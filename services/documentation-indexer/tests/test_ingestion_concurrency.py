@@ -232,7 +232,7 @@ def test_failed_publication_preserves_previous_source_analysis(tmp_path: Path, m
 
 
 @pytest.mark.parametrize("duplicate", [False, True], ids=["fresh", "duplicate"])
-def test_committed_ingest_retains_source_analysis_after_projection_failure_and_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, duplicate: bool):
+def test_committed_ingest_retains_source_analysis_after_projection_failure_and_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, duplicate: bool):
     archive = DocumentationArchive(tmp_path / "archive")
     source = io.BytesIO()
     Image.new("RGB", (10, 10)).save(source, format="PNG")
@@ -248,8 +248,9 @@ def test_committed_ingest_retains_source_analysis_after_projection_failure_and_r
     monkeypatch.setattr(archive_module, "extract_bytes", extract)
     if duplicate:
         archive.ingest_upload(filename="source.png", content=content, content_type="image/png")
+    previous_projection = archive.health()["indexProjection"]["projectedGeneration"]
     analysis = "Committed replacement analysis"
-    metadata = {"filename": "source.png", "contentType": "image/png; name=source.png", "upload": True}
+    metadata = {"filename": "source.png", "contentType": "image/png; name=source.png", "upload": True, "originalFilename": "source.png"}
 
     def fail_projection_read():
         documents = archive.list_documents()
@@ -260,14 +261,22 @@ def test_committed_ingest_retains_source_analysis_after_projection_failure_and_r
 
     with monkeypatch.context() as projection_failure:
         projection_failure.setattr(archive, "_projected_index_generation", fail_projection_read)
-        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-            archive.ingest_upload(filename="source.png", content=content, content_type=metadata["contentType"])
+        committed = archive.ingest_upload(filename="source.png", content=content, content_type=metadata["contentType"])
+
+    pending = archive.health()
+    assert pending["ready"] is False
+    assert pending["indexProjection"]["ready"] is False
+    assert pending["indexProjection"]["projectedGeneration"] == previous_projection
+    assert pending["indexProjection"]["activeGeneration"] != previous_projection
+    assert "Documentation index projection remains pending" in caplog.text
+    assert "database is locked" in caplog.text
 
     for restart in [False, True]:
         current = DocumentationArchive(archive.root) if restart else archive
         documents = current.list_documents()
         assert len(documents) == 1
         document = current.get_document(documents[0]["document_id"])
+        assert document["document_id"] == committed.document_id
         snapshot = current.root / document["snapshot_path"]
         assert snapshot.is_file()
         assert snapshot.read_bytes() == content
@@ -287,11 +296,11 @@ def test_upload_rejects_reserved_artifact_directory_name_before_publication(tmp_
     source = io.BytesIO()
     Image.new("RGB", (10, 10)).save(source, format="PNG")
 
-    with pytest.raises(archive_module.ArchiveError, match="reserved.*extracted"):
-        archive.ingest_upload(filename=filename, content=source.getvalue(), content_type="image/png")
-
-    assert archive.list_documents() == []
-    assert list(archive.snapshots_dir.iterdir()) == []
+    document = archive.ingest_upload(filename=filename, content=source.getvalue(), content_type="image/png")
+    snapshot = archive.root / archive.get_document(document.document_id)["snapshot_path"]
+    assert snapshot.name == "source-extracted"
+    assert snapshot.read_bytes() == source.getvalue()
+    assert snapshot.parent.joinpath("extracted").is_dir()
     assert archive.health()["ready"] is True
 
 

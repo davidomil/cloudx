@@ -4,6 +4,7 @@ import { AlertTriangle, Bot, BookOpen, Download, ExternalLink, FileImage, FilePl
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
+import { DocumentationRevisions } from "./DocumentationRevisions.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
 import { HttpError, documentationArchiveDownloadUrl, getDocumentationArchiveExport, startDocumentationArchiveExport, importDocumentationArchive, uploadDocumentationFile, type DocumentationArchiveExport, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
 import { documentationIngestController } from "./documentationPanelQueue.js";
@@ -374,6 +375,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const [reprocessing, setReprocessing] = useState<{ documentId: string; label: string }>();
   const reprocessingRef = useRef(false);
   const mountedRef = useRef(true);
+  const sourceViewVersionRef = useRef(0);
   const sourceViewerRef = useRef<HTMLElement | null>(null);
   const sourceChunkListRef = useRef<HTMLDivElement | null>(null);
   const sourceAutoLoadSentinelRef = useRef<HTMLDivElement | null>(null);
@@ -607,6 +609,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   async function search(event?: FormEvent) {
     event?.preventDefault();
+    sourceViewVersionRef.current += 1;
     if (!query.trim()) {
       setResults([]);
       setAnswer(undefined);
@@ -798,6 +801,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       return;
     }
     const targetDocumentId = documentId(selectedDocument);
+    sourceViewVersionRef.current += 1;
     const label = selectedDocument.title ?? targetDocumentId;
     reprocessingRef.current = true;
     setReprocessing({ documentId: targetDocumentId, label });
@@ -834,6 +838,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   }
 
   async function remove(targetDocumentId: string) {
+    sourceViewVersionRef.current += 1;
     await run(async () => {
       await call("documentation.remove", { documentId: targetDocumentId });
       setSelectedDocument((current) => current && documentId(current) === targetDocumentId ? undefined : current);
@@ -897,6 +902,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       setArchiveImportConfirmation("");
       setArchiveImportInputKey((current) => current + 1);
       if (mode === "replace") {
+        sourceViewVersionRef.current += 1;
         setSelectedDocument(undefined);
         setResults([]);
         setAnswer(undefined);
@@ -918,6 +924,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       setStatus("Documentation hook bridge is not available.");
       return;
     }
+    sourceViewVersionRef.current += 1;
     setDocumentBusy(true);
     setStatus("");
     try {
@@ -927,6 +934,26 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
       setStatus(error instanceof Error ? error.message : String(error));
     } finally {
       setDocumentBusy(false);
+    }
+  }
+
+  function closeSource() {
+    sourceViewVersionRef.current += 1;
+    setSelectedDocument(undefined);
+  }
+
+  async function showRefreshedSource(newDocumentId: string, version: number) {
+    const isCurrent = () => mountedRef.current && sourceViewVersionRef.current === version;
+    if (!isCurrent()) return;
+    try {
+      const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", sourceDocumentWindowInput(newDocumentId));
+      if (!isCurrent()) return;
+      setSelectedDocument(result.document);
+      setResults([]);
+      setAnswer(undefined);
+      await refresh();
+    } catch (error) {
+      if (isCurrent()) throw error;
     }
   }
 
@@ -997,6 +1024,8 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const queuedIngestCount = visibleIngestJobs.filter((job) => job.status === "queued").length;
   const finishedIngestCount = visibleIngestJobs.filter((job) => job.status === "complete" || job.status === "failed").length;
   const selectedDocumentId = selectedDocument ? documentId(selectedDocument) : "";
+  // Preserve the originating view while the child awaits the source refresh request.
+  const sourceViewVersion = sourceViewVersionRef.current;
   const archiveImportBusy = archiveImportProgress?.status === "uploading" || archiveImportProgress?.status === "processing";
   const activeArchiveImport = archiveImportProgress?.status === "processing"
     ? serverIngestJobs.find((job) => job.label === archiveImportProgress.filename && job.detail === `${archiveImportProgress.mode} documentation archive` && (job.status === "running" || job.status === "queued"))
@@ -1079,9 +1108,10 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
               <ControlButton size="compact" tone="danger" disabled={busy || !selectedDocumentId || reprocessing?.documentId === selectedDocumentId} onClick={() => void remove(selectedDocumentId)} title="Remove document">
                 <Trash2 size={13} /> Remove
               </ControlButton>
-              <ControlButton size="compact" onClick={() => setSelectedDocument(undefined)}>Close</ControlButton>
+              <ControlButton size="compact" onClick={closeSource}>Close</ControlButton>
             </div>
           </div>
+          <DocumentationRevisions key={selectedDocumentId} documentId={selectedDocumentId} callHook={callHook} onRefresh={(newDocumentId) => showRefreshedSource(newDocumentId, sourceViewVersion)} />
           <div ref={sourceChunkListRef} className="documentation-chunk-list">
             {(selectedDocument.chunks ?? []).map((chunk) => (
               <DocumentationChunkArticle key={`${chunkId(chunk)}:${chunk.locator ?? "chunk"}`} document={selectedDocument} chunk={chunk} />

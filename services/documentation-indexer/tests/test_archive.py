@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from enrichment_fixture import enrich_archive
+
+from enrichment_fixture import enrich_via_run
+
+import base64
 import hashlib
 import json
 import os
@@ -84,9 +89,7 @@ def test_archive_ingests_searches_invalidates_and_remains_portable(tmp_path: Pat
     assert archive.search("solder bridge flux cleanup", limit=3)[0]["documentId"] == media_doc.document_id
     dense_only_query = dense_collision_query(["reciprocal", "rank", "fusion", "portable", "manifest"])
     assert archive.search(dense_only_query, limit=3, source_types=["book"], mode="lexical") == []
-    dense_fallback = archive.search(dense_only_query, limit=1, source_types=["book"])
-    assert dense_fallback[0]["sourceType"] == "book"
-    assert dense_fallback[0]["denseScore"] >= DENSE_ONLY_MIN_SCORE
+    assert archive.search(dense_only_query, limit=1, source_types=["book"]) == []
 
     datasheet_id = archive.search("BOOT_MODE reset timing", limit=1)[0]["documentId"]
     archive.invalidate_document(datasheet_id, state="stale", reason="Superseded by newer vendor revision.")
@@ -175,9 +178,11 @@ def test_ingest_does_not_publish_catalog_rows_when_index_generation_fails(tmp_pa
         uri="manual://preserved-generation",
     )
     published_manifest = json.loads(archive.manifest_path.read_text(encoding="utf-8"))
+    published_catalog = searchable_catalog_state(archive)
     published_files = {
         entry["path"]: entry["sha256"]
         for entry in archive.portable_manifest()["files"]
+        if entry["category"] != "database"
     }
 
     def fail_index_write(_index, _path: str) -> None:
@@ -196,9 +201,11 @@ def test_ingest_does_not_publish_catalog_rows_when_index_generation_fails(tmp_pa
     assert archive.search("PRESERVED-GENERATION-41", limit=1)[0]["documentId"] == preserved.document_id
     assert archive.search("UNPUBLISHED-GENERATION-41", limit=10) == []
     assert json.loads(archive.manifest_path.read_text(encoding="utf-8")) == published_manifest
+    assert searchable_catalog_state(archive) == published_catalog
     assert {
         entry["path"]: entry["sha256"]
         for entry in archive.portable_manifest()["files"]
+        if entry["category"] != "database"
     } == published_files
 
     reopened = DocumentationArchive(archive_root)
@@ -238,7 +245,7 @@ def test_enrichment_does_not_publish_without_its_index_generation(tmp_path: Path
         text="The source remains available during enrichment publication.",
         uri="manual://enrichment-generation",
     )
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[archive_module.ExtractedSpan("The published enrichment contains PUBLISHED-ENRICHMENT-42.", "ai:published")],
         model="gpt-test",
@@ -251,7 +258,7 @@ def test_enrichment_does_not_publish_without_its_index_generation(tmp_path: Path
     monkeypatch.setattr(archive_module.IdMapIndex, "write", fail_index_write)
 
     with pytest.raises(RuntimeError, match="forced enrichment index failure"):
-        archive.enrich_document(
+        enrich_archive(archive,
             document.document_id,
             spans=[archive_module.ExtractedSpan("The failed enrichment contains UNPUBLISHED-ENRICHMENT-42.", "ai:unpublished")],
             model="gpt-test",
@@ -595,9 +602,11 @@ def test_archive_merge_preserves_prior_archive_when_index_generation_fails(tmp_p
         text="The target retains PRESERVED-MERGE-45.",
         uri="manual://preserved-merge",
     )
+    published_catalog = searchable_catalog_state(target)
     published_files = {
         entry["path"]: entry["sha256"]
         for entry in target.portable_manifest()["files"]
+        if entry["category"] != "database"
     }
 
     def fail_index_write(_index, _path: str) -> None:
@@ -610,9 +619,11 @@ def test_archive_merge_preserves_prior_archive_when_index_generation_fails(tmp_p
 
         assert target.search("PRESERVED-MERGE-45", limit=1)[0]["documentId"] == preserved.document_id
         assert target.search("FAILED-MERGE-45", limit=10) == []
+        assert searchable_catalog_state(target) == published_catalog
         assert {
             entry["path"]: entry["sha256"]
             for entry in target.portable_manifest()["files"]
+            if entry["category"] != "database"
         } == published_files
     finally:
         exported.path.unlink(missing_ok=True)
@@ -849,7 +860,7 @@ def test_ai_enrichment_adds_searchable_provenance_and_replaces_prior_ai_chunks(t
         uri="mock://visual-import",
     )
 
-    enriched = archive.enrich_document(
+    enriched = enrich_archive(archive,
         document.document_id,
         spans=[
             archive_module.ExtractedSpan("AI visual summary says FLOWCHART-ENRICH-1 has RESET LOW then ENABLE RAIL.", "ai:visual:flowchart"),
@@ -871,7 +882,7 @@ def test_ai_enrichment_adds_searchable_provenance_and_replaces_prior_ai_chunks(t
     assert result["chunkOrigin"] == "ai"
     assert result["enrichmentId"] == ai_chunks[0]["enrichment_id"]
 
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[archive_module.ExtractedSpan("AI rerun summary says FLOWCHART-ENRICH-2 replaced the prior visual note.", "ai:visual:rerun")],
         model="gpt-test",
@@ -898,7 +909,7 @@ def test_document_detail_can_exclude_large_enrichment_and_event_metadata(tmp_pat
     )
     document_id = ingest_response.json()["document"]["documentId"]
     archive = app.state.archive
-    archive.enrich_document(
+    enrich_archive(archive,
         document_id,
         spans=[archive_module.ExtractedSpan("AI note repeats RESPONSE-METADATA-88.", "ai:metadata")],
         model="gpt-test",
@@ -936,16 +947,9 @@ def test_fastapi_enrich_endpoint_writes_derived_chunks(tmp_path: Path) -> None:
     )
     document_id = ingested.json()["document"]["documentId"]
 
-    response = client.post(
-        f"/documents/{document_id}/enrich",
-        json={
-            "model": "gpt-test",
-            "skillIds": ["documentation-enrich-media"],
-            "summary": "Added media sections.",
-            "spans": [{"locator": "ai:media:0", "text": "AI media summary says MEDIA-ENRICH-7 appears in the setup section."}],
-            "payload": {"source": "test"},
-        },
-    )
+    response = enrich_via_run(client, document_id,
+        "AI media summary says MEDIA-ENRICH-7 appears in the setup section.",
+        model="gpt-test", skill_ids=["documentation-enrich-media"], locator="ai:media:0")
 
     assert response.status_code == 200
     assert response.json()["document"]["enrichments"][0]["skill_ids_json"] == '["documentation-enrich-media"]'
@@ -1148,7 +1152,7 @@ def test_reanalysis_preserves_generated_youtube_evidence_independently_of_shared
     stub_youtube_media(monkeypatch, {video_url: "YOUTUBE-REANALYSIS-19 explains allocator pressure."})
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_url(video_url, collection="lectures", tags=["retained"])
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[archive_module.ExtractedSpan("Previous video analysis stays available.", "ai:media")],
         model="gpt-test",
@@ -1170,19 +1174,29 @@ def test_reanalysis_preserves_generated_youtube_evidence_independently_of_shared
         sibling = archive.ingest_upload(filename="retained-transcript.txt", content=source_bytes, content_type="text/plain")
         sibling_before = archive.get_document(sibling.document_id)
         assert sibling.document_id != document.document_id
-        assert (archive.root / sibling_before["snapshot_path"]).parent == snapshot.parent
-        assert "youtube" not in json.loads(metadata_path.read_text())
+        assert (archive.root / sibling_before["snapshot_path"]).parent != snapshot.parent
+        assert "youtube" in json.loads(metadata_path.read_text())
     elif metadata_state == "missing":
         metadata_path.unlink()
-    published_files = {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"]}
+    published_files = {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"] if entry["path"] != "catalog.sqlite"}
 
     for _ in range(2):
-        with pytest.raises(ArchiveError, match="Rerun AI enrichment"):
+        if metadata_state == "missing":
+            with pytest.raises(ArchiveError, match="metadata"):
+                archive.reanalyze_document(document.document_id)
+            assert archive.get_document(document.document_id) == before
+            assert snapshot.read_bytes() == source_bytes
+            assert {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"] if entry["path"] != "catalog.sqlite"} == published_files
+        else:
+            prior_revision = archive.get_document(document.document_id)["extraction_revision"]
             archive.reanalyze_document(document.document_id)
-
-        assert archive.get_document(document.document_id) == before
-        assert snapshot.read_bytes() == source_bytes
-        assert {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"]} == published_files
+            after = archive.get_document(document.document_id)
+            assert after["extraction_revision"] != prior_revision
+            assert (archive.root / after["snapshot_path"]).read_bytes() == source_bytes
+            assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"]] == [
+                (chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"
+            ]
+            assert not snapshot.exists()
         assert not list(archive.snapshots_dir.glob("reanalysis-*"))
         for artifact_path, content in keyframes.items():
             assert archive.document_artifact_file(document.document_id, artifact_path).path.read_bytes() == content
@@ -1827,7 +1841,7 @@ def test_schematic_pdf_page_creates_searchable_artifacts(tmp_path: Path) -> None
 
     document = archive.ingest_path(pdf_path, source_type="datasheet")[0]
 
-    result = archive.search("Phase 1 analysis outputs R3 VDD schematic", source_types=["datasheet"], limit=1)[0]
+    result = archive.search("Structured terminal graph R3 VDD schematic", source_types=["datasheet"], limit=1)[0]
     assert result["documentId"] == document.document_id
     assert result["locator"].startswith("schematic schematic-001 page 1 figure-001")
     snapshot = tmp_path / "archive" / result["citation"]["snapshotPath"]
@@ -1837,7 +1851,13 @@ def test_schematic_pdf_page_creates_searchable_artifacts(tmp_path: Path) -> None
     analysis_path = extracted / "schematics" / "schematic-001" / "analysis.json"
     assert "Reference designators: R3, U1" in description_path.read_text(encoding="utf-8")
     analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
-    assert analysis["analysisOutputs"] == []
+    assert analysis["schemaVersion"] == 2
+    assert analysis["analysisOutputs"][0]["kind"] == "terminal-graph"
+    graph = json.loads((analysis_path.parent / "graph.json").read_text(encoding="utf-8"))
+    assert graph == analysis["structuredAnalysis"]
+    assert graph["source"]["pageNumber"] == 1
+    assert graph["source"]["sheetId"] == "page-1"
+    assert any(capability["name"] == "native-pdf" and capability["state"] == "supported" for capability in graph["capabilities"])
     assert analysis["referenceDesignators"] == ["R3", "U1"]
     assert {"GND", "VDD"}.issubset(set(analysis["labels"]))
 
@@ -1847,7 +1867,7 @@ def test_schematic_pdf_page_creates_searchable_artifacts(tmp_path: Path) -> None
     assert schematic["imagePath"] == "figures/figure-001.png"
     assert schematic["descriptionPath"] == "schematics/schematic-001/description.md"
     assert schematic["jsonPath"] == "schematics/schematic-001/analysis.json"
-    assert schematic["analysisOutputs"] == []
+    assert schematic["analysisOutputs"][0]["path"] == "schematics/schematic-001/graph.json"
     assert archive.document_artifact_file(document.document_id, schematic["descriptionPath"]).media_type == "text/markdown"
     assert archive.document_artifact_file(document.document_id, schematic["imagePath"]).media_type == "image/png"
 
@@ -2079,14 +2099,18 @@ void configure_boot_pin(void) {
 
     record = archive.get_document(document.document_id)
     assert record["source_type"] == "repo_code"
-    assert record["snapshot_path"].endswith(".generated-code.md")
+    assert record["snapshot_path"].endswith(".vendor-sources.json")
+    bundle = json.loads((archive.root / record["snapshot_path"]).read_text())
+    assert base64.b64decode(bundle["sources"][0]["contentBase64"]) == source_text.encode()
+    assert record["sourceManifest"]["metadata"]["rawSourceRetained"] is True
     assert archive.search("configure_boot_pin BOOT_DRIVER_MODE", source_types=["repo_code"], limit=1)[0]["documentId"] == document.document_id
     assert archive.search("RAW_ONLY_CODE_TOKEN", source_types=["repo_code"], limit=5, mode="lexical") == []
 
     artifacts = record["artifacts"]
     manifest_artifact = next(artifact for artifact in artifacts if artifact["type"] == "vendor_code" and artifact["kind"] == "manifest")
     assert manifest_artifact["rawSourceIndexed"] is False
-    assert manifest_artifact["rawSourceRetained"] is False
+    assert manifest_artifact["rawSourceRetained"] is True
+    assert manifest_artifact["rawSourceArtifactsExposed"] is False
     assert manifest_artifact["coveredFileCount"] == 1
     assert manifest_artifact["coveredFilePreview"] == [{"path": "boot_driver.c", "language": "C", "parser": "line-pattern", "symbolCount": 3}]
     assert "coveredFiles" not in manifest_artifact
@@ -2309,26 +2333,21 @@ def test_concurrent_mutations_serialize_index_rebuilds(tmp_path: Path, monkeypat
     max_active_writes = 0
     state_lock = threading.Lock()
 
-    class SlowIdMapIndex:
-        def __init__(self, **_kwargs: object):
-            pass
+    write_index = archive_module.IdMapIndex.write
 
-        def add_with_ids(self, *_args: object) -> None:
-            pass
-
-        def write(self, path: str) -> None:
-            nonlocal active_writes, max_active_writes
+    def slow_write(index, path: str) -> None:
+        nonlocal active_writes, max_active_writes
+        with state_lock:
+            active_writes += 1
+            max_active_writes = max(max_active_writes, active_writes)
+        try:
+            time.sleep(0.05)
+            write_index(index, path)
+        finally:
             with state_lock:
-                active_writes += 1
-                max_active_writes = max(max_active_writes, active_writes)
-            try:
-                time.sleep(0.05)
-                Path(path).write_bytes(b"fake-index")
-            finally:
-                with state_lock:
-                    active_writes -= 1
+                active_writes -= 1
 
-    monkeypatch.setattr(archive_module, "IdMapIndex", SlowIdMapIndex)
+    monkeypatch.setattr(archive_module.IdMapIndex, "write", slow_write)
     archive = DocumentationArchive(tmp_path / "archive")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2346,6 +2365,8 @@ def test_concurrent_mutations_serialize_index_rebuilds(tmp_path: Path, monkeypat
     assert max_active_writes == 1
     assert {document.title for document in documents} == {"Concurrent document 0", "Concurrent document 1"}
     assert len(archive.list_documents()) == 2
+    for index in range(2):
+        assert archive.search(f"LOCK-SERIAL-{index}")[0]["title"] == f"Concurrent document {index}"
 
 
 def test_cli_help_documents_service_options() -> None:
@@ -2359,6 +2380,15 @@ def test_cli_help_documents_service_options() -> None:
     assert "--archive-root" in result.stdout
     assert "--host" in result.stdout
     assert "--port" in result.stdout
+
+
+def searchable_catalog_state(archive: DocumentationArchive) -> dict:
+    with archive._connect() as db:
+        tables = db.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'embedding_cache' AND name NOT LIKE 'sqlite_%'").fetchall()
+        return {
+            name: sorted((tuple(row) for row in db.execute('SELECT * FROM "' + name.replace('"', '""') + '"')), key=repr)
+            for (name,) in tables
+        }
 
 
 def make_pdf(path: Path, lines: list[str]) -> None:
@@ -2405,6 +2435,8 @@ def make_schematic_pdf(path: Path) -> None:
     pdf.drawString(72, 760, "Buck Converter Schematic")
     pdf.drawString(72, 736, "U1 drives R3 from VDD to GND in the feedback circuit.")
     pdf.rect(180, 610, 120, 80)
+    pdf.drawString(168, 655, "1")
+    pdf.drawString(306, 655, "2")
     pdf.drawString(216, 650, "U1")
     pdf.drawString(206, 632, "REGULATOR")
     pdf.line(72, 650, 180, 650)

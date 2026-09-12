@@ -87,20 +87,20 @@ describe("DocumentationBackgroundEnrichment", () => {
     importDocument("slow");
     worker.start();
     await vi.advanceTimersByTimeAsync(0);
-    expect(started).toEqual(["slow"]);
+    await vi.waitFor(() => expect(started).toEqual(["slow"]));
 
     importDocument("new");
     await vi.advanceTimersByTimeAsync(29_999);
-    expect(started).toEqual(["slow"]);
+    await vi.waitFor(() => expect(started).toEqual(["slow"]));
     await vi.advanceTimersByTimeAsync(1);
-    expect(started).toEqual(["slow", "new"]);
-    expect(client.enrichDocument).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(0);
+    await vi.waitFor(() => expect(started).toEqual(["slow", "new"]));
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(2);
 
     finish("new");
     await vi.advanceTimersByTimeAsync(0);
-    expect(client.enrichDocument).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ documentId: "new" }), { signal: expect.any(AbortSignal) });
-    expect(vi.getTimerCount()).toBe(1);
+    expect(client.completeEnrichmentRun).toHaveBeenCalledExactlyOnceWith("new", expect.any(Object), { signal: expect.any(AbortSignal) });
+    expect(vi.getTimerCount()).toBe(2);
   });
 
   it("starts the next document after a foreground duplicate becomes unchanged while its sibling remains active", async () => {
@@ -110,13 +110,13 @@ describe("DocumentationBackgroundEnrichment", () => {
     await vi.advanceTimersByTimeAsync(0);
     worker.start();
     await vi.advanceTimersByTimeAsync(0);
-    expect(started).toEqual(["duplicate", "slow"]);
+    await vi.waitFor(() => expect(started).toEqual(["duplicate", "slow"]));
 
     finish("duplicate");
     await foreground;
     await vi.advanceTimersByTimeAsync(0);
-    expect(started).toEqual(["duplicate", "slow", "next"]);
-    expect(client.enrichDocument).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ documentId: "duplicate" }));
+    await vi.waitFor(() => expect(started).toEqual(["duplicate", "slow", "next"]));
+    expect(client.completeEnrichmentRun).toHaveBeenCalledExactlyOnceWith("duplicate", expect.any(Object), { signal: expect.any(AbortSignal) });
     expect(reportError).not.toHaveBeenCalled();
   });
 
@@ -125,16 +125,16 @@ describe("DocumentationBackgroundEnrichment", () => {
     importDocument("slow");
     worker.start();
     await vi.advanceTimersByTimeAsync(0);
-    expect(started).toEqual(["slow"]);
-    expect(vi.getTimerCount()).toBe(1);
+    await vi.waitFor(() => expect(started).toEqual(["slow"]));
+    expect(vi.getTimerCount()).toBe(2);
 
     await worker.dispose();
     importDocument("new");
     worker.start();
     await vi.advanceTimersByTimeAsync(90_000);
-    expect(started).toEqual(["slow"]);
+    await vi.waitFor(() => expect(started).toEqual(["slow"]));
     expect(client.pendingEnrichments).toHaveBeenCalledTimes(1);
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
     expect(reportError).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -477,12 +477,18 @@ describe("DocumentationBackgroundEnrichment", () => {
           document_id: documentId,
           state: "active",
           extraction_revision: document(documentId).extractionRevision,
-          chunks: [{ chunk_origin: written.has(documentId) ? "ai" : "source", locator: "text", text: `Evidence for ${documentId}.` }]
+          chunks: [{ chunk_id: 11, chunk_origin: written.has(documentId) ? "ai" : "source", locator: "text", text: `Evidence for ${documentId}.` }]
         } };
       }),
-      enrichDocument: vi.fn<DocumentationClient["enrichDocument"]>(async ({ documentId }) => {
+      beginEnrichmentRun: vi.fn<DocumentationClient["beginEnrichmentRun"]>(async (documentId, input) => ({ runId: documentId, leaseToken: "aabb", extractionRevision: input.extractionRevision, status: written.has(documentId) ? "complete" : "running" })),
+      lookupEnrichmentBatch: vi.fn<DocumentationClient["lookupEnrichmentBatch"]>(async () => ({ status: "pending" })),
+      checkpointEnrichmentBatch: vi.fn(async () => ({})),
+      recordEnrichmentRunOutcome: vi.fn(async () => ({})),
+      heartbeatEnrichmentRun: vi.fn(async () => ({})),
+      getEnrichmentMedia: vi.fn(async () => ({ complete: false, chunks: [], artifacts: [], metadata: {}, window: { offset: 0, limit: 100, total: 0, hasMore: false } })),
+      completeEnrichmentRun: vi.fn<DocumentationClient["completeEnrichmentRun"]>(async (documentId) => {
         written.add(documentId);
-        return {};
+        return { chunkCount: 1, warnings: [] };
       })
     };
     const runner: DocumentationEnrichmentRunner = {
@@ -513,7 +519,7 @@ describe("DocumentationBackgroundEnrichment", () => {
     return {
       worker, client, enrichment, started, reportError,
       importDocument(id: string) { documents.set(id, document(id)); },
-      finish(id: string) { completions.get(id)!({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: `Enriched ${id}.` }], metadata: [], warnings: [] }); }
+      finish(id: string) { completions.get(id)!({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: `Enriched ${id}.`, kind: "content", supportAnchorIds: ["chunk:11"] }], metadata: [], warnings: [] }); }
     };
   }
 

@@ -298,8 +298,7 @@ service install.
 For the local documentation archive:
 
 ```bash
-~/.local/share/cloudx/uv/bin/uv sync --locked \
-  --project services/documentation-indexer --extra dev
+npm run documentation:setup
 npm run documentation:start
 ```
 
@@ -314,6 +313,18 @@ search, and manage archive ZIP export/import. Portable manifest inspection and
 Turbovec index rebuild are available through the documentation helper, plugin
 hooks, and local indexer API.
 
+The documentation service requires Python 3.11 or newer (the installer uses
+3.12). Setup provisions the pinned MiniLM model and verifies its artifact hashes.
+Provisioning uses `CLOUDX_DOCUMENTATION_MODEL_DIR` when configured, otherwise
+`CLOUDX_DOCUMENTATION_DATA_DIR/models/minilm` (default `.cloudx/documentation/models/minilm`).
+The standalone `cloudx-documentation-model [directory]` command uses the same defaults.
+Startup requires those local assets; inference does not download models. Hybrid
+search combines lexical evidence with learned sentence embeddings. Model and
+tokenizer revisions, runtime versions, pooling rules and artifact hashes identify
+each index profile. Portable exports retain archive-local model assets; an
+externally configured model directory is represented by pinned provisioning
+references in the manifest.
+
 Documentation rules and skills are synced automatically as CloudX system
 contributions when the server starts, so Codex tabs can use the archive without
 a separate install step.
@@ -322,6 +333,14 @@ Documentation AI assistance is enabled by default when global AI control is on.
 If it is disabled, the Documentation tab still supports manual source-text
 search and full source inspection, but assisted answers and post-ingest AI
 enrichment are unavailable.
+
+Source refresh, source reanalysis, and AI re-enrichment are separate operations.
+AI enrichment uses archive-owned, revision-bound batch checkpoints; interrupted
+runs resume only when explicitly requested. Source campaigns rebuild selected
+retained revisions without AI. See the [documentation lifecycle guide](docs/architecture/documentation-lifecycle.md)
+for hooks, source families, retained media, schema version 2, and irreversible
+purge. The former direct `/documents/{id}/enrich` API is retired in favor of
+validated enrichment runs.
 
 The documentation archive is portable as one directory. Stop writes, then back
 up or move `.cloudx/documentation` or the directory named by
@@ -369,6 +388,8 @@ Common environment variables:
 - `CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES`: indexer archive import upload cap, default `1073741824`.
 - `CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST`: set to `true` only for trusted private URL ingest sources.
 - `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory, default `.cloudx/documentation`.
+- `CLOUDX_DOCUMENTATION_MODEL_DIR`: pinned MiniLM assets directory, default `models/minilm` within the documentation archive.
+- `CLOUDX_DOCUMENTATION_RETRIEVAL_PROFILE`: `minilm` by default; `diagnostic-hash` explicitly selects the nonsemantic feature-hash profile for diagnostics.
 - `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.
 

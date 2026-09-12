@@ -51,12 +51,12 @@ describe("DocumentationEnrichmentService", () => {
 
     await expect(service.enrichIngestResponse({ document: { documentId: "doc-1" } })).resolves.toEqual({ document: { documentId: "doc-1" } });
     expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it.each([
     { state: "stale" },
-    { state: "active", chunks: [{ chunk_origin: "ai", text: "Already analyzed", locator: "ai:metadata" }] },
+    { state: "active", chunks: [{ chunk_id: 11, chunk_origin: "ai", text: "Already analyzed", locator: "ai:metadata" }] },
   ])("rechecks pending documents before invoking the model: %j", async (document) => {
     const runner = fakeRunner();
     const client = fakeDocumentationClient(document);
@@ -66,7 +66,7 @@ describe("DocumentationEnrichmentService", () => {
       enrichment: { results: [{ documentId: "doc-1", status: "unchanged" }] }
     });
     expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it.each([false, true])("publishes enrichment for the extraction revision used as model input (background: %s)", async (onlyPending) => {
@@ -79,7 +79,7 @@ describe("DocumentationEnrichmentService", () => {
       .resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
 
     expect(runner.run).toHaveBeenCalledOnce();
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({ documentId: "doc-1", extractionRevision }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it.each([undefined, "invalid"])("requires a valid discovery revision before starting background enrichment: %s", async (extractionRevision) => {
@@ -92,17 +92,17 @@ describe("DocumentationEnrichmentService", () => {
 
     expect(client.getDocument).not.toHaveBeenCalled();
     expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
-  it.each(["discovery", "chunks", "artifacts"])("discards replaced extraction evidence while reading %s before invoking the model", async (stage) => {
+  it.each(["discovery", "chunks", "artifacts"])("rejects publication when extraction changes while reading %s", async (stage) => {
     const runner = fakeRunner();
     const client = fakeDocumentationClient({ state: "active", extraction_revision: "f".repeat(32) });
     if (stage !== "discovery") {
       client.getDocument.mockResolvedValueOnce({ document: {
         state: "active", extraction_revision: "e".repeat(32),
-        chunks: [{ chunk_origin: "source", locator: "page 1", text: "Original extraction." }],
-        artifacts: [{ path: "page-1.png" }],
+        chunks: [{ chunk_id: 11, chunk_origin: "source", locator: "page 1", text: "Original extraction." }],
+        artifacts: [{ path: "page-1.png", available: false }],
         chunkWindow: { offset: 0, limit: 1, total: stage === "chunks" ? 2 : 1, hasMore: stage === "chunks" },
         artifactWindow: { offset: 0, limit: 1, total: stage === "artifacts" ? 2 : 1, hasMore: stage === "artifacts" },
       } });
@@ -113,17 +113,18 @@ describe("DocumentationEnrichmentService", () => {
       .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Document extraction was replaced before enrichment could read its evidence." }] } });
 
     expect(client.getDocument).toHaveBeenCalledTimes(stage === "discovery" ? 1 : 2);
-    expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(runner.run).toHaveBeenCalledTimes(stage === "discovery" ? 0 : 1);
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it.each(["chunks", "artifacts"])("discards explicit enrichment evidence replaced between %s pages", async (stage) => {
     const runner = fakeRunner();
     const client = fakeDocumentationClient({ extraction_revision: "f".repeat(32) });
     client.getDocument.mockResolvedValueOnce({ document: {
+      state: "active",
       extraction_revision: "e".repeat(32),
-      chunks: [{ chunk_origin: "source", locator: "page 1", text: "Original extraction." }],
-      artifacts: [{ path: "page-1.png" }],
+      chunks: [{ chunk_id: 11, chunk_origin: "source", locator: "page 1", text: "Original extraction." }],
+      artifacts: [{ path: "page-1.png", available: false }],
       chunkWindow: { offset: 0, limit: 1, total: stage === "chunks" ? 2 : 1, hasMore: stage === "chunks" },
       artifactWindow: { offset: 0, limit: 1, total: stage === "artifacts" ? 2 : 1, hasMore: stage === "artifacts" }
     } });
@@ -133,15 +134,15 @@ describe("DocumentationEnrichmentService", () => {
       .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Document extraction was replaced before enrichment could read its evidence." }] } });
 
     expect(client.getDocument).toHaveBeenCalledTimes(2);
-    expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(runner.run).toHaveBeenCalledOnce();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it("prevents explicit enrichment from writing obsolete evidence when reanalysis finishes during the model run", async () => {
     let currentRevision = "e".repeat(32);
     const client = fakeDocumentationClient({ extraction_revision: currentRevision });
-    client.enrichDocument.mockImplementation(async ({ extractionRevision }) => {
-      if (extractionRevision !== undefined && extractionRevision !== currentRevision) {
+    client.completeEnrichmentRun.mockImplementation(async () => {
+      if ("e".repeat(32) !== currentRevision) {
         throw new Error("Enrichment extraction revision no longer matches the document.");
       }
       return {};
@@ -149,13 +150,13 @@ describe("DocumentationEnrichmentService", () => {
     const runner = fakeRunner();
     runner.run.mockImplementation(async () => {
       currentRevision = "f".repeat(32);
-      return { summary: "Obsolete summary", spans: [{ locator: "ai:metadata", text: "Obsolete evidence." }], metadata: [], warnings: [] };
+      return { summary: "Obsolete summary", spans: [{ locator: "ai:metadata", text: "Obsolete evidence.", kind: "content", supportAnchorIds: ["chunk:11"] }], metadata: [], warnings: [] };
     });
     const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
 
     await expect(service.enrichIngestResponse({ document: { documentId: "doc-1" } }))
       .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Enrichment extraction revision no longer matches the document." }] } });
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({ extractionRevision: "e".repeat(32) }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it.each([undefined, null, "invalid"])("rejects explicit enrichment without a valid evidence revision: %s", async (extraction_revision) => {
@@ -166,7 +167,7 @@ describe("DocumentationEnrichmentService", () => {
     await expect(service.enrichIngestResponse({ document: { documentId: "doc-1" } }))
       .resolves.toMatchObject({ enrichment: { results: [{ status: "failed", error: "Documentation enrichment evidence requires a valid extraction revision." }] } });
     expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it("waits for explicit enrichment and rechecks the pending document before starting background analysis", async () => {
@@ -175,8 +176,8 @@ describe("DocumentationEnrichmentService", () => {
     runner.run.mockImplementationOnce(() => new Promise((resolve) => { finishModel = resolve; }));
     const client = fakeDocumentationClient({ state: "active" });
     client.getDocument
-      .mockResolvedValueOnce({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_origin: "source", locator: "page 1", text: "Source evidence" }] } })
-      .mockResolvedValue({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_origin: "ai", locator: "ai:metadata", text: "Enriched source" }] } });
+      .mockResolvedValueOnce({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_id: 11, chunk_origin: "source", locator: "page 1", text: "Source evidence" }] } })
+      .mockResolvedValue({ document: { state: "active", extraction_revision: "e".repeat(32), chunks: [{ chunk_id: 11, chunk_origin: "ai", locator: "ai:metadata", text: "Enriched source" }] } });
     const service = new DocumentationEnrichmentService({ client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner });
     const input = { document: { documentId: "doc-1", extractionRevision: "e".repeat(32) } };
     const explicit = service.enrichIngestResponse(input);
@@ -185,11 +186,11 @@ describe("DocumentationEnrichmentService", () => {
     await Promise.resolve();
     expect(client.getDocument).toHaveBeenCalledOnce();
 
-    finishModel({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: "Enriched source" }], metadata: [], warnings: [] });
+    finishModel({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: "Enriched source", kind: "content", supportAnchorIds: ["chunk:11"] }], metadata: [], warnings: [] });
     await expect(explicit).resolves.toMatchObject({ enrichment: { results: [{ status: "written" }] } });
     await expect(background).resolves.toMatchObject({ enrichment: { results: [{ status: "unchanged" }] } });
     expect(runner.run).toHaveBeenCalledOnce();
-    expect(client.enrichDocument).toHaveBeenCalledOnce();
+    expect(client.completeEnrichmentRun).toHaveBeenCalledOnce();
   });
 
   it("rejects assisted answers when either AI control or documentation enrichment is disabled", async () => {
@@ -212,7 +213,7 @@ describe("DocumentationEnrichmentService", () => {
 
       finish("second");
       await vi.waitFor(() => expect(runner.run).toHaveBeenCalledTimes(3));
-      expect(client.enrichDocument).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ documentId: "second" }));
+      expect(client.completeEnrichmentRun).toHaveBeenCalled();
       finish("third");
       finish("first");
       await expect(response).resolves.toMatchObject({ enrichment: { results: [
@@ -238,7 +239,7 @@ describe("DocumentationEnrichmentService", () => {
       finish("second");
       finish("third");
       await Promise.all([first, second, third]);
-      expect(client.enrichDocument).toHaveBeenCalledTimes(3);
+      expect(client.completeEnrichmentRun).toHaveBeenCalledTimes(3);
     });
 
     it("continues waiting and sibling documents when one model run fails", async () => {
@@ -288,7 +289,7 @@ describe("DocumentationEnrichmentService", () => {
       await settlement;
       expect(settled).toHaveBeenCalledExactlyOnceWith(reason);
       expect(runner.run).toHaveBeenCalledTimes(2);
-      expect(client.enrichDocument).not.toHaveBeenCalled();
+      expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
     });
 
     it("rechecks the enabled setting before starting waiting document work", async () => {
@@ -334,7 +335,7 @@ describe("DocumentationEnrichmentService", () => {
     const runner = fakeRunner({
       answer: "Bake the brownies by mixing cocoa, sugar, eggs, and flour, then baking the batter.",
       answerHtml: "<section><h4>Method</h4><ol><li>Mix cocoa, sugar, eggs, and flour.</li><li>Bake the batter.</li></ol></section>",
-      citations: [{ documentId: "doc-1", title: "Brownies video", locator: "transcript 00:03" }],
+      citations: [{ evidenceId: "doc-1:chunk:11" }],
       warnings: []
     });
     const client = fakeDocumentationClient({
@@ -370,10 +371,10 @@ describe("DocumentationEnrichmentService", () => {
     );
     expect(runner.run.mock.calls[0]?.[0]).toContain("The source description adds");
     expect(runner.run.mock.calls[0]?.[0]).toContain("answerHtml");
-    expect(answer).toEqual({
+    expect(answer).toMatchObject({
       answer: "Bake the brownies by mixing cocoa, sugar, eggs, and flour, then baking the batter.",
       answerHtml: "<section><h4>Method</h4><ol><li>Mix cocoa, sugar, eggs, and flour.</li><li>Bake the batter.</li></ol></section>",
-      citations: [{ documentId: "doc-1", title: "Brownies video", locator: "transcript 00:03" }],
+      citations: [{ documentId: "doc-1", title: "Brownies video", locator: "transcript 00:03", origin: "source", chunkId: 11 }],
       warnings: [],
       results: [
         {
@@ -410,30 +411,20 @@ describe("DocumentationEnrichmentService", () => {
       enabled: true,
       results: [{ documentId: "doc-1", status: "written", chunkCount: 1, warnings: ["batch 1: figure labels were not present"] }]
     });
-    expect(client.enrichDocument).toHaveBeenCalledWith({
-      documentId: "doc-1",
-      extractionRevision: "e".repeat(32),
-      spans: [{ locator: "ai:visual:table", text: "AI visual summary says ENRICHED-TABLE-44 contains reset timing rows." }],
-      model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
-      skillIds: DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS,
-      summary: "Batch 1: Found missing visual metadata.",
-      payload: {
-        metadata: { sectionCount: 1 },
-        warnings: ["batch 1: figure labels were not present"],
-        evidence: { artifactCount: 0, batchCount: 1, batchItemCounts: [1], chunkCount: 1, keyframeCount: 0, mediaTranscriptChars: 0 }
-      }
-    });
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
     expect(client.getDocument).toHaveBeenCalledWith({
       documentId: "doc-1",
       chunkOffset: 0,
       chunkLimit: 100,
       chunkTextMaxChars: 4000,
+      chunkOrigins: ["source"],
+      artifactOrigins: ["source"],
       artifactOffset: 0,
       artifactLimit: 100,
       includeEnrichments: false,
       includeEvents: false
-    });
-    expect(runner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-visuals"), { model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL });
+    }, { signal: expect.any(AbortSignal) });
+    expect(runner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-visuals"), expect.objectContaining({ model: "gpt-test" }));
   });
 
   it.each(["written", "failed", "skipped"])("re-enriches from source evidence and preserves prior AI spans unless replacement is written (%s)", async (status) => {
@@ -456,10 +447,11 @@ describe("DocumentationEnrichmentService", () => {
     expect(runner.run.mock.calls[0]?.[0]).toContain("SOURCE-EVIDENCE");
     expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
     if (status === "written") {
-      expect(client.enrichDocument).toHaveBeenCalledOnce();
-      expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({ documentId: "doc-1", spans: [{ locator: "ai:metadata", text: "Reset is active low." }] }));
+      expect(client.completeEnrichmentRun).toHaveBeenCalledOnce();
+    } else if (status === "failed") {
+      expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
     } else {
-      expect(client.enrichDocument).not.toHaveBeenCalled();
+      expect(client.completeEnrichmentRun).toHaveBeenCalledOnce();
     }
   });
 
@@ -506,7 +498,7 @@ describe("DocumentationEnrichmentService", () => {
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
         expect(transcribeFile).not.toHaveBeenCalled();
         expect(mediaProcessLauncher).not.toHaveBeenCalled();
-        expect(client.enrichDocument).toHaveBeenCalledOnce();
+        expect(client.completeEnrichmentRun).toHaveBeenCalledOnce();
         await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(text);
         expect(client.reanalyzeDocument).toHaveBeenCalledTimes(operation === "reanalyze" ? 1 : 0);
       } finally {
@@ -541,20 +533,18 @@ describe("DocumentationEnrichmentService", () => {
 
           expect(result).toMatchObject({ kind: operation, firstDocumentId: "doc-1", enrichment: { results: [{ status: "written" }] } });
           expect(transcribeFile).toHaveBeenCalledTimes(rerun);
-          expect(client.enrichDocument).toHaveBeenCalledTimes(rerun);
-          expect(client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
-            documentId: "doc-1",
-            payload: expect.objectContaining({ evidence: expect.objectContaining({ chunkCount: 0, keyframeCount: video ? 1 : 0 }) }),
-          }), expect.anything());
+          expect(client.completeEnrichmentRun).toHaveBeenCalledTimes(rerun);
           const [prompt, options] = runner.run.mock.lastCall!;
           expect(prompt).not.toContain("BINARY-CHUNK");
           expect(prompt).not.toContain("PRIOR-AI-SPAN");
           if (video) {
             expect(options.imagePaths).toHaveLength(1);
             const framePath = options.imagePaths[0];
-            expect(framePaths.has(framePath)).toBe(false);
             framePaths.add(framePath);
-            await expect(fs.stat(path.dirname(path.dirname(framePath)))).rejects.toMatchObject({ code: "ENOENT" });
+            expect(framePath).toContain("extracted/enrichment/");
+            await expect(fs.readFile(framePath, "utf8")).resolves.toBe("frame");
+            const temporaryFrame = mediaProcessLauncher.mock.calls.filter(([command]) => command === "ffmpeg").at(-1)![1].at(-1)!.replace("%04d", "0001");
+            await expect(fs.stat(temporaryFrame)).rejects.toMatchObject({ code: "ENOENT" });
           } else {
             expect(prompt).toContain("FRESH-AUDIO-TRANSCRIPT");
             expect(options.imagePaths).toBeUndefined();
@@ -602,7 +592,7 @@ describe("DocumentationEnrichmentService", () => {
         }
         expect(transcribeFile).not.toHaveBeenCalled();
         expect(runner.run).not.toHaveBeenCalled();
-        expect(client.enrichDocument).not.toHaveBeenCalled();
+        expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
         expect(mediaProcessLauncher).toHaveBeenCalledOnce();
         await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
       } finally {
@@ -695,11 +685,7 @@ describe("DocumentationEnrichmentService", () => {
           expect(prompt).toContain(transcript);
           expect(prompt).not.toContain("BINARY-CHUNK");
           expect(prompt).not.toContain("PRIOR-AI-SPAN");
-          expect(client.enrichDocument).toHaveBeenCalledTimes(rerun);
-          expect(client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
-            documentId: "doc-1",
-            payload: expect.objectContaining({ evidence: expect.objectContaining({ mediaTranscriptChars: transcript.length }) }),
-          }), expect.anything());
+          expect(client.completeEnrichmentRun).toHaveBeenCalledTimes(rerun);
           await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(originalBytes);
           await expect(client.getDocument({ documentId: "doc-1" })).resolves.toEqual({ document: uploaded });
         }
@@ -760,14 +746,12 @@ describe("DocumentationEnrichmentService", () => {
         }
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
         expect(runner.run.mock.calls[0]?.[0]).not.toContain("PRIOR-AI-SPAN");
-        expect(fixture.client.enrichDocument).toHaveBeenCalledOnce();
-        expect(fixture.client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-          payload: expect.objectContaining({ evidence: expect.objectContaining({ mediaTranscriptChars: transcript.length, keyframeCount: video ? 1 : 0 }) }),
-        }), expect.anything());
+        expect(fixture.client.completeEnrichmentRun).toHaveBeenCalledOnce();
+        expect(fixture.client.completeEnrichmentRun).toHaveBeenCalled();
         if (video) {
           expect(mediaProcessLauncher).toHaveBeenCalledWith("ffmpeg", expect.arrayContaining(["-i", fixture.mediaPath]), expect.anything());
           const capturedFrame = mediaProcessLauncher.mock.calls.find(([command]) => command === "ffmpeg")![1].at(-1)!.replace("%04d", "0001");
-          expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ imagePaths: [capturedFrame] }));
+          expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ imagePaths: [expect.stringContaining("extracted/enrichment/")] }));
           await expect(fs.stat(capturedFrame)).rejects.toMatchObject({ code: "ENOENT" });
         } else {
           expect(mediaProcessLauncher).toHaveBeenCalledOnce();
@@ -806,7 +790,7 @@ describe("DocumentationEnrichmentService", () => {
       expect(child.stderr.listenerCount("data")).toBe(0);
       expect(transcribeFile).not.toHaveBeenCalled();
       expect(runner.run).not.toHaveBeenCalled();
-      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+      expect(fixture.client.completeEnrichmentRun).not.toHaveBeenCalled();
       await expect(fs.readFile(fixture.mediaPath)).resolves.toEqual(fixture.sourceBytes);
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
@@ -823,7 +807,7 @@ describe("DocumentationEnrichmentService", () => {
       const response = await service.enrichIngestResponse({ documents: [{ documentId: "doc-1" }] });
 
       expect(response.enrichment).toMatchObject({ results: [{ status: "written" }] });
-      expect(transcribeFile).toHaveBeenCalledWith(fixture.mediaPath, "recording");
+      expect(transcribeFile).toHaveBeenCalledWith(fixture.mediaPath, "recording", { signal: expect.any(AbortSignal) });
       expect(runner.run.mock.calls[0]?.[0]).toContain("EXTENSIONLESS-TRANSCRIPT");
       expect(runner.run.mock.calls[0]?.[0]).not.toContain("BINARY-CHUNK");
     } finally {
@@ -859,7 +843,7 @@ describe("DocumentationEnrichmentService", () => {
       expect(sourceStream?.destroyed).toBe(true);
       expect(transcribeFile).not.toHaveBeenCalled();
       expect(runner.run).not.toHaveBeenCalled();
-      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+      expect(fixture.client.completeEnrichmentRun).not.toHaveBeenCalled();
     } finally {
       readSource.mockRestore();
       await fs.rm(fixture.root, { recursive: true, force: true });
@@ -894,7 +878,7 @@ describe("DocumentationEnrichmentService", () => {
       expect(response.enrichment).toMatchObject({ results: [{ status: "failed", error: expect.stringMatching(/metadata is missing|metadata must be a regular file|archived source metadata|content type must be a string|JSON/u) }] });
       expect(transcribeFile).not.toHaveBeenCalled();
       expect(runner.run).not.toHaveBeenCalled();
-      expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+      expect(fixture.client.completeEnrichmentRun).not.toHaveBeenCalled();
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true });
     }
@@ -968,6 +952,18 @@ describe("DocumentationEnrichmentService", () => {
     );
   });
 
+  it("transcribes retained binary media when source extraction contains only media metadata", async () => {
+    const fixture = await archivedMediaFixture("recording.wav", "media", { chunks: [{ chunk_id: 11, locator: "media source", text: "Retained media source: recording.wav", chunk_origin: "source" }] });
+    const transcribeFile = vi.fn(async () => ({ text: "SOURCE-AUDIO-TRANSCRIPT" }));
+    const runner = fakeRunner({ summary: "", spans: [{ locator: "ai:media", text: "Grounded speech" }], metadata: [], warnings: [] });
+    const service = new DocumentationEnrichmentService({ client: fixture.client, config: fakeConfig(true), rulesSkills: fakeRulesSkills(), runner, asr: { transcribeFile } as never, mediaProcessLauncher: fakeMediaTools(false) });
+    try {
+      expect(await service.enrichIngestResponse({ document: { documentId: "doc-1" } })).toMatchObject({ enrichment: { results: [{ status: "written" }] } });
+      expect(transcribeFile).toHaveBeenCalledOnce();
+      expect(runner.run.mock.calls[0][0]).toContain("SOURCE-AUDIO-TRANSCRIPT");
+    } finally { await fs.rm(fixture.root, { recursive: true, force: true }); }
+  });
+
   it("does not classify a recording from structured locators in prior AI spans", async () => {
     const fixture = await archivedMediaFixture("recording.wav", "media", {
       chunks: [
@@ -1013,7 +1009,7 @@ describe("DocumentationEnrichmentService", () => {
 
         expect(response.enrichment).toMatchObject({ results: [{ status: "failed", error: expect.stringMatching(/ENOENT|requires the ASR service|ASR failed|no transcript or keyframe evidence/u) }] });
         expect(runner.run).not.toHaveBeenCalled();
-        expect(fixture.client.enrichDocument).not.toHaveBeenCalled();
+        expect(fixture.client.completeEnrichmentRun).not.toHaveBeenCalled();
       } finally {
         await fs.rm(fixture.root, { recursive: true, force: true });
       }
@@ -1054,7 +1050,7 @@ describe("DocumentationEnrichmentService", () => {
         expect(response.enrichment).toMatchObject({ results: [{ status: "failed", error: expect.stringMatching(/escapes the documentation archive root|must be a regular file/u) }] });
         expect(transcribeFile).not.toHaveBeenCalled();
         expect(runner.run).not.toHaveBeenCalled();
-        expect(client.enrichDocument).not.toHaveBeenCalled();
+        expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
       } finally {
         await fs.rm(fixture.root, { recursive: true, force: true });
       }
@@ -1139,6 +1135,7 @@ describe("DocumentationEnrichmentService", () => {
       const chunkPage = chunks.slice(chunkOffset, chunkOffset + chunkLimit);
       return {
         document: {
+          state: "active",
           extraction_revision: "e".repeat(32),
           document_id: "doc-1",
           title: "Power datasheet",
@@ -1179,6 +1176,8 @@ describe("DocumentationEnrichmentService", () => {
         chunkOffset: 0,
         chunkLimit: 100,
         chunkTextMaxChars: 4000,
+        chunkOrigins: ["source"],
+        artifactOrigins: ["source"],
         artifactOffset: 0,
         artifactLimit: 100,
         includeEnrichments: false,
@@ -1189,6 +1188,8 @@ describe("DocumentationEnrichmentService", () => {
         chunkOffset: 100,
         chunkLimit: 100,
         chunkTextMaxChars: 4000,
+        chunkOrigins: ["source"],
+        artifactOrigins: ["source"],
         artifactOffset: 0,
         artifactLimit: 0,
         includeEnrichments: false,
@@ -1196,11 +1197,7 @@ describe("DocumentationEnrichmentService", () => {
       }
     ]);
     expect(runner.run.mock.calls.some(([prompt]) => prompt.includes("PAGED-LAST-CHUNK"))).toBe(true);
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-      payload: expect.objectContaining({
-        evidence: expect.objectContaining({ chunkCount: 125 })
-      })
-    }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it("uses configured models independently for visual enrichment, text enrichment, and assisted answers", async () => {
@@ -1222,10 +1219,10 @@ describe("DocumentationEnrichmentService", () => {
       runner: visualRunner
     }).enrichIngestResponse({ document: { documentId: "doc-1" } });
 
-    expect(visualRunner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-visuals"), { model: "gpt-5.4-mini" });
-    expect(client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({ model: "gpt-5.4-mini" }));
+    expect(visualRunner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-visuals"), expect.objectContaining({ model: "gpt-5.4" }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
 
-    client.enrichDocument.mockClear();
+    client.completeEnrichmentRun.mockClear();
     const textRunner = fakeRunner({
       summary: "text",
       spans: [{ locator: "ai:metadata", text: "Metadata model processed text-only evidence." }],
@@ -1244,13 +1241,13 @@ describe("DocumentationEnrichmentService", () => {
       runner: textRunner
     }).enrichIngestResponse({ document: { documentId: "doc-1" } });
 
-    expect(textRunner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-metadata"), { model: "gpt-5.4" });
-    expect(client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({ model: "gpt-5.4" }));
+    expect(textRunner.run).toHaveBeenCalledWith(expect.stringContaining("documentation-enrich-metadata"), expect.objectContaining({ model: "gpt-5.4" }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
 
     const answerRunner = fakeRunner({
       answer: "The archive says only text evidence exists.",
       answerHtml: "<p>The archive says only text evidence exists.</p>",
-      citations: [{ documentId: "doc-1", title: "Power datasheet", locator: "page 1" }],
+      citations: [{ evidenceId: "doc-1:chunk:11" }],
       warnings: []
     });
     const answer = await new DocumentationEnrichmentService({
@@ -1276,6 +1273,7 @@ describe("DocumentationEnrichmentService", () => {
       warnings: []
     });
     const chunks = Array.from({ length: 95 }, (_unused, index) => ({
+      chunk_id: index + 1,
       locator: `page ${index + 1}`,
       text: index === 94 ? "LAST-CHUNK-NEEDLE should remain visible to Codex." : `Chunk ${index + 1} content.`,
       chunk_origin: "source"
@@ -1291,11 +1289,7 @@ describe("DocumentationEnrichmentService", () => {
     await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
 
     expect(runner.run.mock.calls.some(([prompt]) => prompt.includes("LAST-CHUNK-NEEDLE"))).toBe(true);
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-      payload: expect.objectContaining({
-        evidence: expect.objectContaining({ chunkCount: 95 })
-      })
-    }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it.each([
@@ -1375,12 +1369,8 @@ describe("DocumentationEnrichmentService", () => {
         expect(runner.run).toHaveBeenCalledTimes(rerun);
         expect(transcribeFile).not.toHaveBeenCalled();
         expect(mediaProcessLauncher).not.toHaveBeenCalled();
-        expect(fixture.client.enrichDocument).toHaveBeenCalledTimes(rerun);
-        expect(fixture.client.enrichDocument).toHaveBeenLastCalledWith(expect.objectContaining({
-          documentId: "doc-1",
-          spans: [replacement],
-          payload: expect.objectContaining({ evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 3 }) }),
-        }), expect.anything());
+        expect(fixture.client.completeEnrichmentRun).toHaveBeenCalledTimes(rerun);
+        expect(fixture.client.completeEnrichmentRun).toHaveBeenCalled();
         await expect(fs.readFile(fixture.mediaPath, "utf8")).resolves.toBe(transcript);
         await expect(fs.readFile(keyframePath)).resolves.toEqual(keyframeBytes);
       }
@@ -1435,7 +1425,7 @@ describe("DocumentationEnrichmentService", () => {
       }]
     });
     expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it("attaches schematic page renders to the image-analysis runner for component and connection extraction", async () => {
@@ -1463,7 +1453,7 @@ describe("DocumentationEnrichmentService", () => {
       snapshot_path: "snapshots/schematic/source.pdf",
       chunks: [{
         chunk_id: 51,
-        locator: "schematic schematic-001 page 1 figure-001",
+        locator: "page 1 figure-001",
         text: "Schematic image artifact schematic-001 from page 1 figure-001. Image artifact: figures/figure-001.png.",
         chunk_origin: "source"
       }],
@@ -1503,19 +1493,11 @@ describe("DocumentationEnrichmentService", () => {
     expect(prompt).toContain('"referenceDesignators": [');
     expect(prompt).toContain('"R3"');
     expect(prompt).toContain('"U1"');
-    expect(runner.run).toHaveBeenCalledWith(expect.any(String), {
+    expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
       model: DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL,
       imagePaths: [imagePath]
-    });
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-      spans: [
-        { locator: "ai:schematic:schematic-001:components", text: "Components: U1 regulator and R3 resistor are visible." },
-        { locator: "ai:schematic:schematic-001:connections", text: "Connections: VDD enters U1; U1 output routes through R3 toward GND." }
-      ],
-      payload: expect.objectContaining({
-        evidence: expect.objectContaining({ artifactCount: 1, chunkCount: 1 })
-      })
     }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it("splits large schematic imports into image-bounded batches without dropping page renders", async () => {
@@ -1534,7 +1516,7 @@ describe("DocumentationEnrichmentService", () => {
       await fs.writeFile(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
       chunks.push({
         chunk_id: 100 + index,
-        locator: `schematic ${id} page ${index} ${figure}`,
+        locator: `page ${index} ${figure}`,
         text: `Schematic image artifact ${id} from page ${index} ${figure}. Image artifact: figures/${figure}.png.`,
         chunk_origin: "source"
       });
@@ -1585,11 +1567,7 @@ describe("DocumentationEnrichmentService", () => {
     }
     expect(prompts.every((prompt) => prompt.includes('"attachedImageBatchSize": 8'))).toBe(true);
     expect(prompts.join("\n")).toContain("schematic-012");
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-      payload: expect.objectContaining({
-        evidence: expect.objectContaining({ artifactCount: 12, chunkCount: 12 })
-      })
-    }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it("persists all valid returned spans and warnings without fixed output caps", async () => {
@@ -1609,12 +1587,7 @@ describe("DocumentationEnrichmentService", () => {
 
     await service.enrichIngestResponse({ document: { documentId: "doc-1" } });
 
-    expect(client.enrichDocument).toHaveBeenCalledWith(expect.objectContaining({
-      spans,
-      payload: expect.objectContaining({
-        warnings: warnings.map((warning) => `batch 1: ${warning}`)
-      })
-    }));
+    expect(client.completeEnrichmentRun).toHaveBeenCalled();
   });
 
   it("fails media upload enrichment explicitly when ASR is unavailable", async () => {
@@ -1648,7 +1621,7 @@ describe("DocumentationEnrichmentService", () => {
       ]
     });
     expect(runner.run).not.toHaveBeenCalled();
-    expect(client.enrichDocument).not.toHaveBeenCalled();
+    expect(client.completeEnrichmentRun).not.toHaveBeenCalled();
   });
 
   it("includes ASR transcript evidence for media uploads", async () => {
@@ -1673,7 +1646,7 @@ describe("DocumentationEnrichmentService", () => {
       { filename: "demo.mp3", contentType: "audio/mpeg", sourceType: "media", content: Buffer.from("fake audio") }
     );
 
-    expect(asr.transcribe).toHaveBeenCalledWith(Buffer.from("fake audio"), "demo.mp3");
+    expect(asr.transcribe).toHaveBeenCalledWith(Buffer.from("fake audio"), "demo.mp3", { signal: expect.any(AbortSignal) });
     expect(runner.run.mock.calls[0]?.[0]).toContain("MEDIA-TRANSCRIPT-NEEDLE");
     expect(response.enrichment).toMatchObject({
       enabled: true,
@@ -1692,8 +1665,8 @@ describe("DocumentationEnrichmentService", () => {
     });
     const asr = fakeAsr("Signal propagation transcript.");
     const client = fakeDocumentationClient({ source_type: "media" });
-    vi.mocked(client.enrichDocument).mockImplementation(async (_input, options) => {
-      expect(options?.signal).toBe(controller.signal);
+    vi.mocked(client.completeEnrichmentRun).mockImplementation(async (_runId, _input, options) => {
+      expect(options?.signal).toBeInstanceOf(AbortSignal);
       controller.abort(stopped);
       throw stopped;
     });
@@ -1711,10 +1684,10 @@ describe("DocumentationEnrichmentService", () => {
       { signal: controller.signal }
     )).rejects.toBe(stopped);
 
-    expect(client.getDocument).toHaveBeenCalledWith(expect.any(Object), { signal: controller.signal });
-    expect(client.health).toHaveBeenCalledWith({ signal: controller.signal });
-    expect(asr.transcribe).toHaveBeenCalledWith(Buffer.from("fake audio"), "demo.mp3", { signal: controller.signal });
-    expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal: controller.signal }));
+    expect(client.getDocument).toHaveBeenCalledWith(expect.any(Object), { signal: expect.any(AbortSignal) });
+    expect(client.health).toHaveBeenCalledWith({ signal: expect.any(AbortSignal) });
+    expect(asr.transcribe).toHaveBeenCalledWith(Buffer.from("fake audio"), "demo.mp3", { signal: expect.any(AbortSignal) });
+    expect(runner.run).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signal: expect.any(AbortSignal) }));
   });
 
   it("keeps media process-group escalation alive when the leader exits before its descendant", async () => {
@@ -1961,11 +1934,11 @@ function parallelEnrichmentFixture(concurrency?: number) {
     document_id: documentId,
     state: "active",
     extraction_revision: "e".repeat(32),
-    chunks: [{ chunk_origin: written.has(documentId) ? "ai" : "source", locator: "page 1", text: `Evidence for ${documentId}.` }]
+    chunks: [{ chunk_id: 11, chunk_origin: written.has(documentId) ? "ai" : "source", locator: "page 1", text: `Evidence for ${documentId}.` }]
   } }));
-  client.enrichDocument.mockImplementation(async ({ documentId }) => {
-    written.add(documentId);
-    return {};
+  client.completeEnrichmentRun.mockImplementation(async (runId) => {
+    written.add(runId.replace("run:", ""));
+    return { chunkCount: 1, warnings: [] };
   });
   const runner = fakeRunner();
   runner.run.mockImplementation((prompt) => {
@@ -1978,7 +1951,7 @@ function parallelEnrichmentFixture(concurrency?: number) {
   return {
     service, client, runner, config,
     finish(documentId: string) {
-      completions.get(documentId)!.resolve({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: `Enriched ${documentId}.` }], metadata: [], warnings: [] });
+      completions.get(documentId)!.resolve({ summary: "Source summary", spans: [{ locator: "ai:metadata", text: `Enriched ${documentId}.`, kind: "content", supportAnchorIds: ["chunk:11"] }], metadata: [], warnings: [] });
     },
     fail(documentId: string, error: Error) {
       completions.get(documentId)!.reject(error);
@@ -2007,7 +1980,12 @@ function fakeConfig(enabled: boolean, options: {
 function fakeRunner(output: unknown = { summary: "", spans: [], metadata: [], warnings: [] }): DocumentationEnrichmentRunner & { run: ReturnType<typeof vi.fn> } {
   return {
     model: "gpt-test",
-    run: vi.fn(async () => output)
+    run: vi.fn(async (prompt: string) => {
+      if (!output || typeof output !== "object" || !("spans" in output)) return output;
+      const evidence = JSON.parse(prompt.split("\nEvidence:\n")[1]!);
+      const spans = (output.spans as Array<Record<string, unknown>>).map((span) => ({ ...span, kind: "content", supportAnchorIds: [evidence.supportAnchors[0]?.id] }));
+      return { ...output, spans };
+    })
   };
 }
 
@@ -2061,43 +2039,51 @@ function fakeMediaTools(video: boolean) {
 
 function fakeDocumentationClient(documentOverrides: Record<string, unknown> = {}, options: { archiveRoot?: string } = {}): DocumentationClient & {
   getDocument: ReturnType<typeof vi.fn>;
-  enrichDocument: ReturnType<typeof vi.fn>;
+  completeEnrichmentRun: ReturnType<typeof vi.fn>;
   search: ReturnType<typeof vi.fn>;
 } {
-  return {
+  const checkpoints = new Map<string, Map<number, any>>();
+  let retainedMedia = { complete: false, chunks: [] as Record<string, unknown>[], artifacts: [] as Record<string, unknown>[], metadata: {} as Record<string, unknown> };
+  const client = {
     health: vi.fn(async () => ({ archiveRoot: options.archiveRoot ?? "/tmp/archive" })),
-    getDocument: vi.fn(async () => ({
-      document: {
-        document_id: "doc-1",
-        title: "Power datasheet",
-        source_type: "datasheet",
-        uri: "mock://power",
-        collection: "board",
-        content_sha256: "abc",
-        extraction_revision: "e".repeat(32),
-        snapshot_path: "snapshots/abc/power.pdf",
-        chunks: [{ chunk_id: 11, locator: "page 1", text: "The source text mentions reset timing tables.", chunk_origin: "source" }],
-        ...documentOverrides
+    getDocument: vi.fn(async (input: Record<string, unknown>) => {
+      const allChunks: Record<string, unknown>[] = (documentOverrides.chunks as Record<string, unknown>[] | undefined ?? [{ chunk_id: 11, locator: "page 1", text: "The source text mentions reset timing tables.", chunk_origin: "source" }]).map((chunk, index) => ({ chunk_id: index + 11, state: "active", ...chunk }));
+      const chunks = input.chunkLocators ? allChunks.filter((chunk) => (input.chunkLocators as string[]).includes(String(chunk.locator))) : allChunks;
+      return { document: { document_id: "doc-1", state: "active", title: "Power datasheet", source_type: "datasheet", uri: "mock://power", collection: "board", content_sha256: "abc", extraction_revision: "e".repeat(32), snapshot_path: "snapshots/abc/power.pdf", ...documentOverrides, chunks, artifacts: input.chunkLocators ? [] : documentOverrides.artifacts ?? [] } };
+    }),
+    search: vi.fn(async () => ({ results: [{ chunkId: 11, documentId: "doc-1", title: typeof documentOverrides.title === "string" ? documentOverrides.title : "Power datasheet", sourceType: typeof documentOverrides.source_type === "string" ? documentOverrides.source_type : "datasheet", locator: "transcript 00:03", snippet: "Mix cocoa, sugar, eggs, and flour, then bake the batter." }] })),
+    beginEnrichmentRun: vi.fn(async (documentId: string, input: { extractionRevision: string }) => {
+      const runId = `run:${documentId}`;
+      checkpoints.set(runId, new Map());
+      retainedMedia = { complete: false, chunks: [], artifacts: [], metadata: {} };
+      const latest = await client.getDocument.mock.results.at(-1)?.value;
+      const chunks = latest?.document.chunks ?? [];
+      return { runId, leaseToken: "aabb", extractionRevision: input.extractionRevision, status: chunks.length && chunks.every((chunk: any) => chunk.chunk_origin === "ai") ? "complete" : "running" };
+    }),
+    lookupEnrichmentBatch: vi.fn(async () => ({ status: "pending" })),
+    checkpointEnrichmentBatch: vi.fn(async (runId: string, index: number, input: any) => { checkpoints.get(runId)!.set(index, input.output); return {}; }),
+    completeEnrichmentRun: vi.fn(async (runId: string) => {
+      const outputs = [...checkpoints.get(runId)!.values()];
+      return { chunkCount: outputs.flatMap((output) => output.spans).length, warnings: outputs.flatMap((output, index) => output.warnings.map((warning: string) => `batch ${index + 1}: ${warning}`)) };
+    }),
+    recordEnrichmentRunOutcome: vi.fn(async () => ({})),
+    heartbeatEnrichmentRun: vi.fn(async () => ({})),
+    getEnrichmentMedia: vi.fn(async (_runId: string, _leaseToken: string, offset: number) => ({ ...retainedMedia, window: { offset, limit: 100, total: retainedMedia.chunks.length + retainedMedia.artifacts.length, hasMore: false } })),
+    completeEnrichmentMedia: vi.fn(async (_runId: string, _leaseToken: string, metadata: Record<string, unknown>) => { retainedMedia.complete = true; retainedMedia.metadata = metadata; return {}; }),
+    retainMediaEvidence: vi.fn(async (_documentId: string, input: any) => {
+      const chunks = input.transcript ? [{ chunk_id: 500, locator: input.transcript.locator, text: input.transcript.text, chunk_origin: "media", state: "pending" }] : [];
+      const artifacts = [];
+      for (const [index, frame] of (input.keyframes ?? []).entries()) {
+        const relativePath = `enrichment/${index}-${frame.filename}`;
+        const artifactPath = path.join(options.archiveRoot ?? "/tmp/archive", path.dirname(String(documentOverrides.snapshot_path ?? "snapshots/abc/power.pdf")), "extracted", relativePath);
+        await fs.mkdir(path.dirname(artifactPath), { recursive: true }); await fs.writeFile(artifactPath, Buffer.from(frame.contentBase64, "base64"));
+        artifacts.push({ id: `retained-frame-${index}`, locator: `media keyframe ${frame.offsetSeconds}s`, path: relativePath, kind: "media-keyframe", mimeType: "image/jpeg", offsetSeconds: frame.offsetSeconds });
       }
-    })),
-    search: vi.fn(async () => ({
-      results: [
-        {
-          chunkId: 11,
-          documentId: "doc-1",
-          title: typeof documentOverrides.title === "string" ? documentOverrides.title : "Power datasheet",
-          sourceType: typeof documentOverrides.source_type === "string" ? documentOverrides.source_type : "datasheet",
-          locator: "transcript 00:03",
-          snippet: "Mix cocoa, sugar, eggs, and flour, then bake the batter."
-        }
-      ]
-    })),
-    enrichDocument: vi.fn(async () => ({ document: { document_id: "doc-1" } }))
-  } as unknown as DocumentationClient & {
-    getDocument: ReturnType<typeof vi.fn>;
-    enrichDocument: ReturnType<typeof vi.fn>;
-    search: ReturnType<typeof vi.fn>;
+      retainedMedia.chunks.push(...chunks); retainedMedia.artifacts.push(...artifacts);
+      return { chunks, artifacts };
+    })
   };
+  return client as unknown as DocumentationClient & { getDocument: ReturnType<typeof vi.fn>; completeEnrichmentRun: ReturnType<typeof vi.fn>; search: ReturnType<typeof vi.fn> };
 }
 
 function fakeRulesSkills(): RulesSkillsCatalogService {

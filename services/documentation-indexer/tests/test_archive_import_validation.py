@@ -144,7 +144,7 @@ def test_upload_rejects_invalid_index_numbers_and_allows_valid_import(tmp_path: 
 def assert_upload_rejects_index_and_allows_valid_import(tmp_path: Path, monkeypatch, mode: str, streaming: bool, corrupt_index: Callable[[bytes], bytes]):
     source = DocumentationArchive(tmp_path / "source")
     imported = source.ingest_text(title="Candidate", text="Storage engine uses a cached retrieval index.", uri="manual://candidate")
-    assert source.search("indexes")[0]["documentId"] == imported.document_id
+    assert source.search("cached retrieval index")[0]["documentId"] == imported.document_id
     exported = source.export_archive()
     valid_package = exported.path.read_bytes()
     exported.path.unlink()
@@ -208,7 +208,7 @@ def assert_upload_rejects_index_and_allows_valid_import(tmp_path: Path, monkeypa
         else:
             result = response.json()
         assert result["import"]["mode"] == mode
-        search = client.post("/search", json={"query": "indexes"})
+        search = client.post("/search", json={"query": "cached retrieval index"})
         assert search.status_code == 200
         assert [result["documentId"] for result in search.json()["results"]] == [imported.document_id]
         assert list(tmp_path.glob("cloudx-documentation-import-*")) == []

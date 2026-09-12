@@ -8,6 +8,8 @@ import type { HookProgressEvent } from "@cloudx/plugin-api";
 
 import { ConfigService } from "../configService.js";
 import { DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
+import { AutomationCatalogService } from "../automation/AutomationCatalogService.js";
+import { AutomationTypeService } from "../automation/AutomationTypeService.js";
 import type { DocumentationClient } from "../documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "../documentation/DocumentationIngestQueue.js";
 import { HookRegistry } from "../hooks/HookRegistry.js";
@@ -19,6 +21,97 @@ describe("DocumentationPlugin", () => {
 
   afterEach(async () => {
     await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+  });
+
+  it("exposes revision and campaign outcomes as automation data ports", async () => {
+    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
+    const catalog = await new AutomationCatalogService(new AutomationTypeService(), () => [], () => plugin.hooks).catalog();
+    const expected = {
+      assignSource: ["sourceKey", "revisions", "pendingCleanup"],
+      checkRevision: ["sourceKey", "status", "documentId", "contentSha256", "checkedAt"],
+      refresh: ["sourceKey", "status", "documentId", "contentSha256", "checkedAt"],
+      purge: ["documentId", "sourceKey", "purged", "cleanupPending", "retainedDocument", "error"],
+      "reanalyzeCampaign.start": ["campaign.campaign_id", "campaign.status", "items", "window.total"],
+      "reanalyzeCampaign.resume": ["campaign.campaign_id", "campaign.status", "items", "window.total"],
+      "reanalyzeCampaign.cancel": ["campaign.campaign_id", "campaign.status", "items", "window.total"]
+    };
+    for (const [operation, ports] of Object.entries(expected)) {
+      const node = catalog.nodes.find((entry) => entry.typeId === `hook:documentation.documents.${operation}`)!;
+      expect(node.outputs.map((port) => port.id), operation).toEqual(expect.arrayContaining(ports));
+      expect(node.outputs.filter((port) => ports.includes(port.id)).every((port) => port.type.kind !== "unknown"), operation).toBe(true);
+    }
+  });
+
+  it.each([
+    { operation: "assignSource", method: "assignDocumentSource", input: { documentId: "doc", sourceKey: "source:guide" }, result: { sourceKey: "source:guide", revisions: [], pendingCleanup: [{ documentId: "old", purgeId: 1, error: "Disk unavailable" }] } },
+    { operation: "checkRevision", method: "checkDocumentRevision", input: { documentId: "doc" }, result: { sourceKey: "source:guide", status: "new-revision", documentId: null, contentSha256: "a".repeat(64), checkedAt: "2026-09-12T00:00:00Z" } },
+    { operation: "refresh", method: "refreshDocument", input: { documentId: "doc" }, result: { sourceKey: "source:guide", status: "refreshed", documentId: "new", contentSha256: "b".repeat(64), checkedAt: "2026-09-12T00:00:00Z", comparison: "metadata-transcript-selected-frames" } },
+    { operation: "purge", method: "purgeDocument", input: { documentId: "doc", reason: "Obsolete revision" }, result: { documentId: "doc", sourceKey: "source:guide", purged: false, cleanupPending: true, retainedDocument: false, error: "Disk unavailable" } },
+    ...["start", "resume", "cancel"].map((operation) => ({
+      operation: `reanalyzeCampaign.${operation}`, method: `${operation}ReanalysisCampaign`, input: operation === "start" ? { documentIds: ["doc"] } : { campaignId: "campaign-1" },
+      result: { campaign: { campaign_id: "campaign-1", status: operation === "cancel" ? "cancelled" : "queued", created_at: "2026-09-12T00:00:00Z", updated_at: "2026-09-12T00:00:00Z" }, counts: { pending: 1 }, items: [{ document_id: "doc", expected_revision: "e".repeat(32), status: "pending", error: null }], window: { offset: 0, limit: 100, total: 1, hasMore: false } }
+    }))
+  ])("validates the $operation Python response through the runtime hook registry", async ({ operation, method, input, result }) => {
+    const execute = vi.fn(async (): Promise<Record<string, unknown>> => result);
+    const plugin = new DocumentationPlugin(Object.assign(fakeClient(), { [method]: execute }), new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
+    const registry = new HookRegistry(); plugin.hooks.forEach((hook) => registry.register(hook));
+    await expect(registry.call(`documentation.documents.${operation}`, input, { caller: { kind: "automation" } })).resolves.toEqual(result);
+    execute.mockResolvedValue({});
+    await expect(registry.call(`documentation.documents.${operation}`, input, { caller: { kind: "automation" } })).rejects.toThrow("missing required output");
+  });
+
+  it.each([
+    { id: "revisions", method: "listDocumentRevisions", input: { documentId: "doc" }, args: ["doc"], safety: "read" },
+    { id: "checkRevision", method: "checkDocumentRevision", input: { documentId: "doc" }, args: ["doc", { allowedRoots: ["/tmp"] }], safety: "external" },
+    { id: "refresh", method: "refreshDocument", input: { documentId: "doc" }, args: ["doc", { allowedRoots: ["/tmp"] }], safety: "external" },
+    { id: "assignSource", method: "assignDocumentSource", input: { documentId: "doc", sourceKey: "source:guide" }, args: ["doc", "source:guide"], safety: "external" },
+    { id: "purge", method: "purgeDocument", input: { documentId: "doc", reason: "obsolete source" }, args: ["doc", "obsolete source"], safety: "external" },
+  ])("routes the $id hook to its explicit revision operation", async ({ id, method, input, args, safety }) => {
+    const operation = vi.fn(async () => ({ sourceKey: "source:guide" }));
+    const client = Object.assign(fakeClient(), { [method]: operation });
+    const plugin = new DocumentationPlugin(client, new PathPolicy(["/tmp"]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${id}`)!;
+    await expect(hook.execute(input, { caller: { kind: "ui" } })).resolves.toEqual({ sourceKey: "source:guide" });
+    expect(operation).toHaveBeenCalledWith(...args);
+    expect(hook.automationSafety).toBe(safety);
+    if (id === "purge") expect(hook.description).toContain("Irreversibly");
+    expect(() => hook.execute({ ...input, documentId: " " }, { caller: { kind: "ui" } })).toThrow("documentId");
+  });
+
+  it.each([
+    { id: "checkRevision", method: "checkDocumentRevision" },
+    { id: "refresh", method: "refreshDocument" },
+  ])("takes $id access roots from server configuration even if input tries to override them", async ({ id, method }) => {
+    const operation = vi.fn(async () => ({}));
+    const plugin = new DocumentationPlugin(Object.assign(fakeClient(), { [method]: operation }), new PathPolicy(["/tmp/allowed"]), new DocumentationIngestQueue());
+    const hook = plugin.hooks.find((candidate) => candidate.id === `documentation.documents.${id}`)!;
+    await hook.execute({ documentId: "doc", allowedRoots: ["/"] }, { caller: { kind: "ui" } });
+    expect(operation).toHaveBeenCalledWith("doc", { allowedRoots: ["/tmp/allowed"] });
+  });
+
+  it.each([
+    { id: "start", method: "startReanalysisCampaign", input: { documentIds: ["doc-1"] }, args: [["doc-1"]] },
+    { id: "get", method: "getReanalysisCampaign", input: { campaignId: "campaign-1", offset: 100 }, args: ["campaign-1", { campaignId: "campaign-1", offset: 100 }] },
+    { id: "resume", method: "resumeReanalysisCampaign", input: { campaignId: "campaign-1" }, args: ["campaign-1"] },
+    { id: "cancel", method: "cancelReanalysisCampaign", input: { campaignId: "campaign-1" }, args: ["campaign-1"] },
+  ])("routes campaign $id without invoking AI", async ({ id, method, input, args }) => {
+    const operation = vi.fn(async () => ({ campaign: { campaign_id: "campaign-1" } }));
+    const enrichmentProvider = vi.fn();
+    const plugin = new DocumentationPlugin(Object.assign(fakeClient(), { [method]: operation }), new PathPolicy(["/tmp"]), new DocumentationIngestQueue(), enrichmentProvider);
+    const hook = plugin.hooks.find((candidate) => candidate.id === `documentation.documents.reanalyzeCampaign.${id}`)!;
+    await hook.execute(input, { caller: { kind: "ui" } });
+    expect(operation).toHaveBeenCalledWith(...args);
+    expect(enrichmentProvider).not.toHaveBeenCalled();
+  });
+
+  it("resumes completed enrichment checkpoints only when explicitly requested", async () => {
+    const enrichIngestResponse = vi.fn(async (response: Record<string, unknown>) => response);
+    const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy(["/tmp"]), new DocumentationIngestQueue(), () => ({ isEnabled: () => true, enrichIngestResponse }) as never);
+    const hook = plugin.hooks.find((candidate) => candidate.id === "documentation.documents.reenrich")!;
+    await hook.execute({ documentId: "doc", resume: true }, { caller: { kind: "ui" } });
+    expect(enrichIngestResponse).toHaveBeenCalledWith(expect.any(Object), {}, { signal: expect.any(AbortSignal), resume: true, force: false });
+    expect(() => hook.execute({ documentId: "doc", resume: true, force: true }, { caller: { kind: "ui" } })).toThrow("cannot be resumed and forced");
+    expect(() => hook.execute({ documentId: "doc", resume: "yes" }, { caller: { kind: "ui" } })).toThrow("must be booleans");
   });
 
   it("saves GPT-6 for every documentation model and preserves voice inheritance", async () => {
@@ -347,7 +440,7 @@ describe("DocumentationPlugin", () => {
     const result = await plugin.hooks.find((hook) => hook.id === "documentation.documents.reenrich")!.execute({ documentId: "doc" }, { caller: { kind: "ui" } });
 
     expect(result).toMatchObject({ kind: "reenrich", firstDocumentId: "doc", enrichment: { results: [{ status: "written" }] } });
-    expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [{ documentId: "doc", title: "Archived guide", uri: "text://guide" }] }, {}, { signal: expect.any(AbortSignal) });
+    expect(enrichIngestResponse).toHaveBeenCalledWith({ documents: [{ documentId: "doc", title: "Archived guide", uri: "text://guide" }] }, {}, { signal: expect.any(AbortSignal), resume: false, force: true });
     expect(client.reanalyzeDocument).not.toHaveBeenCalled();
     expect(client.ingestPath).not.toHaveBeenCalled();
     expect(client.ingestUrl).not.toHaveBeenCalled();

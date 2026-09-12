@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enrichment_fixture import enrich_archive
+
 import hashlib
 import json
 import sqlite3
@@ -24,7 +26,9 @@ def test_catalog_summary_and_document_page_do_not_scan_other_documents_chunks(tm
     with archive._connect() as db:
         db.executemany(
             """
-            INSERT INTO documents VALUES (?, ?, 'text', ?, 'snapshots/source.txt', 'hash', 'active', NULL, '[]', '2026', ?, lower(hex(randomblob(16))))
+            INSERT INTO documents (document_id, title, source_type, uri, snapshot_path, content_sha256, state,
+                                   collection, tags_json, created_at, updated_at, extraction_revision)
+            VALUES (?, ?, 'text', ?, 'snapshots/source.txt', 'hash', 'active', NULL, '[]', '2026', ?, lower(hex(randomblob(16))))
             """,
             [(f"doc-{number}", f"Document {number}", f"manual://{number}", str(number)) for number in range(3)],
         )
@@ -187,7 +191,8 @@ def test_replacement_rejects_corrupt_index_even_when_package_hashes_match(tmp_pa
             package.writestr(name, content)
     target = DocumentationArchive(tmp_path / "target")
     preserved = target.ingest_text(title="Preserved", text="Retain the original PRESERVE-INDEX-5.", uri="manual://preserve-index")
-    with pytest.raises(ArchiveError, match="dense index validation failed"):
+    error = "one authoritative archive state row" if corruption == "missing-archive-state" else "dense index validation failed"
+    with pytest.raises(ArchiveError, match=error):
         target.import_archive_replace(corrupt, confirmation=ARCHIVE_IMPORT_REPLACE_CONFIRMATION)
     assert target.search("PRESERVE-INDEX-5", limit=1)[0]["documentId"] == preserved.document_id
     assert list(tmp_path.glob("target.pre-import-*")) == []
@@ -254,13 +259,13 @@ def test_merge_embeds_only_new_active_chunks_and_preserves_existing_generation_o
     with monkeypatch.context() as patch:
         patch.setattr(archive_module, "embed_text", track_embedding)
         result = target.import_archive_merge(exported.path)
-    assert embedded == ["New active text APPEND-VECTOR-2."]
+    assert embedded == []
     assert result["importedChunks"] == 2
     assert result["rebuildManifest"]["activeChunkCount"] == 2
     assert target.search("APPEND-VECTOR-2", limit=1)[0]["documentId"] == new.document_id
     assert target.search("STALE-VECTOR-2", limit=1) == []
     new_chunk_id = target.get_document(new.document_id)["chunks"][0]["chunk_id"]
-    assert new_chunk_id in target._dense_scores("APPEND-VECTOR-2", [new_chunk_id], 1)
+    assert new_chunk_id in target._dense_scores("APPEND-VECTOR-2", [new_chunk_id], 1).scores
 
     embedded.clear()
     with monkeypatch.context() as patch:
@@ -274,10 +279,10 @@ def test_merge_embeds_only_new_active_chunks_and_preserves_existing_generation_o
 def test_merge_preserves_imported_enrichment_links_when_ids_change(tmp_path: Path) -> None:
     target = DocumentationArchive(tmp_path / "target")
     existing = target.ingest_text(title="Existing", text="Original existing text.", uri="manual://existing-enriched")
-    target.enrich_document(existing.document_id, summary="Local summary", spans=[archive_module.ExtractedSpan("Local generated note.", "note")], model="test", skill_ids=[])
+    enrich_archive(target, existing.document_id, summary="Local summary", spans=[archive_module.ExtractedSpan("Local generated note.", "note")], model="test", skill_ids=[])
     source = DocumentationArchive(tmp_path / "source")
     incoming = source.ingest_text(title="Incoming", text="Incoming source text.", uri="manual://incoming-enriched")
-    source.enrich_document(incoming.document_id, summary="Imported summary", spans=[archive_module.ExtractedSpan("Imported derived ENRICH-LINK-6.", "note")], model="test", skill_ids=[])
+    enrich_archive(source, incoming.document_id, summary="Imported summary", spans=[archive_module.ExtractedSpan("Imported derived ENRICH-LINK-6.", "note")], model="test", skill_ids=[])
     exported = source.export_archive()
     result = target.import_archive_merge(exported.path)
     document = target.get_document(incoming.document_id)
@@ -307,10 +312,17 @@ def test_cached_token_embedding_preserves_existing_vectors(text: str) -> None:
 def test_empty_catalog_merge_reuses_gapped_chunk_ids_and_preserves_provenance_and_local_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     source = DocumentationArchive(tmp_path / "source")
     incoming = source.ingest_text(title="Incoming", text="Imported source EMPTY-MERGE-71.", uri="manual://empty-merge")
-    source.enrich_document(incoming.document_id, spans=[archive_module.ExtractedSpan("Derived EVIDENCE-EMPTY-71.", "derived")], model="test", skill_ids=[], summary="Imported evidence")
+    enrich_archive(source, incoming.document_id, spans=[archive_module.ExtractedSpan("Derived EVIDENCE-EMPTY-71.", "derived")], model="test", skill_ids=[], summary="Imported evidence")
     stale = source.ingest_text(title="Stale", text="Stale archive instruction.", uri="manual://empty-merge-stale")
     source.invalidate_document(stale.document_id, state="stale", reason="The imported instruction expired.")
-    source._publish_catalog_change(lambda db: db.execute("UPDATE chunks SET chunk_id = chunk_id * 11 + 100"))
+    def create_gaps(db):
+        chunk_ids = {row[0]: row[0] * 11 + 100 for row in db.execute("SELECT chunk_id FROM chunks")}
+        db.execute("UPDATE chunks SET chunk_id = chunk_id * 11 + 100")
+        for table, column in [("chunks", "support_json"), ("enrichment_batches", "output_json")]:
+            for row in db.execute(f"SELECT rowid AS record_id, {column} FROM {table}").fetchall():
+                value = archive_module.remap_support_chunk_ids(json.loads(row[column]), chunk_ids)
+                db.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (json.dumps(value), row["record_id"]))
+    source._publish_catalog_change(create_gaps)
     with source._connect() as db:
         expected_chunks = [tuple(row) for row in db.execute("SELECT chunk_id, document_id, state, chunk_origin FROM chunks ORDER BY chunk_id")]
     exported = source.export_archive()
