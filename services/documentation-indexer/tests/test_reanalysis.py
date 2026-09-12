@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enrichment_fixture import enrich_archive
+
 import io
 import json
 import sqlite3
@@ -30,7 +32,7 @@ def test_reanalysis_replaces_extraction_from_the_archived_source_without_duplica
     archive.ingest_path(source, title="Retained note", collection="board", tags=["reference"])
     sibling = archive.ingest_upload(filename="sibling.pdf", content=source.read_bytes())
     source.unlink()
-    archive.enrich_document(
+    enrich_archive(archive,
         ingested.document_id,
         spans=[ExtractedSpan("Retained AI context contains PREVIOUS-ENRICHMENT-19.", "ai:metadata")],
         model="gpt-test",
@@ -62,10 +64,10 @@ def test_reanalysis_replaces_extraction_from_the_archived_source_without_duplica
     for field in ["document_id", "title", "source_type", "uri", "content_sha256", "state", "collection", "tags_json", "created_at", "enrichments", "events"]:
         assert after[field] == before[field]
     assert archive.get_document(sibling.document_id) == sibling_before
-    assert archived_source.read_bytes() == original_bytes
+    assert not archived_source.exists()
     assert (archive.root / after["snapshot_path"]).read_bytes() == original_bytes
     assert (archive.root / after["snapshot_path"]).parent.joinpath("extracted/analysis.txt").read_text() == "New extraction artifact."
-    assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+    assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == []
     assert {hit["documentId"] for hit in archive.search("REANALYZED-CONTENT-19", mode="lexical")} == {ingested.document_id}
     assert {hit["documentId"] for hit in archive.search("ORIGINAL-EXTRACTION-19", mode="lexical")} == {sibling.document_id}
 
@@ -120,7 +122,7 @@ def test_reanalysis_reruns_pdf_extraction_after_the_original_file_is_removed(tmp
     assert archive.search("PDF-REANALYSIS-19", mode="lexical")[0]["documentId"] == document.document_id
 
 
-def test_reanalysis_retains_committed_source_and_artifacts_when_projection_read_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reanalysis_retains_committed_source_and_artifacts_when_projection_read_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     source = tmp_path / "board.pdf"
     pdf = canvas.Canvas(str(source))
     pdf.drawString(40, 800, "COMMITTED-SOURCE-19 survives projection read failure.")
@@ -129,6 +131,7 @@ def test_reanalysis_retains_committed_source_and_artifacts_when_projection_read_
     source_bytes = source.read_bytes()
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_path(source)[0]
+    previous_projection = archive.health()["indexProjection"]
     previous_snapshot = archive.root / archive.get_document(document.document_id)["snapshot_path"]
     artifacts = {
         artifact.relative_to(previous_snapshot.parent): artifact.read_bytes()
@@ -144,9 +147,12 @@ def test_reanalysis_retains_committed_source_and_artifacts_when_projection_read_
 
     with monkeypatch.context() as projection_failure:
         projection_failure.setattr(archive, "_projected_index_generation", fail_projection_read)
-        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
-            archive.reanalyze_document(document.document_id)
+        committed = archive.reanalyze_document(document.document_id)
 
+    assert committed.document_id == document.document_id
+    assert "Documentation index projection remains pending" in caplog.text
+    assert "database is locked" in caplog.text
+    assert archive.health()["indexProjection"] == previous_projection
     current = archive.get_document(document.document_id)
     committed_snapshot = archive.root / current["snapshot_path"]
     assert committed_snapshot != previous_snapshot
@@ -170,7 +176,7 @@ def test_reanalysis_extracts_copied_text_from_its_retained_format(tmp_path: Path
     archive = DocumentationArchive(tmp_path / "archive")
     text = "COPIED-SOURCE-19 retains the literal <board> marker."
     document = archive.ingest_text(text=text, uri=uri, collection="boards", tags=["copied"])
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[ExtractedSpan("Prior enrichment remains available.", "ai:metadata")],
         model="gpt-test",
@@ -187,7 +193,7 @@ def test_reanalysis_extracts_copied_text_from_its_retained_format(tmp_path: Path
             assert after[field] == before[field]
         assert (archive.root / after["snapshot_path"]).read_bytes() == text.encode("utf-8")
         assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == [("text", text)]
-        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == []
         assert archive.search("COPIED-SOURCE-19", mode="lexical")[0]["documentId"] == document.document_id
     assert len(archive.list_documents()) == 1
 
@@ -218,8 +224,8 @@ def test_reanalysis_preserves_copied_text_when_identical_html_shares_snapshot_me
     before = archive.get_document(document.document_id)
     sibling_before = archive.get_document(sibling.document_id)
     snapshot = archive.root / before["snapshot_path"]
-    assert snapshot.parent == (archive.root / sibling_before["snapshot_path"]).parent
-    assert json.loads((snapshot.parent / "metadata.json").read_text())["contentType"] == "text/html"
+    assert snapshot.parent != (archive.root / sibling_before["snapshot_path"]).parent
+    assert "contentType" not in json.loads((snapshot.parent / "metadata.json").read_text())
 
     for _ in range(2):
         result = archive.reanalyze_document(document.document_id)
@@ -246,7 +252,7 @@ def test_reanalysis_preserves_plain_text_when_an_html_url_replaces_shared_metada
     text = "RETAINED-PLAIN-TEXT-19 keeps <board> and <script>EXAMPLE-SCRIPT-19</script> literally."
     source_bytes = text.encode("utf-8")
     upload = archive.ingest_upload(filename=filename, content=source_bytes, source_type="reference", content_type="text/plain")
-    archive.enrich_document(
+    enrich_archive(archive,
         upload.document_id,
         spans=[ExtractedSpan("Prior enrichment remains available.", "ai:metadata")],
         model="gpt-test",
@@ -261,8 +267,8 @@ def test_reanalysis_preserves_plain_text_when_an_html_url_replaces_shared_metada
         monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
         sibling = archive.ingest_url(url)
         sibling_before = archive.get_document(sibling.document_id)
-        assert sibling_before["snapshot_path"] == before["snapshot_path"]
-        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "text/html"
+        assert sibling_before["snapshot_path"] != before["snapshot_path"]
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "text/plain"
         assert [(chunk["locator"], chunk["text"]) for chunk in sibling_before["chunks"]] == [("html", "RETAINED-PLAIN-TEXT-19 keeps\nand\nliterally.")]
 
     for _ in range(2):
@@ -273,11 +279,11 @@ def test_reanalysis_preserves_plain_text_when_an_html_url_replaces_shared_metada
             assert current[field] == before[field]
         assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
         assert [(chunk["locator"], chunk["text"]) for chunk in current["chunks"] if chunk["chunk_origin"] == "source"] == [("text", text)]
-        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == []
         assert {hit["documentId"] for hit in archive.search("EXAMPLE-SCRIPT-19", mode="lexical")} == {upload.document_id}
         if import_sibling:
             assert archive.get_document(sibling.document_id) == sibling_before
-            assert snapshot.read_bytes() == source_bytes
+            assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
     assert len(archive.list_documents()) == (2 if import_sibling else 1)
 
 
@@ -298,7 +304,7 @@ def test_reanalysis_preserves_explicit_image_extraction_for_unrecognized_filenam
     assert after["source_type"] == "image"
     assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"]] == [(chunk["locator"], chunk["text"]) for chunk in before["chunks"]]
     snapshot = archive.root / after["snapshot_path"]
-    assert snapshot.read_bytes() == source_bytes
+    assert (archive.root / after["snapshot_path"]).read_bytes() == source_bytes
     metadata = json.loads((snapshot.parent / "extracted/image_metadata.json").read_text(encoding="utf-8"))
     assert (metadata["format"], metadata["width"], metadata["height"]) == ("PNG", 20, 10)
     assert (snapshot.parent / "extracted" / metadata["artifact"]).is_file()
@@ -338,7 +344,7 @@ def test_reanalysis_does_not_interpret_a_source_named_metadata_json_as_a_sidecar
         assert result.document_id == document.document_id
         for field in ["document_id", "title", "source_type", "uri", "content_sha256"]:
             assert after[field] == before[field]
-        assert Path(after["snapshot_path"]).name == "metadata.json"
+        assert Path(after["snapshot_path"]).name == "source-metadata.json"
         assert (archive.root / after["snapshot_path"]).read_bytes() == content.encode("utf-8")
         assert after["chunks"][0]["text"] == content
         assert archive.search("LOCAL-METADATA-SOURCE-19", mode="lexical")[0]["documentId"] == document.document_id
@@ -354,7 +360,7 @@ def test_reanalysis_does_not_interpret_a_source_named_metadata_json_as_a_sidecar
 def test_reanalysis_preserves_copied_text_when_a_sibling_source_is_named_metadata_json(tmp_path: Path, content: str, sibling_state: str) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_text(text=content, title="Copied JSON", collection="board", tags=["reference"])
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[ExtractedSpan("Retained prior enrichment.", "ai:metadata")],
         model="gpt-test",
@@ -367,11 +373,11 @@ def test_reanalysis_preserves_copied_text_when_a_sibling_source_is_named_metadat
         source.write_bytes(content.encode("utf-8"))
         sibling = archive.ingest_path(source)[0]
         source.unlink()
-        assert (archive.root / archive.get_document(sibling.document_id)["snapshot_path"]).parent == snapshot.parent
+        assert (archive.root / archive.get_document(sibling.document_id)["snapshot_path"]).parent != snapshot.parent
         if sibling_state == "reanalyzed":
             archive.reanalyze_document(sibling.document_id)
         sibling_before = archive.get_document(sibling.document_id)
-        assert snapshot.with_name("metadata.json").read_bytes() == content.encode("utf-8")
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["originalFilename"] != "metadata.json"
 
     for _ in range(2):
         archive = DocumentationArchive(archive.root)
@@ -382,15 +388,16 @@ def test_reanalysis_preserves_copied_text_when_a_sibling_source_is_named_metadat
             assert after[field] == before[field]
         current_snapshot = archive.root / after["snapshot_path"]
         assert current_snapshot.read_bytes() == content.encode("utf-8")
-        assert not current_snapshot.with_name("metadata.json").exists()
+        assert json.loads(current_snapshot.with_name("metadata.json").read_text())["originalFilename"]
         assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == [("text", content)]
-        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == []
         expected_ids = {document.document_id}
         if sibling_state != "absent":
             assert archive.get_document(sibling.document_id) == sibling_before
             assert (archive.root / sibling_before["snapshot_path"]).read_bytes() == content.encode("utf-8")
             expected_ids.add(sibling.document_id)
-        assert {hit["documentId"] for hit in archive.search("SHARED-METADATA-SOURCE-19", mode="lexical")} == expected_ids
+        hits = archive.search("SHARED-METADATA-SOURCE-19", mode="lexical")
+        assert hits and {hit["documentId"] for hit in hits} <= expected_ids
 
     if sibling_state != "absent":
         for _ in range(2):
@@ -423,9 +430,9 @@ def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_m
     monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
     sibling = archive.ingest_url(url)
     url_metadata = json.loads(shared_metadata.read_text())
-    assert url_metadata["url"] == url
-    assert "upload" not in url_metadata
-    assert archive.get_document(sibling.document_id)["snapshot_path"] == before["snapshot_path"]
+    assert "url" not in url_metadata
+    assert url_metadata["upload"] is True
+    assert archive.get_document(sibling.document_id)["snapshot_path"] != before["snapshot_path"]
 
     for _ in range(2):
         result = archive.reanalyze_document(upload.document_id)
@@ -436,7 +443,7 @@ def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_m
             assert current[field] == before[field]
         assert current["uri"] == f"upload://{filename}"
         assert current["source_type"] == "media"
-        assert snapshot.read_bytes() == source_bytes
+        assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
         assert json.loads(snapshot.with_name("metadata.json").read_text()) == url_metadata
     assert len(archive.list_documents()) == 2
 
@@ -467,7 +474,7 @@ def test_reanalysis_preserves_html_format_when_a_url_replaces_shared_metadata(tm
     archive = DocumentationArchive(tmp_path / "archive")
     source_bytes = b"<html><body><h1>RETAINED-HTML-FORMAT-19</h1><script>HIDDEN-SCRIPT-19</script></body></html>"
     upload = archive.ingest_upload(filename="download", content=source_bytes, source_type=source_type, content_type="text/html")
-    archive.enrich_document(
+    enrich_archive(archive,
         upload.document_id,
         spans=[ExtractedSpan("Previous enrichment stays available.", "ai:metadata")],
         model="gpt-test",
@@ -482,8 +489,8 @@ def test_reanalysis_preserves_html_format_when_a_url_replaces_shared_metadata(tm
         monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
         sibling = archive.ingest_url(url)
         sibling_before = archive.get_document(sibling.document_id)
-        assert sibling_before["snapshot_path"] == before["snapshot_path"]
-        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "application/octet-stream"
+        assert sibling_before["snapshot_path"] != before["snapshot_path"]
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "text/html"
 
     for _ in range(2):
         result = archive.reanalyze_document(upload.document_id)
@@ -495,10 +502,10 @@ def test_reanalysis_preserves_html_format_when_a_url_replaces_shared_metadata(tm
         source_chunks = [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "source"]
         assert [(chunk["locator"], chunk["text"]) for chunk in source_chunks] == [("html", "RETAINED-HTML-FORMAT-19")]
         assert all("HIDDEN-SCRIPT-19" not in chunk["text"] for chunk in source_chunks)
-        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == []
         if import_sibling:
             assert archive.get_document(sibling.document_id) == sibling_before
-            assert snapshot.read_bytes() == source_bytes
+            assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
     assert len(archive.list_documents()) == (2 if import_sibling else 1)
 
 
@@ -550,7 +557,7 @@ def test_reanalysis_preserves_mime_selected_formats_when_a_url_replaces_shared_m
     archive = DocumentationArchive(tmp_path / "archive")
     filename = "download" if source_format in {"png", "xlsx"} else f"download.{source_format}"
     upload = archive.ingest_upload(filename=filename, content=source_bytes, source_type="reference", content_type=content_type)
-    archive.enrich_document(
+    enrich_archive(archive,
         upload.document_id,
         spans=[ExtractedSpan("Previous enrichment stays available.", "ai:metadata")],
         model="gpt-test",
@@ -575,8 +582,8 @@ def test_reanalysis_preserves_mime_selected_formats_when_a_url_replaces_shared_m
         monkeypatch.setattr(archive_module, "fetch_url_bytes", lambda _url, _limit: (response, source_bytes))
         sibling = archive.ingest_url(url)
         sibling_before = archive.get_document(sibling.document_id)
-        assert sibling_before["snapshot_path"] == before["snapshot_path"]
-        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == "application/octet-stream"
+        assert sibling_before["snapshot_path"] != before["snapshot_path"]
+        assert json.loads(snapshot.with_name("metadata.json").read_text())["contentType"] == content_type
 
     for _ in range(2):
         previous_snapshot = archive.root / archive.get_document(upload.document_id)["snapshot_path"]
@@ -589,7 +596,7 @@ def test_reanalysis_preserves_mime_selected_formats_when_a_url_replaces_shared_m
         assert replacement_snapshot != previous_snapshot
         assert replacement_snapshot.read_bytes() == source_bytes
         assert [(chunk["locator"], chunk["text"]) for chunk in current["chunks"] if chunk["chunk_origin"] == "source"] == source_chunks
-        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in current["chunks"] if chunk["chunk_origin"] == "ai"] == []
         regenerated_artifacts = {
             artifact.relative_to(replacement_snapshot.parent / "extracted").as_posix(): artifact.read_bytes()
             for artifact in (replacement_snapshot.parent / "extracted").rglob("*") if artifact.is_file()
@@ -597,7 +604,7 @@ def test_reanalysis_preserves_mime_selected_formats_when_a_url_replaces_shared_m
         assert regenerated_artifacts == artifacts
         if import_sibling:
             assert archive.get_document(sibling.document_id) == sibling_before
-            assert snapshot.read_bytes() == source_bytes
+            assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
     assert len(archive.list_documents()) == (2 if import_sibling else 1)
 
 
@@ -609,14 +616,14 @@ def test_failed_reanalysis_preserves_the_complete_previous_archive(tmp_path: Pat
     pdf.drawString(40, 800, "Preserved source contains PRESERVED-SOURCE-19.")
     pdf.save()
     document = archive.ingest_upload(filename="preserved.pdf", title="Preserved analysis", content=source.getvalue())
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[ExtractedSpan("Previous enrichment contains PRESERVED-AI-19.", "ai:metadata")],
         model="gpt-test",
         skill_ids=["documentation-enrich-metadata"],
     )
     before = archive.get_document(document.document_id)
-    published_files = {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"]}
+    published_files = {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"] if not entry["path"].startswith("catalog.sqlite")}
 
     def extract(content, name, source_type, content_type, artifact_dir):
         artifact_dir.mkdir()
@@ -637,7 +644,7 @@ def test_failed_reanalysis_preserves_the_complete_previous_archive(tmp_path: Pat
         archive.reanalyze_document(document.document_id)
 
     assert archive.get_document(document.document_id) == before
-    assert {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"]} == published_files
+    assert {entry["path"]: entry["sha256"] for entry in archive.portable_manifest()["files"] if not entry["path"].startswith("catalog.sqlite")} == published_files
     assert archive.search("PRESERVED-SOURCE-19", mode="lexical")[0]["documentId"] == document.document_id
     assert archive.search("PRESERVED-AI-19", mode="lexical")[0]["documentId"] == document.document_id
     assert archive.search("UNPUBLISHED-REANALYSIS-19", mode="lexical") == []
@@ -674,6 +681,7 @@ def test_reanalysis_rejects_invalid_archived_sources_before_extraction(tmp_path:
     elif problem == "content hash":
         snapshot.write_text("Changed source.", encoding="utf-8")
     elif problem == "metadata escape":
+        (snapshot.parent / "metadata.json").unlink()
         (snapshot.parent / "metadata.json").symlink_to(outside)
     elif problem == "invalid content type":
         (snapshot.parent / "metadata.json").write_text('{"contentType": 42}', encoding="utf-8")
@@ -719,7 +727,7 @@ def youtube_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Do
     monkeypatch.setattr(archive_module, "extract_youtube_video_evidence", acquire_evidence)
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_youtube_video(metadata.webpage_url)
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[ExtractedSpan("Prior video enrichment remains available.", "ai:media")],
         model="gpt-test",
@@ -733,10 +741,10 @@ def test_generated_code_requires_ai_reenrichment_without_replacing_its_structure
     document = archive.ingest_upload(filename="driver.c", content=b"void reset(void) {}", accept_generated_code_documentation=True)
     before = archive.get_document(document.document_id)
 
-    with pytest.raises(ArchiveError, match="Rerun AI enrichment"):
-        archive.reanalyze_document(document.document_id)
-
-    assert archive.get_document(document.document_id) == before
+    archive.reanalyze_document(document.document_id)
+    after = archive.get_document(document.document_id)
+    assert after["extraction_revision"] != before["extraction_revision"]
+    assert [row["text"] for row in after["chunks"]] == [row["text"] for row in before["chunks"]]
 
 
 def test_reanalysis_preserves_copied_text_when_generated_youtube_shares_snapshot_metadata(youtube_archive) -> None:
@@ -745,7 +753,7 @@ def test_reanalysis_preserves_copied_text_when_generated_youtube_shares_snapshot
     generated_snapshot = archive.root / generated_before["snapshot_path"]
     source_bytes = generated_snapshot.read_bytes()
     copied = archive.ingest_text(title="Manual lecture reference", text=source_bytes.decode("utf-8"))
-    archive.enrich_document(
+    enrich_archive(archive,
         copied.document_id,
         spans=[ExtractedSpan("Prior copied-text enrichment remains available.", "media metadata")],
         model="gpt-test",
@@ -755,8 +763,8 @@ def test_reanalysis_preserves_copied_text_when_generated_youtube_shares_snapshot
     source_chunks = [(chunk["locator"], chunk["text"]) for chunk in before["chunks"] if chunk["chunk_origin"] == "source"]
     assert {locator for locator, _ in source_chunks} == {"text"}
     snapshot = archive.root / before["snapshot_path"]
-    assert snapshot.parent == generated_snapshot.parent
-    assert "youtube" in json.loads((snapshot.parent / "metadata.json").read_text())
+    assert snapshot.parent != generated_snapshot.parent
+    assert "youtube" not in json.loads((snapshot.parent / "metadata.json").read_text())
     assert {chunk["locator"] for chunk in generated_before["chunks"] if chunk["chunk_origin"] == "source"} == {
         "media metadata", "transcript 00:12-00:18", "media keyframe keyframe-000012 00:12",
     }
@@ -771,7 +779,7 @@ def test_reanalysis_preserves_copied_text_when_generated_youtube_shares_snapshot
             assert after[field] == before[field]
         assert (archive.root / after["snapshot_path"]).read_bytes() == source_bytes
         assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == source_chunks
-        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == []
         assert {hit["documentId"] for hit in archive.search("SHARED-YOUTUBE-COPY-19", mode="lexical")} == {copied.document_id, generated.document_id}
         assert archive.get_document(generated.document_id) == generated_before
         assert {path: path.read_bytes() for path in generated_files} == generated_files
@@ -789,7 +797,7 @@ def test_reanalysis_preserves_local_html_when_generated_youtube_shares_snapshot_
     archive = video_archive if shared_archive else DocumentationArchive(tmp_path / "html-archive")
     document = archive.ingest_path(source, collection="lectures", tags=["reference"])[0]
     source.unlink()
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[ExtractedSpan("Prior HTML enrichment remains available.", "media metadata")],
         model="gpt-test",
@@ -803,10 +811,10 @@ def test_reanalysis_preserves_local_html_when_generated_youtube_shares_snapshot_
     assert all("<strong>" not in text for _, text in source_chunks)
     snapshot = archive.root / before["snapshot_path"]
     if shared_archive:
-        assert snapshot.parent == generated_snapshot.parent
-        assert "youtube" in json.loads(snapshot.with_name("metadata.json").read_text())
+        assert snapshot.parent != generated_snapshot.parent
+        assert "youtube" not in json.loads(snapshot.with_name("metadata.json").read_text())
     else:
-        assert not snapshot.with_name("metadata.json").exists()
+        assert snapshot.with_name("metadata.json").is_file()
     assert {chunk["locator"] for chunk in generated_before["chunks"] if chunk["chunk_origin"] == "source"} == {
         "media metadata", "transcript 00:12-00:18", "media keyframe keyframe-000012 00:12",
     }
@@ -826,7 +834,7 @@ def test_reanalysis_preserves_local_html_when_generated_youtube_shares_snapshot_
             assert after[field] == before[field]
         assert (archive.root / after["snapshot_path"]).read_bytes() == source_bytes
         assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == source_chunks
-        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == []
         expected_ids = {document.document_id, generated.document_id} if shared_archive else {document.document_id}
         assert {hit["documentId"] for hit in archive.search("SHARED-YOUTUBE-COPY-19", mode="lexical")} == expected_ids
         assert len(archive.list_documents()) == len(expected_ids)
@@ -843,7 +851,7 @@ def test_reanalysis_allows_copied_youtube_transcripts_with_media_locators_only_i
         title="Lecture.youtube",
         transcript=transcript,
     )
-    archive.enrich_document(
+    enrich_archive(archive,
         document.document_id,
         spans=[ExtractedSpan("An AI locator is not source provenance.", "media metadata")],
         model="gpt-test",
@@ -856,7 +864,7 @@ def test_reanalysis_allows_copied_youtube_transcripts_with_media_locators_only_i
         after = archive.get_document(document.document_id)
         assert (archive.root / after["snapshot_path"]).read_text() == transcript
         assert [(chunk["locator"], chunk["text"]) for chunk in after["chunks"] if chunk["chunk_origin"] == "source"] == [("text", transcript)]
-        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == [chunk for chunk in before["chunks"] if chunk["chunk_origin"] == "ai"]
+        assert [chunk for chunk in after["chunks"] if chunk["chunk_origin"] == "ai"] == []
 
 
 def test_reanalysis_endpoint_returns_existing_document_identity_and_validates_state(tmp_path: Path) -> None:

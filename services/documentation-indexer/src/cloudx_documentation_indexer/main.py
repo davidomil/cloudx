@@ -26,6 +26,10 @@ from starlette.concurrency import run_in_threadpool
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
 from .archive_jobs import ArchiveExportJobError, ArchiveExportJobs
 from .archive_imports import ArchiveImports
+from .enrichment_api import install_enrichment_routes
+from .revision_api import install_revision_routes
+from .reanalysis_campaigns import ReanalysisCampaigns
+from .retrieval import RetrievalUnavailable
 
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
@@ -77,24 +81,14 @@ class InvalidateRequest(BaseModel):
     reason: str
 
 
-class EnrichmentSpan(BaseModel):
-    locator: str
-    text: str
-
-
-class EnrichDocumentRequest(BaseModel):
-    spans: list[EnrichmentSpan]
-    model: str
-    skill_ids: list[str] = Field(default_factory=list, alias="skillIds")
-    summary: str = ""
-    payload: dict = Field(default_factory=dict)
-    extraction_revision: str | None = Field(default=None, alias="extractionRevision", pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
-
-
 class EnrichmentOutcomeRequest(BaseModel):
     extraction_revision: str = Field(alias="extractionRevision", pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)
     status: Literal["failed", "skipped"]
     error: str = Field(min_length=1, max_length=4000)
+
+
+class ReanalysisCampaignRequest(BaseModel):
+    document_ids: list[str] = Field(alias="documentIds", min_length=1, max_length=100000)
 
 
 class ImportArchiveReplacePathRequest(BaseModel):
@@ -107,26 +101,52 @@ class ImportArchiveMergePathRequest(BaseModel):
 
 
 def create_app(root: str | Path | None = None) -> FastAPI:
+    from .semantic import configured_profile
+
     archive_root = Path(root or os.getenv("CLOUDX_DOCUMENTATION_DATA_DIR", ".cloudx/documentation"))
-    archive = DocumentationArchive(archive_root)
+    archive = DocumentationArchive(archive_root, embedding_profile=configured_profile(archive_root))
     exports = ArchiveExportJobs(archive)
     imports = ArchiveImports()
+    campaigns = ReanalysisCampaigns(archive)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
             yield
         finally:
+            await run_in_threadpool(campaigns.close)
             await run_in_threadpool(imports.close)
             await run_in_threadpool(exports.close)
 
     app = FastAPI(title="Cloudx Documentation Indexer", version="0.1.0", lifespan=lifespan)
+    install_enrichment_routes(app, archive)
+    install_revision_routes(app, archive)
     app.state.archive = archive
     app.state.archive_exports = exports
+
+    @app.exception_handler(RetrievalUnavailable)
+    async def retrieval_unavailable(_request: Request, error: RetrievalUnavailable) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(error), "code": "retrieval_unavailable"})
 
     @app.exception_handler(ArchiveExportJobError)
     async def export_job_error(_request: Request, error: ArchiveExportJobError) -> JSONResponse:
         return JSONResponse(status_code=error.status_code, content={"detail": str(error)})
+
+    @app.post("/reanalysis-campaigns")
+    def start_campaign(request: ReanalysisCampaignRequest) -> dict:
+        return handle_archive_error(lambda: campaigns.start(request.document_ids))
+
+    @app.get("/reanalysis-campaigns/{campaign_id}")
+    def get_campaign(campaign_id: str, offset: int = 0, limit: int = 100) -> dict:
+        return handle_archive_error(lambda: campaigns.get(campaign_id, offset=offset, limit=limit))
+
+    @app.post("/reanalysis-campaigns/{campaign_id}/resume")
+    def resume_campaign(campaign_id: str) -> dict:
+        return handle_archive_error(lambda: campaigns.resume(campaign_id))
+
+    @app.post("/reanalysis-campaigns/{campaign_id}/cancel")
+    def cancel_campaign(campaign_id: str) -> dict:
+        return handle_archive_error(lambda: campaigns.cancel(campaign_id))
 
     @app.get("/health")
     def health() -> dict:
@@ -240,8 +260,11 @@ def create_app(root: str | Path | None = None) -> FastAPI:
         chunk_offset: Annotated[int | None, Query(alias="chunkOffset", ge=0)] = None,
         chunk_limit: Annotated[int | None, Query(alias="chunkLimit", ge=0)] = None,
         chunk_ids: Annotated[str | None, Query(alias="chunkIds")] = None,
+        chunk_locators: Annotated[list[str] | None, Query(alias="chunkLocators", max_length=100)] = None,
+        chunk_origins: Annotated[list[str] | None, Query(alias="chunkOrigins", max_length=3)] = None,
         chunk_context: Annotated[int | None, Query(alias="chunkContext", ge=0)] = None,
         chunk_text_max_chars: Annotated[int | None, Query(alias="chunkTextMaxChars", ge=0)] = None,
+        artifact_origins: Annotated[list[str] | None, Query(alias="artifactOrigins", max_length=2)] = None,
         artifact_offset: Annotated[int | None, Query(alias="artifactOffset", ge=0)] = None,
         artifact_limit: Annotated[int | None, Query(alias="artifactLimit", ge=0)] = None,
         include_enrichments: Annotated[bool, Query(alias="includeEnrichments")] = True,
@@ -254,8 +277,11 @@ def create_app(root: str | Path | None = None) -> FastAPI:
                     chunk_offset=chunk_offset,
                     chunk_limit=chunk_limit,
                     chunk_ids=parse_chunk_ids(chunk_ids),
+                    chunk_locators=chunk_locators,
+                    chunk_origins=chunk_origins,
                     chunk_context=chunk_context,
                     chunk_text_max_chars=chunk_text_max_chars,
+                    artifact_origins=artifact_origins,
                     artifact_offset=artifact_offset,
                     artifact_limit=artifact_limit,
                     include_enrichments=include_enrichments,
@@ -272,22 +298,6 @@ def create_app(root: str | Path | None = None) -> FastAPI:
     @app.delete("/documents/{document_id}")
     def remove_document(document_id: str) -> dict:
         return {"document": handle_archive_error(lambda: archive.remove_document(document_id))}
-
-    @app.post("/documents/{document_id}/enrich")
-    def enrich_document(document_id: str, request: EnrichDocumentRequest) -> dict:
-        return {
-            "document": handle_archive_error(
-                lambda: archive.enrich_document(
-                    document_id,
-                    spans=[span_to_extracted_span(span) for span in request.spans],
-                    model=request.model,
-                    skill_ids=request.skill_ids,
-                    summary=request.summary,
-                    payload=request.payload,
-                    extraction_revision=request.extraction_revision,
-                )
-            )
-        }
 
     @app.post("/documents/{document_id}/enrichment-outcome")
     def enrichment_outcome(document_id: str, request: EnrichmentOutcomeRequest) -> dict:
@@ -437,7 +447,9 @@ def create_app(root: str | Path | None = None) -> FastAPI:
 def handle_archive_error(operation):
     try:
         return operation()
-    except ArchiveError as error:
+    except RetrievalUnavailable:
+        raise
+    except (ArchiveError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
@@ -544,12 +556,6 @@ def archive_progress_stream(operation: Callable[[Callable[[dict[str, Any]], None
         if event is None:
             break
         yield json.dumps(event, ensure_ascii=False) + "\n"
-
-
-def span_to_extracted_span(span: EnrichmentSpan):
-    from .extraction import ExtractedSpan
-
-    return ExtractedSpan(span.text, span.locator)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

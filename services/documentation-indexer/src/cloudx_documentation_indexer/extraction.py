@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 from datetime import date, datetime, time
 import io
 import json
@@ -21,6 +22,17 @@ import pdfplumber
 import pypdfium2 as pdfium
 
 from .vendor_code import CODE_SOURCE_SUFFIXES
+from .schematics.analyzer import SchematicAnalyzer
+from .schematics.detector import SchematicAnalysisSettings, SinaDetector
+from .schematics.domain import Bounds, Issue, SchematicPageAnalysis, SourceGeometry
+from .schematics.pdf_regions import PdfRegionRenderer, rendered_page_bounds
+from .schematics.pdf_metadata import PdfDeclaredMetadata, extract_pdf_metadata
+from .schematics.native_pdf import is_label_color, native_pdf_geometry
+from .schematics.classification import has_native_circuit_geometry
+from .schematics.scope import DocumentPortAnalysis, resolve_native_document_ports
+from .source_admission import decode_source_text, detected_content_type, validate_source_container
+from .media_source import MEDIA_SUFFIXES, looks_like_media, media_source_metadata
+from .pdf_text import SourcePdfPage, is_painted_text, positioned_words, separated_text_pages
 
 
 PDF_SUFFIXES = {".pdf"}
@@ -35,8 +47,7 @@ SPREADSHEET_CONTENT_TYPES = {
     "application/vnd.oasis.opendocument.spreadsheet",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
-SCHEMATIC_SCHEMA_VERSION = 1
-SCHEMATIC_TERMS = {"schematic", "circuit", "netlist", "reference designator", "power rail"}
+SCHEMATIC_SCHEMA_VERSION = 2
 REFERENCE_DESIGNATOR_RE = re.compile(r"\b(?:R|C|L|U|J|P|Q|D|TP|FB|Y|X|K|F|SW|RN)\d+[A-Za-z]?\b")
 NET_LABEL_RE = re.compile(r"\b(?:VCC|VDD|VSS|GND|AGND|DGND|VIN|VOUT|SDA|SCL|MISO|MOSI|RESET|ENABLE|EN|BOOT|INT|CLK|TX|RX)\b")
 TEXT_SUFFIXES = {
@@ -55,7 +66,7 @@ TEXT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-SUPPORTED_FILE_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | IMAGE_SUFFIXES | SPREADSHEET_SUFFIXES | TEXT_SUFFIXES | CODE_SOURCE_SUFFIXES
+SUPPORTED_FILE_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | IMAGE_SUFFIXES | SPREADSHEET_SUFFIXES | TEXT_SUFFIXES | CODE_SOURCE_SUFFIXES | MEDIA_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -94,6 +105,7 @@ class SchematicArtifact:
     labels: list[str]
     connection_cues: list[str]
     metrics: dict[str, int | float]
+    analysis: SchematicPageAnalysis
 
 
 def extract_file(path: Path, content: bytes, source_type: str, artifact_dir: Path | None = None) -> list[ExtractedSpan]:
@@ -108,13 +120,17 @@ def extract_bytes(
     artifact_dir: Path | None = None,
 ) -> list[ExtractedSpan]:
     suffix = source_suffix(name)
-    normalized_type = normalized_content_type(content_type)
+    normalized_type = detected_content_type(content) or normalized_content_type(content_type)
+    validate_source_container(content, spreadsheet=source_type == "spreadsheet" or suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES)
     if suffix in PDF_SUFFIXES or normalized_type == "application/pdf" or looks_like_pdf(content):
         return PdfExtractionPipeline(artifact_dir).extract(content, name)
     if source_type == "spreadsheet" or suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES:
         return SpreadsheetExtractionPipeline(artifact_dir).extract(content, name, normalized_type)
     if source_type == "image" or suffix in IMAGE_SUFFIXES or normalized_type.startswith("image/"):
         return ImageExtractionPipeline(artifact_dir).extract(content, name)
+    if suffix in MEDIA_SUFFIXES or normalized_type.startswith(("audio/", "video/")) or looks_like_media(content):
+        metadata = media_source_metadata(content, name, artifact_dir)
+        return [ExtractedSpan("Retained media source: " + name + "\n" + json.dumps(metadata, sort_keys=True), "media source")]
     if source_type == "website" or suffix in HTML_SUFFIXES or normalized_type.startswith("text/html"):
         return [ExtractedSpan(extract_html(content), "html")]
     if suffix in CODE_SOURCE_SUFFIXES or source_type == "repo_code":
@@ -125,6 +141,7 @@ def extract_bytes(
 class PdfExtractionPipeline:
     def __init__(self, artifact_dir: Path | None = None):
         self.artifact_dir = artifact_dir
+        self.schematic_settings = SchematicAnalysisSettings.from_environment()
 
     def extract(self, content: bytes, name: str = "source.pdf") -> list[ExtractedSpan]:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
@@ -142,17 +159,27 @@ class PdfExtractionPipeline:
         table_records: list[dict[str, str | int]] = []
         figure_records: list[dict[str, str | int]] = []
         schematic_records: list[dict[str, Any]] = []
+        schematic_pages: list[SchematicPageAnalysis] = []
         artifact_root = prepare_artifact_dir(self.artifact_dir)
+        source_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
 
-        with pdfplumber.open(pdf_path) as pdf:
+        with pdfplumber.open(pdf_path) as pdf, SinaDetector(self.schematic_settings).document() as detector:
+            declarations = extract_pdf_metadata(pdf, source_sha256)
             pdfium_doc = pdfium.PdfDocument(str(pdf_path)) if artifact_root else None
             try:
                 for page_number, page in enumerate(pdf.pages, start=1):
-                    text = (page.extract_text() or "").strip()
-                    if text:
-                        spans.append(ExtractedSpan(text, f"page {page_number}"))
+                    page = SourcePdfPage(page)
+                    text_pages = separated_text_pages(page)
+                    text = ""
+                    for layer_name, text_page in text_pages:
+                        layer_text = (text_page.extract_text(x_tolerance=1, y_tolerance=2,
+                            extra_attrs=['non_stroking_color', 'stroking_color']) or "").strip()
+                        if not layer_name:
+                            text = layer_text
+                        if layer_text:
+                            spans.append(ExtractedSpan(layer_text, f"page {page_number}{layer_name}"))
 
-                    page_tables = plausible_tables(page.extract_tables() or [])
+                    page_tables = plausible_tables(text_pages[0][1].extract_tables() or [])
                     for table_number, table in enumerate(page_tables, start=1):
                         table_id = f"table-{len(table_records) + 1:03d}"
                         table_records.append(write_table_artifacts(artifact_root, table_id, page_number, table))
@@ -180,16 +207,31 @@ class PdfExtractionPipeline:
                             image_file=figure_path,
                             page_text=text,
                             visual_summary=visual_summary,
+                            page=page,
+                            source_sha256=source_sha256,
+                            circuit_id=f"page-{page_number}:circuit-candidates",
+                            settings=self.schematic_settings,
+                            detector=detector,
+                            pdf_document=pdfium_doc,
                         )
                         if schematic:
                             record = write_schematic_artifact(artifact_root, schematic)
                             schematic_records.append(record)
+                            schematic_pages.append(schematic.analysis)
+                            spans.extend(schematic_ocr_spans(schematic))
                             spans.append(ExtractedSpan(schematic_span_text(schematic, record), f"schematic {schematic.id} page {page_number} {figure_id}"))
+                    page.close()
             finally:
                 if pdfium_doc is not None:
                     pdfium_doc.close()
 
         if artifact_root:
+            if len(schematic_pages) > 1:
+                spans.append(write_schematic_document_graph(artifact_root, schematic_pages, schematic_records))
+            if declarations.state != 'unsupported':
+                record, declaration_spans = write_pdf_declarations(artifact_root, declarations)
+                schematic_records.append(record)
+                spans.extend(declaration_spans)
             write_index_files(artifact_root, table_records, figure_records, schematic_records)
         return spans
 
@@ -197,12 +239,14 @@ class PdfExtractionPipeline:
 class ImageExtractionPipeline:
     def __init__(self, artifact_dir: Path | None = None):
         self.artifact_dir = artifact_dir
+        self.schematic_settings = SchematicAnalysisSettings.from_environment()
 
     def extract(self, content: bytes, name: str) -> list[ExtractedSpan]:
         spans: list[ExtractedSpan] = []
         schematic_records: list[dict[str, Any]] = []
         artifact_root = prepare_artifact_dir(self.artifact_dir)
-        with Image.open(io.BytesIO(content)) as image:
+        source_sha256 = hashlib.sha256(content).hexdigest()
+        with Image.open(io.BytesIO(content)) as image, SinaDetector(self.schematic_settings).document() as detector:
             image.load()
             frames = frame_count(image)
             metadata: dict[str, Any] = {
@@ -231,10 +275,14 @@ class ImageExtractionPipeline:
                         frames=frames,
                         image_path=relative_frame_path,
                         image=normalized_frame,
+                        source_sha256=source_sha256,
+                        settings=self.schematic_settings,
+                        detector=detector,
                     )
                     if schematic:
                         record = write_schematic_artifact(artifact_root, schematic)
                         schematic_records.append(record)
+                        spans.extend(schematic_ocr_spans(schematic))
                         spans.append(ExtractedSpan(schematic_span_text(schematic, record), f"schematic {schematic.id} image frame {frame_index}"))
                 metadata["artifact"] = frame_paths[0] if frame_paths else ""
                 metadata["artifacts"] = frame_paths
@@ -589,13 +637,43 @@ def schematic_artifact_from_pdf_page(
     image_file: Path,
     page_text: str,
     visual_summary: dict[str, int],
+    page: Any,
+    source_sha256: str,
+    circuit_id: str,
+    settings: SchematicAnalysisSettings,
+    pdf_document,
+    detector=None,
 ) -> SchematicArtifact | None:
     metrics = schematic_image_metrics(image_file)
+    bounds = rendered_page_bounds(page, pdf_document, page_number)
+    page = page.filter(lambda obj: obj.get('x0', bounds.left) <= bounds.right and obj.get('x1', bounds.right) >= bounds.left
+                       and obj.get('top', bounds.top) <= bounds.bottom and obj.get('bottom', bounds.bottom) >= bounds.top)
+    label_page = page.filter(lambda obj: obj.get("object_type") != "char" or is_painted_text(obj) and is_label_color(obj.get("non_stroking_color"))
+        and bounds.left <= obj['x0'] <= obj['x1'] <= bounds.right and bounds.top <= obj['top'] <= obj['bottom'] <= bounds.bottom)
+    page_text = " ".join(word["text"] for word in positioned_words(label_page))
     references = reference_designators(page_text)
     labels = schematic_labels(page_text)
-    reasons = schematic_reasons(filename, page_text, references, labels, visual_summary, metrics)
-    if not reasons:
+    vectors = len(page.lines) + len(page.curves) + len(page.rects)
+    raster_requested = vectors < 3 and bool(schematic_reasons(filename, page_text, references, labels, {}, metrics))
+    if vectors < 3 and not raster_requested:
         return None
+    with Image.open(image_file) as image:
+        source = SourceGeometry(source_sha256=source_sha256,
+            page_number=page_number, sheet_id=f"page-{page_number}", image_path=image_path,
+            image_width=image.width, image_height=image.height, page_bounds=bounds)
+        if raster_requested:
+            analysis = SchematicAnalyzer(settings, detector).analyze(image, source, circuit_id)
+            reasons = ["explicit schematic filename requests raster analysis of this PDF page"]
+        else:
+            try:
+                native = native_pdf_geometry(page, source, circuit_id)
+            except ValueError:
+                return None
+            if not has_native_circuit_geometry(native, image.width / (bounds.right - bounds.left)):
+                return None
+            renderer = PdfRegionRenderer(pdf_document, page_number, image.width, image.height) if pdf_document is not None else None
+            analysis = SchematicAnalyzer(settings, detector).analyze(image, source, circuit_id, page, native=native, region_renderer=renderer)
+            reasons = ["source-native electrical symbol geometry has external wire contacts"]
     return SchematicArtifact(
         id=schematic_id,
         source="pdf-page",
@@ -608,6 +686,7 @@ def schematic_artifact_from_pdf_page(
         labels=labels,
         connection_cues=schematic_connection_cues(visual_summary, metrics),
         metrics=metrics,
+        analysis=analysis,
     )
 
 
@@ -619,6 +698,9 @@ def schematic_artifact_from_image(
     frames: int,
     image_path: str,
     image: Image.Image,
+    source_sha256: str,
+    settings: SchematicAnalysisSettings,
+    detector=None,
 ) -> SchematicArtifact | None:
     metrics = schematic_image_metrics(image)
     references = reference_designators(filename)
@@ -627,6 +709,12 @@ def schematic_artifact_from_image(
     reasons = schematic_reasons(filename, filename, references, labels, {}, metrics)
     if not reasons:
         return None
+    source = SourceGeometry(source_sha256=source_sha256,
+        page_number=frame_index, sheet_id=f"frame-{frame_index}", image_path=image_path,
+        image_width=image.width, image_height=image.height,
+        page_bounds=Bounds(left=0, top=0, right=image.width, bottom=image.height))
+    analysis = SchematicAnalyzer(settings, detector).analyze(
+        image, source, f"frame-{frame_index}:circuit-candidates")
     return SchematicArtifact(
         id=schematic_id,
         source="image",
@@ -639,6 +727,7 @@ def schematic_artifact_from_image(
         labels=labels,
         connection_cues=schematic_connection_cues({}, metrics),
         metrics=metrics,
+        analysis=analysis,
     )
 
 
@@ -650,20 +739,18 @@ def schematic_reasons(
     visual_summary: dict[str, int],
     metrics: dict[str, int | float],
 ) -> list[str]:
-    reasons: list[str] = []
-    lower_text = f"{filename}\n{source_text}".lower()
-    has_schematic_terms = any(term in lower_text for term in SCHEMATIC_TERMS)
-    if has_schematic_terms:
-        reasons.append("source text or filename contains schematic/circuit terms")
-    if len(references) >= 2:
-        reasons.append("source text contains multiple reference-designator-like labels")
-    if labels and (has_schematic_terms or references):
-        reasons.append("source text contains schematic net or signal labels")
-    if visual_summary and references and (visual_summary.get("lines", 0) + visual_summary.get("curves", 0) + visual_summary.get("rectangles", 0)) >= 6:
-        reasons.append("rendered page has schematic-like line geometry near electrical labels")
-    if not visual_summary and any(term in lower_text for term in {"schematic", "circuit"}) and float(metrics.get("edge_ratio", 0.0)) >= 0.01:
-        reasons.append("image filename indicates a schematic and the image has line-art edges")
-    return reasons
+    if visual_summary:
+        vectors = sum(visual_summary.get(kind, 0) for kind in ("lines", "curves", "rectangles"))
+        if vectors < 3:
+            return []
+        if len(references) >= 2:
+            return ["positioned PDF text contains multiple electrical reference candidates alongside vector geometry"]
+        if len(labels) >= 2:
+            return ["positioned PDF text contains multiple electrical net labels alongside vector geometry"]
+        return []
+    if re.search(r"\b(?:schematic|circuit)\b", filename.lower().replace("_", " ").replace("-", " ")) and float(metrics.get("edge_ratio", 0.0)) >= 0.01:
+        return ["image filename requests schematic analysis and the image contains line-art edges"]
+    return []
 
 
 def schematic_connection_cues(visual_summary: dict[str, int], metrics: dict[str, int | float]) -> list[str]:
@@ -712,11 +799,64 @@ def schematic_labels(text: str) -> list[str]:
     return sorted(set(NET_LABEL_RE.findall(text.upper().replace("_", " ").replace("-", " "))))
 
 
+def schematic_ocr_spans(schematic: SchematicArtifact) -> list[ExtractedSpan]:
+    groups: dict[str, list[str]] = {}
+    for graph in schematic.analysis.circuits:
+        for word in graph.text:
+            if word.evidence.kind == 'ocr':
+                purpose = word.evidence.locator.split(':', 1)[0]
+                region = word.evidence.locator.rsplit(':source-region-', 1)
+                locator = f"{schematic.locator} OCR {purpose}" + (f" region {region[1]}" if len(region) == 2 else '')
+                groups.setdefault(locator, []).append(word.text)
+    return [ExtractedSpan('OCR observations (verify against the retained image):\n' + ' '.join(words), locator)
+            for locator, words in groups.items()]
+
+
+def write_pdf_declarations(artifact_root: Path, declarations: PdfDeclaredMetadata) -> tuple[dict, list[ExtractedSpan]]:
+    encoded = declarations.model_dump_json(by_alias=True, indent=2)
+    if len(encoded.encode('utf-8')) > 16_000_000:
+        declarations = PdfDeclaredMetadata(source_sha256=declarations.source_sha256, state='blocked',
+            issues=[Issue(code='metadata-artifact-limit', detail='PDF source declarations exceed the 16-million-byte artifact limit')])
+        encoded = declarations.model_dump_json(by_alias=True, indent=2)
+    directory = artifact_root / 'schematics'
+    directory.mkdir(parents=True, exist_ok=True)
+    json_path = 'schematics/source-declarations.json'
+    description_path = 'schematics/source-declarations.md'
+    (artifact_root / json_path).write_text(encoded + '\n', encoding='utf-8')
+    summary = (f'PDF source declarations: {len(declarations.components)} component identities, {len(declarations.pins)} pin records, '
+               f'{len(declarations.nets)} scoped net records and {len(declarations.component_menus)} unassigned component property menus. '
+               f'State: {declarations.state}. Source SHA-256: {declarations.source_sha256}. '
+               'These are passive export declarations, not verification of drawing geometry or electrical correctness. '
+               f'Original physical sheet scope and PDF object evidence are retained in {json_path}.')
+    notes = [summary, *(f'{issue.code}: {issue.detail}' for issue in declarations.issues)]
+    spans = [ExtractedSpan('\n'.join(notes), 'schematic PDF source declarations')]
+    pin_names = {(pin.page_number, pin.token): pin.pin for pin in declarations.pins}
+    for page in declarations.pages:
+        header = (f'PDF source declarations, physical page {page.page_number}: {page.state}; '
+                  f'{page.outline_components} component identities, {page.declared_pins} pins, {page.component_menus} unassigned property menus.')
+        notes.append(header)
+        nets = [net for net in declarations.nets if net.page_number == page.page_number]
+        if nets:
+            lines = [header, 'Named nets below are source declarations scoped to this physical page, not inferred global connections.']
+            for net in nets:
+                members = ', '.join(pin_names[(net.page_number, token)] for token in net.pin_tokens)
+                lines.append(f'Declared net {net.name}; scope {" / ".join(net.scope)}; pins: {members}.')
+            spans.append(ExtractedSpan('\n'.join(lines), f'page {page.page_number} PDF source declarations'))
+    (artifact_root / description_path).write_text('\n\n'.join(notes) + '\n', encoding='utf-8')
+    output = {'kind': 'source-declarations', 'path': json_path, 'schemaVersion': 1, 'state': declarations.state}
+    record = {'id': 'source-declarations', 'schema_version': SCHEMATIC_SCHEMA_VERSION, 'source': 'pdf-declarations',
+        'locator': 'schematic PDF source declarations', 'description': description_path, 'json': json_path,
+        'reasons': 'Original PDF explicitly contains component and net export declarations',
+        'analysis_outputs': json.dumps([output])}
+    return record, spans
+
+
 def write_schematic_artifact(artifact_root: Path, schematic: SchematicArtifact) -> dict[str, Any]:
     schematic_dir = artifact_root / "schematics" / schematic.id
     schematic_dir.mkdir(parents=True, exist_ok=True)
     description_path = schematic_dir / "description.md"
     json_path = schematic_dir / "analysis.json"
+    graph_path = schematic_dir / "graph.json"
     record: dict[str, Any] = {
         "id": schematic.id,
         "schema_version": SCHEMATIC_SCHEMA_VERSION,
@@ -729,10 +869,11 @@ def write_schematic_artifact(artifact_root: Path, schematic: SchematicArtifact) 
         "labels": ", ".join(schematic.labels),
         "connection_cues": "; ".join(schematic.connection_cues),
         "reasons": "; ".join(schematic.reasons),
-        "analysis_outputs": "[]",
+        "analysis_outputs": json.dumps(schematic_analysis_outputs(schematic)),
     }
     description_path.write_text(schematic_markdown_document(schematic), encoding="utf-8")
     json_path.write_text(json.dumps(schematic_json_document(schematic), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    graph_path.write_text(schematic.analysis.model_dump_json(by_alias=True, indent=2) + "\n", encoding="utf-8")
     return record
 
 
@@ -752,12 +893,54 @@ def schematic_json_document(schematic: SchematicArtifact) -> dict[str, Any]:
         "locator": schematic.locator,
         "image": schematic.image,
         "imageSize": {"width": schematic.width, "height": schematic.height},
-        "classification": {"isSchematic": True, "reasons": schematic.reasons, "metrics": schematic.metrics},
+        "classification": {"isSchematic": True, "state": "candidate", "reasons": schematic.reasons, "metrics": schematic.metrics},
         "referenceDesignators": schematic.reference_designators,
         "labels": schematic.labels,
         "connectionCues": schematic.connection_cues,
-        "analysisOutputs": [],
+        "analysisOutputs": schematic_analysis_outputs(schematic),
+        "structuredAnalysis": schematic.analysis.model_dump(by_alias=True),
     }
+
+
+def schematic_analysis_outputs(schematic: SchematicArtifact) -> list[dict[str, Any]]:
+    states = {circuit.state for circuit in schematic.analysis.circuits}
+    state = next(iter(states)) if len(states) == 1 else "unresolved"
+    return [{"kind": "terminal-graph", "path": f"schematics/{schematic.id}/graph.json", "schemaVersion": 2,
+             "state": state}]
+
+
+def write_schematic_document_graph(artifact_root: Path, pages: list[SchematicPageAnalysis], records: list[dict[str, Any]]) -> ExtractedSpan:
+    try:
+        analysis = resolve_native_document_ports(pages)
+        encoded = analysis.model_dump_json(by_alias=True, indent=2)
+        if len(encoded.encode("utf-8")) > 16_000_000:
+            raise ValueError("Schematic document graph exceeds the 16-million-byte limit")
+    except ValueError as error:
+        analysis = DocumentPortAnalysis(state="blocked", bindings=[], nets=[], issues=[str(error)])
+        encoded = analysis.model_dump_json(by_alias=True, indent=2)
+    path = "schematics/document-graph.json"
+    (artifact_root / path).write_text(encoded + "\n", encoding="utf-8")
+    output = {"kind": "document-terminal-graph", "path": path, "schemaVersion": 2, "state": analysis.state}
+    for record in records:
+        outputs = [*json.loads(record["analysis_outputs"]), output]
+        record["analysis_outputs"] = json.dumps(outputs)
+        json_path = artifact_root / record["json"]
+        document = json.loads(json_path.read_text(encoding="utf-8"))
+        document["analysisOutputs"] = outputs
+        json_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return ExtractedSpan(f"Document schematic scope: {len(analysis.bindings)} explicit hierarchical port bindings between retained pages. "
+                         f"{len(analysis.issues)} scope observations remain unresolved. Electrical graph state: {analysis.state}. "
+                         f"Document graph artifact: {path}.", "schematic document scope")
+
+
+def schematic_analysis_summary(schematic: SchematicArtifact) -> list[str]:
+    circuits = schematic.analysis.circuits
+    lines = [f"Structured terminal graph: {sum(len(circuit.components) for circuit in circuits)} component candidates, "
+             f"{sum(len(circuit.terminals) for circuit in circuits)} identified contact locations and "
+             f"{sum(bool(net.terminal_ids) for circuit in circuits for net in circuit.nets)} nets incident to components.",
+             "Electrical identity and net scope remain unresolved until the source evidence supports them. No placeholder SPICE is generated."]
+    lines.extend(f"{capability.name}: {capability.state}. {capability.detail}" for capability in schematic.analysis.capabilities)
+    return lines
 
 
 def schematic_markdown_document(schematic: SchematicArtifact) -> str:
@@ -772,14 +955,14 @@ def schematic_markdown_document(schematic: SchematicArtifact) -> str:
         *[f"- {reason}" for reason in schematic.reasons],
         "",
         "## Visible Text Candidates",
-        f"Reference designators: {', '.join(schematic.reference_designators) if schematic.reference_designators else 'not extracted by the deterministic Phase 1 analyzer'}",
-        f"Labels and nets: {', '.join(schematic.labels) if schematic.labels else 'not extracted by the deterministic Phase 1 analyzer'}",
+        f"Reference designators: {', '.join(schematic.reference_designators) if schematic.reference_designators else 'not extracted'}",
+        f"Labels and nets: {', '.join(schematic.labels) if schematic.labels else 'not extracted'}",
         "",
         "## Connection Cues",
         *[f"- {cue}" for cue in schematic.connection_cues],
         "",
         "## Structured Analysis Outputs",
-        "No component detection, connectivity mapping, OCR assignment, or netlist output is attached yet. Future SINA-style analyzers can append outputs to this schema without re-ingesting the source document.",
+        *schematic_analysis_summary(schematic),
     ]
     return "\n".join(lines).strip() + "\n"
 
@@ -795,7 +978,7 @@ def schematic_span_text(schematic: SchematicArtifact, record: dict[str, Any]) ->
         f"Classification reasons: {reasons}.",
         f"Reference designator candidates: {references}. Labels and net candidates: {labels}.",
         f"Connection cues: {cues}.",
-        "Analysis outputs are empty in Phase 1; this record is schema-ready for future component detections, connectivity mappings, OCR/designator assignments, and SPICE netlists.",
+        *schematic_analysis_summary(schematic),
     ]).strip()
 
 
@@ -941,14 +1124,14 @@ def frame_count(image: Image.Image) -> int:
 
 
 def extract_html(content: bytes) -> str:
-    soup = BeautifulSoup(content, "html.parser")
+    soup = BeautifulSoup(decode_source_text(content), "html.parser")
     for element in soup(["script", "style", "template", "noscript"]):
         element.extract()
     return "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
 
 
 def decode_text(content: bytes) -> str:
-    return content.decode("utf-8", errors="replace").strip()
+    return decode_source_text(content)
 
 
 def source_suffix(name: str) -> str:

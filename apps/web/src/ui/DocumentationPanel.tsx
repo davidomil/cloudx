@@ -4,6 +4,7 @@ import { AlertTriangle, Bot, BookOpen, Download, ExternalLink, FileImage, FilePl
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
+import { DocumentationRevisions } from "./DocumentationRevisions.js";
 import { PluginPanelDock } from "./PluginPanelDock.js";
 import { HttpError, documentationArchiveDownloadUrl, getDocumentationArchiveExport, startDocumentationArchiveExport, importDocumentationArchive, uploadDocumentationFile, type DocumentationArchiveExport, type DocumentationUploadProgress, type DocumentationUploadResponse } from "../api.js";
 import { documentationIngestController } from "./documentationPanelQueue.js";
@@ -1082,6 +1083,14 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
               <ControlButton size="compact" onClick={() => setSelectedDocument(undefined)}>Close</ControlButton>
             </div>
           </div>
+          <DocumentationRevisions key={selectedDocumentId} documentId={selectedDocumentId} callHook={callHook} onRefresh={async (newDocumentId) => {
+            const result = await call<{ document?: DocumentationDetail }>("documentation.documents.get", sourceDocumentWindowInput(newDocumentId));
+            if (!mountedRef.current) return;
+            setSelectedDocument((current) => current && documentId(current) === selectedDocumentId ? result.document : current);
+            setResults([]);
+            setAnswer(undefined);
+            await refresh();
+          }} />
           <div ref={sourceChunkListRef} className="documentation-chunk-list">
             {(selectedDocument.chunks ?? []).map((chunk) => (
               <DocumentationChunkArticle key={`${chunkId(chunk)}:${chunk.locator ?? "chunk"}`} document={selectedDocument} chunk={chunk} />

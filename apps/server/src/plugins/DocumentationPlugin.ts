@@ -144,8 +144,11 @@ export class DocumentationPlugin implements WorkspacePlugin {
         chunkOffset: { type: "number" },
         chunkLimit: { type: "number" },
         chunkIds: { type: "array", items: { type: "number" } },
+        chunkLocators: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 },
+        chunkOrigins: { type: "array", items: { type: "string", enum: ["source", "ai", "media"] }, minItems: 1, maxItems: 3 },
         chunkContext: { type: "number" },
         chunkTextMaxChars: { type: "number" },
+        artifactOrigins: { type: "array", items: { type: "string", enum: ["source", "media"] }, minItems: 1, maxItems: 2 },
         artifactOffset: { type: "number" },
         artifactLimit: { type: "number" },
         includeEnrichments: { type: "boolean" },
@@ -154,9 +157,20 @@ export class DocumentationPlugin implements WorkspacePlugin {
       externalHook("documentation.documents.reanalyze", "Reanalyze Documentation", "Re-extract an active archived document and run configured AI enrichment without uploading it again.", (input, context) => this.reprocessDocument("reanalyze", input, context), {
         documentId: { type: "string" }
       }, ["documentId"], documentationIngestOutputSchema()),
-      externalHook("documentation.documents.reenrich", "Re-enrich Documentation", "Replace AI enrichment for an active archived document using its existing extracted source evidence.", (input, context) => this.reprocessDocument("reenrich", input, context), {
-        documentId: { type: "string" }
+      externalHook("documentation.documents.reenrich", "Re-enrich Documentation", "Replace AI enrichment using retained source evidence. Explicit resume continues completed batch checkpoints; force starts a fresh run.", (input, context) => this.reprocessDocument("reenrich", input, context), {
+        documentId: { type: "string" },
+        resume: { type: "boolean" },
+        force: { type: "boolean" }
       }, ["documentId"], documentationIngestOutputSchema()),
+      externalHook("documentation.documents.reanalyzeCampaign.start", "Start Source Reanalysis Campaign", "Capture exact document revisions and re-extract their retained sources with durable progress. This operation does not run AI enrichment.", (input) => this.client.startReanalysisCampaign(input.documentIds as string[]), { documentIds: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100000, uniqueItems: true } }, ["documentIds"], documentationCampaignOutputSchema()),
+      readHook("documentation.documents.reanalyzeCampaign.get", "Get Source Reanalysis Campaign", "Read campaign counts and a bounded page of document outcomes.", (input) => this.client.getReanalysisCampaign(requireString(input.campaignId, "campaignId"), input), { campaignId: { type: "string" }, offset: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1, maximum: 200 } }, ["campaignId"]),
+      externalHook("documentation.documents.reanalyzeCampaign.resume", "Resume Source Reanalysis Campaign", "Explicitly resume an interrupted source campaign from its retained per-document progress.", (input) => this.client.resumeReanalysisCampaign(requireString(input.campaignId, "campaignId")), { campaignId: { type: "string" } }, ["campaignId"], documentationCampaignOutputSchema()),
+      externalHook("documentation.documents.reanalyzeCampaign.cancel", "Cancel Source Reanalysis Campaign", "Stop a source campaign while retaining completed document outcomes for inspection.", (input) => this.client.cancelReanalysisCampaign(requireString(input.campaignId, "campaignId")), { campaignId: { type: "string" } }, ["campaignId"], documentationCampaignOutputSchema()),
+      readHook("documentation.documents.revisions", "List Source Revisions", "List retained document revisions in the same explicit source family.", (input) => this.client.listDocumentRevisions(requireString(input.documentId, "documentId")), { documentId: { type: "string" } }, ["documentId"]),
+      externalHook("documentation.documents.checkRevision", "Check Source Revision", "Read the original source and compare its bytes with retained revisions without changing the archive.", (input) => this.client.checkDocumentRevision(requireString(input.documentId, "documentId")), { documentId: { type: "string" } }, ["documentId"], documentationRevisionCheckOutputSchema()),
+      externalHook("documentation.documents.refresh", "Refresh Source Revision", "Read the original source and retain a new revision when its bytes changed. Prior revisions remain available.", (input) => this.client.refreshDocument(requireString(input.documentId, "documentId")), { documentId: { type: "string" } }, ["documentId"], documentationRevisionCheckOutputSchema()),
+      externalHook("documentation.documents.assignSource", "Assign Source Family", "Assign a retained document to an explicit source family for revision comparison.", (input) => this.client.assignDocumentSource(requireString(input.documentId, "documentId"), requireString(input.sourceKey, "sourceKey")), { documentId: { type: "string" }, sourceKey: { type: "string" } }, ["documentId", "sourceKey"], documentationRevisionsOutputSchema()),
+      externalHook("documentation.documents.purge", "Permanently Purge Documentation", "Irreversibly delete an inactive document and its unreferenced retained bytes. Active documents must be invalidated first. Record a reason for deletion.", (input) => this.client.purgeDocument(requireString(input.documentId, "documentId"), requireString(input.reason, "reason")), { documentId: { type: "string" }, reason: { type: "string" } }, ["documentId", "reason"], documentationPurgeOutputSchema()),
       readHook("documentation.search", "Search Documentation", "Search active local documentation and return source-grounded results.", (input) => this.client.search(input).then(searchResult), {
         query: { type: "string" },
         limit: { type: "number" },
@@ -293,6 +307,9 @@ export class DocumentationPlugin implements WorkspacePlugin {
 
   private reprocessDocument(kind: "reanalyze" | "reenrich", input: Record<string, unknown>, context?: HookCallContext): Promise<Record<string, unknown>> {
     const documentId = requireString(input.documentId, "documentId");
+    if (input.resume !== undefined && typeof input.resume !== "boolean" || input.force !== undefined && typeof input.force !== "boolean") throw new Error("resume and force must be booleans.");
+    if (input.resume === true && input.force === true) throw new Error("A run cannot be resumed and forced at the same time.");
+    const enrichmentOptions = kind === "reenrich" ? { resume: input.resume === true, force: input.force === undefined ? input.resume !== true : input.force === true } : {};
     return this.ingestQueue.enqueue({
       kind,
       label: documentId,
@@ -320,7 +337,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
           ? await this.reanalyzeDocument(documentId, job)
           : { documents: [{ documentId, title: document.title, uri: document.uri }] };
         job.signal.throwIfAborted();
-        const enriched = await this.enrichExistingDocument(extracted, kind, job);
+        const enriched = await this.enrichExistingDocument(extracted, kind, job, enrichmentOptions);
         job.signal.throwIfAborted();
         return ingestResult(enriched, kind, documentId);
       }
@@ -332,7 +349,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
     return this.client.reanalyzeDocument({ documentId }, { signal: job.signal });
   }
 
-  private async enrichExistingDocument(response: Record<string, unknown>, kind: "reanalyze" | "reenrich", job: DocumentationIngestQueueOperationContext): Promise<Record<string, unknown>> {
+  private async enrichExistingDocument(response: Record<string, unknown>, kind: "reanalyze" | "reenrich", job: DocumentationIngestQueueOperationContext, options: { resume?: boolean; force?: boolean }): Promise<Record<string, unknown>> {
     const service = this.enrichmentProvider();
     if (!service || !service.isEnabled()) {
       const unavailableReason = service ? "Documentation AI enrichment is disabled." : "Documentation AI enrichment is not available.";
@@ -342,7 +359,7 @@ export class DocumentationPlugin implements WorkspacePlugin {
       return skippedEnrichment(response, unavailableReason);
     }
     job.update({ progress: 78, stage: "Running AI enrichment from extracted source evidence." });
-    const enriched = await service.enrichIngestResponse(response, {}, { signal: job.signal });
+    const enriched = await service.enrichIngestResponse(response, {}, { signal: job.signal, ...options });
     const result = isRecord(enriched.enrichment) ? enriched : skippedEnrichment(enriched, "Documentation AI enrichment was disabled before it started.");
     const failed = enrichmentResults(result).find((entry) => entry.status === "failed");
     if (kind === "reenrich" && failed) {
@@ -482,6 +499,77 @@ function documentationDocumentMutationOutputSchema(): Record<string, unknown> {
       uri: { type: "string", description: "Documentation record source URI after this operation." }
     },
     additionalProperties: true
+  };
+}
+
+function documentationRevisionsOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      sourceKey: { type: "string", description: "Source family assigned to the document." },
+      revisions: { type: "array", items: { type: "object", additionalProperties: true }, description: "Retained document revisions in this source family." },
+      pendingCleanup: { type: "array", items: { type: "object", properties: { documentId: { type: "string" }, purgeId: { type: "integer" }, error: { type: ["string", "null"] } }, required: ["documentId", "purgeId", "error"] }, description: "Purge operations whose retained byte cleanup needs an explicit retry." }
+    },
+    required: ["sourceKey", "revisions", "pendingCleanup"],
+    additionalProperties: false
+  };
+}
+
+function documentationRevisionCheckOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      sourceKey: { type: "string", description: "Source family whose original was checked." },
+      status: { type: "string", enum: ["unchanged", "known-revision", "new-revision", "refreshed"], description: "Comparison result, or refreshed after retaining new source bytes." },
+      documentId: { type: ["string", "null"], description: "Retained revision matching the checked source, or null when it has not been imported." },
+      contentSha256: { type: "string", description: "SHA-256 of the checked source bytes or retained video evidence." },
+      checkedAt: { type: "string", description: "Time at which the source comparison was recorded." },
+      comparison: { type: "string", description: "Evidence comparison policy, when checking retained video evidence." }
+    },
+    required: ["sourceKey", "status", "documentId", "contentSha256", "checkedAt"],
+    additionalProperties: false
+  };
+}
+
+function documentationPurgeOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      documentId: { type: "string", description: "Inactive document selected for permanent deletion." },
+      sourceKey: { type: "string", description: "Source family recorded in the purge audit." },
+      purged: { type: "boolean", description: "Whether the document was deleted and unreferenced byte cleanup completed." },
+      cleanupPending: { type: "boolean", description: "Whether retained byte cleanup failed and requires an explicit retry." },
+      retainedDocument: { type: "boolean", description: "Whether a document with this ID still remains in the catalog." },
+      error: { type: "string", description: "Retained byte cleanup failure, when cleanup is pending." }
+    },
+    required: ["documentId", "sourceKey", "purged", "cleanupPending", "retainedDocument"],
+    additionalProperties: false
+  };
+}
+
+function documentationCampaignOutputSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    properties: {
+      campaign: {
+        type: "object",
+        properties: {
+          campaign_id: { type: "string", description: "Durable campaign ID used to inspect, cancel, or resume source reanalysis." },
+          status: { type: "string", enum: ["queued", "running", "interrupted", "failed", "cancelled", "complete"], description: "Current source reanalysis campaign status." },
+          created_at: { type: "string" }, updated_at: { type: "string" }
+        },
+        required: ["campaign_id", "status", "created_at", "updated_at"], additionalProperties: false
+      },
+      counts: { type: "object", additionalProperties: { type: "integer" }, description: "Document outcome counts grouped by status." },
+      items: { type: "array", items: { type: "object", additionalProperties: true }, description: "Captured document revisions and their reanalysis outcomes in this result window." },
+      window: {
+        type: "object",
+        properties: { offset: { type: "integer" }, limit: { type: "integer" }, total: { type: "integer" }, hasMore: { type: "boolean" } },
+        required: ["offset", "limit", "total", "hasMore"], additionalProperties: false
+      }
+    },
+    required: ["campaign", "counts", "items", "window"],
+    additionalProperties: false
   };
 }
 
@@ -796,7 +884,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "Use only results whose `state` is `active` unless the user explicitly asks for stale, revoked, deleted, or audit history.",
         "If active local results are absent, weak, stale, or do not cover the user's question, use built-in web search before answering. Prefer official product/project documentation, vendor datasheets, standards/specs, peer-reviewed or government/institutional sources for high-stakes domains, and reputable news sources for current events. Avoid forum or blog claims unless they are explicitly requested or corroborated by stronger sources.",
         "When adding evidence, ingest the original file, PDF, spreadsheet, image, URL, YouTube video, or playlist through the ingest skill so the full extractor can capture text, tables, workbook sheets, figures, screenshots, transcripts, and keyframes; use `/ingest/text` only when no original source is available. Preserve title, URI, source type, and collection metadata.",
-        "For vendor source-code files or code-heavy directories, do not index raw source directly. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` only after reviewing that generated documentation is acceptable; use `retainRawCodeArtifacts: true` only when raw source retention is allowed.",
+        "For vendor source-code files or code-heavy directories, do not index raw source directly. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` only after reviewing that generated documentation is acceptable; Original source bytes are retained in an immutable rebuild bundle; use `retainRawCodeArtifacts: true` only to expose individual raw files as artifacts.",
         "For long-running imports, follow the documentation-ingest skill to wait on the same command or read the original source directly while processing continues. After ingestion completes, rerun local archive search and answer from the local documentation records. If no reliable source can be ingested, say so and answer only with the evidence that was actually inspected.",
         "When writing, carry forward each result's title, source type, locator, URI, and content SHA."
       ]),
@@ -816,7 +904,7 @@ function defaultDocumentationSkills(): PluginSkillContribution[] {
         "After a successful final response, inspect the returned document IDs and warnings for extraction failures or skipped work. Run `node \"$DOC\" search \"query\"` again and `node \"$DOC\" open DOCUMENT_ID` for the relevant returned IDs before claiming the content is available in the archive. Report errors or missing content explicitly; an empty search during processing is not evidence that the source lacks the requested information.",
         "When ingesting a relative local path, run the helper from the intended workspace with `CLOUDX_SERVER_URL` set. If only `CLOUDX_DOCUMENTATION_URL` is available, pass an absolute path.",
         "Always ingest PDFs, spreadsheets, images, documents, YouTube videos, and YouTube playlists as original sources, not pasted excerpts or transcripts, so the extractor can preserve pages, tables, workbook sheets, figures, screenshots, visual keyframes, timestamps, and source artifacts.",
-        "For vendor source-code files or directories, do not use `ingest-text` and do not request raw-code indexing. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` after reviewing the generated Markdown path is acceptable; set `retainRawCodeArtifacts: true` only when raw source retention is allowed.",
+        "For vendor source-code files or directories, do not use `ingest-text` and do not request raw-code indexing. Use path, upload, or URL ingest with `acceptGeneratedCodeDocumentation: true` after reviewing the generated Markdown path is acceptable; Original source bytes are retained in an immutable rebuild bundle; set `retainRawCodeArtifacts: true` only to expose individual raw files as artifacts.",
         "Set `sourceType` to one of `datasheet`, `book`, `website`, `readme`, `media`, `image`, `spreadsheet`, or `text` when the user gives enough context. The indexer assigns `repo_code` to generated code documentation.",
         "Leave `title` and `collection` blank when the indexer should autodetect them from the file, folder, URL, playlist, upload, or first text line.",
         "When ingesting sources found online, prefer durable primary URLs and include the original source URL. Do not ingest search-result pages, low-trust mirrors, or unsupported summaries when a better source is available.",

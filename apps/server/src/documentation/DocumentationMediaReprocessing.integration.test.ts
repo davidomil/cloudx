@@ -51,12 +51,12 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         const html = "<html><body><h1>CORRECTED-GUIDE</h1><p>Release reset after power stabilizes.</p><script>EXCLUDED-SCRIPT</script></body></html>";
         await fs.writeFile(sourcePath, html);
         const enrichment = createEnrichment(fixture);
-        enrichment.run.mockImplementationOnce(async () => {
+        enrichment.run.mockImplementationOnce(async (prompt) => {
           await modelGate;
           if (outcome === "failed") throw new Error("The older model attempt failed.");
           if (outcome === "successful") return {
             summary: "Enrichment from the replaced text extraction.", metadata: [], warnings: [],
-            spans: [{ locator: "ai:metadata", text: "EXCLUDED-SCRIPT" }],
+            spans: [{ locator: "ai:metadata", text: "EXCLUDED-SCRIPT", kind: "content", supportAnchorIds: [JSON.parse(prompt.split("\nEvidence:\n")[1]).supportAnchors[0].id] }],
           };
           return { summary: "No enrichment from the older attempt.", metadata: [], warnings: [], spans: [] };
         });
@@ -114,9 +114,9 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         const documentId = (imported.documents as Array<{ documentId: string }>)[0].documentId;
         const original = await fixture.document(documentId);
         const enrichment = createEnrichment(fixture);
-        enrichment.run.mockImplementationOnce(async () => {
+        enrichment.run.mockImplementationOnce(async (prompt) => {
           await modelGate;
-          return { summary: "Obsolete extraction", metadata: [], warnings: [], spans: [{ locator: "ai:metadata", text: "OBSOLETE-EVIDENCE" }] };
+          return { summary: "Obsolete extraction", metadata: [], warnings: [], spans: [{ locator: "ai:metadata", text: "OBSOLETE-EVIDENCE", kind: "content", supportAnchorIds: [JSON.parse(prompt.split("\nEvidence:\n")[1]).supportAnchors[0].id] }] };
         });
         pending = enrichment.service.enrichIngestResponse({ document: { documentId } });
         await vi.waitFor(() => expect(enrichment.run).toHaveBeenCalledOnce(), { timeout: 10_000 });
@@ -126,7 +126,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
 
         releaseModel();
         await expect(pending).resolves.toMatchObject({ enrichment: { results: [{
-          documentId, status: "failed", error: expect.stringContaining("Enrichment extraction revision no longer matches")
+          documentId, status: "failed", error: expect.stringContaining("fenced")
         }] } });
         const document = await fixture.document(documentId);
         expect(document.extraction_revision).toBe(corrected.extraction_revision);
@@ -154,9 +154,9 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         await fs.unlink(sourcePath);
         await fixture.reopen();
         const enrichment = createEnrichment(fixture);
-        enrichment.run.mockImplementation(async () => {
+        enrichment.run.mockImplementation(async (prompt) => {
           await modelGate;
-          return { summary: "Archived evidence", metadata: [], warnings: [], spans: [{ locator: "ai:media", text: "BACKGROUND-EVIDENCE" }] };
+          return { summary: "Archived evidence", metadata: [], warnings: [], spans: [{ locator: "ai:media", text: "BACKGROUND-EVIDENCE", kind: "content", supportAnchorIds: [JSON.parse(prompt.split("\nEvidence:\n")[1]).supportAnchors[0].id] }] };
         });
         const reportError = vi.fn();
         worker = new DocumentationBackgroundEnrichment(fixture.client, enrichment.service, reportError);
@@ -164,16 +164,20 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
         await vi.waitFor(() => expect(enrichment.run).toHaveBeenCalledOnce(), { timeout: 10_000 });
 
         const hook = enrichment.plugin.hooks.find((candidate) => candidate.id === "documentation.ingest.text")!;
-        await expect(hook.execute({ text: "A new source while the model is busy." }, { caller: { kind: "http" } }))
-          .resolves.toMatchObject({ kind: "text", documentCount: 1 });
+        const newSource = await hook.execute({ text: "A new source while the model is busy." }, { caller: { kind: "http" } }) as { firstDocumentId: string };
+        expect(newSource).toMatchObject({ kind: "text", documentCount: 1 });
         expect(enrichment.run).toHaveBeenCalledOnce();
         expect(fixture.queue.list().capacity.admittedJobs).toBe(0);
 
         releaseModel();
+        await vi.waitFor(async () => {
+          for (const id of [documentId, newSource.firstDocumentId]) {
+            expect((await fixture.document(id)).chunks).toEqual(expect.arrayContaining([
+              expect.objectContaining({ chunk_origin: "ai", text: "BACKGROUND-EVIDENCE" }),
+            ]));
+          }
+        }, { timeout: 10_000 });
         await vi.waitFor(async () => expect(await fixture.client.pendingEnrichments(2)).toEqual([]), { timeout: 10_000 });
-        expect((await fixture.document(documentId)).chunks).toEqual(expect.arrayContaining([
-          expect.objectContaining({ chunk_origin: "ai", text: "BACKGROUND-EVIDENCE" }),
-        ]));
         expect(enrichment.transcribeFile).toHaveBeenCalledOnce();
         expect(enrichment.run.mock.calls[0][0]).toContain("FRESH-TRANSCRIPT-1");
         expect(enrichment.run).toHaveBeenCalledTimes(2);
@@ -200,21 +204,23 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
           const sourceChunks = original.chunks.filter((chunk) => chunk.chunk_origin === "source");
           expect(original.source_type).toBe("repo_code");
           expect(sourceChunks.map((chunk) => chunk.locator)).toEqual(["code-doc summary", "code-doc reset.c", "code-doc policy"]);
-          await fixture.client.enrichDocument({
+          await seedEnrichment(fixture, {
             documentId, model: "prior-model", skillIds: [],
             spans: [{ locator: "ai:code", text: "PRIOR-AI-SPAN is not source evidence." }],
           });
 
           let sibling: ArchivedDocument | undefined;
-          if (contentType) {
+          if (contentType && /^(audio|video)\//u.test(contentType)) {
+            await expect(fixture.client.ingestUploadFile({ filename: "retained-code.txt", path: snapshotPath, contentType, title: "Separate code copy", sourceType: "text" })).rejects.toThrow(/Media source/u);
+          } else if (contentType) {
             const importedSibling = await fixture.client.ingestUploadFile({
               filename: "retained-code.txt", path: snapshotPath, contentType,
               title: "Separate code copy", sourceType: "text",
             });
             sibling = await fixture.document((importedSibling.document as { documentId: string }).documentId);
             expect(sibling.document_id).not.toBe(documentId);
-            expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
-            expect(JSON.parse(await fs.readFile(path.join(path.dirname(snapshotPath), "metadata.json"), "utf8")))
+            expect(path.dirname(sibling.snapshot_path)).not.toBe(path.dirname(original.snapshot_path));
+            expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(sibling.snapshot_path), "metadata.json"), "utf8")))
               .toMatchObject({ contentType, upload: true });
           }
           await fs.unlink(sourcePath);
@@ -225,8 +231,8 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
             await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
               .resolves.toMatchObject({ kind: "reenrich", firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
 
-            expect(enrichment.run).toHaveBeenCalledTimes(rerun);
-            const prompt = enrichment.run.mock.lastCall![0];
+            expect(enrichment.run).toHaveBeenCalledTimes(rerun * 2);
+            const prompt = enrichment.run.mock.calls.slice((rerun - 1) * 2).map(([prompt]) => prompt).join("\n");
             expect(prompt).toContain("release_reset");
             for (const chunk of sourceChunks) {
               expect(prompt).toContain(JSON.stringify(chunk.locator));
@@ -241,7 +247,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
             expect(identity(current)).toEqual(identity(original));
             expect(current.chunks.filter((chunk) => chunk.chunk_origin === "source")).toEqual(sourceChunks);
             expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
-              .toMatchObject([{ text: `REPLACEMENT-AI-${rerun}` }]);
+              .toMatchObject([{ text: `REPLACEMENT-AI-${rerun * 2 - 1}` }, { text: `REPLACEMENT-AI-${rerun * 2}` }]);
             expect(JSON.parse(current.enrichments[0].payload_json).evidence).toMatchObject({
               chunkCount: sourceChunks.length, mediaTranscriptChars: 0, keyframeCount: 0,
             });
@@ -288,7 +294,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
             const importedSibling = await fixture.client.ingestPath({ path: sourcePath });
             sibling = await fixture.document((importedSibling.documents as Array<{ documentId: string }>)[0].documentId);
             expect(sibling.document_id).not.toBe(documentId);
-            expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
+            expect(path.dirname(sibling.snapshot_path)).not.toBe(path.dirname(original.snapshot_path));
             await fs.unlink(sourcePath);
           }
 
@@ -348,7 +354,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
           });
           const documentId = (imported.document as { documentId: string }).documentId;
           const original = await fixture.document(documentId);
-          expect(original.source_type).toBe("text");
+          expect(original.source_type).toBe("media");
           const enrichment = createEnrichment(fixture);
           await expect(enrichment.service.enrichIngestResponse(imported, {
             filename: "recording.mp1", contentPath: sourcePath, contentType: "audio/mpeg",
@@ -391,30 +397,37 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
               const sourceBytes = Buffer.from("RETAINED-NOTES: Release reset after power stabilizes. Café instructions.\n", encoding);
               const sourcePath = path.join(fixture.root, "notes.txt");
               await fs.writeFile(sourcePath, sourceBytes);
-              const imported = await fixture.client.ingestUploadFile({
+              const importRequest = fixture.client.ingestUploadFile({
                 filename: "notes.txt", path: sourcePath, contentType: "text/plain",
                 title: "Original notes", collection: "Text regression", tags: ["retain-me"],
               });
+              if (encoding === "latin1") {
+                await expect(importRequest).rejects.toThrow("Text sources must contain valid UTF-8 or BOM-marked UTF-16");
+                return;
+              }
+              const imported = await importRequest;
               const documentId = (imported.document as { documentId: string }).documentId;
               const original = await fixture.document(documentId);
               const sourceChunks = original.chunks.filter((chunk) => chunk.chunk_origin === "source")
                 .map(({ locator, text }) => ({ locator, text }));
               expect(sourceChunks).toEqual([{ locator: "text", text: sourceBytes.toString("utf8").trim() }]);
-              await fixture.client.enrichDocument({
+              await seedEnrichment(fixture, {
                 documentId, model: "prior-model", skillIds: [],
                 spans: [{ locator: "ai:notes", text: "PRIOR-AI-SPAN is not source evidence." }],
               });
 
               let sibling: ArchivedDocument | undefined;
-              if (contentType) {
+              if (contentType && /^(audio|video)\//u.test(contentType)) {
+                await expect(fixture.client.ingestUploadFile({ filename: "shared-notes.txt", path: sourcePath, contentType, title: "Separate notes copy" })).rejects.toThrow(/Media source/u);
+              } else if (contentType) {
                 const importedSibling = await fixture.client.ingestUploadFile({
                   filename: "shared-notes.txt", path: sourcePath, contentType,
                   title: "Separate notes copy",
                 });
                 sibling = await fixture.document((importedSibling.document as { documentId: string }).documentId);
                 expect(sibling.document_id).not.toBe(documentId);
-                expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
-                expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(original.snapshot_path), "metadata.json"), "utf8")))
+                expect(path.dirname(sibling.snapshot_path)).not.toBe(path.dirname(original.snapshot_path));
+                expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(sibling.snapshot_path), "metadata.json"), "utf8")))
                   .toMatchObject({ contentType, upload: true });
               }
               await fs.unlink(sourcePath);
@@ -488,21 +501,23 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
                 .toEqual([format === "html" ? "html" : "sheet Power Budget range A1:B3"]);
               const originalArtifacts = await extractedFiles(fixture.archiveRoot, original);
               if (format === "xlsx") expect(Object.keys(originalArtifacts)).toContain("spreadsheets/sheet-001-Power_Budget.json");
-              await fixture.client.enrichDocument({
+              await seedEnrichment(fixture, {
                 documentId, model: "prior-model", skillIds: [],
                 spans: [{ locator: "ai:guide", text: "PRIOR-AI-SPAN is not source evidence." }],
               });
 
               let sibling: ArchivedDocument | undefined;
-              if (contentType) {
+              if (contentType && format === "html" && /^(audio|video)\//u.test(contentType)) {
+                await expect(fixture.client.ingestUploadFile({ filename: "sibling.txt", path: sourcePath, contentType, title: "Separate guide copy", sourceType: "text" })).rejects.toThrow(/Media source|ZIP containers/u);
+              } else if (contentType) {
                 const importedSibling = await fixture.client.ingestUploadFile({
                   filename: "sibling.txt", path: sourcePath, contentType,
                   title: "Separate guide copy", sourceType: "text",
                 });
                 sibling = await fixture.document((importedSibling.document as { documentId: string }).documentId);
                 expect(sibling.document_id).not.toBe(documentId);
-                expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
-                expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(original.snapshot_path), "metadata.json"), "utf8")))
+                expect(path.dirname(sibling.snapshot_path)).not.toBe(path.dirname(original.snapshot_path));
+                expect(JSON.parse(await fs.readFile(path.join(fixture.archiveRoot, path.dirname(sibling.snapshot_path), "metadata.json"), "utf8")))
                   .toMatchObject({ contentType, upload: true });
               }
               const siblingArtifacts = sibling ? await extractedFiles(fixture.archiveRoot, sibling) : undefined;
@@ -513,8 +528,9 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
                 const prior = await fixture.document(documentId);
                 await expect(hook.execute({ documentId }, { caller: { kind: "ui" } }))
                   .resolves.toMatchObject({ kind: operation, firstDocumentId: documentId, enrichment: { results: [{ status: "written" }] } });
-                expect(enrichment.run).toHaveBeenCalledTimes(rerun);
-                const prompt = enrichment.run.mock.lastCall![0];
+                const batchesPerRun = 1;
+                expect(enrichment.run).toHaveBeenCalledTimes(rerun * batchesPerRun);
+                const prompt = enrichment.run.mock.calls.slice((rerun - 1) * batchesPerRun).map(([prompt]) => prompt).join("\n");
                 for (const chunk of sourceChunks) {
                   expect(prompt).toContain(JSON.stringify(chunk.locator));
                   expect(prompt).toContain(JSON.stringify(chunk.text));
@@ -531,7 +547,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
                 expect(current.chunks.filter((chunk) => chunk.chunk_origin === "source").map(({ locator, text }) => ({ locator, text })))
                   .toEqual(sourceChunks);
                 expect(current.chunks.filter((chunk) => chunk.chunk_origin === "ai"))
-                  .toMatchObject([{ text: `REPLACEMENT-AI-${rerun}` }]);
+                  .toMatchObject(Array.from({ length: batchesPerRun }, (_, index) => ({ text: `REPLACEMENT-AI-${(rerun - 1) * batchesPerRun + index + 1}` })));
                 expect(JSON.parse(current.enrichments[0].payload_json).evidence).toMatchObject({
                   chunkCount: sourceChunks.length, mediaTranscriptChars: 0, keyframeCount: 0,
                 });
@@ -566,8 +582,7 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
             });
             const documentId = (imported.document as { documentId: string }).documentId;
             const original = await fixture.document(documentId);
-            expect(original.source_type).toBe("text");
-            const originalSnapshot = path.join(fixture.archiveRoot, original.snapshot_path);
+            expect(original.source_type).toBe("media");
             const enrichment = createEnrichment(fixture);
 
             await expect(enrichment.service.enrichIngestResponse(imported, {
@@ -581,8 +596,8 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
               const siblingId = await fixture.importSibling(sourceBytes);
               sibling = await fixture.document(siblingId);
               expect(sibling.document_id).not.toBe(documentId);
-              expect(path.dirname(sibling.snapshot_path)).toBe(path.dirname(original.snapshot_path));
-              await expect(fs.readFile(path.join(path.dirname(originalSnapshot), "metadata.json"), "utf8"))
+              expect(path.dirname(sibling.snapshot_path)).not.toBe(path.dirname(original.snapshot_path));
+              await expect(fs.readFile(path.join(fixture.archiveRoot, path.dirname(sibling.snapshot_path), "metadata.json"), "utf8"))
                 .resolves.toContain('"contentType": "application/octet-stream"');
             }
 
@@ -610,7 +625,6 @@ describe.skipIf(!process.env.CLOUDX_DOCUMENTATION_PYTHON && !existsSync(python))
               if (sibling) {
                 await expect(fixture.document(sibling.document_id)).resolves.toEqual(sibling);
                 await expect(fs.readFile(path.join(fixture.archiveRoot, sibling.snapshot_path))).resolves.toEqual(sourceBytes);
-                await expect(fs.readFile(originalSnapshot)).resolves.toEqual(sourceBytes);
               }
             }
           } finally {
@@ -661,7 +675,7 @@ interface ArchivedDocument {
   tags_json: string;
   content_sha256: string;
   extraction_revision: string;
-  chunks: Array<{ locator: string; text: string; chunk_origin: string }>;
+  chunks: Array<{ chunk_id: number; locator: string; text: string; chunk_origin: string }>;
   enrichments: Array<{ payload_json: string }>;
 }
 
@@ -682,15 +696,26 @@ async function extractedFiles(archiveRoot: string, document: ArchivedDocument) {
   return files;
 }
 
+async function seedEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>, input: { documentId: string; model: string; skillIds: string[]; spans: Array<{ locator: string; text: string }> }) {
+  const document = await fixture.document(input.documentId);
+  const source = document.chunks.find((chunk) => chunk.chunk_origin === "source")!;
+  const run = await fixture.client.beginEnrichmentRun(input.documentId, { extractionRevision: document.extraction_revision, processorFingerprint: "a".repeat(64), ownerId: "integration-fixture", resume: false, force: true });
+  await fixture.client.checkpointEnrichmentBatch(run.runId, 0, { leaseToken: run.leaseToken, inputFingerprint: "b".repeat(64), model: input.model, output: {
+    summary: "Fixture enrichment", metadata: {}, warnings: [],
+    spans: input.spans.map((span) => ({ ...span, kind: "content", supportAnchors: [{ documentId: input.documentId, extractionRevision: document.extraction_revision, locator: source.locator, chunkId: source.chunk_id }] }))
+  } });
+  await fixture.client.completeEnrichmentRun(run.runId, { leaseToken: run.leaseToken, batchCount: 1, skillIds: input.skillIds, evidence: { chunkCount: 1, artifactCount: 0, keyframeCount: 0, mediaTranscriptChars: 0 } });
+}
+
 function createEnrichment(fixture: Awaited<ReturnType<typeof startArchive>>) {
   const mediaProcessLauncher = vi.fn(spawn);
   const transcribeFile = vi.fn(async (sourcePath: string) => {
     await runFile("ffmpeg", ["-v", "error", "-nostdin", "-i", sourcePath, "-f", "null", "-"]);
     return { text: `FRESH-TRANSCRIPT-${transcribeFile.mock.calls.length}` };
   });
-  const run = vi.fn(async (_prompt: string, _options?: DocumentationRunnerOptions) => ({
+  const run = vi.fn(async (prompt: string, _options?: DocumentationRunnerOptions) => ({
     summary: "Fresh source evidence.", metadata: [], warnings: [],
-    spans: [{ locator: "ai:media", text: `REPLACEMENT-AI-${run.mock.calls.length}` }],
+    spans: [{ locator: "ai:media", text: `REPLACEMENT-AI-${run.mock.calls.length}`, kind: "content", supportAnchorIds: [JSON.parse(prompt.split("\nEvidence:\n")[1]).supportAnchors[0].id] }],
   }));
   const config = {
     isAiControlEnabled: () => true,
@@ -741,7 +766,8 @@ async function startArchive() {
         client = await indexer.client;
       },
       async document(documentId: string) {
-        return (await client.getDocument({ documentId })).document as ArchivedDocument;
+        try { return (await client.getDocument({ documentId })).document as ArchivedDocument; }
+        catch (error) { throw new Error(`${error instanceof Error ? error.message : error}\n${indexer.output()}`); }
       },
       async importSibling(bytes: Buffer) {
         siblingBytes = bytes;
@@ -756,6 +782,7 @@ async function startArchive() {
 }
 
 function startArchiveIndexer(archiveRoot: string) {
+  let output = "";
   const indexer = spawn(python, [
     "-m", "cloudx_documentation_indexer.main", "--host", "127.0.0.1", "--port", "0", "--archive-root", archiveRoot,
   ], {
@@ -765,17 +792,18 @@ function startArchiveIndexer(archiveRoot: string) {
       PYTHONPATH: path.join(repositoryRoot, "services/documentation-indexer/src"),
       PYTHONDONTWRITEBYTECODE: "1",
       CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST: "1",
+      CLOUDX_DOCUMENTATION_RETRIEVAL_PROFILE: "diagnostic-hash",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
   const exited = new Promise<void>((resolve) => indexer.once("close", () => resolve()));
   return {
+    output: () => output,
     async stop() {
       indexer.kill("SIGTERM");
       await exited;
     },
     client: new Promise<DocumentationClient>((resolve, reject) => {
-      let output = "";
       const timeout = setTimeout(() => reject(new Error(`Indexer startup timed out: ${output}`)), 10_000);
       indexer.once("error", (error) => { clearTimeout(timeout); reject(error); });
       indexer.once("exit", () => { clearTimeout(timeout); reject(new Error(`Indexer exited during startup: ${output}`)); });

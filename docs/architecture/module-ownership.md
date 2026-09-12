@@ -12,7 +12,11 @@ apps/server -> local HTTP -> services/documentation-indexer
 ```
 
 Python services are independently packaged processes. They do not share
-in-memory state with the Node server.
+in-memory state with the Node server. The [documentation lifecycle](documentation-lifecycle.md)
+describes retained sources, revision families, source campaigns, and archive-owned
+AI run checkpoints at that boundary.
+The [schematic analysis guide](documentation-schematics.md) covers typed circuit
+artifacts, local SINA/OCR provisioning, capability states, and electrical limits.
 
 ## Product Owners
 

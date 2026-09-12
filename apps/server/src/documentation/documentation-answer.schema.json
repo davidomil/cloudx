@@ -14,15 +14,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["documentId", "title", "locator"],
+        "required": ["evidenceId"],
         "properties": {
-          "documentId": {
-            "type": "string"
-          },
-          "title": {
-            "type": "string"
-          },
-          "locator": {
+          "evidenceId": {
             "type": "string"
           }
         }

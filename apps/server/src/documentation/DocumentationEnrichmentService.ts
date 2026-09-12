@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -13,7 +13,16 @@ import type { ConfigService } from "../configService.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import { runCodexExec } from "../voice/VoicePlanner.js";
 import { DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL, DOCUMENTATION_AI_USE_VOICE_MODEL } from "../aiModelOptions.js";
-import { DEFAULT_DOCUMENTATION_TIMEOUT_MS, type DocumentationClient } from "./DocumentationClient.js";
+import {
+  DEFAULT_DOCUMENTATION_TIMEOUT_MS,
+  type DocumentationClient,
+  type DocumentationEnrichmentBatchOutput,
+  type DocumentationEnrichmentEvidenceCounts,
+  type DocumentationEnrichmentRun,
+  type DocumentationMediaEvidencePage,
+  type DocumentationEnrichmentSpan,
+  type DocumentationSupportAnchor
+} from "./DocumentationClient.js";
 
 export const DOCUMENTATION_PLUGIN_ID = "documentation";
 export const DOCUMENTATION_AI_ENRICHMENT_ENABLED_KEY = "aiEnrichmentEnabled";
@@ -42,7 +51,7 @@ const ANSWER_CHUNK_TEXT_MAX_CHARS = 4_000;
 const MEDIA_TOOL_TIMEOUT_MS = 30 * 60 * 1000;
 const MEDIA_TOOL_OUTPUT_MAX_BYTES = 8 * 1024 * 1024;
 const MEDIA_TOOL_TERMINATION_GRACE_MS = 250;
-const TRANSCRIPT_SEGMENT_TARGET_CHARS = 12_000;
+const MEDIA_RETENTION_MAX_BYTES = 16 * 1024 * 1024;
 const MEDIA_SCENE_KEYFRAME_FILTER = "fps=1,select='eq(n,0)+gt(scene,0.08)',showinfo,scale=960:-2:flags=fast_bilinear";
 
 export interface DocumentationEnrichmentRunner {
@@ -63,6 +72,8 @@ export interface DocumentationRunnerOptions {
 export interface DocumentationEnrichmentRequestOptions {
   signal?: AbortSignal;
   onlyPending?: boolean;
+  resume?: boolean;
+  force?: boolean;
 }
 
 export interface DocumentationEnrichmentSource {
@@ -123,6 +134,7 @@ export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichme
 
 export class DocumentationEnrichmentService {
   readonly concurrency: number;
+  private readonly ownerId = randomUUID();
   private readonly activeDocuments = new Set<string>();
   private readonly pendingDocuments: PendingDocumentEnrichment[] = [];
 
@@ -173,7 +185,7 @@ export class DocumentationEnrichmentService {
           signal?.removeEventListener("abort", cancel);
           this.activeDocuments.add(document.documentId);
           const run = this.isEnabled()
-            ? this.enrichDocument(document, source, signal, options.onlyPending)
+            ? this.enrichDocument(document, source, options)
             : Promise.resolve({ documentId: document.documentId, status: "unchanged" });
           void run.then(resolve, reject).finally(() => {
             this.activeDocuments.delete(document.documentId);
@@ -219,149 +231,245 @@ export class DocumentationEnrichmentService {
       };
     }
     const evidence = await this.answerEvidence(results);
+    if (!evidence.length) return { answer: "No supported source material was found.", answerHtml: "<p>No supported source material was found.</p>", citations: [], warnings: ["Matched chunks had no retained support suitable for answering."], results, model };
     const output = normalizeAnswerOutput(
       await this.options.runner.run(buildAnswerPrompt(question, evidence), {
         schemaPath: ANSWER_SCHEMA_PATH,
         outputPrefix: "cloudx-doc-answer-",
         taskLabel: "documentation answer",
         model
-      })
+      }), evidence
     );
     return { ...output, results, model };
   }
 
-  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, signal?: AbortSignal, onlyPending = false): Promise<Record<string, unknown>> {
-    const extractionRevision = onlyPending ? document.extractionRevision : undefined;
-    if (onlyPending && (!extractionRevision || extractionRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(extractionRevision))) {
+  private async enrichDocument(document: IngestedDocumentRef, source: DocumentationEnrichmentSource, options: DocumentationEnrichmentRequestOptions): Promise<Record<string, unknown>> {
+    const { onlyPending = false } = options;
+    const controller = new AbortController();
+    const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+    if (onlyPending && !validExtractionRevision(document.extractionRevision)) {
       throw new Error("Background enrichment requires a valid extraction revision.");
     }
     const skillIds = configuredSkillIds(this.options.config.getPluginConfig(DOCUMENTATION_PLUGIN_ID)[DOCUMENTATION_AI_ENRICHMENT_SKILLS_KEY]);
     const skills = await this.resolveSkills(skillIds, signal);
-    const fullDocument = await this.enrichmentDocument(document.documentId, signal, extractionRevision);
-    if (onlyPending && (fullDocument.state !== "active" || recordsArray(fullDocument.chunks).some((chunk) => chunk.chunk_origin === "ai"))) {
-      return { documentId: document.documentId, status: "unchanged" };
-    }
+    const pages = this.enrichmentDocumentPages(document.documentId, signal, onlyPending ? document.extractionRevision : undefined);
+    const first = await pages.next();
+    if (first.done) throw new Error("Documentation enrichment could not load document details.");
+    const fullDocument = first.value;
+    if (fullDocument.state !== "active") return { documentId: document.documentId, status: "unchanged" };
+    const models = { text: this.enrichmentModel(false), image: this.enrichmentModel(true) };
+    const processorFingerprint = createHash("sha256").update(JSON.stringify({
+      version: 2,
+      models,
+      skills: skills.map(({ id, instructions }) => ({ id, instructions })),
+      schema: await fsp.readFile(ENRICHMENT_SCHEMA_PATH, "utf8"),
+      batchChars: ENRICHMENT_BATCH_TARGET_CHARS,
+      batchImages: ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE
+    })).digest("hex");
+    const run = await this.options.client.beginEnrichmentRun(document.documentId, {
+      extractionRevision: fullDocument.extraction_revision,
+      processorFingerprint,
+      ownerId: this.ownerId,
+      resume: options.resume === true,
+      force: options.force === true
+    }, { signal });
+    if (run.status === "complete") return { documentId: document.documentId, status: "unchanged", runId: run.runId, reason: "Matching enrichment is already complete." };
     const cleanup: Array<() => Promise<void>> = [];
+    const stopHeartbeat = this.heartbeatRun(run, controller, signal);
     try {
-      const archivedMedia = source.content || source.contentPath ? undefined : await this.archivedMediaSource(fullDocument, signal);
-      const mediaEvidence = await this.prepareMediaEvidence(archivedMedia ?? source, cleanup, signal);
-      if (archivedMedia && !mediaEvidence?.transcript?.trim() && !mediaEvidence?.keyframes.length) {
-        throw new Error("Archived media enrichment produced no transcript or keyframe evidence.");
-      }
-      const evidence = {
-        document: documentSummary(fullDocument),
-        chunks: archivedMedia ? [] : documentChunks(fullDocument),
-        artifacts: await this.documentArtifacts(fullDocument, signal),
-        media: mediaEvidence
-      };
-      const model = this.enrichmentModel(skillIds, evidence);
-      const batches = buildEvidenceBatches(evidence);
-      const outputs = [];
-      for (const batch of batches) {
-        signal?.throwIfAborted();
-        const imagePaths = batchImagePaths(batch);
-        const runnerOptions = imagePaths.length > 0 ? { model, imagePaths } : { model };
-        outputs.push(normalizeEnrichmentOutput(await this.options.runner.run(
-          buildEnrichmentPrompt(skills, batch),
-          signal ? { ...runnerOptions, signal } : runnerOptions
-        )));
-      }
-      const output = mergeEnrichmentOutputs(outputs);
-      if (output.spans.length === 0) {
-        return {
-          documentId: document.documentId,
-          status: "skipped",
-          reason: "Codex returned no enrichment spans.",
-          warnings: output.warnings
-        };
-      }
-      const enrichment = {
-        documentId: document.documentId,
-        extractionRevision: fullDocument.extraction_revision,
-        spans: output.spans,
-        model,
-        skillIds,
-        summary: output.summary,
-        payload: {
-          metadata: output.metadata,
-          warnings: output.warnings,
-          evidence: evidenceSummary(evidence, batches)
+      let retainedMedia = await this.options.client.getEnrichmentMedia(run.runId, run.leaseToken, 0, { signal });
+      if (!retainedMedia.complete) {
+        if (options.resume && retainedMedia.window.total > 0) throw new Error("Media evidence retention was interrupted. Start a forced new run to repeat media processing.");
+        const archivedMedia = source.content || source.contentPath ? undefined : await this.archivedMediaSource(fullDocument, signal);
+        const media = await this.prepareMediaEvidence(archivedMedia ?? source, cleanup, signal);
+        if (media) {
+          if (!media.transcript?.trim() && !media.keyframes.length) throw new Error("Archived media enrichment produced no transcript or keyframe evidence.");
+          await this.retainMediaEvidence(fullDocument, run, media, signal);
+          retainedMedia = await this.options.client.getEnrichmentMedia(run.runId, run.leaseToken, 0, { signal });
+          if (!retainedMedia.complete) throw new Error("Media evidence was not durably completed.");
         }
-      };
-      if (signal) {
-        await this.options.client.enrichDocument(enrichment, { signal });
-      } else {
-        await this.options.client.enrichDocument(enrichment);
       }
-      return {
-        documentId: document.documentId,
-        status: "written",
-        chunkCount: output.spans.length,
-        warnings: output.warnings
-      };
+      const counts: DocumentationEnrichmentEvidenceCounts = { chunkCount: 0, artifactCount: 0, keyframeCount: Number(retainedMedia.metadata?.keyframeCount ?? 0), mediaTranscriptChars: Number(retainedMedia.metadata?.mediaTranscriptChars ?? 0) };
+      let batchCount = 0;
+      const seenSpans = new Set<string>();
+      const evidencePages = this.enrichmentPageEvidence(first.value, pages, retainedMedia.complete, counts, signal);
+      const mediaPages = this.retainedMediaEvidence(fullDocument, run, retainedMedia, signal);
+      for await (const evidence of concatenateEvidence(evidencePages, mediaPages)) {
+        for (const batch of buildEvidenceBatches(evidence)) {
+          signal?.throwIfAborted();
+          batch.batch.index = batchCount;
+          const imagePaths = batchImagePaths(batch);
+          const model = imagePaths.length ? models.image : models.text;
+          const prompt = buildEnrichmentPrompt(skills, batch);
+          const fingerprintPrompt = buildEnrichmentPrompt(skills, portableBatchEvidence(batch));
+          const inputFingerprint = await enrichmentBatchFingerprint(fingerprintPrompt, model, imagePaths, signal);
+          const checkpoint = await this.options.client.lookupEnrichmentBatch(run.runId, batchCount, { leaseToken: run.leaseToken, inputFingerprint, model }, { signal });
+          if (checkpoint.status === "complete") {
+            for (const span of checkpoint.output!.spans) seenSpans.add(enrichmentSpanIdentity(span));
+          } else {
+            const value = await this.options.runner.run(prompt, { schemaPath: ENRICHMENT_SCHEMA_PATH, outputPrefix: "cloudx-doc-enrichment-", taskLabel: "documentation enrichment", model, ...(imagePaths.length ? { imagePaths } : {}), signal });
+            signal.throwIfAborted();
+            const output = normalizeEnrichmentOutput(value, batch);
+            output.spans = output.spans.filter((span) => {
+              const identity = enrichmentSpanIdentity(span);
+              if (seenSpans.has(identity)) return false;
+              seenSpans.add(identity);
+              return true;
+            });
+            await this.options.client.checkpointEnrichmentBatch(run.runId, batchCount, { leaseToken: run.leaseToken, inputFingerprint, model, output }, { signal });
+          }
+          batchCount += 1;
+        }
+      }
+      const completed = await this.options.client.completeEnrichmentRun(run.runId, { leaseToken: run.leaseToken, batchCount, skillIds, evidence: counts }, { signal });
+      return { documentId: document.documentId, runId: run.runId, status: completed.chunkCount ? "written" : "skipped", chunkCount: completed.chunkCount, warnings: completed.warnings, ...(completed.chunkCount ? {} : { reason: "Enrichment produced no supported content spans." }) };
+    } catch (error) {
+      await this.options.client.recordEnrichmentRunOutcome(run.runId, {
+        leaseToken: run.leaseToken,
+        status: options.signal?.aborted ? "cancelled" : "failed",
+        code: enrichmentErrorCode(error),
+        error: (error instanceof Error ? error.message : String(error)).slice(0, 4_000)
+      }).catch((outcomeError: unknown) => { throw new AggregateError([error, outcomeError], `${error instanceof Error ? error.message : String(error)}; recording the run outcome also failed: ${outcomeError instanceof Error ? outcomeError.message : String(outcomeError)}`); });
+      throw error;
     } finally {
+      await stopHeartbeat();
       await Promise.allSettled(cleanup.map((operation) => operation()));
     }
   }
 
-  private async enrichmentDocument(documentId: string, signal?: AbortSignal, extractionRevision?: string): Promise<Record<string, unknown> & { extraction_revision: string }> {
+  private heartbeatRun(run: DocumentationEnrichmentRun, controller: AbortController, signal: AbortSignal): () => Promise<void> {
+    let pending: Promise<void> | undefined;
+    const timer = setInterval(() => {
+      if (pending) return;
+      pending = this.options.client.heartbeatEnrichmentRun(run.runId, run.leaseToken, { signal })
+        .then(() => undefined)
+        .catch((error: unknown) => controller.abort(error))
+        .finally(() => { pending = undefined; });
+    }, 15_000);
+    timer.unref();
+    return async () => { clearInterval(timer); await pending; };
+  }
+
+  private async *enrichmentDocumentPages(documentId: string, signal?: AbortSignal, extractionRevision?: string): AsyncGenerator<Record<string, unknown> & { extraction_revision: string }> {
     let chunkOffset = 0;
     let artifactOffset = 0;
     let needsChunks = true;
     let needsArtifacts = true;
-    let document: Record<string, unknown> | undefined;
-    const chunks: Record<string, unknown>[] = [];
-    const artifacts: Record<string, unknown>[] = [];
-    while (!document || needsChunks || needsArtifacts) {
+    do {
       signal?.throwIfAborted();
-      const loadChunks = !document || needsChunks;
-      const loadArtifacts = !document || needsArtifacts;
-      const input = {
+      const response = await this.options.client.getDocument({
         documentId,
-        chunkOffset: loadChunks ? chunkOffset : 0,
-        chunkLimit: loadChunks ? ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE : 0,
+        chunkOffset: needsChunks ? chunkOffset : 0,
+        chunkLimit: needsChunks ? ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE : 0,
         chunkTextMaxChars: ENRICHMENT_CHUNK_TEXT_MAX_CHARS,
-        artifactOffset: loadArtifacts ? artifactOffset : 0,
-        artifactLimit: loadArtifacts ? ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE : 0,
+        chunkOrigins: ["source"],
+        artifactOrigins: ["source"],
+        artifactOffset: needsArtifacts ? artifactOffset : 0,
+        artifactLimit: needsArtifacts ? ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE : 0,
         includeEnrichments: false,
         includeEvents: false
-      };
-      const response = signal
-        ? await this.options.client.getDocument(input, { signal })
-        : await this.options.client.getDocument(input);
-      const nextDocument = getRecord(response.document, "document");
-      const nextRevision = nextDocument.extraction_revision;
-      if (typeof nextRevision !== "string" || nextRevision.length !== 32 || !/^[0-9a-f]{32}$/.test(nextRevision)) {
-        throw new Error("Documentation enrichment evidence requires a valid extraction revision.");
-      }
+      }, { signal });
+      const page = getRecord(response.document, "document");
+      const nextRevision = page.extraction_revision;
+      if (!validExtractionRevision(nextRevision)) throw new Error("Documentation enrichment evidence requires a valid extraction revision.");
       extractionRevision ??= nextRevision;
-      if (nextRevision !== extractionRevision) {
-        throw new Error("Document extraction was replaced before enrichment could read its evidence.");
+      if (nextRevision !== extractionRevision) throw new Error("Document extraction was replaced before enrichment could read its evidence.");
+      const chunks = recordsArray(page.chunks);
+      const artifacts = recordsArray(page.artifacts);
+      if (chunks.length > ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE || artifacts.length > ENRICHMENT_DOCUMENT_ARTIFACT_PAGE_SIZE) throw new Error("Documentation evidence response exceeded its page limit.");
+      needsChunks = windowHasMore(page.chunkWindow);
+      needsArtifacts = windowHasMore(page.artifactWindow);
+      if (needsChunks && !chunks.length) throw new Error("Documentation enrichment chunk window did not advance.");
+      if (needsArtifacts && !artifacts.length) throw new Error("Documentation enrichment artifact window did not advance.");
+      chunkOffset = nextWindowOffset(page.chunkWindow, chunkOffset, chunks.length);
+      artifactOffset = nextWindowOffset(page.artifactWindow, artifactOffset, artifacts.length);
+      yield { ...page, extraction_revision: nextRevision, chunks, artifacts };
+    } while (needsChunks || needsArtifacts);
+  }
+
+  private async *enrichmentPageEvidence(first: Record<string, unknown>, pages: AsyncGenerator<Record<string, unknown>>, skipSource: boolean, counts: DocumentationEnrichmentEvidenceCounts, signal?: AbortSignal): AsyncGenerator<EnrichmentEvidence> {
+    let page: Record<string, unknown> | undefined = first;
+    while (page) {
+      const chunks = skipSource ? [] : documentChunks(page);
+      const artifacts = await this.documentArtifacts({ ...page, artifacts: availableArtifactRecords(page).filter((artifact) => artifact.artifactOrigin !== "media") }, signal);
+      counts.chunkCount += chunks.length;
+      counts.artifactCount += artifacts.length;
+      const remainingArtifacts = new Set(artifacts);
+      const chunkLocators = new Set(chunks.map((chunk) => chunk.locator));
+      const localArtifacts = artifacts.filter((artifact) => artifact.locator && chunkLocators.has(artifact.locator));
+      for (const artifact of localArtifacts) remainingArtifacts.delete(artifact);
+      if (chunks.length || localArtifacts.length) yield { document: documentSummary(page), chunks, artifacts: localArtifacts };
+      const missingLocators = [...new Set([...remainingArtifacts].map((artifact) => artifact.locator).filter((locator): locator is string => Boolean(locator)))];
+      if (missingLocators.length) {
+        let offset = 0;
+        let hasMore: boolean;
+        do {
+          const response = await this.options.client.getDocument({ documentId: page.document_id, chunkLocators: missingLocators, chunkOffset: offset, chunkLimit: ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE, chunkTextMaxChars: ENRICHMENT_CHUNK_TEXT_MAX_CHARS, artifactLimit: 0, includeEnrichments: false, includeEvents: false }, { signal });
+          const context = getRecord(response.document, "artifact source context");
+          if (context.extraction_revision !== page.extraction_revision) throw new Error("Document extraction was replaced before enrichment could read its evidence.");
+          const contextChunks = documentChunks(context);
+          if (contextChunks.length > ENRICHMENT_DOCUMENT_CHUNK_PAGE_SIZE) throw new Error("Documentation artifact context exceeded its page limit.");
+          const locators = new Set(contextChunks.map((chunk) => chunk.locator));
+          const contextArtifacts = [...remainingArtifacts].filter((artifact) => artifact.locator && locators.has(artifact.locator));
+          for (const artifact of contextArtifacts) remainingArtifacts.delete(artifact);
+          if (contextChunks.length) yield { document: documentSummary(page), chunks: contextChunks, artifacts: contextArtifacts };
+          hasMore = windowHasMore(context.chunkWindow);
+          if (hasMore && !contextChunks.length) throw new Error("Documentation artifact context window did not advance.");
+          offset = nextWindowOffset(context.chunkWindow, offset, contextChunks.length);
+        } while (hasMore);
       }
-      document ??= nextDocument;
-      if (loadChunks) {
-        const nextChunks = recordsArray(nextDocument.chunks);
-        chunks.push(...nextChunks);
-        needsChunks = windowHasMore(nextDocument.chunkWindow);
-        if (needsChunks && nextChunks.length === 0) {
-          throw new Error("Documentation enrichment chunk window did not advance.");
-        }
-        chunkOffset = nextWindowOffset(nextDocument.chunkWindow, chunkOffset, nextChunks.length);
-      }
-      if (loadArtifacts) {
-        const nextArtifacts = recordsArray(nextDocument.artifacts);
-        artifacts.push(...nextArtifacts);
-        needsArtifacts = windowHasMore(nextDocument.artifactWindow);
-        if (needsArtifacts && nextArtifacts.length === 0) {
-          throw new Error("Documentation enrichment artifact window did not advance.");
-        }
-        artifactOffset = nextWindowOffset(nextDocument.artifactWindow, artifactOffset, nextArtifacts.length);
-      }
+      if (remainingArtifacts.size) yield { document: documentSummary(page), chunks: [], artifacts: [...remainingArtifacts] };
+      const next = await pages.next();
+      page = next.done ? undefined : next.value;
     }
-    if (!document || !extractionRevision) {
-      throw new Error("Documentation enrichment could not load document details.");
+  }
+
+  private async retainMediaEvidence(document: Record<string, unknown>, run: DocumentationEnrichmentRun, media: MediaEvidence, signal?: AbortSignal): Promise<void> {
+    const documentId = String(document.document_id);
+    const retain = async (input: Pick<Parameters<DocumentationClient["retainMediaEvidence"]>[1], "transcript" | "keyframes">) => {
+      await this.options.client.retainMediaEvidence(documentId, { runId: run.runId, leaseToken: run.leaseToken, extractionRevision: run.extractionRevision, ...input }, { signal });
+    };
+    // Each retained transcript segment has its own immutable support identity.
+    const segments: Array<{ text: string; startSeconds?: number; endSeconds?: number }> = media.transcriptSegments?.length ? media.transcriptSegments : splitText(media.transcript ?? "", 12_000).map((text) => ({ text }));
+    for (const [index, segment] of segments.entries()) {
+      signal?.throwIfAborted();
+      if (!segment.text.trim()) continue;
+      if (segment.text.length > 200_000) throw new Error("Media transcript segment exceeds the retention limit.");
+      await retain({ transcript: { text: segment.text, locator: `media transcript segment ${index + 1}`, producer: { kind: "asr", service: "cloudx-asr" }, ...(segment.startSeconds !== undefined && segment.endSeconds !== undefined ? { segments: [{ text: segment.text, startSeconds: segment.startSeconds, endSeconds: segment.endSeconds }] } : {}) } });
     }
-    return { ...document, extraction_revision: extractionRevision, chunks, artifacts, enrichments: [], events: [] };
+    for (let index = 0; index < media.keyframes.length; index += ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE) {
+      const keyframes = [];
+      let bytes = 0;
+      for (const frame of media.keyframes.slice(index, index + ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE)) {
+        signal?.throwIfAborted();
+        const stat = await fsp.stat(frame.path);
+        bytes += stat.size;
+        if (bytes > MEDIA_RETENTION_MAX_BYTES) throw new Error("Media keyframe batch exceeds the retention limit.");
+        const content = await fsp.readFile(frame.path, { signal });
+        keyframes.push({ filename: path.basename(frame.path), contentBase64: content.toString("base64"), offsetSeconds: frame.offsetSeconds });
+      }
+      await retain({ keyframes });
+    }
+    await this.options.client.completeEnrichmentMedia(run.runId, run.leaseToken, {
+      filename: media.filename, contentType: media.contentType, sourceType: media.sourceType,
+      language: media.language, languageProbability: media.languageProbability,
+      mediaTranscriptChars: media.transcript?.length ?? 0, keyframeCount: media.keyframes.length
+    }, { signal });
+  }
+
+  private async *retainedMediaEvidence(document: Record<string, unknown>, run: DocumentationEnrichmentRun, first: DocumentationMediaEvidencePage, signal?: AbortSignal): AsyncGenerator<EnrichmentEvidence> {
+    if (!first.complete) return;
+    let page = first;
+    while (true) {
+      signal?.throwIfAborted();
+      const artifacts = page.artifacts.filter((artifact) => artifact.kind !== "media-transcript");
+      const details = { ...document, chunks: page.chunks, artifacts };
+      if (page.chunks.length || artifacts.length) yield { document: { ...documentSummary(document), media: page.metadata }, chunks: documentChunks(details), artifacts: await this.documentArtifacts(details, signal) };
+      if (!page.window.hasMore) return;
+      if (!page.chunks.length && !page.artifacts.length) throw new Error("Retained media window did not advance.");
+      page = await this.options.client.getEnrichmentMedia(run.runId, run.leaseToken, page.window.offset + page.window.limit, { signal });
+      if (!page.complete) throw new Error("Retained media completion changed during enrichment.");
+    }
   }
 
   private async resolveSkills(skillIds: string[], signal?: AbortSignal): Promise<CloudxSkill[]> {
@@ -398,17 +506,20 @@ export class DocumentationEnrichmentService {
           includeEnrichments: false,
           includeEvents: false
         })).document, "document");
+        if (!validExtractionRevision(document.extraction_revision)) throw new Error("Answer evidence requires a valid extraction revision.");
         documents.set(documentId, document);
       }
-      for (const chunk of selectAnswerChunks(recordsArray(document.chunks), documentResults)) {
-        const nextChars = chunk.text.length + 400;
-        if (evidence.length > 0 && evidenceChars + nextChars > ANSWER_EVIDENCE_TARGET_CHARS) {
-          return evidence;
-        }
+      if (document.state !== "active") continue;
+      for (const chunk of selectAnswerChunks(recordsArray(document.chunks), documentResults, documentId, String(document.extraction_revision))) {
         const result = documentResults.find((candidate) => candidate.chunkId === chunk.chunkId) ?? documentResults[0];
-        evidence.push({
+        const item: AnswerEvidence = {
+          evidenceId: `${documentId}:chunk:${chunk.chunkId}`,
           result: {
             chunkId: chunk.chunkId,
+            extractionRevision: String(document.extraction_revision),
+            origin: chunk.origin,
+            kind: chunk.kind,
+            supportAnchors: chunk.origin === "source" || chunk.origin === "media" ? [{ documentId, extractionRevision: String(document.extraction_revision), locator: chunk.locator, chunkId: chunk.chunkId }] : chunk.supportAnchors,
             documentId,
             title: result?.title ?? "",
             sourceType: result?.sourceType ?? "",
@@ -416,7 +527,11 @@ export class DocumentationEnrichmentService {
             uri: result?.uri
           },
           text: chunk.text
-        });
+        };
+        const nextChars = JSON.stringify(item).length;
+        if (nextChars > ANSWER_EVIDENCE_TARGET_CHARS) throw new Error("Answer evidence item exceeds the supported context limit.");
+        if (evidenceChars + nextChars > ANSWER_EVIDENCE_TARGET_CHARS) return evidence;
+        evidence.push(item);
         evidenceChars += nextChars;
       }
     }
@@ -444,29 +559,7 @@ export class DocumentationEnrichmentService {
     const extracted = path.join(path.dirname(snapshot), "extracted");
     const structuredArtifacts = await documentArtifactEvidence(document, root, extracted);
     signal?.throwIfAborted();
-    if (structuredArtifacts.length > 0) {
-      return structuredArtifacts;
-    }
-    if (!fs.existsSync(extracted)) {
-      if (availableArtifacts.length > 0) {
-        throw new Error(sharedArtifactFilesystemMessage(`extracted artifact directory is missing for ${snapshotPath}`));
-      }
-      return [];
-    }
-    const paths = await listFiles(extracted, signal);
-    const artifacts: ArtifactEvidence[] = [];
-    for (const artifactPath of paths) {
-      signal?.throwIfAborted();
-      const relativePath = path.relative(root, artifactPath);
-      const stat = await fsp.stat(artifactPath);
-      artifacts.push({
-        path: artifactPath,
-        archivePath: relativePath,
-        bytes: stat.size,
-        kind: artifactKind(artifactPath)
-      });
-    }
-    return artifacts;
+    return structuredArtifacts;
   }
 
   private async archiveRoot(signal?: AbortSignal): Promise<string | undefined> {
@@ -478,7 +571,7 @@ export class DocumentationEnrichmentService {
     const snapshotPath = optionalRecordString(document, "snapshot_path");
     const hasMediaSuffix = snapshotPath && /\.(mp3|wav|m4a|aac|ogg|webm|mp4|mov|mkv|avi)$/iu.test(snapshotPath);
     const sourceChunks = recordsArray(document.chunks).filter((chunk) => chunk.chunk_origin === "source");
-    const retainsStructuredEvidence = sourceChunks.some((chunk) => chunk.locator !== "text");
+    const retainsStructuredEvidence = sourceChunks.some((chunk) => chunk.locator !== "text" && chunk.locator !== "media source");
     const hasTextChunks = sourceChunks.length > 0 && sourceChunks.every((chunk) => chunk.locator === "text");
     if (!snapshotPath || retainsStructuredEvidence) {
       return undefined;
@@ -600,8 +693,7 @@ export class DocumentationEnrichmentService {
     };
   }
 
-  private enrichmentModel(skillIds: string[], evidence: EnrichmentEvidence): string {
-    const imageAnalysis = usesImageAnalysis(skillIds, evidence);
+  private enrichmentModel(imageAnalysis: boolean): string {
     return this.configuredModel(
       imageAnalysis ? DOCUMENTATION_AI_IMAGE_ANALYSIS_MODEL_KEY : DOCUMENTATION_AI_TEXT_ANALYSIS_MODEL_KEY,
       imageAnalysis ? DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL : this.options.runner.model
@@ -627,6 +719,8 @@ interface ArtifactEvidence {
   archivePath: string;
   bytes: number;
   kind: string;
+  origin: string;
+  producerRunId?: string;
   mimeType?: string;
   locator?: string;
   id?: string;
@@ -660,16 +754,15 @@ interface MediaEvidence {
   keyframes: Array<{ path: string; offsetSeconds?: number }>;
 }
 
-interface EnrichmentOutput {
-  summary: string;
-  spans: Array<{ locator: string; text: string }>;
-  metadata: Record<string, string | number | boolean | null>;
-  warnings: string[];
-}
 
 interface AnswerEvidence {
+  evidenceId: string;
   result: {
     chunkId?: number;
+    extractionRevision: string;
+    origin: string;
+    kind: string;
+    supportAnchors: DocumentationSupportAnchor[];
     documentId: string;
     title: string;
     sourceType: string;
@@ -689,6 +782,9 @@ interface AnswerResultRef {
 
 interface AnswerChunkRef {
   chunkId?: number;
+  origin: string;
+  kind: string;
+  supportAnchors: DocumentationSupportAnchor[];
   locator: string;
   text: string;
 }
@@ -696,7 +792,7 @@ interface AnswerChunkRef {
 interface AnswerOutput {
   answer: string;
   answerHtml: string;
-  citations: Array<{ documentId: string; title: string; locator: string }>;
+  citations: Array<AnswerEvidence["result"]>;
   warnings: string[];
 }
 
@@ -704,12 +800,12 @@ interface EnrichmentEvidence {
   document: Record<string, unknown>;
   chunks: DocumentChunkEvidence[];
   artifacts: ArtifactEvidence[];
-  media?: MediaEvidence;
 }
 
 interface DocumentChunkEvidence {
-  locator: unknown;
-  origin: unknown;
+  chunkId: number;
+  locator: string;
+  origin: string;
   text: string;
 }
 
@@ -724,8 +820,8 @@ interface EnrichmentEvidenceBatch {
   };
   chunks: DocumentChunkEvidence[];
   artifacts: ArtifactEvidence[];
+  supportAnchors: Array<DocumentationSupportAnchor & { id: string }>;
   attachedImages?: AttachedImageEvidence[];
-  media?: BatchedMediaEvidence;
 }
 
 interface AttachedImageEvidence {
@@ -737,21 +833,9 @@ interface AttachedImageEvidence {
   role: string;
 }
 
-interface BatchedMediaEvidence {
-  filename?: string;
-  contentType?: string;
-  sourceType?: string;
-  language?: string;
-  languageProbability?: number;
-  transcriptSegments: Array<{ segmentIndex: number; text: string; startSeconds?: number; endSeconds?: number }>;
-  keyframes: Array<{ path: string; offsetSeconds?: number }>;
-}
-
 type EvidenceBatchItem =
   | { kind: "chunk"; value: DocumentChunkEvidence }
-  | { kind: "artifact"; value: ArtifactEvidence }
-  | { kind: "transcript"; value: { segmentIndex: number; text: string; startSeconds?: number; endSeconds?: number } }
-  | { kind: "keyframe"; value: { path: string; offsetSeconds?: number } };
+  | { kind: "artifact"; value: ArtifactEvidence };
 
 function uniqueDocuments(response: Record<string, unknown>): IngestedDocumentRef[] {
   const documents = [
@@ -779,12 +863,6 @@ function configuredSkillIds(value: unknown): string[] {
     .map((skillId) => skillId.trim())
     .filter(Boolean);
   return skillIds.length > 0 ? skillIds : DEFAULT_DOCUMENTATION_ENRICHMENT_SKILL_IDS;
-}
-
-function usesImageAnalysis(skillIds: string[], evidence: EnrichmentEvidence): boolean {
-  return skillIds.some((skillId) => /(?:visual|image)/iu.test(skillId))
-    || evidence.artifacts.length > 0
-    || Boolean(evidence.media?.keyframes.length);
 }
 
 function requiredQuestion(input: Record<string, unknown>): string {
@@ -841,15 +919,21 @@ function answerChunkIds(results: AnswerResultRef[]): number[] {
   return [...new Set(results.map((result) => result.chunkId).filter((chunkId): chunkId is number => typeof chunkId === "number"))];
 }
 
-function selectAnswerChunks(chunks: Record<string, unknown>[], results: AnswerResultRef[]): AnswerChunkRef[] {
+function selectAnswerChunks(chunks: Record<string, unknown>[], results: AnswerResultRef[], documentId: string, extractionRevision: string): AnswerChunkRef[] {
   const sourceChunks = chunks
-    .filter((chunk) => chunk.chunk_origin !== "ai" && chunk.chunkOrigin !== "ai")
+    .filter((chunk) => chunk.state === "active" && Number.isSafeInteger(chunk.chunk_id) && chunk.chunk_kind !== "diagnostic" && ((chunk.chunk_origin === "source" || chunk.chunk_origin === "media") || Array.isArray(chunk.supportAnchors) && chunk.supportAnchors.length > 0))
     .map((chunk): AnswerChunkRef => ({
-      chunkId: typeof chunk.chunk_id === "number" ? chunk.chunk_id : typeof chunk.chunkId === "number" ? chunk.chunkId : undefined,
+      chunkId: typeof chunk.chunk_id === "number" ? chunk.chunk_id : undefined,
+      origin: String(chunk.chunk_origin),
+      kind: typeof chunk.chunk_kind === "string" ? chunk.chunk_kind : "content",
+      supportAnchors: recordsArray(chunk.supportAnchors).map((anchor) => {
+        if (typeof anchor.documentId !== "string" || !validExtractionRevision(anchor.extractionRevision) || typeof anchor.locator !== "string" || !(Number.isSafeInteger(anchor.chunkId) || typeof anchor.artifactId === "string")) throw new Error("Invalid answer support anchor.");
+        return anchor as unknown as DocumentationSupportAnchor;
+      }),
       locator: typeof chunk.locator === "string" ? chunk.locator : "",
       text: typeof chunk.text === "string" ? chunk.text : ""
     }))
-    .filter((chunk) => chunk.locator && chunk.text);
+    .filter((chunk) => chunk.locator && chunk.text && chunk.supportAnchors.every((anchor) => anchor.documentId === documentId && anchor.extractionRevision === extractionRevision));
   const documentChars = sourceChunks.reduce((total, chunk) => total + chunk.text.length, 0);
   if (documentChars <= ANSWER_DOCUMENT_TARGET_CHARS) {
     return sourceChunks;
@@ -890,12 +974,27 @@ function nextWindowOffset(value: unknown, fallbackOffset: number, count: number)
   return offset + Math.max(limit, count);
 }
 
+function portableBatchEvidence(batch: EnrichmentEvidenceBatch): EnrichmentEvidenceBatch {
+  return {
+    ...batch,
+    artifacts: batch.artifacts.map((artifact) => ({
+      ...artifact,
+      path: artifact.archivePath,
+      imagePath: artifact.imageArchivePath,
+      jsonPath: artifact.jsonArchivePath,
+      descriptionPath: artifact.descriptionArchivePath
+    })),
+    attachedImages: batch.attachedImages?.map((image) => ({ ...image, path: image.archivePath! }))
+  };
+}
+
 function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEvidenceBatch): string {
   return [
     "You are improving a CloudX documentation archive import.",
     "Use only the configured skills below and the provided source-grounded evidence.",
     "Return only JSON matching the requested schema.",
-    "Create derived spans that make missing metadata, tables, graphs, flowcharts, screenshots, media transcript details, and extraction gaps searchable.",
+    "Create content spans for source-grounded domain facts. Every content span must reference one or more supportAnchorIds from this batch's supportAnchors list.",
+    "Use kind diagnostic for extraction failures, tool availability, processor status, uncertainty about missing evidence, and workflow recommendations. Diagnostics are retained as run metadata and never indexed as domain content. Diagnostics may have no supportAnchorIds.",
     "When `attachedImages` is non-empty, those files are attached to this Codex exec request. Inspect the attached image pixels directly instead of relying only on OCR, filenames, or heuristic metadata.",
     "Large imports are split so each Codex exec request receives a bounded number of attached images. Every attached image group is processed by a separate request.",
     "For schematic artifacts, extract detailed visual facts from the rendered schematic image: visible components/reference designators, component roles or values when legible, pin/net labels, power and ground symbols, and how wires connect components and nets.",
@@ -904,7 +1003,7 @@ function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEviden
     "Do not invent facts not grounded in the document chunks, extracted artifacts, ASR transcript, or keyframe evidence.",
     "When the evidence is insufficient, describe the limitation in warnings instead of guessing.",
     "Return `metadata` as an array of { key, value } entries so each metadata value is source-grounded and explicitly named.",
-    `This is evidence batch ${evidence.batch.index} of ${evidence.batch.total}. Process this batch only; CloudX will run every batch and merge all returned spans and warnings.`,
+    `This is evidence batch ${evidence.batch.index}. Process only this batch. The archive checkpoints each output and publishes a complete document when all batches finish.`,
     "",
     "Configured skills:",
     JSON.stringify(skills.map((skill) => ({
@@ -922,12 +1021,12 @@ function buildEnrichmentPrompt(skills: CloudxSkill[], evidence: EnrichmentEviden
 function buildAnswerPrompt(question: string, evidence: AnswerEvidence[]): string {
   return [
     "You answer questions using the CloudX documentation archive.",
-    "Use only the source chunks below. If the chunks are insufficient, say what is missing in warnings.",
+    "Use only the evidence below. Preserve the origin of each claim: source is extracted source text; ai and media are derived evidence with retained support anchors. If evidence is insufficient, say what is missing in warnings.",
     "Return only JSON matching the requested schema.",
     "Return `answer` as concise plaintext and `answerHtml` as semantic HTML using only these tags: div, section, h4, h5, p, ol, ul, li, strong, em, code, pre, blockquote, table, thead, tbody, tr, th, and td. Do not include attributes, scripts, styles, images, links, forms, or iframes.",
     "Use short sections, paragraphs, lists, or tables in `answerHtml`; do not put numbered steps into one long paragraph.",
     "For procedural content such as recipes, include enough concrete steps and ingredients from the source chunks for the user to act manually.",
-    "Citations must reference documentId, title, and locator from the evidence.",
+    "Each citation must reference an evidenceId from this evidence. The application resolves the citation identity and source-vs-derived origin; never invent an evidenceId.",
     "",
     `Question: ${question}`,
     "",
@@ -936,67 +1035,48 @@ function buildAnswerPrompt(question: string, evidence: AnswerEvidence[]): string
   ].join("\n");
 }
 
-function normalizeEnrichmentOutput(value: unknown): EnrichmentOutput {
+function normalizeEnrichmentOutput(value: unknown, evidence: EnrichmentEvidenceBatch): DocumentationEnrichmentBatchOutput {
   const record = getRecord(value, "enrichment output");
-  return {
-    summary: typeof record.summary === "string" ? record.summary.trim() : "",
-    spans: recordsArray(record.spans)
-      .map((span) => ({
-        locator: typeof span.locator === "string" ? span.locator.trim() : "",
-        text: typeof span.text === "string" ? span.text.trim() : ""
-      }))
-      .filter((span) => span.locator && span.text),
-    metadata: metadataEntriesRecord(record.metadata),
-    warnings: arrayOfStrings(record.warnings)
-  };
-}
-
-function normalizeAnswerOutput(value: unknown): AnswerOutput {
-  const record = getRecord(value, "answer output");
-  return {
-    answer: typeof record.answer === "string" ? record.answer.trim() : "",
-    answerHtml: typeof record.answerHtml === "string" ? record.answerHtml.trim() : "",
-    citations: recordsArray(record.citations)
-      .map((citation) => ({
-        documentId: typeof citation.documentId === "string" ? citation.documentId.trim() : "",
-        title: typeof citation.title === "string" ? citation.title.trim() : "",
-        locator: typeof citation.locator === "string" ? citation.locator.trim() : ""
-      }))
-      .filter((citation) => citation.documentId && citation.title && citation.locator),
-    warnings: arrayOfStrings(record.warnings)
-  };
-}
-
-function mergeEnrichmentOutputs(outputs: EnrichmentOutput[]): EnrichmentOutput {
-  const metadata: Record<string, string | number | boolean | null> = {};
-  for (const [batchIndex, output] of outputs.entries()) {
-    for (const [key, value] of Object.entries(output.metadata)) {
-      const metadataKey = Object.hasOwn(metadata, key) ? `batch_${batchIndex + 1}_${key}` : key;
-      metadata[metadataKey] = value;
-    }
+  if (typeof record.summary !== "string" || !Array.isArray(record.spans) || !Array.isArray(record.metadata) || !Array.isArray(record.warnings) || record.warnings.some((warning) => typeof warning !== "string")) {
+    throw new Error("Invalid structured documentation enrichment output.");
   }
-  return {
-    summary: outputs
-      .map((output, index) => output.summary ? `Batch ${index + 1}: ${output.summary}` : "")
-      .filter(Boolean)
-      .join("\n\n"),
-    spans: outputs.flatMap((output) => output.spans),
-    metadata,
-    warnings: outputs.flatMap((output, index) => output.warnings.map((warning) => `batch ${index + 1}: ${warning}`))
-  };
+  const admitted = new Map(evidence.supportAnchors.map(({ id, ...anchor }) => [id, anchor]));
+  const spans = record.spans.map((value): DocumentationEnrichmentSpan => {
+    const span = getRecord(value, "enrichment span");
+    if (typeof span.locator !== "string" || !span.locator.trim() || typeof span.text !== "string" || !span.text.trim() || !(typeof span.kind === "string" && ["content", "diagnostic"].includes(span.kind)) || !Array.isArray(span.supportAnchorIds) || span.supportAnchorIds.some((id) => typeof id !== "string" || !admitted.has(id))) {
+      throw new Error("Enrichment spans require a kind and valid batch supportAnchorIds.");
+    }
+    const supportAnchors = [...new Set(span.supportAnchorIds as string[])].map((id) => admitted.get(id)!);
+    if (span.kind === "content" && !supportAnchors.length) throw new Error("Enrichment content requires retained source support.");
+    return { locator: span.locator.trim(), text: span.text.trim(), kind: span.kind as "content" | "diagnostic", supportAnchors };
+  });
+  return { summary: record.summary.trim(), spans, metadata: metadataEntriesRecord(record.metadata), warnings: record.warnings as string[] };
+}
+
+function normalizeAnswerOutput(value: unknown, evidence: AnswerEvidence[]): AnswerOutput {
+  const record = getRecord(value, "answer output");
+  if (typeof record.answer !== "string" || typeof record.answerHtml !== "string" || !Array.isArray(record.citations) || !Array.isArray(record.warnings) || record.warnings.some((warning) => typeof warning !== "string")) {
+    throw new Error("Answer output requires text, HTML, citations and string warnings.");
+  }
+  const admitted = new Map(evidence.map((item) => [item.evidenceId, item.result]));
+  const citations = record.citations.map((value) => {
+    const citation = getRecord(value, "answer citation");
+    const source = typeof citation.evidenceId === "string" ? admitted.get(citation.evidenceId) : undefined;
+    if (!source) throw new Error("Answer citation must reference a supplied evidenceId.");
+    return source;
+  });
+  return { answer: record.answer.trim(), answerHtml: record.answerHtml.trim(), citations, warnings: record.warnings as string[] };
 }
 
 function metadataEntriesRecord(value: unknown): Record<string, string | number | boolean | null> {
+  if (!Array.isArray(value)) throw new Error("Enrichment metadata requires an array of named entries.");
   const metadata: Record<string, string | number | boolean | null> = {};
-  for (const entry of recordsArray(value)) {
+  for (const item of value) {
+    const entry = getRecord(item, "enrichment metadata entry");
     const key = typeof entry.key === "string" ? entry.key.trim() : "";
-    if (!key) {
-      continue;
-    }
     const candidate = entry.value;
-    if (typeof candidate === "string" || typeof candidate === "number" || typeof candidate === "boolean" || candidate === null) {
-      metadata[key] = candidate;
-    }
+    if (!key || Object.hasOwn(metadata, key) || !(typeof candidate === "string" || typeof candidate === "boolean" || candidate === null || typeof candidate === "number" && Number.isFinite(candidate))) throw new Error("Enrichment metadata requires unique names and scalar values.");
+    Object.defineProperty(metadata, key, { value: candidate, enumerable: true, configurable: true, writable: true });
   }
   return metadata;
 }
@@ -1009,7 +1089,8 @@ function documentSummary(document: Record<string, unknown>): Record<string, unkn
     uri: document.uri,
     collection: document.collection,
     contentSha256: document.content_sha256,
-    snapshotPath: document.snapshot_path
+    snapshotPath: document.snapshot_path,
+    extractionRevision: document.extraction_revision
   };
 }
 
@@ -1033,6 +1114,8 @@ async function documentArtifactEvidence(document: Record<string, unknown>, archi
       archivePath: path.relative(archiveRoot, artifactPath),
       bytes: typeof artifact.bytes === "number" ? artifact.bytes : stat.size,
       kind: typeof artifact.kind === "string" ? artifact.kind : artifactKind(relativePath),
+      origin: optionalRecordString(artifact, "artifactOrigin") ?? "source",
+      producerRunId: optionalRecordString(artifact, "producerRunId"),
       mimeType: optionalRecordString(artifact, "mimeType"),
       locator: optionalRecordString(artifact, "locator"),
       id: optionalRecordString(artifact, "id"),
@@ -1064,52 +1147,35 @@ function availableArtifactRecords(document: Record<string, unknown>): Record<str
 
 function documentChunks(document: Record<string, unknown>): DocumentChunkEvidence[] {
   return recordsArray(document.chunks)
-    .filter((chunk) => chunk.chunk_origin !== "ai")
-    .map((chunk) => ({
-      locator: chunk.locator,
-      origin: chunk.chunk_origin,
-      text: typeof chunk.text === "string" ? chunk.text : ""
-    }))
-    .filter((chunk) => chunk.text);
+    .filter((chunk) => chunk.chunk_origin === "source" || chunk.chunk_origin === "media")
+    .map((chunk) => {
+      if (!Number.isSafeInteger(chunk.chunk_id) || typeof chunk.locator !== "string" || typeof chunk.text !== "string") throw new Error("Documentation source chunks require retained identity, locator and text.");
+      return { chunkId: Number(chunk.chunk_id), locator: chunk.locator, origin: String(chunk.chunk_origin), text: chunk.text };
+    }).filter((chunk) => chunk.text.trim());
 }
 
 function buildEvidenceBatches(evidence: EnrichmentEvidence): EnrichmentEvidenceBatch[] {
   const items = buildEvidenceItems(evidence);
   const grouped = groupEvidenceItems(items);
-  return grouped.map((batchItems, index) => evidenceBatch(evidence, batchItems, index + 1, grouped.length));
+  return grouped.map((batchItems, index) => evidenceBatch(evidence, batchItems, index, grouped.length));
 }
 
 function buildEvidenceItems(evidence: EnrichmentEvidence): EvidenceBatchItem[] {
   const items: EvidenceBatchItem[] = [];
-  const remainingArtifacts = new Set(evidence.artifacts);
+  const artifactsByLocator = new Map<string, ArtifactEvidence[]>();
+  for (const artifact of evidence.artifacts) {
+    const locator = artifact.locator ?? "";
+    const group = artifactsByLocator.get(locator) ?? [];
+    group.push(artifact);
+    artifactsByLocator.set(locator, group);
+  }
   for (const chunk of evidence.chunks) {
     items.push({ kind: "chunk", value: chunk });
-    for (const artifact of evidence.artifacts) {
-      if (remainingArtifacts.has(artifact) && artifactMatchesChunk(artifact, chunk)) {
-        items.push({ kind: "artifact", value: artifact });
-        remainingArtifacts.delete(artifact);
-      }
-    }
+    for (const artifact of artifactsByLocator.get(chunk.locator) ?? []) items.push({ kind: "artifact", value: artifact });
+    artifactsByLocator.delete(chunk.locator);
   }
-  for (const artifact of evidence.artifacts) {
-    if (remainingArtifacts.has(artifact)) {
-      items.push({ kind: "artifact", value: artifact });
-    }
-  }
-  items.push(...mediaTranscriptSegments(evidence.media).map((value) => ({ kind: "transcript" as const, value })));
-  items.push(...(evidence.media?.keyframes ?? []).map((value) => ({ kind: "keyframe" as const, value })));
+  for (const artifacts of artifactsByLocator.values()) for (const artifact of artifacts) items.push({ kind: "artifact", value: artifact });
   return items;
-}
-
-function artifactMatchesChunk(artifact: ArtifactEvidence, chunk: DocumentChunkEvidence): boolean {
-  const chunkLocator = typeof chunk.locator === "string" ? chunk.locator : "";
-  if (artifact.locator && artifact.locator === chunkLocator) {
-    return true;
-  }
-  if (artifact.id && (chunkLocator.includes(artifact.id) || chunk.text.includes(artifact.id))) {
-    return true;
-  }
-  return Boolean(artifact.archivePath && chunk.text.includes(path.basename(artifact.archivePath)));
 }
 
 function groupEvidenceItems(items: EvidenceBatchItem[]): EvidenceBatchItem[][] {
@@ -1123,6 +1189,7 @@ function groupEvidenceItems(items: EvidenceBatchItem[]): EvidenceBatchItem[][] {
   for (const item of items) {
     const itemChars = JSON.stringify(item).length;
     const itemImages = imageAttachmentCountForItem(item);
+    if (itemChars > ENRICHMENT_BATCH_TARGET_CHARS || itemImages > ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE) throw new Error("Documentation evidence item exceeds the batch limit.");
     if (current.length > 0 && (currentChars + itemChars > ENRICHMENT_BATCH_TARGET_CHARS || currentImages + itemImages > ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE)) {
       groups.push(current);
       current = [];
@@ -1143,9 +1210,6 @@ function imageAttachmentCountForItem(item: EvidenceBatchItem): number {
   if (item.kind === "artifact") {
     return attachedImagesForArtifact(item.value).length;
   }
-  if (item.kind === "keyframe") {
-    return isReadableImagePath(item.value.path) ? 1 : 0;
-  }
   return 0;
 }
 
@@ -1158,30 +1222,28 @@ function evidenceBatch(evidence: EnrichmentEvidence, items: EvidenceBatchItem[],
       itemCount: items.length
     },
     chunks: [],
-    artifacts: []
+    artifacts: [],
+    supportAnchors: []
   };
   for (const item of items) {
     if (item.kind === "chunk") {
       batch.chunks.push(item.value);
     } else if (item.kind === "artifact") {
       batch.artifacts.push(item.value);
-    } else {
-      batch.media ??= mediaBatchMetadata(evidence.media);
-      if (item.kind === "transcript") {
-        batch.media.transcriptSegments.push(item.value);
-      } else {
-        batch.media.keyframes.push(item.value);
-      }
     }
+  }
+  const documentId = String(evidence.document.documentId);
+  const extractionRevision = String(evidence.document.extractionRevision);
+  for (const chunk of batch.chunks) batch.supportAnchors.push({ id: `chunk:${chunk.chunkId}`, documentId, extractionRevision, locator: chunk.locator, chunkId: chunk.chunkId });
+  for (const artifact of batch.artifacts) {
+    if (!artifact.id || !artifact.locator) throw new Error("Documentation artifacts require retained identity and locator.");
+    batch.supportAnchors.push({ id: `artifact:${artifact.id}`, documentId, extractionRevision, locator: artifact.locator, artifactId: artifact.id });
   }
   const attachedImages = attachedImagesForBatch(batch);
   if (attachedImages.length > 0) {
     batch.attachedImages = attachedImages;
     batch.batch.attachedImageBatchSize = ENRICHMENT_IMAGE_ATTACHMENT_BATCH_SIZE;
     batch.batch.attachedImageCount = attachedImages.length;
-  }
-  if (evidence.media && !batch.media && total === 1) {
-    batch.media = mediaBatchMetadata(evidence.media);
   }
   return batch;
 }
@@ -1191,15 +1253,6 @@ function attachedImagesForBatch(batch: EnrichmentEvidenceBatch): AttachedImageEv
   for (const artifact of batch.artifacts) {
     for (const image of attachedImagesForArtifact(artifact)) {
       images.set(image.path, image);
-    }
-  }
-  for (const keyframe of batch.media?.keyframes ?? []) {
-    if (isReadableImagePath(keyframe.path)) {
-      images.set(keyframe.path, {
-        path: keyframe.path,
-        role: "media keyframe",
-        locator: keyframe.offsetSeconds !== undefined ? `media keyframe ${keyframe.offsetSeconds}s` : "media keyframe"
-      });
     }
   }
   return [...images.values()];
@@ -1234,43 +1287,6 @@ function batchImagePaths(batch: EnrichmentEvidenceBatch): string[] {
   return (batch.attachedImages ?? []).map((image) => image.path);
 }
 
-function mediaBatchMetadata(media: MediaEvidence | undefined): BatchedMediaEvidence {
-  return {
-    filename: media?.filename,
-    contentType: media?.contentType,
-    sourceType: media?.sourceType,
-    language: media?.language,
-    languageProbability: media?.languageProbability,
-    transcriptSegments: [],
-    keyframes: []
-  };
-}
-
-function mediaTranscriptSegments(media: MediaEvidence | undefined): Array<{ segmentIndex: number; text: string; startSeconds?: number; endSeconds?: number }> {
-  if (media?.transcriptSegments?.length) {
-    return media.transcriptSegments
-      .filter((segment) => segment.text.trim())
-      .map((segment, index) => ({
-        segmentIndex: index + 1,
-        text: segment.text,
-        startSeconds: segment.startSeconds,
-        endSeconds: segment.endSeconds
-      }));
-  }
-  return transcriptSegments(media?.transcript);
-}
-
-function transcriptSegments(transcript: string | undefined): Array<{ segmentIndex: number; text: string }> {
-  if (!transcript?.trim()) {
-    return [];
-  }
-  const segments: Array<{ segmentIndex: number; text: string }> = [];
-  for (const text of splitText(transcript, TRANSCRIPT_SEGMENT_TARGET_CHARS)) {
-    segments.push({ segmentIndex: segments.length + 1, text });
-  }
-  return segments;
-}
-
 function splitText(text: string, targetChars: number): string[] {
   const normalized = text.trim();
   if (!normalized) {
@@ -1294,35 +1310,34 @@ function splitText(text: string, targetChars: number): string[] {
   return segments.filter(Boolean);
 }
 
-function evidenceSummary(evidence: EnrichmentEvidence, batches: EnrichmentEvidenceBatch[]): Record<string, unknown> {
-  const transcript = evidence.media?.transcript ?? "";
-  return {
-    chunkCount: evidence.chunks.length,
-    artifactCount: evidence.artifacts.length,
-    mediaTranscriptChars: transcript.length,
-    keyframeCount: evidence.media?.keyframes.length ?? 0,
-    batchCount: batches.length,
-    batchItemCounts: batches.map((batch) => batch.batch.itemCount)
-  };
+async function* concatenateEvidence(...sources: AsyncGenerator<EnrichmentEvidence>[]): AsyncGenerator<EnrichmentEvidence> {
+  for (const source of sources) yield* source;
 }
 
-async function listFiles(root: string, signal?: AbortSignal): Promise<string[]> {
-  const files: string[] = [];
-  async function walk(directory: string): Promise<void> {
+function validExtractionRevision(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{32}$/u.test(value);
+}
+
+function enrichmentSpanIdentity(span: DocumentationEnrichmentSpan): string {
+  const text = span.text.normalize("NFKC").replace(/\s+/gu, " ").trim();
+  const anchors = span.supportAnchors.map((anchor) => `${anchor.documentId}:${anchor.extractionRevision}:${anchor.chunkId !== undefined ? `chunk:${anchor.chunkId}` : `artifact:${anchor.artifactId}`}`).sort();
+  return createHash("sha256").update(JSON.stringify([span.kind, text, anchors])).digest("hex");
+}
+
+async function enrichmentBatchFingerprint(prompt: string, model: string, imagePaths: string[], signal?: AbortSignal): Promise<string> {
+  const hash = createHash("sha256").update(model).update("\0").update(prompt);
+  for (const imagePath of imagePaths) {
     signal?.throwIfAborted();
-    const entries = await fsp.readdir(directory, { withFileTypes: true });
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      signal?.throwIfAborted();
-      const entryPath = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        await walk(entryPath);
-      } else if (entry.isFile()) {
-        files.push(entryPath);
-      }
-    }
+    hash.update("\0");
+    for await (const chunk of fs.createReadStream(imagePath, { signal })) hash.update(chunk);
   }
-  await walk(root);
-  return files;
+  return hash.digest("hex");
+}
+
+function enrichmentErrorCode(error: unknown): string {
+  if (error instanceof Error && error.name === "AbortError") return "cancelled";
+  if (error instanceof Error && /not available|requires the ASR|unavailable|model.*not found/iu.test(error.message)) return "unavailable";
+  return "enrichment_failed";
 }
 
 async function containsVideoStream(inputPath: string, signal?: AbortSignal, mediaProcessLauncher?: MediaProcessLauncher): Promise<boolean> {
