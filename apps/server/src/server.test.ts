@@ -2589,15 +2589,26 @@ describe("buildServer", () => {
     vi.spyOn(services.documentation!, "getDocument").mockResolvedValue({
       document: {
         documentId: "closing-document",
+        document_id: "closing-document",
+        title: "Pending guide",
         extraction_revision: "e".repeat(32),
         state: "active",
-        chunks: [],
+        chunks: [{ chunk_id: 1, locator: "text", text: "Retained source evidence.", chunk_origin: "source", state: "active" }],
         artifacts: [],
         chunkWindow: { hasMore: false },
         artifactWindow: { hasMore: false },
       },
     });
     vi.spyOn(services.documentation!, "health").mockResolvedValue({});
+    vi.spyOn(services.documentation!, "beginEnrichmentRun").mockResolvedValue({
+      runId: "closing-run", leaseToken: "closing-lease", extractionRevision: "e".repeat(32), status: "running",
+    });
+    vi.spyOn(services.documentation!, "getEnrichmentMedia").mockResolvedValue({
+      complete: false, chunks: [], artifacts: [], metadata: {},
+      window: { offset: 0, limit: 100, total: 0, hasMore: false },
+    });
+    vi.spyOn(services.documentation!, "lookupEnrichmentBatch").mockResolvedValue({ status: "pending" });
+    const runOutcome = vi.spyOn(services.documentation!, "recordEnrichmentRunOutcome").mockResolvedValue({});
     const enrichmentStarted = deferred<AbortSignal>();
     const abortObserved = deferred<void>();
     const releaseCleanup = deferred<void>();
@@ -2690,6 +2701,7 @@ describe("buildServer", () => {
     await close;
 
     expect(outcome).not.toHaveBeenCalled();
+    expect(runOutcome).toHaveBeenCalledWith("closing-run", expect.objectContaining({ status: "cancelled" }));
     expect(activeEnrichments).toBe(0);
     expect(runner.run).toHaveBeenCalledWith(
       expect.any(String),
@@ -3500,7 +3512,7 @@ describe("buildServer", () => {
         )
         .map((node: { typeId: string }) => node.typeId)
         .sort();
-      expect(catalogNodes).toHaveLength(122);
+      expect(catalogNodes).toHaveLength(129);
       expect(portsMissingDescriptions).toEqual([]);
       expect(weakPortDescriptions).toEqual([]);
       expect(execOnlyFunctionNodes).toEqual([
@@ -3518,6 +3530,9 @@ describe("buildServer", () => {
           expect.objectContaining({ typeId: "hook:jira.filters.select" }),
           expect.objectContaining({ typeId: "hook:documentation.documents.reanalyze" }),
           expect.objectContaining({ typeId: "hook:documentation.documents.reenrich" }),
+          expect.objectContaining({ typeId: "hook:documentation.documents.checkRevision" }),
+          expect.objectContaining({ typeId: "hook:documentation.documents.refresh" }),
+          expect.objectContaining({ typeId: "hook:documentation.documents.purge" }),
           expect.objectContaining({
             typeId: "hook:workspace.layoutTemplates.apply",
           }),

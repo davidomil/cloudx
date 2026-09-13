@@ -12,13 +12,23 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["locator", "text"],
+        "required": ["locator", "text", "kind", "supportAnchorIds"],
         "properties": {
           "locator": {
             "type": "string"
           },
           "text": {
             "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["content", "diagnostic"]
+          },
+          "supportAnchorIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       }
@@ -35,10 +45,18 @@
           },
           "value": {
             "anyOf": [
-              { "type": "string" },
-              { "type": "number" },
-              { "type": "boolean" },
-              { "type": "null" }
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
             ]
           }
         }

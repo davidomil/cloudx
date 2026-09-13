@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import json
 import re
@@ -133,6 +134,14 @@ class VendorCodeSource:
     source_uri: str
 
 
+def source_bundle(sources: list[VendorCodeSource]) -> bytes:
+    return json.dumps({"schemaVersion": 2, "sources": [
+        {"relativePath": source.relative_path, "sourceUri": source.source_uri,
+         "sha256": hashlib.sha256(source.content).hexdigest(), "contentBase64": base64.b64encode(source.content).decode("ascii")}
+        for source in sorted(sources, key=lambda item: item.relative_path)
+    ]}, sort_keys=True).encode("utf-8")
+
+
 @dataclass(frozen=True)
 class CodeSymbol:
     kind: str
@@ -180,7 +189,7 @@ def code_review_required_message(label: str, count: int) -> str:
     plural = "file" if count == 1 else "files"
     return (
         f"Code-heavy documentation ingest requires generated documentation review for {count} code {plural} in {label}. "
-        "Re-run with acceptGeneratedCodeDocumentation=true to store generated Markdown instead of indexing raw code. Add retainRawCodeArtifacts=true only when raw source artifacts should be retained."
+        "Re-run with acceptGeneratedCodeDocumentation=true to store generated Markdown instead of indexing raw code. Original source files are retained in the rebuild bundle. Add retainRawCodeArtifacts=true to expose individual raw source artifacts."
     )
 
 
@@ -347,9 +356,9 @@ def integration_hazards(text: str) -> list[str]:
 def code_document_summary(title: str, uri: str, analyses: list[CodeFileAnalysis], retain_raw_source: bool) -> str:
     languages = ", ".join(sorted({analysis.language for analysis in analyses}))
     raw_source_handling = (
-        "retained as explicit artifacts under `extracted/vendor_code/source/` and not indexed as raw source chunks"
+        "retained in the original source bundle and exposed as individual artifacts under `extracted/vendor_code/source/`; raw source bodies are not indexed"
         if retain_raw_source
-        else "not retained and not indexed as raw source chunks"
+        else "retained in the original source bundle for rebuilding; individual raw artifacts are not exposed and raw source bodies are not indexed"
     )
     return "\n".join(
         [
@@ -367,7 +376,7 @@ def code_document_summary(title: str, uri: str, analyses: list[CodeFileAnalysis]
 
 
 def code_file_markdown(analysis: CodeFileAnalysis, retain_raw_source: bool) -> str:
-    source_line = f"- Source artifact: `{analysis.artifact_path}`" if retain_raw_source else "- Source artifact: not retained for this ingest."
+    source_line = f"- Source artifact: `{analysis.artifact_path}`" if retain_raw_source else "- Original source: retained in the rebuild bundle; no individual raw artifact is exposed."
     lines = [
         f"## {analysis.relative_path}",
         "",
@@ -417,7 +426,8 @@ def code_manifest(title: str, uri: str, analyses: list[CodeFileAnalysis], retain
         "generatedAt": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "policy": "documentation-first",
         "rawSourceIndexed": False,
-        "rawSourceRetained": retain_raw_source,
+        "rawSourceRetained": True,
+        "rawSourceArtifactsExposed": retain_raw_source,
         "rawSourceArtifactRoot": VENDOR_CODE_SOURCE_DIR if retain_raw_source else None,
         "coveredFiles": [
             {

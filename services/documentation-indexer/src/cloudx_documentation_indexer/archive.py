@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import hashlib
 import ipaddress
 import io
@@ -21,12 +22,13 @@ import threading
 import time
 import zipfile
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import version
+from itertools import islice
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -35,6 +37,17 @@ import httpx
 import numpy as np
 from PIL import Image
 from turbovec import IdMapIndex
+
+from .catalog_schema import SCHEMA_VERSION, upgrade_catalog
+from .source_retention import canonical_source_key, processor_fingerprint, retained_source_manifest
+from .media_source import MEDIA_SUFFIXES, looks_like_media
+from .source_admission import detected_content_type
+
+from .semantic import EmbeddingProfile
+from .schematics.domain import GraphArtifactOutput
+
+from .retrieval import ClosingConnection, DenseMatches, EmbeddingCache, SearchIndexCache, SearchSessions, checkpoint_catalog, diverse_results, matching_terms, query_snippet, retrieval_passages, text_digest
+from .portable_catalog import InvalidPortableCatalog, interrupt_transferred_jobs, merge_archive_history, pending_purge_paths, validate_catalog_records, validate_retained_files
 
 from .extraction import (
     ExtractedSpan,
@@ -55,6 +68,7 @@ from .vendor_code import (
     VendorCodeSource,
     code_review_required_message,
     generate_vendor_code_documentation,
+    source_bundle,
     is_supported_code_source_name,
     is_unsupported_code_source_name,
     unsupported_code_source_message,
@@ -72,7 +86,7 @@ except Exception:  # pragma: no cover - import errors should surface only when p
     yt_dlp = None
 
 
-ARCHIVE_SCHEMA_VERSION = 1
+ARCHIVE_SCHEMA_VERSION = SCHEMA_VERSION
 ARCHIVE_EXPORT_SCHEMA_VERSION = 1
 ARCHIVE_EXPORT_MANIFEST_NAME = "documentation-export-manifest.json"
 ARCHIVE_EXPORT_ROOT_NAME = "archive"
@@ -271,22 +285,32 @@ class IndexGeneration:
 
 
 class DocumentationArchive:
-    def __init__(self, root: Path | str):
+    def __init__(self, root: Path | str, *, embedding_profile: EmbeddingProfile | None = None):
+        self.embedding_profile = embedding_profile
+        self.embedding_profile_id = embedding_profile.profile_id if embedding_profile else EMBEDDING_PROFILE_ID
+        self.embedding_dimensions = embedding_profile.dimensions if embedding_profile else EMBEDDING_DIM
+        self.embedding_provenance = embedding_profile.provenance if embedding_profile else {"kind": "diagnostic-feature-hash"}
         self.root = Path(root).resolve()
         self.snapshots_dir = self.root / "snapshots"
-        self.index_dir = self.root / "indexes" / EMBEDDING_PROFILE_ID
+        self.index_dir = self.root / "indexes" / self.embedding_profile_id
         self.db_path = self.root / "catalog.sqlite"
         self.index_path = self.index_dir / "chunks.tvim"
         self.manifest_path = self.index_dir / "manifest.json"
         self.index_projection_path = self.index_dir / "current"
         self.index_generations_dir = self.index_dir / INDEX_GENERATIONS_DIRECTORY
         self._write_lock = threading.RLock()
+        self._search_sessions = SearchSessions()
+        self._search_index_cache = SearchIndexCache()
         self._extraction_slots = threading.BoundedSemaphore(INGEST_CONCURRENCY)
         self.root.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.index_generations_dir.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        with self._connect() as db:
+            if db.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
+                raise ArchiveError("Documentation retrieval requires SQLite WAL journal mode.")
+        self._upgrade_retained_sources()
         self._recover_index_publication()
 
     def health(self) -> dict:
@@ -306,8 +330,11 @@ class DocumentationArchive:
                 "ready": ready,
                 "archiveRoot": str(self.root),
                 "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-                "embeddingProfileId": EMBEDDING_PROFILE_ID,
-                "embeddingDimension": EMBEDDING_DIM,
+                "extractionProcessor": processor_fingerprint(),
+                "capabilities": {"retainedOriginals": True, "sourceRevisions": True, "permanentRevisionDeletion": True, "durableEnrichment": True, "schematicGraphSchema": 2},
+                "embeddingProfileId": self.embedding_profile_id,
+                "embeddingProfile": self.embedding_provenance,
+                "embeddingDimension": self.embedding_dimensions,
                 "turbovecIndexPath": str(self.index_path),
                 "portable": True,
                 "indexProjection": {
@@ -367,7 +394,8 @@ class DocumentationArchive:
         return {
             "archiveRoot": str(self.root),
             "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-            "embeddingProfileId": EMBEDDING_PROFILE_ID,
+            "embeddingProfileId": self.embedding_profile_id,
+            "embeddingProfile": self.embedding_provenance,
             "turbovecDistribution": TURBOVEC_DISTRIBUTION,
             "turbovecVersion": TURBOVEC_VERSION,
             "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
@@ -416,7 +444,7 @@ class DocumentationArchive:
             with self._write_lock:
                 report_progress(progress, stage="Checking imported index.", progress=65)
                 self._prepare_import_index(package.archive_root)
-                candidate = DocumentationArchive(package.archive_root)
+                candidate = DocumentationArchive(package.archive_root, embedding_profile=self.embedding_profile)
                 rebuild_manifest = json.loads(candidate.manifest_path.read_text(encoding="utf-8"))
                 archive_size = candidate._archive_size(candidate._archive_files())
                 report_progress(progress, stage="Replacing archive.", progress=95)
@@ -442,10 +470,13 @@ class DocumentationArchive:
                 imported_generation = self._prepare_import_index(package.archive_root) if empty_catalog else None
                 imported_snapshot_paths = self._imported_snapshot_paths(package.archive_root)
                 try:
+                    if imported_generation is None:
+                        with sqlite3.connect(package.archive_root / "catalog.sqlite") as imported_db:
+                            self.prepare_embeddings(row[0] for row in imported_db.execute("SELECT text FROM chunks WHERE state = 'active'"))
                     report_progress(progress, stage="Merging records.", progress=65)
                     summary, generation = self._publish_catalog_change(
                         lambda db: self._merge_archive_root(package.archive_root, db, preserve_chunk_ids=empty_catalog),
-                        progress=progress, append_chunks_only=True, imported_generation=imported_generation,
+                        progress=progress, imported_generation=imported_generation,
                     )
                 except Exception:
                     for snapshot_path in imported_snapshot_paths:
@@ -534,6 +565,7 @@ class DocumentationArchive:
                 WHERE d.state = ?
                   AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.document_id = d.document_id AND c.chunk_origin = 'ai')
                   AND NOT EXISTS (SELECT 1 FROM document_enrichment_outcomes o WHERE o.document_id = d.document_id)
+                  AND NOT EXISTS (SELECT 1 FROM enrichment_runs r WHERE r.document_id = d.document_id AND r.extraction_revision = d.extraction_revision AND r.status IN ('running','complete'))
                 ORDER BY d.created_at, d.document_id
                 LIMIT ?
                 """,
@@ -625,17 +657,26 @@ class DocumentationArchive:
         chunk_offset: int | None = None,
         chunk_limit: int | None = None,
         chunk_ids: list[int] | None = None,
+        chunk_locators: list[str] | None = None,
+        chunk_origins: list[str] | None = None,
         chunk_context: int | None = None,
         chunk_text_max_chars: int | None = None,
+        artifact_origins: list[str] | None = None,
         artifact_offset: int | None = None,
         artifact_limit: int | None = None,
         include_enrichments: bool = True,
         include_events: bool = True,
     ) -> dict:
+        if artifact_origins is not None and (not artifact_origins or set(artifact_origins) - {"source", "media"} or len(artifact_origins) > 2):
+            raise ArchiveError("artifactOrigins must select source or media.")
         chunk_offset = normalized_window_value(chunk_offset, "chunk_offset")
         artifact_offset = normalized_window_value(artifact_offset, "artifact_offset")
         chunk_limit = normalized_window_value(chunk_limit, "chunk_limit") if chunk_limit is not None else None
+        if chunk_origins is not None and (not chunk_origins or len(chunk_origins) > 3 or set(chunk_origins) - {"source", "ai", "media"} or chunk_ids is not None):
+            raise ArchiveError("chunkOrigins must select source, ai or media and cannot combine with chunkIds.")
         chunk_ids = normalized_chunk_ids(chunk_ids)
+        if chunk_locators is not None and (chunk_ids is not None or not 1 <= len(chunk_locators) <= 100 or any(not isinstance(locator, str) or not locator.strip() or len(locator) > 1000 for locator in chunk_locators)):
+            raise ArchiveError("chunkLocators requires 1 to 100 exact locators and cannot be combined with chunkIds.")
         chunk_context = normalized_chunk_context(chunk_context)
         if chunk_ids is not None and (chunk_offset != 0 or chunk_limit is not None):
             raise ArchiveError("chunkIds cannot be combined with chunkOffset or chunkLimit.")
@@ -648,8 +689,16 @@ class DocumentationArchive:
                 raise ArchiveError(f"Unknown document: {document_id}")
             chunk_total = int(db.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ?", (document_id,)).fetchone()[0])
             if chunk_ids is None:
-                chunk_sql = "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id FROM chunks WHERE document_id = ? ORDER BY chunk_id"
+                chunk_where = f"document_id = ? AND {published_chunk_sql()}"
                 chunk_params: list[str | int] = [document_id]
+                if chunk_origins is not None:
+                    chunk_where += " AND chunk_origin IN (" + ",".join("?" for _ in chunk_origins) + ")"
+                    chunk_params.extend(chunk_origins)
+                if chunk_locators is not None:
+                    chunk_where += " AND chunk_origin = 'source' AND locator IN (" + ",".join("?" for _ in chunk_locators) + ")"
+                    chunk_params.extend(chunk_locators)
+                chunk_total = db.execute("SELECT COUNT(*) FROM chunks WHERE " + chunk_where, chunk_params).fetchone()[0]
+                chunk_sql = "SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id, support_json FROM chunks WHERE " + chunk_where + " ORDER BY chunk_id"
                 if chunk_limit is not None:
                     chunk_sql += " LIMIT ? OFFSET ?"
                     chunk_params.extend([chunk_limit, chunk_offset])
@@ -661,7 +710,7 @@ class DocumentationArchive:
                     placeholders = ", ".join("?" for _ in selected_ids)
                     chunks = db.execute(
                         f"""
-                        SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id
+                        SELECT chunk_id, locator, text, state, chunk_origin, enrichment_id, support_json
                         FROM chunks
                         WHERE document_id = ? AND chunk_id IN ({placeholders})
                         ORDER BY chunk_id
@@ -684,35 +733,147 @@ class DocumentationArchive:
                 "SELECT * FROM invalidation_events WHERE document_id = ? ORDER BY created_at DESC",
                 (document_id,),
             ).fetchall() if include_events else []
+            processing_runs = db.execute("SELECT run_id,status,extraction_revision,processor_fingerprint,code,error,created_at,updated_at FROM enrichment_runs WHERE document_id = ? ORDER BY created_at DESC LIMIT 20", (document_id,)).fetchall()
             background_enrichment = db.execute(
                 "SELECT status, error, updated_at AS updatedAt FROM document_enrichment_outcomes WHERE document_id = ?",
                 (document_id,),
             ).fetchone()
-            artifact_window = snapshot_artifact_window(document_id, self.root / document["snapshot_path"], offset=artifact_offset, limit=artifact_limit)
+            artifact_window = self._artifact_window(db, document_id, offset=artifact_offset, limit=artifact_limit, origins=artifact_origins)
         result = dict(document)
         result["chunks"] = [document_chunk_dict(row, chunk_text_max_chars) for row in chunks]
+        for chunk in result["chunks"]:
+            chunk["supportAnchors"] = json.loads(chunk.pop("support_json", "[]"))
+        result["sourceManifest"] = json.loads(result.pop("source_manifest_json"))
         result["chunkWindow"] = chunk_window
         result["enrichments"] = [dict(row) for row in enrichments]
         result["events"] = [dict(row) for row in events]
+        result["processingRuns"] = [dict(row) for row in processing_runs]
         result["backgroundEnrichment"] = dict(background_enrichment) if background_enrichment else None
         result["artifacts"] = artifact_window.artifacts
         result["artifactWindow"] = window_metadata(artifact_offset, artifact_limit, artifact_window.total)
         return result
 
+    def _upgrade_retained_sources(self) -> None:
+        from .source_admission import validate_source_container
+        from .legacy_sources import legacy_code_sources
+        created_snapshots, replaced_snapshots = [], []
+        try:
+            with self._connect() as db:
+                documents = db.execute("SELECT * FROM documents WHERE source_manifest_json = '{}' ORDER BY document_id").fetchall()
+                legacy_directories = Counter(Path(row[0]).parent.as_posix() for row in db.execute("SELECT snapshot_path FROM documents")) if documents else {}
+                for document in documents:
+                    snapshot = (self.root / safe_archive_relative_path(document["snapshot_path"])).resolve()
+                    if not is_relative_to(snapshot, self.snapshots_dir.resolve()) or not snapshot.is_file():
+                        raise ArchiveError(f"Cannot upgrade missing retained source: {document['document_id']}")
+                    content = snapshot.read_bytes()
+                    if sha256_bytes(content) != document["content_sha256"]:
+                        raise ArchiveError(f"Cannot upgrade source with mismatched hash: {document['document_id']}")
+                    original_snapshot = snapshot
+                    if snapshot.name == "metadata.json":
+                        snapshot = self._store_snapshot(content, snapshot.name)
+                        created_snapshots.append(snapshot)
+                        artifacts = original_snapshot.parent / "extracted"
+                        if artifacts.exists():
+                            if not artifacts.resolve().is_relative_to(original_snapshot.parent) or any(not path.resolve().is_relative_to(artifacts.resolve()) for path in artifacts.rglob("*")):
+                                raise ArchiveError("Legacy artifacts escape their retained directory.")
+                            shutil.copytree(artifacts, snapshot.parent / "extracted")
+                        document = dict(document)
+                        document["snapshot_path"] = snapshot.relative_to(self.root).as_posix()
+                        replaced_snapshots.append(original_snapshot)
+                    metadata = {}
+                    metadata_path = snapshot.parent / "metadata.json"
+                    if metadata_path != snapshot and metadata_path.is_file():
+                        if not is_relative_to(metadata_path.resolve(), snapshot.parent):
+                            raise ArchiveError("Legacy source metadata escapes its retained directory.")
+                        metadata = json.loads(metadata_path.read_text())
+                        if not isinstance(metadata, dict):
+                            raise ArchiveError("Legacy source metadata must be an object.")
+                    else:
+                        metadata_path.write_text(json.dumps(metadata))
+                    locators = {row[0] for row in db.execute("SELECT DISTINCT locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document["document_id"],))}
+                    mode = "retained-evidence" if "youtube" in metadata else "text" if locators == {"text"} else "html" if locators == {"html"} else "file"
+                    manifest = retained_source_manifest(uri=document["uri"], content_sha256=document["content_sha256"],
+                        snapshot_path=document["snapshot_path"], filename=metadata.get("originalFilename", snapshot.name), metadata=metadata, mode=mode)
+                    manifest["analysisNeedsRebuild"] = True
+                    aliases = legacy_directories[original_snapshot.parent.relative_to(self.root).as_posix()]
+                    if aliases > 1:
+                        manifest["legacyMetadataAttribution"] = "shared-directory-unverified"
+                        manifest["migrationWarnings"] = ["Legacy aliases shared one metadata/artifact directory; overwritten per-import metadata cannot be recovered from retained bytes."]
+                    if document["source_type"] == "repo_code":
+                        manifest["mode"] = "legacy-generated-documentation"
+                        try:
+                            _, manifest["rawOriginals"] = legacy_code_sources(snapshot)
+                            manifest["originalAvailable"] = True
+                        except ArchiveError as error:
+                            manifest["originalAvailable"] = False
+                            manifest["rebuildBlocked"] = str(error)
+                    state = document["state"]
+                    try:
+                        validate_source_container(content, spreadsheet=document["source_type"] == "spreadsheet")
+                        if document["source_type"] in {"text", "readme", "repo_code"}:
+                            decode_text(content)
+                    except ValueError as error:
+                        state = "quarantined"
+                        manifest["admissionError"] = str(error)
+                    db.execute("UPDATE documents SET snapshot_path = ?, source_manifest_json = ?, source_key = ?, state = ? WHERE document_id = ?",
+                               (document["snapshot_path"], json.dumps(manifest), canonical_source_key(document["uri"]), state, document["document_id"]))
+                    # Older enrichment records have no verified dependency/support contract.
+                    db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = 'ai'", (document["document_id"],))
+                    db.execute("UPDATE enrichment_runs SET status = 'obsolete' WHERE document_id = ?", (document["document_id"],))
+                    db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document["document_id"]))
+                    db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document["document_id"],))
+                    self._register_artifacts(db, document["document_id"], snapshot_artifacts(document["document_id"], snapshot))
+                    if mode == "retained-evidence":
+                        spans = [{"text": row["text"], "locator": row["locator"]} for row in db.execute("SELECT text,locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source' ORDER BY chunk_id", (document["document_id"],))]
+                        (snapshot.parent / "source-spans.json").write_text(json.dumps(spans))
+                if documents:
+                    db.execute("UPDATE archive_state SET active_index_generation = NULL WHERE state_id = 1")
+        except Exception:
+            for snapshot in created_snapshots:
+                self._discard_unreferenced_snapshot(snapshot)
+            raise
+        for snapshot in replaced_snapshots:
+            try:
+                self._discard_unreferenced_snapshot(snapshot)
+            except OSError as error:
+                logger.warning("Legacy source was preserved, but its old snapshot could not be removed: %s", error)
+
+    def _register_artifacts(self, db: sqlite3.Connection, document_id: str, artifacts: list[dict]) -> None:
+        revision = db.execute("SELECT extraction_revision FROM documents WHERE document_id = ?", (document_id,)).fetchone()[0]
+        db.execute("DELETE FROM document_artifacts WHERE document_id = ?", (document_id,))
+        for ordinal, artifact in enumerate(artifacts):
+            artifact.setdefault("id", "artifact_" + sha256_bytes(f"{artifact.get('type')}:{artifact.get('path')}".encode())[:24])
+            artifact.setdefault("locator", artifact["id"])
+            db.execute("INSERT INTO document_artifacts(document_id,extraction_revision,artifact_id,ordinal,locator,payload_json) VALUES (?,?,?,?,?,?)",
+                       (document_id, revision, artifact["id"], ordinal, artifact.get("locator", artifact["id"]), json.dumps(artifact)))
+
+    def _artifact_window(self, db: sqlite3.Connection, document_id: str, *, offset: int = 0, limit: int | None = None, origins: list[str] | None = None) -> DocumentArtifactWindow:
+        query = "FROM document_artifacts a JOIN documents d ON a.document_id = d.document_id AND a.extraction_revision = d.extraction_revision WHERE a.document_id = ? AND a.run_id IS NULL"
+        params = [document_id]
+        if origins:
+            query += " AND COALESCE(json_extract(a.payload_json,'$.artifactOrigin'),'source') IN (" + ",".join("?" for _ in origins) + ")"
+            params.extend(origins)
+        total = db.execute("SELECT COUNT(*) " + query, params).fetchone()[0]
+        rows = db.execute("SELECT a.payload_json " + query + " ORDER BY a.ordinal LIMIT ? OFFSET ?", [*params, limit if limit is not None else -1, offset])
+        return DocumentArtifactWindow([json.loads(row[0]) for row in rows], total)
+
     def document_artifacts(self, document_id: str) -> list[dict[str, Any]]:
-        document = self._document_row(document_id)
-        return snapshot_artifacts(document_id, self.root / document["snapshot_path"])
+        return self.document_artifact_window(document_id).artifacts
 
     def document_artifact_window(self, document_id: str, *, offset: int = 0, limit: int | None = None) -> DocumentArtifactWindow:
-        document = self._document_row(document_id)
-        return snapshot_artifact_window(document_id, self.root / document["snapshot_path"], offset=offset, limit=limit)
+        self._document_row(document_id)
+        with self._connect() as db:
+            return self._artifact_window(db, document_id, offset=offset, limit=limit)
 
     def document_artifact_file(self, document_id: str, artifact_path: str) -> DocumentArtifactFile:
         document = self._document_row(document_id)
         snapshot_path = self.root / document["snapshot_path"]
         extracted_root = snapshot_path.parent / "extracted"
         relative_path = safe_artifact_relative_path(artifact_path)
-        if not snapshot_artifact_path_exists(snapshot_path, relative_path):
+        with self._connect() as db:
+            records = db.execute("SELECT payload_json FROM document_artifacts WHERE document_id = ? AND extraction_revision = ?", (document_id, document["extraction_revision"]))
+            registered = any(relative_path in artifact_paths(json.loads(row[0])) for row in records)
+        if not registered:
             raise ArchiveError(f"Unknown document artifact: {artifact_path}")
         absolute_path = (extracted_root / relative_path).resolve()
         if not is_relative_to(absolute_path, extracted_root.resolve()) or not absolute_path.is_file():
@@ -811,7 +972,7 @@ class DocumentationArchive:
                 )
             ]
         source_bytes = path.read_bytes()
-        inferred_type = source_type or infer_source_type(path.name, None)
+        inferred_type = source_type or infer_source_type(path.name, detected_content_type(source_bytes))
         document_title = autodetect_title(title, path=path)
         document_collection = autodetect_collection(collection, path=path)
         return [self._ingest_extracted_source(
@@ -883,7 +1044,7 @@ class DocumentationArchive:
         report_progress(progress, stage="Downloading URL and reading response metadata.", progress=12)
         response, source_bytes = fetch_url_bytes(url, MAX_URL_INGEST_BYTES)
         content_type = response.headers.get("content-type")
-        inferred_type = source_type or infer_source_type(url, content_type)
+        inferred_type = source_type or ("media" if looks_like_media(source_bytes) else infer_source_type(url, detected_content_type(source_bytes) or content_type))
         final_name = safe_file_name(urlparse(str(response.url)).path.rsplit("/", 1)[-1] or urlparse(url).path.rsplit("/", 1)[-1] or "downloaded-source")
         if is_unsupported_code_source_name(final_name) or is_unsupported_code_source_name(url):
             raise ArchiveError(unsupported_code_source_message([url]))
@@ -974,49 +1135,49 @@ class DocumentationArchive:
         tags: list[str] | None = None,
         progress: ProgressReporter | None = None,
     ) -> IngestedDocument:
+        with self.prepare_youtube_source(url, progress=progress) as source:
+            return self.store_youtube_source(url, source, title=title, collection=collection, tags=tags, progress=progress)
+
+    @contextmanager
+    def prepare_youtube_source(self, url: str, *, progress: ProgressReporter | None = None):
         report_progress(progress, stage="Fetching YouTube video metadata.", progress=12)
         metadata = extract_youtube_video_metadata(url)
-        with tempfile.TemporaryDirectory(prefix="cloudx-youtube-evidence-") as temp_dir_name:
-            temp_artifact_dir = Path(temp_dir_name) / "extracted"
+        with tempfile.TemporaryDirectory(prefix="cloudx-youtube-evidence-") as temporary:
+            artifact_dir = Path(temporary) / "extracted"
             with self._extraction_slots:
-                transcript_segments, keyframes = extract_youtube_video_evidence(url, metadata, temp_artifact_dir, progress=progress)
-            transcript = transcript_segments_text(transcript_segments)
-            document_title = autodetect_title(title or metadata.title, url=url, text=transcript)
-            source_text = youtube_source_text(metadata, transcript)
-            source_bytes = source_text.encode("utf-8")
-            with self._write_lock:
-                report_progress(progress, stage="Writing YouTube source snapshot.", progress=59)
-                snapshot_path = self._store_snapshot(
-                    source_bytes,
-                    safe_file_name(document_title) + ".youtube.txt",
-                    metadata={
-                        "url": url,
-                        "sourceType": "media",
-                        "youtube": youtube_metadata_json(metadata),
-                    },
-                )
-                artifact_dir = snapshot_path.parent / "extracted"
-                reset_directory(artifact_dir)
-                shutil.copytree(temp_artifact_dir / "media", artifact_dir / "media", dirs_exist_ok=True)
-                write_transcript_segment_index(artifact_dir / "media" / "transcript_segments.tsv", transcript_segments)
-                write_keyframe_index(artifact_dir / "media" / "keyframes.tsv", keyframes)
-                spans = [
-                    ExtractedSpan(youtube_metadata_span(metadata), "media metadata"),
-                    *youtube_description_spans(metadata),
-                    *youtube_transcript_spans(transcript_segments),
-                    *youtube_keyframe_spans(keyframes, transcript_segments),
-                ]
-                report_progress(progress, stage="Writing indexed YouTube archive chunks.", progress=75)
-                return self._write_document(
-                    title=document_title,
-                    source_type="media",
-                    uri=url,
-                    snapshot_path=snapshot_path,
-                    content_bytes=source_bytes,
-                    spans=spans,
-                    collection=autodetect_collection(collection, url=url, source_type="media"),
-                    tags=tags,
-                )
+                segments, keyframes = extract_youtube_video_evidence(url, metadata, artifact_dir, progress=progress)
+            write_transcript_segment_index(artifact_dir / "media" / "transcript_segments.tsv", segments)
+            write_keyframe_index(artifact_dir / "media" / "keyframes.tsv", keyframes)
+            evidence_files = [
+                {"path": path.relative_to(artifact_dir).as_posix(), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                for path in sorted((artifact_dir / "media").rglob("*")) if path.is_file()
+                and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+            ]
+            source_text = youtube_source_text(metadata, transcript_segments_text(segments))
+            source_text += "\n\nRetained visual evidence:\n" + json.dumps(evidence_files, sort_keys=True)
+            yield {"metadata": metadata, "content": source_text.encode(), "artifact_dir": artifact_dir,
+                   "spans": [ExtractedSpan(youtube_metadata_span(metadata), "media metadata"),
+                             *youtube_description_spans(metadata), *youtube_transcript_spans(segments),
+                             *youtube_keyframe_spans(keyframes, segments)]}
+
+    def store_youtube_source(self, url: str, source: dict, *, title: str | None = None,
+                             collection: str | None = None, tags: list[str] | None = None,
+                             source_key: str | None = None, progress: ProgressReporter | None = None,
+                             expected_source: tuple[str, str, str] | None = None) -> IngestedDocument:
+        metadata = source["metadata"]
+        document_title = autodetect_title(title or metadata.title, url=url)
+        with self._write_lock:
+            snapshot_path = self._store_snapshot(source["content"], safe_file_name(document_title) + ".youtube.txt",
+                metadata={"url": url, "sourceType": "media", "youtube": youtube_metadata_json(metadata),
+                          **({"sourceKey": source_key} if source_key else {})})
+            shutil.copytree(source["artifact_dir"], snapshot_path.parent / "extracted", dirs_exist_ok=True)
+            try:
+                return self._write_document(title=document_title, source_type="media", uri=url, snapshot_path=snapshot_path,
+                    content_bytes=source["content"], spans=source["spans"],
+                    collection=autodetect_collection(collection, url=url, source_type="media"), tags=tags, expected_source=expected_source)
+            except Exception:
+                self._discard_unreferenced_snapshot(snapshot_path)
+                raise
 
     def ingest_upload(
         self,
@@ -1074,62 +1235,29 @@ class DocumentationArchive:
         collection: str | None,
         tags: list[str] | None,
         metadata: dict | None = None,
+        expected_source: tuple[str, str, str] | None = None,
     ) -> IngestedDocument:
         with tempfile.TemporaryDirectory(prefix="cloudx-source-extraction-") as temp_dir:
             artifacts = Path(temp_dir) / "extracted"
             with self._extraction_slots:
-                spans = extract(artifacts)
+                try:
+                    spans = extract(artifacts)
+                except ValueError as error:
+                    raise ArchiveError(str(error)) from error
             if not chunk_spans(spans):
                 raise ArchiveError("No extractable text was found.")
             with self._write_lock:
-                with tempfile.TemporaryDirectory(prefix="ingest-publication-", dir=self.snapshots_dir) as publication_dir:
-                    prepared = Path(publication_dir) / "extracted"
-                    previous_artifacts = Path(publication_dir) / "previous"
+                snapshot_path = self._store_snapshot(content, filename, metadata)
+                try:
                     if artifacts.exists():
-                        shutil.copytree(artifacts, prepared)
-                    snapshot_dir = self.snapshots_dir / sha256_bytes(content)
-                    metadata_path = snapshot_dir / "metadata.json"
-                    previous_metadata = metadata_path.read_bytes() if metadata_path.exists() else None
-                    artifact_dir = snapshot_dir / "extracted"
-                    artifacts_published = False
-                    catalog_committed = False
-
-                    def mark_catalog_committed() -> None:
-                        nonlocal catalog_committed
-                        catalog_committed = True
-
-                    try:
-                        snapshot_path = self._store_snapshot(content, filename, metadata)
-                        if prepared.exists():
-                            if artifact_dir.exists():
-                                artifact_dir.rename(previous_artifacts)
-                            prepared.rename(artifact_dir)
-                            artifacts_published = True
-                        return self._write_document(
-                            title=title,
-                            source_type=source_type,
-                            uri=uri,
-                            snapshot_path=snapshot_path,
-                            content_bytes=content,
-                            spans=spans,
-                            collection=collection,
-                            tags=tags,
-                            on_commit=mark_catalog_committed,
-                        )
-                    except Exception:
-                        if catalog_committed:
-                            raise
-                        if artifacts_published and artifact_dir.exists():
-                            shutil.rmtree(artifact_dir)
-                        if previous_artifacts.exists():
-                            snapshot_dir.mkdir(exist_ok=True)
-                            previous_artifacts.rename(artifact_dir)
-                        if previous_metadata is not None:
-                            snapshot_dir.mkdir(exist_ok=True)
-                            metadata_path.write_bytes(previous_metadata)
-                        else:
-                            metadata_path.unlink(missing_ok=True)
-                        raise
+                        shutil.copytree(artifacts, snapshot_path.parent / "extracted")
+                    return self._write_document(
+                        title=title, source_type=source_type, uri=uri, snapshot_path=snapshot_path,
+                        content_bytes=content, spans=spans, collection=collection, tags=tags, expected_source=expected_source,
+                    )
+                except Exception:
+                    self._discard_unreferenced_snapshot(snapshot_path)
+                    raise
 
     def ingest_text(
         self,
@@ -1173,6 +1301,8 @@ class DocumentationArchive:
         collection: str | None,
         tags: list[str] | None,
         retain_raw_code_artifacts: bool,
+        source_key: str | None = None,
+        expected_source: tuple[str, str, str] | None = None,
     ) -> IngestedDocument:
         generated = generate_vendor_code_documentation(
             title=title,
@@ -1180,28 +1310,36 @@ class DocumentationArchive:
             sources=sources,
             retain_raw_source=retain_raw_code_artifacts,
         )
+        retained_inputs = source_bundle(sources)
         with self._write_lock:
             snapshot_path = self._store_snapshot(
-                generated.content,
-                safe_file_name(title) + ".generated-code.md",
+                retained_inputs,
+                safe_file_name(title) + ".vendor-sources.json",
                 metadata={
                     "sourceType": "repo_code",
                     "generatedCodeDocumentation": True,
-                    "rawSourceRetained": retain_raw_code_artifacts,
+                    "rawSourceRetained": True,
+                    "exposeRawCodeArtifacts": retain_raw_code_artifacts,
+                    **({"sourceKey": source_key} if source_key is not None else {}),
                 },
             )
-            artifact_root = snapshot_path.parent / "extracted"
-            write_vendor_code_artifacts(artifact_root, generated)
-            return self._write_document(
-                title=title,
-                source_type="repo_code",
-                uri=uri,
-                snapshot_path=snapshot_path,
-                content_bytes=generated.content,
-                spans=[ExtractedSpan(text, locator) for locator, text in generated.spans],
-                collection=collection,
-                tags=tags,
-            )
+            try:
+                artifact_root = snapshot_path.parent / "extracted"
+                write_vendor_code_artifacts(artifact_root, generated)
+                return self._write_document(
+                    title=title,
+                    source_type="repo_code",
+                    uri=uri,
+                    snapshot_path=snapshot_path,
+                    content_bytes=retained_inputs,
+                    spans=[ExtractedSpan(text, locator) for locator, text in generated.spans],
+                    collection=collection,
+                    tags=tags,
+                    expected_source=expected_source,
+                )
+            except Exception:
+                self._discard_unreferenced_snapshot(snapshot_path)
+                raise
 
     def search(
         self,
@@ -1213,7 +1351,8 @@ class DocumentationArchive:
         collection: str | None = None,
         mode: str = "hybrid",
     ) -> list[dict]:
-        with self._write_lock:
+        with self._search_sessions.reader(), self._connect() as db:
+            db.execute("BEGIN")
             return self._search(
                 query,
                 limit=limit,
@@ -1221,6 +1360,7 @@ class DocumentationArchive:
                 source_types=source_types,
                 collection=collection,
                 mode=mode,
+                db=db,
             )
 
     def _search(
@@ -1232,26 +1372,26 @@ class DocumentationArchive:
         source_types: list[str] | None,
         collection: str | None,
         mode: str,
+        db: sqlite3.Connection,
     ) -> list[dict]:
         normalized_query = query.strip()
         if not normalized_query:
             raise ArchiveError("Search query is required.")
         if limit < 1 or limit > 100:
             raise ArchiveError("Search limit must be between 1 and 100.")
-        states = states or [ACTIVE_STATE]
-        allowed_ids = self._allowed_chunk_ids(states=states, source_types=source_types, collection=collection)
-        if not allowed_ids:
-            return []
-        dense_scores = {}
-        if mode in {"hybrid", "dense"} and ACTIVE_STATE in states:
-            dense_allowed_ids = self._allowed_chunk_ids(states=[ACTIVE_STATE], source_types=source_types, collection=collection)
-            if dense_allowed_ids:
-                dense_scores = self._dense_scores(normalized_query, dense_allowed_ids, limit)
-        lexical_scores = {}
-        if mode in {"hybrid", "lexical"}:
-            lexical_scores = self._lexical_scores(normalized_query, states=states, source_types=source_types, collection=collection, limit=limit * 4)
         if mode not in {"hybrid", "dense", "lexical"}:
             raise ArchiveError("Search mode must be hybrid, dense, or lexical.")
+        states = states or [ACTIVE_STATE]
+        lexical_scores = {}
+        if mode in {"hybrid", "lexical"}:
+            lexical_scores = self._lexical_scores(normalized_query, states=states, source_types=source_types, collection=collection, limit=limit * 4, db=db)
+        dense_scores = {}
+        dense_passages = {}
+        if mode in {"hybrid", "dense"} and ACTIVE_STATE in states:
+            dense_allowed_ids = self._allowed_chunk_ids(states=[ACTIVE_STATE], source_types=source_types, collection=collection, db=db) if source_types or collection else None
+            if dense_allowed_ids is None or dense_allowed_ids:
+                dense = self._dense_scores(normalized_query, dense_allowed_ids, limit, db=db, lexical_candidates=list(lexical_scores))
+                dense_scores, dense_passages = dense.scores, dense.passages
         if mode == "hybrid":
             dense_scores = {
                 chunk_id: score
@@ -1259,9 +1399,12 @@ class DocumentationArchive:
                 if chunk_id in lexical_scores or score >= DENSE_ONLY_MIN_SCORE
             }
         fused = reciprocal_rank_fusion(dense_scores, lexical_scores)
+        if self.embedding_profile is not None and dense_scores and mode == "hybrid" and not any(is_identifier_term(term) for term in matching_terms(normalized_query)):
+            fused = dict(sorted(((chunk_id, dense_scores.get(chunk_id, -1.0)) for chunk_id in fused), key=lambda item: item[1], reverse=True))
         if not fused:
             return []
-        return self._hydrate_results(list(fused.keys())[:limit], fused, dense_scores, lexical_scores)
+        results = self._hydrate_results(list(fused), fused, dense_scores, lexical_scores, query=normalized_query, db=db, passages=dense_passages)
+        return diverse_results(results, limit)
 
     def invalidate_document(self, document_id: str, *, state: str, reason: str) -> dict:
         if state not in EXCLUDED_STATES:
@@ -1278,7 +1421,7 @@ class DocumentationArchive:
                 "UPDATE documents SET state = ?, updated_at = ? WHERE document_id = ?",
                 (state, now, document_id),
             )
-            db.execute("UPDATE chunks SET state = ? WHERE document_id = ?", (state, document_id))
+            db.execute(f"UPDATE chunks SET state = ? WHERE document_id = ? AND {published_chunk_sql()}", (state, document_id))
             db.execute(
                 """
                 INSERT INTO invalidation_events (document_id, previous_state, next_state, reason, created_at)
@@ -1290,169 +1433,149 @@ class DocumentationArchive:
         self._publish_catalog_change(invalidate)
         return self.get_document(document_id)
 
-    def enrich_document(
-        self,
-        document_id: str,
-        *,
-        spans: list[ExtractedSpan],
-        model: str,
-        skill_ids: list[str],
-        summary: str = "",
-        payload: dict[str, Any] | None = None,
-        extraction_revision: str | None = None,
-    ) -> dict:
-        if extraction_revision is not None and (not isinstance(extraction_revision, str) or not re.fullmatch(r"[0-9a-f]{32}", extraction_revision)):
-            raise ArchiveError("Enrichment requires a valid extraction revision.")
-        chunks = chunk_spans(spans)
-        if not chunks:
-            raise ArchiveError("Enrichment did not produce extractable text.")
-        normalized_model = optional_text(model)
-        if not normalized_model:
-            raise ArchiveError("Enrichment model is required.")
-        now = timestamp()
-
-        def enrich(db: sqlite3.Connection) -> None:
-            document = db.execute("SELECT state, extraction_revision FROM documents WHERE document_id = ?", (document_id,)).fetchone()
-            if not document:
-                raise ArchiveError(f"Unknown document: {document_id}")
-            if document["state"] != ACTIVE_STATE:
-                raise ArchiveError("Only active documents can be enriched.")
-            if extraction_revision is not None and document["extraction_revision"] != extraction_revision:
-                raise ArchiveError("Enrichment extraction revision no longer matches the document.")
-            db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
-            db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = ?", (document_id, "ai"))
-            cursor = db.execute(
-                """
-                INSERT INTO document_enrichments (document_id, model, skill_ids_json, summary, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    document_id,
-                    normalized_model,
-                    json.dumps([skill_id for skill_id in skill_ids if optional_text(skill_id)]),
-                    summary.strip(),
-                    json.dumps(payload or {}, sort_keys=True),
-                    now,
-                ),
-            )
-            enrichment_id = int(cursor.lastrowid)
-            for locator, text in chunks:
-                db.execute(
-                    """
-                    INSERT INTO chunks (document_id, locator, text, state, chunk_origin, enrichment_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (document_id, locator, text, ACTIVE_STATE, "ai", enrichment_id),
-                )
-            db.execute("UPDATE documents SET updated_at = ? WHERE document_id = ?", (now, document_id))
-
-        self._publish_catalog_change(enrich)
-        return self.get_document(document_id)
-
     def remove_document(self, document_id: str, *, reason: str = "Removed by user.") -> dict:
         return self.invalidate_document(document_id, state="deleted", reason=reason)
 
-    def reanalyze_document(self, document_id: str) -> IngestedDocument:
-        with self._write_lock:
-            document = self._document_row(document_id)
-            if document["state"] != ACTIVE_STATE:
-                raise ArchiveError("Only active documents can be reanalyzed.")
-            snapshot_path = (self.root / safe_archive_relative_path(document["snapshot_path"])).resolve()
-            if not is_relative_to(snapshot_path, self.snapshots_dir.resolve()) or not snapshot_path.is_file():
-                raise ArchiveError("The archived source snapshot is missing or outside the snapshots directory.")
-            source_bytes = snapshot_path.read_bytes()
-            if sha256_bytes(source_bytes) != document["content_sha256"]:
-                raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
-            metadata_path = snapshot_path.parent / "metadata.json"
-            has_metadata = metadata_path != snapshot_path and (metadata_path.exists() or metadata_path.is_symlink())
-            metadata = {}
-            if has_metadata:
-                if not is_relative_to(metadata_path.resolve(), snapshot_path.parent):
-                    raise ArchiveError("Snapshot metadata must stay inside its snapshot directory.")
-                try:
-                    metadata_bytes = metadata_path.read_bytes()
-                    has_metadata = metadata_bytes != source_bytes
-                    if has_metadata:
-                        metadata = json.loads(metadata_bytes.decode("utf-8"))
-                except (OSError, ValueError, UnicodeError) as error:
-                    raise ArchiveError("The archived source metadata is invalid.") from error
-                if not isinstance(metadata, dict):
-                    raise ArchiveError("The archived source metadata must be an object.")
-            content_type = metadata.get("contentType")
-            if content_type is not None and not isinstance(content_type, str):
-                raise ArchiveError("The archived source content type must be a string.")
-            with self._connect() as db:
-                source_locators = {
-                    row["locator"] for row in db.execute(
-                        "SELECT DISTINCT locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source'",
-                        (document_id,),
-                    )
-                }
-            retains_plain_text = source_locators == {"text"}
-            retains_html = source_locators == {"html"}
-            if (
-                document["source_type"] == "repo_code"
-                or "media metadata" in source_locators
-                or (not (retains_plain_text or retains_html) and (metadata.get("generatedCodeDocumentation") or "youtube" in metadata))
-            ):
-                raise ArchiveError("This document retains generated code documentation or YouTube evidence. Rerun AI enrichment to analyze its retained text and artifacts; source extraction requires the original source.")
-            staging_dir = Path(tempfile.mkdtemp(prefix="reanalysis-", dir=self.snapshots_dir))
-            replacement_snapshot = staging_dir / snapshot_path.name
-            try:
-                replacement_snapshot.write_bytes(source_bytes)
-                if has_metadata:
-                    shutil.copy2(metadata_path, staging_dir / "metadata.json")
-                with self._extraction_slots:
-                    if retains_plain_text:
-                        spans = [ExtractedSpan(decode_text(source_bytes), "text")]
-                    elif retains_html:
-                        spans = [ExtractedSpan(extract_html(source_bytes), "html")]
-                    elif "image" in source_locators:
-                        spans = ImageExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name)
-                    elif source_locators and all(locator.startswith("sheet ") for locator in source_locators):
-                        workbook_content_type = None
-                        if zipfile.is_zipfile(io.BytesIO(source_bytes)):
-                            with zipfile.ZipFile(io.BytesIO(source_bytes)) as workbook:
-                                if "xl/workbook.xml" in workbook.namelist():
-                                    workbook_content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        spans = SpreadsheetExtractionPipeline(staging_dir / "extracted").extract(source_bytes, snapshot_path.name, workbook_content_type)
+    def reanalyze_document(self, document_id: str, *, expected_revision: str | None = None, campaign_id: str | None = None) -> IngestedDocument:
+        document = self._document_row(document_id)
+        if expected_revision is not None and document["extraction_revision"] != expected_revision:
+            raise ArchiveError("Campaign extraction revision no longer matches the document.")
+        if document["state"] != ACTIVE_STATE:
+            raise ArchiveError("Only active documents can be reanalyzed.")
+        snapshot_path = (self.root / safe_archive_relative_path(document["snapshot_path"])).resolve()
+        if not is_relative_to(snapshot_path, self.snapshots_dir.resolve()) or not snapshot_path.is_file():
+            raise ArchiveError("The archived source snapshot is missing or outside the snapshots directory.")
+        source_bytes = snapshot_path.read_bytes()
+        if sha256_bytes(source_bytes) != document["content_sha256"]:
+            raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
+        manifest = json.loads(document["source_manifest_json"])
+        if manifest.get("mode") == "legacy-generated-documentation" and not manifest.get("originalAvailable"):
+            raise ArchiveError(manifest.get("rebuildBlocked") or "Legacy generated documentation has no verified original source inputs.")
+        metadata = manifest.get("metadata", {})
+        metadata_path = snapshot_path.parent / "metadata.json"
+        try:
+            if not is_relative_to(metadata_path.resolve(), snapshot_path.parent):
+                raise ArchiveError("Retained metadata escapes its source directory.")
+            retained_metadata = json.loads(metadata_path.read_text())
+            if not isinstance(retained_metadata, dict) or retained_metadata != metadata:
+                raise ArchiveError("Retained metadata does not match the catalog source manifest.")
+            if metadata.get("contentType") is not None and not isinstance(metadata["contentType"], str):
+                raise ArchiveError("Retained content type must be a string.")
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ArchiveError(f"Invalid retained source metadata: {error}") from error
+        filename = manifest.get("original", {}).get("filename", snapshot_path.name)
+        metadata = {**metadata, "originalFilename": filename}
+        staging_root = Path(tempfile.mkdtemp(prefix=".documentation-reanalysis-", dir=self.root.parent))
+        staged_snapshot = self._store_snapshot(source_bytes, filename, metadata, directory_root=staging_root)
+        replacement = self.snapshots_dir / staged_snapshot.parent.name / staged_snapshot.name
+        artifacts_root = staged_snapshot.parent / "extracted"
+        try:
+            with self._extraction_slots:
+                mode = manifest.get("mode", "file")
+                if mode == "text":
+                    spans = [ExtractedSpan(decode_text(source_bytes), "text")]
+                elif mode == "html":
+                    spans = [ExtractedSpan(extract_html(source_bytes, metadata.get("contentType")), "html")]
+                elif mode in {"generated-code", "legacy-generated-documentation"}:
+                    if mode == "legacy-generated-documentation":
+                        from .legacy_sources import legacy_code_sources
+                        sources, _ = legacy_code_sources(snapshot_path)
                     else:
-                        spans = extract_bytes(
-                            source_bytes,
-                            snapshot_path.name,
-                            document["source_type"],
-                            content_type or mimetypes.guess_type(snapshot_path.name)[0],
-                            staging_dir / "extracted",
-                        )
-                chunks = chunk_spans(spans)
-                if not chunks:
-                    raise ArchiveError("No extractable text was found during reanalysis.")
+                        bundle = json.loads(source_bytes)
+                        sources = []
+                        for item in bundle["sources"]:
+                            content = base64.b64decode(item["contentBase64"], validate=True)
+                            if sha256_bytes(content) != item["sha256"]:
+                                raise ArchiveError("Retained code source hash does not match its manifest.")
+                            sources.append(VendorCodeSource(item["relativePath"], content, item["sourceUri"]))
+                    generated = generate_vendor_code_documentation(title=document["title"], uri=document["uri"], sources=sources,
+                                                                  retain_raw_source=mode == "legacy-generated-documentation" or bool(metadata.get("exposeRawCodeArtifacts")))
+                    write_vendor_code_artifacts(artifacts_root, generated)
+                    spans = [ExtractedSpan(text, locator) for locator, text in generated.spans]
+                elif mode == "retained-evidence":
+                    records = json.loads((snapshot_path.parent / "source-spans.json").read_text())
+                    spans = [ExtractedSpan(row["text"], row["locator"]) for row in records]
+                    if (snapshot_path.parent / "extracted").exists():
+                        shutil.copytree(snapshot_path.parent / "extracted", artifacts_root, ignore=shutil.ignore_patterns("enrichment"))
+                else:
+                    spans = extract_bytes(source_bytes, filename, document["source_type"], metadata.get("contentType"), artifacts_root)
+            chunks = chunk_spans(spans)
+            if not chunks:
+                raise ArchiveError("No extractable text was found during reanalysis.")
+            updated_manifest = retained_source_manifest(uri=document["uri"], content_sha256=document["content_sha256"],
+                snapshot_path=replacement.relative_to(self.root).as_posix(), filename=filename, metadata=metadata, mode=mode)
+            if mode == "legacy-generated-documentation":
+                updated_manifest.update(originalAvailable=True, rawOriginals=manifest["rawOriginals"])
+            if manifest.get("legacyMetadataAttribution"):
+                updated_manifest.update(legacyMetadataAttribution=manifest["legacyMetadataAttribution"], migrationWarnings=manifest["migrationWarnings"])
+            (staged_snapshot.parent / "source-manifest.json").write_text(json.dumps(updated_manifest, sort_keys=True))
+            (staged_snapshot.parent / "source-spans.json").write_text(json.dumps([{"text": span.text, "locator": span.locator} for span in spans]))
+            artifacts = snapshot_artifacts(document_id, staged_snapshot)
 
-                def replace_source_analysis(db: sqlite3.Connection) -> None:
-                    db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
-                    db.execute("DELETE FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document_id,))
-                    db.executemany(
-                        "INSERT INTO chunks (document_id, locator, text, state, chunk_origin) VALUES (?, ?, ?, ?, 'source')",
-                        [(document_id, locator, text, ACTIVE_STATE) for locator, text in chunks],
-                    )
-                    db.execute(
-                        "UPDATE documents SET snapshot_path = ?, updated_at = ?, extraction_revision = lower(hex(randomblob(16))) WHERE document_id = ?",
-                        (replacement_snapshot.relative_to(self.root).as_posix(), timestamp(), document_id),
-                    )
+            def replace_source_analysis(db: sqlite3.Connection) -> None:
+                current = db.execute("SELECT state, extraction_revision FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+                if not current or current["state"] != ACTIVE_STATE or current["extraction_revision"] != document["extraction_revision"]:
+                    raise ArchiveError("Source changed while reanalysis was running; this result was not published.")
+                staged_snapshot.parent.rename(replacement.parent)
+                db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
+                db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+                db.executemany("INSERT INTO chunks(document_id,locator,text,state,chunk_origin) VALUES(?,?,?,?,'source')",
+                               [(document_id, locator, text, ACTIVE_STATE) for locator, text in chunks])
+                db.execute("UPDATE documents SET snapshot_path = ?, updated_at = ?, extraction_revision = lower(hex(randomblob(16))), source_manifest_json = ?, processor_fingerprint = ? WHERE document_id = ?",
+                           (replacement.relative_to(self.root).as_posix(), timestamp(), json.dumps(updated_manifest), processor_fingerprint(), document_id))
+                db.execute("UPDATE enrichment_runs SET status = 'obsolete' WHERE document_id = ?", (document_id,))
+                self._register_artifacts(db, document_id, artifacts)
+                if campaign_id is not None:
+                    cursor = db.execute("UPDATE reanalysis_items SET status = 'complete',error = NULL WHERE campaign_id = ? AND document_id = ? AND expected_revision = ? AND status = 'running'",
+                                        (campaign_id, document_id, expected_revision))
+                    if cursor.rowcount != 1:
+                        raise ArchiveError("Campaign no longer owns this captured source revision.")
 
-                self._publish_catalog_change(replace_source_analysis)
-            except Exception:
-                self._discard_unreferenced_snapshot(replacement_snapshot)
-                raise
-            try:
-                self._discard_unreferenced_snapshot(snapshot_path)
-            except Exception as error:
-                logger.warning("Reanalysis of %s was published, but the previous snapshot could not be removed: %s", document_id, error)
-            return IngestedDocument(document_id, document["title"], document["source_type"], ACTIVE_STATE, len(chunks), document["content_sha256"])
+
+            self.prepare_embeddings(text for _, text in chunks)
+            self._publish_catalog_change(replace_source_analysis)
+        except Exception:
+            self._discard_unreferenced_snapshot(replacement)
+            raise
+        finally:
+            shutil.rmtree(staging_root)
+        try:
+            self._discard_unreferenced_snapshot(snapshot_path)
+        except OSError as error:
+            logger.warning("Reanalysis of %s was published, but the previous snapshot could not be removed: %s", document_id, error)
+        return IngestedDocument(document_id, document["title"], document["source_type"], ACTIVE_STATE, len(chunks), document["content_sha256"])
 
     def rebuild_index(self) -> dict:
+        self._prepare_active_embeddings()
         _, generation = self._publish_catalog_change(lambda _db: None)
         return generation.manifest
+
+    def prepare_embeddings(self, texts: Iterable[str]) -> None:
+        pending = iter(texts)
+        while batch := list(islice(pending, 1024)):
+            unique = list(dict.fromkeys(value for text in batch for value in ([text, *retrieval_passages(text)] if self.embedding_profile else [text])))
+            with self._connect() as db:
+                cached = EmbeddingCache(db, self.embedding_profile_id, self.embedding_dimensions).lookup(unique)
+            missing = [text for text in unique if text_digest(text) not in cached]
+            prepared = {}
+            for offset in range(0, len(missing), 32):
+                inputs = missing[offset:offset + 32]
+                vectors = self.embedding_profile.encode_batch(inputs) if self.embedding_profile else [embed_text(text) for text in inputs]
+                prepared.update(zip(inputs, vectors))
+            if prepared:
+                with self._write_lock, self._connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    EmbeddingCache(db, self.embedding_profile_id, self.embedding_dimensions).encode(unique, prepared.__getitem__)
+
+    def _prepare_active_embeddings(self) -> None:
+        last_chunk_id = 0
+        while True:
+            with self._connect() as db:
+                rows = db.execute("SELECT chunk_id, text FROM chunks WHERE state = ? AND chunk_id > ? ORDER BY chunk_id LIMIT 1024", (ACTIVE_STATE, last_chunk_id)).fetchall()
+            if not rows:
+                return
+            self.prepare_embeddings(row["text"] for row in rows)
+            last_chunk_id = rows[-1]["chunk_id"]
 
     def _publish_catalog_change(
         self,
@@ -1460,7 +1583,6 @@ class DocumentationArchive:
         *,
         project: bool = True,
         progress: ProgressReporter | None = None,
-        append_chunks_only: bool = False,
         imported_generation: IndexGeneration | None = None,
         on_commit: Callable[[], None] | None = None,
     ) -> tuple[Any, IndexGeneration]:
@@ -1470,8 +1592,8 @@ class DocumentationArchive:
             generation: IndexGeneration | None = None
             try:
                 db.execute("BEGIN IMMEDIATE")
-                base_generation = self._active_index_generation_record() if append_chunks_only else None
-                last_chunk_id = int(db.execute("SELECT COALESCE(MAX(chunk_id), 0) FROM chunks").fetchone()[0]) if append_chunks_only else 0
+                base_generation = self._load_index_generation(previous_generation_id)
+                last_chunk_id = int(db.execute("SELECT COALESCE(MAX(chunk_id), 0) FROM chunks").fetchone()[0])
                 result = mutation(db)
                 report_progress(progress, stage="Installing search index." if imported_generation else "Building search index.", progress=80)
                 generation = self._build_index_generation(
@@ -1505,7 +1627,7 @@ class DocumentationArchive:
             "SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id",
             (ACTIVE_STATE,),
         )
-        generation_id = catalog_index_generation(rows)
+        generation_id = catalog_index_generation(rows, profile_id=self.embedding_profile_id, dimensions=self.embedding_dimensions)
         if imported_generation is not None and imported_generation.generation != generation_id:
             raise ArchiveError("Merged catalog does not match the imported search index generation.")
         existing = self._load_index_generation(generation_id)
@@ -1514,20 +1636,29 @@ class DocumentationArchive:
         if imported_generation is not None:
             return self._copy_index_generation(imported_generation)
 
+        if base_generation is not None:
+            retained = db.execute("SELECT chunk_id, text FROM chunks WHERE state = ? AND chunk_id <= ? ORDER BY chunk_id", (ACTIVE_STATE, append_after))
+            retained_generation = catalog_index_generation(retained, profile_id=self.embedding_profile_id, dimensions=self.embedding_dimensions)
+            if retained_generation != base_generation.generation:
+                base_generation, append_after = None, 0
+        if base_generation is None:
+            append_after = 0
+
         generation_dir = self.index_generations_dir / generation_id
         staging_dir = Path(tempfile.mkdtemp(prefix=".generation-", dir=self.index_generations_dir))
         try:
             has_existing_vectors = base_generation is not None and base_generation.manifest["activeChunkCount"] > 0
-            index = IdMapIndex.load(str(base_generation.index_path)) if has_existing_vectors else IdMapIndex(dim=EMBEDDING_DIM, bit_width=TURBOVEC_BIT_WIDTH)
+            index = IdMapIndex.load(str(base_generation.index_path)) if has_existing_vectors else IdMapIndex(dim=self.embedding_dimensions, bit_width=TURBOVEC_BIT_WIDTH)
             rows = db.execute("SELECT chunk_id, text FROM chunks WHERE state = ? AND chunk_id > ? ORDER BY chunk_id", (ACTIVE_STATE, append_after))
             active_chunk_count = int(db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0])
             chunk_count = active_chunk_count - int(base_generation.manifest["activeChunkCount"]) if base_generation else active_chunk_count
-            all_vectors = np.empty((chunk_count, EMBEDDING_DIM), dtype=np.float32) if not has_existing_vectors else None
+            all_vectors = np.empty((chunk_count, self.embedding_dimensions), dtype=np.float32) if not has_existing_vectors else None
             all_ids = np.empty(chunk_count, dtype=np.uint64) if not has_existing_vectors else None
             indexed = 0
             last_progress = -1
+            embeddings = EmbeddingCache(db, self.embedding_profile_id, self.embedding_dimensions)
             while batch := rows.fetchmany(1024):
-                vectors = np.vstack([embed_text(row["text"]) for row in batch])
+                vectors = embeddings.read([row["text"] for row in batch])
                 ids = np.array([row["chunk_id"] for row in batch], dtype=np.uint64)
                 if has_existing_vectors:
                     index.add_with_ids(vectors, ids)
@@ -1539,14 +1670,17 @@ class DocumentationArchive:
                 if current_progress != last_progress:
                     report_progress(progress, stage="Building search index.", progress=current_progress, metrics={"chunksCompleted": indexed, "chunksTotal": chunk_count})
                     last_progress = current_progress
+            if indexed != chunk_count:
+                raise RetrievalUnavailable("Index construction did not cover every active catalog chunk.")
             if not has_existing_vectors and chunk_count:
                 index.add_with_ids(all_vectors, all_ids)
             staged_index_path = staging_dir / "chunks.tvim"
             index.write(str(staged_index_path))
             manifest = {
                 "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-                "embeddingProfileId": EMBEDDING_PROFILE_ID,
-                "embeddingDimension": EMBEDDING_DIM,
+                "embeddingProfileId": self.embedding_profile_id,
+                "embeddingProfile": self.embedding_provenance,
+                "embeddingDimension": self.embedding_dimensions,
                 "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
                 "turbovecDistribution": TURBOVEC_DISTRIBUTION,
                 "turbovecVersion": TURBOVEC_VERSION,
@@ -1603,7 +1737,7 @@ class DocumentationArchive:
             return None
         if (
             manifest.get("catalogGeneration") != generation_id
-            or manifest.get("embeddingProfileId") != EMBEDDING_PROFILE_ID
+            or manifest.get("embeddingProfileId") != self.embedding_profile_id
             or manifest.get("indexSha256") != sha256_file(index_path)
         ):
             return None
@@ -1646,9 +1780,19 @@ class DocumentationArchive:
         self._replace_with_relative_symlink(generation.index_path.parent, self.index_projection_path)
 
     def _prune_inactive_index_generations(self, active_generation_id: str) -> None:
-        for path in self.index_generations_dir.iterdir():
-            if path.name != active_generation_id and path.is_dir() and re.fullmatch(r"[0-9a-f]{64}", path.name):
-                shutil.rmtree(path)
+        with self._search_sessions.exclusive():
+            for path in self.index_generations_dir.iterdir():
+                if path.name != active_generation_id and path.is_dir() and re.fullmatch(r"[0-9a-f]{64}", path.name):
+                    shutil.rmtree(path)
+            for profile_dir in self.index_dir.parent.iterdir():
+                if profile_dir == self.index_dir or not profile_dir.is_dir() or profile_dir.is_symlink():
+                    continue
+                manifest_path = profile_dir / "manifest.json"
+                if not manifest_path.is_file():
+                    continue
+                manifest = json.loads(manifest_path.read_text())
+                if manifest.get("embeddingProfileId") == profile_dir.name:
+                    shutil.rmtree(profile_dir)
 
     def _replace_with_relative_symlink(self, target: Path, link: Path) -> None:
         temporary_link = link.with_name(f".{link.name}.tmp")
@@ -1660,9 +1804,10 @@ class DocumentationArchive:
             temporary_link.unlink(missing_ok=True)
 
     def _reconcile_index_projection(self, generation: IndexGeneration, *, strict: bool) -> bool:
-        if self._projected_index_generation() == generation.generation and self._index_projection_matches(generation):
-            return True
         try:
+            if self._projected_index_generation() == generation.generation and self._index_projection_matches(generation):
+                self._prune_inactive_index_generations(generation.generation)
+                return True
             self._activate_index_generation(generation)
             self._prune_inactive_index_generations(generation.generation)
             with self._connect() as db:
@@ -1723,6 +1868,7 @@ class DocumentationArchive:
         with self._write_lock:
             generation = self._load_index_generation(self._active_index_generation())
             if generation is None:
+                self._prepare_active_embeddings()
                 _, generation = self._publish_catalog_change(lambda _db: None, project=False)
             self._prepare_index_projection_aliases(generation)
             self._reconcile_index_projection(generation, strict=True)
@@ -1739,19 +1885,55 @@ class DocumentationArchive:
         collection: str | None,
         tags: list[str] | None,
         on_commit: Callable[[], None] | None = None,
+        expected_source: tuple[str, str, str] | None = None,
     ) -> IngestedDocument:
         chunks = chunk_spans(spans)
         if not chunks:
             raise ArchiveError("No extractable text was found.")
         content_sha256 = sha256_bytes(content_bytes)
         document_id = "doc_" + sha256_bytes(f"{uri}\0{content_sha256}".encode("utf-8"))[:24]
+        source_key = canonical_source_key(uri)
+        fingerprint = processor_fingerprint()
+        metadata = json.loads((snapshot_path.parent / "metadata.json").read_text())
+        detected_type = detected_content_type(content_bytes)
+        if detected_type and not metadata.get("contentType"):
+            metadata["contentType"] = detected_type
+            (snapshot_path.parent / "metadata.json").write_text(json.dumps(metadata, sort_keys=True))
+        source_key = metadata.get("sourceKey", source_key)
+        manifest = retained_source_manifest(
+            uri=uri, content_sha256=content_sha256, snapshot_path=snapshot_path.relative_to(self.root).as_posix(),
+            filename=metadata.get("originalFilename", snapshot_path.name), metadata=metadata,
+            mode="generated-code" if source_type == "repo_code" else "retained-evidence" if "youtube" in metadata else "text" if {span.locator for span in spans} == {"text"} else "html" if {span.locator for span in spans} == {"html"} else "file",
+        )
+        (snapshot_path.parent / "source-manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+        (snapshot_path.parent / "source-spans.json").write_text(
+            json.dumps([{"locator": span.locator, "text": span.text} for span in spans]), encoding="utf-8")
+        artifacts = snapshot_artifacts(document_id, snapshot_path)
+        with self._connect() as db:
+            require_source_revision(db, expected_source)
+            existing_document = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            if existing_document and "sourceKey" not in metadata:
+                source_key = existing_document["source_key"]
+            if existing_document and existing_document["state"] == "superseded":
+                self._discard_unreferenced_snapshot(snapshot_path)
+                raise ArchiveError("These bytes are a known superseded revision; importing them cannot reactivate an old revision.")
+            if existing_document and existing_document["state"] == ACTIVE_STATE and existing_document["processor_fingerprint"] == fingerprint:
+                previous_manifest = json.loads(existing_document["source_manifest_json"])
+                if (previous_manifest.get("original", {}).get("filename") == manifest["original"]["filename"]
+                    and previous_manifest.get("metadata", {}).get("contentType") == metadata.get("contentType")
+                    and previous_manifest.get("metadata", {}).get("exposeRawCodeArtifacts") == metadata.get("exposeRawCodeArtifacts")
+                    and existing_document["source_type"] == source_type):
+                    count = db.execute("SELECT COUNT(*) FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document_id,)).fetchone()[0]
+                    self._discard_unreferenced_snapshot(snapshot_path)
+                    return IngestedDocument(document_id, existing_document["title"], source_type, ACTIVE_STATE, count, content_sha256)
         now = timestamp()
 
         def write_document(db: sqlite3.Connection) -> None:
+            require_source_revision(db, expected_source)
             existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
             superseded_documents = db.execute(
-                "SELECT document_id, state FROM documents WHERE uri = ? AND document_id != ? AND state = ?",
-                (uri, document_id, ACTIVE_STATE),
+                "SELECT document_id, state FROM documents WHERE source_key = ? AND document_id != ? AND state = ?",
+                (source_key, document_id, ACTIVE_STATE),
             ).fetchall()
             for superseded in superseded_documents:
                 db.execute(
@@ -1808,6 +1990,10 @@ class DocumentationArchive:
                     now,
                 ),
             )
+            db.execute("UPDATE documents SET source_key = ?, source_manifest_json = ?, processor_fingerprint = ? WHERE document_id = ?",
+                       (source_key, json.dumps(manifest, sort_keys=True), fingerprint, document_id))
+            db.execute("UPDATE enrichment_runs SET status = 'obsolete' WHERE document_id = ? AND status != 'obsolete'", (document_id,))
+            self._register_artifacts(db, document_id, artifacts)
             for locator, text in chunks:
                 db.execute(
                     """
@@ -1817,15 +2003,18 @@ class DocumentationArchive:
                     (document_id, locator, text, ACTIVE_STATE, "source", None),
                 )
 
+        self.prepare_embeddings(text for _, text in chunks)
         try:
             self._publish_catalog_change(write_document, on_commit=on_commit)
         except Exception:
             self._discard_unreferenced_snapshot(snapshot_path)
             raise
+        if existing_document and existing_document["snapshot_path"] != snapshot_path.relative_to(self.root).as_posix():
+            self._discard_unreferenced_snapshot(self.root / existing_document["snapshot_path"])
         return IngestedDocument(document_id, title.strip() or uri, source_type, ACTIVE_STATE, len(chunks), content_sha256)
 
-    def _allowed_chunk_ids(self, *, states: list[str], source_types: list[str] | None, collection: str | None) -> list[int]:
-        where = ["c.state IN ({})".format(", ".join("?" for _ in states))]
+    def _allowed_chunk_ids(self, *, states: list[str], source_types: list[str] | None, collection: str | None, db: sqlite3.Connection | None = None) -> list[int]:
+        where = ["c.state IN ({})".format(", ".join("?" for _ in states)), published_chunk_sql("c")]
         params: list[str] = list(states)
         if source_types:
             where.append("d.source_type IN ({})".format(", ".join("?" for _ in source_types)))
@@ -1840,15 +2029,43 @@ class DocumentationArchive:
             WHERE {" AND ".join(where)}
             ORDER BY c.chunk_id
         """
-        with self._connect() as db:
-            return [int(row["chunk_id"]) for row in db.execute(sql, params)]
+        with nullcontext(db) if db is not None else self._connect() as connection:
+            return [int(row["chunk_id"]) for row in connection.execute(sql, params)]
 
-    def _dense_scores(self, query: str, allowed_ids: list[int], limit: int) -> dict[int, float]:
-        index = IdMapIndex.load(str(self._active_index_path()))
-        query_vector = embed_text(query).reshape(1, EMBEDDING_DIM)
-        allowed = np.array(allowed_ids, dtype=np.uint64)
-        scores, ids = index.search(query_vector, k=min(max(limit * 4, limit), len(allowed_ids)), allowlist=allowed)
-        return {int(chunk_id): float(score) for score, chunk_id in zip(scores[0], ids[0])}
+    def _dense_scores(self, query: str, allowed_ids: list[int] | None, limit: int, *, db: sqlite3.Connection | None = None, lexical_candidates: list[int] | None = None) -> DenseMatches:
+        if db is None:
+            with self._search_sessions.reader(), self._connect() as connection:
+                connection.execute("BEGIN")
+                return self._dense_scores(query, allowed_ids, limit, db=connection, lexical_candidates=lexical_candidates)
+        generation_id = db.execute("SELECT active_index_generation FROM archive_state WHERE state_id = ?", (ARCHIVE_STATE_ROW_ID,)).fetchone()[0]
+        if generation_id is None:
+            raise ArchiveError("The active documentation index generation is unavailable.")
+        loaded = self._search_index_cache.load(
+            self.index_generations_dir / generation_id / "chunks.tvim",
+            lambda: self._load_index_generation(generation_id), IdMapIndex.load,
+        )
+        count = loaded.chunk_count if allowed_ids is None else len(allowed_ids)
+        if not count:
+            return DenseMatches({}, {})
+        query_vector = (self.embedding_profile.encode(query) if self.embedding_profile else embed_text(query)).reshape(1, self.embedding_dimensions)
+        allowed = None if allowed_ids is None else np.array(allowed_ids, dtype=np.uint64)
+        scores, ids = loaded.index.search(query_vector, k=min(limit * 4, count), allowlist=allowed)
+        if self.embedding_profile is not None:
+            candidate_ids = list(dict.fromkeys([*(int(chunk_id) for chunk_id in ids[0]), *(lexical_candidates or [])]))
+            placeholders = ",".join("?" for _ in candidate_ids)
+            rows = db.execute(f"SELECT chunk_id, text FROM chunks WHERE state = 'active' AND {published_chunk_sql()} AND chunk_id IN ({placeholders})", candidate_ids).fetchall()
+            candidates = [[row["text"], *retrieval_passages(row["text"])] for row in rows]
+            vectors = EmbeddingCache(db, self.embedding_profile_id, self.embedding_dimensions).read([text for passages in candidates for text in passages])
+            similarities = vectors @ query_vector[0]
+            reranked, passages, offset = {}, {}, 0
+            for row, texts in zip(rows, candidates):
+                best = int(np.argmax(similarities[offset:offset + len(texts)]))
+                chunk_id = int(row["chunk_id"])
+                reranked[chunk_id] = float(similarities[offset + best])
+                passages[chunk_id] = texts[best]
+                offset += len(texts)
+            return DenseMatches(dict(sorted(reranked.items(), key=lambda item: item[1], reverse=True)), passages)
+        return DenseMatches({int(chunk_id): float(score) for score, chunk_id in zip(scores[0], ids[0])}, {})
 
     def _lexical_scores(
         self,
@@ -1858,11 +2075,12 @@ class DocumentationArchive:
         source_types: list[str] | None,
         collection: str | None,
         limit: int,
+        db: sqlite3.Connection | None = None,
     ) -> dict[int, float]:
         fts_query = fts_query_from_text(query)
         if not fts_query:
             return {}
-        where = ["c.state IN ({})".format(", ".join("?" for _ in states))]
+        where = ["c.state IN ({})".format(", ".join("?" for _ in states)), published_chunk_sql("c")]
         params: list[str | int] = [fts_query, *states]
         if source_types:
             where.append("d.source_type IN ({})".format(", ".join("?" for _ in source_types)))
@@ -1880,8 +2098,8 @@ class DocumentationArchive:
             ORDER BY score
             LIMIT ?
         """
-        with self._connect() as db:
-            rows = db.execute(sql, params).fetchall()
+        with nullcontext(db) if db is not None else self._connect() as connection:
+            rows = connection.execute(sql, params).fetchall()
         terms = tokenize(query)
         return {int(row["chunk_id"]): lexical_relevance_score(terms, row["text"], rank) for rank, row in enumerate(rows)}
 
@@ -1891,28 +2109,40 @@ class DocumentationArchive:
         fused_scores: dict[int, float],
         dense_scores: dict[int, float],
         lexical_scores: dict[int, float],
+        *,
+        query: str = "",
+        db: sqlite3.Connection | None = None,
+        passages: dict[int, str] | None = None,
     ) -> list[dict]:
         if not chunk_ids:
             return []
         placeholders = ", ".join("?" for _ in chunk_ids)
-        with self._connect() as db:
-            rows = db.execute(
+        with nullcontext(db) if db is not None else self._connect() as connection:
+            rows = connection.execute(
                 f"""
-                SELECT c.chunk_id, c.locator, c.text, c.state AS chunk_state, c.chunk_origin, c.enrichment_id,
-                       d.document_id, d.title, d.source_type, d.uri, d.snapshot_path, d.content_sha256, d.state AS document_state
+                SELECT c.chunk_id, c.locator, c.text, c.state AS chunk_state, c.chunk_origin, c.enrichment_id, c.support_json,
+                       d.document_id, d.title, d.source_type, d.uri, d.snapshot_path, d.content_sha256, d.state AS document_state,
+                       d.extraction_revision
                 FROM chunks c
                 JOIN documents d ON d.document_id = c.document_id
-                WHERE c.chunk_id IN ({placeholders})
+                WHERE c.chunk_id IN ({placeholders}) AND {published_chunk_sql("c")}
                 """,
                 chunk_ids,
             ).fetchall()
         by_id = {int(row["chunk_id"]): row for row in rows}
         results = []
+        query_terms = matching_terms(query)
+        identifiers = {term for term in query_terms if is_identifier_term(term)}
         for chunk_id in chunk_ids:
             row = by_id.get(chunk_id)
             if not row:
                 continue
             text = row["text"]
+            evidence_terms = matching_terms(f"{text} {row['locator']} {row['title']}")
+            if not identifiers.issubset(evidence_terms):
+                continue
+            if self.embedding_profile is None and query_terms and chunk_id not in lexical_scores and not query_terms.intersection(evidence_terms):
+                continue
             results.append(
                 {
                     "chunkId": chunk_id,
@@ -1924,34 +2154,33 @@ class DocumentationArchive:
                     "documentState": row["document_state"],
                     "chunkOrigin": row["chunk_origin"],
                     "enrichmentId": row["enrichment_id"],
+                    "supportAnchors": json.loads(row["support_json"]),
                     "locator": row["locator"],
-                    "snippet": snippet(text),
+                    "snippet": query_snippet((passages or {}).get(chunk_id, text) if not identifiers else text, query),
                     "score": fused_scores.get(chunk_id, 0.0),
                     "denseScore": dense_scores.get(chunk_id),
                     "lexicalScore": lexical_scores.get(chunk_id),
                     "citation": {
                         "contentSha256": row["content_sha256"],
                         "snapshotPath": row["snapshot_path"],
+                        "extractionRevision": row["extraction_revision"],
                     },
                 }
             )
         return results
 
-    def _store_snapshot(self, content: bytes, filename: str, metadata: dict | None = None) -> Path:
+    def _store_snapshot(self, content: bytes, filename: str, metadata: dict | None = None, *, directory_root: Path | None = None) -> Path:
         safe_name = safe_file_name(filename)
-        if safe_name == "extracted":
-            raise ArchiveError("Source filename is reserved for archive artifacts: extracted.")
-        digest = sha256_bytes(content)
-        directory = self.snapshots_dir / digest
-        directory.mkdir(parents=True, exist_ok=True)
+        if safe_name in {"extracted", "metadata.json", "source-spans.json", "source-manifest.json"}:
+            safe_name = "source-" + safe_name
+        directory = Path(tempfile.mkdtemp(prefix=sha256_bytes(content)[:16] + "-", dir=directory_root or self.snapshots_dir))
         artifact = directory / safe_name
-        if not artifact.exists():
-            artifact.write_bytes(content)
-        if metadata:
-            (directory / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        artifact.write_bytes(content)
+        (directory / "metadata.json").write_text(
+            json.dumps({**(metadata or {}), "originalFilename": filename}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return artifact
 
-    def _discard_unreferenced_snapshot(self, snapshot_path: Path) -> None:
+    def _discard_unreferenced_snapshot(self, snapshot_path: Path, *, excluding_purge_id: int | None = None) -> None:
         relative_path = snapshot_path.relative_to(self.root).as_posix()
         relative_directory = snapshot_path.parent.relative_to(self.root).as_posix() + "/"
         with self._connect() as db:
@@ -1961,6 +2190,10 @@ class DocumentationArchive:
                     (relative_path, len(relative_directory), relative_directory),
                 ).fetchone()[0]
             )
+            reference_count += db.execute(
+                "SELECT COUNT(*) FROM purge_events WHERE cleanup_status = 'pending' AND (snapshot_path = ? OR substr(snapshot_path, 1, ?) = ?) AND (? IS NULL OR purge_id != ?)",
+                (relative_path, len(relative_directory), relative_directory, excluding_purge_id, excluding_purge_id),
+            ).fetchone()[0]
         if reference_count == 0 and snapshot_path.parent.exists():
             shutil.rmtree(snapshot_path.parent)
 
@@ -1969,7 +2202,7 @@ class DocumentationArchive:
         try:
             stored_paths = [
                 str(row[0])
-                for row in source.execute("SELECT snapshot_path FROM documents ORDER BY document_id").fetchall()
+                for row in source.execute("SELECT snapshot_path FROM documents UNION SELECT snapshot_path FROM purge_events WHERE cleanup_status = 'pending'").fetchall()
             ]
         finally:
             source.close()
@@ -1983,7 +2216,7 @@ class DocumentationArchive:
         return document
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.db_path)
+        db = sqlite3.connect(self.db_path, factory=ClosingConnection)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
         return db
@@ -2002,8 +2235,7 @@ class DocumentationArchive:
             for path in sorted(self.root.rglob("*"))
             if path.is_file()
             and path not in stable_index_paths
-            and not is_relative_to(path, self.index_projection_path)
-            and not is_relative_to(path, self.index_generations_dir)
+            and not is_relative_to(path, self.index_dir.parent)
         ]
         generation = generation or self._active_index_generation_record()
         files.extend(
@@ -2029,6 +2261,9 @@ class DocumentationArchive:
         try:
             with target:
                 source.backup(target, pages=256, sleep=0.05)
+                if target.execute("PRAGMA journal_mode = DELETE").fetchone()[0] != "delete":
+                    raise ArchiveError("Portable catalog backup must be a self-contained SQLite file.")
+                interrupt_transferred_jobs(target)
         finally:
             target.close()
             source.close()
@@ -2069,8 +2304,9 @@ class DocumentationArchive:
                 "createdAt": timestamp(),
                 "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
                 "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-                "embeddingProfileId": EMBEDDING_PROFILE_ID,
-                "embeddingDimension": EMBEDDING_DIM,
+                "embeddingProfileId": self.embedding_profile_id,
+                "embeddingProfile": self.embedding_provenance,
+                "embeddingDimension": self.embedding_dimensions,
                 "turbovecDistribution": TURBOVEC_DISTRIBUTION,
                 "turbovecVersion": TURBOVEC_VERSION,
                 "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
@@ -2101,6 +2337,8 @@ class DocumentationArchive:
             self._validate_export_manifest(manifest, file_hashes)
             self._validate_archive_database(archive_root / "catalog.sqlite")
             self._validate_import_locality(archive_root)
+            with sqlite3.connect(archive_root / "catalog.sqlite", factory=ClosingConnection) as db:
+                interrupt_transferred_jobs(db)
             return ValidatedArchivePackage(temp_dir=temp_dir, archive_root=archive_root, manifest=manifest)
         except (OSError, json.JSONDecodeError, zipfile.BadZipFile) as error:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -2150,8 +2388,9 @@ class DocumentationArchive:
             "exportSchemaVersion": ARCHIVE_EXPORT_SCHEMA_VERSION,
             "packageRoot": ARCHIVE_EXPORT_ROOT_NAME,
             "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-            "embeddingProfileId": EMBEDDING_PROFILE_ID,
-            "embeddingDimension": EMBEDDING_DIM,
+            "embeddingProfileId": self.embedding_profile_id,
+            "embeddingProfile": self.embedding_provenance,
+            "embeddingDimension": self.embedding_dimensions,
             "turbovecDistribution": TURBOVEC_DISTRIBUTION,
             "turbovecIndexFormat": TURBOVEC_INDEX_FORMAT,
         }
@@ -2184,12 +2423,24 @@ class DocumentationArchive:
 
     def _validate_archive_database(self, db_path: Path) -> None:
         required_columns = {
-            "documents": {"document_id", "title", "source_type", "uri", "snapshot_path", "content_sha256", "state", "collection", "tags_json", "created_at", "updated_at"},
-            "chunks": {"chunk_id", "document_id", "locator", "text", "state", "chunk_origin", "enrichment_id"},
-            "document_enrichments": {"enrichment_id", "document_id", "model", "skill_ids_json", "summary", "payload_json", "created_at"},
+            "documents": {"document_id", "title", "source_type", "uri", "snapshot_path", "content_sha256", "state", "collection", "tags_json", "created_at", "updated_at", "extraction_revision", "source_key", "source_manifest_json", "processor_fingerprint"},
+            "document_artifacts": {"document_id", "extraction_revision", "artifact_id", "ordinal", "locator", "payload_json", "run_id"},
+            "enrichment_runs": {"run_id", "document_id", "extraction_revision", "processor_fingerprint", "owner_id", "lease_token", "lease_until", "status", "code", "error", "result_json", "created_at", "updated_at"},
+            "enrichment_batches": {"run_id", "batch_index", "input_fingerprint", "model", "output_json", "created_at"},
+            "media_evidence": {"run_id", "input_sha256", "result_json"},
+            "media_completion": {"run_id", "completed_at", "metadata_json"},
+            "embedding_cache": {"profile_id", "text_sha256", "dimensions", "vector", "vector_sha256"},
+            "chunks": {"chunk_id", "document_id", "locator", "text", "state", "chunk_origin", "enrichment_id", "support_json", "run_id"},
+            "document_enrichments": {"enrichment_id", "document_id", "model", "skill_ids_json", "summary", "payload_json", "created_at", "extraction_revision", "run_id"},
             "invalidation_events": {"event_id", "document_id", "previous_state", "next_state", "reason", "created_at"},
+            "archive_state": {"state_id", "active_index_generation", "projected_index_generation", "updated_at"},
+            "document_enrichment_outcomes": {"document_id", "status", "error", "updated_at"},
+            "source_checks": {"check_id", "source_key", "checked_at", "status", "content_sha256", "details_json"},
+            "purge_events": {"purge_id", "document_id", "source_key", "content_sha256", "reason", "purged_at", "snapshot_path", "cleanup_status", "cleanup_error"},
+            "reanalysis_campaigns": {"campaign_id", "status", "created_at", "updated_at"},
+            "reanalysis_items": {"campaign_id", "document_id", "expected_revision", "status", "error"},
         }
-        with sqlite3.connect(db_path) as db:
+        with sqlite3.connect(db_path, factory=ClosingConnection) as db:
             db.row_factory = sqlite3.Row
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
@@ -2207,6 +2458,10 @@ class DocumentationArchive:
                 missing_columns = sorted(columns - present)
                 if missing_columns:
                     raise ArchiveError(f"Archive import catalog table {table} is missing columns: {', '.join(missing_columns)}")
+            try:
+                validate_catalog_records(db)
+            except (InvalidPortableCatalog, sqlite3.DatabaseError) as error:
+                raise ArchiveError(f"Invalid archive catalog: {error}") from error
             document_columns = {row["name"] for row in db.execute("PRAGMA table_info(documents)")}
             if "extraction_revision" in document_columns and any(
                 not isinstance(row["extraction_revision"], str) or not re.fullmatch(r"[0-9a-f]{32}", row["extraction_revision"])
@@ -2238,8 +2493,12 @@ class DocumentationArchive:
 
     def _validate_import_locality(self, archive_root: Path) -> None:
         violations: list[str] = []
-        with sqlite3.connect(archive_root / "catalog.sqlite") as db:
+        with sqlite3.connect(archive_root / "catalog.sqlite", factory=ClosingConnection) as db:
             db.row_factory = sqlite3.Row
+            try:
+                validate_retained_files(db, archive_root)
+            except InvalidPortableCatalog as error:
+                raise ArchiveError(f"Invalid retained archive files: {error}") from error
             documents = db.execute("SELECT document_id, snapshot_path FROM documents ORDER BY document_id").fetchall()
         for document in documents:
             document_id = str(document["document_id"])
@@ -2277,10 +2536,10 @@ class DocumentationArchive:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
                 raise ArchiveError("Archive import dense index manifest must be a JSON object.")
-            with sqlite3.connect(archive_root / "catalog.sqlite") as db:
+            with sqlite3.connect(archive_root / "catalog.sqlite", factory=ClosingConnection) as db:
                 db.row_factory = sqlite3.Row
                 rows = db.execute("SELECT chunk_id, text FROM chunks WHERE state = ? ORDER BY chunk_id", (ACTIVE_STATE,))
-                generation = catalog_index_generation(rows)
+                generation = catalog_index_generation(rows, profile_id=self.embedding_profile_id, dimensions=self.embedding_dimensions)
                 active_chunk_count = db.execute("SELECT COUNT(*) FROM chunks WHERE state = ?", (ACTIVE_STATE,)).fetchone()[0]
                 state = db.execute("SELECT active_index_generation FROM archive_state WHERE state_id = ?", (ARCHIVE_STATE_ROW_ID,)).fetchone()
                 if state is None or state["active_index_generation"] != generation:
@@ -2289,8 +2548,9 @@ class DocumentationArchive:
                 "catalogGeneration": generation,
                 "activeChunkCount": active_chunk_count,
                 "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-                "embeddingProfileId": EMBEDDING_PROFILE_ID,
-                "embeddingDimension": EMBEDDING_DIM,
+                "embeddingProfileId": self.embedding_profile_id,
+                "embeddingProfile": self.embedding_provenance,
+                "embeddingDimension": self.embedding_dimensions,
                 "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
                 "turbovecVersion": TURBOVEC_VERSION,
                 "indexSha256": sha256_file(index_path),
@@ -2299,7 +2559,7 @@ class DocumentationArchive:
                 raise ArchiveError("Archive import dense index does not match its catalog or runtime profile.")
             self._validate_import_index(index_path, active_chunk_count)
             index = IdMapIndex.load(str(index_path))
-            with sqlite3.connect(archive_root / "catalog.sqlite") as db:
+            with sqlite3.connect(archive_root / "catalog.sqlite", factory=ClosingConnection) as db:
                 for (chunk_id,) in db.execute("SELECT chunk_id FROM chunks WHERE state = ?", (ACTIVE_STATE,)):
                     if not index.contains(chunk_id):
                         raise ArchiveError("Archive import dense index chunk IDs do not match its catalog.")
@@ -2327,7 +2587,7 @@ class DocumentationArchive:
             magic, format_version, bit_width, dimension, vector_count = TURBOVEC_INDEX_HEADER.unpack(header)
             if magic != b"TVIM" or format_version != 3:
                 raise ArchiveError("Archive import dense index must use TVIM format version 3.")
-            if dimension != EMBEDDING_DIM or bit_width != TURBOVEC_BIT_WIDTH:
+            if dimension != self.embedding_dimensions or bit_width != TURBOVEC_BIT_WIDTH:
                 raise ArchiveError("Archive import dense index has an unsupported vector format.")
             if vector_count != active_chunk_count:
                 raise ArchiveError("Archive import dense index count does not match its catalog.")
@@ -2360,18 +2620,22 @@ class DocumentationArchive:
                 raise ArchiveError("Archive import dense index calibration scales must be finite and positive.")
 
     def _install_replacement_archive(self, install_root: Path) -> Path:
-        backup_path = self._next_backup_path()
-        moved_current = False
-        try:
-            if self.root.exists():
-                self.root.replace(backup_path)
-                moved_current = True
-            install_root.replace(self.root)
-            return backup_path
-        except Exception:
-            if moved_current and not self.root.exists() and backup_path.exists():
-                backup_path.replace(self.root)
-            raise
+        with self._search_sessions.exclusive():
+            checkpoint_catalog(self.db_path)
+            checkpoint_catalog(install_root / "catalog.sqlite")
+            backup_path = self._next_backup_path()
+            moved_current = False
+            try:
+                if self.root.exists():
+                    self.root.replace(backup_path)
+                    moved_current = True
+                install_root.replace(self.root)
+                return backup_path
+            except Exception:
+                if moved_current and not self.root.exists() and backup_path.exists():
+                    backup_path.replace(self.root)
+                raise
+
 
     def _next_backup_path(self) -> Path:
         base = self.root.parent / f"{self.root.name}.pre-import-{safe_timestamp()}"
@@ -2405,6 +2669,11 @@ class DocumentationArchive:
             with target_context as target:
                 if preserve_chunk_ids and not catalog_is_empty(target):
                     raise ArchiveError("Preserving imported chunk IDs requires an empty documentation catalog.")
+                for cache_row in source.execute("SELECT * FROM embedding_cache WHERE profile_id = ?", (self.embedding_profile_id,)):
+                    keys = [row["name"] for row in target.execute("PRAGMA table_info(embedding_cache)")]
+                    target.execute("INSERT OR IGNORE INTO embedding_cache (" + ",".join(keys) + ") VALUES (" + ",".join("?" for _ in keys) + ")", [cache_row[key] for key in keys])
+                for snapshot_path in pending_purge_paths(source, target):
+                    self._copy_import_snapshot_tree(source_root, snapshot_path)
                 documents = source.execute("SELECT * FROM documents ORDER BY created_at, document_id")
                 for document in documents:
                     document_id = str(document["document_id"])
@@ -2438,61 +2707,53 @@ class DocumentationArchive:
                             }
                         )
                     self._copy_import_snapshot_tree(source_root, str(document["snapshot_path"]))
-                    target.execute(
-                        """
-                        INSERT INTO documents (
-                          document_id, title, source_type, uri, snapshot_path, content_sha256, state, collection,
-                          tags_json, created_at, updated_at, extraction_revision
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, lower(hex(randomblob(16))))
-                        """,
-                        (
-                            document["document_id"],
-                            document["title"],
-                            document["source_type"],
-                            document["uri"],
-                            document["snapshot_path"],
-                            document["content_sha256"],
-                            document["state"],
-                            document["collection"],
-                            document["tags_json"],
-                            document["created_at"],
-                            document["updated_at"],
-                        ),
-                    )
+                    columns = [row["name"] for row in target.execute("PRAGMA table_info(documents)")]
+                    target.execute("INSERT INTO documents (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")", [document[key] for key in columns])
                     enrichment_id_map: dict[int, int] = {}
                     enrichments = source.execute(
                         "SELECT * FROM document_enrichments WHERE document_id = ? ORDER BY enrichment_id",
                         (document_id,),
                     ).fetchall()
                     for enrichment in enrichments:
-                        cursor = target.execute(
-                            """
-                            INSERT INTO document_enrichments (document_id, model, skill_ids_json, summary, payload_json, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                enrichment["document_id"],
-                                enrichment["model"],
-                                enrichment["skill_ids_json"],
-                                enrichment["summary"],
-                                enrichment["payload_json"],
-                                enrichment["created_at"],
-                            ),
-                        )
+                        columns = [row["name"] for row in target.execute("PRAGMA table_info(document_enrichments)") if row["name"] != "enrichment_id"]
+                        cursor = target.execute("INSERT INTO document_enrichments (" + ",".join(columns) + ") VALUES (" + ",".join("?" for _ in columns) + ")",
+                                                [enrichment[key] for key in columns])
                         enrichment_id_map[int(enrichment["enrichment_id"])] = int(cursor.lastrowid)
                         summary["importedEnrichments"] += 1
-                    chunks = source.execute("SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,))
-                    cursor = target.executemany(
-                        """
-                        INSERT INTO chunks (chunk_id, document_id, locator, text, state, chunk_origin, enrichment_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (imported_chunk_values(chunk, enrichment_id_map, preserve_chunk_id=preserve_chunk_ids) for chunk in chunks),
-                    )
-                    summary["importedChunks"] += cursor.rowcount
+                    chunks = source.execute("SELECT * FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,)).fetchall()
+                    chunk_id_map = {}
+                    for chunk in chunks:
+                        values = {row["name"]: chunk[row["name"]] for row in target.execute("PRAGMA table_info(chunks)")}
+                        old_id = values["chunk_id"]
+                        values["chunk_id"] = old_id if preserve_chunk_ids else None
+                        values["enrichment_id"] = enrichment_id_map.get(values["enrichment_id"])
+                        cursor = target.execute("INSERT INTO chunks (" + ",".join(values) + ") VALUES (" + ",".join("?" for _ in values) + ")", list(values.values()))
+                        chunk_id_map[old_id] = cursor.lastrowid
+                    for chunk in chunks:
+                        support = remap_support_chunk_ids(json.loads(chunk["support_json"]), chunk_id_map)
+                        target.execute("UPDATE chunks SET support_json = ? WHERE chunk_id = ?", (json.dumps(support), chunk_id_map[chunk["chunk_id"]]))
+                    summary["importedChunks"] += len(chunks)
+                    for table in ("enrichment_runs", "document_artifacts"):
+                        for row in source.execute(f"SELECT * FROM {table} WHERE document_id = ?", (document_id,)):
+                            values = {column["name"]: row[column["name"]] for column in target.execute(f"PRAGMA table_info({table})")}
+                            if table == "enrichment_runs":
+                                values["status"] = "interrupted" if values["status"] == "running" else values["status"]
+                                values["lease_until"] = 0
+                            for key in ("result_json", "payload_json"):
+                                if values.get(key) is not None:
+                                    values[key] = json.dumps(remap_support_chunk_ids(json.loads(values[key]), chunk_id_map))
+                            target.execute(f"INSERT INTO {table} (" + ",".join(values) + ") VALUES (" + ",".join("?" for _ in values) + ")", list(values.values()))
+                    for table, json_column in (("enrichment_batches", "output_json"), ("media_evidence", "result_json"), ("media_completion", "metadata_json")):
+                        for row in source.execute(f"SELECT b.* FROM {table} b JOIN enrichment_runs r ON b.run_id = r.run_id WHERE r.document_id = ?", (document_id,)):
+                            values = {column["name"]: row[column["name"]] for column in target.execute(f"PRAGMA table_info({table})")}
+                            values[json_column] = json.dumps(remap_support_chunk_ids(json.loads(values[json_column]), chunk_id_map))
+                            target.execute(f"INSERT INTO {table} (" + ",".join(values) + ") VALUES (" + ",".join("?" for _ in values) + ")", list(values.values()))
                     summary["importedInvalidationEvents"] += self._merge_invalidation_events(source, target, document_id)
                     summary["importedDocuments"] += 1
+                try:
+                    merge_archive_history(source, target)
+                except InvalidPortableCatalog as error:
+                    raise ArchiveError(str(error)) from error
         finally:
             source.close()
         return summary
@@ -2649,6 +2910,8 @@ class DocumentationArchive:
                 db.execute("ALTER TABLE documents ADD COLUMN extraction_revision TEXT NOT NULL DEFAULT ''")
                 db.execute("UPDATE documents SET extraction_revision = lower(hex(randomblob(16)))")
             create_catalog_indexes(db)
+            db.commit()
+            upgrade_catalog(db)
 
 
 class ArchiveError(ValueError):
@@ -2930,10 +3193,17 @@ def normalized_chunk_context(chunk_context: int | None) -> int:
     return value
 
 
+def published_chunk_sql(alias: str = "chunks") -> str:
+    return f"""{alias}.state != 'pending' AND ({alias}.chunk_origin != 'media' OR
+        {alias}.run_id = (SELECT e.run_id FROM document_enrichments e
+                        WHERE e.document_id = {alias}.document_id
+                        ORDER BY e.enrichment_id DESC LIMIT 1))"""
+
+
 def selected_chunk_ids_with_context(db: sqlite3.Connection, document_id: str, chunk_ids: list[int], context: int) -> list[int]:
     if not chunk_ids:
         return []
-    ordered_ids = [int(row["chunk_id"]) for row in db.execute("SELECT chunk_id FROM chunks WHERE document_id = ? ORDER BY chunk_id", (document_id,)).fetchall()]
+    ordered_ids = [int(row["chunk_id"]) for row in db.execute(f"SELECT chunk_id FROM chunks WHERE document_id = ? AND {published_chunk_sql()} ORDER BY chunk_id", (document_id,)).fetchall()]
     target_ids = set(chunk_ids)
     selected_indexes: set[int] = set()
     for index, chunk_id in enumerate(ordered_ids):
@@ -3000,7 +3270,7 @@ def infer_source_type(name: str, content_type: str | None) -> str:
         return "spreadsheet"
     if suffix in CODE_SOURCE_SUFFIXES:
         return "repo_code"
-    if suffix in {".srt", ".vtt"}:
+    if suffix in MEDIA_SUFFIXES or normalized_type.startswith(("audio/", "video/")) or suffix in {".srt", ".vtt"}:
         return "media"
     return "readme" if Path(name).name.lower().startswith("readme") else "text"
 
@@ -3154,6 +3424,21 @@ def schematic_artifacts(document_id: str, artifact_root: Path, *, offset: int = 
             alternate_paths.append(artifact_link("json", artifact_root, json_path))
         if image_path:
             alternate_paths.append(artifact_link("image", artifact_root, image_path))
+        try:
+            encoded_outputs = row.get("analysis_outputs", "[]")
+            if len(encoded_outputs) > 16_384:
+                raise ValueError("Schematic graph output metadata exceeds its byte limit")
+            output_values = json.loads(encoded_outputs)
+            if not isinstance(output_values, list) or len(output_values) > 8:
+                raise ValueError("Schematic graph output metadata must be a bounded list")
+            if optional_int(row.get("schema_version")) == 2 and not output_values:
+                raise ValueError("Schema 2 schematic metadata requires its structured graph output")
+            analysis_outputs = [GraphArtifactOutput.model_validate(value).model_dump(by_alias=True) for value in output_values]
+            for output in analysis_outputs:
+                output["path"] = safe_artifact_relative_path(output["path"])
+                alternate_paths.append(artifact_link(output["kind"], artifact_root, output["path"]))
+        except (ValueError, TypeError) as error:
+            raise ArchiveError(f"Invalid schematic graph artifact metadata: {error}") from error
         records.append(
             with_artifact_file_metadata(
                 artifact_root,
@@ -3173,7 +3458,7 @@ def schematic_artifacts(document_id: str, artifact_root: Path, *, offset: int = 
                     "labels": csv_string_list(row.get("labels")),
                     "connectionCues": semicolon_string_list(row.get("connection_cues")),
                     "classificationReasons": semicolon_string_list(row.get("reasons")),
-                    "analysisOutputs": [],
+                    "analysisOutputs": analysis_outputs,
                     "alternatePaths": alternate_paths,
                 },
             )
@@ -3264,6 +3549,7 @@ def vendor_code_artifacts(document_id: str, artifact_root: Path, *, offset: int 
             "policy": optional_text(str(manifest.get("policy") or "")),
             "rawSourceIndexed": bool(manifest.get("rawSourceIndexed")),
             "rawSourceRetained": bool(manifest.get("rawSourceRetained")),
+            "rawSourceArtifactsExposed": bool(manifest.get("rawSourceArtifactsExposed")),
             "coveredFileCount": len(manifest.get("coveredFiles") or []),
         }
         if kind == "manifest":
@@ -5164,12 +5450,14 @@ def title_from_url(url: str) -> str:
     return leaf or parsed.netloc or url
 
 
-def fetch_url_bytes(url: str, max_bytes: int) -> tuple[httpx.Response, bytes]:
+def fetch_url_bytes(url: str, max_bytes: int, *, headers: dict[str, str] | None = None) -> tuple[httpx.Response, bytes]:
     next_url = url
     with httpx.Client(follow_redirects=False, timeout=20.0) as client:
         for _redirect_count in range(MAX_URL_REDIRECTS + 1):
             validate_url_ingest_target(next_url)
-            with client.stream("GET", next_url) as response:
+            with client.stream("GET", next_url, headers=headers) as response:
+                if response.status_code == 304:
+                    return response, b""
                 if response.is_redirect:
                     location = response.headers.get("location")
                     if not location:
@@ -5236,14 +5524,16 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def catalog_index_generation(rows: Iterator[sqlite3.Row] | list[sqlite3.Row]) -> str:
+def catalog_index_generation(
+    rows: Iterator[sqlite3.Row] | list[sqlite3.Row], *, profile_id: str = EMBEDDING_PROFILE_ID, dimensions: int = EMBEDDING_DIM,
+) -> str:
     digest = hashlib.sha256()
     digest.update(
         json.dumps(
             {
                 "schemaVersion": ARCHIVE_SCHEMA_VERSION,
-                "embeddingProfileId": EMBEDDING_PROFILE_ID,
-                "embeddingDimension": EMBEDDING_DIM,
+                "embeddingProfileId": profile_id,
+                "embeddingDimension": dimensions,
                 "turbovecBitWidth": TURBOVEC_BIT_WIDTH,
                 "turbovecVersion": TURBOVEC_VERSION,
             },
@@ -5261,3 +5551,26 @@ def catalog_index_generation(rows: Iterator[sqlite3.Row] | list[sqlite3.Row]) ->
 
 def timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def artifact_paths(value: Any, key: str = "") -> set[str]:
+    if isinstance(value, dict):
+        return set().union(*(artifact_paths(item, name) for name, item in value.items()), set())
+    if isinstance(value, list):
+        return set().union(*(artifact_paths(item, key) for item in value), set())
+    return {value} if isinstance(value, str) and key in {"path", "image", "jsonPath", "markdownPath", "csvPath", "descriptionPath", "netlistPath", "analysisPath"} else set()
+
+
+def remap_support_chunk_ids(value: Any, chunk_ids: dict[int, int]) -> Any:
+    if isinstance(value, list):
+        return [remap_support_chunk_ids(item, chunk_ids) for item in value]
+    if isinstance(value, dict):
+        return {key: chunk_ids.get(item, item) if key in {"chunkId", "chunk_id"} and isinstance(item, int) else remap_support_chunk_ids(item, chunk_ids) for key, item in value.items()}
+    return value
+
+
+def require_source_revision(db: sqlite3.Connection, expected: tuple[str, str, str] | None) -> None:
+    if expected is not None and not db.execute(
+        "SELECT 1 FROM documents WHERE document_id = ? AND extraction_revision = ? AND source_key = ? AND state = 'active'", expected
+    ).fetchone():
+        raise ArchiveError("Source revision changed while acquiring its replacement. Check the current source again.")

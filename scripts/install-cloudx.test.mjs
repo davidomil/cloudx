@@ -142,11 +142,17 @@ describe("install-cloudx helpers", () => {
     expect(row).not.toContain("from `0`");
   });
 
-  it("runs documentation setup with the installer-owned uv and managed Python runtime", () => {
+  it("runs documentation setup with managed Python before provisioning the configured model", () => {
     const home = fs.mkdtempSync(
       path.join(os.tmpdir(), "cloudx-documentation-setup-home-"),
     );
     const logPath = path.join(home, "uv-args.log");
+    const modelLogPath = path.join(home, "model-args.log");
+    const setupRoot = path.join(home, "workspace");
+    const modelPath = path.join(setupRoot, "services/documentation-indexer/.venv/bin/cloudx-documentation-model");
+    fs.mkdirSync(path.dirname(modelPath), { recursive: true });
+    fs.writeFileSync(modelPath, '#!/bin/sh\n[ -f "$CLOUDX_TEST_UV_LOG" ] || exit 1\nprintf \'%s\\n\' "$#" "$CLOUDX_DOCUMENTATION_DATA_DIR" > "$CLOUDX_TEST_MODEL_LOG"\n');
+    fs.chmodSync(modelPath, 0o755);
     const uvPath = path.join(home, ".local/share/cloudx/uv/bin/uv");
     fs.mkdirSync(path.dirname(uvPath), { recursive: true });
     fs.writeFileSync(
@@ -163,11 +169,13 @@ describe("install-cloudx helpers", () => {
         "/bin/sh",
         ["-c", packageJson.scripts["documentation:setup"]],
         {
-          cwd: process.cwd(),
+          cwd: setupRoot,
           env: {
             HOME: home,
             PATH: "/cloudx-test-path-without-uv",
             CLOUDX_TEST_UV_LOG: logPath,
+            CLOUDX_TEST_MODEL_LOG: modelLogPath,
+            CLOUDX_DOCUMENTATION_DATA_DIR: path.join(home, "archive"),
           },
           stdio: "pipe",
         },
@@ -185,6 +193,7 @@ describe("install-cloudx helpers", () => {
         "--extra",
         "dev",
       ]);
+      expect(fs.readFileSync(modelLogPath, "utf8").trim().split("\n")).toEqual(["0", path.join(home, "archive")]);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -1112,6 +1121,11 @@ describe("runInstaller dry-run", () => {
         ["npm", "run", "build"],
       ]),
     );
+    expect(runner.commands.map(({ command, args }) => [command, ...args])).toContainEqual([
+      "/repo/services/documentation-indexer/.venv/bin/python",
+      "-m", "cloudx_documentation_indexer.semantic",
+      "/repo/.cloudx/documentation/models/minilm",
+    ]);
     const env = runner.writes.find(
       (write) => write.path === "/home/me/.config/cloudx/cloudx.env",
     )?.contents;

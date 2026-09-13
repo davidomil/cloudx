@@ -1584,6 +1584,8 @@ async function runUpdater({
     (envConfig.CLOUDX_DOCUMENTATION_ASR_DEVICE ??
       envConfig.CLOUDX_ASR_DEVICE ??
       "cpu") === "cuda",
+    envConfig.CLOUDX_DOCUMENTATION_MODEL_DIR ??
+      path.join(envConfig.CLOUDX_DOCUMENTATION_DATA_DIR ?? defaultDocumentationConfig(paths).documentationDataDir, "models", "minilm"),
   );
 
   section("7/10 Update optional whisper.cpp alternate ASR backend");
@@ -1814,7 +1816,7 @@ function setupAsr(commands, paths, cuda) {
   syncPythonService(commands, paths, paths.asrDir, paths.venvDir, cuda);
 }
 
-function setupDocumentationIndexer(commands, paths, cuda) {
+function setupDocumentationIndexer(commands, paths, cuda, modelDirectory = path.join(paths.dataDir, "documentation", "models", "minilm")) {
   console.log(
     `Synchronizing the locked documentation archive environment: ${paths.documentationVenvDir}`,
   );
@@ -1825,6 +1827,9 @@ function setupDocumentationIndexer(commands, paths, cuda) {
     paths.documentationVenvDir,
     cuda,
   );
+  commands.run(paths.documentationPythonPath, [
+    "-m", "cloudx_documentation_indexer.semantic", modelDirectory,
+  ]);
 }
 
 function syncPythonService(commands, paths, projectDir, environmentDir, cuda) {

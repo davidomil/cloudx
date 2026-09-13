@@ -7,6 +7,16 @@ import { describe, expect, it } from "vitest";
 import { PathPolicy } from "./pathPolicy.js";
 
 describe("PathPolicy", () => {
+  it("supplies expanded roots without allowing consumers to widen the policy", () => {
+    const home = path.join(os.tmpdir(), "cloudx-home");
+    const policy = new PathPolicy(["~/sources"], { homeDir: home });
+    const roots = policy.configuredRoots();
+    expect(roots).toEqual([path.join(home, "sources")]);
+    roots.push("/");
+    expect(policy.configuredRoots()).toEqual([path.join(home, "sources")]);
+    expect(policy.isAllowed("/etc")).toBe(false);
+  });
+
   it("accepts paths under configured roots", () => {
     const root = path.join(os.tmpdir(), "cloudx-root");
     const policy = new PathPolicy([root]);

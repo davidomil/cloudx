@@ -470,43 +470,6 @@ describe("DocumentationClient", () => {
     await expect(client.search({ query: "" })).rejects.toThrow("Search query is required.");
   });
 
-  it.each([undefined, "e".repeat(32)])("posts AI enrichment spans with extraction revision %s", async (extractionRevision) => {
-    let requestUrl = "";
-    let requestBody = "";
-    const url = await startServer((request, response) => {
-      requestUrl = request.url ?? "";
-      request.on("data", (chunk) => {
-        requestBody += chunk.toString();
-      });
-      request.on("end", () => {
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ document: { documentId: "doc-1" } }));
-      });
-    });
-    const client = new DocumentationClient(`${url}/docs`);
-
-    const result = await client.enrichDocument({
-      documentId: "doc-1",
-      extractionRevision,
-      spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
-      model: "gpt-test",
-      skillIds: ["documentation-enrich-metadata"],
-      summary: "Added metadata.",
-      payload: { source: "test" }
-    });
-
-    expect(result).toEqual({ document: { documentId: "doc-1" } });
-    expect(requestUrl).toBe("/docs/documents/doc-1/enrich");
-    expect(JSON.parse(requestBody)).toEqual({
-      ...(extractionRevision ? { extractionRevision } : {}),
-      spans: [{ locator: "ai:metadata", text: "Metadata summary." }],
-      model: "gpt-test",
-      skillIds: ["documentation-enrich-metadata"],
-      summary: "Added metadata.",
-      payload: { source: "test" }
-    });
-  });
-
   it("uploads files to the indexer as multipart form data", async () => {
     let requestUrl = "";
     let contentType = "";
@@ -642,11 +605,9 @@ describe("DocumentationClient", () => {
     const controller = new AbortController();
     const stopped = new Error("documentation enrichment stopped");
     const read = client.getDocument({ documentId: "doc-1" }, { signal: controller.signal });
-    const write = client.enrichDocument({
-      documentId: "doc-1",
-      spans: [{ locator: "ai:test", text: "test" }],
-      model: "gpt-test",
-      skillIds: ["documentation-enrich-metadata"]
+    const write = client.checkpointEnrichmentBatch("run", 0, {
+      leaseToken: "a".repeat(64), inputFingerprint: "b".repeat(64), model: "fixture",
+      output: { summary: "", spans: [], metadata: {}, warnings: [] }
     }, { signal: controller.signal });
     await requestsStarted;
 

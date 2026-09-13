@@ -1,3 +1,7 @@
+
+from enrichment_fixture import enrich_archive
+from cloudx_documentation_indexer.enrichment_runs import EnrichmentRunError
+from enrichment_fixture import enrich_via_run
 from pathlib import Path
 import re
 
@@ -14,7 +18,7 @@ def test_pending_enrichment_returns_active_documents_without_current_ai_evidence
     archive = DocumentationArchive(tmp_path / "archive")
     pending = archive.ingest_text(title="Pending", text="Pending source.")
     enriched = archive.ingest_text(title="Enriched", text="Enriched source.")
-    archive.enrich_document(enriched.document_id, spans=[ExtractedSpan("Derived evidence.", "ai")], model="test", skill_ids=[])
+    enrich_archive(archive, enriched.document_id, spans=[ExtractedSpan("Derived evidence.", "ai")], model="test", skill_ids=[])
     for state in ["stale", "deleted", "superseded"]:
         document = archive.ingest_text(title=state, text=f"Source in {state} state.")
         archive.invalidate_document(document.document_id, state=state, reason="Inactive source.")
@@ -24,7 +28,7 @@ def test_pending_enrichment_returns_active_documents_without_current_ai_evidence
     assert archive.pending_enrichment() == [{"documentId": pending.document_id, "title": "Pending", "extractionRevision": revision}]
 
     archive.ingest_text(title="Enriched", text="Enriched source.")
-    assert {document["documentId"] for document in archive.pending_enrichment(limit=100)} == {pending.document_id, enriched.document_id}
+    assert {document["documentId"] for document in archive.pending_enrichment(limit=100)} == {pending.document_id}
 
 
 def test_pending_enrichment_is_bounded_and_visits_oldest_documents_first(tmp_path: Path) -> None:
@@ -84,7 +88,7 @@ def test_terminal_background_outcomes_are_visible_and_remain_excluded_after_rest
     assert restarted.search("Attempted source")[0]["documentId"] == document.document_id
 
 
-@pytest.mark.parametrize("recovery", ["enrich", "ingest", "reanalyze"])
+@pytest.mark.parametrize("recovery", ["enrich", "reanalyze"])
 def test_explicit_reprocessing_clears_the_previous_background_outcome(tmp_path: Path, recovery: str) -> None:
     archive = DocumentationArchive(tmp_path / "archive")
     document = archive.ingest_text(title="Retry", text="Original source.")
@@ -92,7 +96,7 @@ def test_explicit_reprocessing_clears_the_previous_background_outcome(tmp_path: 
     archive.record_enrichment_outcome(document.document_id, extraction_revision=revision, status="failed", error="Previous failure.")
 
     if recovery == "enrich":
-        archive.enrich_document(document.document_id, spans=[ExtractedSpan("Recovered evidence.", "ai")], model="test", skill_ids=[])
+        enrich_archive(archive, document.document_id, spans=[ExtractedSpan("Recovered evidence.", "ai")], model="test", skill_ids=[])
     elif recovery == "ingest":
         archive.ingest_text(title="Retry", text="Original source.")
     else:
@@ -139,7 +143,7 @@ def test_late_background_failures_do_not_overwrite_newer_document_state(tmp_path
     document = archive.ingest_text(text="Source changed while enrichment ran.")
     revision = archive.pending_enrichment()[0]["extractionRevision"]
     if change == "enriched":
-        archive.enrich_document(document.document_id, spans=[ExtractedSpan("Manual enrichment succeeded.", "ai")], model="test", skill_ids=[])
+        enrich_archive(archive, document.document_id, spans=[ExtractedSpan("Manual enrichment succeeded.", "ai")], model="test", skill_ids=[])
     elif change == "missing":
         with archive._connect() as db:
             db.execute("DELETE FROM documents WHERE document_id = ?", (document.document_id,))
@@ -156,7 +160,7 @@ def test_late_background_failures_do_not_overwrite_newer_document_state(tmp_path
 
 @pytest.mark.parametrize("status", ["failed", "skipped"])
 @pytest.mark.parametrize("replacement", ["correct-source-type", "same-source-type", "reanalyze"])
-def test_replaced_extraction_rejects_old_outcomes_and_accepts_its_own(tmp_path: Path, status: str, replacement: str) -> None:
+def test_replaced_extraction_rejects_old_outcomes_and_accepts_its_own(tmp_path: Path, status: str, replacement: str, monkeypatch: pytest.MonkeyPatch) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)
     archive = app.state.archive
@@ -166,6 +170,8 @@ def test_replaced_extraction_rejects_old_outcomes_and_accepts_its_own(tmp_path: 
     document = archive.ingest_path(source_path, source_type="text")[0]
     old_revision = archive.pending_enrichment()[0]["extractionRevision"]
 
+    if replacement == "same-source-type":
+        monkeypatch.setattr(archive_module, "processor_fingerprint", lambda: "f" * 64)
     if replacement == "reanalyze":
         current = archive.reanalyze_document(document.document_id)
     else:
@@ -202,7 +208,7 @@ def test_replaced_extraction_rejects_old_outcomes_and_accepts_its_own(tmp_path: 
 
 
 @pytest.mark.parametrize("replacement", ["correct-source-type", "same-source-type", "reanalyze"])
-def test_replaced_extraction_rejects_old_success_and_accepts_its_own(tmp_path: Path, replacement: str) -> None:
+def test_replaced_extraction_rejects_old_success_and_accepts_its_own(tmp_path: Path, replacement: str, monkeypatch: pytest.MonkeyPatch) -> None:
     app = create_app(tmp_path / "archive")
     client = TestClient(app)
     archive = app.state.archive
@@ -210,6 +216,8 @@ def test_replaced_extraction_rejects_old_success_and_accepts_its_own(tmp_path: P
     source_path.write_text("<html><body>Release reset.<script>EXCLUDED-SCRIPT</script></body></html>")
     document = archive.ingest_path(source_path, source_type="text")[0]
     old_revision = archive.pending_enrichment()[0]["extractionRevision"]
+    if replacement == "same-source-type":
+        monkeypatch.setattr(archive_module, "processor_fingerprint", lambda: "f" * 64)
     if replacement == "reanalyze":
         archive.reanalyze_document(document.document_id)
     else:
@@ -217,12 +225,9 @@ def test_replaced_extraction_rejects_old_success_and_accepts_its_own(tmp_path: P
     pending = archive.pending_enrichment()
     current = archive.get_document(document.document_id)
     generation = archive._active_index_generation()
-    endpoint = f"/documents/{document.document_id}/enrich"
-    payload = {"model": "test", "spans": [{"locator": "ai", "text": "Obsolete EXCLUDED-SCRIPT evidence."}]}
+    stale = enrich_via_run(client, document.document_id, "Obsolete EXCLUDED-SCRIPT evidence.", revision=old_revision)
 
-    stale = client.post(endpoint, json={**payload, "extractionRevision": old_revision})
-
-    assert stale.status_code == 400
+    assert stale.status_code == 409
     assert "revision" in stale.json()["detail"]
     assert archive.get_document(document.document_id) == current
     assert archive.pending_enrichment() == pending
@@ -231,10 +236,8 @@ def test_replaced_extraction_rejects_old_success_and_accepts_its_own(tmp_path: P
     assert restarted.get_document(document.document_id) == current
     assert restarted.pending_enrichment() == pending
 
-    accepted = client.post(endpoint, json={
-        "model": "test", "extractionRevision": pending[0]["extractionRevision"],
-        "spans": [{"locator": "ai", "text": "Corrected release reset evidence."}],
-    })
+    accepted = enrich_via_run(client, document.document_id, "Corrected release reset evidence.", revision=pending[0]["extractionRevision"])
+
 
     assert accepted.status_code == 200
     assert [chunk["text"] for chunk in accepted.json()["document"]["chunks"] if chunk["chunk_origin"] == "ai"] == ["Corrected release reset evidence."]
@@ -251,12 +254,12 @@ def test_rejected_old_success_preserves_current_enrichment_and_outcome(tmp_path:
     archive.record_enrichment_outcome(document.document_id, extraction_revision=revision, status="failed", error="Current extraction failed.")
     for current_enriched in [False, True]:
         if current_enriched:
-            archive.enrich_document(document.document_id, model="test", skill_ids=[], spans=[ExtractedSpan("Explicit current evidence.", "ai")])
+            enrich_archive(archive, document.document_id, model="test", skill_ids=[], spans=[ExtractedSpan("Explicit current evidence.", "ai")])
         current = archive.get_document(document.document_id)
         generation = archive._active_index_generation()
 
-        with pytest.raises(ArchiveError, match="revision"):
-            archive.enrich_document(document.document_id, extraction_revision=old_revision, model="test", skill_ids=[], spans=[ExtractedSpan("Obsolete evidence.", "ai")])
+        with pytest.raises(EnrichmentRunError, match="revision"):
+            enrich_archive(archive, document.document_id, extraction_revision=old_revision, model="test", skill_ids=[], spans=[ExtractedSpan("Obsolete evidence.", "ai")])
 
         assert archive.get_document(document.document_id) == current
         assert archive._active_index_generation() == generation
@@ -270,13 +273,13 @@ def test_successful_enrichment_validates_a_supplied_extraction_revision(tmp_path
     document = archive.ingest_text(text="Validation source.")
     current = archive.get_document(document.document_id)
 
-    response = client.post(f"/documents/{document.document_id}/enrich", json={
-        "model": "test", "extractionRevision": revision, "spans": [{"locator": "ai", "text": "Derived evidence."}],
+    response = client.post(f"/documents/{document.document_id}/enrichment-runs", json={
+        "extractionRevision": revision, "processorFingerprint": "a" * 64, "ownerId": "fixture",
     })
 
     assert response.status_code == 422
-    with pytest.raises(ArchiveError, match="revision"):
-        archive.enrich_document(document.document_id, extraction_revision=revision, model="test", skill_ids=[], spans=[ExtractedSpan("Derived evidence.", "ai")])
+    with pytest.raises(EnrichmentRunError, match="revision"):
+        enrich_archive(archive, document.document_id, extraction_revision=revision, model="test", skill_ids=[], spans=[ExtractedSpan("Derived evidence.", "ai")])
     assert archive.get_document(document.document_id) == current
 
 
@@ -290,7 +293,7 @@ def test_document_evidence_and_artifact_snapshot_match_its_extraction_revision(t
     replacement = archive._store_snapshot(b"Replacement extraction.", "replacement.txt")
     changed = False
     artifact_snapshots = []
-    read_artifacts = archive_module.snapshot_artifact_window
+    read_artifacts = archive._artifact_window
 
     def replace_between_document_and_chunks(statement: str) -> None:
         nonlocal changed
@@ -306,12 +309,12 @@ def test_document_evidence_and_artifact_snapshot_match_its_extraction_revision(t
         db.set_trace_callback(replace_between_document_and_chunks)
         return db
 
-    def observe_artifact_snapshot(document_id, snapshot_path, **window):
-        artifact_snapshots.append(snapshot_path.relative_to(archive.root).as_posix())
-        return read_artifacts(document_id, snapshot_path, **window)
+    def observe_artifact_snapshot(db, document_id, **window):
+        artifact_snapshots.append(db.execute("SELECT snapshot_path FROM documents WHERE document_id = ?", (document_id,)).fetchone()[0])
+        return read_artifacts(db, document_id, **window)
 
     monkeypatch.setattr(archive, "_connect", connect_with_concurrent_replacement)
-    monkeypatch.setattr(archive_module, "snapshot_artifact_window", observe_artifact_snapshot)
+    monkeypatch.setattr(archive, "_artifact_window", observe_artifact_snapshot)
 
     evidence = archive.get_document(document.document_id)
 
@@ -358,7 +361,7 @@ def test_failed_enrichment_publication_preserves_the_previous_background_outcome
 
     monkeypatch.setattr(archive, "_build_index_generation", fail_index)
     with pytest.raises(RuntimeError, match="Cannot publish"):
-        archive.enrich_document(document.document_id, spans=[ExtractedSpan("New evidence.", "ai")], model="test", skill_ids=[])
+        enrich_archive(archive, document.document_id, spans=[ExtractedSpan("New evidence.", "ai")], model="test", skill_ids=[])
 
     assert archive.get_document(document.document_id)["backgroundEnrichment"] == outcome
     assert archive.pending_enrichment() == []
@@ -424,15 +427,22 @@ def test_import_rejects_invalid_background_outcomes_without_replacing_the_archiv
     elif problem == "unknown-document":
         outcome["document_id"] = "unknown"
     with source._connect() as db:
+        if problem == "unknown-document":
+            db.execute("PRAGMA foreign_keys = OFF")
         db.execute("DROP TABLE document_enrichment_outcomes")
-        db.execute("CREATE TABLE document_enrichment_outcomes (document_id, status, error, updated_at)")
+        primary_key = "" if problem == "missing-primary-key" else "PRIMARY KEY"
+        db.execute(f"""CREATE TABLE document_enrichment_outcomes (
+            document_id TEXT {primary_key} REFERENCES documents(document_id) ON DELETE CASCADE,
+            status, error, updated_at
+        )""")
         db.execute("INSERT INTO document_enrichment_outcomes VALUES (:document_id, :status, :error, :updated_at)", outcome)
     exported = source.export_archive()
     target = DocumentationArchive(tmp_path / "target")
     preserved = target.ingest_text(text="Preserved source.")
     pending = target.pending_enrichment()
     try:
-        with pytest.raises(ArchiveError, match="background enrichment outcomes"):
+        expected_error = "orphaned foreign-key records" if problem == "unknown-document" else "background enrichment outcomes"
+        with pytest.raises(ArchiveError, match=expected_error):
             target.import_archive_replace(exported.path, confirmation=ARCHIVE_IMPORT_REPLACE_CONFIRMATION)
         assert target.pending_enrichment() == pending
         assert target.search("Preserved source")[0]["documentId"] == preserved.document_id

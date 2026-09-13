@@ -2,7 +2,7 @@
 name = "cloudx-documentation-indexer"
 version = "0.1.0"
 description = "Portable Turbovec-backed documentation archive and retrieval service for Cloudx"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
   "beautifulsoup4>=4.14",
@@ -11,6 +11,7 @@ dependencies = [
   "faster-whisper>=1.1",
   "httpx>=0.28",
   "numpy>=2.0",
+  "onnxruntime==1.27.0",
   "odfpy>=1.4",
   "openpyxl>=3.1",
   "pandas>=2.3",
@@ -21,6 +22,7 @@ dependencies = [
   "pypdfium2>=5.9,<6",
   "python-multipart>=0.0.9",
   "torch>=2.7",
+  "tokenizers==0.22.2",
   "turbovec==0.7.0",
   "uvicorn[standard]>=0.30",
   "xlrd>=2.0",
@@ -30,8 +32,14 @@ dependencies = [
 
 [project.scripts]
 cloudx-documentation-indexer = "cloudx_documentation_indexer.main:main"
+cloudx-documentation-model = "cloudx_documentation_indexer.semantic:main"
 
 [project.optional-dependencies]
+schematic = [
+  "ultralytics==8.3.162",
+  "torch==2.13.0",
+  "torchvision==0.28.0"
+]
 dev = [
   "pytest>=8.0",
   "reportlab>=4.5",
@@ -50,6 +58,9 @@ build-backend = "setuptools.build_meta"
 required-version = "==0.11.28"
 
 [tool.uv.sources]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
+]
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }
 ]

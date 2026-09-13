@@ -362,19 +362,10 @@ function trimUtf8ToLastBytes(value: string, maxBytes: number): string {
   if (Buffer.byteLength(value, "utf8") <= maxBytes) {
     return value;
   }
-  const kept: string[] = [];
-  let bytes = 0;
-  const codePoints = Array.from(value);
-  for (let index = codePoints.length - 1; index >= 0; index -= 1) {
-    const codePoint = codePoints[index]!;
-    const size = Buffer.byteLength(codePoint, "utf8");
-    if (bytes + size > maxBytes) {
-      break;
-    }
-    bytes += size;
-    kept.push(codePoint);
-  }
-  return kept.reverse().join("");
+  const bytes = Buffer.from(value, "utf8");
+  let start = bytes.length - maxBytes;
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  return bytes.toString("utf8", start);
 }
 
 function isNotFound(error: unknown): boolean {
