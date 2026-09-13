@@ -31,13 +31,13 @@ class LocalSourceAccess:
                 raise ArchiveError("Original source is outside configured Cloudx roots.")
             # Walk from the filesystem anchor: O_NOFOLLOW on only the final
             # component would still allow an ancestor swapped for a symlink.
-            descriptor = os.open(resolved.anchor, os.O_RDONLY | os.O_DIRECTORY)
-            for index, component in enumerate(resolved.parts[1:]):
+            for index, component in enumerate(resolved.parts):
                 flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                if index < len(resolved.parts) - 2:
-                    flags |= os.O_DIRECTORY
+                if index < len(resolved.parts) - 1:
+                    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
                 child = os.open(component, flags, dir_fd=descriptor)
-                os.close(descriptor)
+                if descriptor is not None:
+                    os.close(descriptor)
                 descriptor = child
             yield descriptor
         except OSError as error:

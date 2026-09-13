@@ -1,6 +1,7 @@
 """Source revision routes enforce server-supplied access independently of stored URIs."""
 import hashlib
 import json
+import os
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -231,3 +232,76 @@ def test_allowed_nested_code_and_member_aliases_keep_the_original_bundle_identit
         assert response.json()["status"] == "unchanged"
         assert response.json()["contentSha256"] == before["content_sha256"]
         assert archive.get_document(document.document_id) == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="Real permission checks require an unprivileged process")
+@pytest.mark.parametrize("shape", ["text", "code-file", "code-directory"])
+@pytest.mark.parametrize("root_position", ["above-parent", "parent", "below-parent"])
+def test_readable_sources_under_search_only_parents_can_be_checked_and_refreshed(revision_access, shape, root_position):
+    archive, client, allowed, _outside = revision_access
+    parent = allowed / "search-only"
+    directory = parent / "sources"
+    directory.mkdir(parents=True)
+    original = directory / ("guide.txt" if shape == "text" else "driver.c")
+    old_content = b"#define SOURCE_REVISION 1\n"
+    new_content = b"#define SOURCE_REVISION 2\n"
+    original.write_bytes(old_content)
+    roots = {"above-parent": allowed, "parent": parent, "below-parent": directory}
+    source = directory if shape == "code-directory" else original
+    parent.chmod(0o111)
+    try:
+        with pytest.raises(PermissionError):
+            list(parent.iterdir())
+        document = archive.ingest_path(source, accept_generated_code_documentation=shape != "text")[0]
+        before = archive.get_document(document.document_id)
+        snapshot = archive.root / before["snapshot_path"]
+        retained = snapshot.read_bytes()
+        original.write_bytes(new_content)
+        assert original.read_bytes() == new_content
+
+        for endpoint in ENDPOINTS:
+            response = client.post(f"/documents/{document.document_id}/{endpoint}", json={"allowedRoots": [str(roots[root_position])]})
+            assert response.status_code == 200, response.text
+            assert response.json()["status"] == ("refreshed" if endpoint == "refresh" else "new-revision")
+            assert response.json()["contentSha256"] != before["content_sha256"]
+            assert snapshot.read_bytes() == retained
+            if endpoint == "check-revision":
+                assert archive.get_document(document.document_id) == before
+            else:
+                current = archive.get_document(response.json()["documentId"])
+                assert current["source_key"] == before["source_key"]
+                assert current["state"] == "active"
+                assert archive.get_document(document.document_id)["state"] == "superseded"
+    finally:
+        parent.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="Real permission checks require an unprivileged process")
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+@pytest.mark.parametrize("denied", ["parent-search", "file-read", "directory-read", "nested-directory-read"])
+def test_revision_acquisition_still_requires_traversal_and_final_source_permissions(revision_access, endpoint, denied):
+    archive, client, allowed, _outside = revision_access
+    parent = allowed / "parent"
+    directory = parent / "sources"
+    nested = directory / "nested"
+    nested.mkdir(parents=True)
+    original = nested / "driver.c"
+    original.write_text("#define SOURCE_REVISION 1\n")
+    source = directory if "directory" in denied else original
+    document = archive.ingest_path(source, accept_generated_code_documentation=True)[0]
+    original.write_text("#define SOURCE_REVISION 2\n")
+    restricted, mode = {
+        "parent-search": (parent, 0o444),
+        "file-read": (original, 0o000),
+        "directory-read": (directory, 0o111),
+        "nested-directory-read": (nested, 0o111),
+    }[denied]
+    previous_mode = restricted.stat().st_mode & 0o777
+    restricted.chmod(mode)
+    try:
+        with pytest.raises(PermissionError):
+            list(restricted.iterdir()) if "directory" in denied else original.read_bytes()
+        response = assert_access_denied(archive, client, document.document_id, endpoint, [allowed])
+        assert "Permission denied" in response.json()["detail"]
+    finally:
+        restricted.chmod(previous_mode)

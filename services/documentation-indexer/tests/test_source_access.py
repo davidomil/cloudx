@@ -89,3 +89,8 @@ def test_root_authorization_uses_path_components(tmp_path, allowed):
     with pytest.raises(ArchiveError, match="outside configured.*roots"):
         with access.open(source):
             pytest.fail("Outside sources must be rejected before reading")
+
+
+def test_filesystem_anchor_as_final_source_can_be_enumerated():
+    with LocalSourceAccess(["/"]).open(Path("/")) as descriptor:
+        assert isinstance(os.listdir(descriptor), list)
