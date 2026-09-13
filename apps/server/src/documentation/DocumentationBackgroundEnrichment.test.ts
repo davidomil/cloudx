@@ -107,7 +107,7 @@ describe("DocumentationBackgroundEnrichment", () => {
     const { worker, client, enrichment, started, importDocument, finish, reportError } = productionFixture();
     for (const id of ["duplicate", "slow", "next"]) importDocument(id);
     const foreground = enrichment.enrichIngestResponse({ document: document("duplicate") });
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(started).toEqual(["duplicate"]));
     worker.start();
     await vi.advanceTimersByTimeAsync(0);
     await vi.waitFor(() => expect(started).toEqual(["duplicate", "slow"]));

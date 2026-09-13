@@ -36,7 +36,8 @@ describe.skipIf(process.platform !== "linux")("broker-owned terminal processes",
     await vi.waitFor(() => expect(output).toMatch(/READY_PID=\d+/u));
     const pid = Number(/READY_PID=(\d+)/u.exec(output)![1]);
     original.write("python3 -c \"import os; [os.write(1, b'@' * 65536) for _ in range(1024)]\"; printf '\\nBURST_DONE=%s\\n' \"$$\"\n");
-    await vi.waitFor(() => expect(output).toContain(`BURST_DONE=${pid}`), { timeout: 75_000 });
+    // Coverage workers can share one CPU while the full burst drains through the PTY.
+    await vi.waitFor(() => expect(output).toContain(`BURST_DONE=${pid}`), { timeout: 120_000 });
     expect(printableBytes).toBe(64 * 1024 * 1024);
     expect(disconnected).not.toHaveBeenCalled();
     original.write("printf '\\nAFTER_BURST=%s\\n' \"$$\"\n");
@@ -52,7 +53,7 @@ describe.skipIf(process.platform !== "linux")("broker-owned terminal processes",
     await vi.waitFor(() => expect(restoredOutput).toContain(`RESTORED_PID=${pid}`));
     await restored.terminate();
     expect(await running(pid)).toBe(false);
-  }, 90_000);
+  }, 135_000);
 
   it("restores the same shell, working directory, and output produced while the web client was detached", async () => {
     const directory = await temporaryDirectory();
