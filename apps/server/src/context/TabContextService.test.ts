@@ -196,6 +196,19 @@ describe("TabContextService", () => {
     expect(text).not.toContain("\uFFFD");
   });
 
+  it.each([["é", 2], ["漢", 3], ["🙂", 4]] as const)("keeps complete %s characters at every context entry byte boundary", async (character, width) => {
+    const { service, tab } = await createContext();
+    for (let remaining = 0; remaining <= width; remaining++) {
+      const suffix = "x".repeat(12_000 - remaining);
+      await service.record(tab, "terminal-output", `discarded prefix${character}${suffix}`);
+      const text = await service.read(tab);
+      const entry = text.split("```text\n").at(-1)!.split("\n```")[0];
+      expect(entry).toBe(remaining === width ? character + suffix : suffix);
+      expect(Buffer.byteLength(entry!, "utf8")).toBeLessThanOrEqual(12_000);
+      expect(entry).not.toContain("\uFFFD");
+    }
+  });
+
   it("lets tabs start without context history when the disk is full", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-create-enospc-"));
     const service = new TabContextService(path.join(root, ".cloudx"), {
