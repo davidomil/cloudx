@@ -5,6 +5,7 @@ from enrichment_fixture import enrich_archive
 import io
 import json
 import sqlite3
+import sys
 import wave
 from pathlib import Path
 
@@ -410,8 +411,29 @@ def test_reanalysis_preserves_copied_text_when_a_sibling_source_is_named_metadat
     assert len(archive.list_documents()) == (1 if sibling_state == "absent" else 2)
 
 
+@pytest.fixture
+def wav_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide the identity fixture's WAV probe without requiring host FFmpeg."""
+    tools = tmp_path / "media-tools"
+    tools.mkdir()
+    probe = tools / "ffprobe"
+    probe.write_text(f"#!{sys.executable}\n" + '''import json, sys, wave
+assert sys.argv[sys.argv.index('-protocol_whitelist') + 1] == 'file'
+assert sys.argv[sys.argv.index('-of') + 1] == 'json'
+with wave.open(sys.argv[-1], 'rb') as recording:
+    assert recording.getparams()[:4] == (1, 2, 16000, 160)
+    assert recording.readframes(160) == b'\\0\\0' * 160
+    metadata = {'streams': [{'index': 0, 'codec_name': 'pcm_s16le', 'codec_type': 'audio',
+                            'sample_rate': str(recording.getframerate()), 'channels': recording.getnchannels()}],
+                'format': {'format_name': 'wav', 'duration': f'{recording.getnframes() / recording.getframerate():.6f}'}}
+print(json.dumps(metadata))
+''')
+    probe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools))
+
+
 @pytest.mark.parametrize("filename", ["recording.bin", "recording"])
-def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, filename: str) -> None:
+def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wav_probe, filename: str) -> None:
     audio = io.BytesIO()
     with wave.open(audio, "wb") as recording:
         recording.setnchannels(1)
@@ -445,6 +467,9 @@ def test_reanalysis_preserves_media_upload_identity_when_a_url_replaces_shared_m
         assert current["source_type"] == "media"
         assert (archive.root / current["snapshot_path"]).read_bytes() == source_bytes
         assert json.loads(snapshot.with_name("metadata.json").read_text()) == url_metadata
+        media = json.loads((snapshot.parent / "extracted/media-source.json").read_text())
+        assert media["streams"][0]["codec_type"] == "audio"
+        assert media["format"] == {"format_name": "wav", "duration": "0.010000"}
     assert len(archive.list_documents()) == 2
 
 

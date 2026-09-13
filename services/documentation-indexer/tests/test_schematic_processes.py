@@ -1,4 +1,5 @@
 """Exercise private subprocess boundaries with deliberately controlled executables."""
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -82,7 +83,7 @@ sys.stdin.read()
 
 
 @pytest.mark.parametrize("behavior,message", [
-    ("valid", None), ("version", "Tesseract 5"), ("failure", "exit status 4"),
+    ("valid", None), ("slow", None), ("version", "Tesseract 5"), ("failure", "exit status 4"),
     ("missing", "missing or oversized"), ("timeout", "time limit"),
 ])
 def test_local_ocr_runs_bounded_executable_and_maps_word_boxes(tmp_path, behavior, message):
@@ -95,13 +96,16 @@ if '--version' in sys.argv:
     raise SystemExit(0)
 assert sys.argv[sys.argv.index('--psm') + 1] == '11'
 assert sys.argv[sys.argv.index('--oem') + 1] == '1'
+if behavior == 'slow': time.sleep(1.25)
 if behavior == 'timeout': time.sleep(30)
 if behavior == 'failure': raise SystemExit(4)
 if behavior == 'missing': raise SystemExit(0)
 pathlib.Path(sys.argv[2] + '.tsv').write_text('level\\tleft\\ttop\\twidth\\theight\\tconf\\ttext\\n5\\t6\\t9\\t12\\t6\\t96\\tU1\\n')
 ''')
     executable.chmod(0o755)
-    settings = OcrSettings(executable, model, hashlib.sha256(model.read_bytes()).hexdigest(), timeout_seconds=1)
+    settings = OcrSettings(executable, model, hashlib.sha256(model.read_bytes()).hexdigest())
+    if behavior == "timeout":
+        settings = replace(settings, timeout_seconds=1)
     if message:
         with pytest.raises(OcrUnavailable, match=message):
             LocalOcr(settings).recognize(Image.new("RGB", (20, 20)))
