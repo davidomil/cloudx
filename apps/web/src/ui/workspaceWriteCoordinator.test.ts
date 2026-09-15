@@ -7,6 +7,72 @@ import { defaultLayout, splitPane } from "./layout.js";
 import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
 
 describe("WorkspaceWriteCoordinator", () => {
+  it("checks durability with an empty layout queue and propagates failure without retrying", async () => {
+    const persist = vi.fn().mockRejectedValueOnce(new Error("EDQUOT")).mockResolvedValue(undefined);
+    const coordinator = new WorkspaceWriteCoordinator(async () => undefined, 200);
+    try {
+      await expect(coordinator.flushDurably(persist)).rejects.toThrow("EDQUOT");
+      expect(persist).toHaveBeenCalledOnce();
+      await coordinator.flushDurably(persist);
+      expect(persist).toHaveBeenCalledTimes(2);
+    } finally {
+      coordinator.dispose();
+    }
+  });
+
+  it("persists changes queued during the durable checkpoint before releasing the barrier", async () => {
+    const held = deferred<void>();
+    const persist = vi.fn().mockImplementationOnce(() => held.promise).mockResolvedValue(undefined);
+    const persistLayout = vi.fn(async () => undefined);
+    const coordinator = new WorkspaceWriteCoordinator(persistLayout, 60_000);
+    try {
+      const barrier = coordinator.flushDurably(persist);
+      await vi.waitFor(() => expect(persist).toHaveBeenCalledOnce());
+      const layout = defaultLayout();
+      coordinator.scheduleLayout("window-1", layout);
+      held.resolve();
+      await barrier;
+      expect(persistLayout).toHaveBeenCalledExactlyOnceWith("window-1", layout);
+      expect(persist).toHaveBeenCalledTimes(2);
+      expect(persist.mock.invocationCallOrder[0]).toBeLessThan(persistLayout.mock.invocationCallOrder[0]!);
+      expect(persistLayout.mock.invocationCallOrder[0]).toBeLessThan(persist.mock.invocationCallOrder[1]!);
+    } finally {
+      coordinator.dispose();
+    }
+  });
+
+  it("propagates a failed in-flight layout before attempting a durable checkpoint", async () => {
+    const held = deferred<void>();
+    const persist = vi.fn(async () => undefined);
+    const coordinator = new WorkspaceWriteCoordinator(() => held.promise, 60_000);
+    try {
+      coordinator.scheduleLayout("window-1", defaultLayout());
+      const autosave = expect(coordinator.flush()).rejects.toThrow("ENOSPC");
+      const barrier = expect(coordinator.flushDurably(persist)).rejects.toThrow("ENOSPC");
+      held.reject(new Error("ENOSPC"));
+      await Promise.all([autosave, barrier]);
+      expect(persist).not.toHaveBeenCalled();
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(true);
+    } finally {
+      coordinator.dispose();
+    }
+  });
+
+  it("propagates a command queued as the durable barrier begins", async () => {
+    const coordinator = new WorkspaceWriteCoordinator(async () => undefined, 200);
+    try {
+      const barrier = coordinator.flushDurably(async () => undefined);
+      const command = coordinator.run(async () => { throw new Error("Tab close failed"); });
+      const outcomes = await Promise.allSettled([barrier, command]);
+      expect(outcomes).toEqual([
+        { status: "rejected", reason: expect.objectContaining({ message: "Tab close failed" }) },
+        { status: "rejected", reason: expect.objectContaining({ message: "Tab close failed" }) }
+      ]);
+    } finally {
+      coordinator.dispose();
+    }
+  });
+
   it.each(["saved", "failed"])("continues a debounced layout PATCH after a tab close fails: layout %s", async (saveOutcome) => {
     vi.useFakeTimers();
     const close = deferred<Response>();

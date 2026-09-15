@@ -436,6 +436,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.get("/api/workspace", async () => workspaceState(services));
 
+  app.post("/api/workspace/persist", async () => {
+    await services.workspace!.persistDurably();
+    return { ok: true };
+  });
+
   app.post<{ Body: unknown }>("/api/windows", async (request, reply) => {
     await services.workspace!.createWindow(createWindowBody(request.body));
     reply.code(201);

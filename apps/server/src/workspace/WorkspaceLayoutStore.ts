@@ -106,6 +106,10 @@ export class WorkspaceLayoutStore {
     return { ...this.persistence };
   }
 
+  async persistDurably(): Promise<void> {
+    return this.serializeWorkspaceAccess(() => this.persist(true));
+  }
+
   async state(tabs: WorkspaceTab[], activeTabId?: string): Promise<WorkspaceStateResponse> {
     return this.serializeWorkspaceAccess(async () => {
       const changed = this.reconcileTabs(tabs);

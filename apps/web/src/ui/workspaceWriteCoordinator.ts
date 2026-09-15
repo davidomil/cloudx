@@ -38,6 +38,13 @@ export class WorkspaceWriteCoordinator {
     }
   }
 
+  async flushDurably(persistWorkspace: () => Promise<void>): Promise<void> {
+    do {
+      await this.flush();
+      await Promise.all([...this.outstanding, this.enqueue(persistWorkspace)]);
+    } while (this.outstanding.size || this.pendingLayout);
+  }
+
   run<T>(operation: () => Promise<T>): Promise<T> {
     this.clearTimer();
     return this.enqueue(async () => {

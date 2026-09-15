@@ -30,6 +30,7 @@ import type {
   PluginDescriptor,
   CloudxNotification,
   SearchWorkspaceWindowsResponse,
+  TabLayoutState,
   TriggerEvent,
   TriggerDescriptor,
   TriggerListResponse,
@@ -588,6 +589,22 @@ export async function getTabs(): Promise<{ tabs: WorkspaceTab[]; activeTabId?: s
 
 export async function getWorkspace(): Promise<WorkspaceStateResponse> {
   return fetchJson("/api/workspace");
+}
+
+export async function persistWorkspace(): Promise<void> {
+  await fetchJson("/api/workspace/persist", { method: "POST", body: "{}" });
+}
+
+export function isWorkspaceLayoutDurable(state: Pick<WorkspaceStateResponse, "persistence">): boolean {
+  return state.persistence?.some(status => status.name === "Workspace layout" && status.state === "available") === true;
+}
+
+export async function persistWindowLayout(windowId: string, layout: TabLayoutState): Promise<void> {
+  const state = await updateWindow(windowId, { layout });
+  if (!isWorkspaceLayoutDurable(state)) {
+    const status = state.persistence?.find(status => status.name === "Workspace layout");
+    throw new Error(`Workspace layout could not be saved to disk: ${status?.code ?? "persistence unconfirmed"}${status?.message ? `: ${status.message}` : ""}`);
+  }
 }
 
 export async function createWindow(input: CreateWorkspaceWindowRequest): Promise<WorkspaceStateResponse> {

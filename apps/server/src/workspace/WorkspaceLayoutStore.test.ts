@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import type { WorkspaceLayoutTemplateTab, WorkspaceTab } from "@cloudx/shared";
+import type { TabLayoutState, WorkspaceLayoutTemplateTab, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import { WorkspaceLayoutStore } from "./WorkspaceLayoutStore.js";
@@ -268,6 +268,78 @@ describe("WorkspaceLayoutStore", () => {
     expect(statuses).toEqual(["degraded", "available"]);
     expect(recovered.persistence).toEqual([expect.objectContaining({ name: "Workspace layout", state: "available" })]);
     expect(new WorkspaceLayoutStore(dataDir, new PathPolicy([root])).getWindow(created.id)).toMatchObject({ name: "Recovered" });
+  });
+
+  it.each(["ENOSPC", "EDQUOT"])("requires a durable checkpoint after an earlier %s autosave", async (code) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-durable-"));
+    const dataDir = path.join(root, ".cloudx");
+    const pathPolicy = new PathPolicy([root]);
+    const store = new WorkspaceLayoutStore(dataDir, pathPolicy);
+    const window = await store.createWindow({ name: "Saved", defaultCwd: root });
+    const layout: TabLayoutState = {
+      root: {
+        type: "split", id: "split-1", direction: "row", sizes: [50, 50],
+        children: [window.layout.root, { type: "pane", pane: { id: "pane-2", tabIds: [] } }]
+      },
+      activePaneId: window.layout.activePaneId
+    };
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const failure = Object.assign(new Error("Workspace storage is full."), { code });
+    workspaceFile.write = vi.fn().mockRejectedValue(failure);
+    try {
+      await store.updateWindow(window.id, { layout });
+      expect(store.persistenceStatus()).toMatchObject({ state: "degraded", code });
+
+      await expect(store.persistDurably()).rejects.toBe(failure);
+      expect(store.getWindow(window.id).layout).toEqual(layout);
+      expect(new WorkspaceLayoutStore(dataDir, pathPolicy).getWindow(window.id).layout).toEqual(window.layout);
+
+      workspaceFile.write = originalWrite;
+      await store.persistDurably();
+      expect(store.persistenceStatus()).toMatchObject({ state: "available" });
+      expect(new WorkspaceLayoutStore(dataDir, pathPolicy).getWindow(window.id).layout).toEqual(layout);
+    } finally {
+      workspaceFile.write = originalWrite;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("checkpoints the state published by an outstanding workspace mutation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-durable-queue-"));
+    const dataDir = path.join(root, ".cloudx");
+    const pathPolicy = new PathPolicy([root]);
+    const store = new WorkspaceLayoutStore(dataDir, pathPolicy);
+    const window = await store.createWindow({ name: "Saved", defaultCwd: root });
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    const write = vi.fn(originalWrite).mockImplementationOnce(async (value) => {
+      writeStarted.resolve();
+      await releaseWrite.promise;
+      await originalWrite(value);
+    });
+    workspaceFile.write = write;
+    const placement = store.placeTabAndPublish({ tabId: "tab-1", windowId: window.id, paneId: window.layout.activePaneId }, () => undefined);
+    let checkpoint: Promise<void> | undefined;
+    try {
+      await writeStarted.promise;
+      checkpoint = store.persistDurably();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(write).toHaveBeenCalledOnce();
+      expect(store.tabIdsForWindow(window.id)).toEqual([]);
+
+      releaseWrite.resolve();
+      await Promise.all([placement, checkpoint]);
+      expect(write).toHaveBeenCalledTimes(2);
+      expect(new WorkspaceLayoutStore(dataDir, pathPolicy).tabIdsForWindow(window.id)).toEqual(["tab-1"]);
+    } finally {
+      releaseWrite.resolve();
+      await Promise.allSettled([placement, checkpoint]);
+      workspaceFile.write = originalWrite;
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("normalizes stored workspace collection shapes instead of crashing on valid JSON with wrong field types", async () => {

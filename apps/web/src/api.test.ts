@@ -23,6 +23,9 @@ import {
   getConfig,
   getHooks,
   importDocumentationArchive,
+  isWorkspaceLayoutDurable,
+  persistWindowLayout,
+  persistWorkspace,
   runTabAction,
   selectWindow,
   setActiveTab,
@@ -36,10 +39,40 @@ import {
   uploadFileBrowserFile,
   voiceAudioConstraints
 } from "./api.js";
+import { defaultLayout } from "./ui/layout.js";
 
 describe("api client", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("requests a durable workspace checkpoint even without a pending layout", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetch);
+    await persistWorkspace();
+    expect(fetch).toHaveBeenCalledExactlyOnceWith("/api/workspace/persist", {
+      method: "POST", body: "{}", headers: { "content-type": "application/json" }
+    });
+  });
+
+  it.each(["ENOSPC", "EDQUOT"])("rejects an HTTP-successful layout save degraded by %s", async code => {
+    const state = { persistence: [{ name: "Workspace layout", state: "degraded" as const, path: "/workspace.json", code, message: "Disk capacity exhausted" }] };
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse(state)));
+    await expect(persistWindowLayout("window-1", defaultLayout())).rejects.toThrow(`${code}: Disk capacity exhausted`);
+    expect(isWorkspaceLayoutDurable(state)).toBe(false);
+  });
+
+  it("requires confirmed layout persistence and ignores unrelated store degradation", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(jsonResponse({ persistence: [{ name: "Automation groups", state: "available" }] }))
+      .mockResolvedValueOnce(jsonResponse({ persistence: [
+        { name: "Workspace layout", state: "available" }, { name: "Automation groups", state: "degraded" }
+      ] }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(persistWindowLayout("window-1", defaultLayout())).rejects.toThrow("persistence unconfirmed");
+    await expect(persistWindowLayout("window-1", defaultLayout())).rejects.toThrow("persistence unconfirmed");
+    await expect(persistWindowLayout("window-1", defaultLayout())).resolves.toBeUndefined();
   });
 
   it("does not send a JSON content-type header for empty DELETE requests", async () => {
