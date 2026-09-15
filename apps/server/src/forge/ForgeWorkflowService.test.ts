@@ -549,7 +549,7 @@ describe("Manual worker continuation", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("leaves a failed manual continuation idle instead of scheduling the previous automatic step (previous retry: %s)", async scheduled => {
+  it.each([false, true])("logs a failed manual continuation and leaves it idle without scheduling the previous automatic step (previous retry: %s)", async scheduled => {
     const f = await clarificationLoop();
     if (scheduled) {
       await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? { ...worker, providerRetryAt: new Date(Date.now() + 3_600_000).toISOString() } : worker));
@@ -557,6 +557,9 @@ describe("Manual worker continuation", () => {
     }
     f.provider.getIssue.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
     await expect(f.service.continueWorker(f.issue.id, "Implement the clarified input format.", placement)).rejects.toThrow();
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_interrupted", workerId: f.issue.id, failure: "rate_limited", retryable: true, retryAfterMs: 3_600_000 }), expect.any(String));
+    expect(f.logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: "provider_reset_scheduled" }), expect.any(String));
+    expect(JSON.stringify(Object.values(f.logger).flatMap(log => log.mock.calls))).not.toContain("Implement the clarified input format.");
     expect(f.stored().find(worker => worker.id === f.issue.id)!.status).toBe("failed");
     expect(f.stored().find(worker => worker.id === f.issue.id)!.providerRetryAt).toBeUndefined();
     await f.service.poll();

@@ -57,10 +57,14 @@ async function fixture() {
 }
 describe("Forge plugin boundary", () => {
   it.each(["ui", "http"] as const)("continues the selected worker with its message through %s", async kind => {
-    const { hooks, workflow } = await fixture();
+    const { hooks, workflow, logger } = await fixture();
     const message = "The setup is fixed.\nContinue with the failing test.";
     await expect(hooks.call("forge.worker.continue", { id: "worker", message, windowId: "window", paneId: "pane" }, { caller: { kind } })).resolves.toEqual({ worker: { id: "worker" } });
     expect(workflow.continueWorker).toHaveBeenCalledExactlyOnceWith("worker", message, { windowId: "window", paneId: "pane" });
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "hook_completed", hookId: "forge.worker.continue", elapsedMs: expect.any(Number) }), expect.any(String));
+    const logs = JSON.stringify(Object.values(logger).flatMap(log => log.mock.calls));
+    expect(logs).not.toContain("The setup is fixed.");
+    expect(logs).not.toContain("Continue with the failing test.");
   });
 
   it.each([
