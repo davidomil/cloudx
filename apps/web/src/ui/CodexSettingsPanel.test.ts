@@ -66,7 +66,7 @@ describe("global Codex settings editor", () => {
     expect(calls).toEqual([{ hook: "codex-settings.read", input: {} }]);
     expect(model(container).value).toBe(initial.model);
     expect(mode(container).value).toBe(initial.serviceTier);
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(container.textContent).toContain("Shared by CloudX instances using the same Codex home.");
     expect(container.textContent).toContain("Running sessions keep their current settings.");
   });
@@ -76,12 +76,12 @@ describe("global Codex settings editor", () => {
     const { container, calls } = await mount(initial, hook => hook === "codex-settings.read" ? initial : updated);
     await fill(model(container), updated.model);
     await fill(mode(container), updated.serviceTier);
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)).toEqual({ hook: "codex-settings.update", input: { expectedRevision: "first", model: "provider/new-model", serviceTier: "default" } });
     expect(container.textContent).toContain("Global Codex settings saved.");
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
     await fill(model(container), "next-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input.expectedRevision).toBe("second");
   });
 
@@ -90,7 +90,7 @@ describe("global Codex settings editor", () => {
     const { container, calls } = await mount(settings);
     expect(mode(container).value).toBe(serviceTier);
     await fill(model(container), "new-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)).toEqual({ hook: "codex-settings.update", input: { expectedRevision: "first", model: "new-model" } });
   });
 
@@ -98,7 +98,7 @@ describe("global Codex settings editor", () => {
     const { container, calls } = await mount();
     await fill(model(container), "");
     await fill(mode(container), "");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", model: null, serviceTier: null });
   });
 
@@ -107,10 +107,10 @@ describe("global Codex settings editor", () => {
     const { container, calls } = await mount(settings);
     expect(container.textContent).toContain("Fast mode support is disabled");
     await fill(model(container), "new-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", model: "new-model" });
     await fill(mode(container), "default");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", serviceTier: "default" });
   });
 
@@ -118,16 +118,16 @@ describe("global Codex settings editor", () => {
     const settings = { ...initial, serviceTier, fastModeEnabled: false };
     const { container, calls } = await mount(settings, hook => hook === "codex-settings.read" ? settings : { ...settings, fastModeEnabled: true });
     expect(mode(container).value).toBe(serviceTier);
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
     await click(container, "Enable fast mode support");
     expect(mode(container).value).toBe(serviceTier);
-    expect(button(container, "Save").disabled).toBe(false);
+    expect(button(container, "Save Codex settings").disabled).toBe(false);
     expect(container.textContent).toContain("Fast mode support will be enabled when you save.");
     expect(calls).toHaveLength(1);
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", serviceTier });
     expect(container.textContent).not.toContain("Enable fast mode support");
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
   });
 
   it("discards a pending enable on Reload and preserves disabled support for model-only saves", async () => {
@@ -135,17 +135,17 @@ describe("global Codex settings editor", () => {
     const { container, calls } = await mount(settings);
     await click(container, "Enable fast mode support");
     await click(container, "Reload");
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(button(container, "Enable fast mode support").disabled).toBe(false);
     await fill(model(container), "new-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", model: "new-model" });
   });
 
   it.each([null, "custom-tier"])("requires a supported tier before enabling support for %s", async serviceTier => {
     const { container } = await mount({ ...initial, serviceTier, fastModeEnabled: false });
     expect(container.textContent).not.toContain("Enable fast mode support");
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
   });
 
   it("disables the enable action while a model-only save is pending", async () => {
@@ -153,7 +153,7 @@ describe("global Codex settings editor", () => {
     const settings = { ...initial, fastModeEnabled: false };
     const { container } = await mount(settings, hook => hook === "codex-settings.read" ? settings : pending.promise);
     await fill(model(container), "new-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(button(container, "Enable fast mode support").disabled).toBe(true);
     await act(async () => { pending.resolve({ ...settings, model: "new-model" }); });
     expect(button(container, "Enable fast mode support").disabled).toBe(false);
@@ -163,7 +163,7 @@ describe("global Codex settings editor", () => {
     const { container, calls } = await mount();
     await fill(model(container), value);
     expect(model(container).getAttribute("aria-invalid")).toBe("true");
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Enter a model identifier");
     expect(calls).toHaveLength(1);
   });
@@ -175,17 +175,17 @@ describe("global Codex settings editor", () => {
       return current;
     });
     await fill(model(container), "my-draft");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(model(container).value).toBe("my-draft");
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("another instance");
-    expect(button(container, "Save").disabled).toBe(false);
+    expect(button(container, "Save Codex settings").disabled).toBe(false);
     current = { ...initial, revision: "external", model: "external-model", serviceTier: "flex" };
     await click(container, "Reload");
     expect(model(container).value).toBe("external-model");
     expect(mode(container).value).toBe("flex");
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(calls.at(-1)?.hook).toBe("codex-settings.read");
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
   });
 
   it("shows a read error and lets Reload recover", async () => {
@@ -205,7 +205,7 @@ describe("global Codex settings editor", () => {
     const saved = deferred<CodexGlobalSettings>();
     const { container, calls } = await mount(initial, hook => hook === "codex-settings.read" ? initial : saved.promise);
     await fill(model(container), "new-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(model(container).disabled).toBe(true);
     expect(mode(container).disabled).toBe(true);
     expect(button(container, "Reload").disabled).toBe(true);
@@ -250,11 +250,11 @@ describe("global Codex settings editor", () => {
     await remount();
     expect(calls).toHaveLength(1);
     expect(mode(container).value).toBe("priority");
-    expect(button(container, "Save").disabled).toBe(false);
+    expect(button(container, "Save Codex settings").disabled).toBe(false);
     expect(container.textContent).toContain("Fast mode support will be enabled when you save.");
     await click(container, "Reload");
     await remount();
-    expect(button(container, "Save").disabled).toBe(true);
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(container.textContent).toContain("Enable fast mode support");
   });
 
@@ -279,7 +279,7 @@ describe("global Codex settings editor", () => {
     });
     const { container, calls, detach, attach, remount } = fixture;
     await fill(model(container), "pending-model");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     await remount();
     expect(model(container).value).toBe("pending-model");
     expect(model(container).disabled).toBe(true);
@@ -294,12 +294,12 @@ describe("global Codex settings editor", () => {
     expect(model(container).disabled).toBe(false);
     if (outcome === "success") {
       expect(container.textContent).toContain("Global Codex settings saved.");
-      expect(button(container, "Save").disabled).toBe(true);
+      expect(button(container, "Save Codex settings").disabled).toBe(true);
       await fill(model(container), "next-model");
     } else {
       expect(container.querySelector('[role="alert"]')?.textContent).toContain("another instance");
     }
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     expect(calls.at(-1)?.input.expectedRevision).toBe(outcome === "success" ? "saved-revision" : "first");
   });
 
@@ -321,7 +321,7 @@ describe("global Codex settings editor", () => {
     const pending = deferred<CodexGlobalSettings>();
     const { container, editor, detach, attach } = await mount(initial, hook => hook === "codex-settings.read" ? initial : pending.promise);
     await fill(model(container), "closed-tab-draft");
-    await click(container, "Save");
+    await click(container, "Save Codex settings");
     await detach();
     editor.dispose();
     await attach();
@@ -341,8 +341,8 @@ describe("global Codex settings editor", () => {
     await second.remount();
     expect(model(first.container).value).toBe("first-tab-draft");
     expect(model(second.container).value).toBe("second-tab-draft");
-    await click(first.container, "Save");
-    await click(second.container, "Save");
+    await click(first.container, "Save Codex settings");
+    await click(second.container, "Save Codex settings");
     expect(first.calls.at(-1)?.input.expectedRevision).toBe("first");
     expect(second.calls.at(-1)?.input.expectedRevision).toBe("second-tab-revision");
   });
