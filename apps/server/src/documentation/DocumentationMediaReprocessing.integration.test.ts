@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -899,14 +900,39 @@ function startArchiveIndexer(archiveRoot: string) {
       await exited;
     },
     client: new Promise<DocumentationClient>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error(`Indexer startup timed out: ${output}`)), 10_000);
-      indexer.once("error", (error) => { clearTimeout(timeout); reject(error); });
-      indexer.once("exit", () => { clearTimeout(timeout); reject(new Error(`Indexer exited during startup: ${output}`)); });
+      const startup = new AbortController();
+      let readinessStarted = false;
+      const fail = (error: Error) => {
+        clearTimeout(timeout);
+        startup.abort(error);
+        reject(error);
+      };
+      const timeout = setTimeout(() => fail(new Error(`Indexer startup timed out: ${output}`)), 10_000);
+      indexer.once("error", fail);
+      indexer.once("exit", () => fail(new Error(`Indexer exited during startup: ${output}`)));
       indexer.stderr.on("data", (chunk: Buffer) => {
         output += chunk.toString();
         const url = /Uvicorn running on (http:\/\/127\.0\.0\.1:\d+)/u.exec(output)?.[1];
-        if (url) { clearTimeout(timeout); resolve(new DocumentationClient(url)); }
+        if (url && !readinessStarted) {
+          readinessStarted = true;
+          waitForArchiveReady(url, startup.signal).then((client) => {
+            clearTimeout(timeout);
+            resolve(client);
+          }, fail);
+        }
       });
     }),
   };
+}
+
+async function waitForArchiveReady(url: string, signal: AbortSignal): Promise<DocumentationClient> {
+  while (true) {
+    const response = await fetch(`${url}/health`, { signal });
+    const health = await response.json() as { ready?: boolean; status?: string; detail?: string };
+    if (response.ok && health.ready === true) return new DocumentationClient(url);
+    if (response.status !== 503 || health.status !== "initializing") {
+      throw new Error(`Indexer startup failed: ${health.detail ?? health.status ?? response.status}`);
+    }
+    await delay(25, undefined, { signal });
+  }
 }

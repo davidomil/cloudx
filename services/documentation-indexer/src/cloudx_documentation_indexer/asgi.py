@@ -1,3 +1,10 @@
-from .main import create_app
+from .startup import DocumentationService
 
-app = create_app()
+
+def create_archive_app():
+    from .main import create_app
+
+    return create_app()
+
+
+app = DocumentationService(create_archive_app)

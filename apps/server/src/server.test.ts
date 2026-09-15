@@ -2755,6 +2755,38 @@ describe("buildServer", () => {
     });
   });
 
+  it("reports unavailable documentation through the document list hook without exposing URL secrets", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-unavailable-"));
+    const indexer = http.createServer();
+    await new Promise<void>((resolve) => indexer.listen(0, "127.0.0.1", resolve));
+    const address = indexer.address();
+    if (!address || typeof address === "string") throw new Error("Indexer fixture did not bind a TCP port.");
+    await new Promise<void>((resolve) => indexer.close(() => resolve()));
+    const endpoint = `http://127.0.0.1:${address.port}/docs`;
+    const config = { ...testConfig(root), documentationUrl: `${endpoint}?token=private-token` };
+    const app = await buildServer(config, buildServices(config));
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/hooks/documentation.documents.list",
+        payload: { input: { query: "private-query" } },
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({
+        code: "documentation_unavailable",
+        message: expect.stringContaining(`Documentation service unavailable at ${endpoint}/documents`),
+      });
+      expect(response.json().message).toContain("cloudx-documentation.service");
+      expect(response.json().message).toContain("CLOUDX_DOCUMENTATION_URL");
+      expect(response.body).not.toContain("private-");
+      expect(response.json()).not.toHaveProperty("cause");
+    } finally {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["reanalyze", "reenrich"])("validates and streams the documentation %s hook over HTTP", async (operation) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-doc-reprocessing-"));
     const config = testConfig(root);
