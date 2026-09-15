@@ -83,6 +83,7 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.worker.pause": { worker: { ...worker, status: "paused" } },
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
       "forge.worker.resume": { worker },
+      "forge.worker.continue": { worker },
       "forge.worker.syncAndReview": { worker },
       "forge.worker.rebaseAndResolve": { worker },
       "forge.worker.autoReview": { worker }
@@ -127,6 +128,125 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it.each(["issue", "review"] as const)("continues the selected %s worker with the entered message", async kind => {
+    const selected = { ...(kind === "issue" ? worker : reviewWorker), status: "failed" as const };
+    const f = fixture({ workers: [selected] });
+    const container = await renderPanel(f);
+    await click(container, "Workers (1)");
+    await click(container, "Continue with message");
+    const input = container.querySelector<HTMLTextAreaElement>('form textarea')!;
+    expect(document.activeElement).toBe(input);
+    expect(input.maxLength).toBe(20_000);
+    expect(button(container, "Send and continue").disabled).toBe(true);
+    await fill(input, " \n\t");
+    expect(button(container, "Send and continue").disabled).toBe(true);
+    const message = "The setup is fixed.\nContinue with the failing test.";
+    await fill(input, message);
+    await click(container, "Send and continue");
+    expect(f.calls.filter(call => call.hook === "forge.worker.continue")).toEqual([
+      { hook: "forge.worker.continue", input: { id: selected.id, message, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
+    ]);
+    expect(container.querySelector('form')).toBeNull();
+  });
+
+  it("cancels a continuation without sending or retaining the message", async () => {
+    const f = fixture({ workers: [{ ...worker, status: "paused" }] });
+    const container = await renderPanel(f);
+    await click(container, "Workers (1)");
+    await click(container, "Continue with message");
+    await fill(container.querySelector<HTMLTextAreaElement>('form textarea')!, "Ignore this draft.");
+    await click(container, "Cancel");
+    expect(container.querySelector('form')).toBeNull();
+    expect(f.calls.some(call => call.hook === "forge.worker.continue")).toBe(false);
+    await click(container, "Continue with message");
+    expect(container.querySelector<HTMLTextAreaElement>('form textarea')!.value).toBe("");
+  });
+
+  it("retains the message on failure and prevents duplicate submissions while waiting", async () => {
+    const pending = deferred<unknown>();
+    const f = fixture({ workers: [{ ...worker, status: "failed" }] }, hook => hook === "forge.worker.continue" ? pending.promise : undefined);
+    const container = await renderPanel(f);
+    await click(container, "Workers (1)");
+    await click(container, "Continue with message");
+    const input = container.querySelector<HTMLTextAreaElement>('form textarea')!;
+    await fill(input, "The dependency is installed.");
+    await click(container, "Send and continue");
+    expect(button(container, "Continuing…").disabled).toBe(true);
+    expect(input.disabled).toBe(true);
+    await act(async () => { container.querySelector('form')!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    expect(f.calls.filter(call => call.hook === "forge.worker.continue")).toHaveLength(1);
+    await act(async () => { pending.reject(new Error("The checkout needs attention.")); });
+    expect(container.textContent).toContain("The checkout needs attention.");
+    expect(input.value).toBe("The dependency is installed.");
+    expect(button(container, "Send and continue").disabled).toBe(false);
+  });
+
+  it.each([
+    { ...worker, status: "running" as const },
+    { ...publishingWorker, status: "failed" as const },
+    { ...reviewWorker, draft: { ...reviewWorker.draft!, status: "post_failed" as const } },
+  ])("explains why a blocked worker cannot receive a continuation %#", async selected => {
+    const f = fixture({ workers: [selected] });
+    const container = await renderPanel(f);
+    await click(container, "Workers (1)");
+    await click(container, "Continue with message");
+    await fill(container.querySelector<HTMLTextAreaElement>('form textarea')!, "Continue now.");
+    expect(container.querySelector('form [role="status"]')!.textContent).toMatch(/Pause|Reconcile/);
+    expect(button(container, "Send and continue").disabled).toBe(true);
+    expect(f.calls.some(call => call.hook === "forge.worker.continue")).toBe(false);
+  });
+
+  it("keeps a pending continuation bound to its original worker when selection changes", async () => {
+    const pending = deferred<unknown>();
+    const f = fixture({ workers: [{ ...worker, status: "failed" }, reviewWorker] }, hook => hook === "forge.worker.continue" ? pending.promise : undefined);
+    const container = await renderPanel(f);
+    await click(container, "Workers (2)");
+    const panels = container.querySelectorAll<HTMLElement>('[role="tabpanel"]');
+    await click(panels[0], "Continue with message");
+    await fill(panels[0].querySelector<HTMLTextAreaElement>('form textarea')!, "Fix the issue setup.");
+    await click(panels[0], "Send and continue");
+    await act(async () => { container.querySelectorAll<HTMLButtonElement>('[role="tab"]')[1].click(); });
+    expect(panels[1].hidden).toBe(false);
+    await act(async () => { pending.resolve({ worker }); });
+    expect(f.calls.filter(call => call.hook === "forge.worker.continue").map(call => call.input.id)).toEqual([worker.id]);
+    expect(panels[1].hidden).toBe(false);
+    await click(panels[1], "Continue with message");
+    expect(panels[1].querySelector<HTMLTextAreaElement>('form textarea')!.value).toBe("");
+  });
+
+  it("retains review clarification when a failed launch archives the previous draft", async () => {
+    const f = fixture({ workers: [reviewWorker] }, hook => {
+      if (hook !== "forge.worker.continue") return;
+      f.dashboard.workers = [{ ...reviewWorker, status: "failed", draft: undefined, reviewHistory: [reviewWorker.draft!], error: "Model unavailable." }];
+      throw new Error("Model unavailable.");
+    });
+    const container = await renderPanel(f);
+    await click(container, "Pull requests");
+    await click(container, "Continue with message");
+    await fill(container.querySelector<HTMLTextAreaElement>('form textarea')!, "Only JSON input is supported.");
+    await click(container, "Send and continue");
+    expect(container.textContent).toContain("Model unavailable.");
+    expect(container.querySelector<HTMLTextAreaElement>('form textarea')?.value).toBe("Only JSON input is supported.");
+    expect(button(container, "Send and continue").disabled).toBe(false);
+  });
+
+  it("clears a continuation draft when its worker disappears from the dashboard", async () => {
+    const selected = { ...worker, status: "paused" as const };
+    const f = fixture({ workers: [selected] });
+    const container = await renderPanel(f);
+    await click(container, "Workers (1)");
+    await click(container, "Continue with message");
+    await fill(container.querySelector<HTMLTextAreaElement>('form textarea')!, "Old instructions.");
+    f.dashboard.workers = [];
+    await click(container, "Refresh Forge");
+    expect(container.querySelector('form')).toBeNull();
+    f.dashboard.workers = [selected];
+    await click(container, "Refresh Forge");
+    expect(container.querySelector('form')).toBeNull();
+    await click(container, "Continue with message");
+    expect(container.querySelector<HTMLTextAreaElement>('form textarea')!.value).toBe("");
+  });
+
   it.each(["github", "gitlab"] as const)("pins every %s item read and decision to the displayed repository", async provider => {
     const displayed = { ...repository, provider };
     const testFixture = fixture({ repository: displayed });

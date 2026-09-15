@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { hasUnconfirmedPublication, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   CodexReasoningEffort,
   ForgeChangeRequest,
@@ -155,6 +155,11 @@ interface ProviderRecovery {
   resumePreparation: boolean;
   message: string;
   retryMessage?: string;
+}
+
+interface ManualContinuation {
+  message: string;
+  previousError?: string;
 }
 
 export class ForgeWorkflowService {
@@ -467,6 +472,102 @@ export class ForgeWorkflowService {
       if (issue.autoReview?.enabled && issue.autoReview.phase !== "implementing" && !issue.pendingPublication)
         return this.resumeAutoReview(issue, placement);
       return this.resumeWorker(issue.id, placement);
+    });
+  }
+  continueWorker(id: string, input: string, placement: ForgePlacement): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      if (this.disposed) throw new Error("Forge Workers is shutting down.");
+      if (typeof input !== "string" || !input.trim() || input.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH)
+        throw new Error(`A continuation message must contain 1 to ${MAX_FORGE_CONTINUATION_MESSAGE_LENGTH} characters.`);
+      const worker = this.requireWorker(id);
+      const blocker = forgeWorkerContinuationBlocker(worker, this.workers);
+      if (blocker) throw new Error(blocker);
+      if (!sameRepository(worker.repository, this.deps.settings().repository))
+        throw new Error("The configured repository changed. Restore it before continuing this worker.");
+      const parent = worker.issueWorkerId ? this.requireWorker(worker.issueWorkerId) : undefined;
+      const members = parent ? [parent, worker] : [worker];
+      const controller = new AbortController();
+      for (const member of members) this.operations.set(member.id, controller);
+      try {
+        for (const member of members) {
+          if (!member.attemptId) continue;
+          const report = await this.deps.reports.read(member.attemptId);
+          controller.signal.throwIfAborted();
+          if (report !== undefined)
+            throw new Error("A retained completion report must be reconciled with Resume before continuing with a message.");
+        }
+        if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
+      } catch (error) {
+        for (const member of members) this.operations.delete(member.id);
+        throw error;
+      }
+      const manualContinuation: ManualContinuation = { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
+      for (const member of members) this.cancelProviderRecovery(member);
+      try {
+        const provider = this.providerFor(worker);
+        const item = worker.kind === "issue" ? await provider.getIssue(worker.number) : await provider.getChangeRequest(worker.number);
+        if (item.number !== worker.number || item.state !== "open" || "merged" in item && item.merged)
+          throw new Error("Continuation requires the original issue or change request to remain open.");
+        const change = worker.kind === "review" ? item as ForgeChangeRequest : worker.changeNumber ? await provider.getChangeRequest(worker.changeNumber) : undefined;
+        const publishedIssue = parent ?? (worker.kind === "issue" ? worker : undefined);
+        if (change && publishedIssue) {
+          requirePublicationRequest(publishedIssue, change);
+          if (change.merged || change.headSha !== publishedIssue.headSha)
+            throw new Error("The published change request moved or merged. Inspect and reconcile it before continuing this worker.");
+        }
+        if (parent && !change?.reviewReady)
+          throw new Error("The published commit is still processing. Wait until it is ready before continuing this review.");
+        const issue = parent ? await this.providerFor(parent).getIssue(parent.number) : undefined;
+        if (issue && (issue.number !== parent!.number || issue.state !== "open"))
+          throw new Error("Continuation requires the original issue to remain open.");
+        controller.signal.throwIfAborted();
+        for (const member of members) {
+          await this.recoverResources(member);
+          await this.quiesce(member);
+        }
+        if (!worker.worktreePath) {
+          if (worker.kind === "review" && change) {
+            worker.headSha = change.headSha;
+            worker.baseBranch = change.baseBranch;
+          }
+          Object.assign(worker, await this.deps.runtime.prepareWorkspace({
+            id: worker.id,
+            baseBranch: worker.baseBranch,
+            headSha: worker.headSha,
+            ...(worker.kind === "review" ? { baseSha: change!.baseSha } : {}),
+            review: worker.kind === "review",
+            expectedRepository: worker.repository,
+          }, controller.signal));
+        } else if (worker.kind === "review" && change) {
+          await this.refreshReview(worker, change, controller.signal);
+        }
+        if (worker.draft) {
+          (worker.reviewHistory ??= []).push(worker.draft);
+          worker.draft = undefined;
+        }
+        worker.startedAt = new Date().toISOString();
+        worker.status = "starting";
+        if (worker.autoReview) {
+          worker.autoReview.phase = "implementing";
+          worker.autoReview.placement = placement;
+          worker.autoReview.waitingSince = undefined;
+        }
+        if (parent?.autoReview) {
+          parent.autoReview.phase = "reviewing";
+          parent.autoReview.placement = placement;
+          parent.autoReview.waitingSince = undefined;
+          parent.status = "awaiting_review";
+          parent.error = undefined;
+        }
+        await this.persist();
+        if (worker.kind === "issue" && (worker.rebaseRecovery?.phase === "resolving" || change?.hasConflicts))
+          await this.startRebaseRecovery(worker, placement, false, manualContinuation);
+        else await this.launch(worker, placement, { item, change, issue, manualContinuation });
+        return structuredClone(worker);
+      } catch (error) {
+        await this.fail(worker, error, { retryProvider: false });
+        throw error;
+      }
     });
   }
   syncAndReview(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
@@ -1247,7 +1348,7 @@ export class ForgeWorkflowService {
     if (!sameRepository(worker.repository, this.deps.settings().repository))
       throw new Error("The configured repository changed. Restore it before rebasing this worker.");
   }
-  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false): Promise<void> {
+  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false, manualContinuation?: ManualContinuation): Promise<void> {
     this.requireRecoveryPublication(worker);
     this.requireIdleReviewers(worker);
     const signal = this.operations.get(worker.id)?.signal;
@@ -1286,7 +1387,7 @@ export class ForgeWorkflowService {
     await this.persist();
     if (saved?.phase !== "resolving" && prepared.targetHeadSha !== change.targetHeadSha)
       throw new Error("The target branch changed during conflict detection. Resume to continue the preserved rebase on its saved target.");
-    await this.launch(worker, placement, { item, change });
+    await this.launch(worker, placement, { item, change, ...(manualContinuation ? { manualContinuation } : {}) });
   }
   private async acceptRebaseReport(worker: ForgeWorker): Promise<boolean> {
     const recovery = worker.rebaseRecovery!;
@@ -1592,7 +1693,7 @@ export class ForgeWorkflowService {
   private async launch(
     worker: ForgeWorker,
     placement: ForgePlacement,
-    context: { item: unknown; change?: ForgeChangeRequest; issue?: ForgeIssueDetail },
+    context: { item: unknown; change?: ForgeChangeRequest; issue?: ForgeIssueDetail; manualContinuation?: ManualContinuation },
   ): Promise<void> {
     if (!worker.worktreePath) throw new Error("Worker checkout is missing.");
     const signal = this.operations.get(worker.id)?.signal;
@@ -1626,6 +1727,8 @@ export class ForgeWorkflowService {
     }
     if (worker.issueWorkerId)
       instructions += " This review belongs to an automatic issue loop. Set event to request_changes when actionable findings remain, with specific changes and validation needed. Set event to approve only when the implementation satisfies the issue and review feedback and no actionable findings remain. Use comment only when a human clarification or decision is required; it pauses the loop. CloudX publishes the review and chooses the next step. Do not approve merely to finish the loop.";
+    if (context.manualContinuation)
+      instructions += " The task context includes manualContinuation from the user. Apply its message together with the original task and current feedback; previousError records why the worker needed attention. Inspect and preserve the existing work, follow these workflow limits, and write a fresh completion report when finished.";
     const shape =
       worker.kind === "issue"
         ? {
@@ -1864,8 +1967,8 @@ export class ForgeWorkflowService {
     draft.status = "posted";
     await this.persist();
   }
-  private async fail(worker: ForgeWorker, error: unknown, { retainReport = false }: { retainReport?: boolean } = {}): Promise<void> {
-    if (await this.scheduleProviderReset(worker, error)) return;
+  private async fail(worker: ForgeWorker, error: unknown, { retainReport = false, retryProvider = true }: { retainReport?: boolean; retryProvider?: boolean } = {}): Promise<void> {
+    if (retryProvider && await this.scheduleProviderReset(worker, error)) return;
     const wasCleanupFailure = worker.status === "cleanup_failed";
     if (!wasCleanupFailure) {
       try {
