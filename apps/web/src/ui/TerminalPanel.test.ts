@@ -386,11 +386,61 @@ describe("TerminalPanel", () => {
     expect(terminalPanelMocks.terminals[1]!.writeCalls).toEqual(["recovered process"]);
     expect(recover).not.toHaveBeenCalled();
 
-    const latestTab = { ...recoveredTab, updatedAt: new Date(2000).toISOString() };
-    renderTab(latestTab);
     act(() => root!.render(createElement("div")));
     act(() => replacementSocket.close(1008));
-    renderTab({ ...latestTab });
+    renderTab({ ...recoveredTab });
+    expect(host!.textContent).toContain("Check connection");
+    expect(TestWebSocket.instances).toHaveLength(2);
+  });
+
+  it("retains rejection of a reconnect initiated at the latest running revision", () => {
+    vi.useFakeTimers();
+    const recover = vi.fn();
+    act(() => root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1, onRecover: recover })));
+    TestWebSocket.latest!.open();
+    TestWebSocket.latest!.close(1006);
+    const recoveredTab = { ...tab, updatedAt: new Date(1000).toISOString() };
+    act(() => root!.render(createElement(TerminalPanel, { tab: recoveredTab, active: true, uiScale: 1, onRecover: recover })));
+    vi.advanceTimersByTime(500);
+
+    act(() => TestWebSocket.latest!.close(1008));
+    expect(host!.textContent).toContain("Check connection");
+    vi.advanceTimersByTime(10_000);
+    expect(TestWebSocket.instances).toHaveLength(2);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["mounted", "connecting"], ["mounted", "open"],
+    ["cached", "connecting"], ["cached", "open"]
+  ])("reconnects a %s %s socket rejected after the completed recovery update", (viewState, socketState) => {
+    const recover = vi.fn();
+    const renderTab = (currentTab: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: currentTab, active: true, uiScale: 1, onRecover: recover
+    })));
+    renderTab(tab);
+    const originalSocket = TestWebSocket.latest!;
+    if (socketState === "open") originalSocket.open();
+    if (viewState === "cached") act(() => root!.render(createElement("div")));
+
+    const recoveredTab = { ...tab, updatedAt: new Date(1000).toISOString() };
+    renderTab(recoveredTab);
+    expect(TestWebSocket.instances).toHaveLength(1);
+    act(() => originalSocket.close(1008));
+
+    expect(host!.querySelector(".terminal-panel")).not.toBeNull();
+    expect(host!.textContent).not.toContain("Check connection");
+    expect(TestWebSocket.instances).toHaveLength(2);
+    const replacementSocket = TestWebSocket.latest!;
+    expect(replacementSocket.url).toBe(originalSocket.url);
+    replacementSocket.open();
+    replacementSocket.output("recovered process");
+    expect(terminalPanelMocks.terminals.at(-1)!.writeCalls).toEqual(["recovered process"]);
+    expect(recover).not.toHaveBeenCalled();
+
+    act(() => root!.render(createElement("div")));
+    act(() => replacementSocket.close(1008));
+    renderTab({ ...recoveredTab });
     expect(host!.textContent).toContain("Check connection");
     expect(TestWebSocket.instances).toHaveLength(2);
   });

@@ -30,8 +30,13 @@ interface TerminalView {
   releaseMobileScroll?: () => void;
   releaseImagePaste?: () => void;
   uiScale: number;
-  connectionError?: string;
-  onConnectionError?: (message: string) => void;
+  connectionError?: TerminalConnectionError;
+  onConnectionError?: (error: TerminalConnectionError) => void;
+}
+
+interface TerminalConnectionError {
+  tabUpdatedAt: string;
+  message: string;
 }
 
 interface PastedTerminalImage {
@@ -65,6 +70,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<TerminalView | null>(null);
   const activeRef = useRef(active);
+  const tabRef = useRef(tab);
   const [connectionError, setConnectionError] = useState<string>();
   const recovery: TabRecovery | undefined = onRecover ? tab.recovery ?? (connectionError || tab.status === "failed" ? {
     state: "unavailable",
@@ -78,10 +84,11 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   }, [active]);
 
   useEffect(() => {
+    tabRef.current = tab;
     const view = terminalViews.get(tab.id);
-    if (view && !view.connectionError) view.tabUpdatedAt = tab.updatedAt;
+    if (view) view.tabUpdatedAt = tab.updatedAt;
     if (!recoveryEnabled || tab.status !== "running" || tab.recovery) return;
-    if (view?.connectionError && view.tabUpdatedAt !== tab.updatedAt) disposeTerminalViewInternal(tab.id);
+    if (view?.connectionError && view.connectionError.tabUpdatedAt !== tab.updatedAt) disposeTerminalViewInternal(tab.id);
     setConnectionError(undefined);
   }, [tab.id, tab.status, tab.recovery, tab.updatedAt, recoveryEnabled]);
 
@@ -94,8 +101,16 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
 
     const view = getTerminalView(tab, containerRef.current, uiScale);
     viewRef.current = view;
-    view.onConnectionError = recoveryEnabled ? setConnectionError : undefined;
-    if (recoveryEnabled && view.connectionError) setConnectionError(view.connectionError);
+    view.onConnectionError = recoveryEnabled ? error => {
+      const currentTab = tabRef.current;
+      if (currentTab.status === "running" && !currentTab.recovery && error.tabUpdatedAt !== currentTab.updatedAt) {
+        view.connectionError = undefined;
+        reconnectTerminalSocket(view);
+      } else {
+        setConnectionError(error.message);
+      }
+    } : undefined;
+    if (view.connectionError) view.onConnectionError?.(view.connectionError);
 
     const scheduleViewportFit = () => scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active: activeRef.current, trigger: "viewport-change" }));
     const scheduleViewportInset = () => scheduleTerminalKeyboardInsetUpdate(view);
@@ -202,6 +217,7 @@ function createTerminalSocket(tabId: string): WebSocket {
 
 function subscribeTerminalSocket(view: TerminalView): void {
   const socket = view.socket;
+  const tabUpdatedAt = view.tabUpdatedAt;
   const isCurrentSocket = () => !view.disposed && view.socket === socket;
 
   socket.addEventListener("message", (event) => {
@@ -227,7 +243,10 @@ function subscribeTerminalSocket(view: TerminalView): void {
   socket.addEventListener("close", (event) => {
     if (!isCurrentSocket()) return;
     if (event.code === 1008) {
-      view.connectionError = "The terminal connection was rejected. Check its connection to determine whether its process is still running.";
+      view.connectionError = {
+        tabUpdatedAt,
+        message: "The terminal connection was rejected. Check its connection to determine whether its process is still running."
+      };
       view.onConnectionError?.(view.connectionError);
       return;
     }
@@ -236,10 +255,14 @@ function subscribeTerminalSocket(view: TerminalView): void {
     view.reconnectTimer = window.setTimeout(() => {
       view.reconnectTimer = undefined;
       if (!isCurrentSocket()) return;
-      view.socket = createTerminalSocket(view.tabId);
-      subscribeTerminalSocket(view);
+      reconnectTerminalSocket(view);
     }, delay);
   });
+}
+
+function reconnectTerminalSocket(view: TerminalView): void {
+  view.socket = createTerminalSocket(view.tabId);
+  subscribeTerminalSocket(view);
 }
 
 function parseTerminalSocketMessage(data: unknown): { type?: string; data?: string; cols?: number; rows?: number } | undefined {

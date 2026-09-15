@@ -10,6 +10,7 @@ import { listTabLayoutPanes, type CreateTabResponse, type WorkspaceStateResponse
 import { loadConfig } from "./config.js";
 import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
+import { CODEX_CLOSE_ON_EXIT_GRACE_MS } from "./plugins/CodexTerminalPlugin.js";
 import { buildServer, buildServices } from "./server.js";
 import { SessionStateStore } from "./workspace/SessionStateStore.js";
 import { TerminalBroker } from "./terminal/TerminalBroker.js";
@@ -211,6 +212,114 @@ describe("workspace recovery across server updates", () => {
     } finally {
       vi.restoreAllMocks();
       await fixture.close();
+    }
+  }, 15_000);
+
+  it.skipIf(process.platform !== "linux").each([false, true])("retains an original Codex panel during multi-terminal broker shutdown beyond its grace period (web restored: %s)", async (restoreWeb) => {
+    const fixture = await recoveryFixture();
+    let releaseShutdown = () => {};
+    let stopping: Promise<void> | undefined;
+    try {
+      const home = path.join(fixture.root, "codex-home");
+      await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+      const skill = path.join(home, "skills", ".system", "imagegen");
+      await fs.mkdir(skill, { recursive: true });
+      await fs.writeFile(path.join(skill, "SKILL.md"), "---\nname: imagegen\ndescription: Fixture image skill.\n---\n");
+      vi.stubEnv("CODEX_HOME", home);
+      vi.stubEnv("CLOUDX_ASSISTANT_BIN", path.join(fixture.root, "test-shell"));
+      await fixture.startBroker();
+      let { app, services } = await fixture.startServer();
+      const main = services.workspace!.getActiveWindow();
+      const { tab } = await services.workspaceCommands!.createTab({
+        pluginId: "codex-terminal", title: "Original conversation", cwd: fixture.root,
+        initialInput: { prompt: "Do not repeat this work", model: "gpt-6-astra", reasoningEffort: "max" },
+        windowId: main.id, paneId: main.layout.activePaneId
+      });
+      await services.workspaceCommands!.createTab({
+        pluginId: "local-web", title: "Preview", cwd: fixture.root,
+        initialInput: { url: "http://localhost:4000" }, windowId: main.id, paneId: main.layout.activePaneId, newPane: true
+      });
+      const other = await services.workspace!.createWindow({ name: "Other work", defaultCwd: fixture.root });
+      await services.workspaceCommands!.createTab({
+        pluginId: "standard-terminal", cwd: fixture.root, windowId: other.id, paneId: other.layout.activePaneId
+      });
+      const initialSession = services.sessions.getSession(tab.id);
+      if (restoreWeb) {
+        await app.close();
+        ({ app, services } = await fixture.startServer());
+        expect(services.sessions.getSession(tab.id)).not.toBe(initialSession);
+      }
+      const sessions = services.sessions;
+      const previous = sessions.getSession(tab.id);
+      const before = await workspaceSnapshot(app);
+      await sessions.flush();
+      const savedSessions = new SessionStateStore(fixture.config.dataDir);
+      const originalInput = (await savedSessions.read())!.sessions.find(saved => saved.tab.id === tab.id)!.initialInput;
+      expect(originalInput).toMatchObject({
+        model: "gpt-6-astra", reasoningEffort: "max", codexRecovered: false,
+        codexRuntimeContext: { activeWindowId: main.id, pluginRuntime: { "rules-skills": { personalityTemplate: { template: { id: "default-codex" } } } } }
+      });
+
+      // Keep another producer's shutdown pending so exit handling completes while the broker is connected.
+      const otherTerminal = await fixture.spawn.mock.results[1]!.value;
+      const terminateOther = otherTerminal.terminate.bind(otherTerminal);
+      const shutdownReleased = new Promise<void>(resolve => { releaseShutdown = resolve; });
+      vi.spyOn(otherTerminal, "terminate").mockImplementationOnce(async () => {
+        await terminateOther();
+        await shutdownReleased;
+      });
+      await new Promise(resolve => setTimeout(resolve, CODEX_CLOSE_ON_EXIT_GRACE_MS + 20));
+      stopping = fixture.stopBroker();
+      await vi.waitFor(() => expect(previous.hasExited!()).toBe(true));
+      await sessions.flush();
+      expect(sessions.listTabs().map(current => current.id)).toEqual(before.tabs.map(current => current.id));
+      await vi.waitFor(() => expect(sessions.getTab(tab.id).recovery?.state).toBe("missing"));
+      await sessions.flush();
+      expect((await savedSessions.read())!.sessions.find(saved => saved.tab.id === tab.id)!.initialInput).toEqual(originalInput);
+      expect((await workspaceSnapshot(app)).windows).toEqual(before.windows);
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+      releaseShutdown();
+      await stopping;
+      await fixture.startBroker();
+
+      const conversationId = "01a08470-d118-7b72-b1df-439e72e5c744";
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: fixture.root } }) + "\n");
+      const recover = () => app.inject({
+        method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" },
+        payload: { action: "resume-conversation", sessionId: conversationId }
+      });
+      for (const response of await Promise.all([recover(), recover()])) {
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json<WorkspaceTab>()).toMatchObject({ id: tab.id, title: tab.title, cwd: fixture.root, status: "running" });
+      }
+      expect((await recover()).statusCode).toBe(200);
+      expect(services.sessions).toBe(sessions);
+      expect(fixture.spawn).toHaveBeenCalledTimes(3);
+      const [, args, options] = fixture.spawn.mock.calls[2]!;
+      expect(args).toContain(conversationId);
+      expect(args).toContain("gpt-6-astra");
+      expect(args).toContain('model_reasoning_effort="max"');
+      expect(args).not.toContain("Do not repeat this work");
+      expect(options).toMatchObject({ cwd: fixture.root, sessionId: tab.id, env: { CLOUDX_PERSONALITY_TEMPLATE_ID: "default-codex" } });
+      const replacement = sessions.getSession(tab.id);
+      expect(replacement).not.toBe(previous);
+      let output = "";
+      replacement.onData!(data => { output += data; });
+      replacement.write!("stty -echo; printf '\\nRECOVERED_CWD=%s\\n' \"$PWD\"\n");
+      await vi.waitFor(() => expect(output).toContain(`RECOVERED_CWD=${fixture.root}`));
+      const after = await workspaceSnapshot(app);
+      expect(after.windows).toEqual(before.windows);
+      expect(after.activeTabId).toBe(before.activeTabId);
+      expect(after.tabs.map(current => current.id)).toEqual(before.tabs.map(current => current.id));
+      expect(after.tabs.find(current => current.pluginId === "local-web")).toEqual(before.tabs.find(current => current.pluginId === "local-web"));
+      expect((await savedSessions.read())!.sessions.find(saved => saved.tab.id === tab.id)!.initialInput).toMatchObject({
+        codexRuntimeContext: originalInput!.codexRuntimeContext, resume: { mode: "session", sessionId: conversationId }, codexRecovered: true
+      });
+    } finally {
+      releaseShutdown();
+      await stopping;
+      await fixture.close();
+      vi.restoreAllMocks();
     }
   }, 15_000);
 

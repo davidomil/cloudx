@@ -11,6 +11,7 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
@@ -20,14 +21,14 @@ class FakeTerminalProcess implements TerminalProcess {
   killed = false;
   readonly resizes: Array<[cols: number, rows: number]> = [];
   private readonly dataListeners = new Set<(data: string) => void>();
-  private exitListener: ((event: { exitCode: number; signal?: number }) => void) | undefined;
+  private exitListener: ((event: TerminalExit) => void) | undefined;
 
   onData(listener: (data: string) => void): () => void {
     this.dataListeners.add(listener);
     return () => this.dataListeners.delete(listener);
   }
 
-  onExit(listener: (event: { exitCode: number; signal?: number }) => void): () => void {
+  onExit(listener: (event: TerminalExit) => void): () => void {
     this.exitListener = listener;
     return () => {
       this.exitListener = undefined;
@@ -55,8 +56,8 @@ class FakeTerminalProcess implements TerminalProcess {
     }
   }
 
-  exit(exitCode: number): void {
-    this.exitListener?.({ exitCode });
+  exit(exitCode: number, reason?: "broker-shutdown"): void {
+    this.exitListener?.({ exitCode, ...(reason ? { reason } : {}) });
   }
 }
 
@@ -174,6 +175,22 @@ describe("CodexTerminalPlugin", () => {
       factory.process!.exit(0);
 
       expect(closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
+    });
+  });
+
+  it.each(["createSession", "restoreSession"] as const)("preserves a public Codex panel on broker shutdown after %s and the startup grace period", async method => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const terminal = new FakeTerminalProcess();
+      Object.assign(factory, { attach: async () => terminal });
+      const closeTab = vi.fn();
+      const session = await plugin[method]({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
+      const process = method === "createSession" ? factory.process! : terminal;
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      process.exit(0, "broker-shutdown");
+
+      expect(session.hasExited?.()).toBe(true);
+      expect(session.snapshot()).toMatchObject({ status: "failed", statusMessage: "The terminal broker stopped the process. Recover this panel to continue." });
+      expect(closeTab).not.toHaveBeenCalled();
     });
   });
 
@@ -1551,6 +1568,18 @@ describe("Codex terminal update recovery", () => {
       expect(session.hasExited?.()).toBe(true);
       expect(session.snapshot().status).toBe("failed");
       expect(controls.closeTab).not.toHaveBeenCalled();
+    } finally { clock.mockRestore(); }
+  });
+
+  it("still closes an original restored conversation panel after normal exit beyond the grace period", async () => {
+    const terminal = new FakeTerminalProcess();
+    const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+    const plugin = new CodexTerminalPlugin({ spawn: vi.fn(), attach: async () => terminal });
+    await plugin.restoreSession({ tab, cwd: tab.cwd, controls });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+    try {
+      terminal.exit(0);
+      expect(controls.closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
     } finally { clock.mockRestore(); }
   });
 

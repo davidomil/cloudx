@@ -727,6 +727,10 @@ export class CodexTerminalSession implements PluginSession {
         this.setStatus("stopped", "Terminal was stopped.");
         return;
       }
+      if (event.reason === "broker-shutdown") {
+        this.setStatus("failed", "The terminal broker stopped the process. Recover this panel to continue.");
+        return;
+      }
       if (this.options.closeOnExit) {
         const message = event.exitCode === 0 ? "Codex exited cleanly." : `Codex exited with code ${event.exitCode}.`;
         const closeAfterMs = this.options.closeOnExitAfterMs ?? 0;

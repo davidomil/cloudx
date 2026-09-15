@@ -1,8 +1,9 @@
 import type { TerminalScreenSnapshot } from "./TerminalScreen.js";
+import type { TerminalExit } from "./TerminalSupervisor.js";
 
 export interface TerminalProcess {
   onData(listener: (data: string) => void): () => void;
-  onExit(listener: (event: { exitCode: number; signal?: number }) => void): () => void;
+  onExit(listener: (event: TerminalExit) => void): () => void;
   write(data: string): void;
   resize(cols: number, rows: number): void;
   kill(): void;

@@ -104,6 +104,7 @@ export function isTerminalResponse(value: unknown): value is TerminalResponse {
     case "error": return typeof value.message === "string";
     case "exit": return isRecord(value.event) && Number.isInteger(value.event.exitCode)
       && Number(value.event.exitCode) >= 0 && Number(value.event.exitCode) <= 255
+      && (value.event.reason === undefined || value.event.reason === "broker-shutdown")
       && (value.event.signal === undefined || Number.isInteger(value.event.signal) && Number(value.event.signal) > 0 && Number(value.event.signal) <= 64);
     default: return false;
   }
