@@ -67,6 +67,7 @@ import {
 } from "./layout.js";
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
+import { useCloudxUpdate } from "./CloudxUpdatePanel.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept } from "./terminalViewStore.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
@@ -250,6 +251,7 @@ export function App() {
     }
   );
   const workspaceWrites = workspaceWritesRef.current;
+  const cloudxUpdate = useCloudxUpdate(settingsOpen, () => workspaceWrites.flush());
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -1463,6 +1465,7 @@ export function App() {
       {settingsOpen && config ? (
         <SettingsDialog
           config={config}
+          cloudxUpdate={cloudxUpdate}
           rulesSkillsStore={rulesSkillsStore}
           onCancel={() => setSettingsOpen(false)}
           onSave={handleSaveConfig}

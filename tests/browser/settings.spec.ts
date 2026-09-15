@@ -2,6 +2,7 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import type {
   CloudxConfigResponse,
   CloudxLogsResponse,
+  CloudxUpdateStatus,
   WorkspaceStateResponse,
 } from "@cloudx/shared";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -924,6 +925,152 @@ async function expectCodexSettingsFits(page: Page) {
     expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   }
 }
+
+test("Updates reconnects after restart and reloads once with Settings closed", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  let status: CloudxUpdateStatus = { available: true };
+  let disconnected = false;
+  let starts = 0;
+  await page.route("**/api/system/update", async (route) => {
+    if (route.request().method() === "POST") {
+      starts += 1;
+      expect(route.request().postDataJSON()).toEqual({});
+      status = {
+        available: true,
+        run: {
+          id: "browser-update",
+          state: "running",
+          message: "Installing CloudX and dependencies.",
+          startedAt: "2026-09-15T04:00:00.000Z",
+        },
+      };
+      await route.fulfill({ status: 202, json: status });
+    } else if (disconnected) await route.abort("connectionrefused");
+    else await route.fulfill({ json: status });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Codex dependencies");
+  await expect(
+    settings.getByRole("tab", { name: "Updates", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(
+    settings.getByText(/persistent Codex and terminal tabs reconnect/),
+  ).toBeVisible();
+  await expectSettingsFits(page, isMobile);
+  const update = settings.getByRole("button", {
+    name: "Update CloudX and dependencies",
+    exact: true,
+  });
+  await update.scrollIntoViewIfNeeded();
+  await expect(update).toBeInViewport({ ratio: 1 });
+  await update.click();
+  await expect(
+    settings.getByRole("button", { name: "Updating CloudX…", exact: true }),
+  ).toBeDisabled();
+  expect(starts).toBe(1);
+  disconnected = true;
+  await expect(settings.getByText(/Waiting for CloudX to return/)).toBeVisible({
+    timeout: 8_000,
+  });
+  await captureSample(page, testInfo, "settings-update-reconnect");
+  await settings
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await expect(settings).toHaveCount(0);
+  let reloads = 0;
+  page.on("framenavigated", (frame) => {
+    if (frame === page.mainFrame()) reloads += 1;
+  });
+  status = {
+    available: true,
+    run: {
+      ...status.run!,
+      state: "succeeded",
+      message: "CloudX update completed.",
+    },
+  };
+  disconnected = false;
+  await expect.poll(() => reloads, { timeout: 8_000 }).toBe(1);
+  const reopened = await openSettings(page, isMobile);
+  await reopened
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  await expect(
+    reopened.getByText("CloudX update completed.", { exact: true }),
+  ).toBeVisible();
+  await reopened
+    .getByRole("button", { name: "Check update status", exact: true })
+    .click();
+  await expect(
+    reopened.getByRole("button", { name: "Check update status", exact: true }),
+  ).toBeEnabled();
+  expect(reloads).toBe(1);
+  expect(starts).toBe(1);
+});
+
+test("Updates explains unsupported installations and displays installer failures", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  let status: CloudxUpdateStatus = {
+    available: false,
+    unavailableReason: "Updates require the installed CloudX system service.",
+  };
+  let starts = 0;
+  await page.route("**/api/system/update", async (route) => {
+    if (route.request().method() === "POST") {
+      starts += 1;
+      status = {
+        available: true,
+        run: {
+          id: "failed-browser-update",
+          state: "failed",
+          message: "Installer failed: the checkout has local changes.",
+          startedAt: "2026-09-15T04:00:00.000Z",
+        },
+      };
+    }
+    await route.fulfill({ json: status });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  await expect(
+    settings.getByText("Updates require the installed CloudX system service.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    settings.getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  expect(starts).toBe(0);
+  status = { available: true };
+  await settings
+    .getByRole("button", { name: "Check update status", exact: true })
+    .click();
+  await settings
+    .getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    })
+    .click();
+  await expect(settings.getByRole("alert")).toHaveText(
+    "Installer failed: the checkout has local changes.",
+  );
+  expect(starts).toBe(1);
+  await expectSettingsFits(page, isMobile);
+  await captureSample(page, testInfo, "settings-update-failed");
+});
 
 async function openSettings(page: Page, isMobile: boolean) {
   await expect(page.locator(".workspace-pane").first()).toBeVisible();

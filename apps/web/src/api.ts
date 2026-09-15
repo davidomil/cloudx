@@ -12,6 +12,7 @@ import type {
   CloudxConfigValues,
   CloudxLogSource,
   CloudxLogsResponse,
+  CloudxUpdateStatus,
   ForgeConnectionAction,
   ForgeConnections,
   ForgeConnectionStatus,
@@ -39,7 +40,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
+import { parseCloudxUpdateStatus, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -484,6 +485,16 @@ export async function getLogs(source: CloudxLogSource, signal?: AbortSignal): Pr
     throw new Error("Invalid log snapshot.");
   }
   return { source, content: snapshot.content, capturedAt: snapshot.capturedAt, truncated: snapshot.truncated };
+}
+
+export async function getCloudxUpdateStatus(signal?: AbortSignal): Promise<CloudxUpdateStatus> {
+  return parseCloudxUpdateStatus(await fetchJson<unknown>("/api/system/update", { signal, cache: "no-store" }));
+}
+
+export async function startCloudxUpdate(signal?: AbortSignal): Promise<CloudxUpdateStatus> {
+  const response = await fetch("/api/system/update", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal });
+  if (!response.ok && response.status !== 409) throw new HttpError(response.status, errorMessageFromResponse(await response.text(), response.status));
+  return parseCloudxUpdateStatus(await response.json());
 }
 
 export async function getForgeConnections(signal?: AbortSignal): Promise<ForgeConnections> {

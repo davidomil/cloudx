@@ -122,6 +122,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.uninstall = true;
     } else if (arg === "--update") {
       options.update = true;
+    } else if (arg === "--non-interactive") {
+      options.nonInteractive = true;
     } else if (arg === "--update-codex") {
       options.updateCodex = true;
     } else if (arg === "--service") {
@@ -147,6 +149,9 @@ export function parseArgs(argv = process.argv.slice(2)) {
   }
   if (options.uninstall && options.update) {
     throw new Error("--update cannot be combined with --uninstall.");
+  }
+  if (options.nonInteractive && !options.update) {
+    throw new Error("--non-interactive requires --update.");
   }
   if (
     (options.service ||
@@ -183,6 +188,7 @@ export function helpText() {
     "",
     "Options:",
     "  --update           Fast-forward this clean checkout to origin/main and update its installation.",
+    "  --non-interactive  Update without password or login prompts; requires existing non-interactive sudo and Codex authentication.",
     "  --update-codex     Update only Codex CLI to the latest npm release; leave Cloudx and services unchanged.",
     "  --service <unit>   Update only an existing custom web service; preserve its definition and shared dependencies.",
     "  --port <number>    HTTPS readiness port for the selected custom web service.",
@@ -621,6 +627,7 @@ export function ubuntuBootstrapPlan({
   nodeVersionText = "",
   npmVersionText = "",
   quartoVersionText = "",
+  nonInteractive = false,
 } = {}) {
   const nodeInstallNeeded = needsNodeInstall(nodeVersionText, npmVersionText);
   const commands = [
@@ -635,7 +642,7 @@ export function ubuntuBootstrapPlan({
     commands.push([
       "sh",
       "-lc",
-      "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -",
+      `curl -fsSL https://deb.nodesource.com/setup_22.x | sudo ${nonInteractive ? "-n " : ""}-E bash -`,
     ]);
     commands.push([
       "sudo",
@@ -706,6 +713,7 @@ export function installUbuntuPrerequisites(commands, env = process.env) {
     nodeVersionText,
     npmVersionText,
     quartoVersionText,
+    nonInteractive: commands.nonInteractive,
   })) {
     commands.run(command, args);
   }
@@ -783,16 +791,21 @@ export class InstallerRunner {
     cwd = repoRoot,
     log = console.log,
     verbose = false,
+    nonInteractive = false,
   } = {}) {
     this.dryRun = dryRun;
     this.cwd = cwd;
     this.log = log;
     this.verbose = verbose;
+    this.nonInteractive = nonInteractive;
     this.commands = [];
     this.writes = [];
   }
 
   run(command, args = [], options = {}) {
+    if (this.nonInteractive && command === "sudo" && args[0] !== "-n") {
+      args = ["-n", ...args];
+    }
     const display = formatCommand(command, args, options);
     this.commands.push({
       command,
@@ -972,13 +985,22 @@ export async function runInstaller(options = {}) {
   const root = options.repoRoot ?? repoRoot;
   const home = options.home ?? os.homedir();
   const env = options.env ?? process.env;
-  const answers = options.answers ?? {};
-  const yes = options.yes ?? false;
+  const answers = options.nonInteractive
+    ? { ...options.answers, runCodexLogin: false, restartServices: true }
+    : options.answers ?? {};
+  const yes = options.nonInteractive || (options.yes ?? false);
   const dryRun = options.dryRun ?? false;
   const verbose =
     Boolean(options.verbose) || env.CLOUDX_INSTALL_VERBOSE === "1";
   const runner =
-    options.runner ?? new InstallerRunner({ dryRun, cwd: root, verbose });
+    options.runner ??
+    new InstallerRunner({
+      dryRun,
+      cwd: root,
+      verbose,
+      nonInteractive: options.nonInteractive,
+    });
+  if (options.nonInteractive) runner.nonInteractive = true;
   if (verbose) {
     runner.verbose = true;
   }
@@ -1022,6 +1044,7 @@ export async function runInstaller(options = {}) {
       updatePort(savedEnv.CLOUDX_PORT ?? 3001, "Cloudx port");
       documentationReadinessUrl(savedEnv);
     }
+    if (options.nonInteractive) commands.run("sudo", ["-n", "true"]);
     const updatedCommit = updateCheckout(commands, {
       repoRoot: root,
       dryRun,
@@ -1913,13 +1936,14 @@ function setupWhisperCpp(commands, paths, config) {
 
 function installWhisperCppSyclPrerequisites(commands) {
   console.log("Installing Intel oneAPI/SYCL prerequisites for whisper.cpp.");
+  const sudo = commands.nonInteractive ? "sudo -n" : "sudo";
   commands.run("bash", [
     "-lc",
-    "wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null",
+    `wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | ${sudo} tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null`,
   ]);
   commands.run("bash", [
     "-lc",
-    "echo 'deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main' | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null",
+    `echo 'deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main' | ${sudo} tee /etc/apt/sources.list.d/oneAPI.list > /dev/null`,
   ]);
   commands.run("sudo", ["apt-get", "update"]);
   commands.run("sudo", [
@@ -2243,6 +2267,7 @@ export function installServerRuntimeSchemas(runner, paths) {
 
 function commandMap(runner) {
   return {
+    nonInteractive: runner.nonInteractive,
     inspect(command, args, options) {
       return runner.inspect(command, args, options);
     },

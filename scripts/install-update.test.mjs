@@ -475,6 +475,87 @@ function plannedUpdate({ service = false, modelExists = false } = {}) {
 }
 
 describe("the complete updater plan", () => {
+  it("uses the same complete installation plan for terminal and Settings updates", async () => {
+    const fixture = plannedUpdate();
+    for (const name of [
+      "cloudx-asr.service",
+      "cloudx-documentation.service",
+      "cloudx-terminal.service",
+    ]) {
+      fs.writeFileSync(path.join(fixture.unitDir, name), "installed service");
+    }
+    const terminalResult = await runInstaller(fixture.options);
+    const terminalCommands = structuredClone(fixture.runner.commands);
+    const terminalWrites = structuredClone(fixture.runner.writes);
+    fixture.runner.commands = [];
+    fixture.runner.writes = [];
+
+    const settingsResult = await runInstaller({
+      ...fixture.options,
+      nonInteractive: true,
+    });
+    const sudoPrechecks = fixture.runner.commands.filter(
+      ({ command, args }) =>
+        command === "sudo" && args.join(" ") === "-n true",
+    );
+    expect(sudoPrechecks).toHaveLength(1);
+    const settingsCommands = fixture.runner.commands
+      .filter((command) => !sudoPrechecks.includes(command))
+      .map(({ command, args, ...options }) => ({
+        command,
+        args:
+          command === "sudo"
+            ? args.slice(1)
+            : command === "sh"
+              ? args.map((arg) =>
+                  arg.replace("| sudo -n -E bash -", "| sudo -E bash -"),
+                )
+              : args,
+        ...options,
+      }));
+
+    expect(settingsCommands).toEqual(terminalCommands);
+    expect(fixture.runner.writes).toEqual(terminalWrites);
+    for (const key of [
+      "paths",
+      "port",
+      "servicesInstalled",
+      "restartServices",
+      "urls",
+    ]) {
+      expect(settingsResult[key]).toEqual(terminalResult[key]);
+    }
+    expect(settingsResult.restartServices).toBe(true);
+    expect(
+      settingsCommands
+        .filter(({ command }) => command === "curl")
+        .map(({ args }) => args.at(-1)),
+    ).toEqual(expect.arrayContaining([
+      "https://127.0.0.1:3443/api/ready",
+      "http://127.0.0.1:7810/ready",
+      "http://127.0.0.1:9000/ready",
+    ]));
+  });
+  it("checks unattended sudo before changing the checkout", async () => {
+    const fixture = plannedUpdate();
+    const run = fixture.runner.run.bind(fixture.runner);
+    fixture.runner.run = (command, args, options) => {
+      if (command === "sudo") throw new Error("Password required");
+      return run(command, args, options);
+    };
+    await expect(runInstaller({ ...fixture.options, nonInteractive: true })).rejects.toThrow("Password required");
+    expect(fixture.runner.commands.some(({ command }) => command === "git")).toBe(false);
+    expect(fixture.runner.writes).toEqual([]);
+  });
+  it("fails unattended updates without starting Codex login when authentication is missing", async () => {
+    const fixture = plannedUpdate();
+    const statusOk = fixture.runner.statusOk.bind(fixture.runner);
+    fixture.runner.statusOk = (command, args, options) => args[0] === "login" ? false : statusOk(command, args, options);
+    await expect(runInstaller({ ...fixture.options, nonInteractive: true, answers: { runCodexLogin: true } })).rejects.toThrow("Codex must be authenticated");
+    expect(fixture.runner.commands.some(({ args }) => args[0] === "login")).toBe(false);
+    expect(fixture.runner.commands.filter(({ command }) => command === "sudo").every(({ args }) => args[0] === "-n")).toBe(true);
+    expect(fixture.runner.commands.some(({ command, args }) => command === "npm" && args[0] === "ci")).toBe(false);
+  });
   it.each([false, true])("preserves terminal processes when their service is already installed=%s", async installed => {
     const fixture = plannedUpdate();
     const terminalUnit = path.join(fixture.unitDir, "cloudx-terminal.service");

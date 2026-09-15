@@ -1,10 +1,11 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import { Bell, Blocks, ScrollText, Search, Settings2, X } from "lucide-react";
+import { Bell, Blocks, RefreshCw, ScrollText, Search, Settings2, X } from "lucide-react";
 
 import { CLOUDX_LOG_SOURCES } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";
 import { ForgeConnections } from "./ForgeConnections.js";
 import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
@@ -34,6 +35,7 @@ export function SettingsDialog({
   onSaveDefaultTemplate,
   browserNotificationState,
   onRequestBrowserNotifications,
+  cloudxUpdate,
   children
 }: {
   config: CloudxConfigResponse;
@@ -44,6 +46,7 @@ export function SettingsDialog({
   onSaveDefaultTemplate?: (templateId: string | undefined) => Promise<void>;
   browserNotificationState?: BrowserNotificationPermissionState;
   onRequestBrowserNotifications?: () => Promise<void>;
+  cloudxUpdate?: CloudxUpdateController;
   children?: ReactNode;
 }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
@@ -174,6 +177,16 @@ export function SettingsDialog({
       content: <BrowserNotificationSettings state={browserNotificationState} onRequest={onRequestBrowserNotifications} />
     }]
   });
+  if (cloudxUpdate) categories.push({
+    id: "updates",
+    label: "Updates",
+    description: "Update CloudX and the tools managed by its installer.",
+    entries: [{
+      id: "cloudx-update",
+      searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout",
+      content: <CloudxUpdatePanel update={cloudxUpdate} />
+    }]
+  });
 
   const searchWords = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const filteredCategories = categories.map(category => ({
@@ -254,7 +267,7 @@ export function SettingsDialog({
           <div className="settings-workspace">
             <div className="settings-tabs" ref={tabsRef} role="tablist" aria-label="Settings categories" aria-orientation={horizontalTabs ? "horizontal" : "vertical"} onKeyDown={navigateTabs}>
               {filteredCategories.map((category, index) => {
-                const Icon = category.id === "general" ? Settings2 : category.id === "browser" ? Bell : category.id === "logs" ? ScrollText : Blocks;
+                const Icon = category.id === "general" ? Settings2 : category.id === "browser" ? Bell : category.id === "logs" ? ScrollText : category.id === "updates" ? RefreshCw : Blocks;
                 return <button key={category.id} type="button" role="tab" id={`${id}-tab-${index}`} aria-controls={`${id}-panel-${index}`} aria-label={category.label} aria-selected={category.id === activeCategory.id} tabIndex={category.id === activeCategory.id ? 0 : -1} onClick={() => setActiveCategoryId(category.id)}>
                   <Icon size={16} aria-hidden="true" /><span>{category.label}</span><small>{category.entries.filter(entry => entry.matches).length}</small>
                 </button>;
