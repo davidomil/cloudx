@@ -13,6 +13,36 @@ import { JiraPollingService } from "./JiraPollingService.js";
 import { jiraIssueEventPayload, type JiraCommentSummary, type JiraIssueSummary } from "./JiraIssue.js";
 
 describe("JiraPollingService", () => {
+  it("logs scheduled polling failures and stops polling after disposal", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-log-"));
+    const pollingConfig = vi.fn(() => {
+      throw Object.assign(new Error("Polling settings unavailable"), { token: "private-token" });
+    });
+    const warn = vi.fn();
+    const polling = new JiraPollingService(
+      { pollingConfig } as unknown as JiraIntegrationService,
+      new PluginDataStore(dataDir),
+      () => jiraTriggers(),
+      { warn }
+    );
+    vi.useFakeTimers();
+    try {
+      polling.start();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(warn).toHaveBeenCalledExactlyOnceWith({
+        err: expect.objectContaining({ message: "Polling settings unavailable" })
+      }, "Jira polling failed.");
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("private-token");
+      await polling.dispose();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pollingConfig).toHaveBeenCalledTimes(1);
+    } finally {
+      await polling.dispose();
+      vi.useRealTimers();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("bootstraps state, emits changed issue triggers once, and suppresses duplicates", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-jira-polling-"));
     const events: string[] = [];

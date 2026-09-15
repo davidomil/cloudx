@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFile } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { CloudxLogService, LOG_MAX_BYTES, LOG_MAX_ENTRIES, readServiceJournal } from "./CloudxLogService.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
@@ -69,25 +70,74 @@ describe("installed service logs", () => {
     });
   });
 
-  it("limits concurrent journal processes and releases admission after a failure", async () => {
+  it("waits for the active read before starting a replacement and bounds waiting requests", async () => {
+    let finishRead!: (output: string) => void;
+    const readJournal = vi.fn(() => new Promise<string>(resolve => { finishRead = resolve; }));
+    const logs = new CloudxLogService(readJournal);
+    const reading = logs.read("services", signal());
+    const replacement = logs.read("asr", signal());
+    expect(readJournal).toHaveBeenCalledTimes(1);
+    await expect(logs.read("terminals", signal())).rejects.toMatchObject({ statusCode: 429 });
+    await expect(logs.read("current", signal())).resolves.toMatchObject({ content: "" });
+    readJournal.mockResolvedValue("replacement");
+    finishRead("first");
+    await expect(reading).resolves.toMatchObject({ content: "first" });
+    await expect(replacement).resolves.toMatchObject({ source: "asr", content: "replacement" });
+  });
+
+  it("starts a waiting replacement after the active read fails", async () => {
     let rejectRead!: (error: Error) => void;
     const readJournal = vi.fn(() => new Promise<string>((_resolve, reject) => { rejectRead = reject; }));
     const logs = new CloudxLogService(readJournal);
     const reading = logs.read("services", signal());
-    await expect(logs.read("asr", signal())).rejects.toMatchObject({ statusCode: 429 });
-    await expect(logs.read("current", signal())).resolves.toMatchObject({ content: "" });
+    const replacement = logs.read("asr", signal());
+    readJournal.mockResolvedValue("recovered");
     rejectRead(new Error("journal failed"));
     await expect(reading).rejects.toThrow("journal failed");
-    readJournal.mockResolvedValue("recovered");
+    await expect(replacement).resolves.toMatchObject({ source: "asr", content: "recovered" });
     await expect(logs.read("services", signal())).resolves.toMatchObject({ content: "recovered" });
+  });
+
+  it("removes canceled waiting reads without starting them or releasing the active reader", async () => {
+    let finishRead!: (output: string) => void;
+    const readJournal = vi.fn(() => new Promise<string>(resolve => { finishRead = resolve; }));
+    const logs = new CloudxLogService(readJournal);
+    const reading = logs.read("services", signal());
+    const waiting = new AbortController();
+    const canceled = logs.read("asr", waiting.signal);
+    waiting.abort();
+    await expect(canceled).rejects.toThrow("cancelled");
+    const replacement = logs.read("terminals", signal());
+    expect(readJournal).toHaveBeenCalledTimes(1);
+    readJournal.mockResolvedValue("terminal logs");
+    finishRead("first");
+    await reading;
+    await expect(replacement).resolves.toMatchObject({ source: "terminals", content: "terminal logs" });
+    expect(readJournal).toHaveBeenCalledTimes(2);
+    expect(readJournal).not.toHaveBeenCalledWith(["cloudx-asr.service"], waiting.signal);
+  });
+
+  it("does not start an already canceled read and releases admission after a synchronous failure", async () => {
+    const readJournal = vi.fn<() => Promise<string>>().mockImplementationOnce(() => { throw new Error("reader unavailable"); }).mockResolvedValue("ready");
+    const logs = new CloudxLogService(readJournal);
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(logs.read("asr", aborted.signal)).rejects.toThrow("cancelled");
+    expect(readJournal).not.toHaveBeenCalled();
+    await expect(logs.read("asr", signal())).rejects.toThrow("reader unavailable");
+    await expect(logs.read("asr", signal())).resolves.toMatchObject({ content: "ready" });
   });
 });
 
 describe("journal process boundary", () => {
   it("uses a shell-free, time-bounded, byte-bounded command with cancellation", async () => {
     vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
-      (args[3] as (error: null, stdout: string, stderr: string) => void)(null, "journal text", "");
-      return {} as ReturnType<typeof execFile>;
+      const child = new EventEmitter();
+      queueMicrotask(() => {
+        (args[3] as (error: null, stdout: string, stderr: string) => void)(null, "journal text", "");
+        child.emit("close");
+      });
+      return child as ReturnType<typeof execFile>;
     });
     const abort = signal();
     expect(await readServiceJournal(["cloudx.service"], abort)).toBe("journal text");
@@ -98,10 +148,31 @@ describe("journal process boundary", () => {
 
   it.each(["ENOENT", "EACCES", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", "ABORT_ERR", "ETIMEDOUT"])("reports %s without exposing subprocess output", async code => {
     vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
-      (args[3] as (error: Error) => void)(Object.assign(new Error("private process diagnostic"), { code }));
-      return {} as ReturnType<typeof execFile>;
+      const child = new EventEmitter();
+      queueMicrotask(() => {
+        (args[3] as (error: Error) => void)(Object.assign(new Error("private process diagnostic"), { code }));
+        child.emit("close");
+      });
+      return child as ReturnType<typeof execFile>;
     });
     await expect(readServiceJournal(["cloudx.service"], signal())).rejects.toMatchObject({ statusCode: 503, message: expect.stringContaining("Could not read the service journal") });
     await expect(readServiceJournal(["cloudx.service"], signal())).rejects.not.toThrow("private process diagnostic");
+  });
+
+  it("keeps admission until an aborted child closes, even when its callback has already failed", async () => {
+    const child = new EventEmitter();
+    let fail!: () => void;
+    vi.mocked(execFile).mockImplementation((...args: unknown[]) => {
+      fail = () => (args[3] as (error: Error, stdout: string) => void)(new Error("aborted"), "");
+      return child as ReturnType<typeof execFile>;
+    });
+    const settled = vi.fn();
+    const reading = readServiceJournal(["cloudx.service"], signal()).catch(settled);
+    fail();
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
+    child.emit("close");
+    await reading;
+    expect(settled).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ statusCode: 503 }));
   });
 });

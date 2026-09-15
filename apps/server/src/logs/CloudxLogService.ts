@@ -20,13 +20,19 @@ export class LogReadError extends Error {
 
 export function readServiceJournal(units: string[], signal: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile("journalctl", [
+    let failed = false;
+    let output = "";
+    const child = execFile("journalctl", [
       "--user", "--no-pager", "--quiet", "--output=short-iso-precise",
       `--lines=${LOG_MAX_ENTRIES + 1}`,
       ...units.map(unit => `--unit=${unit}`)
     ], { encoding: "utf8", timeout: 5_000, maxBuffer: LOG_MAX_BYTES, killSignal: "SIGKILL", signal }, (error, stdout) => {
-      if (error) reject(new LogReadError("Could not read the service journal. It requires journalctl and access to the CloudX user service logs. Reads are limited to 5 seconds and 1 MiB."));
-      else resolve(stdout);
+      failed = error !== null;
+      output = stdout;
+    });
+    child.once("close", () => {
+      if (failed) reject(new LogReadError("Could not read the service journal. It requires journalctl and access to the CloudX user service logs. Reads are limited to 5 seconds and 1 MiB."));
+      else resolve(output);
     });
   });
 }
@@ -36,6 +42,7 @@ export class CloudxLogService {
   private bytes = 0;
   private truncated = false;
   private journalReadActive = false;
+  private waitingJournalRead?: () => void;
 
   constructor(private readonly readJournal: JournalReader = readServiceJournal) {}
 
@@ -58,15 +65,40 @@ export class CloudxLogService {
     if (source === "current") {
       return { source, capturedAt: new Date().toISOString(), content: this.entries.map(entry => entry.text).join(""), truncated: this.truncated };
     }
-    if (this.journalReadActive) throw new LogReadError("A service journal read is already running. Refresh again when it finishes.", 429);
-    this.journalReadActive = true;
-    try {
-      const units = source === "services" ? Object.values(JOURNAL_UNITS) : [JOURNAL_UNITS[source]];
-      const output = await this.readJournal(units, signal);
-      const lines = output.trimEnd().split("\n");
-      return { source, capturedAt: new Date().toISOString(), content: lines.slice(-LOG_MAX_ENTRIES).join("\n"), truncated: lines.length > LOG_MAX_ENTRIES };
-    } finally {
-      this.journalReadActive = false;
-    }
+    const units = source === "services" ? Object.values(JOURNAL_UNITS) : [JOURNAL_UNITS[source]];
+    const output = await this.readJournalWhenAvailable(units, signal);
+    const lines = output.trimEnd().split("\n");
+    return { source, capturedAt: new Date().toISOString(), content: lines.slice(-LOG_MAX_ENTRIES).join("\n"), truncated: lines.length > LOG_MAX_ENTRIES };
+  }
+
+  private async readJournalWhenAvailable(units: string[], signal: AbortSignal): Promise<string> {
+    if (signal.aborted) throw new LogReadError("Service journal read cancelled.");
+    if (this.waitingJournalRead) throw new LogReadError("A service journal read is running and another is waiting. Refresh again when they finish.", 429);
+    return new Promise((resolve, reject) => {
+      const cancelWaitingRead = () => {
+        this.waitingJournalRead = undefined;
+        reject(new LogReadError("Service journal read cancelled."));
+      };
+      const start = async () => {
+        signal.removeEventListener("abort", cancelWaitingRead);
+        this.journalReadActive = true;
+        try {
+          resolve(await this.readJournal(units, signal));
+        } catch (error) {
+          reject(error);
+        } finally {
+          this.journalReadActive = false;
+          const waiting = this.waitingJournalRead;
+          this.waitingJournalRead = undefined;
+          waiting?.();
+        }
+      };
+      if (this.journalReadActive) {
+        this.waitingJournalRead = start;
+        signal.addEventListener("abort", cancelWaitingRead, { once: true });
+      } else {
+        void start();
+      }
+    });
   }
 }

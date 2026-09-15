@@ -1,5 +1,7 @@
 import type { TriggerRegistry } from "../triggers/TriggerRegistry.js";
 import type { PluginDataStore } from "../plugins/PluginDataStore.js";
+import type { ServiceLogger } from "../logs/ServiceLogger.js";
+import { serializeError } from "../voice/VoiceDebugLog.js";
 import { JiraRateLimitError } from "./JiraClient.js";
 import { JIRA_PLUGIN_ID, type JiraIntegrationService, type JiraPollingAccount } from "./JiraIntegrationService.js";
 import type { JiraCommentSummary, JiraIssueSummary, JiraUserSummary } from "./JiraIssue.js";
@@ -60,7 +62,8 @@ export class JiraPollingService {
   constructor(
     private readonly integration: JiraIntegrationService,
     private readonly pluginData: PluginDataStore,
-    private readonly triggersProvider: () => TriggerRegistry | undefined
+    private readonly triggersProvider: () => TriggerRegistry | undefined,
+    private readonly logger?: Pick<ServiceLogger, "warn">
   ) {}
 
   start(): void {
@@ -68,7 +71,7 @@ export class JiraPollingService {
       return;
     }
     this.timer = setInterval(() => {
-      void this.runIfEnabled().catch((error) => console.warn("Jira polling failed.", error));
+      void this.runIfEnabled().catch((error) => this.logger?.warn({ err: serializeError(error) }, "Jira polling failed."));
     }, 30_000);
   }
 

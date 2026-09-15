@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { loadConfig } from "../config.js";
 import { buildServer, buildServices } from "../server.js";
+import { DocumentationClient } from "../documentation/DocumentationClient.js";
+import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { CloudxLogService, LogReadError, type JournalReader } from "./CloudxLogService.js";
 
 let app: FastifyInstance | undefined;
@@ -14,18 +16,23 @@ let root: string | undefined;
 afterEach(async () => {
   await app?.close();
   app = undefined;
+  vi.restoreAllMocks();
   if (root) await fs.rm(root, { recursive: true, force: true });
   root = undefined;
 });
 
-async function server(readJournal: JournalReader = async () => "journal fixture", level = "warn") {
+async function configuration(level = "warn") {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-log-routes-"));
-  const config = loadConfig({
+  return loadConfig({
     CLOUDX_ALLOWED_ROOTS: root, CLOUDX_DATA_DIR: path.join(root, "data"),
     CLOUDX_TRUSTED_ORIGINS: "http://localhost", CLOUDX_APP_SERVER_ENABLED: "false",
     CLOUDX_AUTOMATION_START_DISABLED: "true", CLOUDX_LOG_LEVEL: level,
     CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9", CLOUDX_ASR_URL: "http://127.0.0.1:9"
   });
+}
+
+async function server(readJournal: JournalReader = async () => "journal fixture", level = "warn") {
+  const config = await configuration(level);
   const services = buildServices(config);
   services.logs = new CloudxLogService(readJournal);
   vi.spyOn(services.documentation!, "pendingEnrichments").mockResolvedValue([]);
@@ -34,6 +41,43 @@ async function server(readJournal: JournalReader = async () => "journal fixture"
 }
 
 describe("Settings logs HTTP boundary", () => {
+  it.each(["info", "fatal"])("captures a real workspace listener failure at the configured %s level", async (level) => {
+    const config = await configuration(level);
+    vi.spyOn(DocumentationClient.prototype, "pendingEnrichments").mockResolvedValue([]);
+    const notifyChange = WorkspaceLayoutStore.prototype.notifyChange;
+    const laterListener = vi.fn();
+    vi.spyOn(WorkspaceLayoutStore.prototype, "notifyChange").mockImplementation(function (this: WorkspaceLayoutStore) {
+      const disposeFailure = this.onChange(() => {
+        throw Object.assign(new Error("Workspace observer disconnected"), { token: "private-error-token" });
+      });
+      const disposeLater = this.onChange(laterListener);
+      try {
+        notifyChange.call(this);
+      } finally {
+        disposeFailure();
+        disposeLater();
+      }
+    });
+    app = await buildServer(config);
+    const created = await app.inject({ method: "POST", url: "/api/windows?token=private-query-token", payload: { name: "Diagnostic regression" } });
+    expect(created.statusCode).toBe(201);
+    expect(laterListener).toHaveBeenCalled();
+    const response = await app.inject("/api/logs");
+    expect(response.statusCode).toBe(200);
+    const content = response.json().content as string;
+    const diagnostics = content.split("\n").filter(Boolean).map(line => JSON.parse(line));
+    if (level === "info") {
+      expect(diagnostics).toContainEqual(expect.objectContaining({
+        level: 50,
+        msg: "Workspace change listener failed.",
+        err: expect.objectContaining({ message: "Workspace observer disconnected" })
+      }));
+    } else {
+      expect(diagnostics).toEqual([]);
+    }
+    expect(content).not.toMatch(/private-error-token|private-query-token|\/api\/logs/);
+  });
+
   it("captures production logger output, keeps request secrets redacted and avoids logging viewer traffic", async () => {
     const serverApp = await server(undefined, "info");
     serverApp.log.info("Settings log fixture");

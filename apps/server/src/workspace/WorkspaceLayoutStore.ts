@@ -26,6 +26,8 @@ import { applyWorkspaceLayoutInstructionToTabLayout, findTabLayoutPane, firstTab
 import { relativeChildPath as relativePathWithin } from "../pathBoundary.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { JsonStateFile } from "../jsonStateFile.js";
+import type { ServiceLogger } from "../logs/ServiceLogger.js";
+import { serializeError } from "../voice/VoiceDebugLog.js";
 import { availablePersistenceStatus, degradedPersistenceStatus, initialPersistenceStatus, isCapacityStateWriteError, persistenceStatusChanged } from "../statePersistence.js";
 import { WorkspacePaneConflictError, WorkspaceWindowConflictError, WorkspaceWindowNotFoundError } from "./WorkspaceErrors.js";
 
@@ -78,7 +80,8 @@ export class WorkspaceLayoutStore {
 
   constructor(
     dataDir: string,
-    private readonly pathPolicy: PathPolicy
+    private readonly pathPolicy: PathPolicy,
+    private readonly logger?: Pick<ServiceLogger, "error">
   ) {
     this.workspaceFile = new JsonStateFile(dataDir, "workspace.json", "Workspace layout");
     this.workspacePath = this.workspaceFile.filePath;
@@ -305,7 +308,7 @@ export class WorkspaceLayoutStore {
       try {
         listener();
       } catch (error) {
-        console.error("Workspace change listener failed.", error);
+        this.logger?.error({ err: serializeError(error) }, "Workspace change listener failed.");
       }
     }
   }

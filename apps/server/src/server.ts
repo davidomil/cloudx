@@ -184,7 +184,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.documentationIngestQueue ??= new DocumentationIngestQueue();
   await reapDocumentationUploadSpool(documentationSpoolRoot(config));
   services.config ??= new ConfigService(config.dataDir, () => services!.plugins.list(), { voiceModel: config.voiceModel });
-  services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy);
+  services.workspace ??= new WorkspaceLayoutStore(config.dataDir, services.pathPolicy, app.log);
   services.workspaceCommands ??= new WorkspaceCommandService(services.sessions, services.workspace);
   services.pluginData ??= new PluginDataStore(config.dataDir);
   services.installedPlugins ??= new InstalledPluginService(config.dataDir, { logger: app.log });
@@ -210,9 +210,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const automationRepository = new AutomationRepository(config.dataDir);
     services.triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
     registerPluginTriggers(services.triggers, services.plugins);
-    services.automation ??= createAutomationService(automationRepository, services, config);
+    services.automation ??= createAutomationService(automationRepository, services, config, app.log);
   }
-  services.automation ??= createAutomationService(new AutomationRepository(config.dataDir), services, config);
+  services.automation ??= createAutomationService(new AutomationRepository(config.dataDir), services, config, app.log);
   services.sessions.setHookRegistry?.(services.hooks);
   services.sessions.setTriggerRegistry?.(services.triggers);
   await services.sessions.restore?.(services.pluginContributionsReady);
@@ -1244,7 +1244,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger): AppServices {
   const plugins = new PluginRegistry();
   const pathPolicy = new PathPolicy([...config.allowedRoots, path.join(config.dataDir, "forge-workers", "checkouts")]);
-  const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy);
+  const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy, logger);
   const terminalFactory = new DurableTerminalProcessFactory(terminalSocketPath(config.dataDir), new NodePtyTerminalProcessFactory(), config.terminalReplayBytes);
   const codexStateSources = new CodexStateSources(config.dataDir);
   const pluginData = new PluginDataStore(config.dataDir);
@@ -1375,8 +1375,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const triggers = new TriggerRegistry({ recordEvent: (event) => automationRepository.appendTriggerEvent(event) });
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
-  jiraPolling = new JiraPollingService(jira, pluginData, () => triggers);
-  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config);
+  jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
+  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
   return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources };
 }
 
@@ -1526,10 +1526,11 @@ function buildHookRegistry(services: AppServices): HookRegistry {
   return hooks;
 }
 
-function createAutomationService(repository: AutomationRepository, services: AppServices, config?: Pick<AppConfig, "automationStartDisabled">): AutomationService {
+function createAutomationService(repository: AutomationRepository, services: AppServices, config?: Pick<AppConfig, "automationStartDisabled">, logger?: StructuredVoiceLogger): AutomationService {
   const typeService = new AutomationTypeService();
   const catalog = new AutomationCatalogService(typeService, () => services.triggers!.list(), () => services.hooks!.list(), buildAutomationDynamicOptionsProvider(services));
   return new AutomationService(repository, services.triggers!, services.hooks!, catalog, new AutomationCompiler(typeService), new AutomationExecutor(), {
+    logger,
     startDisabled: config?.automationStartDisabled,
     executorOptions: { allowedRoots: automationAllowedRoots(services.pathPolicy) },
     layoutEffects: services.workspace
