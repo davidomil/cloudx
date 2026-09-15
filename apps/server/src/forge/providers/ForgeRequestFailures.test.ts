@@ -53,6 +53,9 @@ describe("sanitized provider diagnostics", () => {
     { repository: github, requestId: "1C73:26D4:E2E500:1EF78F4:62EC2479" },
     { repository: gitlab, requestId: "01FGN8P881GF2E5J91JYA338Y3" },
     { repository: gitlab, requestId: "4rAMkV3gof4" },
+    { repository: gitlab, requestId: "a3b8d5b5e910552b-SJC" },
+    { repository: gitlab, requestId: "230B030023AE2822-LHR" },
+    { repository: gitlab, requestId: "a".repeat(128) },
   ])("retains only provider correlation and quota fields for $repository.provider", ({ repository, requestId }) => {
     const observer = vi.fn();
     const failures = new ForgeRequestFailures(repository, "worker", "/user", "GET", "request", observer);
@@ -85,7 +88,10 @@ describe("sanitized provider diagnostics", () => {
   });
 
   it.each([github, gitlab])("drops unsafe or oversized $provider request IDs", repository => {
-    for (const requestId of ["https://private.example?token=private-token", "Bearer private-token", "private-token", "a".repeat(129)]) {
+    for (const requestId of [
+      "https://private.example?token=private-token", "Bearer private-token", "private-token", "a".repeat(129),
+      `${"a".repeat(125)}-SJC`, "a3b8d5b5e910552b-SJC?token=private-token", "a3b8d5b5e910552b-SJC private-token",
+    ]) {
       const observer = vi.fn();
       const failures = new ForgeRequestFailures(repository, "worker", "/user", "GET", "request", observer);
       const response = new Response(null, { status: 403, headers: {
@@ -97,6 +103,20 @@ describe("sanitized provider diagnostics", () => {
       expect(observer.mock.calls[0][0]).toMatchObject({ providerRequestId: undefined, rateLimitResetAt: undefined });
       expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
     }
+  });
+
+  it.each([
+    "a3b8d5b5e910552-SJC", "a3b8d5b5e910552bb-SJC", "g3b8d5b5e910552b-SJC",
+    "a3b8d5b5e910552b-SJ", "a3b8d5b5e910552b-SJCX", "a3b8d5b5e910552b-sjc",
+    "a3b8d5b5e910552b--SJC", "a3b8d5b5e910552b-SJC-LHR",
+  ])("drops malformed GitLab Cloudflare correlation ID %s", requestId => {
+    const observer = vi.fn();
+    const failures = new ForgeRequestFailures(gitlab, "worker", "/user", "GET", "request", observer);
+    const response = new Response(null, { status: 503, headers: { "x-request-id": requestId } });
+    failures.received(response);
+    failures.http(httpFailure(response, "gitlab"), false);
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ providerRequestId: undefined }));
+    expect(JSON.stringify(observer.mock.calls)).not.toContain(requestId);
   });
 
   it.each([

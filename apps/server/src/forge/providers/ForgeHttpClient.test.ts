@@ -64,6 +64,28 @@ describe("safe Forge request failures", () => {
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { status: 404, failure: "rejected", retryable: false },
+    { status: 429, failure: "rate_limited", retryable: true },
+    { status: 503, failure: "service_unavailable", retryable: true },
+  ])("preserves GitLab Cloudflare correlation IDs for HTTP $status", async ({ status, failure, retryable }) => {
+    const gitlab: ForgeRepository = { provider: "gitlab", apiUrl: "https://gitlab.com/api/v4", projectPath: "owner/repo" };
+    const requestId = "a3b8d5b5e910552b-SJC";
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(privateFailure, { status, headers: {
+      "x-request-id": requestId, "set-cookie": "private-cookie",
+    } }));
+    const observer = vi.fn();
+    const http = new ForgeHttpClient(gitlab, new ForgeCredentials(gitlab, async () => ({ kind: "token", token: "private-token" })), fetcher, "worker", undefined, observer);
+    const error = await http.request("/projects/owner%2Frepo/issues/75").catch(error => error);
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      provider: "gitlab", phase: "response", httpStatus: status, failure, retryable,
+      providerRequestId: requestId,
+    }));
+    expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+    expectPrivateFailure(error);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("preserves a provider failure when diagnostic delivery throws", async () => {
     const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 429 }));
     const observer = vi.fn(() => { throw new Error(privateFailure); });

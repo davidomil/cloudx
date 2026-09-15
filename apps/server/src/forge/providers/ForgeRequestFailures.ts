@@ -55,7 +55,9 @@ export class ForgeRequestFailures {
   received(response: Response): void {
     const prefix = this.context.provider === "github" ? "x-ratelimit" : "ratelimit";
     const requestId = response.headers.get(this.context.provider === "github" ? "x-github-request-id" : "x-request-id");
-    const requestIdPattern = this.context.provider === "github" ? /^[A-Fa-f0-9]+(?::[A-Fa-f0-9]+){4}$/ : /^[A-Za-z0-9]+$/;
+    const requestIdPattern = this.context.provider === "github"
+      ? /^[A-Fa-f0-9]+(?::[A-Fa-f0-9]+){4}$/
+      : /^(?:[A-Za-z0-9]+|[A-Fa-f0-9]{16}-[A-Z]{3})$/;
     const rateLimitReset = numericHeader(response.headers, `${prefix}-reset`);
     const rateLimitResetAt = rateLimitReset === undefined ? undefined : rateLimitReset * 1000;
     this.response = {
