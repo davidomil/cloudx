@@ -485,16 +485,24 @@ export class ForgeWorkflowService {
       if (!sameRepository(worker.repository, this.deps.settings().repository))
         throw new Error("The configured repository changed. Restore it before continuing this worker.");
       const parent = worker.issueWorkerId ? this.requireWorker(worker.issueWorkerId) : undefined;
-      for (const member of parent ? [parent, worker] : [worker]) {
-        if (member.attemptId && await this.deps.reports.read(member.attemptId) !== undefined)
-          throw new Error("A retained completion report must be reconciled with Resume before continuing with a message.");
-      }
-      if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
-      const manualContinuation: ManualContinuation = { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
-      for (const member of parent ? [parent, worker] : [worker]) this.cancelProviderRecovery(member);
+      const members = parent ? [parent, worker] : [worker];
       const controller = new AbortController();
-      this.operations.set(worker.id, controller);
-      if (parent) this.operations.set(parent.id, controller);
+      for (const member of members) this.operations.set(member.id, controller);
+      try {
+        for (const member of members) {
+          if (!member.attemptId) continue;
+          const report = await this.deps.reports.read(member.attemptId);
+          controller.signal.throwIfAborted();
+          if (report !== undefined)
+            throw new Error("A retained completion report must be reconciled with Resume before continuing with a message.");
+        }
+        if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
+      } catch (error) {
+        for (const member of members) this.operations.delete(member.id);
+        throw error;
+      }
+      const manualContinuation: ManualContinuation = { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
+      for (const member of members) this.cancelProviderRecovery(member);
       try {
         const provider = this.providerFor(worker);
         const item = worker.kind === "issue" ? await provider.getIssue(worker.number) : await provider.getChangeRequest(worker.number);
@@ -513,7 +521,7 @@ export class ForgeWorkflowService {
         if (issue && (issue.number !== parent!.number || issue.state !== "open"))
           throw new Error("Continuation requires the original issue to remain open.");
         controller.signal.throwIfAborted();
-        for (const member of parent ? [parent, worker] : [worker]) {
+        for (const member of members) {
           await this.recoverResources(member);
           await this.quiesce(member);
         }

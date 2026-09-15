@@ -311,12 +311,64 @@ describe("Manual worker continuation", () => {
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await f.service.dispose();
     const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    const before = f.stored();
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Tests passed" });
     await expect(service.continueWorker(worker.id, "Do additional work.", placement)).rejects.toThrow(/retained completion report.*Resume/);
-    expect(f.stored()[0].attemptId).toBe(worker.attemptId);
+    expect((await service.dashboard()).workers).toEqual(before);
+    expect(f.stored()).toEqual(before);
     expect(f.reports.remove).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledOnce();
     expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.deps.notify).not.toHaveBeenCalled();
+  });
+
+  it.each(["stop", "dispose"] as const)("honors %s while continuation checks a retained issue attempt", async action => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.dispose();
+    const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    const before = f.stored()[0];
+    const reading = deferred<void>();
+    const report = deferred<undefined>();
+    f.reports.read.mockImplementationOnce(() => { reading.resolve(); return report.promise; });
+    const continuation = service.continueWorker(worker.id, "Continue the partial fix.", placement);
+    await reading.promise;
+    const controlling = action === "dispose" ? service.dispose() : service.stop(worker.id);
+    const outcomes = Promise.allSettled([continuation, controlling]);
+    report.resolve(undefined);
+    const [continued, controlled] = await outcomes;
+
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(continued).toMatchObject({ status: "rejected", reason: new Error(action === "dispose" ? "CloudX is shutting down." : "Worker stopped by user.") });
+    expect(controlled.status).toBe("fulfilled");
+    expect(f.stored()[0]).toEqual({ ...before, status: action === "dispose" ? "paused" : "stopped", attemptId: action === "dispose" ? worker.attemptId : undefined, updatedAt: expect.any(String) });
+    expect(f.reports.read).toHaveBeenCalledExactlyOnceWith(worker.attemptId);
+    expect(f.reports.prepare).toHaveBeenCalledOnce();
+    if (action === "dispose") expect(f.reports.remove).not.toHaveBeenCalled();
+    else expect(f.reports.remove).toHaveBeenCalledExactlyOnceWith(worker.attemptId);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.getIssue).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.deps.notify).not.toHaveBeenCalled();
+  });
+
+  it("preserves the issue attempt when the retained-report check fails", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.dispose();
+    const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    const before = f.stored();
+    f.reports.read.mockRejectedValueOnce(new Error("Could not read the retained report."));
+    await expect(service.continueWorker(worker.id, "Continue the partial fix.", placement)).rejects.toThrow("Could not read the retained report.");
+    expect((await service.dashboard()).workers).toEqual(before);
+    expect(f.stored()).toEqual(before);
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.deps.notify).not.toHaveBeenCalled();
   });
 
   it("preserves a linked parent's retained report before continuing the reviewer", async () => {
@@ -325,11 +377,44 @@ describe("Manual worker continuation", () => {
     await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? { ...worker, attemptId } : worker));
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Tests passed" });
     const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    const before = f.stored();
     const previousRemovals = f.reports.remove.mock.calls.length;
     await expect(service.continueWorker(f.reviewer.id, "Continue this review.", placement)).rejects.toThrow(/retained completion report/);
+    expect((await service.dashboard()).workers).toEqual(before);
+    expect(f.stored()).toEqual(before);
     expect(f.reports.read).toHaveBeenLastCalledWith(attemptId);
     expect(f.reports.remove).toHaveBeenCalledTimes(previousRemovals);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["issue", "reviewer"] as const)("honors Stop on the %s while reviewer continuation checks its parent's retained attempt", async target => {
+    const f = await clarificationLoop();
+    const attemptId = randomUUID();
+    await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? { ...worker, attemptId } : worker));
+    const service = new ForgeWorkflowService(f.deps);
+    await service.dashboard();
+    const previousRemovals = f.reports.remove.mock.calls.length;
+    const previousReads = f.provider.getChangeRequest.mock.calls.length;
+    const reading = deferred<void>();
+    const report = deferred<undefined>();
+    f.reports.read.mockImplementationOnce(() => { reading.resolve(); return report.promise; });
+    const continuation = service.continueWorker(f.reviewer.id, "Continue this review.", placement);
+    await reading.promise;
+    const stopping = service.stop(f[target].id);
+    const outcomes = Promise.allSettled([continuation, stopping]);
+    report.resolve(undefined);
+    const [continued, stopped] = await outcomes;
+
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(continued).toMatchObject({ status: "rejected", reason: new Error("Worker stopped by user.") });
+    expect(stopped.status).toBe("fulfilled");
+    expect(f.stored().find(worker => worker.id === f.issue.id)).toMatchObject({ status: "stopped", attemptId: undefined, worktreePath: f.issue.worktreePath, branch: f.issue.branch });
+    expect(f.stored().find(worker => worker.id === f.reviewer.id)).toMatchObject({ status: "completed", draft: f.draft, worktreePath: f.reviewer.worktreePath, branch: f.reviewer.branch });
+    expect(f.reports.remove).toHaveBeenCalledTimes(previousRemovals + 1);
+    expect(f.reports.remove).toHaveBeenLastCalledWith(attemptId);
+    expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(previousReads);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
   });
 
   it.each([
