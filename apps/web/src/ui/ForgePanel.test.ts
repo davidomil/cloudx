@@ -49,6 +49,15 @@ const publishingWorker: ForgeWorker = {
     headSha: "b".repeat(40), previousHeadSha: "a".repeat(40), confirmationStartedAt: "2026-09-07T12:00:00.000Z", repliedDiscussionIds: []
   }
 };
+const uncertainReply = { discussionId: "discussion-1", body: "Fixed the timeout.\nThe reproduction passes." };
+const uncertainReplyWorker: ForgeWorker = {
+  ...publishingWorker, status: "failed", error: "The discussion reply outcome is uncertain.",
+  pendingPublication: {
+    ...publishingWorker.pendingPublication!,
+    report: { ...publishingWorker.pendingPublication!.report, discussionReplies: [uncertainReply], resolvedDiscussionIds: [uncertainReply.discussionId] },
+    replyingToDiscussionId: uncertainReply.discussionId,
+  },
+};
 const conflictedWorker: ForgeWorker = {
   ...worker, status: "awaiting_merge", branch: change.headBranch, worktreePath: "/repo/worker",
   changeNumber: change.number, headSha: change.headSha,
@@ -84,6 +93,7 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
       "forge.worker.resume": { worker },
       "forge.worker.continue": { worker },
+      "forge.worker.omitDiscussionReply": { worker },
       "forge.worker.syncAndReview": { worker },
       "forge.worker.rebaseAndResolve": { worker },
       "forge.worker.autoReview": { worker }
@@ -128,6 +138,73 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it.each(["github", "gitlab"] as const)("previews the uncertain %s reply in issues, requests, and worker tabs", async provider => {
+    const currentRepository = { ...repository, provider };
+    const panel = await renderPanel(fixture({ repository: currentRepository, workers: [{ ...uncertainReplyWorker, repository: currentRepository }] }));
+    for (const section of ["Issues", provider === "github" ? "Pull requests" : "Merge requests", "Workers (1)"]) {
+      await click(panel, section);
+      const preview = panel.querySelector('[aria-label="Uncertain discussion reply"]')!;
+      expect(preview.textContent).toContain("Inspect the reply on the PR/MR. Omit it to continue publication without posting it again or resolving this thread. Then retry publication.");
+      expect(preview.querySelector("code")?.textContent).toBe(uncertainReply.discussionId);
+      expect(preview.querySelector("textarea")?.value).toBe(uncertainReply.body);
+      expect(preview.querySelector("textarea")?.readOnly).toBe(true);
+      expect(button(preview, "Omit reply").disabled).toBe(false);
+    }
+  });
+
+  it.each(["failed", "paused", "stopped", "cleanup_failed"] as const)("omits the displayed reply of a %s issue before an explicit publication retry", async status => {
+    const selected = { ...uncertainReplyWorker, status };
+    const f = fixture({ workers: [selected] }, hook => {
+      if (hook === "forge.worker.omitDiscussionReply") {
+        f.dashboard.workers = [{ ...selected, pendingPublication: { ...selected.pendingPublication!, replyingToDiscussionId: undefined, report: { ...selected.pendingPublication!.report, discussionReplies: [], resolvedDiscussionIds: [] } } }];
+        return { worker: f.dashboard.workers[0] };
+      }
+    });
+    const panel = await renderPanel(f);
+    await click(panel, "Omit reply");
+    expect(panel.querySelector('[aria-label="Uncertain discussion reply"]')).toBeNull();
+    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.omitDiscussionReply", input: { id: worker.id, ...uncertainReply, headSha: selected.pendingPublication!.headSha }, tabId: tab.id },
+    ]);
+    expect(button(panel, "Retry publication").disabled).toBe(false);
+    await click(panel, "Retry publication");
+    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.omitDiscussionReply", input: { id: worker.id, ...uncertainReply, headSha: selected.pendingPublication!.headSha }, tabId: tab.id },
+      { hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+  });
+
+  it.each([
+    { status: "starting" }, { status: "running" }, { status: "awaiting_publication" },
+    { status: "awaiting_review" }, { status: "awaiting_merge" }, { status: "completed" }, { kind: "review" },
+    { pendingPublication: undefined },
+    { pendingPublication: { ...uncertainReplyWorker.pendingPublication!, headSha: undefined } },
+    { pendingPublication: { ...uncertainReplyWorker.pendingPublication!, replyingToDiscussionId: undefined } },
+    { pendingPublication: { ...uncertainReplyWorker.pendingPublication!, replyingToDiscussionId: "another-thread" } },
+  ] satisfies Partial<ForgeWorker>[])("does not offer reply omission without an inactive issue and its exact pending reply %#", async overrides => {
+    const panel = await renderPanel(fixture({ workers: [{ ...uncertainReplyWorker, ...overrides }] }));
+    await act(async () => { Array.from(panel.querySelectorAll<HTMLButtonElement>(".forge-tabs button")).find(item => item.textContent?.startsWith("Workers (1)"))!.click(); });
+    expect(panel.querySelector('[aria-label="Uncertain discussion reply"]')).toBeNull();
+    expect(panel.textContent).not.toContain("Omit reply");
+  });
+
+  it("keeps the uncertain reply visible after a failed omission and blocks duplicate actions while waiting", async () => {
+    const pending = deferred<unknown>();
+    const f = fixture({ workers: [uncertainReplyWorker] }, hook => hook === "forge.worker.omitDiscussionReply" ? pending.promise : undefined);
+    const panel = await renderPanel(f);
+    await click(panel, "Omit reply");
+    expect(button(panel, "Omit reply").disabled).toBe(true);
+    expect(button(panel, "Retry publication").disabled).toBe(true);
+    await click(panel, "Omit reply");
+    await act(async () => { pending.reject(new Error("The uncertain discussion reply changed. Refresh Forge.")); });
+    expect(panel.querySelector('[role="alert"]')?.textContent).toContain("The uncertain discussion reply changed. Refresh Forge.");
+    expect(panel.querySelector<HTMLTextAreaElement>('[aria-label="Uncertain discussion reply"] textarea')?.value).toBe(uncertainReply.body);
+    expect(button(panel, "Omit reply").disabled).toBe(false);
+    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.omitDiscussionReply", input: { id: worker.id, ...uncertainReply, headSha: uncertainReplyWorker.pendingPublication!.headSha }, tabId: tab.id },
+    ]);
+  });
+
   it.each(["issue", "review"] as const)("continues the selected %s worker with the entered message", async kind => {
     const selected = { ...(kind === "issue" ? worker : reviewWorker), status: "failed" as const };
     const f = fixture({ workers: [selected] });

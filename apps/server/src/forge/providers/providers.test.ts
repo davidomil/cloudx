@@ -4,6 +4,7 @@ import type { ForgeListScope, ForgeRepository, ForgeReviewSubmission } from "@cl
 import {
   createForgeProvider,
   ForgeCredentials,
+  ForgeDiscussionReplyNotStartedError,
   ForgeHeadChangedError,
   ForgeMergeNotStartedError,
   ForgeProviderError,
@@ -2327,16 +2328,37 @@ describe("discussion replies from coding workers", () => {
         ? hubFixture({ threads: [{ isResolved: !unresolved }], request: { state: boundary === "closed" ? "closed" : "open" } })
         : labFixture({ notes: [{ ...labNote, resolved: !unresolved }], request: { state: boundary === "closed" ? "closed" : "opened" } });
 
-      await expect(base.provider.replyToDiscussion(7, boundary === "foreign" ? "other-thread" : "thread1", body, boundary === "stale" ? previousSha : headSha))
-        .rejects.toThrow(boundary === "stale" ? "head changed" : "unresolved discussion");
+      const attempt = base.provider.replyToDiscussion(7, boundary === "foreign" ? "other-thread" : "thread1", body, boundary === "stale" ? previousSha : headSha);
+      await expect(attempt).rejects.toBeInstanceOf(ForgeDiscussionReplyNotStartedError);
+      await expect(attempt).rejects.toMatchObject({
+        statusCode: 409,
+        message: expect.stringContaining(boundary === "stale" ? "head changed" : "unresolved discussion"),
+        change: { number: 7, headSha, comments: expect.arrayContaining([expect.objectContaining({ discussionId: "thread1", resolved: !unresolved })]) },
+      });
       expect(base.calls.some((call) => isReply(call.url, call.options)), boundary).toBe(false);
     }
+  });
+
+  it.each(["github", "gitlab"] as const)("distinguishes a failed preliminary read from an uncertain reply (%s)", async kind => {
+    const { provider, calls } = harness(kind === "github" ? github : gitlab, () => new Response(null, { status: 503 }));
+
+    const attempt = provider.replyToDiscussion(7, "thread1", body, headSha);
+
+    await expect(attempt).rejects.toBeInstanceOf(ForgeDiscussionReplyNotStartedError);
+    await expect(attempt).rejects.toMatchObject({
+      change: undefined,
+      cause: expect.objectContaining({ name: "ForgeProviderUnavailableError", failure: "service_unavailable", retryable: true }),
+    });
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.some(call => isReply(call.url, call.options))).toBe(false);
   });
 
   it.each(["github", "gitlab"] as const)("rejects empty, oversized or invalid replies before reading the provider (%s)", async (kind) => {
     const base = kind === "github" ? hubFixture() : labFixture();
     for (const invalidBody of ["", " \n ", "x".repeat(65_001)]) {
-      await expect(base.provider.replyToDiscussion(7, "thread1", invalidBody, headSha)).rejects.toThrow("reply");
+      const attempt = base.provider.replyToDiscussion(7, "thread1", invalidBody, headSha);
+      await expect(attempt).rejects.toBeInstanceOf(ForgeDiscussionReplyNotStartedError);
+      await expect(attempt).rejects.toThrow("reply");
     }
     await expect(base.provider.replyToDiscussion(7, "thread1", body, "not-a-sha")).rejects.toThrow("SHA");
     expect(base.calls).toHaveLength(0);
@@ -2344,7 +2366,9 @@ describe("discussion replies from coding workers", () => {
 
   it("rejects GitLab quick actions before posting a discussion reply", async () => {
     const { provider, calls } = labFixture();
-    await expect(provider.replyToDiscussion(7, "thread1", "Fixed.\n/merge", headSha)).rejects.toThrow("quick actions");
+    const attempt = provider.replyToDiscussion(7, "thread1", "Fixed.\n/merge", headSha);
+    await expect(attempt).rejects.toBeInstanceOf(ForgeDiscussionReplyNotStartedError);
+    await expect(attempt).rejects.toThrow("quick actions");
     expect(calls).toHaveLength(0);
   });
 
@@ -2368,7 +2392,9 @@ describe("discussion replies from coding workers", () => {
   it.each(["github", "gitlab"] as const)("keeps rejected and lost reply responses visible without retrying (%s)", async (kind) => {
     for (const fail of [() => new Response("private-provider-error", { status: 403 }), () => { throw new Error("private-provider-error"); }]) {
       const { provider, calls } = replyFixture(kind, fail);
-      await expect(provider.replyToDiscussion(7, "thread1", body, headSha)).rejects.toMatchObject({
+      const attempt = provider.replyToDiscussion(7, "thread1", body, headSha);
+      await expect(attempt).rejects.not.toBeInstanceOf(ForgeDiscussionReplyNotStartedError);
+      await expect(attempt).rejects.toMatchObject({
         message: `${kind === "github" ? "GitHub" : "GitLab"} did not confirm the discussion reply. Inspect the request before replying again.`,
         statusCode: 409,
       });

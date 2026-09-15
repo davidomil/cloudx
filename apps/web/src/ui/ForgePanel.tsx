@@ -369,6 +369,10 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
   const reviewRunning = reviews.some(review => ["starting", "running"].includes(review.status));
   const canPause = ["starting", "running", "awaiting_publication", "awaiting_merge"].includes(worker.status) || (worker.status === "awaiting_review" && automaticReview);
   const canResume = !reviewRunning && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
+  const pendingPublication = worker.pendingPublication;
+  const uncertainReply = worker.kind === "issue" && ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) && pendingPublication?.headSha && pendingPublication.replyingToDiscussionId
+    ? pendingPublication.report.discussionReplies.find(reply => reply.discussionId === pendingPublication.replyingToDiscussionId)
+    : undefined;
   const canSync = worker.kind === "issue" && !!worker.changeNumber && !!worker.headSha && !worker.pendingPublication && !worker.mergeAttempted &&
     ["paused", "failed", "stopped", "awaiting_review", "awaiting_merge"].includes(worker.status) && !reviewRunning &&
     !reviews.some(review => review.draft && ["posting", "post_failed"].includes(review.draft.status));
@@ -389,6 +393,14 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">The commit was pushed. Waiting for {worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && !conflict && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
+    {!archivedDraft && uncertainReply ? <section aria-label="Uncertain discussion reply">
+      <p className="forge-notice">Inspect the reply on the PR/MR. Omit it to continue publication without posting it again or resolving this thread. Then retry publication.</p>
+      <p>Discussion: <code>{uncertainReply.discussionId}</code></p>
+      <label className="forge-field">Uncertain reply body<textarea readOnly rows={4} value={uncertainReply.body} /></label>
+      <ControlButton size="compact" disabled={busy || controlling} onClick={() => void runAction(() => request("forge.worker.omitDiscussionReply", {
+        id: worker.id, discussionId: uncertainReply.discussionId, headSha: pendingPublication!.headSha, body: uncertainReply.body,
+      }))}>Omit reply</ControlButton>
+    </section> : null}
     {!archivedDraft ? <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
       {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.pendingPublication ? "Retry publication" : "Resume"}</ControlButton> : null}

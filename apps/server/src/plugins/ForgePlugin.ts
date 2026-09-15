@@ -194,6 +194,27 @@ export class ForgePlugin implements WorkspacePlugin {
         }),
       ),
       hook(
+        "worker.omitDiscussionReply",
+        "Omit an uncertain discussion reply",
+        "write",
+        {
+          id,
+          discussionId: { type: "string", minLength: 1, maxLength: 256, pattern: "\\S" },
+          headSha: {
+            type: "string",
+            anyOf: [
+              { pattern: "^[a-fA-F0-9]{40}$", maxLength: 40 },
+              { pattern: "^[a-fA-F0-9]{64}$", maxLength: 64 },
+            ],
+          },
+          body: { type: "string", minLength: 1, maxLength: 20_000, pattern: "\\S" },
+        },
+        ["id", "discussionId", "headSha", "body"],
+        async (input) => ({
+          worker: await this.service().workflow.omitDiscussionReply(String(input.id), String(input.discussionId), String(input.headSha), String(input.body)),
+        }),
+      ),
+      hook(
         "worker.syncAndReview",
         "Sync worker branch and start a fresh review",
         "external",

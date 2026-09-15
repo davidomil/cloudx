@@ -9,10 +9,48 @@ import {
   connectionKey,
   ForgeConnectionStore,
 } from "./connections/ForgeConnectionStore.js";
-import type { ForgeRepository } from "@cloudx/shared";
+import type { ForgeRepository, ForgeWorker } from "@cloudx/shared";
 import { ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 
 describe("Forge in the composed CloudX server", () => {
+  it("dispatches the displayed uncertain reply through the browser HTTP hook after boundary validation", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-reply-recovery-http-"));
+    const config = loadConfig({
+      CLOUDX_DATA_DIR: path.join(root, "data"), CLOUDX_ALLOWED_ROOTS: root, CLOUDX_LOG_LEVEL: "silent",
+      CLOUDX_APP_SERVER_ENABLED: "false", CLOUDX_AUTOMATION_START_DISABLED: "true", CLOUDX_WEB_DIST_DIR: path.join(root, "web"),
+    });
+    const services = buildServices(config);
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    const worker: ForgeWorker = {
+      id: "issue-worker", kind: "issue", number: 7, title: "Repair deployment", status: "failed",
+      repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" },
+      repositoryPath: root, baseBranch: "main", templateId: "worker", autoPost: false, startedAt: "2026-09-15", updatedAt: "2026-09-15",
+    };
+    const omit = vi.spyOn(services.forge!, "omitDiscussionReply").mockResolvedValue(worker);
+    const input = { id: worker.id, discussionId: "discussion-1", headSha: "a".repeat(40), body: "Fixed the timeout.\nThe reproduction passes." };
+    const request = { method: "POST" as const, url: "/api/hooks/forge.worker.omitDiscussionReply", headers: { host: "127.0.0.1:3001" }, payload: { input } };
+    try {
+      for (const headers of [
+        { host: "127.0.0.1:3001", origin: "https://untrusted.example" },
+        { host: "untrusted.example", origin: "http://127.0.0.1:3001" },
+      ]) expect((await app.inject({ ...request, headers })).statusCode).toBe(403);
+      const invalid = await app.inject({ ...request, payload: { input: { ...input, headSha: "outdated" } } });
+      expect(invalid.statusCode).toBeGreaterThanOrEqual(400);
+      expect(invalid.json().message).toMatch(/invalid input.*headSha/);
+      expect(omit).not.toHaveBeenCalled();
+
+      const response = await app.inject(request);
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ result: { worker } });
+      expect(omit).toHaveBeenCalledExactlyOnceWith(input.id, input.discussionId, input.headSha, input.body);
+    } finally {
+      omit.mockRestore();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["request", "authentication"] as const)("records a safe %s diagnostic through the real Forge read hook", async operation => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-provider-diagnostic-"));
     const config = loadConfig({
