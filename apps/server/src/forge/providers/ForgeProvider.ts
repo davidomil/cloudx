@@ -181,6 +181,17 @@ export class ForgeMergeNotStartedError extends ForgeProviderError {
   }
 }
 
+export class ForgeDiscussionReplyNotStartedError extends ForgeProviderError {
+  constructor(error: unknown, readonly change?: ForgeChangeRequest) {
+    super(
+      error instanceof Error ? error.message : "Could not verify the discussion before replying.",
+      error instanceof ForgeProviderError ? error.statusCode : 500,
+    );
+    this.name = "ForgeDiscussionReplyNotStartedError";
+    this.cause = error;
+  }
+}
+
 export function requireMergeReady(
   request: ForgeChangeRequest,
   expectedHeadSha: string,

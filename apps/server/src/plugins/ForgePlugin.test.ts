@@ -27,6 +27,7 @@ async function fixture() {
     syncAndReview: vi.fn(async () => ({ id: "worker" })),
     rebaseAndResolve: vi.fn(async () => ({ id: "worker" })),
     continueWorker: vi.fn(async () => ({ id: "worker" })),
+    omitDiscussionReply: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
     markReview: vi.fn(async () => {}),
     saveReview: vi.fn(async () => ({ id: "worker" })),
@@ -56,6 +57,38 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections, logger };
 }
 describe("Forge plugin boundary", () => {
+  it.each([{ kind: "ui", length: 40 }, { kind: "http", length: 40 }, { kind: "ui", length: 64 }, { kind: "http", length: 64 }] as const)("omits only the displayed reply through $kind at its $length-character head", async ({ kind, length }) => {
+    const { hooks, workflow } = await fixture();
+    const input = { id: "worker", discussionId: "discussion-1", headSha: "a".repeat(length), body: "Fixed the timeout.\nThe reproduction passes." };
+    await expect(hooks.call("forge.worker.omitDiscussionReply", input, { caller: { kind } })).resolves.toEqual({ worker: { id: "worker" } });
+    expect(workflow.omitDiscussionReply).toHaveBeenCalledExactlyOnceWith(input.id, input.discussionId, input.headSha, input.body);
+  });
+
+  it.each([
+    { id: undefined }, { id: "" }, { id: 7 }, { id: "w".repeat(129) },
+    { discussionId: undefined }, { discussionId: "" }, { discussionId: " \n" }, { discussionId: 7 }, { discussionId: "d".repeat(257) },
+    { headSha: undefined }, { headSha: "" }, { headSha: 7 }, { headSha: "a".repeat(39) }, { headSha: "a".repeat(41) },
+    { headSha: "a".repeat(63) }, { headSha: "a".repeat(65) }, { headSha: "g".repeat(40) }, { headSha: `${"a".repeat(40)}\n` },
+    { body: undefined }, { body: "" }, { body: " \n" }, { body: 7 }, { body: "b".repeat(20_001) },
+    { resolved: true }, { repositoryPath: "/untrusted" },
+  ])("rejects invalid uncertain reply recovery input before dispatch %#", async invalid => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.omitDiscussionReply", { id: "worker", discussionId: "discussion-1", headSha: "a".repeat(40), body: "Fixed the timeout.", ...invalid }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.omitDiscussionReply).not.toHaveBeenCalled();
+  });
+
+  it("keeps uncertain reply omission unavailable to automation", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.omitDiscussionReply", { id: "worker", discussionId: "discussion-1", headSha: "a".repeat(40), body: "Fixed the timeout." }, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.omitDiscussionReply).not.toHaveBeenCalled();
+  });
+
+  it("returns stale-checkpoint rejection to the UI", async () => {
+    const { hooks, workflow } = await fixture();
+    workflow.omitDiscussionReply.mockRejectedValue(new Error("The uncertain discussion reply changed. Refresh Forge."));
+    await expect(hooks.call("forge.worker.omitDiscussionReply", { id: "worker", discussionId: "discussion-1", headSha: "a".repeat(40), body: "Fixed the timeout." }, { caller: { kind: "ui" } })).rejects.toThrow("The uncertain discussion reply changed. Refresh Forge.");
+  });
+
   it.each(["ui", "http"] as const)("continues the selected worker with its message through %s", async kind => {
     const { hooks, workflow, logger } = await fixture();
     const message = "The setup is fixed.\nContinue with the failing test.";

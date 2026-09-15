@@ -244,3 +244,141 @@ test("cancels without sending and clears the abandoned message", async ({
     form.getByRole("button", { name: "Send and continue" }),
   ).toBeDisabled();
 });
+
+test("omits the displayed uncertain reply before explicitly retrying publication", async ({
+  page,
+}, testInfo) => {
+  const repository = {
+    provider: "github" as const,
+    apiUrl: "https://api.github.com",
+    projectPath: "cloudx/example",
+  };
+  const reply = {
+    discussionId: "PRRT_uncertain_reply",
+    body: "Fixed the timeout.\nThe reproduction passes.",
+  };
+  const headSha = "a".repeat(40);
+  const worker: ForgeWorker = {
+    id: "issue-worker",
+    kind: "issue",
+    number: 7,
+    title: "Repair deployment",
+    status: "failed",
+    repository,
+    repositoryPath: "/fixture/repository",
+    baseBranch: "main",
+    templateId: "worker-template",
+    autoPost: false,
+    startedAt: "2026-09-15",
+    updatedAt: "2026-09-15",
+    changeNumber: 12,
+    headSha,
+    changeUrl: "https://github.com/cloudx/example/pull/12",
+    error: "The discussion reply outcome is uncertain.",
+    pendingPublication: {
+      headSha,
+      confirmed: true,
+      repliedDiscussionIds: [],
+      replyingToDiscussionId: reply.discussionId,
+      report: {
+        kind: "issue",
+        title: "Repair deployment",
+        body: "The reproduction passes.",
+        discussionReplies: [reply],
+        resolvedDiscussionIds: [reply.discussionId],
+      },
+    },
+  };
+  const actions: Array<{
+    hook: string;
+    input: Record<string, unknown>;
+    tabId: string;
+  }> = [];
+  await page.route("**/fixture-hooks/**", async (route) => {
+    const hook = new URL(route.request().url()).pathname.split("/").pop()!;
+    const body = route.request().postDataJSON();
+    switch (hook) {
+      case "forge.dashboard":
+        return route.fulfill({
+          json: { configured: true, repository, workers: [worker] },
+        });
+      case "forge.issues.list":
+        return route.fulfill({ json: { items: [] } });
+      case "forge.worker.omitDiscussionReply":
+        actions.push({ hook, ...body });
+        worker.pendingPublication!.report.discussionReplies = [];
+        worker.pendingPublication!.report.resolvedDiscussionIds = [];
+        delete worker.pendingPublication!.replyingToDiscussionId;
+        return route.fulfill({ json: { worker } });
+      case "forge.worker.resume":
+        actions.push({ hook, ...body });
+        delete worker.pendingPublication;
+        delete worker.error;
+        worker.status = "awaiting_review";
+        return route.fulfill({ json: { worker } });
+      default:
+        throw new Error(`Unexpected hook ${hook}`);
+    }
+  });
+  await page.goto(baseUrl);
+  await page.getByRole("button", { name: "Workers (1)", exact: true }).click();
+  const recovery = page.getByRole("region", {
+    name: "Uncertain discussion reply",
+  });
+  await expect(recovery).toContainText(reply.discussionId);
+  await expect(recovery).toContainText(
+    "without posting it again or resolving this thread",
+  );
+  const preview = recovery.getByRole("textbox", {
+    name: "Uncertain reply body",
+  });
+  await expect(preview).toHaveValue(reply.body);
+  await expect(preview).toHaveAttribute("readonly", "");
+  const omit = recovery.getByRole("button", {
+    name: "Omit reply",
+    exact: true,
+  });
+  await expect(omit).toBeInViewport({ ratio: 1 });
+  const bounds = (await preview.boundingBox())!;
+  expect(bounds.width).toBeGreaterThanOrEqual(220);
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(
+    page.viewportSize()!.width,
+  );
+  const screenshot = testInfo.outputPath("uncertain-reply-recovery.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("uncertain-reply-recovery", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+
+  await omit.click();
+  await expect(recovery).toHaveCount(0);
+  expect(actions).toEqual([
+    {
+      hook: "forge.worker.omitDiscussionReply",
+      input: { id: worker.id, ...reply, headSha },
+      tabId: "forge-tab",
+    },
+  ]);
+  await expect(page.getByRole("tab", { name: /Issue #7/ })).toContainText(
+    "failed",
+  );
+  await page
+    .getByRole("button", { name: "Retry publication", exact: true })
+    .click();
+  await expect(page.getByRole("tab", { name: /Issue #7/ })).toContainText(
+    "awaiting review",
+  );
+  expect(actions).toEqual([
+    {
+      hook: "forge.worker.omitDiscussionReply",
+      input: { id: worker.id, ...reply, headSha },
+      tabId: "forge-tab",
+    },
+    {
+      hook: "forge.worker.resume",
+      input: { id: worker.id, windowId: "window-1", paneId: "pane-2" },
+      tabId: "forge-tab",
+    },
+  ]);
+});

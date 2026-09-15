@@ -9,6 +9,9 @@ import {
 import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
+import { GitHubProvider } from "./providers/GitHubProvider.js";
+import { GitLabProvider } from "./providers/GitLabProvider.js";
+import type { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
 
 function fixture() {
   const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
@@ -2246,6 +2249,206 @@ describe("Forge publication confirmation", () => {
     expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("Forge discussion reply recovery", () => {
+  async function publication() {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.change.comments = ["first", "uncertain", "last"].map(id => ({
+      id, discussionId: id, body: "Review feedback", author: "reviewer", resolved: false,
+    }));
+    const report = {
+      kind: "issue", title: "Address review", body: "Validated the fixes.",
+      discussionReplies: f.change.comments.map(comment => ({ discussionId: comment.discussionId!, body: `Fixed ${comment.id}.` })),
+      resolvedDiscussionIds: f.change.comments.map(comment => comment.discussionId!),
+    };
+    f.reports.read.mockResolvedValue(report);
+    const save = f.deps.store.write;
+    f.deps.store.write = async workers => save(parseWorkers(workers));
+    return { ...f, worker, report };
+  }
+
+  function realReplies(f: Awaited<ReturnType<typeof publication>>, kind: "github" | "gitlab") {
+    const request = vi.fn(async () => ({ body: kind === "github"
+      ? { data: { addPullRequestReviewThreadReply: { comment: { id: "reply", state: "SUBMITTED", pullRequest: { number: 7 } } } } }
+      : { id: 123, body: "Fixed.", author: { username: "worker" }, system: false },
+    }));
+    const http = { repository: f.deps.settings().repository, request } as unknown as ForgeHttpClient;
+    const provider = kind === "github" ? new GitHubProvider(http) : new GitLabProvider(http);
+    const read = vi.spyOn(provider, "getChangeRequest").mockImplementation(async () => structuredClone(f.change));
+    f.provider.replyToDiscussion.mockImplementation((...args) => provider.replyToDiscussion(...args));
+    return { read, request };
+  }
+
+  it("omits a redundant reply and resolution when the thread is already resolved", async () => {
+    const f = await publication();
+    f.change.comments[1].resolved = true;
+    f.change.comments.push({ id: "system-note", discussionId: "uncertain", body: "Resolved", author: "system" });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha });
+    expect(f.stored()[0].pendingPublication).toBeUndefined();
+    expect(f.provider.replyToDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "last"]);
+    expect(f.provider.resolveDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "last"]);
+  });
+
+  it.each(["github", "gitlab"] as const)("handles a thread resolved during %s reply validation with no reply mutation", async kind => {
+    const f = await publication();
+    const { read, request } = realReplies(f, kind);
+    read.mockImplementation(async () => ({
+      ...structuredClone(f.change), comments: f.change.comments.map(comment => ({ ...comment, resolved: true })),
+    }));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha });
+    expect(f.stored()[0].pendingPublication).toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+  });
+
+  it.each(["github", "gitlab"] as const)("clears a failed %s preliminary read and resumes after restart without repeating a completed reply", async kind => {
+    const f = await publication();
+    const { read, request } = realReplies(f, kind);
+    read.mockResolvedValueOnce(structuredClone(f.change)).mockRejectedValueOnce(new Error("Preliminary read unavailable"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: "Preliminary read unavailable", pendingPublication: {
+      headSha: f.change.headSha, report: f.report, repliedDiscussionIds: ["first"],
+    } });
+    expect(f.stored()[0].pendingPublication?.replyingToDiscussionId).toBeUndefined();
+    expect(request).toHaveBeenCalledOnce();
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    expect((await restarted.resume(f.worker.id, placement)).status).toBe("awaiting_review");
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(f.provider.replyToDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "uncertain", "uncertain", "last"]);
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["closed", "head", "branch", "foreign", "missing", "unknown"])("does not treat a %s validation snapshot as a resolved reply", async boundary => {
+    const f = await publication();
+    const { read, request } = realReplies(f, "github");
+    const snapshot = structuredClone(f.change);
+    snapshot.comments.forEach(comment => { comment.resolved = true; });
+    if (boundary === "closed") snapshot.state = "closed";
+    if (boundary === "head") snapshot.headSha = "d".repeat(40);
+    if (boundary === "branch") snapshot.headBranch = "someone-else";
+    if (boundary === "foreign") snapshot.number = 8;
+    if (boundary === "missing") snapshot.comments = [];
+    if (boundary === "unknown") snapshot.comments.forEach(comment => { comment.resolved = undefined; });
+    read.mockResolvedValue(snapshot);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { report: f.report, repliedDiscussionIds: [] } });
+    expect(f.stored()[0].pendingPublication?.replyingToDiscussionId).toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("requires explicit omission after a lost reply response (provider accepted: %s)", async accepted => {
+    const f = await publication();
+    f.provider.replyToDiscussion.mockResolvedValueOnce(undefined).mockImplementationOnce(async (_number, discussionId, body) => {
+      if (accepted) f.change.comments.push({ id: "published-reply", discussionId, body, author: "worker", resolved: false });
+      throw new Error("Reply response lost");
+    });
+    await f.service.poll();
+    const restarted = new ForgeWorkflowService(f.deps);
+    const blocked = await restarted.resume(f.worker.id, placement);
+    expect(blocked.error).toMatch(/Omit reply/);
+    expect(blocked.pendingPublication).toMatchObject({ replyingToDiscussionId: "uncertain", repliedDiscussionIds: ["first"] });
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledTimes(2);
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+
+    const omitted = await restarted.omitDiscussionReply(f.worker.id, "uncertain", f.change.headSha, "Fixed uncertain.");
+    expect(omitted.status).toBe("failed");
+    expect(omitted.pendingPublication).toMatchObject({ headSha: f.change.headSha, repliedDiscussionIds: ["first"], report: {
+      discussionReplies: [f.report.discussionReplies[0], f.report.discussionReplies[2]], resolvedDiscussionIds: ["first", "last"],
+    } });
+    expect(omitted.pendingPublication?.replyingToDiscussionId).toBeUndefined();
+    expect(omitted.pendingPublication?.confirmed).toBeUndefined();
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledTimes(2);
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+
+    const recovered = new ForgeWorkflowService(f.deps);
+    expect((await recovered.resume(f.worker.id, placement)).status).toBe("awaiting_review");
+    expect(f.provider.replyToDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "uncertain", "last"]);
+    expect(f.provider.resolveDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "last"]);
+    expect(f.change.comments.find(comment => comment.id === "uncertain")?.resolved).toBe(false);
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("resumes a retained uncertain reply to a now-resolved thread after restart without reposting", async () => {
+    const f = await publication();
+    f.provider.replyToDiscussion.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Reply response lost"));
+    await f.service.poll();
+    f.change.comments[1].resolved = true;
+    const restarted = new ForgeWorkflowService(f.deps);
+    expect((await restarted.resume(f.worker.id, placement)).status).toBe("awaiting_review");
+    expect(f.provider.replyToDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "uncertain", "last"]);
+    expect(f.provider.resolveDiscussion.mock.calls.map(call => call[1])).toEqual(["first", "last"]);
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it("retains uncertainty when Resume cannot read discussion state", async () => {
+    const f = await publication();
+    f.provider.replyToDiscussion.mockRejectedValueOnce(new Error("Reply response lost"));
+    await f.service.poll();
+    f.provider.getChangeRequest.mockRejectedValue(new Error("Provider unavailable"));
+    const restarted = new ForgeWorkflowService(f.deps);
+    const blocked = await restarted.resume(f.worker.id, placement);
+    expect(blocked).toMatchObject({ status: "failed", error: "Provider unavailable", pendingPublication: {
+      replyingToDiscussionId: "first", repliedDiscussionIds: [], report: f.report,
+    } });
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+  });
+
+  it("retains an uncertain reply when Resume observes the previous head instead of entering automatic confirmation", async () => {
+    const f = await publication();
+    f.provider.replyToDiscussion.mockRejectedValueOnce(new Error("Reply response lost"));
+    await f.service.poll();
+    const saved = f.stored();
+    saved[0].pendingPublication!.previousHeadSha = "b".repeat(40);
+    saved[0].pendingPublication!.confirmationStartedAt = new Date().toISOString();
+    await f.deps.store.write(saved);
+    f.change.headSha = "b".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const blocked = await restarted.resume(f.worker.id, placement);
+    expect(blocked).toMatchObject({ status: "failed", error: expect.stringMatching(/head changed.*reply/), pendingPublication: {
+      headSha: "a".repeat(40), replyingToDiscussionId: "first", repliedDiscussionIds: [], report: f.report,
+    } });
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+  });
+
+  it("does not omit an uncertain thread with conflicting resolution state", async () => {
+    const f = await publication();
+    f.provider.replyToDiscussion.mockRejectedValueOnce(new Error("Reply response lost"));
+    await f.service.poll();
+    f.change.comments.push({ id: "old-reply", discussionId: "first", body: "Already handled", author: "worker", resolved: true });
+    const restarted = new ForgeWorkflowService(f.deps);
+    const blocked = await restarted.resume(f.worker.id, placement);
+    expect(blocked).toMatchObject({ status: "failed", pendingPublication: { replyingToDiscussionId: "first", report: f.report } });
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+  });
+
+  it.each(["discussion", "head", "body"])("rejects omission from a stale %s without changing reply progress", async stale => {
+    const f = await publication();
+    f.provider.replyToDiscussion.mockRejectedValueOnce(new Error("Reply response lost"));
+    await f.service.poll();
+    const pending = structuredClone(f.stored()[0].pendingPublication);
+    await expect(f.service.omitDiscussionReply(f.worker.id, stale === "discussion" ? "uncertain" : "first",
+      stale === "head" ? "b".repeat(40) : f.change.headSha, stale === "body" ? "Edited reply" : "Fixed first.",
+    )).rejects.toThrow(/changed/);
+    expect(f.stored()[0].pendingPublication).toEqual(pending);
+    expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+  });
+
+  it("rejects omission when no uncertain reply exists", async () => {
+    const f = await publication();
+    await expect(f.service.omitDiscussionReply(f.worker.id, "first", f.change.headSha, "Fixed first.")).rejects.toThrow(/uncertain reply/);
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
   });
 });
 

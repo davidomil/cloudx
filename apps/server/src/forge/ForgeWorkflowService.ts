@@ -13,7 +13,7 @@ import type {
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
-import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
@@ -427,6 +427,25 @@ export class ForgeWorkflowService {
   }
   stop(id: string): Promise<ForgeWorker> {
     return this.control(id, "stopped");
+  }
+  omitDiscussionReply(id: string, discussionId: string, headSha: string, body: string): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      const worker = this.requireWorker(id);
+      const publication = worker.pendingPublication;
+      if (worker.kind !== "issue" || worker.mergeAttempted ||
+          !["failed", "paused", "stopped", "cleanup_failed"].includes(worker.status) ||
+          !publication?.replyingToDiscussionId)
+        throw new Error("Only an inactive issue worker with an uncertain reply can omit it.");
+      const reply = publication.report.discussionReplies.find(reply => reply.discussionId === discussionId);
+      if (publication.replyingToDiscussionId !== discussionId || publication.headSha !== headSha || !reply || reply.body !== body)
+        throw new Error("The pending reply changed. Refresh before omitting it.");
+      omitPublicationReply(publication, discussionId);
+      publication.confirmed = undefined;
+      this.cancelProviderRecovery(worker);
+      worker.error = undefined;
+      await this.persist();
+      return structuredClone(worker);
+    });
   }
   private controlGroup(id: string): ForgeWorker[] {
     const worker = this.workers.find(candidate => candidate.id === id);
@@ -1542,8 +1561,6 @@ export class ForgeWorkflowService {
     const publication = worker.pendingPublication;
     if (!publication?.headSha || !worker.changeNumber)
       throw new Error("Publication confirmation requires a pushed commit and a change request.");
-    if (publication.replyingToDiscussionId)
-      throw new Error("A previous discussion reply must be reconciled with the provider before publication can continue.");
     if (publication.confirmed) {
       publication.confirmed = undefined;
       await this.persist();
@@ -1658,8 +1675,8 @@ export class ForgeWorkflowService {
       head !== publication.previousHeadSha && head !== publication.headSha,
     ))
       throw new Error(`Change request #${worker.changeNumber} reports an unexpected commit (${observedHeads.join(", ")}) after pushing ${publication.headSha}. Inspect the branch before resuming; the completed work is retained.`);
-    if (publication.repliedDiscussionIds.length)
-      throw new Error("The request head changed after discussion replies were published. Inspect the request before resuming.");
+    if (publication.repliedDiscussionIds.length || publication.replyingToDiscussionId)
+      throw new Error("The request head changed after a discussion reply was attempted. Inspect the request before resuming.");
     this.requirePublicationTime(worker);
     worker.status = "awaiting_publication";
     worker.error = undefined;
@@ -1669,13 +1686,35 @@ export class ForgeWorkflowService {
   private async respondToReview(worker: ForgeWorker, change: ForgeChangeRequest, provider: ForgeProvider): Promise<void> {
     const publication = worker.pendingPublication!;
     const headSha = publication.headSha!;
-    if (publication.replyingToDiscussionId)
-      throw new Error("A previous discussion reply must be reconciled with the provider before publication can continue.");
+    if (publication.replyingToDiscussionId) {
+      if (!discussionIsResolved(change, publication.replyingToDiscussionId))
+        throw new Error("A previous discussion reply must be reconciled before publication can continue. Inspect the reply on the PR/MR, then use Omit reply to continue without posting it again or resolving that thread.");
+      omitPublicationReply(publication, publication.replyingToDiscussionId);
+      await this.persist();
+    }
     for (const reply of publication.report.discussionReplies) {
       if (publication.repliedDiscussionIds.includes(reply.discussionId)) continue;
+      if (discussionIsResolved(change, reply.discussionId)) {
+        omitPublicationReply(publication, reply.discussionId);
+        await this.persist();
+        continue;
+      }
       publication.replyingToDiscussionId = reply.discussionId;
       await this.persist();
-      await provider.replyToDiscussion(change.number, reply.discussionId, reply.body, headSha);
+      try {
+        await provider.replyToDiscussion(change.number, reply.discussionId, reply.body, headSha);
+      } catch (error) {
+        if (!(error instanceof ForgeDiscussionReplyNotStartedError)) throw error;
+        publication.replyingToDiscussionId = undefined;
+        const current = error.change;
+        const resolved = current && current.headSha === headSha && current.number === change.number &&
+          current.headBranch === worker.branch && current.baseBranch === worker.baseBranch &&
+          current.state === "open" && !current.merged && discussionIsResolved(current, reply.discussionId);
+        if (resolved) omitPublicationReply(publication, reply.discussionId);
+        await this.persist();
+        if (resolved) continue;
+        throw error.cause;
+      }
       publication.repliedDiscussionIds.push(reply.discussionId);
       publication.replyingToDiscussionId = undefined;
       await this.persist();
@@ -2148,6 +2187,15 @@ function requirePublicationRequest(worker: ForgeWorker, change: ForgeChangeReque
     throw new Error("The change request no longer matches this worker's branches or identity.");
   if (change.state !== "open")
     throw new Error("The change request is closed without merging. Reopen it before resuming.");
+}
+function discussionIsResolved(change: ForgeChangeRequest, discussionId: string): boolean {
+  const comments = change.comments.filter(comment => comment.discussionId === discussionId);
+  return comments.some(comment => comment.resolved === true) && !comments.some(comment => comment.resolved === false);
+}
+function omitPublicationReply(publication: NonNullable<ForgeWorker["pendingPublication"]>, discussionId: string): void {
+  publication.report.discussionReplies = publication.report.discussionReplies.filter(reply => reply.discussionId !== discussionId);
+  publication.report.resolvedDiscussionIds = publication.report.resolvedDiscussionIds.filter(id => id !== discussionId);
+  if (publication.replyingToDiscussionId === discussionId) publication.replyingToDiscussionId = undefined;
 }
 function sameRepository(a: ForgeRepository, b: ForgeRepository): boolean {
   return (

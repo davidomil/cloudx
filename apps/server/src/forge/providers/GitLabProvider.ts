@@ -15,6 +15,7 @@ import type {
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
 import {
+  ForgeDiscussionReplyNotStartedError,
   ForgeHeadChangedError,
   ForgeMergeNotStartedError,
   ForgeProviderError,
@@ -477,9 +478,15 @@ export class GitLabProvider implements ForgeProvider {
     body: string,
     expectedHeadSha: string,
   ): Promise<void> {
-    validateDiscussionReply(body, expectedHeadSha);
-    rejectQuickActions(body);
-    requireDiscussion(await this.getChangeRequest(number), discussionId, expectedHeadSha);
+    let request: ForgeChangeRequest | undefined;
+    try {
+      validateDiscussionReply(body, expectedHeadSha);
+      rejectQuickActions(body);
+      request = await this.getChangeRequest(number);
+      requireDiscussion(request, discussionId, expectedHeadSha);
+    } catch (error) {
+      throw new ForgeDiscussionReplyNotStartedError(error, request);
+    }
     try {
       const response = await this.http.request(
         `${this.requestPath(number)}/discussions/${encodeURIComponent(discussionId)}/notes`,
