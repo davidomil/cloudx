@@ -1,10 +1,12 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import { Bell, Blocks, Search, Settings2, X } from "lucide-react";
+import { Bell, Blocks, ScrollText, Search, Settings2, X } from "lucide-react";
 
+import { CLOUDX_LOG_SOURCES } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { ForgeConnections } from "./ForgeConnections.js";
+import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
 import type { BrowserNotificationPermissionState } from "./notifications.js";
@@ -13,6 +15,7 @@ interface SettingsEntry {
   id: string;
   searchText: string;
   content: ReactNode;
+  mountWhenVisible?: boolean;
 }
 
 interface SettingsCategory {
@@ -150,6 +153,17 @@ export function SettingsDialog({
       entries
     });
   }
+  categories.push({
+    id: "logs",
+    label: "Logs",
+    description: "Inspect and download recent CloudX logs for troubleshooting.",
+    entries: [{
+      id: "viewer",
+      searchText: `Log viewer download refresh ${CLOUDX_LOG_SOURCES.map(source => source.label).join(" ")}`,
+      content: <LogsPanel />,
+      mountWhenVisible: true
+    }]
+  });
   if (browserNotificationState) categories.push({
     id: "browser",
     label: "Browser",
@@ -240,7 +254,7 @@ export function SettingsDialog({
           <div className="settings-workspace">
             <div className="settings-tabs" ref={tabsRef} role="tablist" aria-label="Settings categories" aria-orientation={horizontalTabs ? "horizontal" : "vertical"} onKeyDown={navigateTabs}>
               {filteredCategories.map((category, index) => {
-                const Icon = category.id === "general" ? Settings2 : category.id === "browser" ? Bell : Blocks;
+                const Icon = category.id === "general" ? Settings2 : category.id === "browser" ? Bell : category.id === "logs" ? ScrollText : Blocks;
                 return <button key={category.id} type="button" role="tab" id={`${id}-tab-${index}`} aria-controls={`${id}-panel-${index}`} aria-label={category.label} aria-selected={category.id === activeCategory.id} tabIndex={category.id === activeCategory.id ? 0 : -1} onClick={() => setActiveCategoryId(category.id)}>
                   <Icon size={16} aria-hidden="true" /><span>{category.label}</span><small>{category.entries.filter(entry => entry.matches).length}</small>
                 </button>;
@@ -249,7 +263,9 @@ export function SettingsDialog({
             <div className="settings-content" ref={contentRef}>
               {filteredCategories.map((category, index) => <section key={category.id} className="settings-category" role="tabpanel" id={`${id}-panel-${index}`} aria-labelledby={`${id}-tab-${index}`} hidden={category.id !== activeCategory.id} tabIndex={0}>
                 <div className="settings-category-heading"><h3>{category.label}</h3><p>{category.description}</p></div>
-                {category.entries.map(entry => <div key={entry.id} className="settings-entry" hidden={!entry.matches}>{entry.content}</div>)}
+                {category.entries.map(entry => <div key={entry.id} className="settings-entry" hidden={!entry.matches}>
+                  {!entry.mountWhenVisible || (category.id === activeCategory.id && entry.matches) ? entry.content : null}
+                </div>)}
                 {!category.entries.some(entry => entry.matches) ? <div className="settings-empty">
                   <Search size={28} aria-hidden="true" />
                   <h4>{searchWords.length ? "No matching settings" : "No settings in this tab"}</h4>

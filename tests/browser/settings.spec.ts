@@ -1,6 +1,7 @@
 import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import type {
   CloudxConfigResponse,
+  CloudxLogsResponse,
   WorkspaceStateResponse,
 } from "@cloudx/shared";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -263,6 +264,127 @@ test("drafts survive tab switches and search, Save persists them, and Cancel dis
   await expect(
     settings.getByRole("spinbutton", { name: "Git refresh frequency" }),
   ).toHaveValue("30");
+});
+
+test("Settings Logs shows the current server's recorded startup diagnostic", async ({
+  page,
+  isMobile,
+}) => {
+  const response = await page.request.get(`${baseUrl}/api/logs`);
+  expect(response.ok()).toBe(true);
+  expect(response.headers()["cache-control"]).toBe("no-store");
+  const snapshot = (await response.json()) as CloudxLogsResponse;
+  expect(snapshot).toMatchObject({
+    source: "current",
+    truncated: false,
+  });
+  expect(snapshot.content).toContain(
+    "Documentation background enrichment failed.",
+  );
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openSettings(page, isMobile);
+  await settings.getByRole("tab", { name: "Logs", exact: true }).click();
+  await expect(
+    settings.getByRole("combobox", { name: "Log source" }),
+  ).toHaveValue("current");
+  await expect(
+    settings.locator('pre[aria-label="Log contents"]'),
+  ).toContainText("Documentation background enrichment failed.");
+  await expectSettingsFits(page, isMobile);
+});
+
+test("Settings Logs searches, refreshes a selected source, and downloads the displayed synthetic snapshot as text", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const capturedAt = "2026-09-15T12:34:56.000Z";
+  const refreshedContent = [
+    '<img src="invalid" onerror="document.body.dataset.logMarkupExecuted = true">',
+    "Unicode diagnostic: 日本語",
+    "long diagnostic line ".repeat(100),
+    ...Array.from(
+      { length: 60 },
+      (_, index) => `Diagnostic entry ${index + 1}`,
+    ),
+    "",
+  ].join("\n");
+  const requestedSources: string[] = [];
+  let serviceReads = 0;
+  await page.route("**/api/logs?*", async (route) => {
+    const source = new URL(route.request().url()).searchParams.get("source");
+    expect(source === "current" || source === "services").toBe(true);
+    requestedSources.push(source!);
+    const snapshot: CloudxLogsResponse = {
+      source: source as "current" | "services",
+      content:
+        source === "current"
+          ? ""
+          : ++serviceReads === 1
+            ? "Initial installed service fixture snapshot.\n"
+            : refreshedContent,
+      capturedAt,
+      truncated: source === "services" && serviceReads > 1,
+    };
+    await route.fulfill({ json: snapshot });
+  });
+
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("logs");
+  await expect(
+    settings.getByRole("tab", { name: "Logs", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  const viewer = settings.getByRole("region", { name: "Log viewer" });
+  const contents = settings.locator('pre[aria-label="Log contents"]');
+  await expect(viewer.getByRole("status")).toHaveText(
+    "No logs available for this source.",
+  );
+  await expect(
+    settings.getByRole("button", { name: "Download logs", exact: true }),
+  ).toBeDisabled();
+
+  const source = settings.getByRole("combobox", { name: "Log source" });
+  await source.selectOption({ label: "All installed services" });
+  await expect(contents).toHaveText(
+    "Initial installed service fixture snapshot.\n",
+  );
+  await settings
+    .getByRole("button", { name: "Refresh logs", exact: true })
+    .click();
+  await expect(contents).toHaveText(refreshedContent);
+  expect(await contents.textContent()).toBe(refreshedContent);
+  await expect(contents.locator("img")).toHaveCount(0);
+  await expect(page.locator("body")).not.toHaveAttribute(
+    "data-log-markup-executed",
+  );
+  await expect(viewer.getByRole("status")).toHaveText(
+    "Some entries were omitted to keep this snapshot within the log limits.",
+  );
+  await expect(source).toHaveValue("services");
+  await expectSettingsFits(page, isMobile);
+  for (const name of ["Refresh logs", "Download logs"]) {
+    const action = settings.getByRole("button", { name, exact: true });
+    await action.scrollIntoViewIfNeeded();
+    await expect(action).toBeInViewport({ ratio: 1 });
+    await action.click({ trial: true });
+  }
+  await captureSample(page, testInfo, "settings-logs-synthetic");
+
+  const downloading = page.waitForEvent("download");
+  await settings
+    .getByRole("button", { name: "Download logs", exact: true })
+    .click();
+  const download = await downloading;
+  expect(download.suggestedFilename()).toBe(
+    "cloudx-services-2026-09-15T12-34-56-000Z.log",
+  );
+  const savedPath = testInfo.outputPath(download.suggestedFilename());
+  await download.saveAs(savedPath);
+  expect(await fs.readFile(savedPath, "utf8")).toBe(refreshedContent);
+  expect(requestedSources).toEqual(["current", "services", "services"]);
 });
 
 test("Codex Settings saves shared defaults, keeps them after reload, and can restore model defaults", async ({

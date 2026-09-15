@@ -98,9 +98,12 @@ import { AutomationExecutor } from "./automation/AutomationExecutor.js";
 import { AutomationRepository, type AutomationGroupSave } from "./automation/AutomationRepository.js";
 import { AutomationService } from "./automation/AutomationService.js";
 import { AutomationTypeService } from "./automation/AutomationTypeService.js";
+import { CloudxLogService } from "./logs/CloudxLogService.js";
+import { registerLogRoutes } from "./logs/logRoutes.js";
 import { redactUrlSearchAndHash } from "./urlRedaction.js";
 
 export interface AppServices {
+  logs?: CloudxLogService;
   plugins: PluginRegistry;
   sessions: SessionStore;
   pathPolicy: PathPolicy;
@@ -155,9 +158,14 @@ export type VoiceAudioControlMessage = { type?: string; clientContext?: unknown 
 
 export async function buildServer(config: AppConfig, services?: AppServices): Promise<FastifyInstance> {
   await fs.promises.mkdir(config.dataDir, { recursive: true, mode: 0o700 });
+  const logs = services?.logs ?? new CloudxLogService();
   const app = Fastify({
     logger: {
       level: config.logLevel,
+      stream: { write(message: string) {
+        logs.recordServerLog(message);
+        process.stdout.write(message);
+      } },
       serializers: {
         req: serializeRequestForLog
       }
@@ -171,6 +179,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       : null
   });
   services ??= buildServices(config, app.log);
+  services.logs = logs;
   services.codexStateSources ??= new CodexStateSources(config.dataDir);
   services.documentationIngestQueue ??= new DocumentationIngestQueue();
   await reapDocumentationUploadSpool(documentationSpoolRoot(config));
@@ -316,6 +325,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       return reply.code(503).send({ status: "not-ready" });
     }
   });
+
+  registerLogRoutes(app, logs);
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
   if (services.forgeConnections) registerForgeConnectionRoutes(app, services.forgeConnections, config.trustedOrigins);

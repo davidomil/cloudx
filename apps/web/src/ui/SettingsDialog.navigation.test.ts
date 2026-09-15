@@ -147,7 +147,7 @@ describe("Settings navigation and search", () => {
     const dialog = container.querySelector('[role="dialog"]')!;
     expect(dialog).not.toBeNull();
     expect(dialog.getAttribute("aria-label") ?? document.getElementById(dialog.getAttribute("aria-labelledby")!)?.textContent).toBe("Settings");
-    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Browser"]);
+    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Logs", "Browser"]);
     expect(tab(container, "General").getAttribute("aria-selected")).toBe("true");
     expect(visibleFields(container)).toEqual(["Workspace title", "Default template"]);
 
@@ -162,7 +162,7 @@ describe("Settings navigation and search", () => {
 
   it("omits Browser without permission state and excludes internal settings from navigation", async () => {
     const { container } = await mount({ browserNotificationState: undefined });
-    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search"]);
+    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Logs"]);
     expect(container.textContent).not.toMatch(/Diagnostic pipeline|Internal plugin field|Internal Only|Hidden field/);
   });
 
@@ -210,7 +210,27 @@ describe("Settings navigation and search", () => {
     const { container } = await mount();
     await search(container, query);
     expect(visibleFields(container)).toEqual(["Search engine", "Access token"]);
-    expect(container.querySelector('[role="status"]')?.textContent).toMatch(/2 matching settings\b/i);
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(`${query === "documentation" ? 3 : 2} matching settings across all tabs`);
+  });
+
+  it("loads logs only while their viewer is visible and makes downloads searchable", async () => {
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => new Promise<Response>(() => {}));
+    vi.stubGlobal("fetch", fetchMock);
+    const { container } = await mount();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await search(container, "download logs");
+    expect(tab(container, "Logs").getAttribute("aria-selected")).toBe("true");
+    expect(activePanel(container).querySelector('[aria-label="Log viewer"]')).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    await search(container, "no matching setting");
+    expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(container.querySelector('[aria-label="Log viewer"]')).toBeNull();
+    await search(container, "");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await click(tab(container, "General"));
+    expect(fetchMock.mock.calls[1][1]?.signal?.aborted).toBe(true);
   });
 
   it.each(["internalGlobal", "diagnostic pipeline", "private-tracking-value", "Internal Only", "hidden-plugin-default", "secret-current-value", "secret-default-value", "compact nonexistent"])("returns no matches for %j", async query => {
