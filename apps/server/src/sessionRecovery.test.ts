@@ -73,7 +73,7 @@ async function fixture() {
       const window = workspace.getActiveWindow();
       return commands.createTab({ pluginId, cwd: root, windowId: window.id, paneId: window.layout.activePaneId, initialInput, newPane });
     };
-    return { sessions, workspace, persistence, commands, errors, open };
+    return { sessions, workspace, persistence, commands, plugins, errors, open };
   };
   return { root, running, factory, createStore };
 }
@@ -160,6 +160,39 @@ describe("workspace recovery after server updates", () => {
     expect(factory.spawn).toHaveBeenCalledOnce();
     await expect(after.sessions.recoverTab(tab.id, { action: "resume-conversation" })).rejects.toThrow("does not match");
     expect(factory.spawn).toHaveBeenCalledOnce();
+    await after.sessions.dispose();
+  });
+
+  it("requires an explicit conversation selection when the saved resume identity is unconfirmed", async () => {
+    const { running, factory, createStore } = await fixture();
+    const terminal = new StandardTerminalPlugin(factory);
+    const recoverSession = vi.fn(terminal.createSession.bind(terminal));
+    const plugin = {
+      ...terminal.descriptor(), id: "codex-terminal", actions: [],
+      descriptor: () => ({ ...terminal.descriptor(), id: "codex-terminal" }),
+      createSession: terminal.createSession.bind(terminal),
+      restoreSession: terminal.restoreSession.bind(terminal),
+      describeRecovery: async () => ({ canResume: false, message: "Select the exact conversation to resume." }),
+      recoverSession
+    };
+    const before = createStore();
+    before.plugins.register(plugin);
+    const { tab } = await before.open("codex-terminal", { resume: { mode: "session", sessionId: "conversation-a" } });
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    after.plugins.register(plugin);
+    await after.sessions.restore();
+    expect(after.sessions.getTab(tab.id).recovery).toMatchObject({ state: "missing", canResume: false });
+    await expect(after.sessions.recoverTab(tab.id, { action: "resume-conversation" })).rejects.toThrow("Select an exact Codex conversation ID to resume.");
+    expect(recoverSession).not.toHaveBeenCalled();
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    const recovered = await after.sessions.recoverTab(tab.id, { action: "resume-conversation", sessionId: "conversation-b" });
+    expect(recovered).toMatchObject({ id: tab.id, status: "running", recovery: undefined });
+    expect(recoverSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      initialInput: { resume: { mode: "session", sessionId: "conversation-b" } }
+    }));
+    expect(factory.spawn).toHaveBeenCalledTimes(2);
     await after.sessions.dispose();
   });
 

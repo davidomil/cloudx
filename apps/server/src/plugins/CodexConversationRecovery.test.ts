@@ -20,7 +20,7 @@ beforeEach(async () => {
 afterEach(async () => { await fs.rm(home, { recursive: true, force: true }); });
 
 describe("Codex conversation identity", () => {
-  it("records the native exact session identity atomically and observes subsequent TUI session changes", async () => {
+  it("records session hook receipts atomically and observes subsequent hook receipts", async () => {
     const observed = vi.fn();
     const failed = vi.fn();
     const stop = recovery.observe(observed, failed);

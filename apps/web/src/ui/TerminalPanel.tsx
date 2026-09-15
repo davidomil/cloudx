@@ -13,6 +13,7 @@ import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 
 interface TerminalView {
   tabId: string;
+  tabUpdatedAt: string;
   pluginId: string;
   terminal: Terminal;
   fit: FitAddon;
@@ -75,6 +76,14 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   useEffect(() => {
     activeRef.current = active;
   }, [active]);
+
+  useEffect(() => {
+    const view = terminalViews.get(tab.id);
+    if (view && !view.connectionError) view.tabUpdatedAt = tab.updatedAt;
+    if (!recoveryEnabled || tab.status !== "running" || tab.recovery) return;
+    if (view?.connectionError && view.tabUpdatedAt !== tab.updatedAt) disposeTerminalViewInternal(tab.id);
+    setConnectionError(undefined);
+  }, [tab.id, tab.status, tab.recovery, tab.updatedAt, recoveryEnabled]);
 
   useEffect(() => {
     if (needsRecovery) {
@@ -161,7 +170,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   terminal.loadAddon(fit);
 
   const socket = createTerminalSocket(tab.id);
-  const view: TerminalView = { tabId: tab.id, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false };
+  const view: TerminalView = { tabId: tab.id, tabUpdatedAt: tab.updatedAt, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false };
   terminalViews.set(tab.id, view);
   registerTerminalView(tab.id, {
     dispose: () => disposeTerminalViewInternal(tab.id),

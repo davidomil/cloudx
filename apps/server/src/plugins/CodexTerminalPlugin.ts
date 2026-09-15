@@ -220,15 +220,16 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   async describeRecovery(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume: boolean }> {
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
-    let conversationId: string | undefined;
     try {
       const resume = codexResumeInput(input.initialInput);
-      conversationId = conversation?.read()?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
+      const conversationId = conversation?.read()?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
       if (!conversationId) return { message: "The previous Codex process ended. Its exact conversation ID was not saved. Select a saved session.", canResume: false };
       await this.requireConversation(input.tab.id, conversationId);
-      return { message: "The previous Codex process ended. Resume its saved conversation to continue.", conversationId, canResume: true };
+      // Codex queues SessionStart until the next prompt. A receipt or launch ID
+      // cannot confirm the selected conversation after an idle /resume or /new.
+      return { message: "The previous Codex process ended. Its current conversation cannot be confirmed from the last saved ID. Select a saved session.", canResume: false };
     } catch (error) {
-      return { message: error instanceof Error ? error.message : "Codex conversation recovery is unavailable.", conversationId, canResume: false };
+      return { message: error instanceof Error ? error.message : "Codex conversation recovery is unavailable.", canResume: false };
     }
   }
 

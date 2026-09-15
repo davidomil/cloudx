@@ -299,8 +299,12 @@ describe("TerminalPanel", () => {
       root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));
     });
     TestWebSocket.latest!.close(code);
+    act(() => {
+      root!.render(createElement(TerminalPanel, { tab: { ...tab, updatedAt: new Date(1000).toISOString() }, active: true, uiScale: 1 }));
+    });
     vi.advanceTimersByTime(10_000);
     expect(TestWebSocket.instances).toHaveLength(1);
+    expect(terminalPanelMocks.terminals[0]!.disposed).toBe(false);
   });
 
   it("shows recovery for saved failed tabs without opening a rejected socket", () => {
@@ -324,6 +328,71 @@ describe("TerminalPanel", () => {
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "reconnect" });
     expect(TestWebSocket.instances).toHaveLength(2);
     expect(host!.querySelector(".terminal-panel")).not.toBeNull();
+  });
+
+  it.each(["mounted", "cached"])("reconnects a %s rejected terminal when another client recovers its process", (viewState) => {
+    const recover = vi.fn();
+    const renderTab = (currentTab: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: currentTab, active: true, uiScale: 1, onRecover: recover
+    })));
+    renderTab(tab);
+    const originalSocket = TestWebSocket.latest!;
+    originalSocket.open();
+    if (viewState === "cached") act(() => root!.render(createElement("div")));
+    act(() => originalSocket.close(1008));
+    renderTab({ ...tab });
+    expect(host!.textContent).toContain("Check connection");
+    expect(TestWebSocket.instances).toHaveLength(1);
+    expect(terminalPanelMocks.terminals[0]!.disposed).toBe(true);
+
+    renderTab({ ...tab, status: "failed", recovery: { state: "missing", message: "The previous shell process ended." } });
+    expect(host!.textContent).toContain("Open new shell");
+    renderTab({ ...tab, status: "running", recovery: undefined });
+
+    expect(host!.querySelector(".terminal-panel")).not.toBeNull();
+    expect(host!.textContent).not.toContain("Check connection");
+    expect(TestWebSocket.instances).toHaveLength(2);
+    const replacementSocket = TestWebSocket.latest!;
+    expect(replacementSocket.url).toBe(originalSocket.url);
+    replacementSocket.open();
+    replacementSocket.output("recovered process");
+    expect(terminalPanelMocks.terminals[1]!.writeCalls).toEqual(["recovered process"]);
+    expect(recover).not.toHaveBeenCalled();
+    act(() => replacementSocket.close(1008));
+    expect(host!.textContent).toContain("Check connection");
+    expect(TestWebSocket.instances).toHaveLength(2);
+  });
+
+  it.each(["mounted", "cached"])("reconnects a %s rejected terminal after observing only the completed recovery revision", (viewState) => {
+    const recover = vi.fn();
+    const renderTab = (currentTab: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: currentTab, active: true, uiScale: 1, onRecover: recover
+    })));
+    renderTab(tab);
+    const originalSocket = TestWebSocket.latest!;
+    originalSocket.open();
+    if (viewState === "cached") act(() => root!.render(createElement("div")));
+    act(() => originalSocket.close(1008));
+
+    const recoveredTab = { ...tab, updatedAt: new Date(1000).toISOString() };
+    renderTab(recoveredTab);
+    expect(host!.querySelector(".terminal-panel")).not.toBeNull();
+    expect(TestWebSocket.instances).toHaveLength(2);
+    expect(terminalPanelMocks.terminals[0]!.disposed).toBe(true);
+    const replacementSocket = TestWebSocket.latest!;
+    expect(replacementSocket.url).toBe(originalSocket.url);
+    replacementSocket.open();
+    replacementSocket.output("recovered process");
+    expect(terminalPanelMocks.terminals[1]!.writeCalls).toEqual(["recovered process"]);
+    expect(recover).not.toHaveBeenCalled();
+
+    const latestTab = { ...recoveredTab, updatedAt: new Date(2000).toISOString() };
+    renderTab(latestTab);
+    act(() => root!.render(createElement("div")));
+    act(() => replacementSocket.close(1008));
+    renderTab({ ...latestTab });
+    expect(host!.textContent).toContain("Check connection");
+    expect(TestWebSocket.instances).toHaveLength(2);
   });
 
   it("uploads pasted images into Codex terminal tabs and inserts workspace image references", async () => {

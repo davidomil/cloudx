@@ -1613,6 +1613,32 @@ describe("Codex conversation recovery after process loss", () => {
     expect(factory.spawns).toBe(0);
   });
 
+  it.each(["receipt", "launch input"])("requires explicit selection when the last identity comes from %s", async source => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const selectedId = "01a08470-d118-7b72-b1df-439e72e5c745";
+      for (const id of [conversationId, selectedId]) {
+        await fs.writeFile(path.join(home, "sessions", `rollout-${id}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id, cwd: root } }) + "\n");
+      }
+      if (source === "receipt") {
+        const identity = new CodexConversationRecovery(factory.env!.CODEX_HOME!);
+        await fs.writeFile(identity.receiptPath, JSON.stringify({ sessionId: conversationId, cwd: root }));
+      }
+      previous.stop?.();
+      const initialInput = source === "launch input" ? { resume: { mode: "session", sessionId: conversationId } } : undefined;
+      const recovery = await plugin.describeRecovery({ tab, cwd: root, controls, initialInput });
+      expect(recovery).toMatchObject({ canResume: false, message: expect.stringContaining("cannot be confirmed") });
+      expect(recovery.conversationId).toBeUndefined();
+      expect(factory.spawns).toBe(1);
+
+      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: selectedId } } });
+      expect(factory.args?.at(-1)).toContain(`resume ${selectedId}`);
+      expect(factory.args?.at(-1)).not.toContain(conversationId);
+      recovered.stop?.();
+    });
+  });
+
   it("resumes the selected exact conversation with saved launch context and without replaying its prompt", async () => {
     await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
       const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
@@ -1621,7 +1647,7 @@ describe("Codex conversation recovery after process loss", () => {
       previous.stop?.();
       await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: root } }) + "\n");
       const initialInput = { ...previous.restoreInput?.(), resume: { mode: "session", sessionId: conversationId } };
-      await expect(plugin.describeRecovery({ tab, cwd: root, controls, initialInput })).resolves.toMatchObject({ canResume: true, conversationId });
+      await expect(plugin.describeRecovery({ tab, cwd: root, controls, initialInput })).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("cannot be confirmed") });
       const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput, prepareCodexSession: async () => { throw new Error("Must not prepare another conversation"); } });
       expect(factory.args?.at(-1)).toContain(`resume ${conversationId}`);
       expect(factory.args?.at(-1)).toContain("--cd");
@@ -1643,7 +1669,9 @@ describe("Codex conversation recovery after process loss", () => {
       const previous = await plugin.createSession({ tab, cwd: root, controls });
       previous.stop?.();
       const input = { tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: conversationId } } };
-      await expect(plugin.describeRecovery(input)).resolves.toMatchObject({ canResume: false, conversationId, message: expect.stringContaining("transcript") });
+      const recovery = await plugin.describeRecovery(input);
+      expect(recovery).toMatchObject({ canResume: false, message: expect.stringContaining("transcript") });
+      expect(recovery.conversationId).toBeUndefined();
       await expect(plugin.recoverSession(input)).rejects.toThrow("transcript");
       expect(factory.spawns).toBe(1);
     });

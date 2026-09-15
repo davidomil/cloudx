@@ -182,7 +182,6 @@ export class SessionStore {
     const restoreInput = previous?.restoreInput?.();
     if (restoreInput) this.initialInputs.set(tabId, restoreInput);
     this.disposeSessionListeners(tabId);
-    if (previous?.hasExited?.()) await previous.terminate?.();
     previous?.detach?.();
     this.sessions.delete(tabId);
     this.updateTab(tabId, { status: "starting", statusMessage: "Checking the terminal broker." });
@@ -205,7 +204,10 @@ export class SessionStore {
       this.updateTab(tabId, { status: "starting", statusMessage: "Recovering terminal." });
       const input = await this.sessionInput(this.getTab(tabId));
       const sessionId = request.sessionId ?? this.getTab(tabId).recovery?.conversationId;
-      if (request.action === "resume-conversation" && sessionId) input.initialInput = { ...input.initialInput, resume: { mode: "session", sessionId } };
+      if (request.action === "resume-conversation") {
+        if (!sessionId) throw new Error("Select an exact Codex conversation ID to resume.");
+        input.initialInput = { ...input.initialInput, resume: { mode: "session", sessionId } };
+      }
       const session = request.action === "new-shell"
         ? await plugin.createSession(input)
         : await plugin.recoverSession!(input);

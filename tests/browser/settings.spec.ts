@@ -1223,18 +1223,33 @@ test("workspace recovery replaces a missing shell in its saved panel", async ({
   );
 });
 
-test("workspace recovery reconnects when another client restores the saved terminal", async ({
+test("workspace recovery reconnects a rejected live terminal when another client restores it", async ({
   page,
 }) => {
-  const { tabs, publishTab } = await showRecoveryWorkspace(
+  const { tabs, publishTab, terminalSockets } = await showRecoveryWorkspace(
     page,
     "standard-terminal",
   );
+  const runningTab: WorkspaceTab = {
+    ...tabs[0]!,
+    status: "running",
+    recovery: undefined,
+  };
+  publishTab(runningTab);
   await page.goto(baseUrl);
+  await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+  const originalSocket = terminalSockets.find((socket) =>
+    socket.url().endsWith("/ws/terminal/saved-panel"),
+  )!;
+  await originalSocket.close({ code: 1008, reason: "Unknown terminal tab." });
+  await expect(
+    page.getByRole("button", { name: "Check connection", exact: true }),
+  ).toBeVisible();
+  publishTab(tabs[0]!);
   await expect(
     page.getByRole("button", { name: "Open new shell", exact: true }),
   ).toBeVisible();
-  publishTab({ ...tabs[0]!, status: "running", recovery: undefined });
+  publishTab(runningTab);
   await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
   await expect(
     page.getByRole("region", { name: "Recovery for Saved panel" }),
@@ -1243,6 +1258,13 @@ test("workspace recovery reconnects when another client restores the saved termi
     "Saved panel",
     "Working panel",
   ]);
+  expect(
+    terminalSockets.filter((socket) => socket.url() === originalSocket.url()),
+  ).toHaveLength(2);
+  await expect(page.locator(".workspace-pane")).toHaveAttribute(
+    "data-pane-id",
+    "saved-pane",
+  );
 });
 
 test("workspace recovery requires an exact selection when the Codex transcript is missing", async ({
@@ -1388,7 +1410,9 @@ async function showRecoveryWorkspace(page: Page, pluginId: string) {
     workspaceSockets.push(socket);
     socket.send(JSON.stringify({ type: "workspace", ...state }));
   });
-  await page.routeWebSocket("**/ws/terminal/*", (socket) =>
+  const terminalSockets: WebSocketRoute[] = [];
+  await page.routeWebSocket("**/ws/terminal/*", (socket) => {
+    terminalSockets.push(socket);
     socket.send(
       JSON.stringify({
         type: "screen",
@@ -1396,10 +1420,11 @@ async function showRecoveryWorkspace(page: Page, pluginId: string) {
         cols: 80,
         rows: 24,
       }),
-    ),
-  );
+    );
+  });
   return {
     ...state,
+    terminalSockets,
     publishTab(tab: WorkspaceTab) {
       state.tabs = state.tabs.map((current) =>
         current.id === tab.id ? tab : current,

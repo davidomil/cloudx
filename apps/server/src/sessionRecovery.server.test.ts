@@ -156,6 +156,64 @@ describe("workspace recovery across server updates", () => {
     }
   }, 15_000);
 
+  it.skipIf(process.platform !== "linux").each([false, true])("recovers through the current broker after a broker-only restart (check during outage: %s)", async (checkDuringOutage) => {
+    const fixture = await recoveryFixture();
+    try {
+      await fixture.startBroker();
+      const { app, services } = await fixture.startServer();
+      const window = services.workspace!.getActiveWindow();
+      const { tab } = await services.workspaceCommands!.createTab({
+        pluginId: "standard-terminal", title: "Persistent panel", cwd: fixture.root,
+        windowId: window.id, paneId: window.layout.activePaneId
+      });
+      const before = await workspaceSnapshot(app);
+      const previous = services.sessions.getSession(tab.id);
+      const restore = vi.spyOn(services.plugins.get("standard-terminal"), "restoreSession");
+      const terminatePrevious = vi.spyOn(previous, "terminate");
+      const recover = () => app.inject({
+        method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" },
+        payload: { action: "new-shell" }
+      });
+
+      await fixture.stopBroker();
+      await vi.waitFor(() => {
+        expect(previous.hasExited!()).toBe(true);
+        expect(services.sessions.getTab(tab.id).statusMessage).toContain("broker connection closed");
+      });
+      if (checkDuringOutage) {
+        const unavailable = await recover();
+        expect(unavailable.statusCode, unavailable.body).toBe(200);
+        expect(unavailable.json<WorkspaceTab>()).toMatchObject({ status: "failed", recovery: { state: "unavailable" } });
+        expect(fixture.spawn).toHaveBeenCalledOnce();
+      }
+      await fixture.startBroker();
+
+      for (const response of await Promise.all([recover(), recover()])) {
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json<WorkspaceTab>()).toMatchObject({ id: tab.id, title: tab.title, cwd: fixture.root, status: "running" });
+        expect(response.json<WorkspaceTab>().recovery).toBeUndefined();
+      }
+      expect((await recover()).statusCode).toBe(200);
+      expect(restore).toHaveBeenCalledTimes(checkDuringOutage ? 2 : 1);
+      expect(terminatePrevious).not.toHaveBeenCalled();
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+      expect(fixture.spawn.mock.calls[1]![2]).toMatchObject({ cwd: fixture.root, sessionId: tab.id });
+      const replacement = services.sessions.getSession(tab.id);
+      expect(replacement).not.toBe(previous);
+      let output = "";
+      replacement.onData!(data => { output += data; });
+      replacement.write!("stty -echo; printf '\\nRECOVERED_CWD=%s\\n' \"$PWD\"\n");
+      await vi.waitFor(() => expect(output).toContain(`RECOVERED_CWD=${fixture.root}`));
+      const after = await workspaceSnapshot(app);
+      expect(after.windows).toEqual(before.windows);
+      expect(after.activeTabId).toBe(before.activeTabId);
+      expect(after.tabs.map(current => current.id)).toEqual(before.tabs.map(current => current.id));
+    } finally {
+      vi.restoreAllMocks();
+      await fixture.close();
+    }
+  }, 15_000);
+
   it("restores a saved settings tab as retired and removes only that tab without updating Codex preferences", async () => {
     const fixture = await recoveryFixture();
     const updateSettings = vi.spyOn(CodexSettingsService.prototype, "update");

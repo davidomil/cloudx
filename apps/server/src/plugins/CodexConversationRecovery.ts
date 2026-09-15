@@ -13,7 +13,7 @@ const MAX_TRANSCRIPT_HEADER_BYTES = 1_048_576;
 
 export interface CodexConversationIdentity { sessionId: string; transcriptPath?: string; cwd: string }
 
-/** A native session event binds a panel to one conversation, independent of other sessions in its cwd. */
+/** Records the last observed conversation; native selection can change before the next hook runs. */
 export class CodexConversationRecovery {
   readonly receiptPath: string;
 
