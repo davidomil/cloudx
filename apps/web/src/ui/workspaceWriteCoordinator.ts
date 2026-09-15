@@ -7,6 +7,7 @@ interface PendingLayoutWrite {
 
 export class WorkspaceWriteCoordinator {
   private tail: Promise<void> = Promise.resolve();
+  private outstanding = new Set<Promise<unknown>>();
   private pendingLayout: PendingLayoutWrite | undefined;
   private activeLayout: PendingLayoutWrite | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -22,13 +23,16 @@ export class WorkspaceWriteCoordinator {
     this.clearTimer();
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.flush().catch(this.reportError);
+      void this.flush().catch(() => undefined);
     }, this.debounceMs);
   }
 
-  flush(): Promise<void> {
+  async flush(): Promise<void> {
     this.clearTimer();
-    return this.pendingLayout ? this.enqueue(() => this.flushPendingLayouts()) : this.tail;
+    while (this.outstanding.size || this.pendingLayout) {
+      if (this.outstanding.size) await Promise.all(this.outstanding);
+      else await this.enqueue(() => this.flushPendingLayouts());
+    }
   }
 
   run<T>(operation: () => Promise<T>): Promise<T> {
@@ -54,7 +58,9 @@ export class WorkspaceWriteCoordinator {
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.tail.then(operation);
-    this.tail = run.then(() => undefined, () => undefined);
+    this.outstanding.add(run);
+    const settled = () => { this.outstanding.delete(run); };
+    this.tail = run.then(settled, settled);
     return run;
   }
 
@@ -68,6 +74,7 @@ export class WorkspaceWriteCoordinator {
         await this.persistLayout(pending.windowId, pending.layout);
       } catch (error) {
         this.pendingLayout ??= pending;
+        this.reportError(error);
         throw error;
       } finally {
         if (this.activeLayout === pending) {

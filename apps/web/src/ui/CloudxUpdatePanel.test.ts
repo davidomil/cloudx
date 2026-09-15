@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CloudxUpdateStatus } from "@cloudx/shared";
 
 import { CloudxUpdatePanel, useCloudxUpdate } from "./CloudxUpdatePanel.js";
+import { updateWindow } from "../api.js";
+import { defaultLayout, splitPane } from "./layout.js";
+import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
 
 let root: Root | undefined;
 const reload = vi.fn();
@@ -33,13 +36,13 @@ afterEach(async () => {
 
 function reply(status: CloudxUpdateStatus, code = 200) { return new Response(JSON.stringify(status), { status: code }); }
 
-async function mount(beforeStart: () => Promise<void> = async () => undefined) {
+async function mount(saveWorkspace: () => Promise<void> = async () => undefined) {
   const container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
   function Harness() {
     const [open, setOpen] = useState(true);
-    const update = useCloudxUpdate(open, beforeStart, reload);
+    const update = useCloudxUpdate(open, saveWorkspace, reload);
     return createElement("div", {},
       createElement("button", { onClick: () => setOpen(value => !value) }, "Toggle settings"),
       open ? createElement(CloudxUpdatePanel, { update }) : null
@@ -59,6 +62,111 @@ async function click(label: string) { await act(async () => button(label).click(
 async function poll() { await act(async () => vi.advanceTimersByTimeAsync(2_000)); }
 
 describe("CloudX updates", () => {
+  it("blocks launch when an already-running layout PATCH fails and keeps the save error visible", async () => {
+    let rejectSave!: (error: Error) => void;
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") return new Promise<Response>((_resolve, reject) => { rejectSave = reject; });
+      return reply(available);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const coordinator = new WorkspaceWriteCoordinator(async (windowId, layout) => {
+      await updateWindow(windowId, { layout });
+    }, 200);
+    const container = await mount(() => coordinator.flush());
+    coordinator.scheduleLayout("window-1", defaultLayout());
+    await act(async () => vi.advanceTimersByTimeAsync(200));
+    await click("Update CloudX and dependencies");
+    await act(async () => rejectSave(new Error("Layout PATCH failed.")));
+
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "PATCH")).toHaveLength(1);
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Layout PATCH failed.");
+    expect(button("Update CloudX and dependencies").disabled).toBe(true);
+    expect(coordinator.hasUnsettledLayoutWrite()).toBe(true);
+    await poll();
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Layout PATCH failed.");
+    coordinator.dispose();
+  });
+
+  it.each(["retained failed save", "debounced change"])("persists a %s before reloading after an update", async (scenario) => {
+    let current = run();
+    let allowSave = false;
+    let successfulSaves = 0;
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        if (!allowSave) throw new Error("Layout PATCH unavailable.");
+        successfulSaves += 1;
+        return new Response("{}");
+      }
+      return reply(current);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const coordinator = new WorkspaceWriteCoordinator(async (windowId, layout) => {
+      await updateWindow(windowId, { layout });
+    }, 200);
+    const container = await mount(() => coordinator.flush());
+    await click("Toggle settings");
+    const layout = splitPane(defaultLayout(), "row", () => "pane-2", () => "split-1");
+    coordinator.scheduleLayout("window-1", layout);
+    if (scenario === "retained failed save") await act(async () => vi.advanceTimersByTimeAsync(200));
+    current = run("succeeded");
+    await click("Toggle settings");
+
+    expect(reload).not.toHaveBeenCalled();
+    expect(successfulSaves).toBe(0);
+    expect(coordinator.hasUnsettledLayoutWrite()).toBe(true);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Layout PATCH unavailable.");
+    expect(sessionStorage.getItem("cloudx.update.pendingRun")).toBe("update-1");
+    expect(sessionStorage.getItem("cloudx.update.reloadedRun")).toBeNull();
+    const attempts = fetch.mock.calls.length;
+    await poll();
+    expect(fetch).toHaveBeenCalledTimes(attempts);
+
+    allowSave = true;
+    reload.mockImplementationOnce(() => {
+      expect(successfulSaves).toBe(1);
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(false);
+    });
+    await click("Check update status");
+    expect(reload).toHaveBeenCalledOnce();
+    expect(JSON.parse(fetch.mock.calls.filter(([, init]) => init?.method === "PATCH").at(-1)![1]!.body as string)).toEqual({ layout });
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(sessionStorage.getItem("cloudx.update.reloadedRun")).toBe("update-1");
+    await click("Check update status");
+    expect(reload).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    coordinator.dispose();
+  });
+
+  it.each(["close Settings", "unmount"])("ignores an obsolete reload save after %s", async (action) => {
+    let current = run();
+    let finishSaving!: () => void;
+    const save = vi.fn(() => new Promise<void>(resolve => { finishSaving = resolve; }));
+    vi.stubGlobal("fetch", vi.fn(async () => reply(current)));
+    await mount(save);
+    current = run("succeeded");
+    await poll();
+    expect(save).toHaveBeenCalledOnce();
+    expect(reload).not.toHaveBeenCalled();
+    const finishObsoleteSave = finishSaving;
+    if (action === "close Settings") {
+      await click("Toggle settings");
+      expect(save).toHaveBeenCalledTimes(2);
+    } else {
+      await act(async () => root!.unmount());
+      root = undefined;
+    }
+    await act(async () => finishObsoleteSave());
+    expect(reload).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem("cloudx.update.reloadedRun")).toBeNull();
+    if (action === "close Settings") {
+      await act(async () => finishSaving());
+      expect(reload).toHaveBeenCalledOnce();
+      await click("Toggle settings");
+      expect(reload).toHaveBeenCalledOnce();
+    }
+  });
+
   it("shows update scope, restart behavior, and an unavailable reason without starting anything", async () => {
     const fetch = vi.fn(async () => reply({ available: false, unavailableReason: "Use the installed CloudX system service." }));
     vi.stubGlobal("fetch", fetch);
@@ -92,6 +200,9 @@ describe("CloudX updates", () => {
     await click("Toggle settings");
     current = run("succeeded");
     await poll();
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(reload).not.toHaveBeenCalled();
+    await act(async () => finishSaving());
     expect(reload).toHaveBeenCalledOnce();
     await click("Toggle settings");
     expect(reload).toHaveBeenCalledOnce();

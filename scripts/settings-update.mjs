@@ -175,11 +175,12 @@ export class SettingsUpdater {
     return path.join(this.stateDir, `${id}.json`);
   }
 
-  read(id) {
+  readRecord(id) {
     const record = JSON.parse(fs.readFileSync(this.recordPath(id), "utf8"));
     const run = record.run;
     if (
-      record.repoRoot !== this.repoRoot ||
+      typeof record.repoRoot !== "string" ||
+      !path.isAbsolute(record.repoRoot) ||
       run?.id !== id ||
       !["running", "succeeded", "failed"].includes(run.state) ||
       typeof run.message !== "string" ||
@@ -187,6 +188,13 @@ export class SettingsUpdater {
       (run.finishedAt !== undefined &&
         !Number.isFinite(Date.parse(run.finishedAt)))
     )
+      throw new Error("Invalid stored update status.");
+    return record;
+  }
+
+  read(id) {
+    const record = this.readRecord(id);
+    if (record.repoRoot !== this.repoRoot)
       throw new Error("Invalid stored update status.");
     return record;
   }
@@ -232,7 +240,12 @@ export class SettingsUpdater {
           : latest?.id;
       if (!id) return undefined;
     }
-    const record = this.read(id);
+    const record = this.readRecord(id);
+    if (record.repoRoot !== this.repoRoot) {
+      if (unit.running || record.run.state === "running")
+        throw new Error("Invalid stored update status.");
+      return undefined;
+    }
     if (
       record.run.state === "running" &&
       !(unit.running && unit.id === id) &&

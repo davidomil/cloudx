@@ -251,7 +251,8 @@ export function App() {
     }
   );
   const workspaceWrites = workspaceWritesRef.current;
-  const cloudxUpdate = useCloudxUpdate(settingsOpen, () => workspaceWrites.flush());
+  const saveWorkspace = useCallback(() => workspaceWrites.flush(), [workspaceWrites]);
+  const cloudxUpdate = useCloudxUpdate(settingsOpen, saveWorkspace);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);

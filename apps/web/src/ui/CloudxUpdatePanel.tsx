@@ -23,7 +23,7 @@ export interface CloudxUpdateController {
   check: () => void;
 }
 
-export function useCloudxUpdate(settingsOpen: boolean, beforeStart: () => Promise<void> = noPendingWorkspaceWrites, reload = reloadBrowser): CloudxUpdateController {
+export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Promise<void> = noPendingWorkspaceWrites, reload = reloadBrowser): CloudxUpdateController {
   const [status, setStatus] = useState<CloudxUpdateStatus>();
   const [starting, setStarting] = useState(false);
   const [checking, setChecking] = useState(true);
@@ -76,6 +76,15 @@ export function useCloudxUpdate(settingsOpen: boolean, beforeStart: () => Promis
           const previousRun = sessionStorage.getItem(previousRunKey);
           const observedRun = run && (pendingRun === run.id || previousRun !== null && previousRun !== run.id);
           if (run?.state === "succeeded" && observedRun && sessionStorage.getItem(reloadedRunKey) !== run.id) {
+            try {
+              await saveWorkspace();
+            } catch (cause) {
+              if (!controller.signal.aborted) {
+                setError(`Update complete, but your workspace could not be saved: ${errorMessage(cause)} Check update status to try saving again before reloading.`);
+              }
+              return;
+            }
+            if (controller.signal.aborted) return;
             sessionStorage.setItem(reloadedRunKey, run.id);
             setNotice("Update complete. Reloading CloudX and restoring your workspace…");
             reload();
@@ -101,7 +110,7 @@ export function useCloudxUpdate(settingsOpen: boolean, beforeStart: () => Promis
 
     void readStatus();
     return () => { controller.abort(); activeRequest?.abort(); clearTimeout(pollTimer); clearTimeout(requestTimer); };
-  }, [settingsOpen, refresh, starting, reload]);
+  }, [settingsOpen, refresh, starting, saveWorkspace, reload]);
 
   async function start() {
     if (startRequest.current || !status?.available || status.run?.state === "running" || checking || error || startError) return;
@@ -114,7 +123,7 @@ export function useCloudxUpdate(settingsOpen: boolean, beforeStart: () => Promis
     let timer: ReturnType<typeof setTimeout> | undefined;
     let requested = false;
     try {
-      await beforeStart();
+      await saveWorkspace();
       if (controller.signal.aborted) return;
       sessionStorage.setItem(previousRunKey, status.run?.id ?? "");
       requested = true;

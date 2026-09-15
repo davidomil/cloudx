@@ -22,12 +22,12 @@ afterEach(() =>
     .forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })),
 );
 
-function installation() {
-  const home = fs.mkdtempSync(
-    path.join(os.tmpdir(), "cloudx-settings-update-"),
-  );
-  temporary.push(home);
-  const repoRoot = path.join(home, "checkout");
+function installation({ home, checkout = "checkout" } = {}) {
+  if (!home) {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-settings-update-"));
+    temporary.push(home);
+  }
+  const repoRoot = path.join(home, checkout);
   const dataDir = path.join(repoRoot, ".cloudx");
   const systemdDir = path.join(home, ".config/systemd/user");
   const envPath = path.join(home, ".config/cloudx/cloudx.env");
@@ -255,6 +255,100 @@ describe("installed Settings updater", () => {
     expect(updater.status().run).toEqual(started.run);
     expect(JSON.stringify(started)).not.toContain("secret");
   });
+
+  it.each(["succeeded", "failed"])(
+    "updates a reinstalled checkout after a %s update under the same home",
+    (state) => {
+      const previous = installation();
+      const started = previous.updater.start();
+      if (state === "failed")
+        previous.host.installer = () => {
+          throw new Error("Installer failed");
+        };
+      const completed = previous.updater.run(started.run.id);
+      expect(completed.state).toBe(state);
+      fs.rmSync(previous.repoRoot, { recursive: true });
+
+      const current = installation({
+        home: previous.home,
+        checkout: "reinstalled",
+      });
+      expect(current.updater.preflight()).toBeUndefined();
+      expect(current.updater.status()).toEqual({ available: true });
+      const next = current.updater.start();
+      expect(next).toMatchObject({
+        available: true,
+        run: { state: "running" },
+      });
+      expect(next.run.id).not.toBe(completed.id);
+      expect(current.updater.status()).toEqual(next);
+      expect(current.updater.run(next.run.id).state).toBe("succeeded");
+      current.host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+      expect(new SettingsUpdater(current.options).status().run).toMatchObject({
+        id: next.run.id,
+        state: "succeeded",
+      });
+      expect(previous.updater.read(completed.id).run).toEqual(completed);
+    },
+  );
+
+  it("ignores a failed launch attempt from the former checkout after reinstalling", () => {
+    const previous = installation();
+    const completed = previous.updater.start();
+    previous.updater.run(completed.run.id);
+    previous.host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    previous.host.launch = false;
+    const failed = previous.updater.start();
+    expect(failed.run.state).toBe("failed");
+    expect(previous.updater.pointer("latest").id).toBe(completed.run.id);
+    expect(previous.updater.pointer("attempt").id).toBe(failed.run.id);
+
+    const current = installation({
+      home: previous.home,
+      checkout: "reinstalled",
+    });
+    expect(current.updater.status()).toEqual({ available: true });
+    const next = current.updater.start();
+    expect(next.run.state).toBe("running");
+    expect(next.run.id).not.toBe(failed.run.id);
+    expect(current.updater.status()).toEqual(next);
+    expect(previous.updater.read(failed.run.id).run).toEqual(failed.run);
+  });
+
+  it.each([
+    { state: "running", service: "active" },
+    { state: "succeeded", service: "active" },
+    { state: "running", service: "inactive" },
+  ])(
+    "blocks another checkout with a $state record and an $service update service",
+    ({ state, service }) => {
+      const previous = installation();
+      const started = previous.updater.start();
+      if (state === "succeeded") previous.updater.run(started.run.id);
+      const recordPath = previous.updater.recordPath(started.run.id);
+      const saved = fs.readFileSync(recordPath, "utf8");
+
+      const current = installation({
+        home: previous.home,
+        checkout: "reinstalled",
+      });
+      current.host.unit = { ...previous.host.unit, ActiveState: service };
+      expect(current.updater.preflight()).toBeUndefined();
+      expect(() => current.updater.status()).toThrow(
+        "Invalid stored update status",
+      );
+      expect(() => current.updater.start()).toThrow(
+        "Invalid stored update status",
+      );
+      expect(() => current.updater.run(started.run.id)).toThrow(
+        "Invalid stored update status",
+      );
+      expect(current.calls.some(([command]) => command === "systemd-run")).toBe(
+        false,
+      );
+      expect(fs.readFileSync(recordPath, "utf8")).toBe(saved);
+    },
+  );
 
   it("returns the winning run if another start wins the fixed-unit launch race", () => {
     const { updater, options, host } = installation();
