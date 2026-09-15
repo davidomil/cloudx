@@ -1,7 +1,7 @@
 import type { ConfigFieldOption } from "@cloudx/shared";
 
 export const DOCUMENTATION_AI_USE_VOICE_MODEL = "__voice_model__";
-export const DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL = "gpt-5.4-mini";
+export const DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL = "gpt-5.6-luna";
 export const CODEX_MODEL_OPTIONS: ConfigFieldOption[] = [
   {
     label: "GPT-6-Astra",
@@ -27,21 +27,6 @@ export const CODEX_MODEL_OPTIONS: ConfigFieldOption[] = [
     label: "GPT-5.5",
     value: "gpt-5.5",
     description: "Frontier model for complex coding, research, and real-world work."
-  },
-  {
-    label: "GPT-5.4",
-    value: "gpt-5.4",
-    description: "Strong model for everyday coding."
-  },
-  {
-    label: "GPT-5.4-Mini",
-    value: "gpt-5.4-mini",
-    description: "Small, fast, and cost-efficient model for simpler coding tasks."
-  },
-  {
-    label: "GPT-5.3-Codex-Spark",
-    value: "gpt-5.3-codex-spark",
-    description: "Ultra-fast coding model."
   }
 ];
 

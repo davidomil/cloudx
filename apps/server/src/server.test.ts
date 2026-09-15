@@ -4306,7 +4306,7 @@ describe("buildServer", () => {
           global: {
             aiControlEnabled: false,
             voiceCommandsEnabled: false,
-            voiceModel: "gpt-5.4-mini",
+            voiceModel: "gpt-5.6-luna",
             themeId: "minimalist-dark",
             uiScale: 115,
           },
@@ -4323,7 +4323,7 @@ describe("buildServer", () => {
       expect(updated.statusCode).toBe(200);
       expect(updated.json().values.global.aiControlEnabled).toBe(false);
       expect(updated.json().values.global.voiceCommandsEnabled).toBe(false);
-      expect(updated.json().values.global.voiceModel).toBe("gpt-5.4-mini");
+      expect(updated.json().values.global.voiceModel).toBe("gpt-5.6-luna");
       expect(updated.json().values.global.themeId).toBe("minimalist-dark");
       expect(updated.json().values.global.uiScale).toBe(115);
       expect(updated.json().values.plugins["file-browser"].showGitDiff).toBe(

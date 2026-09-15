@@ -9,16 +9,13 @@ import { PathPolicy } from "./pathPolicy.js";
 import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
 
 describe("Settings model choices", () => {
-  it("includes the visible GPT-6 and GPT-5.6 models alongside all previous choices", () => {
+  it("offers only the currently supported Codex models", () => {
     expect(CODEX_MODEL_OPTIONS.map((option) => option.value)).toEqual([
       "gpt-6-astra",
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "gpt-5.6-luna",
-      "gpt-5.5",
-      "gpt-5.4",
-      "gpt-5.4-mini",
-      "gpt-5.3-codex-spark"
+      "gpt-5.5"
     ]);
   });
 
@@ -33,6 +30,7 @@ describe("Settings model choices", () => {
     for (const field of fields) {
       expect(field.type, field.key).toBe("select");
       expect(field.options?.filter((option) => option.value !== DOCUMENTATION_AI_USE_VOICE_MODEL), field.key).toEqual(CODEX_MODEL_OPTIONS);
+      expect(field.options?.map((option) => option.value), `${field.key} default`).toContain(field.defaultValue);
     }
     for (const field of documentation.configFields.filter((field) => field.key.endsWith("Model"))) {
       expect(field.options?.[0], field.key).toMatchObject({ value: DOCUMENTATION_AI_USE_VOICE_MODEL, label: "Same as voice control" });

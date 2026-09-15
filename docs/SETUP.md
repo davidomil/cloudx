@@ -866,7 +866,7 @@ authorization, and process isolation.
   contribution sync, terminal, workspace, and voice issues.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited roots tabs may open, default `~`.
 - `CLOUDX_DATA_DIR`: runtime state directory, default `.cloudx`.
-- `CLOUDX_VOICE_MODEL`: Codex planner model, default `gpt-5.3-codex-spark`.
+- `CLOUDX_VOICE_MODEL`: Codex planner model, default `gpt-5.6-luna`.
 - `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI path used by terminal
   sessions. The installer currently writes the resolved Codex executable here;
   future providers such as Claude can use the same variable.

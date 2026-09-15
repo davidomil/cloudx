@@ -255,6 +255,12 @@ describe("Forge connected application settings", () => {
       await expect(config.update({ plugins: { forge: { [field]: "unknown" } } })).rejects.toThrow(/configured options/);
       expect(settings.settings()).toMatchObject(selected);
     }
+    for (const field of ["workerModel", "reviewModel"]) {
+      for (const model of ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]) {
+        await expect(config.update({ plugins: { forge: { [field]: model } } })).rejects.toThrow(`plugins.forge.${field} must be one of the configured options.`);
+        expect(settings.settings()).toMatchObject(selected);
+      }
+    }
   });
 
   it("uses the saved human username and registered bot authors in provider searches", async () => {

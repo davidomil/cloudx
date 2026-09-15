@@ -119,7 +119,7 @@ describe("DocumentationPlugin", () => {
     const plugin = new DocumentationPlugin(fakeClient(), new PathPolicy([root]), new DocumentationIngestQueue());
     const config = new ConfigService(root, () => [plugin.descriptor()]);
     expect(config.getPluginConfig("documentation")).toMatchObject({
-      aiImageAnalysisModel: "gpt-5.4-mini",
+      aiImageAnalysisModel: "gpt-5.6-luna",
       aiTextAnalysisModel: DOCUMENTATION_AI_USE_VOICE_MODEL,
       aiAnswerModel: DOCUMENTATION_AI_USE_VOICE_MODEL
     });
@@ -132,6 +132,13 @@ describe("DocumentationPlugin", () => {
     await config.update({ plugins: { documentation: models } });
     const reloaded = new ConfigService(root, () => [plugin.descriptor()]);
     expect(reloaded.getPluginConfig("documentation")).toMatchObject(models);
+
+    for (const key of Object.keys(models)) {
+      for (const model of ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]) {
+        await expect(reloaded.update({ plugins: { documentation: { [key]: model } } })).rejects.toThrow(`plugins.documentation.${key} must be one of the configured options.`);
+        expect(reloaded.getPluginConfig("documentation")).toMatchObject(models);
+      }
+    }
 
     const inherited = Object.fromEntries(Object.keys(models).map((key) => [key, DOCUMENTATION_AI_USE_VOICE_MODEL]));
     await reloaded.update({ plugins: { documentation: inherited } });
@@ -168,11 +175,10 @@ describe("DocumentationPlugin", () => {
     expect(plugin.configFields.find((field) => field.key === "aiEnrichmentEnabled")?.defaultValue).toBe(true);
     expect(plugin.configFields.find((field) => field.key === "aiImageAnalysisModel")).toMatchObject({
       type: "select",
-      defaultValue: "gpt-5.4-mini",
+      defaultValue: "gpt-5.6-luna",
       options: expect.arrayContaining([
         { label: "GPT-5.5", value: "gpt-5.5", description: "Frontier model for complex coding, research, and real-world work." },
-        { label: "GPT-5.4-Mini", value: "gpt-5.4-mini", description: "Small, fast, and cost-efficient model for simpler coding tasks." },
-        { label: "GPT-5.3-Codex-Spark", value: "gpt-5.3-codex-spark", description: "Ultra-fast coding model." }
+        { label: "GPT-5.6-Luna", value: "gpt-5.6-luna", description: "Fast and affordable agentic coding model." }
       ])
     });
     expect(plugin.configFields.find((field) => field.key === "aiEnrichmentSkillIds")).toMatchObject({

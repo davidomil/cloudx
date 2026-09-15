@@ -58,7 +58,7 @@ names, and dashboard tokens.
   such as file-browser Git diff visibility.
 - Shared path autocomplete for tab, window, and template directory fields.
 - Voice control using browser audio, local Faster Whisper, and
-  `gpt-5.3-codex-spark`.
+  `gpt-5.6-luna`.
 - HTTPS on port `3001` with a local self-signed certificate for microphone
   access.
 
@@ -390,7 +390,7 @@ Common environment variables:
 - `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory, default `.cloudx/documentation`.
 - `CLOUDX_DOCUMENTATION_MODEL_DIR`: pinned MiniLM assets directory, default `models/minilm` within the documentation archive.
 - `CLOUDX_DOCUMENTATION_RETRIEVAL_PROFILE`: `minilm` by default; `diagnostic-hash` explicitly selects the nonsemantic feature-hash profile for diagnostics.
-- `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.3-codex-spark`.
+- `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.6-luna`.
 - `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.
 
 ## Engineering Status
