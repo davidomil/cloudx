@@ -397,12 +397,17 @@ test("Settings Logs searches, refreshes a selected source, and downloads the dis
 
 test("Codex Settings saves shared defaults, keeps them after reload, and can restore model defaults", async ({
   page,
+  isMobile,
 }, testInfo) => {
   const configPath = path.join(testRoot, "codex-home", "config.toml");
-  const settings = await openCodexSettings(page);
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
   const model = settings.getByRole("textbox", { name: "Default model" });
   const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
-  const save = settings.getByRole("button", { name: "Save", exact: true });
+  const save = settings.getByRole("button", {
+    name: "Save Codex settings",
+    exact: true,
+  });
   await expect(model).toHaveValue("");
   await expect(fastMode).toHaveValue("");
   await expect(save).toBeDisabled();
@@ -422,6 +427,7 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await captureSample(page, testInfo, "codex-settings-saved");
 
   await page.reload({ waitUntil: "domcontentloaded" });
+  await openCodexSettings(page, isMobile);
   await expect(model).toHaveValue("browser-fixture-model");
   await expect(fastMode).toHaveValue("priority");
   await expect(save).toBeDisabled();
@@ -435,76 +441,65 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
     features: { fast_mode: true },
   });
   await page.reload({ waitUntil: "domcontentloaded" });
+  await openCodexSettings(page, isMobile);
   await expect(model).toHaveValue("");
   await expect(fastMode).toHaveValue("");
 });
 
-for (const delayedEndpoint of ["workspace", "plugins"]) {
-  test(`Codex Settings waits for the initial workspace before tab creation when ${delayedEndpoint} is delayed`, async ({
-    page,
-  }) => {
-    const response = await page.request.get(`${baseUrl}/api/workspace`);
-    expect(response.ok()).toBe(true);
-    const workspace = (await response.json()) as WorkspaceStateResponse;
-    const activeWindow = workspace.windows.find(
-      (window) => window.id === workspace.activeWindowId,
-    )!;
-    expect(activeWindow.layout.activePaneId).not.toBe("pane-1");
-
-    await page.addInitScript(() => {
-      document.addEventListener(
-        "pointerdown",
-        (event) => {
-          const button = (event.target as Element).closest(
-            'button[title="Add tab to this pane"]',
-          );
-          if (button) {
-            document.body.dataset.tabCreationPaneId =
-              button.closest<HTMLElement>("[data-pane-id]")!.dataset.paneId;
-          }
-        },
-        { capture: true },
-      );
-    });
-    // Keep the socket snapshot from satisfying workspace readiness first.
-    await page.routeWebSocket("**/ws/workspace", () => {});
-    await page.route(
-      `**/api/${delayedEndpoint}`,
-      async (route) => {
-        const response = await route.fetch();
-        await expect(page.locator(".workspace-pane.active")).toHaveAttribute(
-          "data-pane-id",
-          "pane-1",
-        );
-        // Inject slow startup; the opener must wait for state, not this timer.
-        await new Promise((resolve) => setTimeout(resolve, 1_000));
-        await route.fulfill({ response });
-      },
-      { times: 1 },
-    );
-
-    const settings = await openCodexSettings(page);
-    await expect(page.locator("body")).toHaveAttribute(
-      "data-tab-creation-pane-id",
-      activeWindow.layout.activePaneId,
-    );
-    await expect(
-      settings.getByRole("textbox", { name: "Default model" }),
-    ).toHaveValue("");
-    await expect(
-      settings.getByRole("button", { name: "Save", exact: true }),
-    ).toBeDisabled();
+test("Codex settings opens inside Settings without creating a workspace tab and is absent from New tab", async ({
+  page,
+  isMobile,
+}) => {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const before = await page.request.get(`${baseUrl}/api/workspace`);
+  expect(before.ok()).toBe(true);
+  const original = (await before.json()) as WorkspaceStateResponse;
+  const tabCreations: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname === "/api/tabs"
+    ) {
+      tabCreations.push(request.url());
+    }
   });
-}
 
-const workspaceNavigations = [
-  "tab switches",
-  "window switches",
-  "pane splits",
-] as const;
+  const settings = await openCodexSettings(page, isMobile);
+  await expect(
+    settings.getByRole("textbox", { name: "Default model" }),
+  ).toHaveValue("");
+  await expect(
+    settings.getByRole("button", { name: "Save Codex settings", exact: true }),
+  ).toBeDisabled();
+  const after = await page.request.get(`${baseUrl}/api/workspace`);
+  expect(after.ok()).toBe(true);
+  expect(((await after.json()) as WorkspaceStateResponse).tabs).toEqual(
+    original.tabs,
+  );
+  expect(tabCreations).toEqual([]);
 
-for (const navigation of workspaceNavigations) {
-  test(`Codex Settings keeps drafts across workspace ${navigation} and discards them when the tab closes`, async ({
+  await page
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await page
+    .locator(".workspace-pane.active")
+    .getByTitle("Add tab to this pane")
+    .click();
+  await expect(
+    page.getByRole("heading", { name: "New tab", exact: true }),
+  ).toBeVisible();
+  const plugins = page.getByRole("combobox", { name: "Plugin", exact: true });
+  await expect(plugins).toBeEnabled();
+  await expect(plugins.locator('option[value="codex-settings"]')).toHaveCount(
+    0,
+  );
+  await expect(plugins).not.toContainText("Codex Settings");
+});
+
+const settingsNavigations = ["category switches", "search filtering"] as const;
+
+for (const navigation of settingsNavigations) {
+  test(`Codex Settings keeps drafts across ${navigation} and discards them when Settings closes`, async ({
     page,
     isMobile,
   }) => {
@@ -513,23 +508,24 @@ for (const navigation of workspaceNavigations) {
       configPath,
       'model = "initial-model"\nservice_tier = "priority"\n',
     );
-    if (navigation === "window switches") await prepareWindowSwitch(page);
     const initialRead = page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
     );
-    const settings = await openCodexSettings(page);
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    const settings = await openCodexSettings(page, isMobile);
     const initialRevision = (await (await initialRead).json()).result.settings
       .revision;
-    await createWorkspaceTab(page, "Local Web", "Other work");
-    await activateWorkspaceTab(page, "Codex defaults");
     const model = settings.getByRole("textbox", { name: "Default model" });
     const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
-    const save = settings.getByRole("button", { name: "Save", exact: true });
+    const save = settings.getByRole("button", {
+      name: "Save Codex settings",
+      exact: true,
+    });
     await model.fill("unsaved-draft-model");
     await fastMode.selectOption({ label: "Off" });
 
-    await navigateWorkspace(page, isMobile, navigation);
+    await navigateCodexSettings(page, navigation);
     await expect(model).toHaveValue("unsaved-draft-model");
     await expect(fastMode).toHaveValue("default");
     await expect(save).toBeEnabled();
@@ -556,18 +552,17 @@ for (const navigation of workspaceNavigations) {
 
     await model.fill("discarded-draft-model");
     await fastMode.selectOption({ label: "Flex" });
-    await activateWorkspaceTab(page, "Other work");
     await page
-      .getByRole("button", { name: "Close Codex defaults", exact: true })
+      .getByRole("button", { name: "Close settings", exact: true })
       .click();
     await expect(page.locator(".codex-settings-panel")).toHaveCount(0);
-    await createCodexSettingsTab(page);
+    await openCodexSettings(page, isMobile);
     await expect(model).toHaveValue("unsaved-draft-model");
     await expect(fastMode).toHaveValue("default");
     await expect(save).toBeDisabled();
   });
 
-  test(`Codex Settings keeps a rejected stale draft and its revision across workspace ${navigation} until Reload`, async ({
+  test(`Codex Settings keeps a rejected stale draft and its revision across ${navigation} until Reload`, async ({
     page,
     isMobile,
   }, testInfo) => {
@@ -578,19 +573,20 @@ for (const navigation of workspaceNavigations) {
       configPath,
       `model = "initial-model"\nservice_tier = "default"\n${unrelatedSettings}`,
     );
-    if (navigation === "window switches") await prepareWindowSwitch(page);
     const initialRead = page.waitForResponse(
       (response) =>
         new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
     );
-    const settings = await openCodexSettings(page);
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    const settings = await openCodexSettings(page, isMobile);
     const initialRevision = (await (await initialRead).json()).result.settings
       .revision;
-    await createWorkspaceTab(page, "Local Web", "Other work");
-    await activateWorkspaceTab(page, "Codex defaults");
     const model = settings.getByRole("textbox", { name: "Default model" });
     const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
-    const save = settings.getByRole("button", { name: "Save", exact: true });
+    const save = settings.getByRole("button", {
+      name: "Save Codex settings",
+      exact: true,
+    });
     await expect(model).toHaveValue("initial-model");
     await expect(fastMode).toHaveValue("default");
     await model.fill("unsaved-draft-model");
@@ -621,7 +617,7 @@ for (const navigation of workspaceNavigations) {
     await settings.getByRole("alert").scrollIntoViewIfNeeded();
     await captureSample(page, testInfo, "codex-settings-stale-draft");
 
-    await navigateWorkspace(page, isMobile, navigation);
+    await navigateCodexSettings(page, navigation);
     await expect(model).toHaveValue("unsaved-draft-model");
     await expect(fastMode).toHaveValue("priority");
     await expect(settings.getByRole("alert")).toHaveText(
@@ -666,13 +662,18 @@ for (const navigation of workspaceNavigations) {
 for (const serviceTier of ["priority", "default", "flex"]) {
   test(`Codex Settings enables disabled fast mode support with the saved ${serviceTier} tier unchanged`, async ({
     page,
+    isMobile,
   }, testInfo) => {
     const configPath = path.join(testRoot, "codex-home", "config.toml");
     const initialConfig = `model = "initial-model"\nservice_tier = "${serviceTier}"\n[features]\nfast_mode = false\n`;
     await fs.writeFile(configPath, initialConfig);
-    const settings = await openCodexSettings(page);
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    const settings = await openCodexSettings(page, isMobile);
     const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
-    const save = settings.getByRole("button", { name: "Save", exact: true });
+    const save = settings.getByRole("button", {
+      name: "Save Codex settings",
+      exact: true,
+    });
     const enable = settings.getByRole("button", {
       name: "Enable fast mode support",
       exact: true,
@@ -772,137 +773,42 @@ for (const viewport of [
   });
 }
 
-async function openCodexSettings(page: Page) {
-  const initialWorkspace = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === "/api/workspace" &&
-      response.request().method() === "GET",
-  );
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  const response = await initialWorkspace;
-  expect(response.ok()).toBe(true);
-  const workspace = (await response.json()) as WorkspaceStateResponse;
-  const activeWindow = workspace.windows.find(
-    (window) => window.id === workspace.activeWindowId,
-  )!;
-  await expect(page.locator(".workspace-pane.active")).toHaveAttribute(
-    "data-pane-id",
-    activeWindow.layout.activePaneId,
-  );
-  await expect(
-    page.getByTitle("Workspace windows", { exact: true }),
-  ).toHaveText(activeWindow.name);
-  return createCodexSettingsTab(page);
-}
-
-async function createWorkspaceTab(page: Page, plugin: string, title: string) {
-  await page
-    .locator(".workspace-pane.active")
-    .getByTitle("Add tab to this pane")
-    .click();
-  await expect(
-    page.getByRole("heading", { name: "New tab", exact: true }),
-  ).toBeVisible();
-  await page
-    .getByRole("combobox", { name: "Plugin", exact: true })
-    .selectOption({
-      label: plugin,
-    });
-  await expect(page.getByLabel("New tab directory")).toHaveCount(0);
-  await page.getByRole("textbox", { name: "Title", exact: true }).fill(title);
-  await page.getByRole("button", { name: "Create", exact: true }).click();
-  await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
-    title,
-  );
-}
-
-async function activateWorkspaceTab(page: Page, title: string) {
-  await page.locator(".tab-activation").filter({ hasText: title }).click();
-  await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
-    title,
-  );
-}
-
-async function prepareWindowSwitch(page: Page) {
-  const response = await page.request.get(`${baseUrl}/api/workspace`);
-  expect(response.ok()).toBe(true);
-  const workspace = (await response.json()) as WorkspaceStateResponse;
-  const created = await page.request.post(`${baseUrl}/api/windows`, {
-    data: { name: "Other workspace", defaultCwd: testRoot },
-  });
-  expect(created.status()).toBe(201);
-  const restored = await page.request.post(
-    `${baseUrl}/api/windows/${workspace.activeWindowId}/active`,
-    { data: {} },
-  );
-  expect(restored.ok()).toBe(true);
-  const settled = (await restored.json()) as WorkspaceStateResponse;
-  expect(settled.activeWindowId).toBe(workspace.activeWindowId);
-  expect(settled.windows).toContainEqual(
-    expect.objectContaining({ name: "Other workspace", defaultCwd: testRoot }),
-  );
-}
-
-async function navigateWorkspace(
-  page: Page,
-  isMobile: boolean,
-  navigation: (typeof workspaceNavigations)[number],
-) {
-  const settings = page.getByRole("region", {
-    name: "Global Codex settings",
-    exact: true,
-  });
-  if (navigation === "tab switches") {
-    await activateWorkspaceTab(page, "Other work");
-    await expect(settings).toBeHidden();
-    await activateWorkspaceTab(page, "Codex defaults");
-    return;
-  }
-  if (navigation === "window switches") {
-    const switcher = page.getByTitle("Workspace windows", { exact: true });
-    const originalWindow = (await switcher.textContent())!.trim();
-    await switcher.click();
-    await page
-      .locator(".window-row-main")
-      .filter({ hasText: "Other workspace" })
-      .click();
-    await expect(switcher).toHaveText("Other workspace");
-    await expect(settings).toBeHidden();
-    await expect(page.locator(".window-menu")).toBeHidden();
-    await switcher.click();
-    await page
-      .locator(".window-row-main")
-      .filter({ hasText: originalWindow })
-      .click();
-    await expect(switcher).toHaveText(originalWindow);
-    await expect(page.locator(".window-menu")).toBeHidden();
-    return;
-  }
-  if (isMobile) {
-    await page
-      .getByRole("button", { name: "Workspace actions", exact: true })
-      .click();
-    await page
-      .getByRole("menuitem", { name: "Split vertically", exact: true })
-      .click();
-  } else {
-    await page
-      .getByRole("button", { name: "Split columns", exact: true })
-      .click();
-  }
-  await expect(page.locator(".workspace-pane")).toHaveCount(2);
-  await activateWorkspaceTab(page, "Codex defaults");
-}
-
-async function createCodexSettingsTab(page: Page) {
-  await createWorkspaceTab(page, "Codex Settings", "Codex defaults");
-  const settings = page.getByRole("region", {
+async function openCodexSettings(page: Page, isMobile: boolean) {
+  const dialog = await openSettings(page, isMobile);
+  await dialog.getByRole("tab", { name: "Codex", exact: true }).click();
+  const settings = dialog.getByRole("region", {
     name: "Global Codex settings",
     exact: true,
   });
   await expect(settings).toBeVisible();
   await expect(settings).toHaveAttribute("aria-busy", "false");
   return settings;
+}
+
+async function navigateCodexSettings(
+  page: Page,
+  navigation: (typeof settingsNavigations)[number],
+) {
+  const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
+  const panel = dialog.getByRole("region", {
+    name: "Global Codex settings",
+    exact: true,
+  });
+  if (navigation === "category switches") {
+    await dialog.getByRole("tab", { name: "General", exact: true }).click();
+    await expect(panel).toBeHidden();
+    await dialog.getByRole("tab", { name: "Codex", exact: true }).click();
+  } else {
+    const search = dialog.getByRole("searchbox", { name: "Search settings" });
+    await search.fill("No matching Codex setting");
+    await expect(panel).toBeHidden();
+    await dialog.getByRole("tab", { name: "General", exact: true }).click();
+    await search.fill("Codex service tier");
+    await expect(
+      dialog.getByRole("tab", { name: "Codex", exact: true }),
+    ).toHaveAttribute("aria-selected", "true");
+  }
+  await expect(panel).toBeVisible();
 }
 
 async function expectCodexSettingsFits(page: Page) {
@@ -923,7 +829,7 @@ async function expectCodexSettingsFits(page: Page) {
   for (const control of [
     settings.getByRole("textbox", { name: "Default model" }),
     settings.getByRole("combobox", { name: "Fast mode" }),
-    settings.getByRole("button", { name: "Save", exact: true }),
+    settings.getByRole("button", { name: "Save Codex settings", exact: true }),
     settings.getByRole("button", { name: "Reload", exact: true }),
   ]) {
     await control.scrollIntoViewIfNeeded();
