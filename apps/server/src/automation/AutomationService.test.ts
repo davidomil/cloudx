@@ -610,56 +610,82 @@ describe("AutomationService", () => {
   });
 
   it("isolates listener failures from automation execution and later listeners", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const warn = vi.fn();
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-listeners-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    hooks.register({
+      id: "fake.effect",
+      owner: { kind: "app" },
+      title: "Effect",
+      description: "Return workspace effects.",
+      exposures: ["automation"],
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      outputSchema: { type: "object", properties: { automationEffects: { type: "array", items: { type: "object" } } }, additionalProperties: true },
+      execute: () => ({
+        automationEffects: [{ type: "workspace.ui", instruction: { type: "open_tab_settings", tabId: "tab-1" } }]
+      })
+    });
+    const typeService = new AutomationTypeService();
+    const service = new AutomationService(
+      repository,
+      triggers,
+      hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService),
+      new AutomationExecutor(),
+      { logger: { warn } }
+    );
+    let deliveredRuns = 0;
+    const uiInstructions: WorkspaceUiInstruction[] = [];
+    service.onRunsChange(() => {
+      throw new Error("runs listener failed");
+    });
+    service.onRunsChange(() => {
+      deliveredRuns += 1;
+    });
+    service.onUiInstruction(() => {
+      throw new Error("ui listener failed");
+    });
+    service.onUiInstruction((instruction) => uiInstructions.push(instruction));
+    await service.saveGroup(effectGroup());
+
+    const result = await service.startTest("effect", {});
+
+    expect(result.sample.status).toBe("succeeded");
+    expect(deliveredRuns).toBeGreaterThan(0);
+    expect(uiInstructions).toEqual([{ type: "open_tab_settings", tabId: "tab-1" }]);
+    expect(warn).toHaveBeenCalledWith({ err: expect.objectContaining({ message: "runs listener failed" }), listenerKind: "runs" }, "Automation listener failed.");
+    expect(warn).toHaveBeenCalledWith({ err: expect.objectContaining({ message: "ui listener failed" }), listenerKind: "ui-instruction" }, "Automation listener failed.");
+    await service.dispose();
+  });
+
+  it("logs a trigger queue persistence failure with its trigger ID", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-queue-log-"));
+    const repository = new AutomationRepository(dataDir);
+    const triggers = new TriggerRegistry({ recordEvent: event => repository.appendTriggerEvent(event) });
+    triggers.register(triggerDefinition());
+    const hooks = new HookRegistry();
+    const typeService = new AutomationTypeService();
+    const warn = vi.fn();
+    const service = new AutomationService(
+      repository, triggers, hooks,
+      new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
+      new AutomationCompiler(typeService), new AutomationExecutor(), { logger: { warn } }
+    );
     try {
-      const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-listeners-"));
-      const repository = new AutomationRepository(dataDir);
-      const triggers = new TriggerRegistry({ recordEvent: (event) => repository.appendTriggerEvent(event) });
-      triggers.register(triggerDefinition());
-      const hooks = new HookRegistry();
-      hooks.register({
-        id: "fake.effect",
-        owner: { kind: "app" },
-        title: "Effect",
-        description: "Return workspace effects.",
-        exposures: ["automation"],
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-        outputSchema: { type: "object", properties: { automationEffects: { type: "array", items: { type: "object" } } }, additionalProperties: true },
-        execute: () => ({
-          automationEffects: [{ type: "workspace.ui", instruction: { type: "open_tab_settings", tabId: "tab-1" } }]
-        })
-      });
-      const typeService = new AutomationTypeService();
-      const service = new AutomationService(
-        repository,
-        triggers,
-        hooks,
-        new AutomationCatalogService(typeService, () => triggers.list(), () => hooks.list()),
-        new AutomationCompiler(typeService),
-        new AutomationExecutor()
-      );
-      let deliveredRuns = 0;
-      const uiInstructions: WorkspaceUiInstruction[] = [];
-      service.onRunsChange(() => {
-        throw new Error("runs listener failed");
-      });
-      service.onRunsChange(() => {
-        deliveredRuns += 1;
-      });
-      service.onUiInstruction(() => {
-        throw new Error("ui listener failed");
-      });
-      service.onUiInstruction((instruction) => uiInstructions.push(instruction));
-      await service.saveGroup(effectGroup());
-
-      const result = await service.startTest("effect", {});
-
-      expect(result.sample.status).toBe("succeeded");
-      expect(deliveredRuns).toBeGreaterThan(0);
-      expect(uiInstructions).toEqual([{ type: "open_tab_settings", tabId: "tab-1" }]);
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("listener failed"), expect.any(Error));
+      await service.saveGroup(group("queue-failure", true));
+      vi.spyOn(repository, "saveRun").mockRejectedValue(Object.assign(new Error("Run storage unavailable"), { token: "private-token" }));
+      await triggers.emit("fake.started", {}, { kind: "test" });
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledExactlyOnceWith({
+        err: expect.objectContaining({ message: "Run storage unavailable" }), triggerId: "fake.started"
+      }, "Automation trigger queue failed."));
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("private-token");
     } finally {
-      warn.mockRestore();
+      await service.dispose();
+      await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
 

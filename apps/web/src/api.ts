@@ -10,6 +10,8 @@ import type {
   AutomationValidationSummary,
   CloudxConfigResponse,
   CloudxConfigValues,
+  CloudxLogSource,
+  CloudxLogsResponse,
   ForgeConnectionAction,
   ForgeConnections,
   ForgeConnectionStatus,
@@ -473,6 +475,15 @@ export async function cancelAutomationRun(runId: string): Promise<AutomationRuns
 
 export async function getConfig(): Promise<CloudxConfigResponse> {
   return fetchJson("/api/config");
+}
+
+export async function getLogs(source: CloudxLogSource, signal?: AbortSignal): Promise<CloudxLogsResponse> {
+  const snapshot = await fetchJson<unknown>(`/api/logs?${new URLSearchParams({ source })}`, { signal });
+  if (!isRecord(snapshot) || snapshot.source !== source || typeof snapshot.content !== "string"
+    || typeof snapshot.capturedAt !== "string" || !Number.isFinite(Date.parse(snapshot.capturedAt)) || typeof snapshot.truncated !== "boolean") {
+    throw new Error("Invalid log snapshot.");
+  }
+  return { source, content: snapshot.content, capturedAt: snapshot.capturedAt, truncated: snapshot.truncated };
 }
 
 export async function getForgeConnections(signal?: AbortSignal): Promise<ForgeConnections> {

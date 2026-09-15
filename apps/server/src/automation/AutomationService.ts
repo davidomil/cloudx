@@ -5,12 +5,15 @@ import { workspaceAutomationEffectsFromResult, type AutomationCatalogResponse, t
 import type { HookRegistry } from "../hooks/HookRegistry.js";
 import { validateObjectSchema } from "../hooks/schema.js";
 import type { TriggerRegistry } from "../triggers/TriggerRegistry.js";
+import type { ServiceLogger } from "../logs/ServiceLogger.js";
+import { serializeError } from "../voice/VoiceDebugLog.js";
 import { AutomationCatalogService } from "./AutomationCatalogService.js";
 import { AutomationCompiler } from "./AutomationCompiler.js";
 import { AutomationExecutor, type AutomationEffectSink, type AutomationExecutorOptions } from "./AutomationExecutor.js";
 import { AutomationRepository, type AutomationGroupSave } from "./AutomationRepository.js";
 
 interface AutomationServiceOptions {
+  logger?: Pick<ServiceLogger, "warn">;
   startDisabled?: boolean;
   executorOptions?: Pick<AutomationExecutorOptions, "allowedRoots">;
   layoutEffects?: {
@@ -279,7 +282,7 @@ export class AutomationService {
       () => this.ownedBatches.delete(batch),
       (error) => {
         this.ownedBatches.delete(batch);
-        console.warn(`Automation trigger ${triggerId} queue failed.`, error);
+        this.options.logger?.warn({ err: serializeError(error), triggerId }, "Automation trigger queue failed.");
       }
     );
   }
@@ -415,7 +418,7 @@ export class AutomationService {
     try {
       await deliver();
     } catch (error) {
-      console.warn(`Automation ${kind} listener failed.`, error);
+      this.options.logger?.warn({ err: serializeError(error), listenerKind: kind }, "Automation listener failed.");
     }
   }
 
