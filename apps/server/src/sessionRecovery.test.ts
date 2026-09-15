@@ -25,7 +25,17 @@ afterEach(async () => {
 
 class RunningTerminal implements TerminalProcess {
   onData = () => () => {};
-  onExit = () => () => {};
+  private exitEvent?: { exitCode: number };
+  private exitListeners = new Set<(event: { exitCode: number }) => void>();
+  onExit = (listener: (event: { exitCode: number }) => void) => {
+    this.exitListeners.add(listener);
+    if (this.exitEvent) queueMicrotask(() => { if (this.exitListeners.has(listener)) listener(this.exitEvent!); });
+    return () => { this.exitListeners.delete(listener); };
+  };
+  exit(exitCode: number) {
+    this.exitEvent = { exitCode };
+    for (const listener of this.exitListeners) listener(this.exitEvent);
+  }
   write = vi.fn();
   resize = vi.fn();
   kill = vi.fn();
@@ -96,6 +106,175 @@ describe("workspace recovery after server updates", () => {
     expect(factory.spawn).toHaveBeenCalledOnce();
     expect(factory.attach).toHaveBeenCalledWith(terminal.tab.id);
     await after.sessions.dispose();
+  });
+
+  it("opens one replacement shell only after explicit recovery, preserving the tab and saved directory", async () => {
+    const { root, running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    const layout = await before.workspace.state(before.sessions.listTabs());
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    await after.sessions.restore();
+    expect(after.sessions.getTab(tab.id).recovery?.state).toBe("missing");
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    const recovering = after.sessions.recoverTab(tab.id, { action: "new-shell" });
+    expect(after.sessions.recoverTab(tab.id, { action: "new-shell" })).toBe(recovering);
+    expect(await recovering).toMatchObject({ id: tab.id, cwd: root, title: tab.title, status: "running", recovery: undefined });
+    await after.sessions.recoverTab(tab.id, { action: "new-shell" });
+    expect(factory.spawn).toHaveBeenCalledTimes(2);
+    expect(factory.spawn.mock.calls[1]![2]).toMatchObject({ cwd: root, sessionId: tab.id });
+    expect((await after.workspace.state(after.sessions.listTabs())).windows).toEqual(layout.windows);
+    expect((await after.persistence.read())?.sessions[0]?.tab.recovery).toBeUndefined();
+    await after.sessions.dispose();
+  });
+
+  it("checks an unavailable broker without spawning, then reattaches its surviving process", async () => {
+    const { factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    factory.attach.mockRejectedValueOnce(new Error("broker offline"));
+    const after = createStore();
+    await after.sessions.restore();
+    expect(after.sessions.getTab(tab.id).recovery?.state).toBe("unavailable");
+    factory.attach.mockRejectedValueOnce(new Error("broker still offline"));
+    const unavailable = await after.sessions.recoverTab(tab.id, { action: "new-shell" });
+    expect(unavailable.recovery).toMatchObject({ state: "unavailable", message: expect.stringContaining("broker still offline") });
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    expect((await after.sessions.recoverTab(tab.id, { action: "reconnect" })).status).toBe("running");
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    await after.sessions.dispose();
+  });
+
+  it("a connection check reports a confirmed missing process without starting a shell", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    await after.sessions.restore();
+    expect((await after.sessions.recoverTab(tab.id, { action: "reconnect" })).recovery?.state).toBe("missing");
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    await expect(after.sessions.recoverTab(tab.id, { action: "resume-conversation" })).rejects.toThrow("does not match");
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    await after.sessions.dispose();
+  });
+
+  it("reattaches a process whose spawn acknowledgement was lost instead of starting another", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    await after.sessions.restore();
+    factory.spawn.mockImplementationOnce(async (_command, _args, options) => {
+      running.set(options.sessionId!, new RunningTerminal());
+      throw new Error("broker acknowledgement lost");
+    });
+    await expect(after.sessions.recoverTab(tab.id, { action: "new-shell" })).rejects.toThrow("acknowledgement lost");
+    expect((await after.sessions.recoverTab(tab.id, { action: "new-shell" })).status).toBe("running");
+    expect(factory.spawn).toHaveBeenCalledTimes(2);
+    await after.sessions.dispose();
+  });
+
+  it("releases a confirmed exited process before opening another shell in its panel", async () => {
+    const { running, factory, createStore } = await fixture();
+    const store = createStore();
+    const { tab } = await store.open("standard-terminal");
+    const original = running.get(tab.id)!;
+    original.terminate.mockImplementation(async () => { running.delete(tab.id); });
+    original.exit(1);
+    await vi.waitFor(() => expect(store.sessions.getTab(tab.id).recovery?.state).toBe("missing"));
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    expect((await store.sessions.recoverTab(tab.id, { action: "new-shell" })).status).toBe("running");
+    expect(original.terminate).toHaveBeenCalledOnce();
+    expect(factory.spawn).toHaveBeenCalledTimes(2);
+    expect(running.get(tab.id)).not.toBe(original);
+    await store.sessions.dispose();
+  });
+
+  it("restores an exited broker record as a missing process without launching work", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    const original = running.get(tab.id)!;
+    original.terminate.mockImplementation(async () => { running.delete(tab.id); });
+    await before.sessions.dispose();
+    original.exit(1);
+    const after = createStore();
+    await after.sessions.restore();
+    expect(after.sessions.getTab(tab.id).recovery?.state).toBe("missing");
+    expect(original.terminate).toHaveBeenCalledOnce();
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    await after.sessions.dispose();
+  });
+
+  it("keeps a successfully recovered process usable when the recovery save fails", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    await after.sessions.restore();
+    vi.spyOn(after.persistence, "flush").mockRejectedValueOnce(new Error("disk full"));
+    await expect(after.sessions.recoverTab(tab.id, { action: "new-shell" })).rejects.toThrow("disk full");
+    expect(after.sessions.getTab(tab.id)).toMatchObject({ status: "running", recovery: undefined });
+    await after.sessions.recoverTab(tab.id, { action: "new-shell" });
+    expect(factory.spawn).toHaveBeenCalledTimes(2);
+    await after.sessions.flush();
+    expect((await after.persistence.read())?.sessions[0]?.tab.status).toBe("running");
+    await after.sessions.dispose();
+  });
+
+  it("waits for an in-flight recovery before deleting the same tab", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    await after.sessions.restore();
+    const replacement = new RunningTerminal();
+    let spawned!: () => void;
+    factory.spawn.mockImplementationOnce(() => new Promise(resolve => { spawned = () => resolve(replacement); }));
+    const recovering = after.sessions.recoverTab(tab.id, { action: "new-shell" });
+    await vi.waitFor(() => expect(spawned).toBeTypeOf("function"));
+    const closing = after.sessions.closeTab(tab.id);
+    await expect(after.sessions.recoverTab(tab.id, { action: "new-shell" })).rejects.toThrow("closing");
+    expect(after.sessions.listTabs()).toHaveLength(1);
+    spawned();
+    await Promise.all([recovering, closing]);
+    expect(replacement.terminate).toHaveBeenCalledOnce();
+    expect(after.sessions.listTabs()).toEqual([]);
+    expect((await after.persistence.read())?.sessions).toEqual([]);
+    await after.sessions.dispose();
+  });
+
+  it("finishes recovery before detaching and saving during shutdown", async () => {
+    const { running, factory, createStore } = await fixture();
+    const before = createStore();
+    const { tab } = await before.open("standard-terminal");
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    await after.sessions.restore();
+    const replacement = new RunningTerminal();
+    let spawned!: () => void;
+    factory.spawn.mockImplementationOnce(() => new Promise(resolve => { spawned = () => resolve(replacement); }));
+    const recovering = after.sessions.recoverTab(tab.id, { action: "new-shell" });
+    await vi.waitFor(() => expect(spawned).toBeTypeOf("function"));
+    const shutdown = after.sessions.dispose();
+    expect(replacement.detach).not.toHaveBeenCalled();
+    spawned();
+    await Promise.all([recovering, shutdown]);
+    expect(replacement.detach).toHaveBeenCalledOnce();
+    expect((await after.persistence.read())?.sessions[0]?.tab).toMatchObject({ id: tab.id, status: "running" });
+    await expect(after.sessions.recoverTab(tab.id, { action: "new-shell" })).rejects.toThrow("disposed");
   });
 
   it("does not resurrect explicitly closed tabs", async () => {

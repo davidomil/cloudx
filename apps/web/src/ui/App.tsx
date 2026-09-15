@@ -25,6 +25,7 @@ import {
   isWorkspaceLayoutDurable,
   persistWindowLayout,
   persistWorkspace,
+  recoverTab,
   saveLayoutTemplate,
   searchWorkspaceWindows,
   selectWindow,
@@ -45,6 +46,8 @@ import { disposeFileBrowserTransfersExcept } from "./fileBrowserTransfers.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 import { PathEntry } from "./PathEntry.js";
 import { TabPanel } from "./TabPanel.js";
+import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
+import type { RecoverTabRequest } from "@cloudx/shared";
 import {
   activatePane,
   activatePaneTab,
@@ -201,6 +204,7 @@ export function App() {
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   const [maximizedPaneId, setMaximizedPaneId] = useState<string | undefined>();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsCategory, setSettingsCategory] = useState("general");
   const [tabSettings, setTabSettings] = useState<{ tabId: string; sectionId?: string } | undefined>();
   const [createTargetPaneId, setCreateTargetPaneId] = useState<string | undefined>();
   const [error, setError] = useState<string | undefined>();
@@ -800,18 +804,33 @@ export function App() {
   async function handleClose(tabId: string) {
     setError(undefined);
     try {
-      const result = await workspaceWrites.run(() => closeTab(tabId));
-      setTabs((current) => current.filter((tab) => tab.id !== tabId));
-      updateLayout((current) => removeTabFromPanes(current, tabId));
-      activeTabIdRef.current = result.activeTabId;
-      setActiveTabId(result.activeTabId);
-      disposeTerminalView(tabId);
-      disposeDocumentationIngestController(tabId);
-      setDocumentationPanelStates((current) => omitRecordKey(current, tabId));
-      setAutomationPanelStates((current) => omitRecordKey(current, tabId));
+      await removeWorkspaceTab(tabId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function removeWorkspaceTab(tabId: string) {
+    const result = await workspaceWrites.run(() => closeTab(tabId));
+    setTabs((current) => current.filter((tab) => tab.id !== tabId));
+    updateLayout((current) => removeTabFromPanes(current, tabId));
+    activeTabIdRef.current = result.activeTabId;
+    setActiveTabId(result.activeTabId);
+    disposeTerminalView(tabId);
+    disposeDocumentationIngestController(tabId);
+    setDocumentationPanelStates((current) => omitRecordKey(current, tabId));
+    setAutomationPanelStates((current) => omitRecordKey(current, tabId));
+  }
+
+  async function handleRecoverTab(tabId: string, input: RecoverTabRequest) {
+    const tab = await workspaceWrites.run(() => recoverTab(tabId, input));
+    setTabs(current => current.map(currentTab => currentTab.id === tabId ? tab : currentTab));
+  }
+
+  async function retireSettingsTab(tabId: string) {
+    await removeWorkspaceTab(tabId);
+    setSettingsCategory("codex");
+    setSettingsOpen(true);
   }
 
   function handleTranscriptKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -1448,10 +1467,11 @@ export function App() {
       {settingsOpen && config ? (
         <SettingsDialog
           config={config}
+          initialCategoryId={settingsCategory}
           callHook={pluginById.has("codex-settings") ? callUiHook : undefined}
           cloudxUpdate={cloudxUpdate}
           rulesSkillsStore={rulesSkillsStore}
-          onCancel={() => setSettingsOpen(false)}
+          onCancel={() => { setSettingsOpen(false); setSettingsCategory("general"); }}
           onSave={handleSaveConfig}
           onClearPluginSecret={handleClearPluginSecret}
           onSaveDefaultTemplate={handleSetDefaultTemplate}
@@ -1635,6 +1655,8 @@ export function App() {
                   active={paneActive && selected}
                   config={pluginConfig(tab.pluginId)}
                   uiScale={uiScale}
+                  onRecover={input => handleRecoverTab(tab.id, input)}
+                  onRetire={() => retireSettingsTab(tab.id)}
                   uiContributionRegistry={uiContributionRegistry}
                   callHook={callUiHook}
                   automationRuns={automationRuns}
@@ -2125,6 +2147,8 @@ function PluginPanel({
   active,
   config,
   uiScale,
+  onRecover,
+  onRetire,
   uiContributionRegistry,
   callHook,
   automationRuns,
@@ -2140,6 +2164,8 @@ function PluginPanel({
   active: boolean;
   config: Record<string, ConfigValue>;
   uiScale: number;
+  onRecover: (input: RecoverTabRequest) => Promise<void>;
+  onRetire: () => Promise<void>;
   uiContributionRegistry: UiContributionRegistry;
   callHook: UiContributionRenderContext["callHook"];
   automationRuns: AutomationRunSummary[];
@@ -2149,6 +2175,9 @@ function PluginPanel({
   emitTrigger: TriggerEmitter;
   onAutomationGroupsChanged: () => Promise<void>;
 }) {
+  if (tab.pluginId === "codex-settings") {
+    return <WorkspaceRecoveryPanel tab={tab} recovery={tab.recovery ?? { state: "retired", message: "Codex settings are now available in Settings → Codex." }} onRetire={onRetire} />;
+  }
   const panelContribution = selectPluginPanelContribution(plugins, plugin);
   if (panelContribution) {
     const panel = uiContributionRegistry.render(panelContribution, { tab, plugin, plugins, active, config, uiScale, callHook });
@@ -2179,7 +2208,7 @@ function PluginPanel({
   if (plugin?.panelKind === "terminal" || !plugin) {
     return (
       <Suspense fallback={<div className="empty-pane">Loading terminal...</div>}>
-        <TerminalPanel tab={tab} active={active} uiScale={uiScale} />
+        <TerminalPanel tab={tab} active={active} uiScale={uiScale} onRecover={onRecover} />
       </Suspense>
     );
   }

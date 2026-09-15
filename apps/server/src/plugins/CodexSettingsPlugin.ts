@@ -16,6 +16,7 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly panelKind = "placeholder" as const;
   readonly creatable = false;
   readonly requiresDirectory = false;
+  readonly retirementMessage = "Codex settings moved to Settings → Codex. Open Settings and remove this obsolete tab; your preferences are preserved.";
   readonly actions = [];
   readonly hooks: HookDefinition[];
 

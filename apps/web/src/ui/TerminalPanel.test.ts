@@ -112,6 +112,7 @@ describe("TerminalPanel", () => {
   let host: HTMLDivElement | undefined;
 
   beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     terminalPanelMocks.fitCalls.length = 0;
     terminalPanelMocks.terminals.length = 0;
     terminalPanelMocks.releaseMobileScroller = vi.fn();
@@ -300,6 +301,29 @@ describe("TerminalPanel", () => {
     TestWebSocket.latest!.close(code);
     vi.advanceTimersByTime(10_000);
     expect(TestWebSocket.instances).toHaveLength(1);
+  });
+
+  it("shows recovery for saved failed tabs without opening a rejected socket", () => {
+    act(() => root!.render(createElement(TerminalPanel, {
+      tab: { ...tab, status: "failed", recovery: { state: "missing", message: "The previous shell process ended." } },
+      active: true, uiScale: 1, onRecover: vi.fn()
+    })));
+    expect(host!.textContent).toContain("Open new shell");
+    expect(TestWebSocket.instances).toHaveLength(0);
+  });
+
+  it("replaces a code 1008 dead end with a connection check and reconnects after recovery", async () => {
+    const recover = vi.fn().mockResolvedValue(undefined);
+    act(() => root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1, onRecover: recover })));
+    act(() => TestWebSocket.latest!.close(1008));
+    expect(host!.textContent).toContain("The terminal connection was rejected.");
+    expect(terminalPanelMocks.terminals[0]!.disposed).toBe(true);
+    const button = host!.querySelector<HTMLButtonElement>("button")!;
+    expect(button.textContent).toBe("Check connection");
+    await act(async () => button.click());
+    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "reconnect" });
+    expect(TestWebSocket.instances).toHaveLength(2);
+    expect(host!.querySelector(".terminal-panel")).not.toBeNull();
   });
 
   it("uploads pasted images into Codex terminal tabs and inserts workspace image references", async () => {

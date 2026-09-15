@@ -1519,6 +1519,23 @@ a:hover svg {
   overflow: hidden;
 }
 
+.workspace-recovery-panel {
+  width: 100%;
+  height: 100%;
+  padding: 24px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+.workspace-recovery-panel h2 { display: flex; align-items: center; gap: 8px; font-size: var(--font-size-md); }
+.workspace-recovery-panel p { max-width: 680px; }
+.workspace-recovery-directory { color: var(--color-muted-foreground); }
+.workspace-recovery-panel form { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-top: 20px; }
+.workspace-recovery-panel label { display: flex; flex-direction: column; gap: 8px; width: min(100%, 440px); }
+.workspace-recovery-panel input { width: 100%; min-height: 44px; }
+.workspace-recovery-panel .cx-button { min-height: 44px; white-space: normal; }
+.workspace-recovery-panel [role="alert"] { color: var(--color-warning); }
+
 .terminal-panel::after {
   content: "";
   position: absolute;

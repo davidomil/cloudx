@@ -1,14 +1,15 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-import { terminalInputMessages, type WorkspaceTab } from "@cloudx/shared";
+import { terminalInputMessages, type RecoverTabRequest, type TabRecovery, type WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 import { readTerminalColorTheme } from "./theme.js";
 import { registerTerminalView, unregisterTerminalView } from "./terminalViewStore.js";
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
 import { uploadFileBrowserFile } from "../api.js";
+import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 
 interface TerminalView {
   tabId: string;
@@ -28,6 +29,8 @@ interface TerminalView {
   releaseMobileScroll?: () => void;
   releaseImagePaste?: () => void;
   uiScale: number;
+  connectionError?: string;
+  onConnectionError?: (message: string) => void;
 }
 
 interface PastedTerminalImage {
@@ -52,20 +55,38 @@ const CODEX_PASTED_IMAGE_EXTENSIONS = new Map([
 ]);
 let pastedImageSequence = 0;
 
-export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) {
+export function TerminalPanel({ tab, active, uiScale, onRecover }: {
+  tab: WorkspaceTab;
+  active: boolean;
+  uiScale: number;
+  onRecover?: (input: RecoverTabRequest) => Promise<void>;
+}) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<TerminalView | null>(null);
   const activeRef = useRef(active);
+  const [connectionError, setConnectionError] = useState<string>();
+  const recovery: TabRecovery | undefined = onRecover ? tab.recovery ?? (connectionError || tab.status === "failed" ? {
+    state: "unavailable",
+    message: connectionError ?? tab.statusMessage ?? "The terminal could not be restored. Check its connection to determine whether its process is still running."
+  } : undefined) : undefined;
+  const needsRecovery = Boolean(recovery);
+  const recoveryEnabled = Boolean(onRecover);
 
   useEffect(() => {
     activeRef.current = active;
   }, [active]);
 
   useEffect(() => {
+    if (needsRecovery) {
+      disposeTerminalViewInternal(tab.id);
+      return;
+    }
     if (!containerRef.current) return;
 
     const view = getTerminalView(tab, containerRef.current, uiScale);
     viewRef.current = view;
+    view.onConnectionError = recoveryEnabled ? setConnectionError : undefined;
+    if (recoveryEnabled && view.connectionError) setConnectionError(view.connectionError);
 
     const scheduleViewportFit = () => scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active: activeRef.current, trigger: "viewport-change" }));
     const scheduleViewportInset = () => scheduleTerminalKeyboardInsetUpdate(view);
@@ -85,9 +106,10 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
       cancelTerminalInputReveal(view);
       clearTerminalKeyboardInset(view);
       releaseTerminalContainerBindings(view);
+      view.onConnectionError = undefined;
       viewRef.current = null;
     };
-  }, [tab.id, tab.cwd, tab.title, uiScale]);
+  }, [tab.id, tab.cwd, tab.title, uiScale, needsRecovery, recoveryEnabled]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -96,7 +118,10 @@ export function TerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; act
     }
   }, [active]);
 
-  return <div className="terminal-panel" ref={containerRef} />;
+  return recovery && onRecover ? <WorkspaceRecoveryPanel tab={tab} recovery={recovery} onRecover={async input => {
+    await onRecover(input);
+    setConnectionError(undefined);
+  }} /> : <div className="terminal-panel" ref={containerRef} />;
 }
 
 function disposeTerminalViewInternal(tabId: string): void {
@@ -191,7 +216,13 @@ function subscribeTerminalSocket(view: TerminalView): void {
     fitAndResize(view);
   });
   socket.addEventListener("close", (event) => {
-    if (!isCurrentSocket() || view.reconnectTimer !== undefined || event.code === 1003 || event.code === 1008) return;
+    if (!isCurrentSocket()) return;
+    if (event.code === 1008) {
+      view.connectionError = "The terminal connection was rejected. Check its connection to determine whether its process is still running.";
+      view.onConnectionError?.(view.connectionError);
+      return;
+    }
+    if (view.reconnectTimer !== undefined || event.code === 1003) return;
     const delay = Math.min(TERMINAL_SOCKET_RECONNECT_BASE_MS * 2 ** view.reconnectAttempt++, TERMINAL_SOCKET_RECONNECT_MAX_MS);
     view.reconnectTimer = window.setTimeout(() => {
       view.reconnectTimer = undefined;

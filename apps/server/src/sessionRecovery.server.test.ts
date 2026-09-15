@@ -6,8 +6,10 @@ import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
-import type { CreateTabResponse, WorkspaceStateResponse } from "@cloudx/shared";
+import { listTabLayoutPanes, type CreateTabResponse, type WorkspaceStateResponse, type WorkspaceTab } from "@cloudx/shared";
 import { loadConfig } from "./config.js";
+import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
+import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import { buildServer, buildServices } from "./server.js";
 import { SessionStateStore } from "./workspace/SessionStateStore.js";
 import { TerminalBroker } from "./terminal/TerminalBroker.js";
@@ -28,6 +30,174 @@ describe("workspace recovery across server updates", () => {
       expect(requestUrl.origin).toBe("http://127.0.0.1:9");
       expect(requestUrl.pathname).toBe("/enrichment/pending");
       expect(options?.method).toBe("GET");
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("opens one replacement shell only on request after a fresh broker, preserving both windows and other panels", async () => {
+    const fixture = await recoveryFixture();
+    try {
+      await fixture.startBroker();
+      const original = await fixture.startServer();
+      const main = original.services.workspace!.getActiveWindow();
+      const project = path.join(fixture.root, "project");
+      await fs.mkdir(project);
+      const first = await original.services.workspaceCommands!.createTab({
+        pluginId: "standard-terminal", title: "Project shell", cwd: project,
+        windowId: main.id, paneId: main.layout.activePaneId
+      });
+      const viewer = await original.services.workspaceCommands!.createTab({
+        pluginId: "local-web", title: "Preview", cwd: fixture.root, initialInput: { url: "http://localhost:4000" },
+        windowId: main.id, paneId: main.layout.activePaneId, newPane: true
+      });
+      const music = await original.services.workspace!.createWindow({ name: "Music", defaultCwd: fixture.root });
+      const second = await original.services.workspaceCommands!.createTab({
+        pluginId: "standard-terminal", title: "Music shell", cwd: fixture.root,
+        windowId: music.id, paneId: music.layout.activePaneId
+      });
+      const before = await workspaceSnapshot(original.app);
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+      await original.app.close();
+      await fixture.stopBroker();
+      await fixture.startBroker();
+
+      const restored = await fixture.startServer();
+      const failed = await workspaceSnapshot(restored.app);
+      expect(failed.windows).toEqual(before.windows);
+      expect(failed.activeWindowId).toBe(before.activeWindowId);
+      expect(failed.activeTabId).toBe(before.activeTabId);
+      expect(failed.tabs.map(tab => tab.id)).toEqual(before.tabs.map(tab => tab.id));
+      for (const tabId of [first.tab.id, second.tab.id]) {
+        expect(failed.tabs.find(tab => tab.id === tabId)).toMatchObject({ status: "failed", recovery: { state: "missing" } });
+      }
+      expect(failed.tabs.find(tab => tab.id === viewer.tab.id)).toMatchObject({ status: "running" });
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+
+      for (const payload of [{ action: "restart" }, { action: "new-shell", sessionId: "other" }, { action: "resume-conversation", sessionId: "../other" }, { action: "new-shell", extra: true }]) {
+        const response = await restored.app.inject({
+          method: "POST", url: `/api/tabs/${first.tab.id}/recover`, headers: { host: "localhost" }, payload
+        });
+        expect(response.statusCode, response.body).toBe(400);
+      }
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+
+      const recover = () => restored.app.inject({
+        method: "POST", url: `/api/tabs/${first.tab.id}/recover`, headers: { host: "localhost" },
+        payload: { action: "new-shell" }
+      });
+      const concurrent = await Promise.all([recover(), recover()]);
+      for (const response of concurrent) {
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json<WorkspaceTab>()).toMatchObject({ id: first.tab.id, title: first.tab.title, cwd: project, status: "running" });
+        expect(response.json<WorkspaceTab>().recovery).toBeUndefined();
+      }
+      expect((await recover()).statusCode).toBe(200);
+      expect(fixture.spawn).toHaveBeenCalledTimes(3);
+      expect(fixture.spawn.mock.calls[2]![2]).toMatchObject({ cwd: project, sessionId: first.tab.id });
+      const shell = restored.services.sessions.getSession(first.tab.id);
+      let output = "";
+      shell.onData!(data => { output += data; });
+      shell.write!("stty -echo; printf '\\nRECOVERED_CWD=%s\\n' \"$PWD\"\n");
+      await vi.waitFor(() => expect(output).toContain(`RECOVERED_CWD=${project}`));
+      const after = await workspaceSnapshot(restored.app);
+      expect(after.windows).toEqual(before.windows);
+      expect(after.activeWindowId).toBe(before.activeWindowId);
+      expect(after.activeTabId).toBe(before.activeTabId);
+      expect(after.tabs.map(tab => tab.id)).toEqual(before.tabs.map(tab => tab.id));
+      expect(after.tabs.find(tab => tab.id === second.tab.id)).toMatchObject({ recovery: { state: "missing" } });
+      expect(restored.services.sessions.getSession(viewer.tab.id).snapshot().state).toMatchObject({ url: "http://localhost:4000/" });
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
+  it.skipIf(process.platform !== "linux")("never replaces an unreachable shell and reconnects its original process when the broker returns", async () => {
+    const fixture = await recoveryFixture();
+    try {
+      await fixture.startBroker();
+      const original = await fixture.startServer();
+      const window = original.services.workspace!.getActiveWindow();
+      const { tab } = await original.services.workspaceCommands!.createTab({
+        pluginId: "standard-terminal", cwd: fixture.root, windowId: window.id, paneId: window.layout.activePaneId
+      });
+      const shell = original.services.sessions.getSession(tab.id);
+      let output = "";
+      shell.onData!(data => { output += data; });
+      shell.write!("stty -echo; printf '\\nORIGINAL_PID=%s\\n' \"$$\"\n");
+      await vi.waitFor(() => expect(output).toMatch(/ORIGINAL_PID=\d+/u));
+      const pid = Number(/ORIGINAL_PID=(\d+)/u.exec(output)![1]);
+      await original.app.close();
+      await fs.rename(fixture.socketPath, `${fixture.socketPath}.offline`);
+      const restored = await fixture.startServer();
+      expect(restored.services.sessions.getTab(tab.id)).toMatchObject({ status: "failed", recovery: { state: "unavailable" } });
+      for (const action of ["new-shell", "reconnect"]) {
+        const response = await restored.app.inject({
+          method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" }, payload: { action }
+        });
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json<WorkspaceTab>()).toMatchObject({ id: tab.id, status: "failed", recovery: { state: "unavailable" } });
+      }
+      expect(fixture.spawn).toHaveBeenCalledOnce();
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      await fs.rename(`${fixture.socketPath}.offline`, fixture.socketPath);
+      const response = await restored.app.inject({
+        method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" }, payload: { action: "reconnect" }
+      });
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.json<WorkspaceTab>()).toMatchObject({ id: tab.id, status: "running" });
+      expect(response.json<WorkspaceTab>().recovery).toBeUndefined();
+      const resumed = restored.services.sessions.getSession(tab.id);
+      let resumedOutput = "";
+      resumed.onData!(data => { resumedOutput += data; });
+      resumed.write!("printf '\\nRECONNECTED_PID=%s\\n' \"$$\"\n");
+      await vi.waitFor(() => expect(resumedOutput).toContain(`RECONNECTED_PID=${pid}`));
+      expect(fixture.spawn).toHaveBeenCalledOnce();
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
+  it("restores a saved settings tab as retired and removes only that tab without updating Codex preferences", async () => {
+    const fixture = await recoveryFixture();
+    const updateSettings = vi.spyOn(CodexSettingsService.prototype, "update");
+    const writePreferences = vi.spyOn(CodexStateSources.prototype, "replaceConfig");
+    try {
+      const original = await fixture.startServer();
+      const window = original.services.workspace!.getActiveWindow();
+      const retained = await original.services.workspaceCommands!.createTab({
+        pluginId: "local-web", title: "Preview", cwd: fixture.root, initialInput: { url: "http://localhost:4000" },
+        windowId: window.id, paneId: window.layout.activePaneId
+      });
+      const legacy = await original.services.workspaceCommands!.createTab({
+        pluginId: "local-web", title: "Codex defaults", cwd: fixture.root,
+        windowId: window.id, paneId: window.layout.activePaneId
+      });
+      const before = await workspaceSnapshot(original.app);
+      await original.app.close();
+      const store = new SessionStateStore(fixture.config.dataDir);
+      const saved = (await store.read())!;
+      const obsolete = saved.sessions.find(session => session.tab.id === legacy.tab.id)!;
+      obsolete.tab.pluginId = "codex-settings";
+      delete obsolete.initialInput;
+      await store.save(saved);
+
+      const restored = await fixture.startServer();
+      const after = await workspaceSnapshot(restored.app);
+      expect(after.windows).toEqual(before.windows);
+      expect(after.tabs.find(tab => tab.id === legacy.tab.id)).toMatchObject({
+        pluginId: "codex-settings", recovery: { state: "retired", message: expect.stringMatching(/Settings.*Codex/u) }
+      });
+      const removed = await restored.app.inject({ method: "DELETE", url: `/api/tabs/${legacy.tab.id}`, headers: { host: "localhost" } });
+      expect(removed.statusCode, removed.body).toBe(200);
+      const remaining = await workspaceSnapshot(restored.app);
+      expect(remaining.tabs).toMatchObject([{ id: retained.tab.id, status: "running" }]);
+      expect(remaining.windows.map(window => window.id)).toEqual(before.windows.map(window => window.id));
+      expect(remaining.windows.flatMap(window => listTabLayoutPanes(window.layout.root).flatMap(pane => pane.tabIds))).toEqual([retained.tab.id]);
+      expect((await store.read())!.sessions.map(session => session.tab.id)).toEqual([retained.tab.id]);
+      expect(updateSettings).not.toHaveBeenCalled();
+      expect(writePreferences).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+      await fixture.close();
     }
   });
 
@@ -382,6 +552,58 @@ describe("workspace recovery across server updates", () => {
     }
   });
 });
+
+async function recoveryFixture() {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-explicit-recovery-"));
+  const config = loadConfig({
+    CLOUDX_DATA_DIR: path.join(root, ".cloudx"),
+    CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
+    CLOUDX_ALLOWED_ROOTS: root,
+    CLOUDX_TRUSTED_ORIGINS: "http://localhost",
+    CLOUDX_LOG_LEVEL: "silent"
+  });
+  const shell = path.join(root, "test-shell");
+  await fs.writeFile(shell, "#!/bin/sh\nexec /bin/bash --noprofile --norc\n", { mode: 0o700 });
+  vi.stubEnv("SHELL", shell);
+  const socketPath = terminalSocketPath(config.dataDir);
+  const nativeFactory = new NodePtyTerminalProcessFactory();
+  const spawn = vi.fn((...args: Parameters<NodePtyTerminalProcessFactory["spawn"]>) => nativeFactory.spawn(...args));
+  const servers: FastifyInstance[] = [];
+  let broker: TerminalBroker | undefined;
+  return {
+    root, config, socketPath, spawn,
+    async startBroker() {
+      broker = new TerminalBroker(socketPath, { spawn });
+      await broker.start();
+    },
+    async stopBroker() {
+      await broker?.stop();
+      broker = undefined;
+    },
+    async startServer() {
+      const services = buildServices(config);
+      const app = await buildServer(config, services);
+      servers.push(app);
+      return { app, services };
+    },
+    async close() {
+      try {
+        for (const server of servers.reverse()) await server.close();
+        await broker?.stop();
+      } finally {
+        vi.unstubAllEnvs();
+        await fs.rm(path.dirname(socketPath), { recursive: true, force: true });
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    }
+  };
+}
+
+async function workspaceSnapshot(app: FastifyInstance) {
+  const response = await app.inject({ url: "/api/workspace", headers: { host: "localhost" } });
+  expect(response.statusCode, response.body).toBe(200);
+  return response.json<WorkspaceStateResponse>();
+}
 
 async function connectTerminal(app: FastifyInstance, tabId: string, sockets: WebSocket[]) {
   const previousRequests = vi.mocked(fetch).mock.calls.length;
