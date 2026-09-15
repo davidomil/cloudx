@@ -272,9 +272,14 @@ does the operational refresh:
   Existing model and runtime-data directories from the saved configuration are preserved.
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
 - Rewrites user-level systemd service files when they are already installed.
-- Asks whether to restart services now; if restarted, it verifies the Cloudx,
-  ASR, and documentation indexer readiness endpoints and then prints the local URL.
-  Documentation readiness uses the saved listener host and port.
+- Asks whether to restart services now; if restarted, it verifies ASR and the
+  documentation indexer before checking Cloudx web readiness and printing the local URL.
+  Documentation readiness uses the saved listener host and port. Each endpoint gets a
+  five-minute startup budget, with at most five additional seconds for an in-flight
+  request. Archive migration and semantic index rebuilding can delay the indexer's
+  HTTP listener after an update. Verification still fails if a service does not
+  become ready within its budget; the error names the service and endpoint.
+  Failure diagnostics include logs from five minutes before verification began.
   Updates preserve exact `CLOUDX_HOST=0.0.0.0` only when a nonempty
   `CLOUDX_TRUSTED_ORIGINS` is also present. Other network-facing values and an
   incomplete wildcard configuration are replaced with `127.0.0.1`.

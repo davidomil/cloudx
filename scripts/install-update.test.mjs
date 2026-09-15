@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { InstallerRunner, runInstaller, parseArgs } from "./install-cloudx.mjs";
 import {
   inspectUpdateTarget,
@@ -528,13 +528,50 @@ describe("the complete updater plan", () => {
     expect(settingsResult.restartServices).toBe(true);
     expect(
       settingsCommands
-        .filter(({ command }) => command === "curl")
+        .filter(({ command, args }) =>
+          command === "curl" && args.at(-1).endsWith("/ready"),
+        )
         .map(({ args }) => args.at(-1)),
-    ).toEqual(expect.arrayContaining([
-      "https://127.0.0.1:3443/api/ready",
+    ).toEqual([
       "http://127.0.0.1:7810/ready",
       "http://127.0.0.1:9000/ready",
-    ]));
+      "https://127.0.0.1:3443/api/ready",
+    ]);
+  });
+  it("reports documentation startup failure and collects diagnostics before checking the web service", async () => {
+    const fixture = plannedUpdate();
+    const verificationStartedAt = Date.parse("2026-09-15T06:25:00Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(verificationStartedAt);
+    onTestFinished(() => now.mockRestore());
+    const capture = fixture.runner.capture.bind(fixture.runner);
+    fixture.runner.capture = (command, args, options) => {
+      const result = capture(command, args, options);
+      if (command === "curl" && args.at(-1) === "http://127.0.0.1:9000/ready") {
+        now.mockReturnValue(verificationStartedAt + 6 * 60_000);
+        throw new Error("Command failed (exit code 22)");
+      }
+      return result;
+    };
+
+    await expect(runInstaller(fixture.options)).rejects.toThrow(
+      "Cloudx documentation indexer readiness verification failed at http://127.0.0.1:9000/ready",
+    );
+    const commands = fixture.runner.commands;
+    expect(commands
+      .filter(({ command, args }) =>
+        command === "curl" && args.at(-1).endsWith("/ready"),
+      )
+      .map(({ args }) => args.at(-1)),
+    ).toEqual(["http://127.0.0.1:7810/ready", "http://127.0.0.1:9000/ready"]);
+    expect(commands.some(({ command, args }) =>
+      command === "systemctl" && args[1] === "status",
+    )).toBe(true);
+    expect(commands.find(({ command }) => command === "journalctl")?.args).toEqual(
+      expect.arrayContaining([
+        "-u", "cloudx-documentation.service",
+        "--since", `@${verificationStartedAt / 1000 - 5 * 60}`,
+      ]),
+    );
   });
   it("checks unattended sudo before changing the checkout", async () => {
     const fixture = plannedUpdate();
