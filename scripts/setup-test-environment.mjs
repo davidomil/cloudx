@@ -109,7 +109,7 @@ function configDocument() {
       aiControlEnabled: true,
       voiceCommandsEnabled: true,
       microphoneEnabled: false,
-      voiceModel: "gpt-5.3-codex-spark",
+      voiceModel: "gpt-5.6-luna",
       themeId: "cloudx-neon",
       uiScale: 100
     },
@@ -694,7 +694,7 @@ function serverEnv() {
     CLOUDX_APP_SERVER_ENABLED: "false",
     CLOUDX_LOG_LEVEL: "info",
     CLOUDX_AUTOMATION_START_DISABLED: "false",
-    CLOUDX_VOICE_MODEL: "gpt-5.3-codex-spark"
+    CLOUDX_VOICE_MODEL: "gpt-5.6-luna"
   };
 }
 

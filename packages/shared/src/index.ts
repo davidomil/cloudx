@@ -10,7 +10,7 @@ export * from "./documentationArchive.js";
 export * from "./codexSettings.js";
 export * from "./cloudxUpdate.js";
 
-export const DEFAULT_VOICE_MODEL = "gpt-5.3-codex-spark";
+export const DEFAULT_VOICE_MODEL = "gpt-5.6-luna";
 
 export type PluginId = "codex-terminal" | "standard-terminal" | "file-browser" | "local-web" | string;
 

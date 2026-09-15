@@ -22,7 +22,7 @@ describe("ConfigService", () => {
     });
 
     await service.update({
-      global: { aiControlEnabled: false, voiceCommandsEnabled: false, voiceModel: "gpt-5.4-mini", themeId: "minimalist-dark", uiScale: 115 },
+      global: { aiControlEnabled: false, voiceCommandsEnabled: false, voiceModel: "gpt-5.6-luna", themeId: "minimalist-dark", uiScale: 115 },
       plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
     });
 
@@ -32,7 +32,7 @@ describe("ConfigService", () => {
     const reloaded = new ConfigService(dataDir, () => [fileBrowserDescriptor()]);
     expect(reloaded.getResponse()).toMatchObject({
       values: {
-        global: { aiControlEnabled: false, voiceCommandsEnabled: false, microphoneEnabled: true, voiceModel: "gpt-5.4-mini", themeId: "minimalist-dark", uiScale: 115 },
+        global: { aiControlEnabled: false, voiceCommandsEnabled: false, microphoneEnabled: true, voiceModel: "gpt-5.6-luna", themeId: "minimalist-dark", uiScale: 115 },
         plugins: { "file-browser": { showGitDiff: false, gitAutoRefresh: false, gitAutoRefreshSeconds: 30 } }
       }
     });
@@ -40,22 +40,22 @@ describe("ConfigService", () => {
 
   it("uses the startup voice model as the runtime default and persists overrides", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-voice-model-"));
-    const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.4" });
+    const service = new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.6-terra" });
 
     expect(service.getResponse().globalFields.find((field) => field.key === "voiceModel")).toMatchObject({
       type: "select",
-      defaultValue: "gpt-5.4",
+      defaultValue: "gpt-5.6-terra",
       options: expect.arrayContaining([
-        expect.objectContaining({ value: "gpt-5.4", label: "GPT-5.4" }),
-        expect.objectContaining({ value: "gpt-5.4-mini", label: "GPT-5.4-Mini" })
+        expect.objectContaining({ value: "gpt-5.6-terra", label: "GPT-5.6-Terra" }),
+        expect.objectContaining({ value: "gpt-5.6-luna", label: "GPT-5.6-Luna" })
       ])
     });
-    expect(service.getVoiceModel()).toBe("gpt-5.4");
+    expect(service.getVoiceModel()).toBe("gpt-5.6-terra");
 
-    await service.update({ global: { voiceModel: "gpt-5.4-mini" } });
+    await service.update({ global: { voiceModel: "gpt-5.6-luna" } });
 
-    expect(service.getVoiceModel()).toBe("gpt-5.4-mini");
-    expect(new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.4" }).getVoiceModel()).toBe("gpt-5.4-mini");
+    expect(service.getVoiceModel()).toBe("gpt-5.6-luna");
+    expect(new ConfigService(dataDir, () => [fileBrowserDescriptor()], { voiceModel: "gpt-5.6-terra" }).getVoiceModel()).toBe("gpt-5.6-luna");
   });
 
   it("saves GPT-6 for voice without changing the default model", async () => {
@@ -68,6 +68,23 @@ describe("ConfigService", () => {
 
       expect(new ConfigService(dataDir).getVoiceModel()).toBe("gpt-6-astra");
       expect(service.getResponse().globalFields.find((field) => field.key === "voiceModel")?.defaultValue).toBe(DEFAULT_VOICE_MODEL);
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"])("rejects retired voice model %s and resolves old saved selections to the supported default", async (model) => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-config-retired-model-"));
+    try {
+      await fs.writeFile(path.join(dataDir, "config.json"), JSON.stringify({ global: { voiceModel: model } }));
+      const service = new ConfigService(dataDir);
+
+      expect(service.getVoiceModel()).toBe("gpt-5.6-luna");
+      await expect(service.update({ global: { voiceModel: model } })).rejects.toThrow("global.voiceModel must be one of the configured options.");
+      expect(service.getVoiceModel()).toBe("gpt-5.6-luna");
+
+      await service.update({ global: { voiceModel: "gpt-5.6-terra" } });
+      expect(new ConfigService(dataDir).getVoiceModel()).toBe("gpt-5.6-terra");
     } finally {
       await fs.rm(dataDir, { recursive: true, force: true });
     }
