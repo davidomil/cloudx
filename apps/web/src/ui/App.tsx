@@ -22,6 +22,9 @@ import {
   getNotifications,
   getPlugins,
   getWorkspace,
+  isWorkspaceLayoutDurable,
+  persistWindowLayout,
+  persistWorkspace,
   saveLayoutTemplate,
   searchWorkspaceWindows,
   selectWindow,
@@ -67,6 +70,7 @@ import {
 } from "./layout.js";
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
+import { useCloudxUpdate } from "./CloudxUpdatePanel.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept } from "./terminalViewStore.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
@@ -236,7 +240,7 @@ export function App() {
   const workspaceWritesRef = useRef<WorkspaceWriteCoordinator | undefined>(undefined);
   workspaceWritesRef.current ??= new WorkspaceWriteCoordinator(
     async (windowId, persistedLayout) => {
-      await updateWindow(windowId, { layout: persistedLayout });
+      await persistWindowLayout(windowId, persistedLayout);
       if (pendingLayoutPersistWindowIdRef.current === windowId && pendingLayoutPersistRef.current === persistedLayout) {
         clearPendingLayoutPersistence();
         resolveLayoutPersistenceError();
@@ -250,6 +254,8 @@ export function App() {
     }
   );
   const workspaceWrites = workspaceWritesRef.current;
+  const saveWorkspace = useCallback(() => workspaceWrites.flushDurably(persistWorkspace), [workspaceWrites]);
+  const cloudxUpdate = useCloudxUpdate(settingsOpen, saveWorkspace);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -518,11 +524,12 @@ export function App() {
     let pendingMerge = options.preservePendingLayout ? workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, pendingLayoutBaseRef.current, activeTabIdRef.current) : undefined;
     const incomingPendingWindow = state.windows.find((window) => window.id === pendingLayoutPersistWindowIdRef.current);
     const pendingLayout = pendingLayoutPersistRef.current;
-    const serverPersistedPendingLayout = incomingPendingWindow && pendingLayout ? tabLayoutsEqual(incomingPendingWindow.layout, pendingLayout) : false;
+    const durableLayout = isWorkspaceLayoutDurable(state);
+    const serverPersistedPendingLayout = durableLayout && incomingPendingWindow && pendingLayout ? tabLayoutsEqual(incomingPendingWindow.layout, pendingLayout) : false;
     if (pendingMerge?.decision === "accepted-server" && (workspaceWrites.hasUnsettledLayoutWrite() || layoutPersistenceErrorRef.current !== undefined) && !serverPersistedPendingLayout) {
       pendingMerge = workspaceStateWithPreservedLayout(state, layoutRef.current, pendingLayoutPersistWindowIdRef.current, undefined, activeTabIdRef.current);
     }
-    if (pendingMerge?.decision === "accepted-server" && (layoutPersistenceErrorRef.current === undefined || serverPersistedPendingLayout)) {
+    if (pendingMerge?.decision === "accepted-server" && durableLayout && (layoutPersistenceErrorRef.current === undefined || serverPersistedPendingLayout)) {
       clearPendingLayoutPersistence();
       if (serverPersistedPendingLayout) {
         resolveLayoutPersistenceError();
@@ -1463,6 +1470,7 @@ export function App() {
       {settingsOpen && config ? (
         <SettingsDialog
           config={config}
+          cloudxUpdate={cloudxUpdate}
           rulesSkillsStore={rulesSkillsStore}
           onCancel={() => setSettingsOpen(false)}
           onSave={handleSaveConfig}

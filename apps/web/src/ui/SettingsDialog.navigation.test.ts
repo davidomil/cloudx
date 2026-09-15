@@ -142,6 +142,15 @@ async function pressKey(target: HTMLElement, key: string, shiftKey = false) {
 }
 
 describe("Settings navigation and search", () => {
+  it("finds the Updates action by the tools and dependencies it updates", async () => {
+    const start = vi.fn(async () => undefined);
+    const { container } = await mount({ cloudxUpdate: { status: { available: true }, starting: false, checking: false, start, check: vi.fn() } });
+    await search(container, "Codex dependencies");
+    expect(tab(container, "Updates").getAttribute("aria-selected")).toBe("true");
+    await click(button(activePanel(container), "Update CloudX and dependencies"));
+    expect(start).toHaveBeenCalledOnce();
+  });
+
   it("opens General and exposes one associated panel for each visible category", async () => {
     const { container } = await mount();
     const dialog = container.querySelector('[role="dialog"]')!;

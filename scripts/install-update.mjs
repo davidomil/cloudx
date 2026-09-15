@@ -154,10 +154,7 @@ export function inspectUpdateTarget({ paths, commands, service, port, host }) {
   };
 }
 
-export function updateCheckout(
-  commands,
-  { repoRoot, dryRun = false, updatedCommit },
-) {
+export function inspectUpdateCheckout(commands, repoRoot) {
   const gitRoot = commands.inspect("git", ["rev-parse", "--show-toplevel"]);
   if (!samePath(gitRoot, repoRoot))
     throw new Error("Run the updater from the Cloudx checkout root.");
@@ -172,7 +169,14 @@ export function updateCheckout(
       "The checkout has local changes. Commit or move them before updating; no local work was changed.",
     );
   }
-  const head = commands.inspect("git", ["rev-parse", "HEAD"]);
+  return commands.inspect("git", ["rev-parse", "HEAD"]);
+}
+
+export function updateCheckout(
+  commands,
+  { repoRoot, dryRun = false, updatedCommit },
+) {
+  const head = inspectUpdateCheckout(commands, repoRoot);
   if (updatedCommit) {
     if (head !== updatedCommit)
       throw new Error(

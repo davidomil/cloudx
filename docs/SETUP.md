@@ -195,6 +195,36 @@ Use this mode on its own; it cannot be combined with `--update`, `--uninstall`,
 or custom web-service options. Full installation and full update still install
 the pinned Codex version listed below, which can replace a newer Codex-only update.
 
+### Update from Settings
+
+Open **Settings → Updates** and select **Update CloudX and
+dependencies**. CloudX saves pending workspace layout changes, runs the
+full installer update, then reloads the browser after service readiness
+succeeds. Progress monitoring continues when Settings closes.
+
+The Settings button and `./install.sh --update` run the same dependency,
+build, restart, and readiness steps. Settings runs the installer
+unattended in a separate user service.
+
+The button requires the standard installed CloudX user services, a clean
+checkout, and noninteractive sudo access for installer prerequisites.
+Development checkouts and custom services use the terminal commands
+below. Missing permissions and authentication fail without opening
+password or Codex login prompts.
+
+The updater runs in a separate user service so restarting CloudX does
+not stop it. Persistent Codex and shell terminals reconnect to their
+existing processes and the saved workspace layout returns. New sessions
+use updated executables; running terminals continue with their current
+executables. Running automation and voice operations may stop during
+restart.
+
+If an update fails, Settings shows its status. Private installer logs
+are retained in `~/.local/state/cloudx/settings-update`. Review the
+failure before starting another update.
+
+### Update from a terminal
+
 To update the full Cloudx installation, run:
 
 ```bash

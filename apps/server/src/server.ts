@@ -74,6 +74,8 @@ import { JiraIntegrationService } from "./jira/JiraIntegrationService.js";
 import { JiraDashboardFilterStore } from "./jira/JiraDashboardFilterStore.js";
 import { JiraPollingService } from "./jira/JiraPollingService.js";
 import { SessionStore } from "./sessionStore.js";
+import { CloudxUpdateService } from "./system/CloudxUpdateService.js";
+import { registerCloudxUpdateRoutes } from "./system/CloudxUpdateRoutes.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
@@ -127,6 +129,7 @@ export interface AppServices {
   jiraPolling?: JiraPollingService;
   forge?: ForgeWorkflowService;
   forgeConnections?: ForgeConnectionService;
+  updates?: Pick<CloudxUpdateService, "status" | "start">;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   disposeRulesSkillsUpdates?: () => Promise<void>;
   codexStateSources?: CodexStateSources;
@@ -329,6 +332,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   registerLogRoutes(app, logs);
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
+  registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir), config.trustedOrigins);
   if (services.forgeConnections) registerForgeConnectionRoutes(app, services.forgeConnections, config.trustedOrigins);
 
   app.get("/api/plugins/installed", async () => ({ plugins: services.installedPlugins!.listPublicRecordsSync() }));
@@ -431,6 +435,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.get("/api/tabs", async () => ({ tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() }));
 
   app.get("/api/workspace", async () => workspaceState(services));
+
+  app.post("/api/workspace/persist", async () => {
+    await services.workspace!.persistDurably();
+    return { ok: true };
+  });
 
   app.post<{ Body: unknown }>("/api/windows", async (request, reply) => {
     await services.workspace!.createWindow(createWindowBody(request.body));

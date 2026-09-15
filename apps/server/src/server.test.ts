@@ -8,7 +8,7 @@ import { describe, expect, it, onTestFinished, vi } from "vitest";
 import WebSocket, { type RawData, WebSocketServer } from "ws";
 
 import { descriptorFromPlugin, pluginActionHookId, type CreatePluginSessionInput, type WorkspacePlugin } from "@cloudx/plugin-api";
-import { RULES_SKILLS_PLUGIN_ID } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, type TabLayoutState } from "@cloudx/shared";
 
 import { DEFAULT_ASR_TIMEOUT_MS } from "./asrClient.js";
 import {
@@ -1336,6 +1336,47 @@ describe("buildServer", () => {
     } finally {
       workspaceFile.write = originalWrite;
       client?.close();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["ENOSPC", "EDQUOT"])("requires durable workspace persistence after an earlier %s layout PATCH", async (code) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-workspace-durable-route-"));
+    const config = { ...testConfig(root), logLevel: "silent" as const, automationStartDisabled: true };
+    const services = buildServices(config);
+    const store = services.workspace!;
+    const window = await store.createWindow({ name: "Saved", defaultCwd: root });
+    const layout: TabLayoutState = {
+      root: {
+        type: "split", id: "split-1", direction: "row", sizes: [50, 50],
+        children: [window.layout.root, { type: "pane", pane: { id: "pane-2", tabIds: [] } }]
+      },
+      activePaneId: window.layout.activePaneId
+    };
+    const workspaceFile = (store as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+    const originalWrite = workspaceFile.write.bind(workspaceFile);
+    const app = await buildServer(config, services);
+    workspaceFile.write = vi.fn().mockRejectedValue(Object.assign(new Error("Workspace storage is full."), { code }));
+    try {
+      const autosave = await app.inject({ method: "PATCH", url: `/api/windows/${window.id}`, payload: { layout } });
+      expect(autosave.statusCode).toBe(200);
+      expect(autosave.json().persistence).toContainEqual(expect.objectContaining({ name: "Workspace layout", state: "degraded", code }));
+
+      const failedSave = await app.inject({ method: "POST", url: "/api/workspace/persist" });
+      expect(failedSave.statusCode).toBe(500);
+      expect(failedSave.json().message).toBe("Workspace storage is full.");
+      expect(store.getWindow(window.id).layout).toEqual(layout);
+      expect(new WorkspaceLayoutStore(config.dataDir, services.pathPolicy).getWindow(window.id).layout).toEqual(window.layout);
+
+      workspaceFile.write = originalWrite;
+      const saved = await app.inject({ method: "POST", url: "/api/workspace/persist" });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json()).toEqual({ ok: true });
+      expect(store.persistenceStatus()).toMatchObject({ state: "available" });
+      expect(new WorkspaceLayoutStore(config.dataDir, services.pathPolicy).getWindow(window.id).layout).toEqual(layout);
+    } finally {
+      workspaceFile.write = originalWrite;
       await app.close();
       await fs.rm(root, { recursive: true, force: true });
     }
