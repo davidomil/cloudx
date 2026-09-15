@@ -93,6 +93,8 @@ export class ForgeProviderError extends Error {
 export type ForgeProviderFailure = "timeout" | "cancelled" | "connection" | "unreadable_response" |
   "tls" | "redirect" | "invalid_request" | "rate_limited" | "service_unavailable" | "rejected" | "unknown";
 
+export const forgeRequestTimeoutMs = 30_000;
+
 export interface ForgeRequestDiagnostic {
   readonly provider: ForgeRepository["provider"];
   readonly role: ForgeCredentialRole;
@@ -103,8 +105,14 @@ export interface ForgeRequestDiagnostic {
   readonly failure: ForgeProviderFailure;
   readonly causeCodes: readonly string[];
   readonly retryable: boolean;
+  readonly elapsedMs: number;
+  readonly timeoutMs: number;
   readonly httpStatus?: number;
   readonly retryAfterMs?: number;
+  readonly providerRequestId?: string;
+  readonly rateLimitLimit?: number;
+  readonly rateLimitRemaining?: number;
+  readonly rateLimitResetAt?: number;
 }
 
 export type ForgeDiagnosticObserver = (diagnostic: Readonly<ForgeRequestDiagnostic>) => void;

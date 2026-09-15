@@ -13,6 +13,7 @@ import {
 } from "../forge/ForgeSettingsService.js";
 import type { ForgeWorkflowService } from "../forge/ForgeWorkflowService.js";
 import { parseReview } from "../forge/ForgeWorkflowValidation.js";
+import { forgeErrorFields, forgeLog, type ForgeLogger } from "../forge/ForgeLog.js";
 
 export class ForgePlugin implements WorkspacePlugin {
   readonly id = "forge";
@@ -41,6 +42,7 @@ export class ForgePlugin implements WorkspacePlugin {
       settings: ForgeSettingsService;
       workflow: ForgeWorkflowService;
     },
+    logger?: ForgeLogger,
   ) {
     const number = { type: "integer", minimum: 1 } satisfies JsonSchemaLike;
     const id = {
@@ -300,7 +302,23 @@ export class ForgePlugin implements WorkspacePlugin {
           };
         },
       ),
-    ];
+    ].map(definition => ({
+      ...definition,
+      execute: async (input, context) => {
+        const startedAt = performance.now();
+        const fields = { hookId: definition.id };
+        const level = definition.automationSafety === "read" ? "debug" : "info";
+        forgeLog(logger, level, "hook_started", fields);
+        try {
+          const result = await definition.execute(input, context);
+          forgeLog(logger, level, "hook_completed", { ...fields, elapsedMs: Math.round(performance.now() - startedAt) });
+          return result;
+        } catch (error) {
+          forgeLog(logger, "warn", "hook_failed", { ...fields, elapsedMs: Math.round(performance.now() - startedAt), ...forgeErrorFields(error) });
+          throw error;
+        }
+      },
+    }));
   }
   descriptor() {
     return descriptorFromPlugin(this);

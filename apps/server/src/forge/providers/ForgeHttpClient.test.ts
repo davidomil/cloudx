@@ -22,6 +22,85 @@ function expectPrivateFailure(error: unknown) {
 }
 
 describe("safe Forge request failures", () => {
+  it("measures a timed-out fetch independently of the wall clock and reports the configured deadline", async () => {
+    let elapsed = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const deadline = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(deadline.signal);
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      elapsed += 30_000;
+      vi.spyOn(Date, "now").mockReturnValue(0);
+      deadline.abort(new DOMException(privateFailure, "TimeoutError"));
+      throw deadline.signal.reason;
+    });
+    const observer = vi.fn();
+    await expect(client(fetcher, undefined, observer).request("/user")).rejects.toMatchObject({ failure: "timeout", retryable: true });
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ phase: "fetch", failure: "timeout", elapsedMs: 30_000, timeoutMs: 30_000 }));
+    expect(timeout).toHaveBeenCalledWith(30_000);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each(["rejected", "unreadable_response"])("preserves response correlation and quota metadata for %s", async failure => {
+    let elapsed = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      elapsed += 75;
+      return new Response(privateFailure, { status: failure === "rejected" ? 403 : 200, headers: {
+        "x-github-request-id": "1C73:26D4:E2E500:1EF78F4:62EC2479",
+        "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "100", "x-ratelimit-reset": "2000000120",
+        "set-cookie": "private-cookie",
+      } });
+    });
+    const observer = vi.fn();
+    const error = await client(fetcher, undefined, observer).request("/user").catch(error => error);
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      phase: "response", failure, elapsedMs: 75, timeoutMs: 30_000,
+      httpStatus: failure === "rejected" ? 403 : 200,
+      providerRequestId: "1C73:26D4:E2E500:1EF78F4:62EC2479",
+      rateLimitLimit: 5000, rateLimitRemaining: 100, rateLimitResetAt: 2_000_000_120_000,
+    }));
+    expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+    expectPrivateFailure(error);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { status: 404, failure: "rejected", retryable: false },
+    { status: 429, failure: "rate_limited", retryable: true },
+    { status: 503, failure: "service_unavailable", retryable: true },
+  ])("preserves GitLab Cloudflare correlation IDs for HTTP $status", async ({ status, failure, retryable }) => {
+    const gitlab: ForgeRepository = { provider: "gitlab", apiUrl: "https://gitlab.com/api/v4", projectPath: "owner/repo" };
+    const requestId = "a3b8d5b5e910552b-SJC";
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(privateFailure, { status, headers: {
+      "x-request-id": requestId, "set-cookie": "private-cookie",
+    } }));
+    const observer = vi.fn();
+    const http = new ForgeHttpClient(gitlab, new ForgeCredentials(gitlab, async () => ({ kind: "token", token: "private-token" })), fetcher, "worker", undefined, observer);
+    const error = await http.request("/projects/owner%2Frepo/issues/75").catch(error => error);
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      provider: "gitlab", phase: "response", httpStatus: status, failure, retryable,
+      providerRequestId: requestId,
+    }));
+    expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+    expectPrivateFailure(error);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("preserves a provider failure when diagnostic delivery throws", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => new Response(null, { status: 429 }));
+    const observer = vi.fn(() => { throw new Error(privateFailure); });
+    await expect(client(fetcher, undefined, observer).request("/user")).rejects.toMatchObject({ failure: "rate_limited", retryable: true });
+    expect(observer).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("keeps successful provider polling out of failure diagnostics", async () => {
+    const observer = vi.fn();
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ id: 1 }));
+    await expect(client(fetcher, undefined, observer).request("/user")).resolves.toMatchObject({ body: { id: 1 } });
+    expect(observer).not.toHaveBeenCalled();
+  });
+
   it.each([
     { code: "ECONNRESET", failure: "connection", retryable: true },
     { code: "EAI_AGAIN", failure: "connection", retryable: true },
@@ -41,6 +120,7 @@ describe("safe Forge request failures", () => {
       provider: "github", role: "worker", operation: "request", method: "GET",
       path: "/repos/{owner}/{repo}/pulls/{number}", phase: "fetch", failure, retryable,
       causeCodes: code && code !== privateFailure ? [code] : [],
+      elapsedMs: expect.any(Number), timeoutMs: 30_000,
     });
     expect(JSON.stringify(onFailure.mock.calls)).not.toMatch(/private-|hidden/);
     expectPrivateFailure(error);

@@ -95,7 +95,9 @@ function fixture() {
     read: vi.fn(),
     remove: vi.fn(async () => {}),
   };
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const deps = {
+    logger,
     settings: () => ({
       repository: {
         provider: "github",
@@ -125,6 +127,7 @@ function fixture() {
   return {
     service: new ForgeWorkflowService(deps),
     deps,
+    logger,
     provider,
     runtime,
     reports,
@@ -546,7 +549,7 @@ describe("Manual worker continuation", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("leaves a failed manual continuation idle instead of scheduling the previous automatic step (previous retry: %s)", async scheduled => {
+  it.each([false, true])("logs a failed manual continuation and leaves it idle without scheduling the previous automatic step (previous retry: %s)", async scheduled => {
     const f = await clarificationLoop();
     if (scheduled) {
       await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? { ...worker, providerRetryAt: new Date(Date.now() + 3_600_000).toISOString() } : worker));
@@ -554,6 +557,9 @@ describe("Manual worker continuation", () => {
     }
     f.provider.getIssue.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
     await expect(f.service.continueWorker(f.issue.id, "Implement the clarified input format.", placement)).rejects.toThrow();
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_interrupted", workerId: f.issue.id, failure: "rate_limited", retryable: true, retryAfterMs: 3_600_000 }), expect.any(String));
+    expect(f.logger.warn).not.toHaveBeenCalledWith(expect.objectContaining({ event: "provider_reset_scheduled" }), expect.any(String));
+    expect(JSON.stringify(Object.values(f.logger).flatMap(log => log.mock.calls))).not.toContain("Implement the clarified input format.");
     expect(f.stored().find(worker => worker.id === f.issue.id)!.status).toBe("failed");
     expect(f.stored().find(worker => worker.id === f.issue.id)!.providerRetryAt).toBeUndefined();
     await f.service.poll();
@@ -3043,6 +3049,7 @@ describe("Forge issue auto review", () => {
     f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "request", { retryable: true, retryAfterMs: 3_600_000 }));
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "paused", providerRetryAt: new Date(Date.now() + 3_600_000).toISOString() });
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "provider_reset_scheduled", workerId: f.issue.id, failure: "rate_limited", retryAfterMs: 3_600_000, retryAt: f.currentIssue().providerRetryAt }), expect.any(String));
     const service = new ForgeWorkflowService(f.deps);
     await service.dashboard();
     f.provider.getChangeRequest.mockClear();
@@ -3142,6 +3149,7 @@ describe("Forge issue auto review", () => {
     const f = await approvedIssue();
     f.provider.getChangeRequest.mockRejectedValue(transientProviderFailure());
     await f.poll();
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "provider_recovery_scheduled", workerId: f.issue.id, retryCount: 1, delayMs: 5000, recoveryWindowMs: 300_000 }), expect.any(String));
     let checks = f.provider.getChangeRequest.mock.calls.length;
     for (const delay of [5_000, 15_000, 30_000, 60_000]) {
       f.advanceTime(delay - 1);
@@ -3151,6 +3159,7 @@ describe("Forge issue auto review", () => {
       await f.service.poll();
       expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(++checks);
     }
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "provider_recovery_exhausted", workerId: f.issue.id, retryCount: 4 }), expect.any(String));
     expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/automatic.*exhausted.*Resume/i) });
     f.advanceTime(300_000);
     await f.service.poll();
@@ -3939,5 +3948,84 @@ describe("Forge issue auto review", () => {
     await f.poll();
     expect(f.provider.merge).toHaveBeenCalledOnce();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe("Forge worker diagnostics", () => {
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  it("records timeout budget and attempt identity before stopping the tab", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-15T12:00:00Z");
+    const f = fixture();
+    f.issue.title = "private-title";
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    vi.setSystemTime("2026-09-15T13:00:00.001Z");
+    await f.service.poll();
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_timed_out", workerId: worker.id, attemptId: worker.attemptId, tabId: "tab-1", elapsedMs: 3_600_001, timeoutMs: 3_600_000 }), expect.any(String));
+    expect(f.stored()[0].status).toBe("failed");
+    expect(f.runtime.close).toHaveBeenCalledWith("tab-1");
+    expect(JSON.stringify(f.logger.warn.mock.calls)).not.toContain("private-title");
+  });
+
+  it("logs accepted reports and committed state changes once across idle polling", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "private-review", comments: [] });
+    await f.service.poll();
+    expect(f.logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_report_received", workerId: worker.id, attemptId: worker.attemptId }), expect.any(String));
+    expect(f.logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_state_changed", workerId: worker.id, status: "completed" }), expect.any(String));
+    f.logger.info.mockClear();
+    await f.service.poll();
+    await f.service.poll();
+    expect(f.logger.info).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes missing reports and failed cleanup without exposing arbitrary error text", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.runtime.isActive.mockReturnValue(false);
+    f.runtime.close.mockRejectedValueOnce(new Error("private-cleanup-error"));
+    await f.service.poll();
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_report_missing", workerId: worker.id, attemptId: worker.attemptId }), expect.any(String));
+    expect(f.logger.error).toHaveBeenCalledWith(expect.objectContaining({ event: "worker_cleanup_failed", workerId: worker.id }), expect.any(String));
+    expect(f.stored()[0].status).toBe("cleanup_failed");
+    expect(JSON.stringify(f.logger.error.mock.calls)).not.toContain("private-cleanup-error");
+  });
+
+  it("passes worker and attempt identity to provider diagnostics during completion checks", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const provider = vi.fn(f.deps.provider);
+    f.deps.provider = provider;
+    f.provider.getChangeRequestStatus.mockRejectedValueOnce(new ForgeProviderUnavailableError("timeout", "request", { retryable: true }));
+    await f.service.poll();
+    expect(provider).toHaveBeenCalledWith(worker.repository, "reviewer", expect.any(AbortSignal), expect.objectContaining({ workerId: worker.id, attemptId: worker.attemptId }));
+    expect(f.logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "completion_check_failed", workerId: worker.id, attemptId: worker.attemptId, failure: "timeout", retryable: true }), expect.any(String));
+  });
+
+  it("reports background persistence failures and stops polling on shutdown", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const read = vi.spyOn(f.deps.store, "read").mockRejectedValueOnce(new Error("private-state-error"));
+    f.service.start();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(f.logger.error).toHaveBeenCalledWith(expect.objectContaining({ event: "poll_failed" }), expect.any(String));
+    expect(JSON.stringify(f.logger.error.mock.calls)).not.toContain("private-state-error");
+    await f.service.dispose();
+    expect(f.logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "shutdown_completed" }), expect.any(String));
+    const reads = read.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(read).toHaveBeenCalledTimes(reads);
+  });
+
+  it("keeps worker lifecycle intact when the logger throws", async () => {
+    const f = fixture();
+    for (const log of Object.values(f.logger)) log.mockImplementation(() => { throw new Error("logger failed"); });
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    expect(worker.status).toBe("running");
+    await expect(f.service.stop(worker.id)).resolves.toMatchObject({ status: "stopped" });
+    expect(f.runtime.pause).toHaveBeenCalledWith("tab-1");
   });
 });

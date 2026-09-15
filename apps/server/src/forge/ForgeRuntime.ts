@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
@@ -19,6 +20,7 @@ import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalo
 import type { SessionStore } from "../sessionStore.js";
 import type { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import type { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
+import { forgeLog, type ForgeLogger } from "./ForgeLog.js";
 import { validateRepository } from "./providers/ForgeCredentials.js";
 import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
 
@@ -31,6 +33,7 @@ export interface ForgeWorkspace {
 }
 
 export interface ForgeRuntimeDependencies {
+  logger?: ForgeLogger;
   sessions: Pick<
     SessionStore,
     | "getTab"
@@ -134,6 +137,7 @@ interface OwnedTab {
 /** Owns Git checkouts and Codex tabs; the service owns issue/review decisions. */
 export class ForgeRuntime {
   private static readonly operations = new Map<string, Promise<void>>();
+  private static readonly logContext = new AsyncLocalStorage<{ workerId: string; operation: string }>();
   private readonly ownedTabs = new Map<string, OwnedTab>();
   private readonly reviewConversations: Pick<ForgeReviewConversation, "prepare">;
 
@@ -161,7 +165,7 @@ export class ForgeRuntime {
     },
     signal?: AbortSignal,
   ): Promise<{ repositoryPath: string; worktreePath: string; branch: string }> {
-    return this.serialize(input.id, async () => {
+    return this.serialize(input.id, "prepareWorkspace", signal, async () => {
       signal?.throwIfAborted();
       if (input.review && !input.headSha)
         throw new Error("A review requires an exact head commit.");
@@ -311,7 +315,7 @@ export class ForgeRuntime {
     comparison: { headSha: string; baseSha: string; baseBranch: string },
     signal?: AbortSignal,
   ): Promise<void> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "refreshReviewWorkspace", signal, async () => {
       signal?.throwIfAborted();
       if (!isCommitSha(comparison.headSha) || !isCommitSha(comparison.baseSha))
         throw new Error("Refreshing a review requires exact head and base commits.");
@@ -429,7 +433,7 @@ export class ForgeRuntime {
     },
     signal?: AbortSignal,
   ): Promise<string> {
-    return this.serialize(input.id, async () => {
+    return this.serialize(input.id, "launch", signal, async () => {
     signal?.throwIfAborted();
     const owned = await this.readOwned(input.id);
     if (
@@ -596,7 +600,7 @@ export class ForgeRuntime {
   recover(
     id: string,
   ): Promise<{ workspace?: ForgeWorkspace; tabIds: string[] }> {
-    return this.serialize(id, async () => {
+    return this.serialize(id, "recover", undefined, async () => {
       const stored = await this.manifest(id).read<OwnedWorkspace>();
       const owned = stored ? await this.readOwned(id) : undefined;
       if (owned && !owned.cleaned && owned.gitPending && owned.issueRebase?.publication && !owned.issueRebase.publication.confirmed)
@@ -676,7 +680,7 @@ export class ForgeRuntime {
     expectedHeadSha?: string,
     expectedRemoteHeadSha?: string,
   ): Promise<string> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "publishBranch", signal, async () => {
       signal?.throwIfAborted();
       const owned = await this.matchOwned(workspace);
       if (expectedRemoteHeadSha !== undefined)
@@ -718,7 +722,7 @@ export class ForgeRuntime {
     expectedRemoteHeadSha: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "syncPublishedBranch", signal, async () => {
       if (!isCommitSha(expectedLocalHeadSha) || !isCommitSha(expectedRemoteHeadSha))
         throw new Error("Branch synchronization requires exact local and published commits.");
       const owned = await this.matchOwned(workspace);
@@ -771,7 +775,7 @@ export class ForgeRuntime {
     baseBranch: string,
     signal?: AbortSignal,
   ): Promise<string> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "updateIssueBranch", signal, async () => {
       signal?.throwIfAborted();
       if (!isCommitSha(expectedHeadSha)) throw new Error("Branch updates require an exact published head commit.");
       baseBranch = baseBranch.trim();
@@ -866,7 +870,7 @@ export class ForgeRuntime {
     baseBranch: string,
     signal?: AbortSignal,
   ): Promise<{ targetHeadSha: string; originalHeadSha: string }> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "prepareIssueRebase", signal, async () => {
       signal?.throwIfAborted();
       if (!isCommitSha(expectedHeadSha)) throw new Error("Rebase recovery requires the exact published commit.");
       baseBranch = baseBranch.trim();
@@ -917,7 +921,7 @@ export class ForgeRuntime {
     comparison: { expectedHeadSha: string; targetHeadSha: string },
     signal?: AbortSignal,
   ): Promise<string> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "completeIssueRebase", signal, async () => {
       signal?.throwIfAborted();
       const owned = await this.matchOwned(workspace);
       const rebase = owned.issueRebase;
@@ -1084,7 +1088,7 @@ export class ForgeRuntime {
   }
 
   cleanup(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<void> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "cleanup", signal, async () => {
       const owned = await this.matchOwned(workspace);
       if (owned.launchPending)
         throw new Error("A worker launch is unresolved; cleanup is blocked.");
@@ -1108,7 +1112,7 @@ export class ForgeRuntime {
     expectedHeadSha: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    return this.serialize(workspace.id, async () => {
+    return this.serialize(workspace.id, "verifyPublishedWorkspace", signal, async () => {
       const owned = await this.matchOwned(workspace);
       if (owned.cleaned || !owned.branchOwned)
         throw new Error(
@@ -1368,13 +1372,32 @@ export class ForgeRuntime {
     );
   }
 
-  private runGit(
+  private async runGit(
     cwd: string,
     args: string[],
     signal?: AbortSignal,
     environment?: NodeJS.ProcessEnv,
   ): Promise<string> {
-    return (this.dependencies.git ?? git)(cwd, args, signal, environment);
+    const fields = { ...ForgeRuntime.logContext.getStore(), command: args[0] };
+    const started = performance.now();
+    const diagnostic: GitDiagnostic = {};
+    forgeLog(this.dependencies.logger, "debug", "git.started", fields);
+    try {
+      const result = this.dependencies.git
+        ? await this.dependencies.git(cwd, args, signal, environment)
+        : await git(cwd, args, signal, environment, diagnostic);
+      forgeLog(this.dependencies.logger, "debug", "git.completed", {
+        ...fields, durationMs: Math.round(performance.now() - started),
+      });
+      return result;
+    } catch (error) {
+      forgeLog(this.dependencies.logger, "warn", "git.failed", {
+        ...fields, durationMs: Math.round(performance.now() - started),
+        outcome: diagnostic.outcome ?? (signal?.aborted ? "cancelled" : "failed"),
+        ...(diagnostic.exitCode === undefined ? {} : { exitCode: diagnostic.exitCode }),
+      });
+      throw error;
+    }
   }
 
   private async access(
@@ -1624,10 +1647,31 @@ export class ForgeRuntime {
       );
   }
 
-  private serialize<T>(id: string, operation: () => Promise<T>): Promise<T> {
+  private serialize<T>(id: string, name: string, signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
     const key = this.manifest(id).filePath;
-    const run = (ForgeRuntime.operations.get(key) ?? Promise.resolve()).then(
-      operation,
+    const fields = { workerId: id, operation: name };
+    const queued = performance.now();
+    forgeLog(this.dependencies.logger, "debug", "runtime.queued", fields);
+    const run = (ForgeRuntime.operations.get(key) ?? Promise.resolve()).then(() =>
+      ForgeRuntime.logContext.run(fields, async () => {
+        const started = performance.now();
+        forgeLog(this.dependencies.logger, "info", "runtime.started", {
+          ...fields, queueDurationMs: Math.round(started - queued),
+        });
+        try {
+          const result = await operation();
+          forgeLog(this.dependencies.logger, "info", "runtime.completed", {
+            ...fields, durationMs: Math.round(performance.now() - started),
+          });
+          return result;
+        } catch (error) {
+          forgeLog(this.dependencies.logger, "warn", "runtime.failed", {
+            ...fields, durationMs: Math.round(performance.now() - started),
+            outcome: signal?.aborted ? "cancelled" : "failed",
+          });
+          throw error;
+        }
+      }),
     );
     const settled = run.then(
       () => undefined,
@@ -1753,11 +1797,17 @@ async function optionalIdentity(
   }
 }
 
+interface GitDiagnostic {
+  outcome?: "timeout" | "cancelled" | "output_limit" | "spawn_failed" | "exit_code";
+  exitCode?: number | null;
+}
+
 async function git(
   cwd: string,
   args: string[],
   signal?: AbortSignal,
   environment?: NodeJS.ProcessEnv,
+  diagnostic: GitDiagnostic = {},
 ): Promise<string> {
   signal?.throwIfAborted();
   const env: NodeJS.ProcessEnv = {
@@ -1818,8 +1868,9 @@ async function git(
   const errorOutput: Buffer[] = [];
   let bytes = 0;
   let failure: unknown;
-  const stop = (reason: unknown): void => {
+  const stop = (reason: unknown, outcome: GitDiagnostic["outcome"]): void => {
     if (failure) return;
+    diagnostic.outcome = outcome;
     failure = reason ?? new Error("Git command was cancelled.");
     if (child.pid) {
       try {
@@ -1835,27 +1886,30 @@ async function git(
   const collect = (chunk: Buffer, retain: boolean): void => {
     bytes += chunk.length;
     if (bytes > 2_000_000)
-      stop(new Error("Git command exceeded its output limit."));
+      stop(new Error("Git command exceeded its output limit."), "output_limit");
     else (retain ? output : errorOutput).push(chunk);
   };
   child.stdout.on("data", (chunk: Buffer) => collect(chunk, true));
   child.stderr.on("data", (chunk: Buffer) => collect(chunk, false));
-  const abort = (): void => stop(signal?.reason);
+  const abort = (): void => stop(signal?.reason, "cancelled");
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) abort();
   const timer = setTimeout(
-    () => stop(new Error("Git command exceeded its five minute deadline.")),
+    () => stop(new Error("Git command exceeded its five minute deadline."), "timeout"),
     300_000,
   );
   try {
     const code = await new Promise<number | null>((resolve) => {
       child.once("error", (error) => {
+        diagnostic.outcome = "spawn_failed";
         failure = error;
       });
       child.once("close", resolve);
     });
+    diagnostic.exitCode = code;
     if (failure) throw failure;
     if (code !== 0) {
+      diagnostic.outcome = "exit_code";
       if (args[0] === "push" && /refusing to allow a GitHub App to create or update workflow\b/iu.test(Buffer.concat(errorOutput).toString("utf8")))
         throw new Error("GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing.");
       throw Object.assign(new Error(`Git ${args[0]} failed with exit code ${code}.`), { code });

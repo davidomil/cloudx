@@ -50,6 +50,76 @@ describe("provider timing guidance", () => {
 
 describe("sanitized provider diagnostics", () => {
   it.each([
+    { repository: github, requestId: "1C73:26D4:E2E500:1EF78F4:62EC2479" },
+    { repository: gitlab, requestId: "01FGN8P881GF2E5J91JYA338Y3" },
+    { repository: gitlab, requestId: "4rAMkV3gof4" },
+    { repository: gitlab, requestId: "a3b8d5b5e910552b-SJC" },
+    { repository: gitlab, requestId: "230B030023AE2822-LHR" },
+    { repository: gitlab, requestId: "a".repeat(128) },
+  ])("retains only provider correlation and quota fields for $repository.provider", ({ repository, requestId }) => {
+    const observer = vi.fn();
+    const failures = new ForgeRequestFailures(repository, "worker", "/user", "GET", "request", observer);
+    const prefix = repository.provider === "github" ? "x-ratelimit" : "ratelimit";
+    const response = new Response(null, { status: 429, headers: {
+      [repository.provider === "github" ? "x-github-request-id" : "x-request-id"]: requestId,
+      [`${prefix}-limit`]: "5000", [`${prefix}-remaining`]: "0", [`${prefix}-reset`]: String(now / 1000),
+      authorization: "Bearer private-token", "set-cookie": "private-cookie", location: "https://private.example",
+    } });
+    failures.received(response);
+    failures.http(httpFailure(response, repository.provider), false);
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      providerRequestId: requestId, httpStatus: 429, rateLimitLimit: 5000, rateLimitRemaining: 0, rateLimitResetAt: now,
+    }));
+    expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+  });
+
+  it.each(["", "-1", "1.5", "1e4", "9007199254740992", "0".repeat(1000), "private-token"])("drops malformed or oversized numeric response metadata: %s", value => {
+    const observer = vi.fn();
+    const failures = new ForgeRequestFailures(github, "worker", "/user", "GET", "request", observer);
+    const response = new Response(null, { status: 403, headers: {
+      "x-ratelimit-limit": value, "x-ratelimit-remaining": value, "x-ratelimit-reset": value,
+    } });
+    failures.received(response);
+    failures.http(httpFailure(response, "github"), false);
+    expect(observer.mock.calls[0][0]).toMatchObject({
+      rateLimitLimit: undefined, rateLimitRemaining: undefined, rateLimitResetAt: undefined,
+    });
+    expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+  });
+
+  it.each([github, gitlab])("drops unsafe or oversized $provider request IDs", repository => {
+    for (const requestId of [
+      "https://private.example?token=private-token", "Bearer private-token", "private-token", "a".repeat(129),
+      `${"a".repeat(125)}-SJC`, "a3b8d5b5e910552b-SJC?token=private-token", "a3b8d5b5e910552b-SJC private-token",
+    ]) {
+      const observer = vi.fn();
+      const failures = new ForgeRequestFailures(repository, "worker", "/user", "GET", "request", observer);
+      const response = new Response(null, { status: 403, headers: {
+        [repository.provider === "github" ? "x-github-request-id" : "x-request-id"]: requestId,
+        "ratelimit-reset": "9007199254740991", "x-ratelimit-reset": "9007199254740991",
+      } });
+      failures.received(response);
+      failures.http(httpFailure(response, repository.provider), false);
+      expect(observer.mock.calls[0][0]).toMatchObject({ providerRequestId: undefined, rateLimitResetAt: undefined });
+      expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+    }
+  });
+
+  it.each([
+    "a3b8d5b5e910552-SJC", "a3b8d5b5e910552bb-SJC", "g3b8d5b5e910552b-SJC",
+    "a3b8d5b5e910552b-SJ", "a3b8d5b5e910552b-SJCX", "a3b8d5b5e910552b-sjc",
+    "a3b8d5b5e910552b--SJC", "a3b8d5b5e910552b-SJC-LHR",
+  ])("drops malformed GitLab Cloudflare correlation ID %s", requestId => {
+    const observer = vi.fn();
+    const failures = new ForgeRequestFailures(gitlab, "worker", "/user", "GET", "request", observer);
+    const response = new Response(null, { status: 503, headers: { "x-request-id": requestId } });
+    failures.received(response);
+    failures.http(httpFailure(response, "gitlab"), false);
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ providerRequestId: undefined }));
+    expect(JSON.stringify(observer.mock.calls)).not.toContain(requestId);
+  });
+
+  it.each([
     { repository: github, path: "/search/issues?q=private-secret", expected: "/search/issues" },
     { repository: github, path: "/repos/private-owner/private-repo/pulls/8/reviews", expected: "/repos/{owner}/{repo}/pulls/{number}/reviews" },
     { repository: github, path: "/repos/private-owner/private-repo/rules/branches/private%2Fbranch", expected: "/repos/{owner}/{repo}/rules/branches/{branch}" },
@@ -65,7 +135,7 @@ describe("sanitized provider diagnostics", () => {
   ])("uses only a static template for $path", ({ repository, path, expected }) => {
     const observer = vi.fn();
     new ForgeRequestFailures(repository, "reviewer", path, "GET", "request", observer).prepare();
-    expect(observer).toHaveBeenCalledExactlyOnceWith({ provider: repository.provider, role: "reviewer", operation: "request", method: "GET", path: expected, phase: "prepare", failure: "invalid_request", retryable: false, causeCodes: [] });
+    expect(observer).toHaveBeenCalledExactlyOnceWith({ provider: repository.provider, role: "reviewer", operation: "request", method: "GET", path: expected, phase: "prepare", failure: "invalid_request", retryable: false, causeCodes: [], elapsedMs: expect.any(Number), timeoutMs: 30_000 });
     expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
   });
 

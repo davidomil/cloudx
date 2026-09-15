@@ -4,7 +4,7 @@ import type {
   ForgeRepository,
 } from "@cloudx/shared";
 import { ForgeCredentials, validateRepository } from "./ForgeCredentials.js";
-import { ForgeProviderError, type ForgeDiagnosticObserver } from "./ForgeProvider.js";
+import { ForgeProviderError, forgeRequestTimeoutMs, type ForgeDiagnosticObserver } from "./ForgeProvider.js";
 import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
 import { list } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
@@ -51,7 +51,7 @@ export class ForgeHttpClient {
       ? `${api.origin}${this.repository.provider === "github" && api.hostname === "api.github.com" ? "" : "/api"}`
       : this.repository.apiUrl.replace(/\/$/, "");
     const signal = AbortSignal.any([
-      AbortSignal.timeout(30_000),
+      AbortSignal.timeout(forgeRequestTimeoutMs),
       ...[this.signal, options.signal].filter(
         (signal): signal is AbortSignal => signal !== undefined,
       ),
@@ -60,6 +60,7 @@ export class ForgeHttpClient {
       ...(await this.credentials.headers(
         role,
         signal,
+        this.onFailure,
       )),
       Accept: options.text ? "application/vnd.github.diff" : "application/json",
       ...(this.repository.provider === "github"
@@ -95,6 +96,7 @@ export class ForgeHttpClient {
     } catch (error) {
       throw failures.transport(error, signal, changesRemoteState);
     }
+    failures.received(response);
     if (!response.ok) {
       const failure = httpFailure(response, this.repository.provider);
       this.credentials.deferRequests(failure.retryAfterMs);

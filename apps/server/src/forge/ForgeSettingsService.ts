@@ -45,11 +45,11 @@ export class ForgeSettingsService {
     return repositoryKey(repository) === repositoryKey(this.repository());
   }
 
-  provider(repository: ForgeRepository, role: ForgeCredentialRole, signal?: AbortSignal): ForgeProvider {
+  provider(repository: ForgeRepository, role: ForgeCredentialRole, signal?: AbortSignal, onFailure = this.onFailure): ForgeProvider {
     return createForgeProvider(repository, this.credentials(repository), {
       role,
       signal,
-      onFailure: this.onFailure,
+      onFailure,
       listIdentity: () => ({
         username: String(this.config.getPluginConfig("forge").username ?? "").trim(),
         workerAuthors: this.connections.workerAuthors(repository),

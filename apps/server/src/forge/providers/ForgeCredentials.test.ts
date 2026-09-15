@@ -12,6 +12,29 @@ const privateFailure = "private-token https://private.example/repository?secret=
 afterEach(() => vi.restoreAllMocks());
 
 describe("GitHub installation-token request failures", () => {
+  it.each(["rate_limited", "unreadable_response"])("includes authentication response timing and quota metadata for %s", async failure => {
+    let elapsed = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => elapsed);
+    const fetcher = vi.fn<typeof fetch>(async () => {
+      elapsed += 250;
+      return new Response(privateFailure, { status: failure === "rate_limited" ? 429 : 200, headers: {
+        "x-github-request-id": "1C73:26D4:E2E500:1EF78F4:62EC2479",
+        "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "2000000120",
+      } });
+    });
+    const observer = vi.fn();
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher, observer);
+    await expect(credentials.headers("worker")).rejects.toMatchObject({ failure });
+    expect(observer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      operation: "authentication", phase: "response", failure, elapsedMs: 250, timeoutMs: 30_000,
+      httpStatus: failure === "rate_limited" ? 429 : 200,
+      providerRequestId: "1C73:26D4:E2E500:1EF78F4:62EC2479",
+      rateLimitLimit: 5000, rateLimitRemaining: 0, rateLimitResetAt: 2_000_000_120_000,
+    }));
+    expect(JSON.stringify(observer.mock.calls)).not.toMatch(/private-|Bearer|hidden|BEGIN/);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
   it("shares and extends the longest provider cooldown across credential roles", async () => {
     let now = 2_000_000_000_000;
     vi.spyOn(Date, "now").mockImplementation(() => now);

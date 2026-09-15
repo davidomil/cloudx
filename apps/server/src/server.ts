@@ -59,6 +59,7 @@ import { PluginDataStore } from "./plugins/PluginDataStore.js";
 import { InstalledPluginInstallError, InstalledPluginService } from "./plugins/InstalledPluginService.js";
 import { ForgePlugin } from "./plugins/ForgePlugin.js";
 import { ForgeSettingsService } from "./forge/ForgeSettingsService.js";
+import { forgeLog } from "./forge/ForgeLog.js";
 import { ForgeWorkflowService } from "./forge/ForgeWorkflowService.js";
 import { ForgeRuntime } from "./forge/ForgeRuntime.js";
 import { ForgeWorkflowStore, ForgeWorkerReports } from "./forge/ForgeWorkflowStore.js";
@@ -1282,7 +1283,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new ForgePlugin(() => {
     if (!forge || !forgeSettings) throw new Error("Forge Workers service is not available.");
     return { settings: forgeSettings, workflow: forge };
-  }));
+  }, logger));
   let jira: JiraIntegrationService | undefined;
   let jiraPolling: JiraPollingService | undefined;
   plugins.register(new JiraPlugin(() => {
@@ -1324,13 +1325,15 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     registration: new ForgeRegistrationClient()
   });
   forgeSettings = new ForgeSettingsService(configService, forgeConnections, diagnostic => {
-    logger?.warn({ forgeRequest: diagnostic }, "Forge provider request failed");
+    forgeLog(logger, "warn", "provider_request_failed", { forgeRequest: diagnostic });
   });
   const settingsForForge: ForgeSettingsService = forgeSettings;
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),
-    provider: (repository, role, signal) => settingsForForge.provider(repository, role, signal),
-    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
+    logger,
+    provider: (repository, role, signal, context) => settingsForForge.provider(repository, role, signal,
+      context ? diagnostic => forgeLog(logger, "warn", "provider_request_failed", { ...context, forgeRequest: diagnostic }) : undefined),
+    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, logger, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     notify: (title, body) => { notifications.send({ title, body }); }

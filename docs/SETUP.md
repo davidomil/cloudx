@@ -846,6 +846,29 @@ tailscale serve --bg https+insecure://localhost:3001
 Do not use Tailscale Funnel or any public exposure without real authentication,
 authorization, and process isolation.
 
+## Forge diagnostics
+
+Forge logs include worker state and runtime lifecycle events at info
+level, failures and recovery decisions at warn/error, and routine hook
+reads and Git operations at debug.
+
+Use `workerId` and `attemptId` to follow a worker run; `hookId` identifies
+plugin actions.
+
+Provider failures record `elapsedMs`, `timeoutMs` and available validated
+`providerRequestId`, `rateLimitRemaining`, `rateLimitResetAt` and `retryAfterMs`
+fields; `rateLimitResetAt` uses Unix epoch milliseconds.
+
+Worker timeouts include `elapsedMs` and `timeoutMs`; Git failures
+distinguish timeout, cancellation, output limits, spawn failures and
+nonzero exits.
+
+Forge diagnostic fields exclude prompts, credentials, request bodies,
+raw error messages and Git output.
+
+Set `CLOUDX_LOG_LEVEL=debug` in the CloudX environment file and restart the
+service to include debug events.
+
 ## Full Configuration
 
 - `CLOUDX_HOST`: bind host, default `127.0.0.1`. The only supported

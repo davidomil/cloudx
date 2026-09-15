@@ -10,6 +10,7 @@ import {
   ForgeConnectionStore,
 } from "./connections/ForgeConnectionStore.js";
 import type { ForgeRepository } from "@cloudx/shared";
+import { ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 
 describe("Forge in the composed CloudX server", () => {
   it.each(["request", "authentication"] as const)("records a safe %s diagnostic through the real Forge read hook", async operation => {
@@ -43,16 +44,57 @@ describe("Forge in the composed CloudX server", () => {
         payload: { input: { repository, filter: "is:open label:private-query" } },
       });
       expect(response.statusCode).toBe(502);
-      expect(logger.warn).toHaveBeenCalledExactlyOnceWith({ forgeRequest: expect.objectContaining({
+      expect(logger.warn).toHaveBeenCalledWith({ event: "provider_request_failed", forgeRequest: expect.objectContaining({
         provider: "github", role: "worker", operation,
         method: operation === "authentication" ? "POST" : "GET",
         path: operation === "authentication" ? expect.stringContaining("access_tokens") : "/search/issues",
-        causeCodes: ["ECONNRESET"], retryable: true,
-      }) }, "Forge provider request failed");
+        causeCodes: ["ECONNRESET"], retryable: true, elapsedMs: expect.any(Number), timeoutMs: 30_000,
+      }) }, "Forge provider_request_failed");
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "hook_failed", hookId: "forge.issues.list", failure: "connection" }), expect.any(String));
       expect(fetcher).toHaveBeenCalledOnce();
       const visible = response.body + JSON.stringify(logger.warn.mock.calls);
       for (const secret of ["private-credential", "private.example", "private-provider-detail", "private-query", "hidden", privateKey])
         expect(visible).not.toContain(secret);
+    } finally {
+      fetcher.mockRestore();
+      credential.mockRestore();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["request", "authentication"] as const)("correlates rate-limited %s checks with the persisted worker and attempt", async operation => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-worker-diagnostic-"));
+    const config = loadConfig({ CLOUDX_DATA_DIR: path.join(root, "data"), CLOUDX_ALLOWED_ROOTS: root,
+      CLOUDX_LOG_LEVEL: "silent", CLOUDX_APP_SERVER_ENABLED: "false", CLOUDX_AUTOMATION_START_DISABLED: "true" });
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const services = buildServices(config, logger);
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    const repository: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" };
+    const workerId = "33333333-3333-4333-8333-333333333333";
+    const attemptId = "44444444-4444-4444-8444-444444444444";
+    const credential = vi.spyOn(services.forgeConnections!, "credential").mockReturnValue(operation === "request"
+      ? { kind: "token", token: "private-credential" }
+      : { kind: "github-app", appId: "101", installationId: "123", privateKey: generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" }).toString() });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("private-response", { status: 429, headers: {
+      "retry-after": "120", "x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0", "x-github-request-id": "ABCD:1234:ABCD:1234:ABCD",
+    } }));
+    try {
+      await services.config!.update({ plugins: { forge: { projectPath: repository.projectPath } } });
+      await new ForgeWorkflowStore(services.pluginData!).write([{
+        id: workerId, attemptId, kind: "review", number: 7, changeNumber: 7, title: "private-title", repository,
+        status: "completed", baseBranch: "main", templateId: "review", autoPost: false,
+        startedAt: "2026-09-15T12:00:00.000Z", updatedAt: "2026-09-15T12:00:00.000Z",
+      }]);
+      await services.forge!.poll();
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "provider_request_failed", workerId, attemptId,
+        forgeRequest: expect.objectContaining({ operation, failure: "rate_limited", httpStatus: 429, retryAfterMs: 120_000, rateLimitLimit: 5000, rateLimitRemaining: 0, providerRequestId: "ABCD:1234:ABCD:1234:ABCD" }),
+      }), expect.any(String));
+      expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "completion_check_failed", workerId, attemptId, failure: "rate_limited", statusCode: 502 }), expect.any(String));
+      expect(fetcher).toHaveBeenCalledOnce();
+      for (const secret of ["private-credential", "private-response", "private-title", "fixture/project"])
+        expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(secret);
     } finally {
       fetcher.mockRestore();
       credential.mockRestore();
