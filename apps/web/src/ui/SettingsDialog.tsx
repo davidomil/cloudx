@@ -5,12 +5,15 @@ import { CLOUDX_LOG_SOURCES } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { CodexSettingsEditor } from "./CodexSettingsEditor.js";
+import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";
 import { ForgeConnections } from "./ForgeConnections.js";
 import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
 import type { BrowserNotificationPermissionState } from "./notifications.js";
+import type { UiContributionRenderContext } from "./uiContributions.js";
 
 interface SettingsEntry {
   id: string;
@@ -36,6 +39,7 @@ export function SettingsDialog({
   browserNotificationState,
   onRequestBrowserNotifications,
   cloudxUpdate,
+  callHook,
   children
 }: {
   config: CloudxConfigResponse;
@@ -47,6 +51,7 @@ export function SettingsDialog({
   browserNotificationState?: BrowserNotificationPermissionState;
   onRequestBrowserNotifications?: () => Promise<void>;
   cloudxUpdate?: CloudxUpdateController;
+  callHook?: UiContributionRenderContext["callHook"];
   children?: ReactNode;
 }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
@@ -55,6 +60,7 @@ export function SettingsDialog({
   const [query, setQuery] = useState("");
   const [activeCategoryId, setActiveCategoryId] = useState("general");
   const [horizontalTabs, setHorizontalTabs] = useState(false);
+  const [codexSettingsEditor] = useState(() => new CodexSettingsEditor());
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -64,6 +70,8 @@ export function SettingsDialog({
   const selectedRepository = forgeRepository(values.plugins.forge, forgeFields);
 
   useOutsidePointerDismiss(true, dialogRef, onCancel);
+
+  useEffect(() => () => codexSettingsEditor.dispose(), [codexSettingsEditor]);
 
   useEffect(() => {
     const previousFocus = document.activeElement;
@@ -142,6 +150,17 @@ export function SettingsDialog({
     content: <TemplateSelect value={defaultTemplateId} templates={rulesSkillsStore.templates} defaultTemplateId={defaultTemplateId} onChange={setDefaultTemplateId} label="Default template" />
   });
   if (children) categories[0].entries.push({ id: "additional", searchText: "Additional settings", content: children });
+  if (callHook) categories.push({
+    id: "codex",
+    label: "Codex",
+    description: "Global defaults shared by Codex sessions.",
+    entries: [{
+      id: "global-defaults",
+      searchText: "Default model Fast mode service tier priority standard flex shared settings reload",
+      content: <CodexSettingsPanel editor={codexSettingsEditor} callHook={callHook} />,
+      mountWhenVisible: true
+    }]
+  });
   for (const plugin of config.plugins) {
     const entries = plugin.fields.filter(isUserVisibleConfigField).map(field => fieldEntry(field, plugin.pluginId));
     if (plugin.pluginId === "forge") entries.push({
@@ -290,7 +309,7 @@ export function SettingsDialog({
           </div>
         </div>
         <footer className="settings-footer">
-          <small>Save applies changes across all tabs.</small>
+          <small>{callHook ? "Save applies CloudX changes. Save Codex settings in the Codex section." : "Save applies changes across all tabs."}</small>
           <div className="dialog-actions">
             <ControlButton onClick={onCancel} disabled={busy}>Cancel</ControlButton>
             <ControlButton className="primary-button" tone="primary" onClick={() => void save()} disabled={busy}>{busy ? "Saving…" : "Save"}</ControlButton>

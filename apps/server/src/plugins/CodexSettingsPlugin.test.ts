@@ -363,7 +363,13 @@ describe("Codex settings plugin boundary", () => {
 
     await expect(f.hooks.call("codex-settings.read", {}, { caller: { kind } })).resolves.toEqual({ settings });
     await expect(f.hooks.call("codex-settings.update", { expectedRevision: settings.revision, model: "chosen-model" }, { caller: { kind } })).resolves.toMatchObject({ settings: { model: "chosen-model" } });
-    expect(f.plugin.descriptor()).toMatchObject({ id: "codex-settings", creatable: true, requiresDirectory: false });
+    expect(f.plugin.descriptor()).toMatchObject({ id: "codex-settings", creatable: false, requiresDirectory: false });
+  });
+
+  it("exposes settings hooks without offering a workspace tab", async () => {
+    const { plugin } = await pluginFixture();
+    expect(plugin.descriptor().uiContributions?.some(contribution => contribution.slot === "plugin.panel")).toBe(false);
+    expect(() => plugin.createSession()).toThrow("Settings > Codex");
   });
 
   it.each([
