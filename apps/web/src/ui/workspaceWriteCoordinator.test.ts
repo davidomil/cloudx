@@ -2,9 +2,93 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { TabLayoutState } from "@cloudx/shared";
 
+import { closeTab, updateWindow } from "../api.js";
+import { defaultLayout, splitPane } from "./layout.js";
 import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
 
 describe("WorkspaceWriteCoordinator", () => {
+  it.each(["saved", "failed"])("continues a debounced layout PATCH after a tab close fails: layout %s", async (saveOutcome) => {
+    vi.useFakeTimers();
+    const close = deferred<Response>();
+    const reportError = vi.fn();
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === "/api/tabs/tab-1" && init?.method === "DELETE") return close.promise;
+      if (url === "/api/windows/window-1" && init?.method === "PATCH") {
+        return new Response(JSON.stringify(saveOutcome === "saved" ? {} : { message: "Layout save failed" }), {
+          status: saveOutcome === "saved" ? 200 : 503
+        });
+      }
+      throw new Error(`Unexpected request: ${init?.method} ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const coordinator = new WorkspaceWriteCoordinator(async (windowId, layout) => {
+      await updateWindow(windowId, { layout });
+    }, 200, reportError);
+    try {
+      const closing = coordinator.run(() => closeTab("tab-1"));
+      const closeFailed = expect(closing).rejects.toThrow("Tab close failed");
+      await vi.advanceTimersByTimeAsync(0);
+      const layout = splitPane(defaultLayout(), "row", () => "pane-2", () => "split-1");
+      coordinator.scheduleLayout("window-1", layout);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(true);
+
+      close.resolve(new Response(JSON.stringify({ message: "Tab close failed" }), { status: 503 }));
+      await closeFailed;
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenLastCalledWith("/api/windows/window-1", {
+        method: "PATCH", body: JSON.stringify({ layout }), headers: { "content-type": "application/json" }
+      });
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(saveOutcome === "failed");
+      if (saveOutcome === "failed") expect(reportError).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ message: "Layout save failed" }));
+      else expect(reportError).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } finally {
+      coordinator.dispose();
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["active layout save", "queued command"])("does not retry a debounced layout already failed by preceding work: %s", async (precedingWrite) => {
+    vi.useFakeTimers();
+    const held = deferred<void>();
+    const error = new Error("Layout save failed");
+    const reportError = vi.fn();
+    const initial = layoutFixture("tab-1");
+    const latest = layoutFixture("tab-2");
+    const persistLayout = vi.fn(async (_windowId: string, layout: TabLayoutState) => {
+      if (layout === initial) await held.promise;
+      else throw error;
+    });
+    const coordinator = new WorkspaceWriteCoordinator(persistLayout, 200, reportError);
+    try {
+      if (precedingWrite === "active layout save") coordinator.scheduleLayout("window-1", initial);
+      else void coordinator.run(() => held.promise);
+      await vi.advanceTimersByTimeAsync(200);
+      const command = precedingWrite === "queued command" ? coordinator.run(async () => undefined) : undefined;
+      const commandOutcome = Promise.allSettled(command ? [command] : []);
+      coordinator.scheduleLayout("window-1", latest);
+      await vi.advanceTimersByTimeAsync(200);
+      const barrier = expect(coordinator.flush()).rejects.toBe(error);
+      held.resolve();
+      await barrier;
+      await commandOutcome;
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(persistLayout.mock.calls.filter(([, layout]) => layout === latest)).toHaveLength(1);
+      expect(reportError).toHaveBeenCalledExactlyOnceWith(error);
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(true);
+    } finally {
+      coordinator.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["explicit flush", "workspace command", "debounce timer"])("reports layout save errors once for %s", async (trigger) => {
     vi.useFakeTimers();
     const error = new Error("Layout could not be saved");
@@ -75,6 +159,63 @@ describe("WorkspaceWriteCoordinator", () => {
     ]);
     await expect(coordinator.flush()).resolves.toBeUndefined();
     coordinator.dispose();
+  });
+
+  it("preserves a concurrent explicit flush failure while the debounced layout is saved", async () => {
+    vi.useFakeTimers();
+    const command = deferred<void>();
+    const persistLayout = vi.fn(async () => undefined);
+    const coordinator = new WorkspaceWriteCoordinator(persistLayout, 200);
+    try {
+      const operation = coordinator.run(() => command.promise);
+      await vi.advanceTimersByTimeAsync(0);
+      const layout = layoutFixture("tab-1");
+      coordinator.scheduleLayout("window-1", layout);
+      await vi.advanceTimersByTimeAsync(200);
+      const barrier = coordinator.flush();
+      const outcomes = Promise.allSettled([operation, barrier]);
+      const error = new Error("Tab close failed");
+      command.reject(error);
+
+      expect(await outcomes).toEqual([
+        { status: "rejected", reason: error },
+        { status: "rejected", reason: error }
+      ]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(persistLayout).toHaveBeenCalledExactlyOnceWith("window-1", layout);
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(false);
+    } finally {
+      coordinator.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("saves a newer debounced layout after an older layout save fails", async () => {
+    vi.useFakeTimers();
+    const oldSave = deferred<void>();
+    const initial = layoutFixture("tab-1");
+    const latest = layoutFixture("tab-2");
+    const reportError = vi.fn();
+    const persistLayout = vi.fn(async (_windowId: string, layout: TabLayoutState) => {
+      if (layout === initial) await oldSave.promise;
+    });
+    const coordinator = new WorkspaceWriteCoordinator(persistLayout, 200, reportError);
+    try {
+      coordinator.scheduleLayout("window-1", initial);
+      await vi.advanceTimersByTimeAsync(200);
+      coordinator.scheduleLayout("window-1", latest);
+      await vi.advanceTimersByTimeAsync(200);
+      const error = new Error("Old layout save failed");
+      oldSave.reject(error);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(persistLayout.mock.calls).toEqual([["window-1", initial], ["window-1", latest]]);
+      expect(reportError).toHaveBeenCalledExactlyOnceWith(error);
+      expect(coordinator.hasUnsettledLayoutWrite()).toBe(false);
+    } finally {
+      coordinator.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("waits for commands queued during a layout save before completing the flush", async () => {

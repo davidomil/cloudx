@@ -3,6 +3,7 @@ import type { TabLayoutState } from "@cloudx/shared";
 interface PendingLayoutWrite {
   windowId: string;
   layout: TabLayoutState;
+  failed?: boolean;
 }
 
 export class WorkspaceWriteCoordinator {
@@ -23,7 +24,9 @@ export class WorkspaceWriteCoordinator {
     this.clearTimer();
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.flush().catch(() => undefined);
+      void this.enqueue(async () => {
+        if (!this.pendingLayout?.failed) await this.flushPendingLayouts();
+      }).catch(() => undefined);
     }, this.debounceMs);
   }
 
@@ -73,6 +76,7 @@ export class WorkspaceWriteCoordinator {
       try {
         await this.persistLayout(pending.windowId, pending.layout);
       } catch (error) {
+        pending.failed = true;
         this.pendingLayout ??= pending;
         this.reportError(error);
         throw error;
