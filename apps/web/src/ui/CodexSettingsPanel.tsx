@@ -42,7 +42,7 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
       </div> : null}
       {saved ? <p role="status">Global Codex settings saved.</p> : null}
       <div className="codex-settings-actions">
-        <ControlButton type="submit" tone="primary" disabled={!canSave}><Save size={16} aria-hidden="true" /> {busy === "saving" ? "Saving…" : "Save"}</ControlButton>
+        <ControlButton type="submit" tone="primary" disabled={!canSave}><Save size={16} aria-hidden="true" /> {busy === "saving" ? "Saving…" : "Save Codex settings"}</ControlButton>
         <ControlButton onClick={() => void editor.reload()} disabled={busy !== null}><RefreshCw size={16} aria-hidden="true" /> Reload</ControlButton>
       </div>
       <small>Reload reads the shared settings and discards unsaved edits.</small>

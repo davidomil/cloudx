@@ -1,6 +1,5 @@
 import {
   descriptorFromPlugin,
-  type CreatePluginSessionInput,
   type HookDefinition,
   type PluginSession,
   type WorkspacePlugin,
@@ -15,18 +14,10 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly displayName = "Codex Settings";
   readonly description = "Edit global Codex defaults shared across CloudX instances using the same Codex home.";
   readonly panelKind = "placeholder" as const;
-  readonly creatable = true;
+  readonly creatable = false;
   readonly requiresDirectory = false;
   readonly actions = [];
   readonly hooks: HookDefinition[];
-  readonly uiContributions = [{
-    id: "codex-settings.panel",
-    owner: { kind: "plugin" as const, pluginId: this.id },
-    slot: "plugin.panel" as const,
-    renderer: "codex-settings.panel",
-    title: "Codex Settings",
-    targetPluginId: this.id,
-  }];
 
   constructor(settings: CodexSettingsService) {
     this.hooks = [
@@ -62,23 +53,7 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
 
   descriptor() { return descriptorFromPlugin(this); }
 
-  createSession(input: CreatePluginSessionInput): PluginSession {
-    return new CodexSettingsSession(input.tab);
-  }
-}
-
-class CodexSettingsSession implements PluginSession {
-  constructor(readonly tab: CreatePluginSessionInput["tab"]) {}
-
-  snapshot() {
-    return { tabId: this.tab.id, pluginId: this.tab.pluginId, title: this.tab.title, cwd: this.tab.cwd, status: this.tab.status };
-  }
-
-  voiceContext() {
-    return { kind: "codex-settings", cwd: this.tab.cwd, summary: "Shared global Codex settings editor." };
-  }
-
-  handleAction(): Record<string, unknown> {
-    throw new Error("Codex Settings does not expose tab actions.");
+  createSession(): PluginSession {
+    throw new Error("Codex settings are available in Settings > Codex, not as a workspace tab.");
   }
 }

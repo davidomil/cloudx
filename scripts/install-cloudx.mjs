@@ -2042,14 +2042,10 @@ function installSystemdServices(commands, runner, paths) {
 }
 
 function verifyServices(commands, port, envConfig) {
+  const journalSince = `@${Math.floor(Date.now() / 1000) - 5 * 60}`;
   console.log("Verifying service enablement and readiness endpoints.");
   commands.run("systemctl", ["--user", "is-enabled", ...SERVICE_NAMES]);
   try {
-    waitForHealth(commands, {
-      label: "Cloudx web",
-      url: `https://127.0.0.1:${port}/api/ready`,
-      insecure: true,
-    });
     waitForHealth(commands, {
       label: "Cloudx ASR",
       url: "http://127.0.0.1:7810/ready",
@@ -2057,6 +2053,11 @@ function verifyServices(commands, port, envConfig) {
     waitForHealth(commands, {
       label: "Cloudx documentation indexer",
       url: documentationReadinessUrl(envConfig),
+    });
+    waitForHealth(commands, {
+      label: "Cloudx web",
+      url: `https://127.0.0.1:${port}/api/ready`,
+      insecure: true,
     });
   } catch (error) {
     console.error(
@@ -2073,7 +2074,7 @@ function verifyServices(commands, port, envConfig) {
         "--user",
         ...SERVICE_NAMES.flatMap((serviceName) => ["-u", serviceName]),
         "--since",
-        "5 minutes ago",
+        journalSince,
         "--no-pager",
       ],
       { allowFailure: true },
@@ -2082,8 +2083,13 @@ function verifyServices(commands, port, envConfig) {
   }
 }
 
-function waitForHealth(commands, { label, url, insecure = false }) {
-  console.log(`Waiting for ${label} readiness endpoint: ${url}`);
+export function waitForHealth(
+  commands,
+  { label, url, insecure = false, startupTimeoutSeconds = 300 },
+) {
+  console.log(
+    `Waiting for ${label} readiness endpoint: ${url} (startup budget: ${startupTimeoutSeconds}s)`,
+  );
   const args = [
     "--fail",
     "--silent",
@@ -2091,7 +2097,9 @@ function waitForHealth(commands, { label, url, insecure = false }) {
     "--max-time",
     "5",
     "--retry",
-    "30",
+    String(startupTimeoutSeconds),
+    "--retry-max-time",
+    String(startupTimeoutSeconds),
     "--retry-delay",
     "1",
     "--retry-connrefused",
@@ -2100,7 +2108,14 @@ function waitForHealth(commands, { label, url, insecure = false }) {
     args.push("--insecure");
   }
   args.push(url);
-  commands.capture("curl", args);
+  try {
+    commands.capture("curl", args);
+  } catch (error) {
+    throw new Error(
+      `${label} readiness verification failed at ${url} (startup budget: ${startupTimeoutSeconds}s). ${error.message}`,
+      { cause: error },
+    );
+  }
   console.log(`  ${label} readiness ok.`);
 }
 

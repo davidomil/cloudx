@@ -272,9 +272,14 @@ does the operational refresh:
   Existing model and runtime-data directories from the saved configuration are preserved.
 - Rebuilds Cloudx and creates the local HTTPS certificate if it is missing.
 - Rewrites user-level systemd service files when they are already installed.
-- Asks whether to restart services now; if restarted, it verifies the Cloudx,
-  ASR, and documentation indexer readiness endpoints and then prints the local URL.
-  Documentation readiness uses the saved listener host and port.
+- Asks whether to restart services now; if restarted, it verifies ASR and the
+  documentation indexer before checking Cloudx web readiness and printing the local URL.
+  Documentation readiness uses the saved listener host and port. Each endpoint gets a
+  five-minute startup budget, with at most five additional seconds for an in-flight
+  request. Archive migration and semantic index rebuilding can delay the indexer's
+  HTTP listener after an update. Verification still fails if a service does not
+  become ready within its budget; the error names the service and endpoint.
+  Failure diagnostics include logs from five minutes before verification began.
   Updates preserve exact `CLOUDX_HOST=0.0.0.0` only when a nonempty
   `CLOUDX_TRUSTED_ORIGINS` is also present. Other network-facing values and an
   incomplete wildcard configuration are replaced with `127.0.0.1`.
@@ -526,6 +531,19 @@ indexer elsewhere, start Cloudx with:
 ```bash
 CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820 npm run dev
 ```
+
+During startup, the indexer returns HTTP 503 with status `initializing`
+while it prepares retained sources and the search index. Large archives
+can take several minutes after a search-profile change.
+
+The Documentation panel displays the initialization message. Select
+**Refresh** after initialization finishes to reload the summary and any
+previously opened document list.
+
+If initialization fails, the indexer returns HTTP 503 with status
+`failed`; inspect the documentation service logs, correct the error, and
+restart the service. `/ready` returns HTTP 200 only when archive health
+reports ready.
 
 Interactive terminal tabs also require the independent terminal broker. For
 development, run `npm run terminals -w @cloudx/server` in a separate terminal

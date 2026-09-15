@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DocumentationClient } from "./DocumentationClient.js";
 
@@ -11,7 +11,60 @@ describe("DocumentationClient", () => {
   const servers: http.Server[] = [];
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  });
+
+  it.each([
+    ["document list", (client: DocumentationClient) => client.listDocuments({ query: "private-query" })],
+    ["artifact bytes", (client: DocumentationClient) => client.getArtifact({ documentId: "doc", path: "private-path" })],
+    ["artifact stream", (client: DocumentationClient) => client.streamArtifact({ documentId: "doc", path: "private-path" })],
+    ["archive stream", (client: DocumentationClient) => client.streamArchiveExport()],
+    ["ingest progress", (client: DocumentationClient) => client.ingestUrl({ url: "https://example.com" }, { onProgress() {} })],
+  ])("reports an unavailable indexer for %s", async (_label, request) => {
+    const url = await startServer((_request, response) => response.end("{}"));
+    await new Promise<void>((resolve) => servers.at(-1)!.close(() => resolve()));
+    const client = new DocumentationClient(`${url}/docs?token=private-token`);
+
+    const failure = await request(client).catch((error: Error) => error);
+
+    expect(failure).toMatchObject({
+      statusCode: 503,
+      code: "documentation_unavailable",
+      cause: { message: "fetch failed", cause: { code: "ECONNREFUSED" } },
+    });
+    expect(failure).toHaveProperty("message", expect.stringContaining(`Documentation service unavailable at ${url}/docs/`));
+    expect(failure).toHaveProperty("message", expect.stringContaining("cloudx-documentation.service"));
+    expect(failure).toHaveProperty("message", expect.stringContaining("logs"));
+    expect(failure).toHaveProperty("message", expect.stringContaining("CLOUDX_DOCUMENTATION_URL"));
+    expect(failure).toHaveProperty("message", expect.not.stringContaining("private-"));
+  });
+
+  it("keeps endpoint credentials and query values out of unavailable errors", async () => {
+    const transportError = new TypeError("fetch failed", { cause: new Error("private transport details") });
+    const fetchRequest = vi.spyOn(globalThis, "fetch").mockRejectedValue(transportError);
+    const client = new DocumentationClient("http://private-user:private-password@127.0.0.1:7820/docs?token=private-token#private-fragment");
+
+    const failure = await client.listDocuments().catch((error: Error) => error);
+
+    expect(fetchRequest).toHaveBeenCalledTimes(1);
+    expect(failure).toHaveProperty("cause", transportError);
+    expect(failure).toHaveProperty("message", expect.stringContaining("http://127.0.0.1:7820/docs/documents"));
+    expect(failure).toHaveProperty("message", expect.not.stringContaining("private-"));
+    expect(JSON.stringify(failure)).not.toContain("private");
+  });
+
+  it("preserves request construction errors", async () => {
+    const invalidRequest = new TypeError("Invalid request header");
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(invalidRequest);
+
+    await expect(new DocumentationClient().listDocuments()).rejects.toBe(invalidRequest);
+  });
+
+  it("preserves malformed JSON errors from a reachable indexer", async () => {
+    const url = await startServer((_request, response) => response.end("not JSON"));
+
+    await expect(new DocumentationClient(url).listDocuments()).rejects.toBeInstanceOf(SyntaxError);
   });
 
   it("posts search requests to a base path with JSON", async () => {

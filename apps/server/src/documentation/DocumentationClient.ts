@@ -111,6 +111,15 @@ export interface DocumentationArchiveFileInput {
   confirmation?: string;
 }
 
+export class DocumentationServiceUnavailableError extends Error {
+  readonly statusCode = 503;
+  readonly code = "documentation_unavailable";
+
+  constructor(endpoint: URL, cause: Error) {
+    super(`Documentation service unavailable at ${endpoint.origin}${endpoint.pathname}. Check cloudx-documentation.service and its logs, and verify CLOUDX_DOCUMENTATION_URL.`, { cause });
+  }
+}
+
 export class DocumentationClient {
   private readonly timeoutMs: number;
   private readonly responseMaxBytes: number;
@@ -284,7 +293,7 @@ export class DocumentationClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await fetch(this.serviceUrl(`/documents/${documentId}/artifact?path=${path}`), {
+      const response = await this.fetchService(`/documents/${documentId}/artifact?path=${path}`, {
         method: "GET",
         headers: compactHeaders(headers),
         signal: controller.signal
@@ -331,7 +340,7 @@ export class DocumentationClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await fetch(this.serviceUrl(pathname), {
+      const response = await this.fetchService(pathname, {
         method: "GET",
         headers: compactHeaders(headers),
         signal: controller.signal
@@ -501,7 +510,7 @@ export class DocumentationClient {
     try {
       const headers = new Headers(init.headers);
       headers.set("accept", "application/x-ndjson");
-      const response = await fetch(this.serviceUrl(pathname), {
+      const response = await this.fetchService(pathname, {
         ...init,
         headers,
         signal: scope.signal
@@ -530,7 +539,7 @@ export class DocumentationClient {
     const scope = createDocumentationRequestAbortScope(signal);
     const timeout = setTimeout(() => scope.abortForTimeout(), this.timeoutMs);
     try {
-      const response = await fetch(this.serviceUrl(pathname), { ...init, signal: scope.signal });
+      const response = await this.fetchService(pathname, { ...init, signal: scope.signal });
       const text = await readBoundedText(response, this.responseMaxBytes);
       if (!response.ok) {
         throw Object.assign(new Error(errorMessage(text, response.status)), { statusCode: response.status });
@@ -558,7 +567,7 @@ export class DocumentationClient {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
-      const response = await fetch(this.serviceUrl(pathname), { ...init, signal: controller.signal });
+      const response = await this.fetchService(pathname, { ...init, signal: controller.signal });
       const content = await readBoundedBytes(response, this.responseMaxBytes);
       if (!response.ok) {
         throw new Error(errorMessage(new TextDecoder().decode(content), response.status));
@@ -575,6 +584,18 @@ export class DocumentationClient {
       throw error;
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  private async fetchService(pathname: string, init: RequestInit): Promise<Response> {
+    const endpoint = new URL(this.serviceUrl(pathname));
+    try {
+      return await fetch(endpoint, init);
+    } catch (error) {
+      if (!init.signal?.aborted && error instanceof TypeError && error.message === "fetch failed") {
+        throw new DocumentationServiceUnavailableError(endpoint, error);
+      }
+      throw error;
     }
   }
 
