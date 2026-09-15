@@ -6,6 +6,7 @@ import {
   type WorkspacePlugin,
 } from "@cloudx/plugin-api";
 import type { ForgePlacement, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
+import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH } from "@cloudx/shared";
 import {
   forgeConfigFields,
   type ForgeSettingsService,
@@ -178,6 +179,16 @@ export class ForgePlugin implements WorkspacePlugin {
             String(input.id),
             place(input),
           ),
+        }),
+      ),
+      hook(
+        "worker.continue",
+        "Continue worker with a message",
+        "external",
+        { id, message: { type: "string", minLength: 1, maxLength: MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, pattern: "\\S" }, ...placement },
+        ["id", "message", "windowId", "paneId"],
+        async (input) => ({
+          worker: await this.service().workflow.continueWorker(String(input.id), String(input.message), place(input)),
         }),
       ),
       hook(

@@ -26,6 +26,7 @@ async function fixture() {
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
     syncAndReview: vi.fn(async () => ({ id: "worker" })),
     rebaseAndResolve: vi.fn(async () => ({ id: "worker" })),
+    continueWorker: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
     markReview: vi.fn(async () => {}),
     saveReview: vi.fn(async () => ({ id: "worker" })),
@@ -54,6 +55,30 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections };
 }
 describe("Forge plugin boundary", () => {
+  it.each(["ui", "http"] as const)("continues the selected worker with its message through %s", async kind => {
+    const { hooks, workflow } = await fixture();
+    const message = "The setup is fixed.\nContinue with the failing test.";
+    await expect(hooks.call("forge.worker.continue", { id: "worker", message, windowId: "window", paneId: "pane" }, { caller: { kind } })).resolves.toEqual({ worker: { id: "worker" } });
+    expect(workflow.continueWorker).toHaveBeenCalledExactlyOnceWith("worker", message, { windowId: "window", paneId: "pane" });
+  });
+
+  it.each([
+    { message: undefined }, { message: null }, { message: 7 }, { message: "" }, { message: " \n\t" }, { message: "x".repeat(20_001) },
+    { id: undefined }, { id: "" }, { id: 7 }, { id: "x".repeat(129) },
+    { windowId: undefined }, { windowId: "" }, { paneId: undefined }, { paneId: "" },
+    { repositoryPath: "/untrusted" }, { headSha: "a".repeat(40) },
+  ])("rejects invalid continuation input before dispatch %#", async invalid => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.continue", { id: "worker", message: "Continue", windowId: "window", paneId: "pane", ...invalid }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.continueWorker).not.toHaveBeenCalled();
+  });
+
+  it("keeps manual continuation unavailable to automation", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.continue", { id: "worker", message: "Continue", windowId: "window", paneId: "pane" }, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.continueWorker).not.toHaveBeenCalled();
+  });
+
   it.each(["ui", "http"] as const)("starts conflict recovery through %s using the selected worker and pane", async kind => {
     const { hooks, workflow } = await fixture();
     await expect(hooks.call("forge.worker.rebaseAndResolve", { id: "worker", windowId: "window", paneId: "pane" }, { caller: { kind } })).resolves.toEqual({ worker: { id: "worker" } });

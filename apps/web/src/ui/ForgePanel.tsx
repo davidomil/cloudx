@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
-import { hasUnconfirmedPublication } from "@cloudx/shared";
+import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH } from "@cloudx/shared";
 import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -13,6 +13,10 @@ type Request = <T>(hook: string, input?: Record<string, unknown>) => Promise<T>;
 type RunAction = (work: () => Promise<unknown>, interrupt?: boolean) => Promise<boolean>;
 type View = "issues" | "changes" | "workers";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
+const WorkerContinuations = createContext<{
+  messages: Record<string, string>;
+  setMessage: (workerId: string, message?: string) => void;
+} | null>(null);
 
 export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending }: {
   callHook: CallHook;
@@ -37,6 +41,21 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
   const [revision, setRevision] = useState(0);
   const [snapshot, setSnapshot] = useState<{ key: string; dashboard: ForgeDashboard }>();
+  const [continuationMessages, setContinuationMessages] = useState<Record<string, string>>({});
+  function setContinuationMessage(workerId: string, message?: string) {
+    setContinuationMessages(current => {
+      const next = { ...current };
+      if (message === undefined) delete next[workerId];
+      else next[workerId] = message;
+      return next;
+    });
+  }
+  useEffect(() => {
+    if (!snapshot) return;
+    const ids = new Set(snapshot.dashboard.workers.map(worker => worker.id));
+    setContinuationMessages(current => Object.keys(current).every(id => ids.has(id)) ? current :
+      Object.fromEntries(Object.entries(current).filter(([id]) => ids.has(id))));
+  }, [snapshot]);
   const dashboard = snapshot?.dashboard;
   const repositoryReady = !repositoryChangePending && snapshot?.key === repositorySettingsKey;
   const [loadError, setLoadError] = useState<string>();
@@ -93,7 +112,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const changeLabel = repository?.provider === "gitlab" ? "Merge requests" : "Pull requests";
   const awaitingReview = workers.filter((worker) => worker.status === "awaiting_review" && !worker.autoReview?.enabled).length;
 
-  return <section className="forge-panel" aria-label="Forge">
+  return <WorkerContinuations.Provider value={{ messages: continuationMessages, setMessage: setContinuationMessage }}><section className="forge-panel" aria-label="Forge">
     <header className="forge-header">
       <div><h2><GitPullRequest size={18} /> Forge</h2><p>{repository ? `${repository.provider === "github" ? "GitHub" : "GitLab"} · ${repository.projectPath}` : "Issue workers and reviews"}</p></div>
       <div className="forge-actions">
@@ -120,7 +139,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
-  </section>;
+  </section></WorkerContinuations.Provider>;
 }
 
 function ForgeItems({ kind, repository, request, revision, workers, placement, runAction, busy, onViewWorker }: {
@@ -328,6 +347,15 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
   collapsible?: boolean;
 }) {
   const [controlling, setControlling] = useState(false);
+  const continuation = useContext(WorkerContinuations)!;
+  const continuing = continuation.messages[worker.id] !== undefined;
+  const continuationMessage = continuation.messages[worker.id] ?? "";
+  const continuationBlocker = forgeWorkerContinuationBlocker(worker, workers);
+  async function continueWorker() {
+    if (continuationBlocker || !continuationMessage.trim() || continuationMessage.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH) return;
+    const successful = await runAction(() => request("forge.worker.continue", { id: worker.id, message: continuationMessage, ...placement }));
+    if (successful) continuation.setMessage(worker.id);
+  }
   const controlRunning = useRef(false);
   async function interruptWorker(action: "pause" | "stop") {
     if (controlRunning.current) return;
@@ -364,6 +392,7 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
     {!archivedDraft ? <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
       {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.pendingPublication ? "Retry publication" : "Resume"}</ControlButton> : null}
+      {worker.kind === "review" || worker.status !== "completed" ? <ControlButton size="compact" disabled={busy} aria-expanded={continuing} onClick={() => continuation.setMessage(worker.id, continuing ? undefined : "")}><MessageSquare size={14} /> Continue with message</ControlButton> : null}
       {canSync ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.syncAndReview", { id: worker.id, ...placement }))}><RefreshCw size={14} /> Sync and re-review</ControlButton> : null}
       {canResolveConflicts ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.rebaseAndResolve", { id: worker.id, ...placement }))}><RefreshCw size={14} /> Rebase and resolve conflicts</ControlButton> : null}
       {canStop ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("stop")}><Square size={13} /> Stop</ControlButton> : null}
@@ -371,6 +400,17 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
       {onViewWorker ? <ControlButton size="compact" onClick={() => onViewWorker(worker.id)}><Terminal size={14} /> View worker</ControlButton> : null}
       {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">Open PR/MR <ExternalLink size={12} /></a> : null}
     </div> : null}
+    {!archivedDraft && continuing ? <form aria-label="Continue worker with a message" onSubmit={event => { event.preventDefault(); void continueWorker(); }}>
+      <p className="forge-muted">Continue this {worker.kind === "issue" ? "issue" : "review"} worker with additional instructions.</p>
+      {continuationBlocker ? <p role="status" className="forge-notice">{continuationBlocker}</p> : null}
+      <label className="forge-field">Message to worker
+        <textarea autoFocus required rows={4} maxLength={MAX_FORGE_CONTINUATION_MESSAGE_LENGTH} value={continuationMessage} disabled={busy} onChange={event => continuation.setMessage(worker.id, event.target.value)} />
+      </label>
+      <div className="forge-actions">
+        <ControlButton type="submit" tone="primary" size="compact" disabled={busy || !!continuationBlocker || !continuationMessage.trim() || continuationMessage.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH}>{busy ? "Continuing…" : "Send and continue"}</ControlButton>
+        <ControlButton size="compact" disabled={busy} onClick={() => continuation.setMessage(worker.id)}>Cancel</ControlButton>
+      </div>
+    </form> : null}
     {draft ? <ReviewEditor key={draft.id} worker={worker} draft={draft} archived={!!archivedDraft} request={request} runAction={runAction} busy={busy} canSubmitReview={canSubmitReview} /> : null}
   </article>;
   if (!collapsible) return card;

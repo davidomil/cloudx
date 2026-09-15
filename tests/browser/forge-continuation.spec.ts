@@ -1,0 +1,246 @@
+import { expect, test, type Page, type Route } from "@playwright/test";
+import type { ForgeWorker } from "@cloudx/shared";
+import react from "@vitejs/plugin-react";
+import { createServer as createHttpServer, type Server } from "node:http";
+import path from "node:path";
+import { createServer, type ViteDevServer } from "vite";
+
+const repoRoot = path.resolve(import.meta.dirname, "../..");
+let server: ViteDevServer;
+let httpServer: Server;
+let baseUrl: string;
+
+test.beforeAll(async () => {
+  httpServer = createHttpServer();
+  server = await createServer({
+    configFile: false,
+    root: repoRoot,
+    plugins: [react()],
+    resolve: {
+      alias: {
+        "@cloudx/shared": path.join(repoRoot, "packages/shared/src/index.ts"),
+      },
+    },
+    server: { middlewareMode: { server: httpServer }, ws: false },
+    optimizeDeps: { entries: ["tests/browser/fixtures/forge-panel.html"] },
+  });
+  httpServer.on("request", server.middlewares);
+  await new Promise<void>((resolve) =>
+    httpServer.listen(0, "127.0.0.1", resolve),
+  );
+  const address = httpServer.address();
+  if (!address || typeof address === "string")
+    throw new Error("Missing browser fixture port");
+  baseUrl = `http://127.0.0.1:${address.port}/tests/browser/fixtures/forge-panel.html`;
+});
+
+test.afterAll(async () => {
+  await server?.close();
+  await new Promise<void>((resolve, reject) =>
+    httpServer.close((error) => (error ? reject(error) : resolve())),
+  );
+});
+
+async function workers(page: Page, holdFirstContinuation = false) {
+  const repository = {
+    provider: "github" as const,
+    apiUrl: "https://api.github.com",
+    projectPath: "cloudx/example",
+  };
+  const common = {
+    repository,
+    repositoryPath: "/fixture/repository",
+    baseBranch: "main",
+    templateId: "worker-template",
+    autoPost: false,
+    startedAt: "2026-09-15",
+    updatedAt: "2026-09-15",
+  };
+  const entries: ForgeWorker[] = [
+    {
+      ...common,
+      id: "issue-worker",
+      kind: "issue",
+      number: 7,
+      title: "Repair deployment",
+      status: "failed",
+      error: "The dependency is unavailable.",
+    },
+    {
+      ...common,
+      id: "review-worker",
+      kind: "review",
+      number: 12,
+      title: "Review deployment changes",
+      status: "completed",
+    },
+  ];
+  const continuations: Array<{
+    input: Record<string, unknown>;
+    tabId: string;
+  }> = [];
+  let held!: Route;
+  let requested!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    requested = resolve;
+  });
+
+  await page.route("**/fixture-hooks/**", async (route) => {
+    const hook = new URL(route.request().url()).pathname.split("/").pop();
+    const body = route.request().postDataJSON();
+    switch (hook) {
+      case "forge.dashboard":
+        return route.fulfill({
+          json: { configured: true, repository, workers: entries },
+        });
+      case "forge.issues.list":
+        return route.fulfill({ json: { items: [] } });
+      case "forge.worker.continue": {
+        continuations.push(body);
+        if (holdFirstContinuation && continuations.length === 1) {
+          held = route;
+          requested();
+          return;
+        }
+        const worker = entries.find((entry) => entry.id === body.input.id);
+        if (!worker) throw new Error(`Unknown worker ${body.input.id}`);
+        worker.status = "running";
+        delete worker.error;
+        return route.fulfill({ json: { worker } });
+      }
+      default:
+        throw new Error(`Unexpected hook ${hook}`);
+    }
+  });
+  await page.goto(baseUrl);
+  await page.getByRole("button", { name: "Workers (2)", exact: true }).click();
+  return {
+    continuations,
+    pending,
+    fail: () =>
+      held.fulfill({
+        status: 409,
+        json: { error: "The checkout needs attention." },
+      }),
+  };
+}
+
+for (const worker of [
+  { kind: "issue", number: 7, status: "failed" },
+  { kind: "review", number: 12, status: "completed" },
+]) {
+  test(`continues the selected ${worker.status} ${worker.kind} worker with a multiline message`, async ({
+    page,
+  }, testInfo) => {
+    const fixture = await workers(page);
+    const tab = page.getByRole("tab", {
+      name: new RegExp(`${worker.kind} #${worker.number}`, "i"),
+    });
+    await tab.click();
+    await expect(tab).toHaveAttribute("aria-selected", "true");
+    await page.getByRole("button", { name: "Continue with message" }).click();
+
+    const form = page.getByRole("form", {
+      name: "Continue worker with a message",
+    });
+    const input = form.getByRole("textbox", { name: "Message to worker" });
+    const submit = form.getByRole("button", { name: "Send and continue" });
+    await expect(input).toBeFocused();
+    await expect(input).toHaveAttribute("maxlength", "20000");
+    await expect(submit).toBeDisabled();
+    await input.fill(" \n\t");
+    await expect(submit).toBeDisabled();
+    const message =
+      "The dependency is installed.\nRun the deployment check again.";
+    await input.fill(message);
+    await expect(submit).toBeEnabled();
+    await expect(input).toBeInViewport({ ratio: 1 });
+    await expect(submit).toBeInViewport({ ratio: 1 });
+    const bounds = (await input.boundingBox())!;
+    expect(bounds.width).toBeGreaterThanOrEqual(220);
+    expect(bounds.height).toBeGreaterThanOrEqual(60);
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(
+      page.viewportSize()!.width,
+    );
+    const screenshot = testInfo.outputPath("continuation-form.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("continuation-form", {
+      path: screenshot,
+      contentType: "image/png",
+    });
+
+    await submit.click();
+    await expect(form).toHaveCount(0);
+    expect(fixture.continuations).toEqual([
+      {
+        input: {
+          id: `${worker.kind}-worker`,
+          message,
+          windowId: "window-1",
+          paneId: "pane-2",
+        },
+        tabId: "forge-tab",
+      },
+    ]);
+    await expect(tab).toContainText("running");
+  });
+}
+
+test("retains a failed message and allows an explicit retry", async ({
+  page,
+}) => {
+  const fixture = await workers(page, true);
+  await page.getByRole("button", { name: "Continue with message" }).click();
+  const form = page.getByRole("form", {
+    name: "Continue worker with a message",
+  });
+  const input = form.getByRole("textbox", { name: "Message to worker" });
+  const message = "The dependency is installed.\nContinue the existing work.";
+  await input.fill(message);
+  await form.getByRole("button", { name: "Send and continue" }).click();
+  await fixture.pending;
+  await expect(input).toBeDisabled();
+  await expect(
+    form.getByRole("button", { name: "Continuing…" }),
+  ).toBeDisabled();
+  await expect(form.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  expect(fixture.continuations).toHaveLength(1);
+
+  await fixture.fail();
+  await expect(
+    page
+      .getByRole("alert")
+      .filter({ hasText: "The checkout needs attention." }),
+  ).toBeVisible();
+  await expect(input).toHaveValue(message);
+  await expect(input).toBeEnabled();
+  await form.getByRole("button", { name: "Send and continue" }).click();
+  await expect(form).toHaveCount(0);
+  expect(fixture.continuations).toHaveLength(2);
+  expect(fixture.continuations[1]).toEqual(fixture.continuations[0]);
+});
+
+test("cancels without sending and clears the abandoned message", async ({
+  page,
+}) => {
+  const fixture = await workers(page);
+  const open = page.getByRole("button", { name: "Continue with message" });
+  await open.click();
+  const form = page.getByRole("form", {
+    name: "Continue worker with a message",
+  });
+  await form
+    .getByRole("textbox", { name: "Message to worker" })
+    .fill("Discard this draft.");
+  await form.getByRole("button", { name: "Cancel" }).click();
+  await expect(form).toHaveCount(0);
+  expect(fixture.continuations).toEqual([]);
+  await open.click();
+  await expect(
+    form.getByRole("textbox", { name: "Message to worker" }),
+  ).toHaveValue("");
+  await expect(
+    form.getByRole("button", { name: "Send and continue" }),
+  ).toBeDisabled();
+});

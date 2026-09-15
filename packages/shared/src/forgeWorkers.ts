@@ -2,6 +2,7 @@ import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication } from
 
 export const FORGE_PLUGIN_ID = "forge";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
+export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
 export type ForgeWorkerStatus =
   | "starting"
   | "running"
@@ -114,4 +115,45 @@ export interface ForgePlacement {
 export function hasUnconfirmedPublication(worker: ForgeWorker): boolean {
   return worker.kind === "issue" && Boolean(worker.pendingPublication?.headSha) &&
     worker.pendingPublication!.confirmed !== true;
+}
+
+export function forgeWorkerContinuationBlocker(worker: ForgeWorker, workers: readonly ForgeWorker[]): string | undefined {
+  const blocker = continuationStateBlocker(worker);
+  if (blocker) return blocker;
+  if (worker.rebaseRecovery && worker.rebaseRecovery.phase !== "resolving")
+    return "Finish publishing and reviewing the preserved rebase before continuing with a message.";
+  const related = workers.filter(candidate => candidate.repository.provider === worker.repository.provider &&
+    candidate.repository.apiUrl === worker.repository.apiUrl && candidate.repository.projectPath === worker.repository.projectPath);
+  if (worker.kind === "issue") {
+    const reviews = related.filter(candidate => candidate.kind === "review" && candidate.number === worker.changeNumber);
+    if (reviews.some(review => review.status !== "completed" || uncertainReview(review)))
+      return "Finish the existing review and reconcile its submission before continuing the issue worker.";
+  } else {
+    const issues = related.filter(candidate => candidate.kind === "issue" && candidate.changeNumber === worker.number);
+    if (issues.some(issue => continuationStateBlocker(issue) || issue.rebaseRecovery && issue.rebaseRecovery.phase !== "reviewing"))
+      return "Pause the issue worker and reconcile its publication or merge before continuing this review.";
+    if (worker.issueWorkerId && !issues.some(issue => issue.id === worker.issueWorkerId && issue.autoReview?.reviewWorkerId === worker.id))
+      return "Restore this review's issue loop before continuing.";
+    if (related.some(candidate => candidate.id !== worker.id && candidate.kind === "review" && candidate.number === worker.number &&
+      (candidate.status !== "completed" || uncertainReview(candidate))))
+      return "Finish the other review and reconcile its submission before continuing.";
+  }
+}
+
+function continuationStateBlocker(worker: ForgeWorker): string | undefined {
+  if (["starting", "running"].includes(worker.status))
+    return "Pause this worker before continuing with a message.";
+  if (!["paused", "stopped", "failed", "awaiting_review", "awaiting_merge"].includes(worker.status) &&
+    !(worker.kind === "review" && worker.status === "completed"))
+    return "This worker is not ready to continue with a message. Use Resume to recover unfinished cleanup.";
+  if (worker.pendingPublication || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState ?? ""))
+    return "Reconcile the pending publication or merge using Resume before continuing with a message.";
+  if (uncertainReview(worker))
+    return "Reconcile the previous review submission before continuing with a message.";
+  if (worker.kind === "review" && worker.draft && (worker.reviewHistory?.length ?? 0) >= MAX_FORGE_REVIEW_HISTORY)
+    return "The review history limit has been reached. Inspect this worker before continuing.";
+}
+
+function uncertainReview(worker: ForgeWorker): boolean {
+  return !!worker.draft && ["posting", "post_failed"].includes(worker.draft.status);
 }
