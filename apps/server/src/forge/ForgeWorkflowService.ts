@@ -16,6 +16,7 @@ import type {
 import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
+import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
 
 export interface ForgeSettings {
   repository: ForgeRepository;
@@ -124,11 +125,13 @@ interface Runtime {
   ): Promise<string>;
 }
 export interface ForgeWorkflowDependencies {
+  logger?: ForgeLogger;
   settings(): ForgeSettings;
   provider(
     repository: ForgeRepository,
     role: ForgeCredentialRole,
     signal?: AbortSignal,
+    context?: ForgeWorkerLogContext,
   ): ForgeProvider;
   runtime: Runtime;
   store: {
@@ -164,6 +167,7 @@ interface ManualContinuation {
 
 export class ForgeWorkflowService {
   private workers: ForgeWorker[] = [];
+  private readonly loggedWorkerStates = new Map<string, string>();
   private loaded = false;
   private queue: Promise<unknown> = Promise.resolve();
   private timer?: ReturnType<typeof setTimeout>;
@@ -181,7 +185,8 @@ export class ForgeWorkflowService {
     const tick = async () => {
       try {
         await this.poll();
-      } catch {
+      } catch (error) {
+        forgeLog(this.deps.logger, "error", "poll_failed", forgeErrorFields(error));
         this.deps.notify(
           "Forge worker state needs attention",
           "Could not read or persist worker state. Inspect the Forge panel before continuing.",
@@ -194,8 +199,10 @@ export class ForgeWorkflowService {
     };
     this.timer = setTimeout(() => void tick(), 2000);
     this.timer.unref();
+    forgeLog(this.deps.logger, "info", "polling_started", { intervalMs: 2000 });
   }
   async dispose(): Promise<void> {
+    forgeLog(this.deps.logger, "info", "shutdown_started", { workerCount: this.workers.length });
     this.disposed = true;
     clearTimeout(this.timer);
     this.completionChecks.abort(new Error("CloudX is shutting down."));
@@ -213,6 +220,7 @@ export class ForgeWorkflowService {
       await this.persist();
       this.providerRecoveries.clear();
     });
+    forgeLog(this.deps.logger, "info", "shutdown_completed", { workerCount: this.workers.length });
   }
   dashboard(): Promise<ForgeDashboard> {
     const snapshot = async (): Promise<ForgeDashboard> => {
@@ -700,6 +708,7 @@ export class ForgeWorkflowService {
       if (worker.kind === "issue" && worker.attemptId && !worker.pendingPublication) {
         const raw = await this.deps.reports.read(worker.attemptId);
         if (raw !== undefined) {
+          this.log(worker, "info", "worker_report_received");
           const report = parseWorkerReport(raw);
           if (report.kind !== "issue") throw new Error("Completion report does not match this worker.");
           retainReport = true;
@@ -869,19 +878,23 @@ export class ForgeWorkflowService {
         try {
           const raw = await this.deps.reports.read(worker.attemptId!);
           if (raw === undefined) {
-            if (!worker.tabId || !this.deps.runtime.isActive(worker.tabId))
+            if (!worker.tabId || !this.deps.runtime.isActive(worker.tabId)) {
+              this.log(worker, "warn", "worker_report_missing");
               throw new Error(
                 "The Codex tab ended without a completion report. Inspect the worker before resuming.",
               );
-            if (
-              Date.now() - Date.parse(worker.updatedAt) >
-              this.deps.settings().maxRunMinutes * 60_000
-            )
+            }
+            const elapsedMs = Date.now() - Date.parse(worker.updatedAt);
+            const timeoutMs = this.deps.settings().maxRunMinutes * 60_000;
+            if (elapsedMs > timeoutMs) {
+              this.log(worker, "warn", "worker_timed_out", { elapsedMs, timeoutMs });
               throw new Error(
                 "Worker time limit reached. Inspect the tab and resume explicitly.",
               );
+            }
             continue;
           }
+          this.log(worker, "info", "worker_report_received");
           const report = parseWorkerReport(raw);
           if (report.kind !== worker.kind)
             throw new Error("Completion report does not match this worker.");
@@ -994,6 +1007,7 @@ export class ForgeWorkflowService {
         await this.exhaustProviderRecovery(worker, recovery.message);
         continue;
       }
+      if (recovery) this.log(worker, "info", "provider_recovery_resuming", { retryCount: recovery.retryCount });
       this.nextAutoReviewCheckAt.set(worker.id, Date.now() + 5_000);
       try {
         if (recovery?.resumePreparation) {
@@ -1018,6 +1032,7 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(worker.id)?.signal;
     if (signal?.aborted && (error === signal.reason || unavailable instanceof ForgeProviderUnavailableError)) return true;
     if (!(unavailable instanceof ForgeProviderUnavailableError)) return false;
+    this.log(worker, "warn", "provider_interrupted", forgeErrorFields(unavailable));
     if (await this.scheduleProviderReset(worker, error)) return true;
     if (worker.mergeAttempted || worker.pendingPublication ||
       !["awaiting_review", "awaiting_merge", "paused", "stopped", "failed"].includes(worker.status)) return false;
@@ -1046,6 +1061,7 @@ export class ForgeWorkflowService {
         worker.error = `${unavailable.message} Automatic retry ${recovery.retryCount} of ${PROVIDER_RECOVERY_DELAYS.length} in ${Math.ceil((retryAt - now) / 1000)} seconds.`;
         recovery.retryMessage = worker.error;
         await this.persist();
+        this.log(worker, "warn", "provider_recovery_scheduled", { ...forgeErrorFields(unavailable), retryCount: recovery.retryCount, delayMs: retryAt - now, retryAt: new Date(retryAt).toISOString(), recoveryWindowMs: PROVIDER_RECOVERY_WINDOW });
       }
       return true;
     }
@@ -1078,11 +1094,13 @@ export class ForgeWorkflowService {
     worker.status = "paused";
     worker.error = `${unavailable.message} This worker will resume automatically at ${worker.providerRetryAt}.`;
     await this.persist();
+    this.log(worker, "warn", "provider_reset_scheduled", { ...forgeErrorFields(unavailable), retryAt: worker.providerRetryAt });
     return true;
   }
   private async resumeScheduledWorkers(): Promise<void> {
     for (const worker of this.workers.filter(candidate => candidate.providerRetryAt && Date.parse(candidate.providerRetryAt) <= Date.now())) {
       if (this.disposed) return;
+      this.log(worker, "info", "provider_reset_resuming", { retryAt: worker.providerRetryAt });
       worker.providerRetryAt = undefined;
       await this.persist();
       try {
@@ -1097,10 +1115,13 @@ export class ForgeWorkflowService {
     }
   }
   private async exhaustProviderRecovery(worker: ForgeWorker, reason: string): Promise<void> {
+    this.log(worker, "warn", "provider_recovery_exhausted", { retryCount: this.providerRecoveries.get(worker.id)?.retryCount ?? 0, recoveryWindowMs: PROVIDER_RECOVERY_WINDOW });
     this.providerRecoveries.delete(worker.id);
     await this.pauseAutoReview(worker, `${reason} Automatic recovery exhausted. Resume the issue loop when provider access is restored.`);
   }
   private cancelProviderRecovery(worker: ForgeWorker): void {
+    if (worker.providerRetryAt || this.providerRecoveries.has(worker.id))
+      this.log(worker, "info", "provider_recovery_cleared");
     if (worker.providerRetryAt) worker.error = undefined;
     worker.providerRetryAt = undefined;
     const recovery = this.providerRecoveries.get(worker.id);
@@ -1798,13 +1819,15 @@ export class ForgeWorkflowService {
           sameRepository(candidate.repository, worker.repository) && candidate.headSha &&
           (["paused", "stopped", "failed"].includes(candidate.status) || candidate.status === "awaiting_review" && !candidate.autoReview?.enabled) &&
           !candidate.pendingPublication && !candidate.mergeAttempted && !["creating", "uncertain"].includes(candidate.publicationState ?? ""))) {
-          const change = await this.deps.provider(issue.repository, "worker", this.completionChecks.signal).getChangeRequest(number);
+          const change = await this.deps.provider(issue.repository, "worker", this.completionChecks.signal, forgeWorkerContext(issue)).getChangeRequest(number);
           this.observeMergeConflict(issue, change);
           await this.persist();
         }
       } catch (error) {
-        if (!this.disposed)
+        if (!this.disposed) {
+          this.log(worker, "warn", "completion_check_failed", forgeErrorFields(error));
           this.deps.notify("Forge completion check failed", `${worker.title}: ${message(error)}`);
+        }
       }
     }
   }
@@ -1821,7 +1844,7 @@ export class ForgeWorkflowService {
   ): Promise<boolean> {
     const number = changeNumber(worker);
     if (!number) return false;
-    const provider = this.deps.provider(worker.repository, worker.kind === "issue" ? "worker" : "reviewer", signal);
+    const provider = this.deps.provider(worker.repository, worker.kind === "issue" ? "worker" : "reviewer", signal, forgeWorkerContext(worker));
     change ??= await provider.getChangeRequestStatus(number);
     if (!change.merged) return false;
     if (change.number !== number) throw new Error("Completion status does not match this change request.");
@@ -1881,6 +1904,7 @@ export class ForgeWorkflowService {
     }
   }
   private async cleanupFailed(worker: ForgeWorker, error: unknown): Promise<void> {
+    this.log(worker, "error", "worker_cleanup_failed", forgeErrorFields(error));
     worker.status = "cleanup_failed";
     worker.error = message(error);
     await this.persist();
@@ -1968,13 +1992,15 @@ export class ForgeWorkflowService {
     await this.persist();
   }
   private async fail(worker: ForgeWorker, error: unknown, { retainReport = false, retryProvider = true }: { retainReport?: boolean; retryProvider?: boolean } = {}): Promise<void> {
+    this.log(worker, "warn", "worker_interrupted", { ...forgeErrorFields(error), retainReport });
     if (retryProvider && await this.scheduleProviderReset(worker, error)) return;
     const wasCleanupFailure = worker.status === "cleanup_failed";
     if (!wasCleanupFailure) {
       try {
         await this.recoverResources(worker);
         await this.quiesce(worker, { retainReport });
-      } catch {
+      } catch (cleanupError) {
+        this.log(worker, "error", "worker_cleanup_failed", forgeErrorFields(cleanupError));
         worker.status = "cleanup_failed";
       }
     }
@@ -1989,6 +2015,7 @@ export class ForgeWorkflowService {
         member.status = "paused";
         member.error = `Auto review needs attention: ${worker.error}`;
       } catch (cleanupError) {
+        this.log(member, "error", "worker_cleanup_failed", forgeErrorFields(cleanupError));
         member.status = "cleanup_failed";
         member.error = message(cleanupError);
       }
@@ -2007,7 +2034,11 @@ export class ForgeWorkflowService {
       worker.repository,
       role,
       (this.operations.get(worker.id) ?? this.operations.get(this.autoReviewParent(worker)?.id ?? ""))?.signal,
+      forgeWorkerContext(worker),
     );
+  }
+  private log(worker: ForgeWorker, level: keyof ForgeLogger, event: string, fields: Record<string, unknown> = {}): void {
+    forgeLog(this.deps.logger, level, event, { ...forgeWorkerContext(worker), ...fields });
   }
   private requireWorker(id: string): ForgeWorker {
     const worker = this.workers.find((w) => w.id === id);
@@ -2027,6 +2058,18 @@ export class ForgeWorkflowService {
     for (const worker of this.workers)
       if (worker.status !== "running") worker.updatedAt = now;
     await this.deps.store.write(this.workers);
+    for (const worker of this.workers) {
+      const state = JSON.stringify([worker.status, worker.attemptId, worker.autoReview?.phase, worker.draft?.status]);
+      if (this.loggedWorkerStates.get(worker.id) !== state) {
+        this.log(worker, worker.status === "failed" || worker.status === "cleanup_failed" ? "warn" : "info", "worker_state_changed", { reviewStatus: worker.draft?.status });
+        this.loggedWorkerStates.set(worker.id, state);
+      }
+    }
+    for (const id of this.loggedWorkerStates.keys()) {
+      if (this.workers.some(worker => worker.id === id)) continue;
+      forgeLog(this.deps.logger, "info", "worker_retired", { workerId: id });
+      this.loggedWorkerStates.delete(id);
+    }
     for (const id of this.nextPublicationCheckAt.keys())
       if (!this.workers.some(worker => worker.id === id && worker.status === "awaiting_publication"))
         this.nextPublicationCheckAt.delete(id);

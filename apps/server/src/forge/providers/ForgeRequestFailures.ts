@@ -3,6 +3,7 @@ import {
   ForgeProviderError,
   ForgeProviderUnavailableError,
   forgeRequestFailure,
+  forgeRequestTimeoutMs,
   type ForgeDiagnosticObserver,
   type ForgeProviderFailure,
   type ForgeRequestDiagnostic,
@@ -16,6 +17,8 @@ interface FailureDetails {
   retryAfterMs?: number;
 }
 
+type ResponseDiagnostic = Pick<ForgeRequestDiagnostic, "httpStatus" | "providerRequestId" | "rateLimitLimit" | "rateLimitRemaining" | "rateLimitResetAt">;
+
 const timeoutCodes = new Set(["ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"]);
 const connectionCodes = new Set(["ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "EPIPE", "UND_ERR_SOCKET"]);
 const tlsCodes = new Set([
@@ -25,7 +28,9 @@ const tlsCodes = new Set([
 const allowedCodes = new Set([...timeoutCodes, ...connectionCodes, ...tlsCodes, "ENOTFOUND", "ABORT_ERR"]);
 
 export class ForgeRequestFailures {
+  private readonly startedAt = performance.now();
   private readonly context: Pick<ForgeRequestDiagnostic, "provider" | "role" | "operation" | "method" | "path">;
+  private response: ResponseDiagnostic = {};
 
   constructor(
     repository: ForgeRepository,
@@ -45,6 +50,21 @@ export class ForgeRequestFailures {
   prepare(message = "The forge request could not be prepared; check its configuration."): ForgeProviderError {
     this.report("prepare", { failure: "invalid_request", retryable: false });
     return new ForgeProviderError(message);
+  }
+
+  received(response: Response): void {
+    const prefix = this.context.provider === "github" ? "x-ratelimit" : "ratelimit";
+    const requestId = response.headers.get(this.context.provider === "github" ? "x-github-request-id" : "x-request-id");
+    const requestIdPattern = this.context.provider === "github" ? /^[A-Fa-f0-9]+(?::[A-Fa-f0-9]+){4}$/ : /^[A-Za-z0-9]+$/;
+    const rateLimitReset = numericHeader(response.headers, `${prefix}-reset`);
+    const rateLimitResetAt = rateLimitReset === undefined ? undefined : rateLimitReset * 1000;
+    this.response = {
+      httpStatus: response.status,
+      providerRequestId: requestId && requestId.length <= 128 && requestIdPattern.test(requestId) ? requestId : undefined,
+      rateLimitLimit: numericHeader(response.headers, `${prefix}-limit`),
+      rateLimitRemaining: numericHeader(response.headers, `${prefix}-remaining`),
+      rateLimitResetAt: Number.isSafeInteger(rateLimitResetAt) ? rateLimitResetAt : undefined,
+    };
   }
 
   assertReady(signal?: AbortSignal, retryAfterMs?: number): void {
@@ -87,13 +107,25 @@ export class ForgeRequestFailures {
   }
 
   private report(phase: ForgeRequestDiagnostic["phase"], details: FailureDetails): void {
-    const diagnostic = Object.freeze({ ...this.context, phase, ...details, causeCodes: Object.freeze([...(details.causeCodes ?? [])]) });
+    const diagnostic = Object.freeze({
+      ...this.context, ...this.response, phase, ...details,
+      elapsedMs: Math.max(0, Math.round(performance.now() - this.startedAt)),
+      timeoutMs: forgeRequestTimeoutMs,
+      causeCodes: Object.freeze([...(details.causeCodes ?? [])]),
+    });
     try {
       this.onFailure?.(diagnostic);
     } catch {
       // Diagnostic delivery must not change the request outcome.
     }
   }
+}
+
+function numericHeader(headers: Headers, name: string): number | undefined {
+  const value = headers.get(name)?.trim();
+  if (!value || !/^\d{1,16}$/.test(value)) return undefined;
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : undefined;
 }
 
 export function httpFailure(response: Response, provider: ForgeRepository["provider"]): FailureDetails {

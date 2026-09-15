@@ -1,6 +1,6 @@
 import { createPrivateKey, sign } from "node:crypto";
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
-import { ForgeProviderError, throwIfForgeRequestAborted, type ForgeDiagnosticObserver } from "./ForgeProvider.js";
+import { ForgeProviderError, forgeRequestTimeoutMs, throwIfForgeRequestAborted, type ForgeDiagnosticObserver } from "./ForgeProvider.js";
 import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
 import { record, string } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
@@ -123,6 +123,7 @@ export class ForgeCredentials {
   async headers(
     role: ForgeCredentialRole,
     signal?: AbortSignal,
+    onFailure = this.onFailure,
   ): Promise<Record<string, string>> {
     throwIfForgeRequestAborted(signal);
     let credential: ForgeCredential | undefined;
@@ -145,7 +146,7 @@ export class ForgeCredentials {
           "GitHub application credentials require a GitHub repository.",
         );
       return {
-        Authorization: `Bearer ${await this.installationToken(role, credential, signal)}`,
+        Authorization: `Bearer ${await this.installationToken(role, credential, signal, onFailure)}`,
       };
     }
     if (!credential.token.trim())
@@ -185,10 +186,11 @@ export class ForgeCredentials {
   private async installationToken(
     role: ForgeCredentialRole,
     credential: Extract<ForgeCredential, { kind: "github-app" }>,
-    signal?: AbortSignal,
+    signal: AbortSignal | undefined,
+    onFailure: ForgeDiagnosticObserver | undefined,
   ): Promise<string> {
     const path = `/app/installations/${credential.installationId}/access_tokens`;
-    const failures = new ForgeRequestFailures(this.repository, role, path, "POST", "authentication", this.onFailure);
+    const failures = new ForgeRequestFailures(this.repository, role, path, "POST", "authentication", onFailure);
     failures.assertReady(signal, this.requestDelay());
     if (
       !/^[A-Za-z0-9_]+$/.test(credential.appId) ||
@@ -205,7 +207,7 @@ export class ForgeCredentials {
     const jwt = githubAppJwt(credential);
     let response: Response;
     const requestSignal = AbortSignal.any([
-      AbortSignal.timeout(30_000),
+      AbortSignal.timeout(forgeRequestTimeoutMs),
       ...(signal ? [signal] : []),
     ]);
     failures.assertReady(requestSignal, this.requestDelay());
@@ -228,6 +230,7 @@ export class ForgeCredentials {
     } catch (error) {
       throw failures.transport(error, requestSignal, false);
     }
+    failures.received(response);
     if (!response.ok) {
       const failure = httpFailure(response, this.repository.provider);
       this.deferRequests(failure.retryAfterMs);

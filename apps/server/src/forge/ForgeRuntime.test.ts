@@ -11,6 +11,7 @@ import type { WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
+import type { ForgeLogger } from "./ForgeLog.js";
 import type { ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import {
   ForgeRuntime,
@@ -215,6 +216,84 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.unstubAllEnvs();
   await fs.rm(root, { recursive: true, force: true });
+});
+
+function captureRuntimeLogs() {
+  const records: Record<string, unknown>[] = [];
+  const write = (fields: Record<string, unknown>) => { records.push(fields); };
+  const logger: ForgeLogger = { debug: vi.fn(write), info: vi.fn(write), warn: vi.fn(write), error: vi.fn(write) };
+  return { logger, records };
+}
+
+describe("ForgeRuntime diagnostics", () => {
+  it("correlates preparation, launch and cleanup without logging prompts or Git secrets", async () => {
+    const { logger, records } = captureRuntimeLogs();
+    const deps = { ...dependencies(), logger };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Private task prompt", windowId: "window", paneId: "pane" });
+    vi.mocked(deps.sessions.getTab).mockReturnValue(workerTab(workspace));
+    await runtime.pause("codex-1");
+    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+
+    for (const operation of ["prepareWorkspace", "launch", "cleanup"]) {
+      expect(records).toContainEqual(expect.objectContaining({ event: "runtime.started", workerId: workspace.id, operation, queueDurationMs: expect.any(Number) }));
+      expect(records).toContainEqual(expect.objectContaining({ event: "runtime.completed", workerId: workspace.id, operation, durationMs: expect.any(Number) }));
+    }
+    expect(logger.debug).toHaveBeenCalledWith(expect.objectContaining({ event: "git.completed", workerId: workspace.id, operation: "prepareWorkspace", command: "fetch", durationMs: expect.any(Number) }), expect.any(String));
+    for (const secret of ["Private task prompt", "fixture-secret", root, expectedRepository.apiUrl, expectedRepository.projectPath, headSha])
+      expect(JSON.stringify(records)).not.toContain(secret);
+  });
+
+  it("preserves the original injected Git failure and logs only the failed command", async () => {
+    const { logger, records } = captureRuntimeLogs();
+    const failure = new Error("Authorization: Basic private-token at /private/checkout");
+    runtime = new ForgeRuntime({ ...dependencies(), logger, git: async () => { throw failure; } });
+
+    await expect(prepare()).rejects.toBe(failure);
+
+    expect(records).toContainEqual(expect.objectContaining({ event: "git.failed", workerId: "issue-1", command: "check-ref-format", outcome: "failed", durationMs: expect.any(Number) }));
+    expect(records).toContainEqual(expect.objectContaining({ event: "runtime.failed", operation: "prepareWorkspace", outcome: "failed" }));
+    expect(JSON.stringify(records)).not.toContain(failure.message);
+    expect(JSON.stringify(records)).not.toContain("private-token");
+  });
+
+  it("preserves outcomes when every logger method throws", async () => {
+    const write = () => { throw new Error("logger failed"); };
+    runtime = new ForgeRuntime({ ...dependencies(), logger: { debug: write, info: write, warn: write, error: write } });
+    const workspace = await prepare();
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).resolves.toBeUndefined();
+    const failure = new Error("original Git failure");
+    runtime = new ForgeRuntime({ ...dependencies(), logger: { debug: write, info: write, warn: write, error: write }, git: async () => { throw failure; } });
+    await expect(prepare("failure-worker")).rejects.toBe(failure);
+  });
+
+  it("keeps worker correlation independent during overlapping preparations", async () => {
+    const { logger, records } = captureRuntimeLogs();
+    const deps = dependencies();
+    const executeGit = deps.git!;
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const started = new Promise<void>(resolve => { firstStarted = resolve; });
+    const release = new Promise<void>(resolve => { releaseFirst = resolve; });
+    deps.git = async (cwd, args, signal, environment) => {
+      if (cwd.endsWith("first-worker") && args[0] === "fetch") {
+        firstStarted();
+        await release;
+      }
+      return executeGit(cwd, args, signal, environment);
+    };
+    runtime = new ForgeRuntime({ ...deps, logger });
+    const first = prepare("first-worker");
+    try {
+      await started;
+      await prepare("second-worker");
+    } finally { releaseFirst(); }
+    await first;
+
+    expect(records.filter(record => record.event === "git.completed" && record.command === "fetch").map(record => record.workerId)).toEqual(["second-worker", "first-worker"]);
+  });
 });
 
 describe("ForgeRuntime remote checkouts", () => {
@@ -1705,6 +1784,64 @@ describe("ForgeRuntime owned branch updates", () => {
 describe.skipIf(process.platform !== "linux")(
   "ForgeRuntime Git subprocesses",
   () => {
+    it("identifies a Git spawn failure without exposing executable paths", async () => {
+      const { logger, records } = captureRuntimeLogs();
+      const deps = { ...dependencies(), logger };
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const bin = path.join(root, "empty-bin");
+      await fs.mkdir(bin);
+      vi.stubEnv("PATH", bin);
+
+      await expect(prepare()).rejects.toMatchObject({ code: "ENOENT" });
+
+      expect(records).toContainEqual(expect.objectContaining({ event: "git.failed", workerId: "issue-1", command: "check-ref-format", outcome: "spawn_failed", exitCode: expect.any(Number) }));
+      expect(JSON.stringify(records)).not.toContain(bin);
+    });
+
+    it("identifies the Git output limit while keeping subprocess output private", async () => {
+      await installGitFixture(false, "private-output-marker".repeat(100_001));
+      const { logger, records } = captureRuntimeLogs();
+      const deps = { ...dependencies(), logger };
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const workspace = await prepare();
+
+      await expect(runtime.publishBranch(workspace)).rejects.toThrow("Git command exceeded its output limit.");
+
+      expect(records).toContainEqual(expect.objectContaining({ event: "git.failed", workerId: workspace.id, command: "push", outcome: "output_limit" }));
+      expect(JSON.stringify(records)).not.toContain("private-output-marker");
+    });
+
+    it("logs an expired Git deadline after the fetch process exits and cleanup completes", async () => {
+      const fixture = await installGitFixture(true);
+      const { logger, records } = captureRuntimeLogs();
+      const deps = { ...dependencies(), logger };
+      delete deps.git;
+      runtime = new ForgeRuntime(deps);
+      const schedule = globalThis.setTimeout;
+      let expireDeadline: (() => void) | undefined;
+      const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => {
+        if (delay === 300_000) expireDeadline = () => callback(...args);
+        return schedule(callback, delay, ...args);
+      });
+      const controller = new AbortController();
+      const pending = runtime.prepareWorkspace({ id: "timed-out-fetch", expectedRepository, baseBranch: "main", review: false }, controller.signal);
+      void pending.catch(() => undefined);
+      try {
+        await vi.waitFor(async () => { await fs.access(fixture.children); }, { timeout: 3_000 });
+        expect(expireDeadline).toBeDefined();
+        expireDeadline!();
+        await expect(pending).rejects.toThrow("Git command exceeded its five minute deadline.");
+        expect(records).toContainEqual(expect.objectContaining({ event: "git.failed", workerId: "timed-out-fetch", command: "fetch", outcome: "timeout", exitCode: null, durationMs: expect.any(Number) }));
+        await expect(fs.stat(path.join(root, "data", "forge-workers", "checkouts", "timed-out-fetch"))).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        timer.mockRestore();
+        controller.abort();
+        await pending.catch(() => undefined);
+      }
+    });
+
     it("passes refreshed application authorization only to bounded fetch and push processes", async () => {
       const fixture = await installGitFixture();
       const deps = dependencies();
@@ -1790,7 +1927,8 @@ describe.skipIf(process.platform !== "linux")(
         ...privateDetails,
       ].join("\n");
       await installGitFixture(false, remoteError);
-      const deps = dependencies();
+      const { logger, records } = captureRuntimeLogs();
+      const deps = { ...dependencies(), logger };
       delete deps.git;
       runtime = new ForgeRuntime(deps);
       const workspace = await prepare();
@@ -1799,7 +1937,9 @@ describe.skipIf(process.platform !== "linux")(
       expect((failure as Error).message).toBe(recognized
         ? "GitHub rejected workflow changes. Grant the worker App Workflows: write permission and approve it for this installation, then retry publishing."
         : "Git push failed with exit code 1.");
+      expect(records).toContainEqual(expect.objectContaining({ event: "git.failed", workerId: workspace.id, command: "push", outcome: "exit_code", exitCode: 1, durationMs: expect.any(Number) }));
       for (const detail of privateDetails) {
+        expect(JSON.stringify(records)).not.toContain(detail);
         expect(String(failure)).not.toContain(detail);
         expect(JSON.stringify(failure)).not.toContain(detail);
       }
@@ -1885,7 +2025,8 @@ describe.skipIf(process.platform !== "linux")(
 
     it.each([{ name: "issue", review: false }, { name: "review base", review: true }])("awaits cancellation of the $name fetch and its child process before removing the owned checkout", async ({ review }) => {
       const fixture = await installGitFixture(review ? "review-base" : true);
-      const deps = dependencies();
+      const { logger, records } = captureRuntimeLogs();
+      const deps = { ...dependencies(), logger };
       delete deps.git;
       runtime = new ForgeRuntime(deps);
       const controller = new AbortController();
@@ -1910,6 +2051,7 @@ describe.skipIf(process.platform !== "linux")(
         );
         controller.abort(new Error("fetch cancelled"));
         await expect(pending).rejects.toThrow("fetch cancelled");
+        expect(records).toContainEqual(expect.objectContaining({ event: "git.failed", workerId: "cancelled-fetch", command: "fetch", outcome: "cancelled", exitCode: null, durationMs: expect.any(Number) }));
         for (const pid of pids) {
           const stat = await fs
             .readFile(`/proc/${pid}/stat`, "utf8")
@@ -1954,7 +2096,7 @@ const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key
 fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
 const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
 if (args.includes("push") && ${JSON.stringify(pushError)} !== undefined) {
-  process.stderr.write(${JSON.stringify(pushError)});
+  fs.writeSync(2, ${JSON.stringify(pushError)});
   process.exit(1);
 }
 const hangMerge = ${JSON.stringify(hangFetch)} === "merge" && args.includes("merge") && !args.includes("--abort");

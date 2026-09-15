@@ -32,11 +32,12 @@ async function fixture() {
     saveReview: vi.fn(async () => ({ id: "worker" })),
     submitReview: vi.fn(async () => ({ id: "worker" })),
   };
+  const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   let settings: ForgeSettingsService;
   const plugin = new ForgePlugin(() => ({
     settings,
     workflow: workflow as unknown as ForgeWorkflowService,
-  }));
+  }), logger);
   const config = new ConfigService(root, () => [plugin.descriptor()]);
   const connections = {
     workerAuthors: vi.fn(() => ["app/cloudx-worker", "app/cloudx-reviewer"]),
@@ -52,7 +53,7 @@ async function fixture() {
   settings = new ForgeSettingsService(config, connections);
   const hooks = new HookRegistry();
   plugin.hooks.forEach((h) => hooks.register(h));
-  return { plugin, config, settings, hooks, workflow, connections };
+  return { plugin, config, settings, hooks, workflow, connections, logger };
 }
 describe("Forge plugin boundary", () => {
   it.each(["ui", "http"] as const)("continues the selected worker with its message through %s", async kind => {
@@ -275,5 +276,35 @@ describe("Forge plugin boundary", () => {
     expect(JSON.stringify(config.getResponse())).not.toContain(
       "private-reviewer-secret",
     );
+  });
+});
+
+
+describe("Forge hook diagnostics", () => {
+  it("times actions and keeps dashboard polling at debug level without logging input or output", async () => {
+    const { hooks, workflow, logger } = await fixture();
+    workflow.dashboard.mockResolvedValue({ workers: [{ title: "private-result" }] } as never);
+    await hooks.call("forge.dashboard", {}, { caller: { kind: "ui" } });
+    expect(logger.debug).toHaveBeenCalledWith(expect.objectContaining({ event: "hook_completed", hookId: "forge.dashboard", elapsedMs: expect.any(Number) }), expect.any(String));
+    expect(logger.info).not.toHaveBeenCalled();
+    await hooks.call("forge.review.save", { id: "worker", draftId: "33333333-3333-4333-8333-333333333333", body: "private-review", comments: [], event: "comment" }, { caller: { kind: "ui" } });
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "hook_started", hookId: "forge.review.save" }), expect.any(String));
+    expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ event: "hook_completed", hookId: "forge.review.save", elapsedMs: expect.any(Number) }), expect.any(String));
+    const logs = JSON.stringify(Object.values(logger).flatMap(log => log.mock.calls));
+    expect(logs).not.toContain("private-review");
+    expect(logs).not.toContain("private-result");
+  });
+
+  it("preserves failures and successful actions when logging throws", async () => {
+    const { hooks, workflow, logger } = await fixture();
+    const failure = new Error("private-error");
+    workflow.dashboard.mockRejectedValueOnce(failure);
+    await expect(hooks.call("forge.dashboard", {}, { caller: { kind: "ui" } })).rejects.toThrow("private-error");
+    expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "hook_failed", hookId: "forge.dashboard", failure: "unknown", elapsedMs: expect.any(Number) }), expect.any(String));
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("private-error");
+    for (const log of Object.values(logger)) log.mockImplementation(() => { throw new Error("logger failed"); });
+    await expect(hooks.call("forge.dashboard", {}, { caller: { kind: "ui" } })).resolves.toEqual({ workers: [] });
+    workflow.dashboard.mockRejectedValueOnce(failure);
+    await expect(hooks.call("forge.dashboard", {}, { caller: { kind: "ui" } })).rejects.toThrow("private-error");
   });
 });
