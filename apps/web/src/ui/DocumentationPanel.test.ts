@@ -384,6 +384,52 @@ describe("DocumentationPanel", () => {
     await unmount(root);
   });
 
+  it.each(["unopened", "opened", "hidden"])("recovers on Refresh after archive initialization with the document list %s", async (listState) => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const initializing = "Documentation archive is initializing. Large archives may take several minutes. Refresh when initialization finishes.";
+    let summaryReady = false;
+    let documentsReady = false;
+    let listCalls = 0;
+    const callHook: DocumentationCallHook = async <T extends Record<string, unknown>>(hookId: string) => {
+      if (hookId === "documentation.summary") {
+        if (!summaryReady) throw new Error(initializing);
+        return hookResult<T>({ activeDocumentCount: 1, activeChunkCount: 3 });
+      }
+      if (hookId === "documentation.documents.list") {
+        listCalls += 1;
+        if (!documentsReady) throw new Error(initializing);
+        return hookResult<T>({ documents: [{ documentId: "ready-doc", title: "Initialized archive guide", state: "active" }] });
+      }
+      return {} as T;
+    };
+    await act(async () => root.render(createElement(DocumentationPanel, { callHook })));
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(initializing);
+    expect(listCalls).toBe(0);
+
+    if (listState !== "unopened") {
+      await click(buttonByLabel(container, "Show active documents"));
+      expect(listCalls).toBe(1);
+      if (listState === "hidden") await click(buttonByLabel(container, "Hide active documents"));
+      summaryReady = true;
+      await click(buttonByText(container, "Refresh"));
+      expect(listCalls).toBe(2);
+      expect(container.querySelector('[role="alert"]')?.textContent).toBe(initializing);
+    }
+
+    summaryReady = true;
+    documentsReady = true;
+    await click(buttonByText(container, "Refresh"));
+
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.textContent).toContain("1 active documents, 3 active chunks");
+    expect(listCalls).toBe(listState === "unopened" ? 0 : 3);
+    if (listState !== "opened") await click(buttonByLabel(container, "Show active documents"));
+    expect(container.querySelector(".documentation-document-row")?.textContent).toContain("Initialized archive guide");
+    await unmount(root);
+  });
+
   it("loads active documents on panel open, appends pages without duplicates, and virtualizes rows", async () => {
     const container = document.createElement("div");
     document.body.append(container);

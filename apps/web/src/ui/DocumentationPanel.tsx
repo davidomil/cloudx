@@ -380,6 +380,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   const sourceChunkListRef = useRef<HTMLDivElement | null>(null);
   const sourceAutoLoadSentinelRef = useRef<HTMLDivElement | null>(null);
   const documentListRef = useRef<HTMLDivElement | null>(null);
+  const documentListRequestedRef = useRef(false);
   const documentListLoadedRef = useRef(false);
   const documentListRequestRef = useRef<Promise<void> | undefined>(undefined);
   const documentListRefreshRef = useRef<Promise<void> | undefined>(undefined);
@@ -397,7 +398,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   useEffect(() => {
     const refreshDocumentList = async () => {
-      if (documentListLoadedRef.current || documentListRequestRef.current) await loadDocumentPage("replace");
+      if (documentListRequestedRef.current) await loadDocumentPage("replace");
     };
     ingestController.refreshDocumentList = refreshDocumentList;
     return () => {
@@ -490,6 +491,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
   async function refresh() {
     if (!canCall) return;
     setSummaryBusy(true);
+    setStatus("");
     try {
       await Promise.all([
         loadArchiveSummary(),
@@ -560,6 +562,7 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
 
   async function fetchDocumentPage(mode: "replace" | "append") {
     const offset = mode === "append" ? nextDocumentListOffset(documentListWindow, documents.length) : 0;
+    documentListRequestedRef.current = true;
     setDocumentListBusy(true);
     setStatus("");
     try {

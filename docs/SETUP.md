@@ -527,6 +527,19 @@ indexer elsewhere, start Cloudx with:
 CLOUDX_DOCUMENTATION_URL=http://127.0.0.1:7820 npm run dev
 ```
 
+During startup, the indexer returns HTTP 503 with status `initializing`
+while it prepares retained sources and the search index. Large archives
+can take several minutes after a search-profile change.
+
+The Documentation panel displays the initialization message. Select
+**Refresh** after initialization finishes to reload the summary and any
+previously opened document list.
+
+If initialization fails, the indexer returns HTTP 503 with status
+`failed`; inspect the documentation service logs, correct the error, and
+restart the service. `/ready` returns HTTP 200 only when archive health
+reports ready.
+
 Interactive terminal tabs also require the independent terminal broker. For
 development, run `npm run terminals -w @cloudx/server` in a separate terminal
 before starting the web server. Keep it running through web-server restarts.
