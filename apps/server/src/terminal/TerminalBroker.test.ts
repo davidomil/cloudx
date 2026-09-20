@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DurableTerminalProcessFactory } from "./DurableTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
-import { isTerminalRequest, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
+import { isTerminalRequest, isTerminalResponse, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
 import type { TerminalProducer } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 
@@ -42,8 +42,11 @@ describe("durable terminal broker", () => {
     const data = "x".repeat(256 * 1024);
     let received = "";
     terminal.onData((chunk) => { received += chunk; });
-    process.data(data);
-    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    process.terminate.mockImplementationOnce(async () => {
+      process.data(data);
+      expect(process.pauseOutput).toHaveBeenCalledOnce();
+      process.exit({ exitCode: 0 });
+    });
     if (close === "terminate") await terminal.terminate();
     else {
       await broker.stop();
@@ -66,6 +69,36 @@ describe("durable terminal broker", () => {
     restored.write("AFTER_REJECTED_CLOSE\n");
     await vi.waitFor(() => expect(process.write).toHaveBeenCalledWith("AFTER_REJECTED_CLOSE\n"));
     await restored.terminate();
+  });
+
+  it("identifies broker-induced exits before disconnecting its clients", async () => {
+    const { factory, process, broker } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("broker-shutdown"));
+    const exited = new Promise<TerminalExit>(resolve => terminal.onExit(resolve));
+    process.terminate.mockImplementationOnce(async () => {
+      process.exit({ exitCode: 0, signal: 9 });
+      await exited;
+    });
+    const stopping = broker.stop();
+    cleanups.pop();
+    try {
+      expect(await exited).toEqual({ exitCode: 0, signal: 9, reason: "broker-shutdown" });
+    } finally { await stopping; }
+  });
+
+  it.each([
+    [undefined, true], ["broker-shutdown", true], ["unknown", false], [null, false], [1, false]
+  ])("validates an exit reason of %s before delivering the event", (reason, valid) => {
+    expect(isTerminalResponse({ type: "exit", event: { exitCode: 0, reason } })).toBe(valid);
+  });
+
+  it("retains the broker shutdown reason when attachment receives the exit before its listener subscribes", async () => {
+    const event = { exitCode: 0, signal: 9, reason: "broker-shutdown" };
+    const factory = await respondingBroker([{ type: "ready" }, { type: "exit", event }]);
+    const terminal = await factory.attach("shutdown-replay");
+    try {
+      expect(await new Promise<TerminalExit>(resolve => terminal.onExit(resolve))).toEqual(event);
+    } finally { terminal.detach!(); }
   });
 
   it.each([

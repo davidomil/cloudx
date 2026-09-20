@@ -1,6 +1,7 @@
 import {
   isUsableTabLayoutState,
   isRecord,
+  isTabRecovery,
   readWorkspaceUiInstruction,
   type AutomationRunSummary,
   type CloudxNotification,
@@ -108,7 +109,8 @@ function isWorkspaceTab(value: unknown): value is WorkspaceTab {
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string" &&
     (value.contextPath === undefined || typeof value.contextPath === "string") &&
-    (value.statusMessage === undefined || typeof value.statusMessage === "string")
+    (value.statusMessage === undefined || typeof value.statusMessage === "string") &&
+    (value.recovery === undefined || isTabRecovery(value.recovery))
   );
 }
 

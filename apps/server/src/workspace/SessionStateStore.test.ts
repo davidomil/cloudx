@@ -45,7 +45,13 @@ it.each([
   { ...saved(), activeTabId: "unknown" },
   { ...saved(), sessions: [...saved().sessions, ...saved().sessions] },
   { ...saved(), sessions: [{ ...saved().sessions[0], tab: { ...saved().sessions[0]!.tab, id: "../outside" } }] },
-  { ...saved(), sessions: [{ ...saved().sessions[0], tab: { ...saved().sessions[0]!.tab, ownerPluginId: "forge" } }] }
+  { ...saved(), sessions: [{ ...saved().sessions[0], tab: { ...saved().sessions[0]!.tab, ownerPluginId: "forge" } }] },
+  ...[
+    { state: "missing", message: 1 },
+    { state: "unknown", message: "Offline" },
+    { state: "missing", message: "Offline", conversationId: 42 },
+    { state: "missing", message: "Offline", canResume: "yes" }
+  ].map(recovery => ({ ...saved(), sessions: [{ ...saved().sessions[0], tab: { ...saved().sessions[0]!.tab, recovery } }] }))
 ])("rejects invalid recovery state without replacing it", async value => {
   const { directory, store } = await fixture();
   const file = path.join(directory, "sessions.json");

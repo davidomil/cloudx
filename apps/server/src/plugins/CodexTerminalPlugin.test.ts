@@ -11,22 +11,24 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
+import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
+import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 
 class FakeTerminalProcess implements TerminalProcess {
   written = "";
   killed = false;
   readonly resizes: Array<[cols: number, rows: number]> = [];
   private readonly dataListeners = new Set<(data: string) => void>();
-  private exitListener: ((event: { exitCode: number; signal?: number }) => void) | undefined;
+  private exitListener: ((event: TerminalExit) => void) | undefined;
 
   onData(listener: (data: string) => void): () => void {
     this.dataListeners.add(listener);
     return () => this.dataListeners.delete(listener);
   }
 
-  onExit(listener: (event: { exitCode: number; signal?: number }) => void): () => void {
+  onExit(listener: (event: TerminalExit) => void): () => void {
     this.exitListener = listener;
     return () => {
       this.exitListener = undefined;
@@ -54,8 +56,8 @@ class FakeTerminalProcess implements TerminalProcess {
     }
   }
 
-  exit(exitCode: number): void {
-    this.exitListener?.({ exitCode });
+  exit(exitCode: number, reason?: "broker-shutdown"): void {
+    this.exitListener?.({ exitCode, ...(reason ? { reason } : {}) });
   }
 }
 
@@ -173,6 +175,22 @@ describe("CodexTerminalPlugin", () => {
       factory.process!.exit(0);
 
       expect(closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
+    });
+  });
+
+  it.each(["createSession", "restoreSession"] as const)("preserves a public Codex panel on broker shutdown after %s and the startup grace period", async method => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const terminal = new FakeTerminalProcess();
+      Object.assign(factory, { attach: async () => terminal });
+      const closeTab = vi.fn();
+      const session = await plugin[method]({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
+      const process = method === "createSession" ? factory.process! : terminal;
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      process.exit(0, "broker-shutdown");
+
+      expect(session.hasExited?.()).toBe(true);
+      expect(session.snapshot()).toMatchObject({ status: "failed", statusMessage: "The terminal broker stopped the process. Recover this panel to continue." });
+      expect(closeTab).not.toHaveBeenCalled();
     });
   });
 
@@ -1534,8 +1552,35 @@ describe("Codex terminal update recovery", () => {
     const session = new CodexTerminalSession(tab, terminal, { closeTab, setTabIndicator: vi.fn() }, { closeOnExit: true });
     disconnect(new Error("Broker connection lost"));
     expect(session.snapshot()).toMatchObject({ status: "failed", statusMessage: "Broker connection lost" });
+    expect(session.hasExited()).toBe(false);
     expect(closeTab).not.toHaveBeenCalled();
     expect(terminal.killed).toBe(false);
+  });
+
+  it("keeps a recovered conversation panel open after a web-only restart and later process failure", async () => {
+    const terminal = new FakeTerminalProcess();
+    const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+    const plugin = new CodexTerminalPlugin({ spawn: vi.fn(), attach: async () => terminal });
+    const session = await plugin.restoreSession({ tab, cwd: tab.cwd, controls, initialInput: { codexRecovered: true } });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+    try {
+      terminal.exit(1);
+      expect(session.hasExited?.()).toBe(true);
+      expect(session.snapshot().status).toBe("failed");
+      expect(controls.closeTab).not.toHaveBeenCalled();
+    } finally { clock.mockRestore(); }
+  });
+
+  it("still closes an original restored conversation panel after normal exit beyond the grace period", async () => {
+    const terminal = new FakeTerminalProcess();
+    const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+    const plugin = new CodexTerminalPlugin({ spawn: vi.fn(), attach: async () => terminal });
+    await plugin.restoreSession({ tab, cwd: tab.cwd, controls });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+    try {
+      terminal.exit(0);
+      expect(controls.closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
+    } finally { clock.mockRestore(); }
   });
 
   it("waits for confirmed termination before completing a terminal stop", async () => {
@@ -1561,5 +1606,119 @@ describe("Codex terminal update recovery", () => {
     expect(session.snapshot().recentOutput).toBe("Still running");
     terminal.exit(0);
     expect(session.snapshot().status).toBe("completed");
+  });
+});
+
+describe("Codex conversation recovery after process loss", () => {
+  const conversationId = "01a08470-d118-7b72-b1df-439e72e5c744";
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("persists native conversation changes while keeping the launch model and runtime", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const setRestoreInput = vi.fn();
+      const runtimeContext = { pluginRuntime: { "rules-skills": { personalityTemplate: { source: "tab", template: { id: "original", name: "Original", color: "green", ruleIds: [], skillIds: [] }, rules: [], skills: [] } } } };
+      const session = await plugin.createSession({
+        tab, cwd: root, runtimeContext,
+        initialInput: { model: "gpt-6-astra", reasoningEffort: "max", resume: { mode: "last" } },
+        controls: { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput }
+      });
+      const identity = new CodexConversationRecovery(factory.env!.CODEX_HOME!);
+      await fs.writeFile(identity.receiptPath, JSON.stringify({ sessionId: conversationId, cwd: root }));
+      await vi.waitFor(() => expect(setRestoreInput).toHaveBeenLastCalledWith(expect.objectContaining({
+        model: "gpt-6-astra", reasoningEffort: "max", codexRuntimeContext: runtimeContext,
+        resume: { mode: "session", sessionId: conversationId }
+      })));
+      expect(session.restoreInput?.()).toMatchObject({ resume: { mode: "session", sessionId: conversationId } });
+      session.stop?.();
+    });
+  });
+
+  it("explains a missing exact identity and refuses last during recovery", async () => {
+    const factory = new CapturingFactory();
+    const plugin = new CodexTerminalPlugin(factory);
+    const input = { tab, cwd: tab.cwd, initialInput: { resume: { mode: "last" } }, controls: { closeTab: vi.fn(), setTabIndicator: vi.fn() } };
+    await expect(plugin.describeRecovery(input)).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("exact conversation ID was not saved") });
+    await expect(plugin.recoverSession(input)).rejects.toThrow("Select a saved session");
+    expect(factory.spawns).toBe(0);
+  });
+
+  it.each(["receipt", "launch input"])("requires explicit selection when the last identity comes from %s", async source => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const selectedId = "01a08470-d118-7b72-b1df-439e72e5c745";
+      for (const id of [conversationId, selectedId]) {
+        await fs.writeFile(path.join(home, "sessions", `rollout-${id}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id, cwd: root } }) + "\n");
+      }
+      if (source === "receipt") {
+        const identity = new CodexConversationRecovery(factory.env!.CODEX_HOME!);
+        await fs.writeFile(identity.receiptPath, JSON.stringify({ sessionId: conversationId, cwd: root }));
+      }
+      previous.stop?.();
+      const initialInput = source === "launch input" ? { resume: { mode: "session", sessionId: conversationId } } : undefined;
+      const recovery = await plugin.describeRecovery({ tab, cwd: root, controls, initialInput });
+      expect(recovery).toMatchObject({ canResume: false, message: expect.stringContaining("cannot be confirmed") });
+      expect(recovery.conversationId).toBeUndefined();
+      expect(factory.spawns).toBe(1);
+
+      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: selectedId } } });
+      expect(factory.args?.at(-1)).toContain(`resume ${selectedId}`);
+      expect(factory.args?.at(-1)).not.toContain(conversationId);
+      recovered.stop?.();
+    });
+  });
+
+  it("resumes the selected exact conversation with saved launch context and without replaying its prompt", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const runtimeContext = { pluginRuntime: { "rules-skills": { personalityTemplate: { source: "tab", template: { id: "original", name: "Original", color: "green", ruleIds: [], skillIds: [] }, rules: [], skills: [] } } } };
+      const previous = await plugin.createSession({ tab, cwd: root, controls, runtimeContext, initialInput: { prompt: "Do not replay", model: "gpt-6-astra", reasoningEffort: "max" } });
+      previous.stop?.();
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: root } }) + "\n");
+      const initialInput = { ...previous.restoreInput?.(), resume: { mode: "session", sessionId: conversationId } };
+      await expect(plugin.describeRecovery({ tab, cwd: root, controls, initialInput })).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("cannot be confirmed") });
+      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput, prepareCodexSession: async () => { throw new Error("Must not prepare another conversation"); } });
+      expect(factory.args?.at(-1)).toContain(`resume ${conversationId}`);
+      expect(factory.args?.at(-1)).toContain("--cd");
+      expect(factory.args?.at(-1)).toContain("--model gpt-6-astra");
+      expect(factory.args?.at(-1)).not.toContain("Do not replay");
+      expect(factory.env?.CLOUDX_PERSONALITY_TEMPLATE_ID).toBe("original");
+      expect(recovered.restoreInput?.()).not.toHaveProperty("prompt");
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
+      factory.process!.exit(1);
+      expect(recovered.hasExited?.()).toBe(true);
+      expect(recovered.snapshot().status).toBe("failed");
+      expect(controls.closeTab).not.toHaveBeenCalled();
+    });
+  });
+
+  it("reports an unavailable exact transcript without starting a replacement", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      previous.stop?.();
+      const input = { tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: conversationId } } };
+      const recovery = await plugin.describeRecovery(input);
+      expect(recovery).toMatchObject({ canResume: false, message: expect.stringContaining("transcript") });
+      expect(recovery.conversationId).toBeUndefined();
+      await expect(plugin.recoverSession(input)).rejects.toThrow("transcript");
+      expect(factory.spawns).toBe(1);
+    });
+  });
+
+  it("persists an explicitly selected identity before spawn acknowledgement can fail", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn(async (_input: Record<string, unknown>) => undefined) };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      previous.stop?.();
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId } }) + "\n");
+      controls.setRestoreInput.mockClear();
+      vi.spyOn(factory, "spawn").mockImplementation(async () => {
+        expect(controls.setRestoreInput).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ resume: { mode: "session", sessionId: conversationId } }));
+        expect(controls.setRestoreInput.mock.calls[0]![0]).not.toHaveProperty("prompt");
+        throw new Error("Spawn acknowledgement lost");
+      });
+      await expect(plugin.recoverSession({ tab, cwd: root, controls, initialInput: { prompt: "Old work", resume: { mode: "session", sessionId: conversationId } } })).rejects.toThrow("Spawn acknowledgement lost");
+    });
   });
 });

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { IPty } from "node-pty";
 
-export interface TerminalExit { exitCode: number; signal?: number }
+export interface TerminalExit { exitCode: number; signal?: number; reason?: "broker-shutdown" }
 interface SupervisorExit { event: TerminalExit; error?: Error }
 
 const startupRequirement = "Terminal supervision requires Python 3.9 or newer, the bundled terminal-supervisor.py helper, and Linux subreaper support.";

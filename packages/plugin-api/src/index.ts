@@ -131,7 +131,8 @@ export interface PluginSession {
   stop?(): void;
   terminate?(): Promise<void>;
   detach?(): void;
-  restoreInput?(): Record<string, unknown>;
+  hasExited?(): boolean;
+  restoreInput?(): Record<string, unknown> | undefined;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   snapshot(): PluginSessionSnapshot;
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
@@ -210,6 +211,7 @@ export interface CloudxAppContext {
 
 export interface PluginTabControls {
   setTabIndicator(indicator: TabIndicatorUpdate): void;
+  setRestoreInput?(input: Record<string, unknown>): void | Promise<void>;
   closeTab(reason?: string): void;
 }
 
@@ -241,6 +243,9 @@ export interface WorkspacePlugin {
   defaultTitleContext?(input: { cwd: string; initialInput?: Record<string, unknown> }): string | undefined;
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  describeRecovery?(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume?: boolean }> | { message: string; conversationId?: string; canResume?: boolean };
+  retirementMessage?: string;
   descriptor(): PluginDescriptor;
 }
 

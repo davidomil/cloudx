@@ -174,9 +174,10 @@ export class TerminalBroker {
     });
     process.onExit((event) => {
       exited = true;
+      const exit: TerminalExit = this.stopping ? { ...event, reason: "broker-shutdown" } : event;
       const publishExit = () => {
-        terminal.exit = event;
-        for (const { output } of terminal.clients.values()) output.send({ type: "exit", event });
+        terminal.exit = exit;
+        for (const { output } of terminal.clients.values()) output.send({ type: "exit", event: exit });
       };
       void screen.flush().then(publishExit, publishExit);
     });

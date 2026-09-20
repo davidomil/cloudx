@@ -93,6 +93,18 @@ export interface TabIndicatorUpdate {
   message?: string;
 }
 
+export interface TabRecovery {
+  state: "missing" | "unavailable" | "retired";
+  message: string;
+  conversationId?: string;
+  canResume?: boolean;
+}
+
+export interface RecoverTabRequest {
+  action: "reconnect" | "new-shell" | "resume-conversation";
+  sessionId?: string;
+}
+
 export interface WorkspaceTab {
   id: string;
   pluginId: PluginId;
@@ -106,6 +118,7 @@ export interface WorkspaceTab {
   updatedAt: string;
   contextPath?: string;
   statusMessage?: string;
+  recovery?: TabRecovery;
 }
 
 export interface PluginActionDescriptor {
@@ -1127,8 +1140,16 @@ export function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
     typeof value.createdAt === "string" &&
     typeof value.updatedAt === "string" &&
     (value.contextPath === undefined || typeof value.contextPath === "string") &&
-    (value.statusMessage === undefined || typeof value.statusMessage === "string")
+    (value.statusMessage === undefined || typeof value.statusMessage === "string") &&
+    (value.recovery === undefined || isTabRecovery(value.recovery))
   );
+}
+
+export function isTabRecovery(value: unknown): value is TabRecovery {
+  return isRecord(value) && (value.state === "missing" || value.state === "unavailable" || value.state === "retired") &&
+    typeof value.message === "string" &&
+    (value.conversationId === undefined || typeof value.conversationId === "string") &&
+    (value.canResume === undefined || typeof value.canResume === "boolean");
 }
 
 function isTabIndicator(value: unknown): value is TabIndicator {
