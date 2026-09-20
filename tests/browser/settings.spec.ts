@@ -11,6 +11,7 @@ import type {
   CloudxUpdateStatus,
   TabLayoutState,
   WorkspaceStateResponse,
+  WorkspaceTab,
 } from "@cloudx/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -1188,6 +1189,341 @@ test("Updates explains unsupported installations and displays installer failures
   await expectSettingsFits(page, isMobile);
   await captureSample(page, testInfo, "settings-update-failed");
 });
+
+test("workspace recovery replaces a missing shell in its saved panel", async ({
+  page,
+}, testInfo) => {
+  const { tabs } = await showRecoveryWorkspace(page, "standard-terminal");
+  const requests: unknown[] = [];
+  await page.route("**/api/tabs/saved-panel/recover", async (route) => {
+    requests.push(route.request().postDataJSON());
+    await route.fulfill({
+      json: { ...tabs[0], status: "running", recovery: undefined },
+    });
+  });
+  await page.goto(baseUrl);
+  const recovery = page.getByRole("region", {
+    name: "Recovery for Saved panel",
+  });
+  await expect(recovery).toContainText("The previous shell process ended.");
+  await expect(recovery).toContainText(testRoot);
+  await captureSample(page, testInfo, "workspace-shell-recovery");
+  await recovery
+    .getByRole("button", { name: "Open new shell", exact: true })
+    .click();
+  await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+  expect(requests).toEqual([{ action: "new-shell" }]);
+  await expect(page.locator(".tab-title")).toHaveText([
+    "Saved panel",
+    "Working panel",
+  ]);
+  await expect(page.locator(".workspace-pane")).toHaveAttribute(
+    "data-pane-id",
+    "saved-pane",
+  );
+});
+
+test("workspace recovery reconnects a rejected live terminal when another client restores it", async ({
+  page,
+}) => {
+  const { tabs, publishTab, terminalSockets } = await showRecoveryWorkspace(
+    page,
+    "standard-terminal",
+  );
+  const runningTab: WorkspaceTab = {
+    ...tabs[0]!,
+    status: "running",
+    recovery: undefined,
+  };
+  publishTab(runningTab);
+  await page.goto(baseUrl);
+  await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+  const originalSocket = terminalSockets.find((socket) =>
+    socket.url().endsWith("/ws/terminal/saved-panel"),
+  )!;
+  await originalSocket.close({ code: 1008, reason: "Unknown terminal tab." });
+  await expect(
+    page.getByRole("button", { name: "Check connection", exact: true }),
+  ).toBeVisible();
+  publishTab(tabs[0]!);
+  await expect(
+    page.getByRole("button", { name: "Open new shell", exact: true }),
+  ).toBeVisible();
+  publishTab(runningTab);
+  await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+  await expect(
+    page.getByRole("region", { name: "Recovery for Saved panel" }),
+  ).toHaveCount(0);
+  await expect(page.locator(".tab-title")).toHaveText([
+    "Saved panel",
+    "Working panel",
+  ]);
+  expect(
+    terminalSockets.filter((socket) => socket.url() === originalSocket.url()),
+  ).toHaveLength(2);
+  await expect(page.locator(".workspace-pane")).toHaveAttribute(
+    "data-pane-id",
+    "saved-pane",
+  );
+});
+
+for (const viewState of ["mounted", "cached"] as const) {
+  test(`workspace recovery reconnects a ${viewState} terminal when its old rejection arrives last`, async ({
+    page,
+  }, testInfo) => {
+    const { tabs, publishTab, terminalSockets } = await showRecoveryWorkspace(
+      page,
+      "standard-terminal",
+    );
+    const runningTab: WorkspaceTab = {
+      ...tabs[0]!,
+      status: "running",
+      recovery: undefined,
+    };
+    publishTab(runningTab);
+    await page.goto(baseUrl);
+    await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+    const originalSocket = terminalSockets.find((socket) =>
+      socket.url().endsWith("/ws/terminal/saved-panel"),
+    )!;
+    if (viewState === "cached") {
+      await page.getByRole("button", { name: /^Working panel/ }).click();
+    }
+
+    const updatedAt = "2026-09-15T22:00:00.000Z";
+    publishTab({
+      ...runningTab,
+      updatedAt,
+      indicator: {
+        color: "green",
+        label: "Running",
+        message: "Recovery completed",
+        updatedAt,
+      },
+    });
+    await expect(
+      page.getByLabel("Running: Recovery completed", { exact: true }),
+    ).toBeVisible();
+    if (viewState === "cached") {
+      await page.getByRole("button", { name: /^Saved panel/ }).click();
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "RECOVERED-PANEL",
+      );
+    }
+    expect(
+      terminalSockets.filter((socket) => socket.url() === originalSocket.url()),
+    ).toHaveLength(1);
+    await originalSocket.close({ code: 1008, reason: "Unknown terminal tab." });
+
+    await expect
+      .poll(
+        () =>
+          terminalSockets.filter(
+            (socket) => socket.url() === originalSocket.url(),
+          ).length,
+      )
+      .toBe(2);
+    await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+    await expect(
+      page.getByRole("region", { name: "Recovery for Saved panel" }),
+    ).toHaveCount(0);
+    await expect(page.locator(".tab-title")).toHaveText([
+      "Saved panel",
+      "Working panel",
+    ]);
+    await expect(page.locator(".workspace-pane")).toHaveAttribute(
+      "data-pane-id",
+      "saved-pane",
+    );
+    await captureSample(
+      page,
+      testInfo,
+      `workspace-recovery-late-rejection-${viewState}`,
+    );
+
+    const replacementSocket = terminalSockets.filter(
+      (socket) => socket.url() === originalSocket.url(),
+    )[1]!;
+    await replacementSocket.close({
+      code: 1008,
+      reason: "Unknown terminal tab.",
+    });
+    await expect(
+      page.getByRole("button", { name: "Check connection", exact: true }),
+    ).toBeVisible();
+    expect(
+      terminalSockets.filter((socket) => socket.url() === originalSocket.url()),
+    ).toHaveLength(2);
+  });
+}
+
+test("workspace recovery requires an exact selection when the Codex transcript is missing", async ({
+  page,
+}, testInfo) => {
+  const { tabs } = await showRecoveryWorkspace(page, "codex-terminal");
+  const requests: unknown[] = [];
+  await page.route("**/api/tabs/saved-panel/recover", async (route) => {
+    requests.push(route.request().postDataJSON());
+    await route.fulfill({
+      json: { ...tabs[0], status: "running", recovery: undefined },
+    });
+  });
+  await page.goto(baseUrl);
+  const recovery = page.getByRole("region", {
+    name: "Recovery for Saved panel",
+  });
+  await expect(recovery).toContainText(
+    "The saved conversation transcript is unavailable.",
+  );
+  await expect(
+    recovery.getByRole("button", { name: "Resume conversation", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    recovery.getByRole("button", { name: "Resume selected conversation" }),
+  ).toBeDisabled();
+  await recovery
+    .getByRole("textbox", { name: "Conversation session ID" })
+    .fill("11111111-2222-4333-8444-555555555555");
+  await captureSample(page, testInfo, "workspace-codex-recovery");
+  await recovery
+    .getByRole("button", { name: "Resume selected conversation" })
+    .click();
+  await expect(page.locator(".xterm-rows")).toContainText("RECOVERED-PANEL");
+  expect(requests).toEqual([
+    {
+      action: "resume-conversation",
+      sessionId: "11111111-2222-4333-8444-555555555555",
+    },
+  ]);
+  await expect(page.locator(".tab-title")).toHaveText([
+    "Saved panel",
+    "Working panel",
+  ]);
+});
+
+test("workspace recovery retires saved CFG into Settings Codex without writing preferences", async ({
+  page,
+}, testInfo) => {
+  await showRecoveryWorkspace(page, "codex-settings");
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() !== "GET")
+      writes.push(new URL(request.url()).pathname);
+  });
+  await page.route("**/api/tabs/saved-panel", (route) =>
+    route.fulfill({ json: { activeTabId: "working-panel" } }),
+  );
+  await page.goto(baseUrl);
+  const recovery = page.getByRole("region", {
+    name: "Recovery for Saved panel",
+  });
+  await expect(recovery).toContainText(
+    "Your Codex preferences stay unchanged.",
+  );
+  await captureSample(page, testInfo, "workspace-settings-retirement");
+  await recovery
+    .getByRole("button", { name: "Open Settings → Codex and remove tab" })
+    .click();
+  const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+  await expect(
+    settings.getByRole("tab", { name: "Codex", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(
+    settings.getByRole("textbox", { name: "Default model" }),
+  ).toBeVisible();
+  await expect(page.locator(".tab-title")).toHaveText(["Working panel"]);
+  expect(writes).toContain("/api/tabs/saved-panel");
+  expect(writes).not.toContain("/api/hooks/codex-settings.update");
+  expect(writes).not.toContain("/api/config");
+});
+
+async function showRecoveryWorkspace(page: Page, pluginId: string) {
+  const state = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  const timestamp = "2026-09-15T00:00:00.000Z";
+  const tab: WorkspaceTab = {
+    id: "saved-panel",
+    pluginId,
+    title: "Saved panel",
+    cwd: testRoot,
+    status: "failed",
+    indicator: { color: "red", label: "Failed", updatedAt: timestamp },
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    recovery:
+      pluginId === "codex-settings"
+        ? { state: "retired", message: "Settings moved to Settings → Codex." }
+        : {
+            state: "missing",
+            message:
+              pluginId === "codex-terminal"
+                ? "The saved conversation transcript is unavailable."
+                : "The previous shell process ended.",
+            canResume: false,
+          },
+  };
+  state.tabs = [
+    tab,
+    {
+      ...tab,
+      id: "working-panel",
+      pluginId: "standard-terminal",
+      title: "Working panel",
+      status: "running",
+      recovery: undefined,
+    },
+  ];
+  state.activeTabId = tab.id;
+  state.windows[0]!.layout = {
+    activePaneId: "saved-pane",
+    root: {
+      type: "pane",
+      pane: {
+        id: "saved-pane",
+        tabIds: state.tabs.map((tab) => tab.id),
+        activeTabId: tab.id,
+      },
+    },
+  };
+  await page.route("**/api/workspace", (route) =>
+    route.fulfill({ json: state }),
+  );
+  await page.route("**/api/windows/*", (route) =>
+    route.fulfill({ json: state }),
+  );
+  await page.route("**/api/tabs/*/active", (route) =>
+    route.fulfill({ json: {} }),
+  );
+  const workspaceSockets: WebSocketRoute[] = [];
+  await page.routeWebSocket("**/ws/workspace", (socket) => {
+    workspaceSockets.push(socket);
+    socket.send(JSON.stringify({ type: "workspace", ...state }));
+  });
+  const terminalSockets: WebSocketRoute[] = [];
+  await page.routeWebSocket("**/ws/terminal/*", (socket) => {
+    terminalSockets.push(socket);
+    socket.send(
+      JSON.stringify({
+        type: "screen",
+        data: "RECOVERED-PANEL",
+        cols: 80,
+        rows: 24,
+      }),
+    );
+  });
+  return {
+    ...state,
+    terminalSockets,
+    publishTab(tab: WorkspaceTab) {
+      state.tabs = state.tabs.map((current) =>
+        current.id === tab.id ? tab : current,
+      );
+      for (const socket of workspaceSockets)
+        socket.send(JSON.stringify({ type: "workspace", ...state }));
+    },
+  };
+}
 
 async function openSettings(page: Page, isMobile: boolean) {
   await expect(page.locator(".workspace-pane").first()).toBeVisible();

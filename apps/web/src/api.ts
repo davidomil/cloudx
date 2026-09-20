@@ -28,6 +28,7 @@ import type {
   PathOptionsResponse,
   PathOption,
   PluginDescriptor,
+  RecoverTabRequest,
   CloudxNotification,
   SearchWorkspaceWindowsResponse,
   TabLayoutState,
@@ -676,6 +677,13 @@ export async function setActiveTab(tabId: string): Promise<void> {
 
 export async function closeTab(tabId: string): Promise<{ activeTabId?: string }> {
   return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}`, { method: "DELETE" });
+}
+
+export async function recoverTab(tabId: string, input: RecoverTabRequest): Promise<WorkspaceTab> {
+  return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/recover`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
 }
 
 export async function runTabAction<T>(tabId: string, action: string, input: Record<string, unknown>): Promise<T> {

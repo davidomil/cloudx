@@ -14,6 +14,7 @@ import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTe
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
+import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import path from "node:path";
 import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory, TerminalProducer } from "../terminal/TerminalProcess.js";
@@ -99,6 +100,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {
+    return this.startSession(input, false);
+  }
+
+  private async startSession(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
     const baseEnv = { ...process.env };
     let launchTemplate: MaterializedCodexTemplate;
@@ -115,6 +120,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
+    let restoredInput: Record<string, unknown> = { ...input.initialInput, codexRuntimeContext: input.runtimeContext, codexRecovered: recovering };
     if (input.prepareCodexSession) {
       const sessionId = await input.prepareCodexSession({
         tabId: input.tab.id,
@@ -124,9 +130,13 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         env: launchTemplate.env,
       });
       initialArgs = buildCodexLaunchArgs([], { ...input.initialInput, resume: { mode: "session", sessionId } });
+      restoredInput = { ...restoredInput, resume: { mode: "session", sessionId } };
     }
+    const conversation = launchTemplate.overlay ? new CodexConversationRecovery(launchTemplate.overlay.codexHome) : undefined;
+    await conversation?.reset();
+    await input.controls.setRestoreInput?.(restoredInput);
     const command = launchTemplate.command;
-    const launchArgs = [...launchTemplate.args, ...initialArgs];
+    const launchArgs = [...launchTemplate.args, ...conversation?.launchArgs() ?? [], ...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
     const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
@@ -136,13 +146,20 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ...(!input.tab.ownerPluginId ? { sessionId: input.tab.id } : {})
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
-      closeOnExit: !input.tab.ownerPluginId,
+      closeOnExit: !input.tab.ownerPluginId && !recovering,
       closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
       voiceSummary: launchTemplate.voiceSummary,
       templateName: launchTemplate.templateName,
+      restoreInput: () => restoredInput,
+      observeConversation: () => conversation?.observe(identity => {
+        restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
+        return input.controls.setRestoreInput?.(restoredInput);
+      }, error => {
+        restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
+      }),
       applyRuntimeContext: async (runtimeContext) => {
         const nextTemplate = templateFromRuntimeContext(runtimeContext);
         const nextLaunchTemplate = await materializeCodexTemplate(nextTemplate, baseEnv, {
@@ -153,6 +170,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           resetOverlay: false,
           sources: this.sources
         });
+        restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext };
+        await input.controls.setRestoreInput?.(restoredInput);
         return {
           prompt: buildCodexRuntimeUpdatePrompt(nextTemplate, nextLaunchTemplate.overlay),
           voiceSummary: nextLaunchTemplate.voiceSummary,
@@ -166,18 +185,29 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   async restoreSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     if (!this.factory.attach) throw new Error("Codex terminal reconnection is unavailable.");
     const terminal = await this.factory.attach(input.tab.id);
+    let restoredInput = { ...input.initialInput };
+    const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
     return new CodexTerminalSession(input.tab, terminal, input.controls, {
-      closeOnExit: true,
+      closeOnExit: input.initialInput?.codexRecovered !== true,
       closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
       voiceSummary: "Existing interactive Codex CLI session.",
+      restoreInput: () => restoredInput,
+      observeConversation: () => conversation?.observe(identity => {
+        restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
+        return input.controls.setRestoreInput?.(restoredInput);
+      }, error => {
+        restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
+      }),
       applyRuntimeContext: async (runtimeContext) => {
         const template = templateFromRuntimeContext(runtimeContext);
         const launch = await materializeCodexTemplate(template, { ...process.env }, {
           dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources
         });
+        restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext };
+        await input.controls.setRestoreInput?.(restoredInput);
         return {
           prompt: buildCodexRuntimeUpdatePrompt(template, launch.overlay),
           voiceSummary: launch.voiceSummary,
@@ -186,6 +216,40 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         };
       }
     });
+  }
+
+  async describeRecovery(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume: boolean }> {
+    const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
+    try {
+      const resume = codexResumeInput(input.initialInput);
+      const conversationId = conversation?.read()?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
+      if (!conversationId) return { message: "The previous Codex process ended. Its exact conversation ID was not saved. Select a saved session.", canResume: false };
+      await this.requireConversation(input.tab.id, conversationId);
+      // Codex queues SessionStart until the next prompt. A receipt or launch ID
+      // cannot confirm the selected conversation after an idle /resume or /new.
+      return { message: "The previous Codex process ended. Its current conversation cannot be confirmed from the last saved ID. Select a saved session.", canResume: false };
+    } catch (error) {
+      return { message: error instanceof Error ? error.message : "Codex conversation recovery is unavailable.", canResume: false };
+    }
+  }
+
+  async recoverSession(input: CreatePluginSessionInput): Promise<PluginSession> {
+    const resume = codexResumeInput(input.initialInput);
+    if (resume?.mode !== "session" || !resume.sessionId) throw new Error("The exact Codex conversation ID is unavailable. Select a saved session.");
+    await this.requireConversation(input.tab.id, resume.sessionId);
+    const { prompt: _prompt, codexRuntimeContext, ...initialInput } = input.initialInput ?? {};
+    return this.startSession({
+      ...input, initialInput, prepareCodexSession: undefined,
+      runtimeContext: isRecord(codexRuntimeContext) ? codexRuntimeContext as WorkspaceRuntimeContext : input.runtimeContext
+    }, true);
+  }
+
+  private async requireConversation(tabId: string, conversationId: string): Promise<void> {
+    if (!this.sources) throw new Error("The Codex conversation store is unavailable. Select a saved session after checking Codex settings.");
+    const source = await this.sources.readBinding(tabId);
+    if (!source) throw new Error("The saved Codex launch context is unavailable. Select a saved session after checking Codex settings.");
+    await this.sources.assertCurrent(source);
+    await new CodexConversationRecovery(this.sources.viewPath(tabId)).requireTranscript(conversationId, source.home);
   }
 }
 
@@ -528,6 +592,8 @@ interface TerminalSessionOptions {
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
   templateName?: string;
+  restoreInput?(): Record<string, unknown>;
+  observeConversation?(): (() => void) | undefined;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
 }
 
@@ -614,6 +680,7 @@ export class CodexTerminalSession implements PluginSession {
   private lastOutputAt = 0;
   private terminalClosed = false;
   private readonly terminalSubscriptions: Array<() => void> = [];
+  private stopObservingConversation: (() => void) | undefined;
 
   constructor(
     public readonly tab: WorkspaceTab,
@@ -623,6 +690,7 @@ export class CodexTerminalSession implements PluginSession {
   ) {
     this.status = tab.status;
     this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
+    this.stopObservingConversation = options.observeConversation?.();
     if ("pauseOutput" in terminalProcess && typeof terminalProcess.pauseOutput === "function"
       && "resumeOutput" in terminalProcess && typeof terminalProcess.resumeOutput === "function") {
       this.producer = terminalProcess as TerminalProducer;
@@ -650,12 +718,17 @@ export class CodexTerminalSession implements PluginSession {
     });
     if (screenSubscription) this.terminalSubscriptions.push(screenSubscription);
     this.terminalSubscriptions.push(this.terminalProcess.onExit((event) => {
+      this.stopObservingConversation?.();
       this.terminalClosed = true;
       this.clearPendingSubmitTimers();
       this.clearReadyQuietTimer();
       this.setReadiness("closed", "Terminal process exited.");
       if (this.stopped) {
         this.setStatus("stopped", "Terminal was stopped.");
+        return;
+      }
+      if (event.reason === "broker-shutdown") {
+        this.setStatus("failed", "The terminal broker stopped the process. Recover this panel to continue.");
         return;
       }
       if (this.options.closeOnExit) {
@@ -687,6 +760,14 @@ export class CodexTerminalSession implements PluginSession {
     return this.terminalProcess.onData(listener);
   }
 
+  restoreInput(): Record<string, unknown> | undefined {
+    return this.options.restoreInput?.();
+  }
+
+  hasExited(): boolean {
+    return this.terminalClosed;
+  }
+
   attachTerminal(listener: (data: string) => void) {
     return this.screen.attach(listener);
   }
@@ -704,6 +785,7 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   stop(): void {
+    this.stopObservingConversation?.();
     this.stopped = true;
     this.terminalClosed = true;
     this.clearPendingSubmitTimers();
@@ -716,6 +798,7 @@ export class CodexTerminalSession implements PluginSession {
 
   detach(): void {
     if (!this.terminalProcess.detach) throw new Error("This terminal cannot survive server shutdown.");
+    this.stopObservingConversation?.();
     this.clearPendingSubmitTimers();
     this.clearReadyQuietTimer();
     for (const unsubscribe of this.terminalSubscriptions) unsubscribe();
@@ -740,6 +823,7 @@ export class CodexTerminalSession implements PluginSession {
       throw error;
     }
     this.terminalClosed = true;
+    this.stopObservingConversation?.();
     this.setReadiness("closed", "Terminal was stopped.");
     this.setStatus("stopped", "Terminal was stopped.");
   }

@@ -270,6 +270,16 @@ describe("workspaceStateWithPreservedLayout", () => {
 });
 
 describe("parseWorkspaceSocketUpdate", () => {
+  it("keeps recovery choices and rejects malformed recovery metadata", () => {
+    const tab = workspaceTab("tab-1", "codex-terminal");
+    const recovery = { state: "missing", message: "The previous process ended.", conversationId: "exact-session", canResume: true };
+    const update = (value: unknown) => JSON.stringify({ type: "tabs", tabs: [{ ...tab, recovery: value }] });
+    expect(parseWorkspaceSocketUpdate(update(recovery))).toMatchObject({ tabs: [{ ...tab, recovery }] });
+    for (const malformed of [null, { ...recovery, state: "retry" }, { ...recovery, message: 2 }, { ...recovery, canResume: "yes" }, { ...recovery, conversationId: 1 }]) {
+      expect(parseWorkspaceSocketUpdate(update(malformed))).toBeUndefined();
+    }
+  });
+
   it("requires full workspace fields for workspace socket updates", () => {
     const state = workspaceState("window-1", layoutWithActiveTab("tab-old"));
     expect(parseWorkspaceSocketUpdate(JSON.stringify({ type: "workspace", tabs: [] }))).toBeUndefined();
