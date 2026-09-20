@@ -794,6 +794,13 @@ class DocumentationArchive:
                     manifest["analysisNeedsRebuild"] = True
                     if recovered_metadata:
                         manifest["migrationWarnings"] = [recovery["warning"]]
+                        if document["source_type"] == "media":
+                            manifest["rebuildBlocked"] = (
+                                f"Reanalysis is blocked for legacy media {document['document_id']} at {document['snapshot_path']}: "
+                                "media provenance is unavailable after metadata recovery. Retained chunks and artifacts are preserved; "
+                                "restore verified media provenance before rebuilding."
+                            )
+                            manifest["migrationWarnings"].append(manifest["rebuildBlocked"])
                     aliases = legacy_directories[original_snapshot.parent.relative_to(self.root).as_posix()]
                     if aliases > 1:
                         manifest["legacyMetadataAttribution"] = "shared-directory-unverified"
@@ -1473,6 +1480,8 @@ class DocumentationArchive:
         if sha256_bytes(source_bytes) != document["content_sha256"]:
             raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
         manifest = json.loads(document["source_manifest_json"])
+        if manifest.get("rebuildBlocked"):
+            raise ArchiveError(manifest["rebuildBlocked"])
         if manifest.get("mode") == "legacy-generated-documentation" and not manifest.get("originalAvailable"):
             raise ArchiveError(manifest.get("rebuildBlocked") or "Legacy generated documentation has no verified original source inputs.")
         metadata = manifest.get("metadata", {})

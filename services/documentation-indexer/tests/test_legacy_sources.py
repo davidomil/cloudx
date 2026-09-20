@@ -4,9 +4,13 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
 
+from cloudx_documentation_indexer import archive as archive_module
 from cloudx_documentation_indexer.archive import ArchiveError, DocumentationArchive
 from cloudx_documentation_indexer.extraction import ExtractedSpan
+from cloudx_documentation_indexer.main import create_app
 from cloudx_documentation_indexer.vendor_code import VendorCodeSource, generate_vendor_code_documentation, write_vendor_code_artifacts
 from enrichment_fixture import enrich_archive
 
@@ -15,6 +19,116 @@ def mark_legacy(archive):
     with archive._connect() as db:
         db.execute("UPDATE documents SET source_manifest_json = '{}',processor_fingerprint = ''")
         db.execute('PRAGMA user_version = 1')
+
+
+@pytest.fixture
+def legacy_media_archive(tmp_path):
+    archive = DocumentationArchive(tmp_path / 'archive')
+    segments = [archive_module.TranscriptSegment(12, 18, 'RETAINED_MEDIA_86 timed source evidence.')]
+    content = archive_module.transcript_segments_text(segments).encode()
+    snapshot = archive._store_snapshot(content, 'lecture.youtube.txt', {'youtube': {'title': 'Legacy lecture'}})
+    media = snapshot.parent / 'extracted' / 'media'
+    (media / 'keyframes').mkdir(parents=True)
+    Image.new('RGB', (64, 36), 'white').save(media / 'keyframes' / 'frame-000001.jpg')
+    frames = [{'offsetSeconds': 12, 'path': 'media/keyframes/frame-000001.jpg',
+               'transcriptStartSeconds': 12, 'transcriptEndSeconds': 18}]
+    archive_module.write_transcript_segment_index(media / 'transcript_segments.tsv', segments)
+    archive_module.write_keyframe_index(media / 'keyframes.tsv', frames)
+    document = archive._write_document(
+        title='Legacy lecture', source_type='media', uri='https://www.youtube.com/watch?v=legacy86',
+        snapshot_path=snapshot, content_bytes=content, collection=None, tags=[],
+        spans=[ExtractedSpan('Legacy lecture', 'media metadata'),
+               *archive_module.youtube_transcript_spans(segments),
+               *archive_module.youtube_keyframe_spans(frames, segments)],
+    )
+    # Legacy importers retained frames and indexes separately from the hashed text.
+    snapshot.with_name('source-manifest.json').unlink()
+    snapshot.with_name('source-spans.json').unlink()
+    return archive, document
+
+
+@pytest.mark.parametrize('sidecar', [b'', b' \n\t ', None], ids=['empty', 'whitespace', 'missing'])
+def test_recovered_legacy_media_blocks_reanalysis_and_keeps_retained_evidence(legacy_media_archive, sidecar):
+    archive, document = legacy_media_archive
+    sibling = archive.ingest_text(text='UNAFFECTED_MEDIA_SIBLING_86 retained text.')
+    before = archive.get_document(document.document_id)
+    snapshot = archive.root / before['snapshot_path']
+    original = snapshot.read_bytes()
+    retained_files = {path: path.read_bytes() for path in snapshot.parent.rglob('*') if path.is_file()
+                      and path.name != 'metadata.json'}
+    metadata_path = snapshot.with_name('metadata.json')
+    if sidecar is None:
+        metadata_path.unlink()
+    else:
+        metadata_path.write_bytes(sidecar)
+    mark_legacy(archive)
+
+    for _ in range(2):
+        with TestClient(create_app(archive.root)) as client:
+            assert client.get('/ready').status_code == 200
+            upgraded = client.app.state.archive
+            response = client.post(f'/documents/{document.document_id}/reanalyze')
+            after = upgraded.get_document(document.document_id)
+            assert after['chunks'] == before['chunks']
+            assert after['snapshot_path'] == before['snapshot_path']
+            assert after['extraction_revision'] == before['extraction_revision']
+            assert after['state'] == 'active'
+            assert {path: path.read_bytes() for path in retained_files} == retained_files
+            assert snapshot.read_bytes() == original
+            assert hashlib.sha256(original).hexdigest() == after['content_sha256']
+            frame = client.get(f'/documents/{document.document_id}/artifact', params={'path': before['artifacts'][0]['path']})
+            assert frame.status_code == 200
+            assert frame.content == retained_files[snapshot.parent / 'extracted' / before['artifacts'][0]['path']]
+            assert upgraded.search('RETAINED_MEDIA_86', mode='lexical')[0]['documentId'] == document.document_id
+            assert response.status_code == 400
+            diagnostic = after['sourceManifest']['rebuildBlocked']
+            assert diagnostic in response.json()['detail']
+            assert document.document_id in diagnostic
+            assert before['snapshot_path'] in diagnostic
+            assert 'media provenance' in diagnostic
+            assert diagnostic in after['sourceManifest']['migrationWarnings']
+            assert 'youtube' not in after['sourceManifest']['metadata']
+            assert client.post(f'/documents/{sibling.document_id}/reanalyze').status_code == 200
+
+
+def test_recovered_legacy_media_aliases_stay_blocked_after_migration_retry(legacy_media_archive, monkeypatch):
+    archive, document = legacy_media_archive
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    alias = archive.ingest_text(text=snapshot.read_text(), uri='manual://media-alias', source_type='media')
+    with archive._connect() as db:
+        db.execute('UPDATE documents SET snapshot_path=? WHERE document_id=?',
+                   (snapshot.relative_to(archive.root).as_posix(), alias.document_id))
+    documents = [document, alias]
+    chunks = {item.document_id: archive.get_document(item.document_id)['chunks'] for item in documents}
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata_path.write_bytes(b'')
+    retained_files = {path: path.read_bytes() for path in snapshot.parent.rglob('*') if path.is_file()
+                      and path.name != 'metadata.json'}
+    snapshot_directories = set(archive.snapshots_dir.iterdir())
+    mark_legacy(archive)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(DocumentationArchive, '_register_artifacts', lambda *_args: (_ for _ in ()).throw(RuntimeError('migration interruption')))
+        with pytest.raises(RuntimeError, match='migration interruption'):
+            DocumentationArchive(archive.root)
+    assert json.loads(metadata_path.read_text())['legacyMetadataRecovery']['reason'] == 'empty'
+    with archive._connect() as db:
+        assert all(row[0] == '{}' for row in db.execute('SELECT source_manifest_json FROM documents'))
+
+    for _ in range(2):
+        upgraded = DocumentationArchive(archive.root)
+        for item in documents:
+            detail = upgraded.get_document(item.document_id)
+            manifest = detail['sourceManifest']
+            assert manifest['legacyMetadataAttribution'] == 'shared-directory-unverified'
+            assert manifest['rebuildBlocked'] in manifest['migrationWarnings']
+            with pytest.raises(ArchiveError, match='media provenance'):
+                upgraded.reanalyze_document(item.document_id)
+            assert upgraded.get_document(item.document_id) == detail
+            assert detail['chunks'] == chunks[item.document_id]
+        assert {path: path.read_bytes() for path in retained_files} == retained_files
+        assert set(archive.snapshots_dir.iterdir()) == snapshot_directories
+        assert not snapshot.with_name('source-spans.json').exists()
 
 
 def test_local_upgrade_classifies_plain_text_and_rebuilds_from_retained_bytes(tmp_path):
