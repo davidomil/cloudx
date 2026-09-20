@@ -17,6 +17,7 @@ import {
   documentationReadinessUrl,
   inspectUpdateTarget,
   updateCheckout,
+  updateCommit,
   updateHost,
   updatePort,
 } from "./install-update.mjs";
@@ -122,6 +123,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.uninstall = true;
     } else if (arg === "--update") {
       options.update = true;
+    } else if (arg === "--target-commit") {
+      options.targetCommit = updateCommit(argv[++index]);
     } else if (arg === "--non-interactive") {
       options.nonInteractive = true;
     } else if (arg === "--update-codex") {
@@ -152,6 +155,9 @@ export function parseArgs(argv = process.argv.slice(2)) {
   }
   if (options.nonInteractive && !options.update) {
     throw new Error("--non-interactive requires --update.");
+  }
+  if (options.targetCommit !== undefined && !options.update) {
+    throw new Error("--target-commit requires --update.");
   }
   if (
     (options.service ||
@@ -188,6 +194,7 @@ export function helpText() {
     "",
     "Options:",
     "  --update           Fast-forward this clean checkout to origin/main and update its installation.",
+    "  --target-commit <sha>  Update to this exact commit from origin; requires --update.",
     "  --non-interactive  Update without password or login prompts; requires existing non-interactive sudo and Codex authentication.",
     "  --update-codex     Update only Codex CLI to the latest npm release; leave Cloudx and services unchanged.",
     "  --service <unit>   Update only an existing custom web service; preserve its definition and shared dependencies.",
@@ -982,6 +989,10 @@ export class InstallerRunner {
 }
 
 export async function runInstaller(options = {}) {
+  if (options.targetCommit !== undefined) {
+    updateCommit(options.targetCommit);
+    if (!options.update) throw new Error("--target-commit requires --update.");
+  }
   const root = options.repoRoot ?? repoRoot;
   const home = options.home ?? os.homedir();
   const env = options.env ?? process.env;
@@ -1049,6 +1060,7 @@ export async function runInstaller(options = {}) {
       repoRoot: root,
       dryRun,
       updatedCommit: env.CLOUDX_INSTALL_UPDATED_COMMIT,
+      targetCommit: options.targetCommit,
     });
     if (options.cliArgs && !dryRun && !env.CLOUDX_INSTALL_UPDATED_COMMIT) {
       return runner.run(

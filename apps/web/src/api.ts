@@ -12,6 +12,8 @@ import type {
   CloudxConfigValues,
   CloudxLogSource,
   CloudxLogsResponse,
+  CloudxUpdateChannel,
+  CloudxUpdatePreview,
   CloudxUpdateStatus,
   ForgeConnectionAction,
   ForgeConnections,
@@ -41,7 +43,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseCloudxUpdateStatus, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
+import { parseCloudxUpdatePreview, parseCloudxUpdateStatus, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -492,8 +494,16 @@ export async function getCloudxUpdateStatus(signal?: AbortSignal): Promise<Cloud
   return parseCloudxUpdateStatus(await fetchJson<unknown>("/api/system/update", { signal, cache: "no-store" }));
 }
 
-export async function startCloudxUpdate(signal?: AbortSignal): Promise<CloudxUpdateStatus> {
-  const response = await fetch("/api/system/update", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", signal });
+export async function getCloudxUpdatePreview(signal?: AbortSignal): Promise<CloudxUpdatePreview> {
+  return parseCloudxUpdatePreview(await fetchJson<unknown>("/api/system/update/preview", { signal, cache: "no-store" }));
+}
+
+export async function setCloudxUpdateChannel(channel: CloudxUpdateChannel, signal?: AbortSignal): Promise<CloudxUpdatePreview> {
+  return parseCloudxUpdatePreview(await fetchJson<unknown>("/api/system/update/preview", { method: "PUT", body: JSON.stringify({ channel }), signal }));
+}
+
+export async function startCloudxUpdate(channel: CloudxUpdateChannel, targetCommit: string, signal?: AbortSignal): Promise<CloudxUpdateStatus> {
+  const response = await fetch("/api/system/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel, targetCommit }), signal });
   if (!response.ok && response.status !== 409) throw new HttpError(response.status, errorMessageFromResponse(await response.text(), response.status));
   return parseCloudxUpdateStatus(await response.json());
 }

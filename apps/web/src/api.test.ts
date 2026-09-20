@@ -21,6 +21,7 @@ import {
   fileBrowserRawFileUrl,
   filenameFromContentDisposition,
   getConfig,
+  getCloudxUpdatePreview,
   getHooks,
   importDocumentationArchive,
   isWorkspaceLayoutDurable,
@@ -29,7 +30,9 @@ import {
   runTabAction,
   selectWindow,
   setActiveTab,
+  setCloudxUpdateChannel,
   startAudioStream,
+  startCloudxUpdate,
   submitAudio,
   submitTranscript,
   updateConfig,
@@ -44,6 +47,33 @@ import { defaultLayout } from "./ui/layout.js";
 describe("api client", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("reads and validates a channel preview without using a cached response", async () => {
+    const preview = { channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "unavailable", changelog: [], changelogComplete: false };
+    const fetch = vi.fn().mockResolvedValueOnce(jsonResponse(preview)).mockResolvedValueOnce(jsonResponse({ channel: "nightly" }));
+    vi.stubGlobal("fetch", fetch);
+    const signal = new AbortController().signal;
+    await expect(getCloudxUpdatePreview(signal)).resolves.toEqual(preview);
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/system/update/preview", { signal, cache: "no-store", headers: undefined });
+    await expect(getCloudxUpdatePreview()).rejects.toThrow("Invalid CloudX update preview");
+  });
+
+  it("saves the selected channel and starts only the displayed commit", async () => {
+    const preview = {
+      channel: "releases", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "available", changelog: [], changelogComplete: true,
+      target: { commit: "b".repeat(40), name: "v0.2.0", url: "https://github.com/davidomil/cloudx/releases/tag/v0.2.0" }
+    };
+    const fetch = vi.fn().mockResolvedValueOnce(jsonResponse(preview)).mockResolvedValueOnce(jsonResponse({ available: true }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(setCloudxUpdateChannel("releases")).resolves.toEqual(preview);
+    expect(fetch).toHaveBeenNthCalledWith(1, "/api/system/update/preview", {
+      method: "PUT", body: JSON.stringify({ channel: "releases" }), headers: { "content-type": "application/json" }, signal: undefined
+    });
+    await startCloudxUpdate("releases", preview.target.commit);
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/system/update", {
+      method: "POST", body: JSON.stringify({ channel: "releases", targetCommit: preview.target.commit }), headers: { "content-type": "application/json" }, signal: undefined
+    });
   });
 
   it("requests a durable workspace checkpoint even without a pending layout", async () => {

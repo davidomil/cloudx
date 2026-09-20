@@ -15,6 +15,7 @@ import {
   processBelongsToService,
 } from "./settings-update.mjs";
 
+const TARGET_COMMIT = "b".repeat(40);
 const temporary = [];
 afterEach(() =>
   temporary
@@ -124,6 +125,26 @@ function installation({ home, checkout = "checkout" } = {}) {
 }
 
 describe("installed Settings updater", () => {
+  it.each([undefined, "", "main", "a".repeat(39), "A".repeat(40), "--upload-pack=other"])(
+    "rejects invalid target %j before inspecting or starting host services",
+    (targetCommit) => {
+      const { updater, calls } = installation();
+      expect(() => updater.start(targetCommit)).toThrow("commit SHA");
+      expect(calls).toEqual([]);
+      expect(fs.existsSync(updater.stateDir)).toBe(false);
+    },
+  );
+
+  it("persists the selected commit for the detached worker and rejects a corrupted target", () => {
+    const { updater, calls } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    const record = updater.read(started.run.id);
+    expect(record.targetCommit).toBe(TARGET_COMMIT);
+    updater.save({ ...record, targetCommit: "main" });
+    expect(() => updater.run(started.run.id)).toThrow("commit SHA");
+    expect(calls.some(([command]) => command === process.execPath)).toBe(false);
+  });
+
   it("recognizes the Node child of the standard npm service without requiring MainPID equality", () => {
     const fixture = installation();
     expect(fixture.updater.status()).toEqual({ available: true });
@@ -150,7 +171,7 @@ describe("installed Settings updater", () => {
   ])("disables %s without launching anything", (_name, service) => {
     const { updater, host, calls } = installation();
     host.service = service;
-    expect(updater.start()).toMatchObject({
+    expect(updater.start(TARGET_COMMIT)).toMatchObject({
       available: false,
       unavailableReason: expect.stringContaining("standard installed"),
     });
@@ -185,7 +206,7 @@ describe("installed Settings updater", () => {
   it("refuses password-requiring sudo before Git or a launch", () => {
     const { updater, host, calls } = installation();
     host.sudo = false;
-    expect(updater.start()).toMatchObject({
+    expect(updater.start(TARGET_COMMIT)).toMatchObject({
       available: false,
       unavailableReason: expect.stringContaining("non-interactive sudo"),
     });
@@ -200,7 +221,7 @@ describe("installed Settings updater", () => {
     expect(() =>
       inspectUpdateCheckout(fixture.options.commands, fixture.repoRoot),
     ).toThrow("local changes");
-    expect(fixture.updater.start()).toMatchObject({
+    expect(fixture.updater.start(TARGET_COMMIT)).toMatchObject({
       available: false,
       unavailableReason: expect.stringContaining("checkout must be clean"),
     });
@@ -211,10 +232,10 @@ describe("installed Settings updater", () => {
 
   it("launches an independent bounded service and reconnects to the same durable run", () => {
     const { updater, options, calls, repoRoot } = installation();
-    const first = updater.start();
+    const first = updater.start(TARGET_COMMIT);
     expect(first).toMatchObject({ available: true, run: { state: "running" } });
     const restartedServer = new SettingsUpdater({ ...options, serverPid: 789 });
-    expect(restartedServer.start()).toEqual(first);
+    expect(restartedServer.start(TARGET_COMMIT)).toEqual(first);
     const launches = calls.filter(([command]) => command === "systemd-run");
     expect(launches).toHaveLength(1);
     expect(launches[0][1]).toEqual(
@@ -247,7 +268,7 @@ describe("installed Settings updater", () => {
   it("persists launch failure without exposing command output", () => {
     const { updater, host } = installation();
     host.launch = false;
-    const started = updater.start();
+    const started = updater.start(TARGET_COMMIT);
     expect(started.run).toMatchObject({
       state: "failed",
       finishedAt: host.now.toISOString(),
@@ -260,7 +281,7 @@ describe("installed Settings updater", () => {
     "updates a reinstalled checkout after a %s update under the same home",
     (state) => {
       const previous = installation();
-      const started = previous.updater.start();
+      const started = previous.updater.start(TARGET_COMMIT);
       if (state === "failed")
         previous.host.installer = () => {
           throw new Error("Installer failed");
@@ -275,7 +296,7 @@ describe("installed Settings updater", () => {
       });
       expect(current.updater.preflight()).toBeUndefined();
       expect(current.updater.status()).toEqual({ available: true });
-      const next = current.updater.start();
+      const next = current.updater.start(TARGET_COMMIT);
       expect(next).toMatchObject({
         available: true,
         run: { state: "running" },
@@ -294,11 +315,11 @@ describe("installed Settings updater", () => {
 
   it("ignores a failed launch attempt from the former checkout after reinstalling", () => {
     const previous = installation();
-    const completed = previous.updater.start();
+    const completed = previous.updater.start(TARGET_COMMIT);
     previous.updater.run(completed.run.id);
     previous.host.unit = { LoadState: "not-found", ActiveState: "inactive" };
     previous.host.launch = false;
-    const failed = previous.updater.start();
+    const failed = previous.updater.start(TARGET_COMMIT);
     expect(failed.run.state).toBe("failed");
     expect(previous.updater.pointer("latest").id).toBe(completed.run.id);
     expect(previous.updater.pointer("attempt").id).toBe(failed.run.id);
@@ -308,7 +329,7 @@ describe("installed Settings updater", () => {
       checkout: "reinstalled",
     });
     expect(current.updater.status()).toEqual({ available: true });
-    const next = current.updater.start();
+    const next = current.updater.start(TARGET_COMMIT);
     expect(next.run.state).toBe("running");
     expect(next.run.id).not.toBe(failed.run.id);
     expect(current.updater.status()).toEqual(next);
@@ -323,7 +344,7 @@ describe("installed Settings updater", () => {
     "blocks another checkout with a $state record and an $service update service",
     ({ state, service }) => {
       const previous = installation();
-      const started = previous.updater.start();
+      const started = previous.updater.start(TARGET_COMMIT);
       if (state === "succeeded") previous.updater.run(started.run.id);
       const recordPath = previous.updater.recordPath(started.run.id);
       const saved = fs.readFileSync(recordPath, "utf8");
@@ -337,7 +358,7 @@ describe("installed Settings updater", () => {
       expect(() => current.updater.status()).toThrow(
         "Invalid stored update status",
       );
-      expect(() => current.updater.start()).toThrow(
+      expect(() => current.updater.start(TARGET_COMMIT)).toThrow(
         "Invalid stored update status",
       );
       expect(() => current.updater.run(started.run.id)).toThrow(
@@ -352,7 +373,7 @@ describe("installed Settings updater", () => {
 
   it("returns the winning run if another start wins the fixed-unit launch race", () => {
     const { updater, options, host } = installation();
-    const first = updater.start();
+    const first = updater.start(TARGET_COMMIT);
     const active = host.unit;
     host.unit = { LoadState: "not-found", ActiveState: "inactive" };
     updater.finish(updater.read(first.run.id), "failed", "Test stale state");
@@ -363,7 +384,7 @@ describe("installed Settings updater", () => {
       updater.save(winner);
       throw new Error("Unit already exists");
     };
-    expect(new SettingsUpdater(options).start().run.id).toBe(first.run.id);
+    expect(new SettingsUpdater(options).start(TARGET_COMMIT).run.id).toBe(first.run.id);
   });
 
   it("keeps the winner after it completes while a concurrent launch fails", () => {
@@ -392,10 +413,10 @@ describe("installed Settings updater", () => {
       let inspections = 0;
       concurrent.unit = () =>
         inspections++ === 0 ? { running: false } : inspectUnit();
-      loser = concurrent.start();
+      loser = concurrent.start(TARGET_COMMIT);
       return "";
     };
-    expect(updater.start().run).toMatchObject({
+    expect(updater.start(TARGET_COMMIT).run).toMatchObject({
       id: winnerId,
       state: "succeeded",
     });
@@ -424,7 +445,7 @@ describe("installed Settings updater", () => {
         }
         throw new Error("Timed out waiting for launch acknowledgement");
       };
-      expect(updater.start().run.state).toBe(
+      expect(updater.start(TARGET_COMMIT).run.state).toBe(
         completed ? "succeeded" : "running",
       );
     },
@@ -432,7 +453,7 @@ describe("installed Settings updater", () => {
 
   it("reconciles an interrupted job after the launch grace period", () => {
     const { updater, host, options } = installation();
-    const started = updater.start();
+    const started = updater.start(TARGET_COMMIT);
     host.unit = { LoadState: "not-found", ActiveState: "inactive" };
     expect(updater.status().run.state).toBe("running");
     host.now = new Date(host.now.getTime() + 30000);
@@ -447,12 +468,14 @@ describe("installed Settings updater", () => {
     "reports installer success=%s only after the bounded installer exits",
     (succeeds) => {
       const { updater, host, calls, repoRoot } = installation();
-      const started = updater.start();
+      const started = updater.start(TARGET_COMMIT);
       host.installer = (args, options) => {
         expect(updater.status().run.state).toBe("running");
         expect(args).toEqual([
           path.join(repoRoot, "scripts/install-cloudx.mjs"),
           "--update",
+          "--target-commit",
+          TARGET_COMMIT,
           "--yes",
           "--non-interactive",
           "--answers",
@@ -486,7 +509,7 @@ describe("installed Settings updater", () => {
 
   it("revalidates service ownership in the detached worker before invoking the installer", () => {
     const { updater, host, calls } = installation();
-    const started = updater.start();
+    const started = updater.start(TARGET_COMMIT);
     host.service = { DropInPaths: "/tmp/new-custom-unit.conf" };
     expect(updater.run(started.run.id).state).toBe("failed");
     expect(calls.some(([command]) => command === process.execPath)).toBe(false);
@@ -497,7 +520,7 @@ describe("installed Settings updater", () => {
     expect(() => updater.run("../../anything")).toThrow(
       "Invalid update run identifier",
     );
-    const started = updater.start();
+    const started = updater.start(TARGET_COMMIT);
     updater.readCgroup = () => "0::/user.slice/unrelated.service\n";
     expect(() => updater.run(started.run.id)).toThrow("managed service");
   });

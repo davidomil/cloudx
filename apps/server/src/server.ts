@@ -130,7 +130,7 @@ export interface AppServices {
   jiraPolling?: JiraPollingService;
   forge?: ForgeWorkflowService;
   forgeConnections?: ForgeConnectionService;
-  updates?: Pick<CloudxUpdateService, "status" | "start">;
+  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   disposeRulesSkillsUpdates?: () => Promise<void>;
   codexStateSources?: CodexStateSources;

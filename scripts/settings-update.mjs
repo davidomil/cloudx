@@ -10,6 +10,7 @@ import {
   inspectUpdateCheckout,
   inspectUpdateTarget,
   SERVICE_NAMES,
+  updateCommit,
 } from "./install-update.mjs";
 import { parseEnvironmentFile } from "./installer-environment.mjs";
 
@@ -284,7 +285,8 @@ export class SettingsUpdater {
     };
   }
 
-  start() {
+  start(targetCommit) {
+    updateCommit(targetCommit);
     const previousRunId = this.pointer("latest")?.id;
     const status = this.status();
     if (!status.available || status.run?.state === "running") return status;
@@ -309,6 +311,7 @@ export class SettingsUpdater {
       repoRoot: this.repoRoot,
       dataDir: this.dataDir,
       serverPid: this.serverPid,
+      targetCommit,
       run: {
         id: randomUUID(),
         state: "running",
@@ -372,6 +375,7 @@ export class SettingsUpdater {
 
   run(id) {
     const record = this.read(id);
+    updateCommit(record.targetCommit);
     const unit = this.unit();
     if (
       record.run.state !== "running" ||
@@ -398,6 +402,8 @@ export class SettingsUpdater {
         [
           path.join(this.repoRoot, "scripts/install-cloudx.mjs"),
           "--update",
+          "--target-commit",
+          record.targetCommit,
           "--yes",
           "--non-interactive",
           "--answers",
@@ -432,11 +438,14 @@ export class SettingsUpdater {
 }
 
 function main() {
-  const [action, dataDir, serverPid, ...extra] = process.argv.slice(2);
+  const [action, dataDir, serverPid, targetCommit, ...extra] =
+    process.argv.slice(2);
   if (
     action === "run" &&
     RUN_ID.test(dataDir ?? "") &&
-    serverPid === undefined
+    serverPid === undefined &&
+    targetCommit === undefined &&
+    !extra.length
   ) {
     const run = new SettingsUpdater().run(dataDir);
     if (run.state !== "succeeded") process.exitCode = 1;
@@ -446,11 +455,13 @@ function main() {
     !["status", "start"].includes(action) ||
     !dataDir ||
     !/^\d+$/.test(serverPid ?? "") ||
+    (action === "status" && targetCommit !== undefined) ||
+    (action === "start" && targetCommit === undefined) ||
     extra.length
   )
     throw new Error("Invalid updater invocation.");
   const updater = new SettingsUpdater({ dataDir, serverPid });
-  console.log(JSON.stringify(updater[action]()));
+  console.log(JSON.stringify(updater[action](targetCommit)));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

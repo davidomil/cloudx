@@ -8,6 +8,7 @@ import {
 import type {
   CloudxConfigResponse,
   CloudxLogsResponse,
+  CloudxUpdatePreview,
   CloudxUpdateStatus,
   TabLayoutState,
   WorkspaceStateResponse,
@@ -24,8 +25,35 @@ let testRoot: string;
 let baseUrl: string;
 let server: ChildProcess;
 let serverLogs = "";
+const mainUpdatePreview: CloudxUpdatePreview = {
+  channel: "main",
+  currentCommit: "a".repeat(40),
+  checkedAt: "2026-09-15T04:00:00.000Z",
+  state: "available",
+  target: {
+    commit: "b".repeat(40),
+    name: "main",
+    url: "https://github.com/davidomil/cloudx/commit/" + "b".repeat(40),
+  },
+  changelog: [
+    {
+      number: 82,
+      title: "Choose a release channel and preview merged pull requests",
+      url: "https://github.com/davidomil/cloudx/pull/82",
+    },
+  ],
+  changelogComplete: true,
+  compareUrl:
+    "https://github.com/davidomil/cloudx/compare/" +
+    "a".repeat(40) +
+    "..." +
+    "b".repeat(40),
+};
 
-test.beforeEach(async () => {
+test.beforeEach(async ({ page }) => {
+  await page.route("**/api/system/update/preview", (route) =>
+    route.fulfill({ json: mainUpdatePreview }),
+  );
   serverLogs = "";
   testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-"));
   const codexHome = path.join(testRoot, "codex-home");
@@ -839,6 +867,134 @@ async function expectCodexSettingsFits(page: Page) {
   }
 }
 
+test("Updates selects persisted release channels and shows availability and merged pull requests", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  let preview = mainUpdatePreview;
+  let checks = 0;
+  await page.route("**/api/system/update", (route) =>
+    route.fulfill({ json: { available: true } }),
+  );
+  await page.route("**/api/system/update/preview", async (route) => {
+    checks += 1;
+    if (route.request().method() === "PUT") {
+      expect(route.request().postDataJSON()).toEqual({ channel: "releases" });
+      preview = {
+        ...mainUpdatePreview,
+        channel: "releases",
+        changelogComplete: false,
+        target: {
+          ...mainUpdatePreview.target!,
+          name: "v0.2.0",
+          url: "https://github.com/davidomil/cloudx/releases/tag/v0.2.0",
+        },
+        message: "Some pull request details could not be loaded.",
+      };
+    }
+    await route.fulfill({ json: preview });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  expect(checks).toBe(0);
+  let settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("release channel");
+  await expect(
+    settings.getByText("New changes are available on main.", { exact: true }),
+  ).toBeVisible();
+  const channel = settings.getByRole("combobox", { name: "Update channel" });
+  await channel.scrollIntoViewIfNeeded();
+  await expect(channel).toBeInViewport({ ratio: 1 });
+  expect((await channel.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  await channel.selectOption("releases");
+  await expect(
+    settings.getByText("A new release is available.", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    settings.getByRole("link", { name: "v0.2.0", exact: true }),
+  ).toHaveAttribute(
+    "href",
+    "https://github.com/davidomil/cloudx/releases/tag/v0.2.0",
+  );
+  const change = settings.getByRole("link", {
+    name: "#82 Choose a release channel and preview merged pull requests",
+    exact: true,
+  });
+  await change.scrollIntoViewIfNeeded();
+  await expect(change).toBeVisible();
+  await expect(change).toHaveAttribute(
+    "href",
+    "https://github.com/davidomil/cloudx/pull/82",
+  );
+  await expect(
+    settings.getByText("Some pull request details could not be loaded.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    settings.getByRole("link", {
+      name: "View all changes on GitHub",
+      exact: true,
+    }),
+  ).toHaveAttribute("href", mainUpdatePreview.compareUrl!);
+  await expectSettingsFits(page, isMobile);
+  await captureSample(page, testInfo, "settings-update-release-preview");
+  await settings
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  await expect(
+    settings.getByRole("combobox", { name: "Update channel" }),
+  ).toHaveValue("releases");
+  expect(checks).toBe(3);
+  preview = {
+    ...preview,
+    state: "current",
+    changelog: [],
+    changelogComplete: true,
+    message: undefined,
+  };
+  const check = settings.getByRole("button", {
+    name: "Check update status",
+    exact: true,
+  });
+  await check.click();
+  await expect(
+    settings.getByText(
+      "CloudX is on the latest release. You can still update dependencies.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(
+    settings.getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  preview = {
+    ...preview,
+    state: "unavailable",
+    target: undefined,
+    message: "No published stable release is available.",
+  };
+  await check.click();
+  await expect(
+    settings.getByText("No published stable release is available.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    settings.getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    }),
+  ).toBeDisabled();
+});
+
 test("Updates reconnects after restart and reloads once with Settings closed", async ({
   page,
   isMobile,
@@ -849,7 +1005,10 @@ test("Updates reconnects after restart and reloads once with Settings closed", a
   await page.route("**/api/system/update", async (route) => {
     if (route.request().method() === "POST") {
       starts += 1;
-      expect(route.request().postDataJSON()).toEqual({});
+      expect(route.request().postDataJSON()).toEqual({
+        channel: "main",
+        targetCommit: mainUpdatePreview.target!.commit,
+      });
       status = {
         available: true,
         run: {

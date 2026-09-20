@@ -75,6 +75,7 @@ function checkout({ includeInstaller = false } = {}) {
   };
   return {
     root,
+    author,
     commands,
     mutations,
     latest: git(author, "rev-parse", "HEAD"),
@@ -158,6 +159,149 @@ describe("updating the installed checkout from main", () => {
       updateCheckout(fixture.commands, { repoRoot: fixture.root }),
     ).toThrow();
     expect(git(fixture.root, "rev-parse", "HEAD")).toBe(beforeHead);
+  });
+});
+
+describe("updating the installed checkout to a selected commit", () => {
+  it("installs the selected release even when main has newer changes", () => {
+    const fixture = checkout();
+    const targetCommit = fixture.latest;
+    git(fixture.author, "tag", "v1.0.0", targetCommit);
+    fs.writeFileSync(path.join(fixture.author, "version"), "unreleased\n");
+    git(fixture.author, "commit", "-am", "TEST: unreleased main change");
+    git(fixture.author, "push", "origin", "main", "v1.0.0");
+
+    expect(
+      updateCheckout(fixture.commands, {
+        repoRoot: fixture.root,
+        targetCommit,
+      }),
+    ).toBe(targetCommit);
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(targetCommit);
+    expect(fs.readFileSync(path.join(fixture.root, "version"), "utf8")).toBe(
+      "two\n",
+    );
+    expect(fixture.mutations).toEqual([
+      ["git", "fetch", "--no-tags", "origin", targetCommit],
+      ["git", "merge", "--ff-only", "--no-edit", targetCommit],
+    ]);
+  });
+
+  it.each([
+    "",
+    "main",
+    "a".repeat(39),
+    "A".repeat(40),
+    "--upload-pack=other",
+    42,
+  ])("rejects malformed target %j before Git commands", (targetCommit) => {
+    const inspect = vi.fn();
+    expect(() =>
+      updateCheckout({ inspect }, { repoRoot: "/unused", targetCommit }),
+    ).toThrow("commit SHA");
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it.each(["ahead", "diverged"])(
+    "preserves %s history when the selected release cannot be fast-forwarded",
+    (kind) => {
+      const fixture = checkout();
+      if (kind === "ahead")
+        git(fixture.root, "pull", "--ff-only", "origin", "main");
+      fs.writeFileSync(path.join(fixture.root, "version"), "local commit\n");
+      git(fixture.root, "commit", "-am", "TEST: local commit");
+      const head = git(fixture.root, "rev-parse", "HEAD");
+      expect(() =>
+        updateCheckout(fixture.commands, {
+          repoRoot: fixture.root,
+          targetCommit: fixture.latest,
+        }),
+      ).toThrow("selected update commit");
+      expect(git(fixture.root, "rev-parse", "HEAD")).toBe(head);
+      expect(fixture.mutations).toEqual([
+        ["git", "fetch", "--no-tags", "origin", fixture.latest],
+      ]);
+    },
+  );
+
+  it("rejects a tag object SHA instead of silently selecting its commit", () => {
+    const fixture = checkout();
+    git(fixture.author, "tag", "-a", "v1.0.0", "-m", "Release");
+    git(fixture.author, "push", "origin", "v1.0.0");
+    const targetCommit = git(fixture.author, "rev-parse", "v1.0.0");
+    const head = git(fixture.root, "rev-parse", "HEAD");
+    expect(() =>
+      updateCheckout(fixture.commands, {
+        repoRoot: fixture.root,
+        targetCommit,
+      }),
+    ).toThrow("does not identify a commit");
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(head);
+  });
+
+  it("leaves the checkout unchanged when origin cannot supply the selected commit", () => {
+    const fixture = checkout();
+    const head = git(fixture.root, "rev-parse", "HEAD");
+    expect(() =>
+      updateCheckout(fixture.commands, {
+        repoRoot: fixture.root,
+        targetCommit: "a".repeat(40),
+      }),
+    ).toThrow();
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(head);
+    expect(fixture.mutations).toEqual([
+      ["git", "fetch", "--no-tags", "origin", "a".repeat(40)],
+    ]);
+  });
+
+  it("keeps the selected commit pinned across installer reload without another fetch", () => {
+    const fixture = checkout();
+    const targetCommit = fixture.latest;
+    updateCheckout(fixture.commands, {
+      repoRoot: fixture.root,
+      targetCommit,
+    });
+    fixture.mutations.length = 0;
+    expect(
+      updateCheckout(fixture.commands, {
+        repoRoot: fixture.root,
+        targetCommit,
+        updatedCommit: targetCommit,
+      }),
+    ).toBe(targetCommit);
+    expect(fixture.mutations).toEqual([]);
+    expect(() =>
+      updateCheckout(fixture.commands, {
+        repoRoot: fixture.root,
+        targetCommit: "a".repeat(40),
+        updatedCommit: targetCommit,
+      }),
+    ).toThrow("selected update commit");
+    expect(() =>
+      updateCheckout(fixture.commands, {
+        repoRoot: fixture.root,
+        targetCommit,
+        updatedCommit: "a".repeat(40),
+      }),
+    ).toThrow("reloading");
+    expect(fixture.mutations).toEqual([]);
+  });
+
+  it("plans the selected commit during a dry run without changing HEAD", () => {
+    const fixture = checkout();
+    const before = git(fixture.root, "rev-parse", "HEAD");
+    fixture.commands.run = (command, args) =>
+      fixture.mutations.push([command, ...args]);
+    updateCheckout(fixture.commands, {
+      repoRoot: fixture.root,
+      targetCommit: fixture.latest,
+      dryRun: true,
+    });
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(before);
+    expect(fixture.mutations).toEqual([
+      ["git", "fetch", "--no-tags", "origin", fixture.latest],
+      ["git", "merge", "--ff-only", "--no-edit", fixture.latest],
+    ]);
   });
 });
 
@@ -324,6 +468,81 @@ describe("documentation service readiness", () => {
 });
 
 describe("installer update entrypoints", () => {
+  it("accepts a complete target commit only in update mode", () => {
+    const targetCommit = "b".repeat(40);
+    expect(
+      parseArgs(["--update", "--target-commit", targetCommit]),
+    ).toMatchObject({ update: true, targetCommit });
+    expect(() => parseArgs(["--target-commit", targetCommit])).toThrow(
+      "requires --update",
+    );
+    for (const invalid of [undefined, "main", "B".repeat(40), "b".repeat(39)]) {
+      expect(() =>
+        parseArgs([
+          "--update",
+          "--target-commit",
+          ...(invalid ? [invalid] : []),
+        ]),
+      ).toThrow("commit SHA");
+    }
+  });
+
+  it("reloads the selected release installer with the same target and commit handoff when main moves ahead", () => {
+    const fixture = checkout({ includeInstaller: true });
+    fs.writeFileSync(
+      path.join(fixture.author, "scripts/install-cloudx.mjs"),
+      [
+        'console.log("selected release installer executed");',
+        "console.log(JSON.stringify({ args: process.argv.slice(2), updatedCommit: process.env.CLOUDX_INSTALL_UPDATED_COMMIT }));",
+      ].join("\n"),
+    );
+    git(fixture.author, "commit", "-am", "TEST: release installer");
+    const targetCommit = git(fixture.author, "rev-parse", "HEAD");
+    git(fixture.author, "tag", "v1.0.0");
+    fs.writeFileSync(
+      path.join(fixture.author, "scripts/install-cloudx.mjs"),
+      'throw new Error("main must not be installed");\n',
+    );
+    git(fixture.author, "commit", "-am", "TEST: main moves ahead");
+    git(fixture.author, "push", "origin", "main", "v1.0.0");
+    const bin = directory();
+    fs.writeFileSync(
+      path.join(bin, "systemctl"),
+      '#!/bin/sh\nprintf "LoadState=loaded\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"\n',
+      { mode: 0o755 },
+    );
+    const args = [
+      "--update",
+      "--target-commit",
+      targetCommit,
+      "--service",
+      "preview.service",
+      "--port",
+      "3002",
+      "--yes",
+    ];
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/install-cloudx.mjs", ...args],
+      {
+        cwd: fixture.root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          CLOUDX_TEST_CHECKOUT: fixture.root,
+        },
+      },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("selected release installer executed");
+    expect(JSON.parse(result.stdout.trim().split("\n").at(-1))).toEqual({
+      args,
+      updatedCommit: targetCommit,
+    });
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(targetCommit);
+  });
+
   it("reloads the installer from the fetched commit before running package updates", () => {
     const fixture = checkout({ includeInstaller: true });
     const bin = path.join(directory(), "bin");
