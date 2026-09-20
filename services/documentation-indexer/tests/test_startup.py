@@ -11,6 +11,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cloudx_documentation_indexer import main
+from cloudx_documentation_indexer.archive import DocumentationArchive
+from cloudx_documentation_indexer.startup import DocumentationService
 
 
 @contextmanager
@@ -90,6 +92,33 @@ def test_import_does_not_initialize_the_archive_and_failure_stays_explicit(monke
             assert "/host/private" not in response.text
         assert calls == [True]
     assert "private archive /host/private failed" in caplog.text
+
+
+@pytest.mark.parametrize('metadata', ['', '{broken'])
+def test_legacy_metadata_recovery_or_repair_error_reaches_service_readiness(tmp_path, metadata, caplog):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='RETAINED_STARTUP_86 source evidence.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata_path.write_text(metadata)
+    with archive._connect() as db:
+        db.execute("UPDATE documents SET source_manifest_json='{}',processor_fingerprint=''")
+
+    service = DocumentationService(lambda: main.create_app(tmp_path))
+    with TestClient(service) as client:
+        wait_until(lambda: service.status in {'ready', 'failed'})
+        response = client.get('/ready')
+        if metadata:
+            assert response.status_code == 503
+            assert response.json()['code'] == 'documentation_startup_failed'
+            assert document.document_id in caplog.text
+            assert str(metadata_path) in caplog.text
+            assert metadata_path.read_text() == metadata
+        else:
+            assert response.status_code == 200
+            response = client.get(f'/documents/{document.document_id}')
+            assert response.status_code == 200
+            assert response.json()['document']['sourceManifest']['metadata']['legacyMetadataRecovery']['reason'] == 'empty'
 
 
 @pytest.mark.parametrize("shutdown_during_initialization", [False, True])

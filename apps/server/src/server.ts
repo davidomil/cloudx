@@ -33,7 +33,7 @@ import type {
 import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
-import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
+import { DEFAULT_DOCUMENTATION_URL, DocumentationClient, DocumentationStartupError } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
 import { DocumentationBackgroundEnrichment } from "./documentation/DocumentationBackgroundEnrichment.js";
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
@@ -326,6 +326,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       return { status: "ready" };
     } catch (error) {
       app.log.warn({ dependencyError: error instanceof Error ? error.name : "unknown" }, "Cloudx readiness check failed.");
+      if (error instanceof DocumentationStartupError) {
+        return reply.code(503).send({ status: "not-ready", code: error.code, detail: error.message });
+      }
       return reply.code(503).send({ status: "not-ready" });
     }
   });

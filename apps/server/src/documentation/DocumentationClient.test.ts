@@ -67,6 +67,36 @@ describe("DocumentationClient", () => {
     await expect(new DocumentationClient(url).listDocuments()).rejects.toBeInstanceOf(SyntaxError);
   });
 
+  it.each(["documentation_startup_failed", "documentation_startup_initializing"])("preserves the %s startup code without private details", async (code) => {
+    const url = await startServer((_request, response) => {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ code, detail: "private archive path" }));
+    });
+
+    const failure = await new DocumentationClient(url).health().catch((error: Error) => error);
+
+    expect(failure).toMatchObject({ statusCode: 503, code });
+    expect(failure).toHaveProperty("message", expect.stringContaining("Documentation archive"));
+    expect(failure).toHaveProperty("message", expect.not.stringContaining("private"));
+  });
+
+  it.each([
+    [503, { code: "unrecognized", detail: "Original failure" }],
+    [503, { code: ["documentation_startup_failed"], detail: "Original failure" }],
+    [400, { code: "documentation_startup_failed", detail: "Original failure" }],
+    [503, "Original failure"],
+  ])("keeps other HTTP errors unchanged (%s, %j)", async (statusCode, body) => {
+    const url = await startServer((_request, response) => {
+      response.writeHead(statusCode);
+      response.end(typeof body === "string" ? body : JSON.stringify(body));
+    });
+
+    const failure = await new DocumentationClient(url).health().catch((error: Error) => error);
+
+    expect(failure).toMatchObject({ statusCode, message: "Original failure" });
+    expect(failure).not.toHaveProperty("code");
+  });
+
   it("posts search requests to a base path with JSON", async () => {
     let requestUrl = "";
     let requestBody = "";

@@ -791,6 +791,24 @@ already-running terminals into the new owner. Sessions launched after that
 upgrade survive subsequent web updates. To update the broker itself, finish or
 close its terminal tabs, then run `systemctl --user restart cloudx-terminal.service`.
 
+When `workspace.json` exists but `sessions.json` does not, the standard
+updater warns before restarting services and saves a private, verified
+copy at
+`CLOUDX_DATA_DIR/terminal-upgrade-backup-<suffix>/workspace.json`. The
+adjacent `README.txt` records its SHA-256 and recovery limits.
+
+This snapshot preserves window and pane placement, but cannot preserve
+legacy processes or reconstruct their unsaved session identities. Save
+work and record working directories and historical Codex session IDs
+before restarting. Use `--no-start` to defer the restart while preparing
+recovery. Recreate tabs through Cloudx and resume only known historical
+Codex sessions; do not replay shell commands or AI prompts.
+
+Custom `--service` updates print the same warning with manual backup
+instructions. Identify the service's actual `CLOUDX_DATA_DIR`, copy its
+`workspace.json` into a private directory, and verify the copy before
+restarting. The updater does not infer custom data paths.
+
 Custom `--service` updates preserve the selected service definition. Configure
 an independent broker with the same `CLOUDX_DATA_DIR` before using interactive
 tabs; custom updates do not create or start that broker. Its production command

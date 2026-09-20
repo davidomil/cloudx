@@ -343,6 +343,49 @@ describe("buildServer", () => {
     }
   });
 
+  it.each([
+    ["failed", 503, "documentation_startup_failed"],
+    ["initializing", 503, "documentation_startup_initializing"],
+    ["ready", 200, undefined],
+    ["unknown", 503, undefined],
+  ])("reports documentation readiness through HTTP while the archive is %s", async (status, statusCode, code) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-documentation-ready-"));
+    const requests: string[] = [];
+    const indexer = http.createServer((request, response) => {
+      requests.push(request.url!);
+      response.writeHead(statusCode, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        status,
+        ready: status === "ready",
+        code: `documentation_startup_${status}`,
+        detail: "private archive path",
+      }));
+    });
+    await new Promise<void>((resolve) => indexer.listen(0, "127.0.0.1", resolve));
+    const address = indexer.address();
+    if (!address || typeof address === "string") throw new Error("Indexer did not listen on TCP.");
+    const config = { ...testConfig(root), documentationUrl: `http://127.0.0.1:${address.port}` };
+    const services = buildServices(config);
+    vi.spyOn(services.asr, "ready").mockResolvedValue();
+    vi.spyOn(services.automation!, "ready").mockResolvedValue();
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/ready" });
+
+      expect(requests).toContain("/health");
+      expect(response.statusCode).toBe(statusCode);
+      expect(response.json()).toEqual(code
+        ? { status: "not-ready", code, detail: expect.any(String) }
+        : { status: status === "ready" ? "ready" : "not-ready" });
+      if (status === "failed") expect(response.json().detail).toContain("cloudx-documentation.service");
+      expect(response.body).not.toContain("private archive path");
+    } finally {
+      await app.close();
+      await new Promise<void>((resolve) => indexer.close(() => resolve()));
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses the configured runtime log level", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-log-level-"));
     const app = await buildServer({ ...testConfig(root), logLevel: "debug" });

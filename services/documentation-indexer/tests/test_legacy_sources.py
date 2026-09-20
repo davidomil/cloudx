@@ -169,3 +169,202 @@ def test_failed_legacy_metadata_relocation_preserves_original_and_removes_stagin
     with archive._connect() as db:
         row = db.execute('SELECT snapshot_path,source_manifest_json FROM documents WHERE document_id=?', (document.document_id,)).fetchone()
         assert tuple(row) == (legacy.relative_to(archive.root).as_posix(), '{}')
+
+
+@pytest.mark.parametrize('sidecar', [b'', b' \n\t ', None], ids=['empty', 'whitespace', 'missing'])
+def test_unavailable_legacy_metadata_recovers_verified_source_and_preserves_provenance(tmp_path, sidecar, caplog):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='RECOVERED_SOURCE_86 retained evidence.')
+    sibling = archive.ingest_text(text='UNAFFECTED_SOURCE_86 sibling evidence.')
+    enrich_archive(archive, document.document_id, spans=[ExtractedSpan('Prior enrichment', 'old summary')], model='fixture', skill_ids=[])
+    before = archive.get_document(document.document_id)
+    snapshot = archive.root / before['snapshot_path']
+    metadata_path = snapshot.with_name('metadata.json')
+    if sidecar is None:
+        metadata_path.unlink()
+    else:
+        metadata_path.write_bytes(sidecar)
+    mark_legacy(archive)
+
+    upgraded = DocumentationArchive(tmp_path)
+    detail = upgraded.get_document(document.document_id)
+    metadata = detail['sourceManifest']['metadata']
+    assert set(metadata) == {'originalFilename', 'legacyMetadataRecovery'}
+    assert metadata['originalFilename'] == snapshot.name
+    recovery = metadata['legacyMetadataRecovery']
+    assert recovery['reason'] == ('missing' if sidecar is None else 'empty')
+    assert recovery['metadataPath'] == metadata_path.relative_to(archive.root).as_posix()
+    assert recovery['verifiedContentSha256'] == before['content_sha256']
+    assert 'unavailable' in recovery['warning']
+    assert recovery['warning'] in detail['sourceManifest']['migrationWarnings']
+    assert document.document_id in caplog.text
+    assert str(metadata_path) in caplog.text
+    assert json.loads(metadata_path.read_text()) == metadata
+    assert detail['enrichments'] == before['enrichments']
+    for _ in range(2):
+        upgraded = DocumentationArchive(tmp_path)
+        upgraded.reanalyze_document(document.document_id)
+        detail = upgraded.get_document(document.document_id)
+        assert detail['sourceManifest']['metadata'] == metadata
+        assert detail['enrichments'] == before['enrichments']
+        assert recovery['warning'] in detail['sourceManifest']['migrationWarnings']
+        assert hashlib.sha256((upgraded.root / detail['snapshot_path']).read_bytes()).hexdigest() == before['content_sha256']
+        assert upgraded.search('RECOVERED_SOURCE_86')[0]['documentId'] == document.document_id
+        assert upgraded.search('UNAFFECTED_SOURCE_86')[0]['documentId'] == sibling.document_id
+
+
+@pytest.mark.parametrize('sidecar', [b'{broken', b'[]', b'null', b'42', b'"text"', b'\xff'])
+def test_malformed_legacy_metadata_is_preserved_with_document_and_path_diagnostics(tmp_path, sidecar):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='Verified retained bytes.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata_path.write_bytes(sidecar)
+    mark_legacy(archive)
+    with pytest.raises(ArchiveError) as failure:
+        DocumentationArchive(tmp_path)
+    assert document.document_id in str(failure.value)
+    assert str(metadata_path) in str(failure.value)
+    assert metadata_path.read_bytes() == sidecar
+    with archive._connect() as db:
+        assert db.execute('SELECT source_manifest_json FROM documents').fetchone()[0] == '{}'
+
+
+@pytest.mark.parametrize('exists', [False, True], ids=['dangling', 'existing'])
+def test_legacy_metadata_cannot_follow_an_external_symlink(tmp_path, exists):
+    archive = DocumentationArchive(tmp_path / 'archive')
+    document = archive.ingest_text(text='Verified retained bytes.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    external = tmp_path / 'external.json'
+    if exists:
+        external.write_bytes(b'')
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata_path.unlink()
+    metadata_path.symlink_to(external)
+    mark_legacy(archive)
+    with pytest.raises(ArchiveError, match='escapes its retained directory') as failure:
+        DocumentationArchive(archive.root)
+    assert document.document_id in str(failure.value)
+    assert str(metadata_path) in str(failure.value)
+    assert metadata_path.is_symlink()
+    assert external.exists() is exists
+    if exists:
+        assert external.read_bytes() == b''
+
+
+@pytest.mark.parametrize('damage', ['missing', 'hash-mismatch'])
+def test_legacy_metadata_recovery_requires_verified_original(tmp_path, damage):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='Verified retained bytes.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata_path.write_bytes(b'')
+    if damage == 'missing':
+        snapshot.unlink()
+    else:
+        snapshot.write_bytes(b'changed')
+    mark_legacy(archive)
+    with pytest.raises(ArchiveError, match='missing retained source|mismatched hash'):
+        DocumentationArchive(tmp_path)
+    assert metadata_path.read_bytes() == b''
+
+
+@pytest.mark.parametrize('state', ['stale', 'revoked', 'deleted', 'superseded', 'quarantined'])
+def test_legacy_admission_preserves_inactive_state(tmp_path, state):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='Prior searchable evidence.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    content = gzip.compress(b'unsupported binary archive')
+    snapshot.write_bytes(content)
+    with archive._connect() as db:
+        db.execute('UPDATE documents SET state=?, content_sha256=?', (state, hashlib.sha256(content).hexdigest()))
+        db.execute('UPDATE chunks SET state=?', (state,))
+    mark_legacy(archive)
+    upgraded = DocumentationArchive(tmp_path)
+    detail = upgraded.get_document(document.document_id)
+    assert detail['state'] == state
+    assert 'Compressed' in detail['sourceManifest']['admissionError']
+    assert all(chunk['state'] == state for chunk in detail['chunks'])
+
+
+def test_metadata_recovery_provenance_survives_a_rolled_back_migration(tmp_path, monkeypatch):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='RECOVERY_RETRY_86 retained bytes.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata_path.write_bytes(b'')
+    mark_legacy(archive)
+    with monkeypatch.context() as patch:
+        patch.setattr(DocumentationArchive, '_register_artifacts', lambda *_args: (_ for _ in ()).throw(RuntimeError('migration interruption')))
+        with pytest.raises(RuntimeError, match='migration interruption'):
+            DocumentationArchive(tmp_path)
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata['legacyMetadataRecovery']['reason'] == 'empty'
+    with archive._connect() as db:
+        assert db.execute('SELECT source_manifest_json FROM documents').fetchone()[0] == '{}'
+    restarted = DocumentationArchive(tmp_path)
+    manifest = restarted.get_document(document.document_id)['sourceManifest']
+    assert manifest['metadata'] == metadata
+    assert metadata['legacyMetadataRecovery']['warning'] in manifest['migrationWarnings']
+    assert restarted.search('RECOVERY_RETRY_86')
+
+
+@pytest.mark.parametrize('value', ['old source annotation', True, {'reason': 'empty'},
+                                 {'warning': 'unrelated annotation'}, {'reason': ['empty'], 'warning': 'source annotation'}])
+def test_valid_legacy_metadata_with_unrelated_recovery_field_is_preserved(tmp_path, value):
+    archive = DocumentationArchive(tmp_path)
+    document = archive.ingest_text(text='Valid retained metadata.')
+    snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
+    metadata_path = snapshot.with_name('metadata.json')
+    metadata = {'originalFilename': snapshot.name, 'legacyMetadataRecovery': value}
+    metadata_path.write_text(json.dumps(metadata))
+    mark_legacy(archive)
+    upgraded = DocumentationArchive(tmp_path)
+    manifest = upgraded.get_document(document.document_id)['sourceManifest']
+    assert manifest['metadata'] == metadata
+    assert 'migrationWarnings' not in manifest
+    assert json.loads(metadata_path.read_text()) == metadata
+
+
+def test_shared_empty_legacy_metadata_retains_recovery_and_attribution_warnings(tmp_path):
+    archive = DocumentationArchive(tmp_path)
+    first = archive.ingest_text(text='Shared retained evidence.', uri='manual://first')
+    second = archive.ingest_text(text='Shared retained evidence.', uri='manual://second')
+    snapshot_path = archive.get_document(first.document_id)['snapshot_path']
+    (archive.root / snapshot_path).with_name('metadata.json').write_bytes(b'')
+    with archive._connect() as db:
+        db.execute('UPDATE documents SET snapshot_path=? WHERE document_id=?', (snapshot_path, second.document_id))
+    mark_legacy(archive)
+    upgraded = DocumentationArchive(tmp_path)
+    for document in [first, second]:
+        manifest = upgraded.get_document(document.document_id)['sourceManifest']
+        assert manifest['metadata']['legacyMetadataRecovery']['reason'] == 'empty'
+        assert manifest['legacyMetadataAttribution'] == 'shared-directory-unverified'
+        assert len(manifest['migrationWarnings']) == 2
+        upgraded.reanalyze_document(document.document_id)
+        assert upgraded.get_document(document.document_id)['sourceManifest']['migrationWarnings'] == manifest['migrationWarnings']
+
+
+def test_shared_empty_metadata_recovers_each_retained_filename(tmp_path):
+    archive = DocumentationArchive(tmp_path)
+    first = archive.ingest_text(text='Shared source bytes.', uri='manual://first')
+    second = archive.ingest_text(text='Shared source bytes.', uri='manual://second')
+    first_snapshot = archive.root / archive.get_document(first.document_id)['snapshot_path']
+    second_snapshot = archive.root / archive.get_document(second.document_id)['snapshot_path']
+    snapshots = [first_snapshot.with_name('first.txt'), first_snapshot.with_name('second.txt')]
+    first_snapshot.rename(snapshots[0])
+    second_snapshot.rename(snapshots[1])
+    with archive._connect() as db:
+        for document, snapshot in zip([first, second], snapshots):
+            db.execute('UPDATE documents SET snapshot_path=? WHERE document_id=?', (snapshot.relative_to(archive.root).as_posix(), document.document_id))
+    snapshots[0].with_name('metadata.json').write_bytes(b'')
+    mark_legacy(archive)
+    upgraded = DocumentationArchive(tmp_path)
+    for document, snapshot in zip([first, second], snapshots):
+        manifest = upgraded.get_document(document.document_id)['sourceManifest']
+        assert manifest['original']['filename'] == snapshot.name
+        assert len(manifest['migrationWarnings']) == 2
+        upgraded.reanalyze_document(document.document_id)
+        updated = upgraded.get_document(document.document_id)['sourceManifest']
+        assert updated['original']['filename'] == snapshot.name
+        assert updated['metadata']['originalFilename'] == snapshot.name
