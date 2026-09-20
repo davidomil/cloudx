@@ -42,8 +42,11 @@ describe("durable terminal broker", () => {
     const data = "x".repeat(256 * 1024);
     let received = "";
     terminal.onData((chunk) => { received += chunk; });
-    process.data(data);
-    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    process.terminate.mockImplementationOnce(async () => {
+      process.data(data);
+      expect(process.pauseOutput).toHaveBeenCalledOnce();
+      process.exit({ exitCode: 0 });
+    });
     if (close === "terminate") await terminal.terminate();
     else {
       await broker.stop();

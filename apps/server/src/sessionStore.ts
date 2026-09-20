@@ -909,11 +909,12 @@ export class SessionStore {
 
   private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {
     this.sessions.set(tabId, session);
+    const offersRecovery = !session.tab.ownerPluginId && this.plugins.get(session.tab.pluginId).panelKind === "terminal";
     const disposers: Array<() => void> = [];
     const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
       if (this.tabs.has(tabId)) {
         const tab = this.getTab(tabId);
-        if ((status === "failed" || status === "completed") && session.hasExited?.() && this.plugins.get(tab.pluginId).panelKind === "terminal") {
+        if (offersRecovery && (status === "failed" || status === "completed") && session.hasExited?.()) {
           const update = this.recordRestoreFailure(tab, new PluginSessionMissingError(statusMessage ?? "The terminal process ended."), session);
           this.producerActions.add(update);
           void update.then(() => this.producerActions.delete(update), error => {
@@ -922,7 +923,7 @@ export class SessionStore {
           });
           return;
         }
-        const recovery = (status === "failed" || status === "completed") && this.plugins.get(tab.pluginId).panelKind === "terminal"
+        const recovery = offersRecovery && (status === "failed" || status === "completed")
           ? { state: "unavailable" as const, message: statusMessage ?? "Terminal connection failed. Check the connection to recover this panel." }
           : undefined;
         this.updateTab(tabId, {
@@ -956,7 +957,7 @@ export class SessionStore {
     this.updateTab(tabId, {
       status,
       statusMessage,
-      recovery: status === "failed" && this.plugins.get(session.tab.pluginId).panelKind === "terminal"
+      recovery: offersRecovery && status === "failed"
         ? { state: "unavailable", message: statusMessage ?? "Check the terminal connection to recover this panel." }
         : undefined,
       indicator: status === "running"

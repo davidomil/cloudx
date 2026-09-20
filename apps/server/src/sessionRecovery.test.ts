@@ -464,6 +464,28 @@ describe("workspace recovery after server updates", () => {
     await after.sessions.dispose();
   });
 
+  it.each([
+    [0, "completed", "Terminal exited cleanly."],
+    [17, "failed", "Terminal exited with code 17."]
+  ] as const)("preserves a plugin-owned terminal's exit status for code %s without offering workspace recovery", async (exitCode, status, statusMessage) => {
+    const { factory, createStore, root } = await fixture();
+    const store = createStore();
+    try {
+      const tab = await store.sessions.prepareTab({ pluginId: "standard-terminal", cwd: root }, undefined, { ownerPluginId: "local-web" });
+      store.sessions.publishPreparedTab(tab.id);
+
+      const terminal = await factory.spawn.mock.results[0]!.value;
+      terminal.exit(exitCode);
+
+      expect(store.sessions.getTab(tab.id)).toMatchObject({ status, statusMessage, recovery: undefined });
+      expect(store.sessions.getSession(tab.id).snapshot()).toMatchObject({ status, statusMessage });
+      await expect(store.sessions.recoverTab(tab.id, { action: "new-shell" })).rejects.toThrow("does not support terminal recovery");
+      expect(factory.spawn).toHaveBeenCalledOnce();
+    } finally {
+      await store.sessions.dispose();
+    }
+  });
+
   it("keeps embedded and unpublished sessions out of recovery and stops them on shutdown", async () => {
     const { factory, createStore, root } = await fixture();
     const store = createStore();
