@@ -17,6 +17,7 @@ import { TerminalBroker } from "./terminal/TerminalBroker.js";
 import { terminalSocketPath } from "./terminal/TerminalBrokerProtocol.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import type { TerminalProducer } from "./terminal/TerminalProcess.js";
+import { retainTerminalDiagnostics } from "./terminal/testing/TerminalDiagnostics.js";
 
 describe("workspace recovery across server updates", () => {
   beforeEach(() => {
@@ -446,7 +447,8 @@ describe("workspace recovery across server updates", () => {
     }
   }, 15_000);
 
-  it.skipIf(process.platform !== "linux")("restores a full 32 MiB replay as context with a usable screen and confirmed shell deletion", async () => {
+  it.skipIf(process.platform !== "linux")("restores a full 32 MiB replay as context with a usable screen and confirmed shell deletion", async context => {
+    const diagnostics = retainTerminalDiagnostics(context, "full-replay-recovery");
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-full-replay-"));
     const replayBytes = 32 * 1024 * 1024;
     const config = loadConfig({
@@ -461,13 +463,11 @@ describe("workspace recovery across server updates", () => {
     await fs.writeFile(shell, "#!/bin/sh\nexec /bin/bash --noprofile --norc\n", { mode: 0o700 });
     vi.stubEnv("SHELL", shell);
     const directFactory = new NodePtyTerminalProcessFactory();
-    let nativeOutput = "";
     const socketPath = terminalSocketPath(config.dataDir);
     const broker = new TerminalBroker(socketPath, {
       async spawn(...args: Parameters<NodePtyTerminalProcessFactory["spawn"]>) {
         const terminal = await directFactory.spawn(...args);
-        terminal.onData(data => { nativeOutput = (nativeOutput + data).slice(-4096); });
-        return terminal;
+        return diagnostics.observe(terminal);
       }
     }, replayBytes);
     await broker.start();
@@ -475,6 +475,7 @@ describe("workspace recovery across server updates", () => {
     let restored: FastifyInstance | undefined;
     const sockets: WebSocket[] = [];
     try {
+      diagnostics.enterPhase("start original server and shell");
       const originalServices = buildServices(config);
       original = await buildServer(config, originalServices);
       const window = originalServices.workspace!.getActiveWindow();
@@ -489,10 +490,13 @@ describe("workspace recovery across server updates", () => {
       await vi.waitFor(() => expect(terminal.output).toMatch(/SHELL_PID=\d+/u));
       const pid = Number(/SHELL_PID=(\d+)/u.exec(terminal.output)![1]);
       terminal.write("while [ ! -e server-stopped ]; do sleep 0.02; done; python3 -c \"import os; [os.write(1, b'\\r' * 65536) for _ in range(512)]\"; printf '\\nHISTORY_ONLY_MARKER\\033[2J\\033[3J\\033[HREPLAY_SCREEN_READY=%s\\n' \"$$\"\n");
+      diagnostics.enterPhase("detach original server");
       await original.close();
+      diagnostics.enterPhase("receive 32 MiB and REPLAY_SCREEN_READY");
       await fs.writeFile(path.join(root, "server-stopped"), "stopped");
-      await vi.waitFor(() => expect(nativeOutput).toContain(`REPLAY_SCREEN_READY=${pid}`), { timeout: 100_000 });
+      await vi.waitFor(() => expect(diagnostics.lastOutput).toContain(`REPLAY_SCREEN_READY=${pid}`), { timeout: 100_000 });
 
+      diagnostics.enterPhase("restore server and complete replay history");
       const restoredServices = buildServices(config);
       restored = await buildServer(config, restoredServices);
       const workspace = (await restored.inject({ url: "/api/workspace", headers: { host: "localhost" } })).json<WorkspaceStateResponse>();
@@ -503,6 +507,7 @@ describe("workspace recovery across server updates", () => {
       expect(history).toContain("HISTORY_ONLY_MARKER");
       expect((await session.voiceContext!()).recentOutput).toContain("HISTORY_ONLY_MARKER");
 
+      diagnostics.enterPhase("restore screen and original shell PID");
       const reconnected = await connectTerminal(restored, tab.id, sockets);
       await vi.waitFor(() => expect(reconnected.output).toContain(`REPLAY_SCREEN_READY=${pid}`));
       expect(reconnected.output).not.toContain("HISTORY_ONLY_MARKER");
@@ -518,11 +523,15 @@ describe("workspace recovery across server updates", () => {
         }
         return save.call(this, state);
       });
+      diagnostics.enterPhase("confirm shell deletion before recovery record removal");
       const closed = await restored.inject({ method: "DELETE", url: `/api/tabs/${tab.id}`, headers: { host: "localhost" } });
       expect(closed.statusCode, closed.body).toBe(200);
       expect(removedRecoveryRecord).toHaveBeenCalled();
       expect(() => process.kill(pid, 0)).toThrow();
       expect((await new SessionStateStore(config.dataDir).read())?.sessions).toEqual([]);
+    } catch (error) {
+      diagnostics.fail(error);
+      throw error;
     } finally {
       vi.restoreAllMocks();
       for (const socket of sockets) socket.close();
