@@ -1997,6 +1997,9 @@ describe.skipIf(process.platform !== "linux")(
         delete deps.git;
         runtime = new ForgeRuntime(deps);
         const launch = vi.spyOn(runtime, "launch").mockResolvedValue("implementation-tab");
+        const isActive = vi.spyOn(runtime, "isActive").mockReturnValue(true);
+        const readTurnCompletion = vi.spyOn(runtime, "readTurnCompletion").mockResolvedValue(undefined);
+        const finish = vi.spyOn(runtime, "finish").mockImplementation(async () => { isActive.mockReturnValue(false); });
         vi.spyOn(runtime, "pause").mockResolvedValue();
         vi.spyOn(runtime, "close").mockResolvedValue();
         const prepareWorkspace = vi.spyOn(runtime, "prepareWorkspace");
@@ -2046,7 +2049,20 @@ describe.skipIf(process.platform !== "linux")(
           .filter(record => record.args.includes("push"));
 
         await service.poll();
+        expect(stored[0]).toMatchObject({ status: "running", completion: { report } });
+        expect(stored[0]!.pendingPublication).toBeUndefined();
+        expect(finish).not.toHaveBeenCalled();
+        expect(runtime.pause).not.toHaveBeenCalled();
+        expect(runtime.close).not.toHaveBeenCalled();
+        expect(await pushes()).toHaveLength(0);
+        const completion: ForgeTurnCompletion = {
+          workerId: worker.id, attemptId: worker.attemptId!, threadId: "coding-thread", turnId: "coding-turn",
+          status: "completed",
+        };
+        readTurnCompletion.mockResolvedValue(completion);
+        await service.poll();
         expect(stored[0]).toMatchObject({ status: "failed", error: expect.stringContaining("Workflows: write"), pendingPublication: { report } });
+        expect(finish).toHaveBeenCalledExactlyOnceWith("implementation-tab", completion);
         expect(stored[0]!.pendingPublication!.headSha).toBeUndefined();
         expect(stored[0]!.providerRetryAt).toBeUndefined();
         expect(await pushes()).toHaveLength(1);
@@ -2109,6 +2125,9 @@ describe.skipIf(process.platform !== "linux")(
         expect(prepareWorkspace).toHaveBeenCalledOnce();
         expect(prepareReport).toHaveBeenCalledOnce();
         expect(readReport).toHaveBeenCalledOnce();
+        expect(readTurnCompletion).toHaveBeenCalledTimes(2);
+        expect(finish).toHaveBeenCalledOnce();
+        expect(published.completion).toMatchObject({ readyAt: expect.any(String), turn: completion, report });
         expect(await settings.gitAccess(expectedRepository, "reviewer")).toEqual(reviewerAccess);
         expect(exchanges.filter(installation => installation === "43")).toHaveLength(1);
         await service.dispose();
