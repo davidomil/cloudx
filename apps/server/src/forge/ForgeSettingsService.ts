@@ -61,6 +61,10 @@ export class ForgeSettingsService {
     return this.credentials(repository).gitAccess(role, signal);
   }
 
+  refreshPublicationCredentials(repository: ForgeRepository, signal?: AbortSignal): Promise<void> {
+    return this.credentials(repository).refreshPublicationCredentials(signal);
+  }
+
   private credentials(repository: ForgeRepository): ForgeCredentials {
     const current = this.repository();
     if (current.provider !== repository.provider || current.apiUrl !== repository.apiUrl || current.projectPath !== repository.projectPath)

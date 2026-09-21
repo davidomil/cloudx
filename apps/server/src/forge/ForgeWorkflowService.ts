@@ -128,6 +128,7 @@ interface Runtime {
 export interface ForgeWorkflowDependencies {
   logger?: ForgeLogger;
   settings(): ForgeSettings;
+  refreshPublicationCredentials(repository: ForgeRepository, signal?: AbortSignal): Promise<void>;
   provider(
     repository: ForgeRepository,
     role: ForgeCredentialRole,
@@ -507,7 +508,7 @@ export class ForgeWorkflowService {
       if (issue.autoReview) issue.autoReview.placement = placement;
       if (issue.autoReview?.enabled && issue.autoReview.phase !== "implementing" && !issue.pendingPublication)
         return this.resumeAutoReview(issue, placement);
-      return this.resumeWorker(issue.id, placement);
+      return this.resumeWorker(issue.id, placement, { refreshPublicationCredentials: true });
     });
   }
   continueWorker(id: string, input: string, placement: ForgePlacement): Promise<ForgeWorker> {
@@ -681,7 +682,7 @@ export class ForgeWorkflowService {
       }
     });
   }
-  private async resumeWorker(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
+  private async resumeWorker(id: string, placement: ForgePlacement, { refreshPublicationCredentials = false } = {}): Promise<ForgeWorker> {
     const worker = this.requireWorker(id);
     if (
       ![
@@ -754,6 +755,8 @@ export class ForgeWorkflowService {
       }
       if (worker.kind === "issue" && worker.pendingPublication) {
         await this.quiesce(worker);
+        if (refreshPublicationCredentials && !worker.pendingPublication.headSha)
+          await this.deps.refreshPublicationCredentials(worker.repository, controller.signal);
         if (worker.pendingPublication.confirmationStartedAt)
           worker.pendingPublication.confirmationStartedAt = new Date(Date.now()).toISOString();
         await this.issueReady(worker);

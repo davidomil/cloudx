@@ -100,6 +100,7 @@ export class ForgeCredentials {
     ForgeCredentialRole,
     { credential: string; token: string; expires: number }
   >();
+  private readonly installationTokenGenerations = new Map<ForgeCredentialRole, number>();
 
   constructor(
     private readonly repository: ForgeRepository,
@@ -120,11 +121,28 @@ export class ForgeCredentials {
     return delay > 0 ? delay : undefined;
   }
 
+  async refreshPublicationCredentials(signal?: AbortSignal): Promise<void> {
+    const credential = await this.readCredential("worker", signal);
+    if (credential.kind === "github-app")
+      await this.installationToken("worker", credential, signal, this.onFailure, { refreshForPublication: true });
+  }
+
   async headers(
     role: ForgeCredentialRole,
     signal?: AbortSignal,
     onFailure = this.onFailure,
   ): Promise<Record<string, string>> {
+    const credential = await this.readCredential(role, signal);
+    if (credential.kind === "github-app")
+      return {
+        Authorization: `Bearer ${await this.installationToken(role, credential, signal, onFailure)}`,
+      };
+    return this.repository.provider === "gitlab" && credential.kind === "token"
+      ? { "PRIVATE-TOKEN": credential.token }
+      : { Authorization: `Bearer ${credential.token}` };
+  }
+
+  private async readCredential(role: ForgeCredentialRole, signal?: AbortSignal): Promise<ForgeCredential> {
     throwIfForgeRequestAborted(signal);
     let credential: ForgeCredential | undefined;
     try {
@@ -145,9 +163,7 @@ export class ForgeCredentials {
         throw new ForgeProviderError(
           "GitHub application credentials require a GitHub repository.",
         );
-      return {
-        Authorization: `Bearer ${await this.installationToken(role, credential, signal, onFailure)}`,
-      };
+      return credential;
     }
     if (!credential.token.trim())
       throw new ForgeProviderError(
@@ -161,9 +177,7 @@ export class ForgeCredentials {
       throw new ForgeProviderError(
         "GitLab OAuth credentials require a GitLab repository.",
       );
-    return this.repository.provider === "gitlab" && credential.kind === "token"
-      ? { "PRIVATE-TOKEN": credential.token }
-      : { Authorization: `Bearer ${credential.token}` };
+    return credential;
   }
 
   async gitAccess(
@@ -188,6 +202,7 @@ export class ForgeCredentials {
     credential: Extract<ForgeCredential, { kind: "github-app" }>,
     signal: AbortSignal | undefined,
     onFailure: ForgeDiagnosticObserver | undefined,
+    { refreshForPublication = false } = {},
   ): Promise<string> {
     const path = `/app/installations/${credential.installationId}/access_tokens`;
     const failures = new ForgeRequestFailures(this.repository, role, path, "POST", "authentication", onFailure);
@@ -201,9 +216,11 @@ export class ForgeCredentials {
       );
     const identity = JSON.stringify(credential);
     const cached = this.installationTokens.get(role);
-    if (cached?.credential === identity && cached.expires > Date.now() + 60_000)
+    if (!refreshForPublication && cached?.credential === identity && cached.expires > Date.now() + 60_000)
       return cached.token;
     this.installationTokens.delete(role);
+    const generation = (this.installationTokenGenerations.get(role) ?? 0) + (refreshForPublication ? 1 : 0);
+    this.installationTokenGenerations.set(role, generation);
     const jwt = githubAppJwt(credential);
     let response: Response;
     const requestSignal = AbortSignal.any([
@@ -263,7 +280,16 @@ export class ForgeCredentials {
         "GitHub App returned an expired or invalid installation token.",
         502,
       );
-    this.installationTokens.set(role, { credential: identity, token, expires });
+    if (refreshForPublication) {
+      const permissions = body.permissions;
+      if (!permissions || typeof permissions !== "object" || Array.isArray(permissions) || record(permissions).workflows !== "write")
+        throw new ForgeProviderError(
+          "The refreshed worker GitHub App token lacks Workflows: write. Grant this permission and approve it for this installation, then retry publication. The saved publication is retained.",
+          403,
+        );
+    }
+    if (this.installationTokenGenerations.get(role) === generation)
+      this.installationTokens.set(role, { credential: identity, token, expires });
     return token;
   }
 }

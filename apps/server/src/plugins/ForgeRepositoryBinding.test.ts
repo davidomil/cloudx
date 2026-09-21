@@ -76,6 +76,7 @@ async function fixture(selectedRepository: ForgeRepository) {
     completeIssueRebase: vi.fn(async () => headSha),
   } satisfies ForgeWorkflowDependencies["runtime"];
   const deps: ForgeWorkflowDependencies = {
+    refreshPublicationCredentials: (selected, signal) => settings.refreshPublicationCredentials(selected, signal),
     settings: () => settings.settings(), provider: (selected, role, signal) => settings.provider(selected, role, signal), runtime,
     store: { read: vi.fn(async (): Promise<ForgeWorker[]> => []), write: vi.fn(async () => {}) },
     reports: { prepare: vi.fn(async () => ({ reportPath: path.join(root, "report.json"), contextPath: path.join(root, "context.json") })), read: vi.fn(), remove: vi.fn(async () => {}) },

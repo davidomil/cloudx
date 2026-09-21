@@ -11,6 +11,96 @@ const privateFailure = "private-token https://private.example/repository?secret=
 
 afterEach(() => vi.restoreAllMocks());
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(accept => { resolve = accept; });
+  return { promise, resolve };
+}
+
+describe("publication credential refresh", () => {
+  it.each([undefined, null, [], "write", {}, { workflows: "read" }, { workflows: true }])("requires an effective workflow write grant instead of %j", async permissions => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({
+      token: "private-token", expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions,
+    }));
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher);
+    await credentials.headers("worker");
+    const error = await credentials.refreshPublicationCredentials().catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error).toMatchObject({ statusCode: 403, message: expect.stringContaining("approve it for this installation") });
+    expect(String(error)).not.toContain("private-token");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not evict cached authorization for an already cancelled retry", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ token: "private-token", expires_at: new Date(Date.now() + 3_600_000).toISOString() }));
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher);
+    const headers = await credentials.headers("worker");
+    await expect(credentials.refreshPublicationCredentials(AbortSignal.abort())).rejects.toMatchObject({ failure: "cancelled" });
+    expect(await credentials.headers("worker")).toEqual(headers);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("exchanges a fresh token when an older request finishes while publication credentials are being read", async () => {
+    const olderExchange = deferred<Response>();
+    const olderExchangeStarted = deferred<void>();
+    const refreshRead = deferred<ForgeCredential>();
+    const refreshReadStarted = deferred<void>();
+    const read = vi.fn(async (): Promise<ForgeCredential> => application);
+    const fetcher = vi.fn<typeof fetch>()
+      .mockImplementationOnce(() => { olderExchangeStarted.resolve(); return olderExchange.promise; })
+      .mockImplementation(async () => Response.json({
+        token: "approved-token", expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: { workflows: "write" },
+      }));
+    const credentials = new ForgeCredentials(repository, read, fetcher);
+    const olderRequest = credentials.headers("worker");
+    await olderExchangeStarted.promise;
+    read.mockImplementationOnce(() => { refreshReadStarted.resolve(); return refreshRead.promise; });
+    const refresh = credentials.refreshPublicationCredentials().catch(error => error);
+    await refreshReadStarted.promise;
+
+    olderExchange.resolve(Response.json({ token: "old-token", expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: {} }));
+    expect(await olderRequest).toEqual({ Authorization: "Bearer old-token" });
+    refreshRead.resolve(application);
+
+    expect(await refresh).toBeUndefined();
+    expect(await credentials.headers("worker")).toEqual({ Authorization: "Bearer approved-token" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the approved token cached when a pre-refresh exchange finishes afterwards", async () => {
+    const olderExchange = deferred<Response>();
+    const olderExchangeStarted = deferred<void>();
+    const fetcher = vi.fn<typeof fetch>()
+      .mockImplementationOnce(() => { olderExchangeStarted.resolve(); return olderExchange.promise; })
+      .mockImplementation(async () => Response.json({
+        token: "approved-token", expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: { workflows: "write" },
+      }));
+    const credentials = new ForgeCredentials(repository, async () => application, fetcher);
+    const olderRequest = credentials.headers("worker");
+    await olderExchangeStarted.promise;
+    await credentials.refreshPublicationCredentials();
+    expect(await credentials.headers("worker")).toEqual({ Authorization: "Bearer approved-token" });
+
+    olderExchange.resolve(Response.json({ token: "old-token", expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: {} }));
+    expect(await olderRequest).toEqual({ Authorization: "Bearer old-token" });
+
+    expect(await credentials.headers("worker")).toEqual({ Authorization: "Bearer approved-token" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { repository, credential: { kind: "token", token: "static-token" } },
+    { repository: { ...repository, provider: "gitlab", apiUrl: "https://gitlab.example/api/v4" }, credential: { kind: "gitlab-oauth", token: "oauth-token" } },
+  ] as const)("keeps $credential.kind publication credentials without an App token exchange", async ({ repository, credential }) => {
+    const fetcher = vi.fn<typeof fetch>();
+    const credentials = new ForgeCredentials(repository, async () => credential, fetcher);
+    const access = await credentials.gitAccess("worker");
+    await credentials.refreshPublicationCredentials();
+    expect(await credentials.gitAccess("worker")).toEqual(access);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+});
+
 describe("GitHub installation-token request failures", () => {
   it.each(["rate_limited", "unreadable_response"])("includes authentication response timing and quota metadata for %s", async failure => {
     let elapsed = 100;

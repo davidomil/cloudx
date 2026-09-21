@@ -101,6 +101,7 @@ function fixture() {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const deps = {
     logger,
+    refreshPublicationCredentials: vi.fn(async () => {}),
     settings: () => ({
       repository: {
         provider: "github",
@@ -1269,6 +1270,7 @@ describe("Forge publication and feedback reconciliation", () => {
     expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { report } });
     expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
     expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.deps.refreshPublicationCredentials).not.toHaveBeenCalled();
 
     const published = await restarted.resume(worker.id, placement);
     expect(published).toMatchObject({
@@ -1286,6 +1288,31 @@ describe("Forge publication and feedback reconciliation", () => {
     expect(f.reports.prepare).toHaveBeenCalledOnce();
     expect(f.reports.read).toHaveBeenCalledOnce();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.deps.refreshPublicationCredentials).toHaveBeenCalledExactlyOnceWith(worker.repository, expect.any(AbortSignal));
+  });
+
+  it("keeps the saved publication when credential refresh fails and waits for another manual retry", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const report = { kind: "issue", title: "Update workflow", body: "Validated", discussionReplies: [], resolvedDiscussionIds: [] };
+    f.reports.read.mockResolvedValue(report);
+    f.runtime.publishBranch.mockRejectedValueOnce(new Error("Git push failed with exit code 1."));
+    await f.service.poll();
+    vi.mocked(f.deps.refreshPublicationCredentials).mockRejectedValueOnce(new ForgeProviderError("Installation approval is missing.", 403));
+
+    const retained = await f.service.resume(worker.id, placement);
+    expect(retained).toMatchObject({ status: "failed", error: "Installation approval is missing.", pendingPublication: { report } });
+    await f.service.poll();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.deps.refreshPublicationCredentials).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(retained.providerRetryAt).toBeUndefined();
+
+    expect(await f.service.resume(worker.id, placement)).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha });
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.deps.refreshPublicationCredentials).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
   });
 
   it("verifies the pending published head before cleaning up a merged request after resource recovery", async () => {
@@ -2159,6 +2186,18 @@ describe("Forge publication confirmation", () => {
     expect(f.stored()[0].status).toBe(action === "pause" ? "paused" : "stopped");
     expect(f.stored()[0].pendingPublication?.headSha).toBe(f.publishedHead);
     expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+  });
+
+  it("resumes confirmation of an already pushed commit without refreshing credentials or pushing again", async () => {
+    const f = await feedbackPublication();
+    await f.service.poll();
+    await f.service.pause(f.worker.id);
+    const pushes = f.runtime.publishBranch.mock.calls.length;
+    f.change.headSha = f.publishedHead;
+    expect(await f.service.resume(f.worker.id, placement)).toMatchObject({ status: "awaiting_review", headSha: f.publishedHead });
+    expect(f.deps.refreshPublicationCredentials).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(pushes);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
   it("aborts the individual worker's in-flight confirmation on Pause", async () => {
