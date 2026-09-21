@@ -1891,6 +1891,8 @@ describe("Forge worker controls during startup", () => {
 });
 
 describe("Forge ownership recovery", () => {
+  afterEach(() => vi.useRealTimers());
+
   it.each(["running", "starting", "awaiting_publication"] as const)("keeps the ownership reason and returns a blocked worker on repeated Resume after restarting %s", async status => {
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
@@ -1940,11 +1942,18 @@ describe("Forge ownership recovery", () => {
   });
 
   it("keeps unrelated cleanup failures blocked when startup finds no terminal to retire", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-21T12:00:00.000Z");
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     const blocked = { ...worker, status: "cleanup_failed" as const, tabId: undefined, error: "New local work does not match the merged head" };
     await f.deps.store.write([blocked]);
-    expect((await new ForgeWorkflowService(f.deps).dashboard()).workers[0]).toMatchObject(blocked);
+    const restartedAt = "2026-09-21T12:01:00.000Z";
+    vi.setSystemTime(restartedAt);
+    expect((await new ForgeWorkflowService(f.deps).dashboard()).workers[0]).toMatchObject({ ...blocked, updatedAt: restartedAt });
+    expect(f.stored()).toEqual([{ ...blocked, updatedAt: restartedAt }]);
+    expect(f.runtime.recover).toHaveBeenCalledExactlyOnceWith(worker.id);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
     expect(f.runtime.close).not.toHaveBeenCalled();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.reports.remove).not.toHaveBeenCalled();

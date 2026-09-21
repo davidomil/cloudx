@@ -145,6 +145,104 @@ setTimeout(() => process.exit(0), 100);
     }
   });
 
+  it.each([true, false])(
+    "checks current process state after a cleanup snapshot crosses the deadline (terminated: %s)",
+    async (terminated) => {
+      const directory = fs.mkdtempSync(
+        path.join(os.tmpdir(), "cloudx-gate-b-cleanup-snapshot-"),
+      );
+      const pidFile = path.join(directory, "descendant.pid");
+      const exitFile = path.join(directory, "leader-exit");
+      const secret = "gate-b-cleanup-token-that-must-not-appear-0123456789";
+      const descendantSource = `
+const fs = require("node:fs");
+process.on("SIGTERM", () => {});
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`;
+      const leaderSource = `
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+spawn(process.execPath, ["-e", ${JSON.stringify(descendantSource)}], { stdio: "ignore" });
+setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(exitFile)})) process.exit(0);
+}, 10);
+`;
+      const originalKill = process.kill;
+      const originalRead = fs.promises.readFile;
+      const originalNow = Date.now;
+      let outcome;
+      let processGroup;
+      let kill;
+      let read;
+      let clock;
+      let killRequested = false;
+      let snapshotDelivered = false;
+      let clockOffset = 0;
+      try {
+        outcome = gateBPublisher
+          .runGateBCommandForDirectTest(
+            process.execPath,
+            ["-e", leaderSource],
+            {
+              env: { ...process.env, GH_TOKEN: secret },
+            },
+          )
+          .catch((error) => error);
+        processGroup = await recordedProcessGroup(pidFile);
+        const descendantStat = `/proc/${fs.readFileSync(pidFile, "utf8")}/stat`;
+        clock = vi
+          .spyOn(Date, "now")
+          .mockImplementation(() => originalNow() + clockOffset);
+        kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+          if (
+            pid === -processGroup &&
+            signal === "SIGKILL" &&
+            !snapshotDelivered
+          ) {
+            killRequested = true;
+            return true;
+          }
+          return originalKill(pid, signal);
+        });
+        read = vi
+          .spyOn(fs.promises, "readFile")
+          .mockImplementation(async (...args) => {
+            const snapshot = await originalRead(...args);
+            if (
+              args[0] === descendantStat &&
+              killRequested &&
+              !snapshotDelivered
+            ) {
+              snapshotDelivered = true;
+              if (terminated) await terminateProcessGroup(processGroup);
+              clockOffset += 2_000;
+            }
+            return snapshot;
+          });
+        fs.writeFileSync(exitFile, "");
+
+        expect(await outcome).toEqual(
+          terminated
+            ? { stdout: "", stderr: "", exitCode: 1 }
+            : new Error("Gate B command runner failed."),
+        );
+        expect(snapshotDelivered).toBe(true);
+        expect(await processGroupHasRunningMember(processGroup)).toBe(
+          !terminated,
+        );
+      } finally {
+        read?.mockRestore();
+        kill?.mockRestore();
+        clock?.mockRestore();
+        fs.writeFileSync(exitFile, "");
+        await outcome;
+        if (processGroup) await terminateProcessGroup(processGroup);
+        fs.rmSync(directory, { force: true, recursive: true });
+      }
+    },
+  );
+
   it("keeps the private runner's output type and independent two-MiB stream bounds", async () => {
     const limit = 2 * 1024 * 1024;
     const exact = await gateBPublisher.runGateBCommandForDirectTest(
