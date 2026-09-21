@@ -5,6 +5,8 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isCompleteWorkspaceTab, isUsableTabLayoutState } from "../packages/shared/src/index.ts";
 import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStore.ts";
+import { WorkspaceLayoutStore } from "../apps/server/src/workspace/WorkspaceLayoutStore.ts";
+import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
 import { CodexStateSources } from "../apps/server/src/plugins/CodexStateSources.ts";
 import { assertTerminalMigrationSafe, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
 
@@ -83,15 +85,51 @@ describe("controlled terminal replacement snapshots", () => {
     expect(() => snapshotTerminalRecovery(f)).toThrow("Legacy workspace has no saved session identities");
   });
 
-  it("preserves an empty workspace created before its first session", () => {
+  it.each([
+    ["an empty session list", []],
+    ["a missing active-window tab", ["shell-1", "shell-2"]],
+    ["a missing nested-pane tab", ["codex-1", "shell-2"]],
+    ["a missing inactive-window tab", ["codex-1", "shell-1"]],
+  ])("refuses %s without changing the saved state", async (_description, savedIds) => {
+    const f = fixture();
+    const workspace = f.read("workspace.json");
+    workspace.activeWindowId = "window-1";
+    workspace.windows[0].layout = { activePaneId: "pane-1", root: { type: "split", id: "split-1", direction: "row", sizes: [50, 50], children: [
+      { type: "pane", pane: { id: "pane-1", tabIds: ["codex-1"] } },
+      { type: "split", id: "split-2", direction: "column", sizes: [40, 60], children: [
+        { type: "pane", pane: { id: "pane-2", tabIds: ["shell-1"] } },
+        { type: "pane", pane: { id: "pane-3", tabIds: [] } },
+      ] },
+    ] } };
+    workspace.windows.push({ ...workspace.windows[0], id: "window-2", name: "Inactive window",
+      layout: { activePaneId: "pane-4", root: { type: "pane", pane: { id: "pane-4", tabIds: ["shell-2"] } } } });
+    f.write("workspace.json", workspace);
+    const sessions = f.read("sessions.json").sessions;
+    sessions.push({ tab: { ...sessions[1].tab, id: "shell-2" } });
+    f.write("sessions.json", { version: 1, sessions: sessions.filter(({ tab }) => savedIds.includes(tab.id)) });
+    const originals = ["workspace.json", "sessions.json"].map(relative => [relative, fs.readFileSync(path.join(f.dataDir, relative))]);
+    const loaded = await new SessionStateStore(f.dataDir).read();
+    expect(loaded.sessions.map(({ tab }) => tab.id)).toEqual(savedIds);
+    const layout = new WorkspaceLayoutStore(f.dataDir, new PathPolicy(["/project"]));
+    expect(layout.tabIdsForWindow("window-1")).toEqual(["codex-1", "shell-1"]);
+    expect(layout.tabIdsForWindow("window-2")).toEqual(["shell-2"]);
+
+    expect(() => snapshotTerminalRecovery(f)).toThrow(/Workspace tab .* has no saved session identity; broker replacement stopped/);
+
+    for (const [relative, bytes] of originals) expect(fs.readFileSync(path.join(f.dataDir, relative))).toEqual(bytes);
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it.each(["absent", "empty"])("preserves an empty workspace with %s saved sessions", kind => {
     const f = fixture();
     const workspace = f.read("workspace.json");
     workspace.windows[0].layout.root.pane.tabIds = [];
     f.write("workspace.json", workspace);
-    fs.unlinkSync(path.join(f.dataDir, "sessions.json"));
+    if (kind === "absent") fs.unlinkSync(path.join(f.dataDir, "sessions.json"));
+    else f.write("sessions.json", { version: 1, sessions: [] });
     const backup = snapshotTerminalRecovery(f);
     expect(JSON.parse(fs.readFileSync(path.join(backup, "workspace.json"), "utf8"))).toEqual(workspace);
-    expect(fs.existsSync(path.join(backup, "sessions.json"))).toBe(false);
+    expect(fs.existsSync(path.join(backup, "sessions.json"))).toBe(kind === "empty");
   });
 
   it.each(["launchPending", "gitPending"])("refuses %s without changing ownership", flag => {

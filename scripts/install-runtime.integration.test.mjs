@@ -8,6 +8,9 @@ import { afterEach, expect, it, vi } from "vitest";
 
 import { DurableTerminalProcessFactory } from "../apps/server/src/terminal/DurableTerminalProcess.ts";
 import { NodePtyTerminalProcessFactory } from "../apps/server/src/terminal/NodePtyTerminalProcess.ts";
+import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
+import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStore.ts";
+import { WorkspaceLayoutStore } from "../apps/server/src/workspace/WorkspaceLayoutStore.ts";
 import { prepareRuntimeUpdate } from "./install-runtime.mjs";
 
 const cleanups = [];
@@ -50,10 +53,50 @@ it.skipIf(process.platform !== "linux")("gates a live legacy broker before mutat
 
   installation.installCurrentRuntime();
   await installation.startBroker();
+  const restored = await new SessionStateStore(installation.dataDir).read();
+  const workspace = new WorkspaceLayoutStore(installation.dataDir, new PathPolicy([installation.root]));
+  const reconciled = await workspace.state(restored.sessions.map(({ tab }) => tab), restored.activeTabId);
+  expect(reconciled.windows).toMatchObject(JSON.parse(saved.originals.get("workspace.json")).windows);
+  expect(workspace.tabIdsForWindow("window-1")).toEqual(["saved-shell", "saved-codex"]);
   await expect(installation.terminals.attach(options.sessionId)).rejects.toThrow("It was not restarted");
   const recovered = await installation.terminals.spawn("/bin/sh", ["-c", "printf RECOVERED_EXPLICITLY"], options);
   await expectSuccessfulOutput(recovered, "RECOVERED_EXPLICITLY");
   expect(fs.existsSync(path.join(installation.root, "replayed-command"))).toBe(false);
+}, 20_000);
+
+it.skipIf(process.platform !== "linux").each(["empty", "partial"])("refuses migration with %s saved sessions while preserving the live broker and original state", async kind => {
+  const installation = await legacyInstallation();
+  const options = { cwd: installation.root, env: process.env, cols: 100, rows: 30, sessionId: "saved-shell" };
+  const original = await installation.terminals.spawn("/bin/bash", ["--noprofile", "--norc"], options);
+  let output = "";
+  original.onData(data => { output += data; });
+  original.write("stty -echo; printf '\\nORIGINAL_PID=%s\\n' \"$$\"\n");
+  await vi.waitFor(() => expect(output).toMatch(/ORIGINAL_PID=\d+/u));
+  const pid = Number(/ORIGINAL_PID=(\d+)/u.exec(output)[1]);
+  const saved = saveRecoveryState(installation);
+  const sessions = await new SessionStateStore(installation.dataDir).read();
+  const incomplete = Buffer.from(JSON.stringify({ version: 1, sessions: kind === "empty" ? [] : sessions.sessions.slice(0, 1) }));
+  fs.writeFileSync(path.join(installation.dataDir, "sessions.json"), incomplete);
+  saved.originals.set("sessions.json", incomplete);
+  const beforeBrokerStop = vi.fn();
+  const migration = migrationAdapter(installation, beforeBrokerStop);
+
+  expect(() => prepareRuntimeUpdate({ ...migration, migrateTerminals: true })).toThrow(/Workspace tab .* has no saved session identity; broker replacement stopped/);
+
+  expect(migration.actions).toEqual(["cloudx.service"]);
+  expect(beforeBrokerStop).not.toHaveBeenCalled();
+  expect(running(installation.broker.pid)).toBe(true);
+  expect(running(pid)).toBe(true);
+  for (const [relative, bytes] of saved.originals)
+    expect(fs.readFileSync(path.join(installation.dataDir, relative))).toEqual(bytes);
+  expect(fs.readdirSync(installation.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  original.detach();
+  const attached = await installation.terminals.attach(options.sessionId);
+  let attachedOutput = "";
+  attached.onData(data => { attachedOutput += data; });
+  attached.write("printf '\\nPRESERVED_PID=%s\\n' \"$$\"\n");
+  await vi.waitFor(() => expect(attachedOutput).toContain(`PRESERVED_PID=${pid}`));
+  await attached.terminate();
 }, 20_000);
 
 async function legacyInstallation() {

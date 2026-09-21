@@ -13,6 +13,18 @@ Broker replacement interrupts terminals; save active work first.
 
 ## First adoption from an older installation
 
+Run migration from an external terminal, such as a desktop terminal or a
+separate SSH connection outside CloudX. The updater rejects callers in
+either CloudX service's control group, including descendants, before
+stopping either service. It also refuses migration if it cannot verify
+the caller's unified cgroup membership.
+
+CloudX shells inherit their owner's cgroup, so staging the updater in a
+temporary directory does not isolate its process. Stopping that service
+would terminate the updater before it could finish the update. See the
+primary [Linux cgroup documentation](https://cdn.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#processes)
+and [systemd stop semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html#KillMode=).
+
 Run the new updater from a temporary directory before changing the
 installed checkout. An older updater can replace the helper before it
 loads the new safeguards. From the installed repository root, stage the
@@ -46,6 +58,10 @@ and ownership records, per-tab Codex source and conversation receipts,
 and the exact referenced transcripts. Its manifest records SHA-256
 hashes and maps each original tab to its last observed conversation ID.
 Backup files use mode 0600 and directories use mode 0700.
+
+Every tab referenced by any saved window or pane must have a saved
+session identity. An empty or partial session list cannot preserve those
+tabs during recovery and blocks broker replacement.
 
 The snapshot rejects invalid saved layouts or session metadata, missing
 or conflicting conversation identities, transcript mismatches, changed

@@ -92,3 +92,55 @@ it("does not treat missing cgroup.events in an existing group as proof of cleanu
     })).toThrow("requires unified cgroup.events evidence");
   } finally { exists.mockRestore(); }
 });
+
+function migrationFrom(cgroup) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-migration-caller-")); roots.push(root);
+  fs.writeFileSync(path.join(root, "preserved-state"), "unchanged");
+  const stopped = [];
+  const commands = {
+    inspect: (_command, args) => Object.entries({ ...state, ControlGroup: `/user/${args[2]}`,
+      ...(stopped.includes(args[2]) ? { ActiveState: "inactive", MainPID: "0" } : {}),
+    }).map(([key, value]) => `${key}=${value}`).join("\n"),
+    run: vi.fn((_command, args) => stopped.push(args[2])),
+  };
+  return {
+    root, commands, stopped,
+    migrate: () => prepareRuntimeUpdate({ paths: { dataDir: root, repoRoot: "/repo" }, commands,
+      target: { kind: "standard" }, migrateTerminals: true, log: () => {},
+      readFile: file => {
+        if (file !== "/proc/self/cgroup") return "populated 0\n";
+        if (cgroup instanceof Error) throw cgroup;
+        return cgroup;
+      },
+    }),
+  };
+}
+
+it.each([
+  ["cloudx.service", ""], ["cloudx.service", "/worker/launch"],
+  ["cloudx-terminal.service", ""], ["cloudx-terminal.service", "/shell/child"],
+])("refuses migration from %s%s before stopping either service", (service, descendant) => {
+  const migration = migrationFrom(`0::/user/${service}${descendant}\n`);
+  expect(migration.migrate).toThrow(new RegExp(`${service}.*external terminal`));
+  expect(migration.commands.run).not.toHaveBeenCalled();
+  expect(fs.readdirSync(migration.root)).toEqual(["preserved-state"]);
+  expect(fs.readFileSync(path.join(migration.root, "preserved-state"), "utf8")).toBe("unchanged");
+});
+
+it.each([
+  "", "invalid", "0::relative\n", "0::/user/../other\n", "0::/one\n0::/two\n",
+  "1:name=systemd:/user/external.scope\n", new Error("Permission denied"),
+])("refuses migration when caller cgroup evidence cannot be verified: %s", cgroup => {
+  const migration = migrationFrom(cgroup);
+  expect(migration.migrate).toThrow(/Cannot verify the updater.*control group/);
+  expect(migration.commands.run).not.toHaveBeenCalled();
+  expect(fs.readdirSync(migration.root)).toEqual(["preserved-state"]);
+});
+
+it.each(["/", "/user/external.scope", "/user/cloudx-terminal.service-other", "/user/cloudx.service-other/child"])(
+  "allows migration from an external caller at %s", group => {
+    const migration = migrationFrom(`0::${group}\n`);
+    expect(migration.migrate).not.toThrow();
+    expect(migration.stopped).toEqual(["cloudx.service", "cloudx-terminal.service"]);
+  },
+);

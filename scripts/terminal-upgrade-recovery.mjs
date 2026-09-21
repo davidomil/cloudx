@@ -125,10 +125,16 @@ class RecoverySnapshot {
         saved.sessions.some(session => !session || !validSession(session)))
       throw new Error("Invalid saved tab identities; broker replacement stopped.");
     const ids = saved.sessions.map(({ tab }) => tab.id);
-    if (new Set(ids).size !== ids.length || saved.activeTabId !== undefined && !ids.includes(saved.activeTabId))
+    const savedIds = new Set(ids);
+    if (savedIds.size !== ids.length || saved.activeTabId !== undefined && !savedIds.has(saved.activeTabId))
       throw new Error("Duplicate or unknown active tab identity; broker replacement stopped.");
     if ((workspace !== undefined || ids.length) && !validWorkspace(workspace))
       throw new Error("Saved tabs have no recoverable workspace layout; broker replacement stopped.");
+    if (workspace)
+      for (const window of workspace.windows)
+        for (const tabId of layoutTabIds(window.layout))
+          if (!savedIds.has(tabId))
+            throw new Error(`Workspace tab ${tabId} has no saved session identity; broker replacement stopped. Preserve and close the tab manually, or repair sessions.json before migration.`);
     for (const session of saved.sessions)
       if (session.tab.pluginId === "codex-terminal") this.readConversation(session);
   }

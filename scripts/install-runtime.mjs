@@ -66,6 +66,7 @@ export function prepareRuntimeUpdate({ paths, commands, target, migrateTerminals
       throw new Error("Terminal migration requires the original service control group to verify cleanup.");
     }
   }
+  assertUpdaterOutsideServices([[webService, web], ["cloudx-terminal.service", broker]], readFile);
   assertTerminalMigrationSafe({ dataDir: paths.dataDir });
   log("Terminal migration will interrupt all terminal processes. Tabs and layouts remain saved; shells and exact saved Codex conversations must be recovered explicitly. No commands or prompts will be replayed.");
   commands.run("systemctl", ["--user", "stop", webService]);
@@ -75,6 +76,25 @@ export function prepareRuntimeUpdate({ paths, commands, target, migrateTerminals
   } else log("Dry run: would verify a private recovery snapshot after the web service stops and before stopping the broker.");
   commands.run("systemctl", ["--user", "stop", "cloudx-terminal.service"]);
   if (!dryRun) assertStoppedService(commands, "cloudx-terminal.service", broker.ControlGroup, readFile);
+}
+
+function assertUpdaterOutsideServices(services, readFile) {
+  let callerGroup;
+  try {
+    const groups = readFile("/proc/self/cgroup", "utf8").trim().split("\n").filter(line => line.startsWith("0::"));
+    callerGroup = groups[0]?.slice(3);
+    if (groups.length !== 1 || !callerGroup.startsWith("/") || callerGroup.split("/").includes("..")) {
+      throw new Error("Expected one absolute unified cgroup path in /proc/self/cgroup.");
+    }
+  } catch (error) {
+    throw new Error(`Cannot verify the updater's control group; no services were stopped. ${error.message}`, { cause: error });
+  }
+  for (const [service, state] of services) {
+    const group = state.ControlGroup;
+    if (state.LoadState !== "not-found" && group && (callerGroup === group || callerGroup.startsWith(`${group}/`))) {
+      throw new Error(`Terminal migration cannot run inside ${service}'s control group. Run the updater from an external terminal outside CloudX; no services were stopped.`);
+    }
+  }
 }
 
 export function assertStoppedService(commands, service, previousControlGroup, readFile = fs.readFileSync) {
