@@ -277,7 +277,7 @@ export class SessionStore {
       this.tabs.set(id, tab);
       this.initialInputs.set(id, request.initialInput);
       if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
-      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession });
+      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession, prepareTerminalExecution: launchOptions.prepareTerminalExecution });
       this.unpublishedTabIds.add(id);
       const session = await plugin.createSession({
         tab,
@@ -288,6 +288,7 @@ export class SessionStore {
         initialInput: request.initialInput,
         authorizeProjectTrust: this.launchOptions.get(id)?.authorizeProjectTrust,
         prepareCodexSession: this.launchOptions.get(id)?.prepareCodexSession,
+        prepareTerminalExecution: this.launchOptions.get(id)?.prepareTerminalExecution,
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
@@ -768,6 +769,7 @@ export class SessionStore {
   async restartTab(tabId: string, reason = "Restarting tab."): Promise<WorkspaceTab> {
     this.assertSessionOwnershipResolved(tabId);
     const current = this.getTab(tabId);
+    if (current.ownerPluginId === "forge") throw new Error("Resume the worker through Forge to start a new execution.");
     const plugin = this.plugins.get(current.pluginId);
     const oldSession = this.sessions.get(tabId);
     this.disposeSessionListeners(tabId);
@@ -791,6 +793,7 @@ export class SessionStore {
         cwd: tab.cwd,
         authorizeProjectTrust: this.launchOptions.get(tabId)?.authorizeProjectTrust,
         prepareCodexSession: this.launchOptions.get(tabId)?.prepareCodexSession,
+        prepareTerminalExecution: this.launchOptions.get(tabId)?.prepareTerminalExecution,
         runtimeContext,
         app: this.createAppContext(plugin.id, tabId),
         controls: this.createControls(tabId),

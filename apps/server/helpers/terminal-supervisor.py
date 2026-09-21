@@ -19,10 +19,12 @@ SUPERVISOR_SIGNALS = (
 
 
 class TerminalSupervisor:
-    def __init__(self, directory, parent, command):
+    def __init__(self, directory, parent, execution, command):
         self.directory = Path(directory)
         self.parent = parent
         self.command = command
+        self.execution = execution
+        self.identity = {"pid": os.getpid()}
         self.children = Path(f"/proc/self/task/{os.getpid()}/children")
         self.worker = None
         self.worker_status = None
@@ -33,7 +35,8 @@ class TerminalSupervisor:
             raise RuntimeError("Terminal supervision requires Python 3.9 or newer")
         self.children.read_text()
         self.own_orphaned_descendants()
-        self.write_receipt("ready", {"pid": os.getpid()})
+        self.bind_execution()
+        self.write_receipt("ready", self.identity)
         try:
             if not self.stopping:
                 self.launch_command()
@@ -48,10 +51,32 @@ class TerminalSupervisor:
                 time.sleep(0.01)
             raise
         event = self.command_exit()
-        self.write_receipt("complete", {"pid": os.getpid(), **event})
-        if os.getppid() != self.parent:
+        self.write_receipt("complete", {**self.identity, **event})
+        if self.execution is None and os.getppid() != self.parent:
             shutil.rmtree(self.directory)
         return event["exitCode"]
+
+    def bind_execution(self):
+        if self.execution is None:
+            return
+        if not isinstance(self.execution, dict) or any(
+            not isinstance(self.execution.get(key), str) or not self.execution[key]
+            for key in ("executionId", "directory", "bootId", "pidNamespace")
+        ):
+            raise RuntimeError("Terminal execution binding is invalid")
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        pid_namespace = os.readlink("/proc/self/ns/pid")
+        started = Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        self.identity.update({
+            "executionId": self.execution["executionId"], "bootId": boot_id,
+            "pidNamespace": pid_namespace, "started": started,
+        })
+        if (
+            self.execution["directory"] != str(self.directory)
+            or self.execution["bootId"] != boot_id
+            or self.execution["pidNamespace"] != pid_namespace
+        ):
+            raise RuntimeError("Terminal execution binding does not match the current boot and PID namespace")
 
     def own_orphaned_descendants(self):
         for number in SUPERVISOR_SIGNALS:
@@ -121,14 +146,24 @@ class TerminalSupervisor:
 
     def write_receipt(self, name, value):
         temporary = self.directory / f"{name}.tmp"
-        temporary.write_text(json.dumps(value))
+        with temporary.open("w") as receipt:
+            json.dump(value, receipt)
+            if self.execution is not None:
+                receipt.flush()
+                os.fsync(receipt.fileno())
         temporary.replace(self.directory / f"{name}.json")
+        if self.execution is not None:
+            directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
 
 
 if __name__ == "__main__":
-    supervisor = TerminalSupervisor(sys.argv[1], int(sys.argv[2]), sys.argv[3:])
+    supervisor = TerminalSupervisor(sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4:])
     try:
         sys.exit(supervisor.run())
     except Exception as error:
-        supervisor.write_receipt("error", {"message": str(error)})
+        supervisor.write_receipt("error", {**supervisor.identity, "message": str(error)})
         sys.exit(125)

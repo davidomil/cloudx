@@ -23,6 +23,7 @@ import type { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js"
 import { forgeLog, type ForgeLogger } from "./ForgeLog.js";
 import { validateRepository } from "./providers/ForgeCredentials.js";
 import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
+import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecution } from "./ForgeExecution.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -117,6 +118,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   baseCommit: string;
   prepared: boolean;
   launchPending: boolean;
+  launchBootId?: string;
   baseUpdate?: OwnedBaseUpdate;
   issueRebase?: OwnedIssueRebase;
   publishedSync?: OwnedPublishedSync;
@@ -132,6 +134,8 @@ interface OwnedTab {
   launch?: DirectoryIdentity;
   closed: boolean;
   quiescent: boolean;
+  execution?: ForgeExecution;
+  observedBootId?: string;
 }
 
 /** Owns Git checkouts and Codex tabs; the service owns issue/review decisions. */
@@ -140,9 +144,11 @@ export class ForgeRuntime {
   private static readonly logContext = new AsyncLocalStorage<{ workerId: string; operation: string }>();
   private readonly ownedTabs = new Map<string, OwnedTab>();
   private readonly reviewConversations: Pick<ForgeReviewConversation, "prepare">;
+  private readonly executions: ForgeExecutionRecovery;
 
   constructor(private readonly dependencies: ForgeRuntimeDependencies) {
     this.reviewConversations = dependencies.reviewConversations ?? new ForgeReviewConversation(dependencies.dataDir);
+    this.executions = new ForgeExecutionRecovery(dependencies.dataDir);
   }
 
   isActive(tabId: string): boolean {
@@ -447,13 +453,12 @@ export class ForgeRuntime {
         "Worker workspace ownership does not match or a previous launch is unresolved.",
       );
     await this.assertIdentity(owned.worktree);
+    await this.assertQuiescent(owned);
     if (owned.role === "reviewer") {
-      await this.assertQuiescent(owned);
       if (owned.reviewRefresh || await this.requireCleanReviewHead(owned, signal) !== owned.baseCommit || await this.reviewBase(owned, signal) !== owned.reviewBaseSha)
         throw new Error("Refresh the reviewer checkout to its exact comparison before launching it.");
     }
     if (owned.role === "worker" && owned.issueRebase) {
-      await this.assertQuiescent(owned);
       await this.assertCheckout(owned);
       await this.verifyRebaseRecovery(owned, owned.issueRebase, signal);
     }
@@ -469,6 +474,7 @@ export class ForgeRuntime {
     if (!authorizeProjectTrust)
       throw new Error("The worker repository must match the current Forge settings before starting or resuming a worker.");
     owned.launchPending = true;
+    owned.launchBootId = (await executionEnvironment()).bootId;
     await this.manifest(owned.id).write(owned);
     let preparingTabId: string | undefined;
     const prepareCodexSession = owned.role === "reviewer" ? async (launch: PreparedCodexLaunch) => {
@@ -507,6 +513,18 @@ export class ForgeRuntime {
     }, {
       ownerPluginId: "forge",
       authorizeProjectTrust,
+      prepareTerminalExecution: async tabId => {
+        preparingTabId = tabId;
+        const tab = this.dependencies.sessions.getTab(tabId);
+        if (tab.cwd !== owned.worktreePath || tab.ownerPluginId !== "forge" || tab.pluginMetadata?.["forge-workers"]?.workerId !== owned.id)
+          throw new Error("Worker execution tab does not match its checkout ownership.");
+        const ownership = this.ownedTabs.get(tabId) ?? { tabId, workerId: owned.id, closed: false, quiescent: false };
+        if (ownership.execution) throw new Error("This worker tab already owns an execution. Resume through Forge to start a new attempt.");
+        ownership.execution = await this.executions.prepare();
+        this.ownedTabs.set(tabId, ownership);
+        await this.captureTab(tab, ownership);
+        return ownership.execution;
+      },
       ...(prepareCodexSession ? { prepareCodexSession } : {}),
     }).catch(async error => {
       if (error instanceof PluginSessionNotStartedError) {
@@ -519,7 +537,7 @@ export class ForgeRuntime {
       }
       throw error;
     });
-    const ownedTab: OwnedTab = {
+    const ownedTab: OwnedTab = this.ownedTabs.get(tab.id) ?? {
       tabId: tab.id,
       workerId: input.id,
       closed: false,
@@ -567,6 +585,8 @@ export class ForgeRuntime {
         typeof owned.closed !== "boolean")
     )
       throw new Error("Worker tab ownership record is invalid.");
+    if (!owned && !this.dependencies.sessions.listTabs().some(tab => tab.id === tabId))
+      throw new Error("Worker tab ownership record is missing. Restore the original ownership record before Resume; termination cannot be verified. Local resources were preserved.");
     if (this.dependencies.sessions.listTabs().some((tab) => tab.id === tabId)) {
       await this.requireWorkerTab(tabId);
       await this.dependencies.sessions.executePluginAction(tabId, "stop", {});
@@ -577,9 +597,20 @@ export class ForgeRuntime {
       if (owned?.context) await this.assertContextIdentity(owned.context);
       await this.dependencies.sessions.discardPreparedTab(tabId);
     } else if (owned && !owned.closed && !owned.quiescent) {
-      throw new Error(
-        "Worker process ownership is unresolved after its terminal disappeared. Local resources were preserved.",
-      );
+      if (owned.execution) await this.executions.assertEnded(owned.execution);
+      else {
+        const { bootId } = await executionEnvironment();
+        if (owned.observedBootId !== undefined && !isUuid(owned.observedBootId))
+          throw new Error("Worker ownership observation is invalid. Local resources were preserved.");
+        if (!owned.observedBootId) {
+          owned.observedBootId = bootId;
+          await this.tabManifest(tabId).write(owned);
+        }
+        if (owned.observedBootId === bootId)
+          throw new Error("Worker process ownership is unresolved after its terminal disappeared: no durable execution evidence was recorded. Reboot the host, then Resume to prove the old execution ended. Local resources were preserved.");
+      }
+      owned.quiescent = true;
+      await this.tabManifest(tabId).write(owned);
     }
     await this.dependencies.workspace.state(
       this.dependencies.sessions.listTabs(),
@@ -591,6 +622,7 @@ export class ForgeRuntime {
         const worker = await this.readOwned(owned.workerId);
         await this.removeLaunch(owned.launch, tabId, worker.role === "reviewer" ? worker.reviewConversation : undefined);
       }
+      if (owned.execution) await this.executions.remove(owned.execution);
       owned.closed = true;
       await this.tabManifest(tabId).write(owned);
       this.ownedTabs.delete(tabId);
@@ -599,7 +631,7 @@ export class ForgeRuntime {
 
   recover(
     id: string,
-  ): Promise<{ workspace?: ForgeWorkspace; tabIds: string[] }> {
+  ): Promise<{ workspace?: ForgeWorkspace; tabIds: string[]; executionEnded?: boolean }> {
     return this.serialize(id, "recover", undefined, async () => {
       const stored = await this.manifest(id).read<OwnedWorkspace>();
       const owned = stored ? await this.readOwned(id) : undefined;
@@ -653,11 +685,18 @@ export class ForgeRuntime {
         }
         tabIds.add(tab.id);
       }
+      let executionEnded = false;
       if (owned?.launchPending) {
-        if (tabIds.size === 0)
-          throw new Error(
-            "A worker launch was interrupted before its process ownership was recorded. Local resources were preserved.",
-          );
+        if (tabIds.size === 0) {
+          const { bootId } = await executionEnvironment();
+          if (!owned.launchBootId) {
+            owned.launchBootId = bootId;
+            await this.manifest(id).write(owned);
+          }
+          if (owned.launchBootId === bootId)
+            throw new Error("A worker launch was interrupted before its process ownership was recorded. Reboot the host, then Resume to prove the old execution ended. Local resources were preserved.");
+          executionEnded = true;
+        }
         owned.launchPending = false;
         await this.manifest(id).write(owned);
       }
@@ -670,7 +709,7 @@ export class ForgeRuntime {
               branch: owned.branch,
             }
           : undefined;
-      return { workspace, tabIds: [...tabIds] };
+      return { workspace, tabIds: [...tabIds], ...(executionEnded ? { executionEnded } : {}) };
     });
   }
 
@@ -1317,6 +1356,7 @@ export class ForgeRuntime {
       typeof value.cleaned !== "boolean" ||
       typeof value.prepared !== "boolean" ||
       typeof value.launchPending !== "boolean" ||
+      (value.launchBootId !== undefined && !isUuid(value.launchBootId)) ||
       typeof value.baseCommit !== "string" ||
       (value.role === "reviewer") !== (value.branch === "") ||
       (value.role === "reviewer" && value.branchOwned) ||
@@ -1533,6 +1573,7 @@ export class ForgeRuntime {
   }
 
   private async captureTab(tab: WorkspaceTab, owned: OwnedTab): Promise<void> {
+    owned.observedBootId ??= (await executionEnvironment()).bootId;
     const contextPath = tab.contextPath
       ? path.resolve(tab.contextPath)
       : undefined;

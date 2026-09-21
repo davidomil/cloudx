@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { IPty } from "node-pty";
+import type { TerminalExecutionBinding } from "./TerminalProcess.js";
 
 export interface TerminalExit { exitCode: number; signal?: number; reason?: "broker-shutdown" }
 interface SupervisorExit { event: TerminalExit; error?: Error }
@@ -15,7 +16,11 @@ export class TerminalSupervisor {
   private exited = false;
   private termination: Promise<void> | undefined;
 
-  constructor(private readonly process: Pick<IPty, "pid" | "onExit" | "kill">, private readonly directory: string) {
+  constructor(
+    private readonly process: Pick<IPty, "pid" | "onExit" | "kill">,
+    private readonly directory: string,
+    private readonly execution?: TerminalExecutionBinding
+  ) {
     this.started = processStarted(process.pid);
     this.completion = new Promise((resolve) => {
       process.onExit(() => {
@@ -30,7 +35,7 @@ export class TerminalSupervisor {
     while (!this.exited) {
       const receipt = await this.readReceipt("ready");
       if (receipt) {
-        if (receipt.pid !== this.process.pid) throw new Error("Terminal supervisor returned an invalid ownership receipt.");
+        if (!this.ownsReceipt(receipt)) throw new Error("Terminal supervisor returned an invalid ownership receipt.");
         return;
       }
       if (Date.now() >= deadline) throw new Error(`Terminal supervisor did not start before the deadline. ${startupRequirement}`);
@@ -73,7 +78,9 @@ export class TerminalSupervisor {
   private async confirmExit(): Promise<SupervisorExit> {
     try {
       const receipt = await this.readReceipt("complete");
-      if (!isCompletionReceipt(receipt, this.process.pid)) {
+      const ready = this.execution ? await this.readReceipt("ready") : undefined;
+      if (!isCompletionReceipt(receipt, this.process.pid) || !this.ownsReceipt(receipt)
+        || this.execution && (!this.ownsReceipt(ready) || ready?.started !== receipt.started)) {
         const error = await this.readReceipt("error");
         throw new Error(typeof error?.message === "string" ? `Terminal supervision failed: ${error.message}` : "Terminal supervisor exited without confirming its descendants stopped.");
       }
@@ -81,8 +88,16 @@ export class TerminalSupervisor {
     } catch (error) {
       return { event: { exitCode: 125 }, error: error instanceof Error ? error : new Error("Terminal ownership verification failed.") };
     } finally {
-      await fs.rm(this.directory, { recursive: true, force: true });
+      if (!this.execution) await fs.rm(this.directory, { recursive: true, force: true });
     }
+  }
+
+  private ownsReceipt(receipt: Record<string, unknown> | undefined): boolean {
+    if (!receipt || receipt.pid !== this.process.pid) return false;
+    if (!this.execution) return true;
+    return receipt.executionId === this.execution.executionId && receipt.bootId === this.execution.bootId
+      && receipt.pidNamespace === this.execution.pidNamespace && typeof receipt.started === "string"
+      && /^\d+$/u.test(receipt.started) && (this.started === undefined || receipt.started === this.started);
   }
 
   private async readReceipt(name: string): Promise<Record<string, unknown> | undefined> {

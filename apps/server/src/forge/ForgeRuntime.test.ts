@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -2397,7 +2398,7 @@ describe("ForgeRuntime Codex tabs", () => {
         windowId: "window-1",
         paneId: "pane-1",
       }),
-      { ownerPluginId: "forge", authorizeProjectTrust: expect.any(Function) },
+      { ownerPluginId: "forge", authorizeProjectTrust: expect.any(Function), prepareTerminalExecution: expect.any(Function) },
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
@@ -2472,6 +2473,13 @@ describe("ForgeRuntime Codex tabs", () => {
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
     expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
+  it("refuses to declare an absent terminal stopped when its ownership record is missing", async () => {
+    const deps = dependencies();
+    await expect(new ForgeRuntime(deps).close("missing-tab")).rejects.toThrow("Restore the original ownership record");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    expect(deps.workspace.state).not.toHaveBeenCalled();
   });
 
   it("cleans disappeared worker artifacts after a verified pause and restart while preserving shared state", async () => {
@@ -2574,6 +2582,73 @@ describe("ForgeRuntime Codex tabs", () => {
     );
     expect((await fs.stat(launch)).isDirectory()).toBe(true);
     expect((await fs.stat(workspace.worktreePath)).isDirectory()).toBe(true);
+  });
+
+  it("persists execution ownership before spawn and refuses a second agent until retirement", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    const tabFile = path.join(deps.dataDir, "forge-workers", "tabs", `${tab.id}.json`);
+    vi.mocked(deps.workspaceCommands.createTab).mockImplementation(async (_request, options) => {
+      const execution = await options!.prepareTerminalExecution!(tab.id);
+      expect(JSON.parse(await fs.readFile(tabFile, "utf8"))).toMatchObject({ tabId: tab.id, workerId: workspace.id, execution });
+      throw new Error("Server died before the process was spawned");
+    });
+    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" };
+    await expect(runtime.launch(request)).rejects.toThrow("Server died");
+    runtime = new ForgeRuntime(deps);
+    expect((await runtime.recover(workspace.id)).tabIds).toEqual([tab.id]);
+    await expect(runtime.close(tab.id)).rejects.toThrow("launch receipt is missing");
+    await expect(runtime.launch(request)).rejects.toThrow("Stop the worker process");
+    expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    const owned = JSON.parse(await fs.readFile(tabFile, "utf8"));
+    owned.execution.bootId = randomUUID(); // Model a confirmed new host boot.
+    await fs.writeFile(tabFile, JSON.stringify(owned));
+    await fs.writeFile(path.join(workspace.worktreePath, "unfinished.txt"), "Keep untracked work");
+    runtime = new ForgeRuntime(deps);
+    await runtime.close(tab.id);
+    await runtime.close(tab.id);
+    expect((await runtime.recover(workspace.id)).tabIds).toEqual([]);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Keep untracked work");
+  });
+
+  it("recovers a crash before the first tab record only after a confirmed host reboot", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    vi.mocked(deps.workspaceCommands.createTab).mockRejectedValue(new Error("Server died before preparing a tab"));
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Server died");
+    await expect(new ForgeRuntime(deps).recover(workspace.id)).rejects.toThrow("Reboot the host");
+    const file = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const owned = JSON.parse(await fs.readFile(file, "utf8"));
+    expect(owned.launchBootId).toMatch(/^[a-f0-9-]{36}$/);
+    owned.launchBootId = randomUUID();
+    await fs.writeFile(file, JSON.stringify(owned));
+    expect(await new ForgeRuntime(deps).recover(workspace.id)).toEqual({ workspace, tabIds: [], executionEnded: true });
+    expect(await new ForgeRuntime(deps).recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+  });
+
+  it("records missing execution evidence once and retires the old tab after a later host reboot", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    const file = path.join(deps.dataDir, "forge-workers", "tabs", `${tab.id}.json`);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, JSON.stringify({ workerId: workspace.id, tabId: tab.id, closed: false, quiescent: false }));
+    for (let attempt = 0; attempt < 3; attempt++)
+      await expect(new ForgeRuntime(deps).close(tab.id)).rejects.toThrow("Reboot the host");
+    const owned = JSON.parse(await fs.readFile(file, "utf8"));
+    expect(owned.observedBootId).toMatch(/^[a-f0-9-]{36}$/);
+    owned.observedBootId = randomUUID();
+    await fs.writeFile(file, JSON.stringify(owned));
+    await new ForgeRuntime(deps).close(tab.id);
+    expect(JSON.parse(await fs.readFile(file, "utf8"))).toMatchObject({ closed: true, quiescent: true });
+    expect(await new ForgeRuntime(deps).recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
   });
 
   it("prevents duplicate workers when launch was interrupted before tab ownership became durable", async () => {

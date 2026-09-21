@@ -41,6 +41,7 @@ interface Runtime {
       branch: string;
     };
     tabIds: string[];
+    executionEnded?: boolean;
   }>;
   prepareWorkspace(
     input: {
@@ -690,13 +691,20 @@ export class ForgeWorkflowService {
     const controller = this.operations.get(worker.id) ?? this.operations.get(this.autoReviewParent(worker)?.id ?? "") ?? new AbortController();
     this.operations.set(worker.id, controller);
     controller.signal.throwIfAborted();
+    if (recoveringResources) {
+      try {
+        await this.recoverResources(worker);
+      } catch (error) {
+        await this.cleanupFailed(worker, error);
+        return structuredClone(worker);
+      }
+    }
     if (await this.reconcileMergedChange(worker, { retryCleanupId: worker.id }))
       return structuredClone(worker);
     controller.signal.throwIfAborted();
     if (worker.kind === "review" && worker.draft && ["posting", "post_failed"].includes(worker.draft.status))
       throw new Error("The previous review submission must be reconciled before resuming.");
     if (recoveringResources) {
-      await this.recoverResources(worker);
       if (worker.kind === "review" && worker.draft) {
         await this.quiesce(worker);
         worker.status = "completed";
@@ -1949,11 +1957,12 @@ export class ForgeWorkflowService {
     await this.persist();
     this.deps.notify("Forge worker cleanup needs attention", `${worker.title}: ${worker.error}`);
   }
-  private async recoverResources(worker: ForgeWorker): Promise<void> {
+  private async recoverResources(worker: ForgeWorker): Promise<{ tabIds: string[]; executionEnded?: boolean }> {
     const recovered = await this.deps.runtime.recover(worker.id);
     if (recovered.workspace) Object.assign(worker, recovered.workspace);
     for (const tabId of recovered.tabIds) await this.deps.runtime.close(tabId);
     if (recovered.tabIds.includes(worker.tabId ?? "")) worker.tabId = undefined;
+    return recovered;
   }
   private async quiesce(worker: ForgeWorker, { closeTab = true, retainReport = false }: { closeTab?: boolean; retainReport?: boolean } = {}): Promise<void> {
     if (worker.tabId) {
@@ -2140,23 +2149,22 @@ export class ForgeWorkflowService {
               await this.recoverResources(worker);
               await this.quiesce(worker);
               this.operations.set(worker.id, new AbortController());
-            } catch {
+            } catch (error) {
               worker.status = "cleanup_failed";
-              worker.error = "Publication resources could not be recovered. Inspect ownership before continuing.";
+              worker.error = message(error);
             }
-          }
-          if (["running", "starting"].includes(worker.status) || worker.autoReview?.enabled &&
+          } else if (["running", "starting", "cleanup_failed"].includes(worker.status) || worker.autoReview?.enabled &&
             ["awaiting_publication", "awaiting_review", "awaiting_merge"].includes(worker.status)) {
-            worker.status = "paused";
-            worker.error =
-              "CloudX restarted. Inspect and resume this worker explicitly.";
+            const cleanupFailed = worker.status === "cleanup_failed";
             try {
-              await this.recoverResources(worker);
+              const recovered = await this.recoverResources(worker);
+              if (cleanupFailed && !recovered.tabIds.length && !recovered.executionEnded && !worker.tabId) continue;
               await this.quiesce(worker, { retainReport: worker.kind === "issue" && !worker.pendingPublication });
-            } catch {
+              worker.status = "paused";
+              worker.error = "CloudX restarted. Inspect and resume this worker explicitly.";
+            } catch (error) {
               worker.status = "cleanup_failed";
-              worker.error =
-                "Interrupted worker resources could not be cleaned up. Inspect ownership before continuing.";
+              worker.error = message(error);
             }
           }
         }
