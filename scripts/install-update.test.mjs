@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { execFileSync, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { InstallerRunner, runInstaller, parseArgs } from "./install-cloudx.mjs";
@@ -41,6 +42,7 @@ function checkout({ includeInstaller = false } = {}) {
     for (const file of [
       "install-cloudx.mjs",
       "install-update.mjs",
+      "install-terminal-upgrade.mjs",
       "installer-environment.mjs",
     ])
       fs.copyFileSync(
@@ -976,5 +978,104 @@ describe("the complete updater plan", () => {
       fixture.runner.commands.filter((command) => !command.inspect),
     ).toEqual([]);
     expect(fixture.runner.writes).toEqual([]);
+  });
+});
+
+describe("interactive updater cleanup", () => {
+  it.each([
+    ["standard", false],
+    ["standard", true],
+    ["web", false],
+    ["web", true],
+  ])("closes input after %s update with readiness failure=%s", async (kind, failReadiness) => {
+    const fixture = plannedUpdate({ service: kind === "web" });
+    const input = new PassThrough();
+    const output = new PassThrough();
+    onTestFinished(() => { input.destroy(); output.destroy(); });
+    output.on("data", () => queueMicrotask(() => input.write("yes\n")));
+    const capture = fixture.runner.capture.bind(fixture.runner);
+    fixture.runner.capture = (command, args, options) => {
+      if (command === "curl") {
+        expect(input.listenerCount("data")).toBe(1);
+        if (failReadiness) throw new Error("Permanent readiness failure");
+      }
+      return capture(command, args, options);
+    };
+    const update = runInstaller({
+      ...fixture.options,
+      dryRun: false,
+      yes: false,
+      env: { ...fixture.options.env, CLOUDX_INSTALL_UPDATED_COMMIT: git(fixture.root, "rev-parse", "HEAD") },
+      input,
+      output,
+    });
+
+    if (failReadiness) await expect(update).rejects.toThrow("Permanent readiness failure");
+    else expect((await update).restartServices).toBe(true);
+    expect(input.listenerCount("data")).toBe(0);
+    expect(input.isPaused()).toBe(true);
+  });
+});
+
+describe("legacy terminal upgrade preparation", () => {
+  it("preserves the legacy workspace before install commands and service restart", async () => {
+    const fixture = plannedUpdate();
+    const workspace = '{"windows":[{"id":"saved-window","tabs":["legacy-tab"]}]}\n';
+    fs.mkdirSync(fixture.dataDir);
+    fs.writeFileSync(path.join(fixture.dataDir, "workspace.json"), workspace);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    onTestFinished(() => warn.mockRestore());
+    const run = fixture.runner.run.bind(fixture.runner);
+    fixture.runner.run = (command, args, options) => {
+      const backups = fs.readdirSync(fixture.dataDir).filter(name => name.startsWith("terminal-upgrade-backup-"));
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(path.join(fixture.dataDir, backups[0], "workspace.json"), "utf8")).toBe(workspace);
+      expect(warn.mock.calls.flat().join("\n")).toContain("cannot preserve legacy in-memory tabs");
+      return run(command, args, options);
+    };
+
+    const result = await runInstaller({
+      ...fixture.options,
+      dryRun: false,
+      env: { ...fixture.options.env, CLOUDX_INSTALL_UPDATED_COMMIT: git(fixture.root, "rev-parse", "HEAD") },
+    });
+    expect(result.restartServices).toBe(true);
+  });
+
+  it("stops before installation or restart when the legacy workspace cannot be backed up", async () => {
+    const fixture = plannedUpdate();
+    fs.mkdirSync(fixture.dataDir);
+    fs.writeFileSync(path.join(fixture.dataDir, "workspace.json"), "{}");
+    const write = fs.writeFileSync.bind(fs);
+    const writeFailure = vi.spyOn(fs, "writeFileSync").mockImplementation((file, ...args) => {
+      if (String(file).includes("terminal-upgrade-backup-")) throw Object.assign(new Error("Disk full"), { code: "ENOSPC" });
+      return write(file, ...args);
+    });
+    onTestFinished(() => writeFailure.mockRestore());
+
+    await expect(runInstaller({
+      ...fixture.options,
+      dryRun: false,
+      env: { ...fixture.options.env, CLOUDX_INSTALL_UPDATED_COMMIT: git(fixture.root, "rev-parse", "HEAD") },
+    })).rejects.toThrow("Could not preserve legacy workspace");
+    expect(fixture.runner.commands.filter(command => !command.inspect)).toEqual([]);
+    expect(fixture.runner.writes).toEqual([]);
+  });
+
+  it("warns about the custom service backup requirements before rebuilding or restarting", async () => {
+    const fixture = plannedUpdate({ service: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    onTestFinished(() => warn.mockRestore());
+    const run = fixture.runner.run.bind(fixture.runner);
+    fixture.runner.run = (command, args, options) => {
+      expect(warn.mock.calls.flat().join("\n")).toContain("identify CLOUDX_DATA_DIR");
+      return run(command, args, options);
+    };
+    const result = await runInstaller({
+      ...fixture.options,
+      dryRun: false,
+      env: { ...fixture.options.env, CLOUDX_INSTALL_UPDATED_COMMIT: git(fixture.root, "rev-parse", "HEAD") },
+    });
+    expect(result.restartServices).toBe(true);
   });
 });

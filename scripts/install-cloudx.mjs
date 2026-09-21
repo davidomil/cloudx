@@ -10,6 +10,7 @@ import {
   parseEnvironmentFile,
   updateEnvironmentFile,
 } from "./installer-environment.mjs";
+import { prepareTerminalUpgrade } from "./install-terminal-upgrade.mjs";
 import {
   SERVICE_NAMES,
   TERMINAL_SERVICE_NAME,
@@ -513,10 +514,10 @@ function missingEnvVars(existing, defaults) {
 }
 
 const NVIDIA_LIBRARY_PATH_PYTHON =
-  "import os, nvidia.cublas.lib, nvidia.cudnn.lib; print(os.path.dirname(nvidia.cublas.lib.__file__) + ':' + os.path.dirname(nvidia.cudnn.lib.__file__))";
+  "import nvidia.cublas.lib, nvidia.cudnn.lib; print(':'.join([*nvidia.cublas.lib.__path__, *nvidia.cudnn.lib.__path__]))";
 
 function cudaLibraryPathExport(pythonPath, deviceExpression) {
-  return `if [ "${deviceExpression}" = "cuda" ]; then export LD_LIBRARY_PATH="$(${shellQuote(pythonPath)} -c ${shellQuote(NVIDIA_LIBRARY_PATH_PYTHON)})\${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi`;
+  return `if [ "${deviceExpression}" = "cuda" ]; then cuda_library_path=$(${shellQuote(pythonPath)} -c ${shellQuote(NVIDIA_LIBRARY_PATH_PYTHON)}) || exit $?; export LD_LIBRARY_PATH="$cuda_library_path\${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; fi`;
 }
 
 export function renderAsrService({
@@ -540,7 +541,7 @@ export function renderAsrService({
     "Type=simple",
     `WorkingDirectory=${root}`,
     `EnvironmentFile=${envPath}`,
-    `ExecStart=/bin/bash -lc ${shellQuote(startCommand)}`,
+    `ExecStart=/bin/bash -lc ${systemdCommandArgument(startCommand)}`,
     "Restart=on-failure",
     "RestartSec=5",
     "",
@@ -620,7 +621,7 @@ export function renderDocumentationService({
     "Type=simple",
     `WorkingDirectory=${root}`,
     `EnvironmentFile=${envPath}`,
-    `ExecStart=/bin/bash -lc ${shellQuote(startCommand)}`,
+    `ExecStart=/bin/bash -lc ${systemdCommandArgument(startCommand)}`,
     "Restart=on-failure",
     "RestartSec=5",
     "",
@@ -1071,6 +1072,11 @@ export async function runInstaller(options = {}) {
         },
       );
     }
+    prepareTerminalUpgrade({
+      dataDir: paths.dataDir,
+      customService: updateTarget.kind === "web" ? updateTarget.serviceNames[0] : undefined,
+      dryRun,
+    });
   }
   const prompt = createPrompter({
     answers,
@@ -1079,293 +1085,296 @@ export async function runInstaller(options = {}) {
     input: options.input,
     output: options.output,
   });
-  if (updateTarget?.kind === "web") {
-    return await runWebServiceUpdater({
-      paths,
-      commands,
-      runner,
-      prompt,
-      target: updateTarget,
-      noStart: options.noStart,
-    });
-  }
-  if (options.uninstall) {
-    return await runUninstaller({ paths, commands, runner, prompt, dryRun });
-  }
-  section("1/10 Install and verify Ubuntu prerequisites");
-  if (env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
-    console.log(
-      "Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.",
-    );
-    verifyNodeAndNpm(commands);
-  } else {
-    installUbuntuPrerequisites(commands, env);
-  }
-  await ensureSupportedGit(commands, prompt);
-  if (options.update) {
-    return await runUpdater({
-      paths,
-      commands,
-      runner,
-      prompt,
-      noStart: options.noStart,
-      networkInterfaces,
-      env,
-      target: updateTarget,
-      envConfig: savedEnv,
-    });
-  }
-  const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
-  const nvidiaGpuInfo =
-    options.nvidiaGpuInfo ??
-    (gpuDetected ? detectNvidiaGpuInfo(commands) : undefined);
-  const cudaRuntimeReady =
-    options.cudaRuntimeReady ?? detectCudaRuntime(commands);
-  const intelGpuDetected = options.intelGpuDetected ?? detectIntelGpu(commands);
-  const parallelism = options.parallelism ?? defaultParallelism();
-  const defaultThreads = defaultCpuThreads(parallelism);
+  try {
+    if (updateTarget?.kind === "web") {
+      return await runWebServiceUpdater({
+        paths,
+        commands,
+        runner,
+        prompt,
+        target: updateTarget,
+        noStart: options.noStart,
+      });
+    }
+    if (options.uninstall) {
+      return await runUninstaller({ paths, commands, runner, prompt, dryRun });
+    }
+    section("1/10 Install and verify Ubuntu prerequisites");
+    if (env.CLOUDX_INSTALL_BOOTSTRAPPED === "1") {
+      console.log(
+        "Shell bootstrap already installed Ubuntu packages. Verifying Node.js and npm.",
+      );
+      verifyNodeAndNpm(commands);
+    } else {
+      installUbuntuPrerequisites(commands, env);
+    }
+    await ensureSupportedGit(commands, prompt);
+    if (options.update) {
+      return await runUpdater({
+        paths,
+        commands,
+        runner,
+        prompt,
+        noStart: options.noStart,
+        networkInterfaces,
+        env,
+        target: updateTarget,
+        envConfig: savedEnv,
+      });
+    }
+    const gpuDetected = options.gpuDetected ?? commands.exists("nvidia-smi");
+    const nvidiaGpuInfo =
+      options.nvidiaGpuInfo ??
+      (gpuDetected ? detectNvidiaGpuInfo(commands) : undefined);
+    const cudaRuntimeReady =
+      options.cudaRuntimeReady ?? detectCudaRuntime(commands);
+    const intelGpuDetected = options.intelGpuDetected ?? detectIntelGpu(commands);
+    const parallelism = options.parallelism ?? defaultParallelism();
+    const defaultThreads = defaultCpuThreads(parallelism);
 
-  section("Cloudx installer wizard");
-  console.log(
-    `Ubuntu target: ${osRelease.PRETTY_NAME ?? osRelease.VERSION_ID ?? "unknown"}`,
-  );
-  console.log(`Repository: ${root}`);
-  console.log(`Configuration file: ${paths.envPath}`);
-  console.log(`ASR model directory: ${paths.modelDir}`);
-  if (gpuDetected && nvidiaGpuInfo) {
+    section("Cloudx installer wizard");
     console.log(
-      `NVIDIA GPU detected: ${nvidiaGpuInfo.name || "unknown GPU"}, driver ${nvidiaGpuInfo.driverVersion || "unknown"}, ${nvidiaGpuInfo.memoryMb ?? "unknown"} MB VRAM.`,
+      `Ubuntu target: ${osRelease.PRETTY_NAME ?? osRelease.VERSION_ID ?? "unknown"}`,
     );
-  } else {
-    console.log(
-      "No NVIDIA GPU was detected with nvidia-smi; faster-whisper ASR will use CPU.",
-    );
-  }
-  if (gpuDetected && !cudaRuntimeReady) {
-    console.log(
-      "System CUDA/cuDNN libraries were not detected; if CUDA ASR is selected, the installer will add the required Python NVIDIA runtime libraries.",
-    );
-  }
-  if (intelGpuDetected) {
-    console.log(
-      "Intel GPU detected; optional whisper.cpp SYCL ASR can be installed for Intel GPU acceleration. CPU-only and NVIDIA installs do not need whisper.cpp.",
-    );
-  }
+    console.log(`Repository: ${root}`);
+    console.log(`Configuration file: ${paths.envPath}`);
+    console.log(`ASR model directory: ${paths.modelDir}`);
+    if (gpuDetected && nvidiaGpuInfo) {
+      console.log(
+        `NVIDIA GPU detected: ${nvidiaGpuInfo.name || "unknown GPU"}, driver ${nvidiaGpuInfo.driverVersion || "unknown"}, ${nvidiaGpuInfo.memoryMb ?? "unknown"} MB VRAM.`,
+      );
+    } else {
+      console.log(
+        "No NVIDIA GPU was detected with nvidia-smi; faster-whisper ASR will use CPU.",
+      );
+    }
+    if (gpuDetected && !cudaRuntimeReady) {
+      console.log(
+        "System CUDA/cuDNN libraries were not detected; if CUDA ASR is selected, the installer will add the required Python NVIDIA runtime libraries.",
+      );
+    }
+    if (intelGpuDetected) {
+      console.log(
+        "Intel GPU detected; optional whisper.cpp SYCL ASR can be installed for Intel GPU acceleration. CPU-only and NVIDIA installs do not need whisper.cpp.",
+      );
+    }
 
-  section("2/10 Verify Codex CLI");
-  const assistantBin = await ensureCodex(commands, prompt, paths, env);
-  const toolPath = toolPathFor(assistantBin, paths.npmGlobalDir, env.PATH);
+    section("2/10 Verify Codex CLI");
+    const assistantBin = await ensureCodex(commands, prompt, paths, env);
+    const toolPath = toolPathFor(assistantBin, paths.npmGlobalDir, env.PATH);
 
-  section("3/10 Collect install choices");
-  explainQuestion(
-    "Allowed workspace roots",
-    "Cloudx can open terminals and files only under these roots. Use ':' to separate multiple roots on Linux, for example '~:/srv/projects'.",
-  );
-  const allowedRoots = await prompt.text(
-    "allowedRoots",
-    "Allowed workspace roots",
-    "~",
-  );
-  explainQuestion(
-    "Cloudx HTTPS port",
-    "This is the HTTPS port for the web UI. Keep 3001 unless it is already in use.",
-  );
-  const port = await prompt.integer("port", "Cloudx HTTPS port", 3001, {
-    min: 1,
-    max: 65_535,
-  });
-  const host = "127.0.0.1";
-  console.log(
-    "Cloudx binds to loopback. Use an authenticated reverse proxy such as Tailscale Serve for remote access.",
-  );
-  explainQuestion(
-    "Additional certificate hostnames",
-    "Optional names or IPs to include in the generated local certificate, useful for phone or LAN access. Leave blank for localhost and detected local addresses.",
-  );
-  const certHosts = await prompt.text(
-    "certificateHosts",
-    "Additional certificate hostnames (comma-separated, blank for none)",
-    "",
-  );
-  explainQuestion(
-    "ASR CPU threads",
-    "Controls how many CPU threads Faster Whisper may use. More threads can improve transcription speed but leaves fewer cores for Codex and builds.",
-  );
-  const cpuThreads = validateCpuThreads(
-    await prompt.integer("cpuThreads", "ASR CPU threads", defaultThreads, {
+    section("3/10 Collect install choices");
+    explainQuestion(
+      "Allowed workspace roots",
+      "Cloudx can open terminals and files only under these roots. Use ':' to separate multiple roots on Linux, for example '~:/srv/projects'.",
+    );
+    const allowedRoots = await prompt.text(
+      "allowedRoots",
+      "Allowed workspace roots",
+      "~",
+    );
+    explainQuestion(
+      "Cloudx HTTPS port",
+      "This is the HTTPS port for the web UI. Keep 3001 unless it is already in use.",
+    );
+    const port = await prompt.integer("port", "Cloudx HTTPS port", 3001, {
       min: 1,
-      max: parallelism,
-    }),
-    parallelism,
-  );
-  if (answers.useGpu !== undefined) {
-    explainQuestion(
-      "NVIDIA GPU override",
-      "The installer automatically uses CUDA when NVIDIA and CUDA/cuDNN are ready. The useGpu answer can still force CPU or require GPU.",
-    );
-  }
-  const useGpu =
-    answers.useGpu === undefined
-      ? undefined
-      : parseBooleanChoice("useGpu", answers.useGpu);
-  const device = resolveDeviceConfig({
-    gpuDetected,
-    useGpu,
-    cudaRuntimeReady,
-    nvidiaGpuInfo,
-  });
-  if (device.device === "cuda") {
-    console.log(`faster-whisper ASR will use CUDA with ${device.computeType}.`);
-  }
-  explainQuestion(
-    "Optional whisper.cpp ASR",
-    "Faster Whisper is the default ASR backend and covers CPU-only and NVIDIA CUDA installs. Install whisper.cpp only when you explicitly want the alternate compiled backend, mainly SYCL for Intel Arc after oneAPI and GPU device access are available.",
-  );
-  const installWhisperCpp = await prompt.boolean(
-    "installWhisperCpp",
-    "Install optional whisper.cpp alternate ASR backend?",
-    false,
-  );
-  const whisperCpp = installWhisperCpp
-    ? {
-        build: normalizeWhisperCppBuild(
-          await prompt.text(
-            "whisperCppBuild",
-            "whisper.cpp build backend (cpu or sycl)",
-            intelGpuDetected ? "sycl" : "cpu",
-          ),
-        ),
-        model: await prompt.text(
-          "whisperCppModel",
-          "whisper.cpp GGML model",
-          WHISPER_CPP_MODEL,
-        ),
-        threads: cpuThreads,
-      }
-    : undefined;
-  explainQuestion(
-    "Install systemd services",
-    "Writes user-level services for Cloudx, persistent terminals, ASR, and the documentation indexer.",
-  );
-  const installServices = await prompt.boolean(
-    "installServices",
-    "Install Cloudx user-level systemd services?",
-    true,
-  );
-  if (installServices) {
-    explainQuestion(
-      "Start services now",
-      "Starts the persistent terminal service, restarts Cloudx, ASR, and the documentation indexer, then verifies their readiness endpoints.",
-    );
-  }
-  const startServices = installServices
-    ? !options.noStart &&
-      (await prompt.boolean(
-        "startServices",
-        "Start Cloudx services after install?",
-        true,
-      ))
-    : false;
-  if (installServices) {
-    explainQuestion(
-      "Enable linger",
-      "Lets the user-level services keep running after logout and start before the next interactive login. This uses sudo loginctl enable-linger.",
-    );
-  }
-  const enableLinger = installServices
-    ? await prompt.boolean(
-        "enableLinger",
-        "Enable user lingering so services survive logout and can start before login?",
-        true,
-      )
-    : false;
-  printChoiceSummary({
-    allowedRoots,
-    host,
-    port,
-    certHosts,
-    cpuThreads,
-    device,
-    whisperCpp,
-    installServices,
-    startServices,
-    enableLinger,
-  });
-
-  section("4/10 Install Cloudx npm dependencies");
-  commands.run("npm", ["ci"]);
-  setupUv(commands, paths);
-  section("5/10 Prepare ASR Python environment and model");
-  setupAsr(commands, paths, device.device === "cuda");
-  downloadModel(commands, paths);
-  section("6/10 Prepare documentation archive Python environment");
-  setupDocumentationIndexer(commands, paths, device.device === "cuda");
-  section("7/10 Prepare optional whisper.cpp alternate ASR backend");
-  if (whisperCpp) {
-    setupWhisperCpp(commands, paths, whisperCpp);
-  } else {
+      max: 65_535,
+    });
+    const host = "127.0.0.1";
     console.log(
-      "Skipping optional whisper.cpp backend; Faster Whisper remains active.",
+      "Cloudx binds to loopback. Use an authenticated reverse proxy such as Tailscale Serve for remote access.",
     );
-  }
-  section("8/10 Build Cloudx and create HTTPS certificate");
-  commands.run("npm", ["run", "build"]);
-  installServerRuntimeSchemas(runner, paths);
-  commands.run("npm", ["run", "cert:create"], {
-    env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined,
-  });
-
-  const envConfig = {
-    host,
-    port,
-    allowedRoots,
-    dataDir: paths.dataDir,
-    assistantBin,
-    toolPath,
-    modelDir: paths.modelDir,
-    ...defaultDocumentationConfig(paths),
-    language: "en",
-    cpuThreads,
-    documentationAsrBackend: whisperCpp ? "whisper-cpp" : "faster-whisper",
-    whisperCpp: whisperCpp ? whisperCppEnv(paths, whisperCpp) : undefined,
-    ...device,
-  };
-  section("9/10 Write Cloudx configuration");
-  runner.writeFile(paths.envPath, renderEnvFile(envConfig));
-
-  if (installServices) {
-    section("10/10 Install user-level systemd services");
-    installSystemdServices(commands, runner, paths);
-    if (enableLinger) {
-      commands.run("sudo", [
-        "loginctl",
-        "enable-linger",
-        os.userInfo().username,
-      ]);
+    explainQuestion(
+      "Additional certificate hostnames",
+      "Optional names or IPs to include in the generated local certificate, useful for phone or LAN access. Leave blank for localhost and detected local addresses.",
+    );
+    const certHosts = await prompt.text(
+      "certificateHosts",
+      "Additional certificate hostnames (comma-separated, blank for none)",
+      "",
+    );
+    explainQuestion(
+      "ASR CPU threads",
+      "Controls how many CPU threads Faster Whisper may use. More threads can improve transcription speed but leaves fewer cores for Codex and builds.",
+    );
+    const cpuThreads = validateCpuThreads(
+      await prompt.integer("cpuThreads", "ASR CPU threads", defaultThreads, {
+        min: 1,
+        max: parallelism,
+      }),
+      parallelism,
+    );
+    if (answers.useGpu !== undefined) {
+      explainQuestion(
+        "NVIDIA GPU override",
+        "The installer automatically uses CUDA when NVIDIA and CUDA/cuDNN are ready. The useGpu answer can still force CPU or require GPU.",
+      );
     }
-    commands.run("systemctl", ["--user", "daemon-reload"]);
-    commands.run("systemctl", ["--user", "enable", ...SERVICE_NAMES]);
-    if (startServices) {
-      commands.run("systemctl", ["--user", "start", TERMINAL_SERVICE_NAME]);
-      commands.run("systemctl", ["--user", "restart", ...UPDATE_SERVICE_NAMES]);
-      verifyServices(commands, port, defaultDocumentationEnvVars(paths));
+    const useGpu =
+      answers.useGpu === undefined
+        ? undefined
+        : parseBooleanChoice("useGpu", answers.useGpu);
+    const device = resolveDeviceConfig({
+      gpuDetected,
+      useGpu,
+      cudaRuntimeReady,
+      nvidiaGpuInfo,
+    });
+    if (device.device === "cuda") {
+      console.log(`faster-whisper ASR will use CUDA with ${device.computeType}.`);
     }
-  } else {
-    section("10/10 Skip systemd service installation");
-    console.log("Cloudx was configured for manual startup with npm run dev.");
-  }
+    explainQuestion(
+      "Optional whisper.cpp ASR",
+      "Faster Whisper is the default ASR backend and covers CPU-only and NVIDIA CUDA installs. Install whisper.cpp only when you explicitly want the alternate compiled backend, mainly SYCL for Intel Arc after oneAPI and GPU device access are available.",
+    );
+    const installWhisperCpp = await prompt.boolean(
+      "installWhisperCpp",
+      "Install optional whisper.cpp alternate ASR backend?",
+      false,
+    );
+    const whisperCpp = installWhisperCpp
+      ? {
+          build: normalizeWhisperCppBuild(
+            await prompt.text(
+              "whisperCppBuild",
+              "whisper.cpp build backend (cpu or sycl)",
+              intelGpuDetected ? "sycl" : "cpu",
+            ),
+          ),
+          model: await prompt.text(
+            "whisperCppModel",
+            "whisper.cpp GGML model",
+            WHISPER_CPP_MODEL,
+          ),
+          threads: cpuThreads,
+        }
+      : undefined;
+    explainQuestion(
+      "Install systemd services",
+      "Writes user-level services for Cloudx, persistent terminals, ASR, and the documentation indexer.",
+    );
+    const installServices = await prompt.boolean(
+      "installServices",
+      "Install Cloudx user-level systemd services?",
+      true,
+    );
+    if (installServices) {
+      explainQuestion(
+        "Start services now",
+        "Starts the persistent terminal service, restarts Cloudx, ASR, and the documentation indexer, then verifies their readiness endpoints.",
+      );
+    }
+    const startServices = installServices
+      ? !options.noStart &&
+        (await prompt.boolean(
+          "startServices",
+          "Start Cloudx services after install?",
+          true,
+        ))
+      : false;
+    if (installServices) {
+      explainQuestion(
+        "Enable linger",
+        "Lets the user-level services keep running after logout and start before the next interactive login. This uses sudo loginctl enable-linger.",
+      );
+    }
+    const enableLinger = installServices
+      ? await prompt.boolean(
+          "enableLinger",
+          "Enable user lingering so services survive logout and can start before login?",
+          true,
+        )
+      : false;
+    printChoiceSummary({
+      allowedRoots,
+      host,
+      port,
+      certHosts,
+      cpuThreads,
+      device,
+      whisperCpp,
+      installServices,
+      startServices,
+      enableLinger,
+    });
 
-  await prompt.close();
-  printInstallComplete({ paths, port, installServices, startServices });
-  return {
-    runner,
-    paths,
-    envConfig,
-    installServices,
-    startServices,
-    enableLinger,
-    urls: cloudxAccessUrls(port),
-  };
+    section("4/10 Install Cloudx npm dependencies");
+    commands.run("npm", ["ci"]);
+    setupUv(commands, paths);
+    section("5/10 Prepare ASR Python environment and model");
+    setupAsr(commands, paths, device.device === "cuda");
+    downloadModel(commands, paths);
+    section("6/10 Prepare documentation archive Python environment");
+    setupDocumentationIndexer(commands, paths, device.device === "cuda");
+    section("7/10 Prepare optional whisper.cpp alternate ASR backend");
+    if (whisperCpp) {
+      setupWhisperCpp(commands, paths, whisperCpp);
+    } else {
+      console.log(
+        "Skipping optional whisper.cpp backend; Faster Whisper remains active.",
+      );
+    }
+    section("8/10 Build Cloudx and create HTTPS certificate");
+    commands.run("npm", ["run", "build"]);
+    installServerRuntimeSchemas(runner, paths);
+    commands.run("npm", ["run", "cert:create"], {
+      env: certHosts.trim() ? { CLOUDX_CERT_HOSTS: certHosts.trim() } : undefined,
+    });
+
+    const envConfig = {
+      host,
+      port,
+      allowedRoots,
+      dataDir: paths.dataDir,
+      assistantBin,
+      toolPath,
+      modelDir: paths.modelDir,
+      ...defaultDocumentationConfig(paths),
+      language: "en",
+      cpuThreads,
+      documentationAsrBackend: whisperCpp ? "whisper-cpp" : "faster-whisper",
+      whisperCpp: whisperCpp ? whisperCppEnv(paths, whisperCpp) : undefined,
+      ...device,
+    };
+    section("9/10 Write Cloudx configuration");
+    runner.writeFile(paths.envPath, renderEnvFile(envConfig));
+
+    if (installServices) {
+      section("10/10 Install user-level systemd services");
+      installSystemdServices(commands, runner, paths);
+      if (enableLinger) {
+        commands.run("sudo", [
+          "loginctl",
+          "enable-linger",
+          os.userInfo().username,
+        ]);
+      }
+      commands.run("systemctl", ["--user", "daemon-reload"]);
+      commands.run("systemctl", ["--user", "enable", ...SERVICE_NAMES]);
+      if (startServices) {
+        commands.run("systemctl", ["--user", "start", TERMINAL_SERVICE_NAME]);
+        commands.run("systemctl", ["--user", "restart", ...UPDATE_SERVICE_NAMES]);
+        verifyServices(commands, port, defaultDocumentationEnvVars(paths));
+      }
+    } else {
+      section("10/10 Skip systemd service installation");
+      console.log("Cloudx was configured for manual startup with npm run dev.");
+    }
+
+    printInstallComplete({ paths, port, installServices, startServices });
+    return {
+      runner,
+      paths,
+      envConfig,
+      installServices,
+      startServices,
+      enableLinger,
+      urls: cloudxAccessUrls(port),
+    };
+  } finally {
+    await prompt.close();
+  }
 }
 
 async function runUninstaller({ paths, commands, runner, prompt }) {
@@ -1523,7 +1532,6 @@ async function runUninstaller({ paths, commands, runner, prompt }) {
 
   section("6/6 Uninstall complete");
   console.log("Cloudx uninstall complete.");
-  await prompt.close();
   return {
     runner,
     paths,
@@ -1692,7 +1700,6 @@ async function runUpdater({
 
   section("Update complete");
   printUpdateComplete({ paths, port, servicesInstalled, restartServices });
-  await prompt.close();
   return {
     runner,
     paths,
@@ -1732,7 +1739,6 @@ async function runWebServiceUpdater({
       insecure: true,
     });
   }
-  await prompt.close();
   section("Update complete");
   console.log(
     `${service}: checkout rebuilt${restartServices ? " and service restarted" : "; service was not restarted"}.`,
@@ -2061,6 +2067,7 @@ function verifyServices(commands, port, envConfig) {
     waitForHealth(commands, {
       label: "Cloudx ASR",
       url: "http://127.0.0.1:7810/ready",
+      requestTimeoutSeconds: 5,
     });
     waitForHealth(commands, {
       label: "Cloudx documentation indexer",
@@ -2097,38 +2104,61 @@ function verifyServices(commands, port, envConfig) {
 
 export function waitForHealth(
   commands,
-  { label, url, insecure = false, startupTimeoutSeconds = 300 },
+  {
+    label,
+    url,
+    insecure = false,
+    startupTimeoutSeconds = 300,
+    requestTimeoutSeconds = 30,
+  },
 ) {
   console.log(
     `Waiting for ${label} readiness endpoint: ${url} (startup budget: ${startupTimeoutSeconds}s)`,
   );
-  const args = [
-    "--fail",
-    "--silent",
-    "--show-error",
-    "--max-time",
-    "5",
-    "--retry",
-    String(startupTimeoutSeconds),
-    "--retry-max-time",
-    String(startupTimeoutSeconds),
-    "--retry-delay",
-    "1",
-    "--retry-connrefused",
-  ];
-  if (insecure) {
-    args.push("--insecure");
+  const deadline = Date.now() + startupTimeoutSeconds * 1000;
+  const retryDelay = new Int32Array(new SharedArrayBuffer(4));
+  let failure;
+  while (Date.now() < deadline) {
+    const timeout = Math.min(requestTimeoutSeconds, (deadline - Date.now()) / 1000);
+    if (timeout <= 0) break;
+    const args = [
+      "--fail-with-body",
+      "--silent",
+      "--show-error",
+      "--max-time",
+      String(timeout),
+      "--write-out",
+      "\n%{http_code}",
+      ...(insecure ? ["--insecure"] : []),
+      url,
+    ];
+    try {
+      commands.capture("curl", args);
+      console.log(`  ${label} readiness ok.`);
+      return;
+    } catch (error) {
+      const response = String(error.stdout ?? "").trim();
+      const separator = response.lastIndexOf("\n");
+      const status = Number(response.slice(separator + 1));
+      const body = separator < 0 ? "" : response.slice(0, separator);
+      let startupFailed = false;
+      try {
+        startupFailed = JSON.parse(body)?.code === "documentation_startup_failed";
+      } catch {
+        // HTTP errors without a JSON body still follow their status code.
+      }
+      failure = new Error(
+        `${label} readiness verification failed at ${url} (startup budget: ${startupTimeoutSeconds}s). ${error.message}${body ? ` Response: ${body}` : ""}`,
+        { cause: error },
+      );
+      const retryable = [7, 28].includes(error.status) ||
+        (error.status === 22 && [408, 429, 500, 502, 503, 504].includes(status));
+      if (startupFailed || !retryable) throw failure;
+    }
+    const remaining = deadline - Date.now();
+    if (remaining > 0) Atomics.wait(retryDelay, 0, 0, Math.min(1000, remaining));
   }
-  args.push(url);
-  try {
-    commands.capture("curl", args);
-  } catch (error) {
-    throw new Error(
-      `${label} readiness verification failed at ${url} (startup budget: ${startupTimeoutSeconds}s). ${error.message}`,
-      { cause: error },
-    );
-  }
-  console.log(`  ${label} readiness ok.`);
+  throw failure ?? new Error(`${label} readiness startup budget was exhausted at ${url}.`);
 }
 
 function runCodexUpdater({ paths, commands, env }) {
@@ -2471,6 +2501,13 @@ function defaultParallelism() {
   return typeof os.availableParallelism === "function"
     ? os.availableParallelism()
     : os.cpus().length || 4;
+}
+
+function systemdCommandArgument(value) {
+  return `"${value
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replace(/[$%]/g, (character) => character + character)}"`;
 }
 
 function shellQuote(value) {

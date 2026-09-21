@@ -780,25 +780,31 @@ class DocumentationArchive:
                         document = dict(document)
                         document["snapshot_path"] = snapshot.relative_to(self.root).as_posix()
                         replaced_snapshots.append(original_snapshot)
-                    metadata = {}
-                    metadata_path = snapshot.parent / "metadata.json"
-                    if metadata_path != snapshot and metadata_path.is_file():
-                        if not is_relative_to(metadata_path.resolve(), snapshot.parent):
-                            raise ArchiveError("Legacy source metadata escapes its retained directory.")
-                        metadata = json.loads(metadata_path.read_text())
-                        if not isinstance(metadata, dict):
-                            raise ArchiveError("Legacy source metadata must be an object.")
-                    else:
-                        metadata_path.write_text(json.dumps(metadata))
+                    metadata = self._read_legacy_metadata(snapshot, document)
+                    recovery = metadata.get("legacyMetadataRecovery")
+                    recovered_metadata = (isinstance(recovery, dict)
+                        and recovery.get("reason") in ("empty", "missing")
+                        and recovery.get("verifiedContentSha256") == document["content_sha256"]
+                        and recovery.get("metadataPath") == (snapshot.parent / "metadata.json").relative_to(self.root).as_posix()
+                        and isinstance(recovery.get("warning"), str))
                     locators = {row[0] for row in db.execute("SELECT DISTINCT locator FROM chunks WHERE document_id = ? AND chunk_origin = 'source'", (document["document_id"],))}
                     mode = "retained-evidence" if "youtube" in metadata else "text" if locators == {"text"} else "html" if locators == {"html"} else "file"
                     manifest = retained_source_manifest(uri=document["uri"], content_sha256=document["content_sha256"],
-                        snapshot_path=document["snapshot_path"], filename=metadata.get("originalFilename", snapshot.name), metadata=metadata, mode=mode)
+                        snapshot_path=document["snapshot_path"], filename=snapshot.name if recovered_metadata else metadata.get("originalFilename", snapshot.name), metadata=metadata, mode=mode)
                     manifest["analysisNeedsRebuild"] = True
+                    if recovered_metadata:
+                        manifest["migrationWarnings"] = [recovery["warning"]]
+                        if document["source_type"] == "media":
+                            manifest["rebuildBlocked"] = (
+                                f"Reanalysis is blocked for legacy media {document['document_id']} at {document['snapshot_path']}: "
+                                "media provenance is unavailable after metadata recovery. Retained chunks and artifacts are preserved; "
+                                "restore verified media provenance before rebuilding."
+                            )
+                            manifest["migrationWarnings"].append(manifest["rebuildBlocked"])
                     aliases = legacy_directories[original_snapshot.parent.relative_to(self.root).as_posix()]
                     if aliases > 1:
                         manifest["legacyMetadataAttribution"] = "shared-directory-unverified"
-                        manifest["migrationWarnings"] = ["Legacy aliases shared one metadata/artifact directory; overwritten per-import metadata cannot be recovered from retained bytes."]
+                        manifest.setdefault("migrationWarnings", []).append("Legacy aliases shared one metadata/artifact directory; overwritten per-import metadata cannot be recovered from retained bytes.")
                     if document["source_type"] == "repo_code":
                         manifest["mode"] = "legacy-generated-documentation"
                         try:
@@ -813,7 +819,8 @@ class DocumentationArchive:
                         if document["source_type"] in {"text", "readme", "repo_code"}:
                             decode_text(content)
                     except ValueError as error:
-                        state = "quarantined"
+                        if state == ACTIVE_STATE:
+                            state = "quarantined"
                         manifest["admissionError"] = str(error)
                     db.execute("UPDATE documents SET snapshot_path = ?, source_manifest_json = ?, source_key = ?, state = ? WHERE document_id = ?",
                                (document["snapshot_path"], json.dumps(manifest), canonical_source_key(document["uri"]), state, document["document_id"]))
@@ -837,6 +844,30 @@ class DocumentationArchive:
                 self._discard_unreferenced_snapshot(snapshot)
             except OSError as error:
                 logger.warning("Legacy source was preserved, but its old snapshot could not be removed: %s", error)
+
+    def _read_legacy_metadata(self, snapshot: Path, document: Mapping) -> dict:
+        metadata_path = snapshot.parent / "metadata.json"
+        diagnostic = f"Legacy source metadata for {document['document_id']} at {metadata_path}"
+        if not is_relative_to(metadata_path.resolve(), snapshot.parent):
+            raise ArchiveError(f"{diagnostic} escapes its retained directory.")
+        try:
+            exists = metadata_path.exists() or metadata_path.is_symlink()
+            text = metadata_path.read_text(encoding="utf-8") if exists else ""
+            if text.strip():
+                metadata = json.loads(text)
+                if not isinstance(metadata, dict):
+                    raise ValueError("metadata must be an object")
+                return metadata
+            reason = "empty" if exists else "missing"
+            warning = f"Legacy metadata was {reason}; only the retained filename was recovered after source SHA-256 verification. Other metadata is unavailable."
+            metadata = {"originalFilename": snapshot.name, "legacyMetadataRecovery": {
+                "reason": reason, "metadataPath": metadata_path.relative_to(self.root).as_posix(),
+                "verifiedContentSha256": document["content_sha256"], "warning": warning}}
+            write_snapshot_metadata(metadata_path, metadata)
+        except (OSError, UnicodeError, ValueError) as error:
+            raise ArchiveError(f"{diagnostic}: {error}") from error
+        logger.warning("%s: %s", diagnostic, warning)
+        return metadata
 
     def _register_artifacts(self, db: sqlite3.Connection, document_id: str, artifacts: list[dict]) -> None:
         revision = db.execute("SELECT extraction_revision FROM documents WHERE document_id = ?", (document_id,)).fetchone()[0]
@@ -1449,6 +1480,8 @@ class DocumentationArchive:
         if sha256_bytes(source_bytes) != document["content_sha256"]:
             raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
         manifest = json.loads(document["source_manifest_json"])
+        if manifest.get("rebuildBlocked"):
+            raise ArchiveError(manifest["rebuildBlocked"])
         if manifest.get("mode") == "legacy-generated-documentation" and not manifest.get("originalAvailable"):
             raise ArchiveError(manifest.get("rebuildBlocked") or "Legacy generated documentation has no verified original source inputs.")
         metadata = manifest.get("metadata", {})
@@ -1507,7 +1540,9 @@ class DocumentationArchive:
             if mode == "legacy-generated-documentation":
                 updated_manifest.update(originalAvailable=True, rawOriginals=manifest["rawOriginals"])
             if manifest.get("legacyMetadataAttribution"):
-                updated_manifest.update(legacyMetadataAttribution=manifest["legacyMetadataAttribution"], migrationWarnings=manifest["migrationWarnings"])
+                updated_manifest["legacyMetadataAttribution"] = manifest["legacyMetadataAttribution"]
+            if manifest.get("migrationWarnings"):
+                updated_manifest["migrationWarnings"] = manifest["migrationWarnings"]
             (staged_snapshot.parent / "source-manifest.json").write_text(json.dumps(updated_manifest, sort_keys=True))
             (staged_snapshot.parent / "source-spans.json").write_text(json.dumps([{"text": span.text, "locator": span.locator} for span in spans]))
             artifacts = snapshot_artifacts(document_id, staged_snapshot)
@@ -1898,7 +1933,7 @@ class DocumentationArchive:
         detected_type = detected_content_type(content_bytes)
         if detected_type and not metadata.get("contentType"):
             metadata["contentType"] = detected_type
-            (snapshot_path.parent / "metadata.json").write_text(json.dumps(metadata, sort_keys=True))
+            write_snapshot_metadata(snapshot_path.parent / "metadata.json", metadata)
         source_key = metadata.get("sourceKey", source_key)
         manifest = retained_source_manifest(
             uri=uri, content_sha256=content_sha256, snapshot_path=snapshot_path.relative_to(self.root).as_posix(),
@@ -2175,9 +2210,12 @@ class DocumentationArchive:
             safe_name = "source-" + safe_name
         directory = Path(tempfile.mkdtemp(prefix=sha256_bytes(content)[:16] + "-", dir=directory_root or self.snapshots_dir))
         artifact = directory / safe_name
-        artifact.write_bytes(content)
-        (directory / "metadata.json").write_text(
-            json.dumps({**(metadata or {}), "originalFilename": filename}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            artifact.write_bytes(content)
+            write_snapshot_metadata(directory / "metadata.json", {**(metadata or {}), "originalFilename": filename})
+        except Exception:
+            shutil.rmtree(directory)
+            raise
         return artifact
 
     def _discard_unreferenced_snapshot(self, snapshot_path: Path, *, excluding_purge_id: int | None = None) -> None:
@@ -5510,6 +5548,21 @@ def private_url_ingest_allowed() -> bool:
 def safe_file_name(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip())[:120].strip("._-")
     return safe or "source"
+
+
+def write_snapshot_metadata(path: Path, metadata: dict) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".metadata-", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def sha256_bytes(content: bytes) -> str:

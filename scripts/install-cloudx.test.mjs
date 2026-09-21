@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { execFileSync } from "node:child_process";
 
 import { describe, expect, it, vi } from "vitest";
@@ -1432,51 +1433,36 @@ describe("runInstaller dry-run", () => {
     ]);
     expect(planned).toContainEqual([
       "curl",
-      "--fail",
+      "--fail-with-body",
       "--silent",
       "--show-error",
       "--max-time",
-      "5",
-      "--retry",
-      "300",
-      "--retry-max-time",
-      "300",
-      "--retry-delay",
-      "1",
-      "--retry-connrefused",
+      "30",
+      "--write-out",
+      "\n%{http_code}",
       "--insecure",
       "https://127.0.0.1:3001/api/ready",
     ]);
     expect(planned).toContainEqual([
       "curl",
-      "--fail",
+      "--fail-with-body",
       "--silent",
       "--show-error",
       "--max-time",
       "5",
-      "--retry",
-      "300",
-      "--retry-max-time",
-      "300",
-      "--retry-delay",
-      "1",
-      "--retry-connrefused",
+      "--write-out",
+      "\n%{http_code}",
       "http://127.0.0.1:7810/ready",
     ]);
     expect(planned).toContainEqual([
       "curl",
-      "--fail",
+      "--fail-with-body",
       "--silent",
       "--show-error",
       "--max-time",
-      "5",
-      "--retry",
-      "300",
-      "--retry-max-time",
-      "300",
-      "--retry-delay",
-      "1",
-      "--retry-connrefused",
+      "30",
+      "--write-out",
+      "\n%{http_code}",
       "http://127.0.0.1:7820/ready",
     ]);
     expect(
@@ -1830,51 +1816,36 @@ describe("runInstaller dry-run", () => {
     );
     expect(planned).toContainEqual([
       "curl",
-      "--fail",
+      "--fail-with-body",
       "--silent",
       "--show-error",
       "--max-time",
-      "5",
-      "--retry",
-      "300",
-      "--retry-max-time",
-      "300",
-      "--retry-delay",
-      "1",
-      "--retry-connrefused",
+      "30",
+      "--write-out",
+      "\n%{http_code}",
       "--insecure",
       "https://127.0.0.1:3443/api/ready",
     ]);
     expect(planned).toContainEqual([
       "curl",
-      "--fail",
+      "--fail-with-body",
       "--silent",
       "--show-error",
       "--max-time",
       "5",
-      "--retry",
-      "300",
-      "--retry-max-time",
-      "300",
-      "--retry-delay",
-      "1",
-      "--retry-connrefused",
+      "--write-out",
+      "\n%{http_code}",
       "http://127.0.0.1:7810/ready",
     ]);
     expect(planned).toContainEqual([
       "curl",
-      "--fail",
+      "--fail-with-body",
       "--silent",
       "--show-error",
       "--max-time",
-      "5",
-      "--retry",
-      "300",
-      "--retry-max-time",
-      "300",
-      "--retry-delay",
-      "1",
-      "--retry-connrefused",
+      "30",
+      "--write-out",
+      "\n%{http_code}",
       "http://127.0.0.1:9000/ready",
     ]);
     expect(
@@ -1891,5 +1862,40 @@ describe("runInstaller dry-run", () => {
         path.join(home, ".config/systemd/user/cloudx-documentation.service"),
       ]),
     );
+  });
+});
+
+describe("installer prompt ownership", () => {
+  it.each(["install", "uninstall"])("closes interactive input after a failed %s", async (mode) => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const runner = new InstallerRunner({ dryRun: true, log: () => {} });
+    runner.run = () => { throw new Error("Installer operation failed"); };
+    try {
+      await expect(runInstaller({
+        repoRoot: "/repo",
+        home: "/home/me",
+        env: { ...TEST_ENV, CLOUDX_INSTALL_BOOTSTRAPPED: "1" },
+        runner,
+        uninstall: mode === "uninstall",
+        input,
+        output,
+        answers: {
+          removeServices: true,
+          removeConfig: false,
+          removeVenv: false,
+          removeRuntimeData: false,
+          removeModel: false,
+          removeNodeModules: false,
+          disableLinger: false,
+        },
+        osRelease: { ID: "ubuntu", VERSION_ID: "24.04" },
+      })).rejects.toThrow("Installer operation failed");
+      expect(input.listenerCount("data")).toBe(0);
+      expect(input.isPaused()).toBe(true);
+    } finally {
+      input.destroy();
+      output.destroy();
+    }
   });
 });

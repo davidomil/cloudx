@@ -23,7 +23,7 @@ afterEach(async () => {
 const initial: CodexGlobalSettings = { revision: "first", model: "initial-model", serviceTier: "priority", fastModeEnabled: true };
 const config: CloudxConfigResponse = { globalFields: [], plugins: [], values: { global: {}, plugins: {} } };
 
-async function mount(read: () => Promise<CodexGlobalSettings> = async () => initial) {
+async function mount(read: () => Promise<CodexGlobalSettings> = async () => initial, initialCategoryId?: string) {
   const calls: { hook: string; input: Record<string, unknown> }[] = [];
   const save = vi.fn(async () => {});
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
@@ -34,7 +34,7 @@ async function mount(read: () => Promise<CodexGlobalSettings> = async () => init
   document.body.append(container);
   root = createRoot(container);
   const dialog = createElement(StrictMode, {}, createElement(SettingsDialog, {
-    config, callHook, onSave: save, onCancel: () => root.render(null)
+    config, callHook, initialCategoryId, onSave: save, onCancel: () => root.render(null)
   }));
   const open = async () => { await act(async () => root.render(dialog)); };
   await open();
@@ -59,6 +59,15 @@ function model(container: Element) { return container.querySelector<HTMLInputEle
 const codexTab = '[role="tab"][aria-label="Codex"]';
 
 describe("Codex settings in the Settings window", () => {
+  it("opens the Codex category directly for a retired workspace panel without writing preferences", async () => {
+    const { container, calls, save } = await mount(undefined, "codex");
+    expect(container.querySelector(codexTab)?.getAttribute("aria-selected")).toBe("true");
+    expect(model(container).value).toBe("initial-model");
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every(call => call.hook === "codex-settings.read")).toBe(true);
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it("loads only when opened and preserves edits across categories and search filtering", async () => {
     const { container, calls } = await mount();
     expect(calls).toEqual([]);

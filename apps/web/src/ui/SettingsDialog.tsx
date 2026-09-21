@@ -40,6 +40,7 @@ export function SettingsDialog({
   onRequestBrowserNotifications,
   cloudxUpdate,
   callHook,
+  initialCategoryId = "general",
   children
 }: {
   config: CloudxConfigResponse;
@@ -52,13 +53,14 @@ export function SettingsDialog({
   onRequestBrowserNotifications?: () => Promise<void>;
   cloudxUpdate?: CloudxUpdateController;
   callHook?: UiContributionRenderContext["callHook"];
+  initialCategoryId?: string;
   children?: ReactNode;
 }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
   const [defaultTemplateId, setDefaultTemplateId] = useState(rulesSkillsStore?.defaultTemplateId ?? "");
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState("");
-  const [activeCategoryId, setActiveCategoryId] = useState("general");
+  const [activeCategoryId, setActiveCategoryId] = useState(initialCategoryId);
   const [horizontalTabs, setHorizontalTabs] = useState(false);
   const [codexSettingsEditor] = useState(() => new CodexSettingsEditor());
   const dialogRef = useRef<HTMLDivElement | null>(null);

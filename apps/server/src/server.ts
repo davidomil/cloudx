@@ -33,7 +33,7 @@ import type {
 import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
 import { AsrClient } from "./asrClient.js";
-import { DEFAULT_DOCUMENTATION_URL, DocumentationClient } from "./documentation/DocumentationClient.js";
+import { DEFAULT_DOCUMENTATION_URL, DocumentationClient, DocumentationStartupError } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
 import { DocumentationBackgroundEnrichment } from "./documentation/DocumentationBackgroundEnrichment.js";
 import { CodexDocumentationEnrichmentRunner, DocumentationEnrichmentService } from "./documentation/DocumentationEnrichmentService.js";
@@ -326,6 +326,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       return { status: "ready" };
     } catch (error) {
       app.log.warn({ dependencyError: error instanceof Error ? error.name : "unknown" }, "Cloudx readiness check failed.");
+      if (error instanceof DocumentationStartupError) {
+        return reply.code(503).send({ status: "not-ready", code: error.code, detail: error.message });
+      }
       return reply.code(503).send({ status: "not-ready" });
     }
   });
@@ -529,6 +532,19 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const body = tabActionBody(request.body);
     const result = await services.sessions.executePluginAction(request.params.tabId, body.action, body.input);
     return { result };
+  });
+
+  app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/recover", async (request) => {
+    const body = optionalRequestBody(request.body);
+    if (Object.keys(body).some(key => key !== "action" && key !== "sessionId")) throwBadRequest("Unknown recovery field.");
+    const action = body.action;
+    if (action !== "reconnect" && action !== "new-shell" && action !== "resume-conversation") throwBadRequest("Unknown recovery action.");
+    let sessionId: string | undefined;
+    if (body.sessionId !== undefined) {
+      sessionId = requiredTrimmedBodyString(body.sessionId, "sessionId");
+      if (action !== "resume-conversation" || !/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) throwBadRequest("sessionId must be an exact conversation ID for resume-conversation.");
+    }
+    return services.sessions.recoverTab(request.params.tabId, { action, sessionId });
   });
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/files/download", async (request, reply) => {

@@ -3,8 +3,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
-import type { CloudxAppContext, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { ConfigValue } from "@cloudx/shared";
+import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
+import type { ConfigValue, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
@@ -57,6 +57,7 @@ export class SessionStore {
   private readonly triggerEmissions = new Set<Promise<unknown>>();
   private readonly contextWrites = new Set<Promise<void>>();
   private readonly tabClosures = new Map<string, Promise<void>>();
+  private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
   private readonly shutdownController = new AbortController();
   private disposed = false;
@@ -90,10 +91,14 @@ export class SessionStore {
       this.activeTabId = saved.activeTabId;
       for (const { tab } of saved.sessions) {
         try {
+          const retirement = this.plugins.get(tab.pluginId).retirementMessage;
+          if (retirement) {
+            this.updateTab(tab.id, { status: "stopped", statusMessage: retirement, recovery: { state: "retired", message: retirement }, indicator: indicatorForStatus("stopped", retirement) });
+            continue;
+          }
           this.bindSession(tab.id, await this.restoreTabSession(tab));
         } catch (error) {
-          const message = `Could not restore tab: ${error instanceof Error ? error.message : String(error)}`;
-          this.updateTab(tab.id, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });
+          await this.recordRestoreFailure(tab, error);
         }
       }
     } finally {
@@ -103,21 +108,120 @@ export class SessionStore {
     await this.savedSessions?.flush();
   }
 
-  private async restoreTabSession(tab: WorkspaceTab): Promise<PluginSession> {
+  private async sessionInput(tab: WorkspaceTab): Promise<CreatePluginSessionInput> {
     const plugin = this.plugins.get(tab.pluginId);
     const cwd = await this.pathPolicy.ensureDirectory(tab.cwd, false);
     const window = this.workspace?.findWindowForTab(tab.id);
-    const input = {
+    return {
       tab: this.getTab(tab.id), cwd, initialInput: this.initialInputs.get(tab.id),
       runtimeContext: await this.runtimeContextResolver?.runtimeContextFor(tab, window),
       app: this.createAppContext(plugin.id, tab.id), controls: this.createControls(tab.id),
       config: this.configProvider.getPluginConfig(plugin.id),
       getConfig: () => this.configProvider.getPluginConfig(plugin.id)
     };
+  }
+
+  private async restoreTabSession(tab: WorkspaceTab): Promise<PluginSession> {
+    const plugin = this.plugins.get(tab.pluginId);
+    const input = await this.sessionInput(tab);
     if (plugin.panelKind === "terminal" && !plugin.restoreSession) {
       throw new Error(`${plugin.displayName} does not support reconnecting an existing session.`);
     }
-    return plugin.restoreSession ? plugin.restoreSession(input) : plugin.createSession(input);
+    const session = await (plugin.restoreSession ? plugin.restoreSession(input) : plugin.createSession(input));
+    if (plugin.panelKind === "terminal" && session.hasExited?.()) {
+      try { await session.terminate?.(); }
+      finally { session.detach?.(); }
+      throw new PluginSessionMissingError("The previous terminal process ended.");
+    }
+    return session;
+  }
+
+  private async recordRestoreFailure(tab: WorkspaceTab, error: unknown, expectedSession?: PluginSession): Promise<void> {
+    const message = `Could not restore tab: ${error instanceof Error ? error.message : String(error)}`;
+    const plugin = this.plugins.values().find(plugin => plugin.id === tab.pluginId);
+    let recovery: TabRecovery | undefined;
+    if (plugin?.panelKind === "terminal") {
+      recovery = { state: "unavailable", message: `${message} Check the connection before deciding whether the process ended.` };
+      if (error instanceof PluginSessionMissingError) {
+        recovery = { state: "missing", message: plugin.id === "standard-terminal"
+          ? "The previous terminal process ended. Open a new shell in the saved directory to continue."
+          : "The previous terminal process ended." };
+        try {
+          if (plugin.describeRecovery) Object.assign(recovery, await plugin.describeRecovery(await this.sessionInput(tab)));
+        } catch (descriptionError) {
+          recovery.message = descriptionError instanceof Error ? descriptionError.message : String(descriptionError);
+          recovery.canResume = false;
+        }
+      }
+    }
+    if (expectedSession && this.sessions.get(tab.id) !== expectedSession) return;
+    this.updateTab(tab.id, { status: "failed", statusMessage: message, recovery, indicator: indicatorForStatus("failed", message) });
+  }
+
+  recoverTab(tabId: string, request: RecoverTabRequest): Promise<WorkspaceTab> {
+    if (this.disposed) return Promise.reject(new Error("Session store is disposed."));
+    if (this.tabClosures.has(tabId)) return Promise.reject(new Error("The tab is closing."));
+    const pending = this.tabRecoveries.get(tabId);
+    if (pending) return pending;
+    const recovering = this.admitAction(undefined, () => this.recoverTabNow(tabId, request));
+    this.tabRecoveries.set(tabId, recovering);
+    void recovering.then(() => this.tabRecoveries.delete(tabId), () => this.tabRecoveries.delete(tabId));
+    return recovering;
+  }
+
+  private async recoverTabNow(tabId: string, request: RecoverTabRequest): Promise<WorkspaceTab> {
+    const tab = this.getTab(tabId);
+    const plugin = this.plugins.get(tab.pluginId);
+    if (tab.ownerPluginId || plugin.panelKind !== "terminal") throw new Error("This tab does not support terminal recovery.");
+    if (request.action === "new-shell" && plugin.id !== "standard-terminal" || request.action === "resume-conversation" && plugin.id !== "codex-terminal") {
+      throw new Error("The recovery action does not match this terminal.");
+    }
+    if (request.action === "resume-conversation" && !plugin.recoverSession) throw new Error("Conversation recovery is unavailable.");
+    const previous = this.sessions.get(tabId);
+    if (previous && !previous.hasExited?.() && !tab.recovery && tab.status === "running") return tab;
+    const restoreInput = previous?.restoreInput?.();
+    if (restoreInput) this.initialInputs.set(tabId, restoreInput);
+    this.disposeSessionListeners(tabId);
+    previous?.detach?.();
+    this.sessions.delete(tabId);
+    this.updateTab(tabId, { status: "starting", statusMessage: "Checking the terminal broker." });
+    let attached: PluginSession | undefined;
+    try {
+      attached = await this.restoreTabSession(tab);
+    } catch (error) {
+      await this.recordRestoreFailure(tab, error);
+      if (!(error instanceof PluginSessionMissingError) || request.action === "reconnect") {
+        await this.savedSessions?.flush();
+        return this.getTab(tabId);
+      }
+    }
+    if (attached) {
+      this.bindSession(tabId, attached);
+      await this.savedSessions?.flush();
+      return this.getTab(tabId);
+    }
+    try {
+      this.updateTab(tabId, { status: "starting", statusMessage: "Recovering terminal." });
+      const input = await this.sessionInput(this.getTab(tabId));
+      const sessionId = request.sessionId ?? this.getTab(tabId).recovery?.conversationId;
+      if (request.action === "resume-conversation") {
+        if (!sessionId) throw new Error("Select an exact Codex conversation ID to resume.");
+        input.initialInput = { ...input.initialInput, resume: { mode: "session", sessionId } };
+      }
+      const session = request.action === "new-shell"
+        ? await plugin.createSession(input)
+        : await plugin.recoverSession!(input);
+      this.bindSession(tabId, session);
+    } catch (error) {
+      // Spawn may have reached the broker before its acknowledgement was lost.
+      // A later recovery must check the broker again before creating a process.
+      const message = error instanceof Error ? error.message : String(error);
+      this.updateTab(tabId, { status: "failed", statusMessage: message, recovery: { state: "unavailable", ...this.getTab(tabId).recovery, message }, indicator: indicatorForStatus("failed", message) });
+      await this.savedSessions?.flush();
+      throw error;
+    }
+    await this.savedSessions?.flush();
+    return this.getTab(tabId);
   }
 
   async flush(): Promise<void> {
@@ -541,6 +645,7 @@ export class SessionStore {
   }
 
   private async closeTabNow(tabId: string, stopSession: boolean): Promise<void> {
+    if (this.tabRecoveries.has(tabId)) await this.tabRecoveries.get(tabId)!.catch(() => {});
     let session = this.sessions.get(tabId);
     try {
       const tab = this.tabs.get(tabId);
@@ -804,12 +909,27 @@ export class SessionStore {
 
   private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {
     this.sessions.set(tabId, session);
+    const offersRecovery = !session.tab.ownerPluginId && this.plugins.get(session.tab.pluginId).panelKind === "terminal";
     const disposers: Array<() => void> = [];
     const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
       if (this.tabs.has(tabId)) {
+        const tab = this.getTab(tabId);
+        if (offersRecovery && (status === "failed" || status === "completed") && session.hasExited?.()) {
+          const update = this.recordRestoreFailure(tab, new PluginSessionMissingError(statusMessage ?? "The terminal process ended."), session);
+          this.producerActions.add(update);
+          void update.then(() => this.producerActions.delete(update), error => {
+            this.producerActions.delete(update);
+            this.reportBackgroundError(error, "describe ended terminal", tabId);
+          });
+          return;
+        }
+        const recovery = offersRecovery && (status === "failed" || status === "completed")
+          ? { state: "unavailable" as const, message: statusMessage ?? "Terminal connection failed. Check the connection to recover this panel." }
+          : undefined;
         this.updateTab(tabId, {
           status,
           statusMessage,
+          recovery,
           indicator: indicatorForStatus(status, statusMessage)
         });
       }
@@ -837,6 +957,9 @@ export class SessionStore {
     this.updateTab(tabId, {
       status,
       statusMessage,
+      recovery: offersRecovery && status === "failed"
+        ? { state: "unavailable", message: statusMessage ?? "Check the terminal connection to recover this panel." }
+        : undefined,
       indicator: status === "running"
         ? createTabIndicator(templateIndicator ?? { color: "green", label: "OK", message: statusMessage ?? "Running." })
         : indicatorForStatus(status, statusMessage)
@@ -853,6 +976,12 @@ export class SessionStore {
   private createControls(tabId: string): PluginTabControls {
     return {
       setTabIndicator: (indicator) => this.updateTabIndicator(tabId, indicator),
+      setRestoreInput: (input) => {
+        if (!this.tabs.has(tabId)) return;
+        this.initialInputs.set(tabId, structuredClone(input));
+        this.persistSessions();
+        return this.savedSessions?.flush();
+      },
       closeTab: (reason) => {
         if (this.unpublishedTabIds.has(tabId)) {
           if (!this.preparedTabFailures.has(tabId)) {
