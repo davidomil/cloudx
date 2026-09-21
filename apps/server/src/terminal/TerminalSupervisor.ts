@@ -43,7 +43,7 @@ export class TerminalSupervisor {
     }
     const result = await this.completion;
     if (!result.error) return;
-    throw new Error(`Terminal supervisor failed to start. ${startupRequirement}`, { cause: result.error });
+    throw new Error(`Terminal supervisor failed to start. ${result.error.message} ${startupRequirement}`, { cause: result.error });
   }
 
   kill(): void {

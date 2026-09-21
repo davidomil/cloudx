@@ -5,9 +5,11 @@ import { loadConfig } from "../config.js";
 import { NodePtyTerminalProcessFactory } from "./NodePtyTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
 import { terminalSocketPath } from "./TerminalBrokerProtocol.js";
+import { recordTerminalRuntime } from "./TerminalRuntimeReceipt.js";
 
 const config = loadConfig();
 const broker = new TerminalBroker(terminalSocketPath(config.dataDir), new NodePtyTerminalProcessFactory(), config.terminalReplayBytes);
+await recordTerminalRuntime(config.dataDir, "broker");
 await broker.start();
 if (process.env.NOTIFY_SOCKET) {
   try { await promisify(execFile)("systemd-notify", ["--ready"]); } catch (error) {

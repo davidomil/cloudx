@@ -48,6 +48,9 @@ import {
 } from "./server.js";
 import { SessionStore } from "./sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
+import { DurableTerminalProcessFactory, terminalSocketPath } from "./terminal/DurableTerminalProcess.js";
+import { TerminalBroker } from "./terminal/TerminalBroker.js";
+import type { TerminalSpawnOptions } from "./terminal/TerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
@@ -339,6 +342,96 @@ describe("buildServer", () => {
       expect(response.body).not.toContain("private ASR path");
     } finally {
       await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux")("verifies new broker and direct supervised terminals through HTTP without retaining sessions", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-ready-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const socketPath = terminalSocketPath(config.dataDir);
+    const broker = new TerminalBroker(socketPath, new NodePtyTerminalProcessFactory());
+    await broker.start();
+    const calls: TerminalSpawnOptions[] = [];
+    const receipts: Array<{ ready: Record<string, unknown>; complete: Record<string, unknown> }> = [];
+    const originalSpawn = NodePtyTerminalProcessFactory.prototype.spawn;
+    const spawn = vi.spyOn(NodePtyTerminalProcessFactory.prototype, "spawn").mockImplementation(async function(this: NodePtyTerminalProcessFactory, command, args, options) {
+      calls.push(options);
+      const terminal = await originalSpawn.call(this, command, args, options);
+      const terminate = terminal.terminate.bind(terminal);
+      vi.spyOn(terminal, "terminate").mockImplementation(async () => {
+        await terminate();
+        receipts.push({
+          ready: JSON.parse(await fs.readFile(path.join(options.execution!.directory, "ready.json"), "utf8")),
+          complete: JSON.parse(await fs.readFile(path.join(options.execution!.directory, "complete.json"), "utf8"))
+        });
+      });
+      return terminal;
+    });
+    const app = await buildServer(config, services);
+    try {
+      const [response, concurrent] = await Promise.all([
+        app.inject({ method: "GET", url: "/api/ready/terminals" }),
+        app.inject({ method: "GET", url: "/api/ready/terminals" })
+      ]);
+
+      expect(response.statusCode).toBe(200);
+      expect(concurrent.statusCode).toBe(200);
+      expect(response.json()).toEqual({ status: "ready", broker: "ready", direct: "ready" });
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(calls).toHaveLength(2);
+      expect(calls[0]!.sessionId).toMatch(/^terminal-readiness-/u);
+      expect(calls[1]!.sessionId).toBeUndefined();
+      for (const [index, options] of calls.entries()) {
+        expect(receipts[index]!.ready).toMatchObject({ executionId: options.execution!.executionId, bootId: options.execution!.bootId,
+          pidNamespace: options.execution!.pidNamespace, pid: expect.any(Number), started: expect.any(String) });
+        expect(receipts[index]!.complete).toEqual({ ...receipts[index]!.ready, exitCode: 0 });
+        await expect(fs.access(options.execution!.directory)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      const client = new DurableTerminalProcessFactory(socketPath, new NodePtyTerminalProcessFactory());
+      await expect(client.attach(calls[0]!.sessionId!)).rejects.toThrow("unavailable in the terminal broker");
+      expect(services.sessions.listTabs()).toEqual([]);
+    } finally {
+      spawn.mockRestore();
+      await app.close();
+      await broker.stop();
+      await fs.rm(path.dirname(socketPath), { recursive: true, force: true });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform !== "linux").each(["broker", "direct"] as const)("rejects terminal readiness when the %s launch owner is stale", async (owner) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-not-ready-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const socketPath = terminalSocketPath(config.dataDir);
+    const broker = new TerminalBroker(socketPath, new NodePtyTerminalProcessFactory());
+    await broker.start();
+    const cause = "Terminal supervisor execution JSON is invalid. A stale CloudX broker/server may be using incompatible supervisor arguments.";
+    const calls: TerminalSpawnOptions[] = [];
+    const originalSpawn = NodePtyTerminalProcessFactory.prototype.spawn;
+    const spawn = vi.spyOn(NodePtyTerminalProcessFactory.prototype, "spawn").mockImplementation(async function(this: NodePtyTerminalProcessFactory, command, args, options) {
+      calls.push(options);
+      if (Boolean(options.sessionId) === (owner === "broker")) throw new Error(cause);
+      return originalSpawn.call(this, command, args, options);
+    });
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/ready/terminals" });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({ status: "not-ready", code: "terminal_supervision_failed", detail: expect.stringContaining(cause) });
+      expect(response.json().detail).toContain(owner === "broker" ? "Broker" : "Direct worker");
+      const client = new DurableTerminalProcessFactory(socketPath, new NodePtyTerminalProcessFactory());
+      await expect(client.attach(calls[0]!.sessionId!)).rejects.toThrow("unavailable in the terminal broker");
+      expect(services.sessions.listTabs()).toEqual([]);
+      expect(await fs.readdir(calls.at(-1)!.execution!.directory)).toEqual([]);
+    } finally {
+      spawn.mockRestore();
+      await app.close();
+      await broker.stop();
+      await fs.rm(path.dirname(socketPath), { recursive: true, force: true });
       await fs.rm(root, { recursive: true, force: true });
     }
   });

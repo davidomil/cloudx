@@ -1673,6 +1673,8 @@ describe("runInstaller dry-run", () => {
       if (!fs.existsSync(path.join(home, ".config/systemd/user", service))) return "LoadState=not-found";
       return [
         "LoadState=loaded",
+        "ActiveState=inactive",
+        "MainPID=0",
         "NeedDaemonReload=no",
         `WorkingDirectory=${root}`,
         `FragmentPath=${path.join(home, ".config/systemd/user", service)}`,

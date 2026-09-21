@@ -11,12 +11,14 @@ import {
   updateEnvironmentFile,
 } from "./installer-environment.mjs";
 import { prepareTerminalUpgrade } from "./install-terminal-upgrade.mjs";
+import { prepareRuntimeUpdate } from "./install-runtime.mjs";
 import {
   SERVICE_NAMES,
   TERMINAL_SERVICE_NAME,
   UPDATE_SERVICE_NAMES,
   documentationReadinessUrl,
   inspectUpdateTarget,
+  inspectUpdateCheckout,
   updateCheckout,
   updateCommit,
   updateHost,
@@ -124,6 +126,12 @@ export function parseArgs(argv = process.argv.slice(2)) {
       options.uninstall = true;
     } else if (arg === "--update") {
       options.update = true;
+    } else if (arg === "--migrate-terminals") {
+      options.migrateTerminals = true;
+    } else if (arg === "--checkout") {
+      const checkout = argv[++index];
+      if (!checkout || !path.isAbsolute(checkout)) throw new Error("--checkout requires an absolute installed checkout path.");
+      options.repoRoot = checkout;
     } else if (arg === "--target-commit") {
       options.targetCommit = updateCommit(argv[++index]);
     } else if (arg === "--non-interactive") {
@@ -157,6 +165,10 @@ export function parseArgs(argv = process.argv.slice(2)) {
   if (options.nonInteractive && !options.update) {
     throw new Error("--non-interactive requires --update.");
   }
+  if (options.migrateTerminals && (!options.update || options.service || options.nonInteractive)) {
+    throw new Error("--migrate-terminals requires an explicit standard-service --update; it cannot run from Settings or with --service.");
+  }
+  if (options.repoRoot && !options.update) throw new Error("--checkout requires --update.");
   if (options.targetCommit !== undefined && !options.update) {
     throw new Error("--target-commit requires --update.");
   }
@@ -195,6 +207,8 @@ export function helpText() {
     "",
     "Options:",
     "  --update           Fast-forward to origin/main; requires no tracked changes. Unrelated untracked files are allowed.",
+    "  --migrate-terminals  Back up recovery state and interrupt terminals for a standard-service update.",
+    "  --checkout <path>  Run a staged updater against this absolute installed checkout path; requires --update.",
     "  --target-commit <sha>  Update to this exact commit from origin; requires --update.",
     "  --non-interactive  Update without password or login prompts; requires existing non-interactive sudo and Codex authentication.",
     "  --update-codex     Update only Codex CLI to the latest npm release; leave Cloudx and services unchanged.",
@@ -1057,6 +1071,11 @@ export async function runInstaller(options = {}) {
       documentationReadinessUrl(savedEnv);
     }
     if (options.nonInteractive) commands.run("sudo", ["-n", "true"]);
+    inspectUpdateCheckout(commands, root);
+    prepareRuntimeUpdate({
+      paths, commands, target: updateTarget, dryRun,
+      migrateTerminals: options.migrateTerminals && !env.CLOUDX_INSTALL_UPDATED_COMMIT,
+    });
     const updatedCommit = updateCheckout(commands, {
       repoRoot: root,
       dryRun,
@@ -1743,6 +1762,12 @@ async function runWebServiceUpdater({
       url: `${target.origin}/api/ready`,
       insecure: true,
     });
+    waitForHealth(commands, {
+      label: `${service} supervised terminals`,
+      url: `${target.origin}/api/ready/terminals`,
+      insecure: true,
+      requestTimeoutSeconds: 60,
+    });
   }
   section("Update complete");
   console.log(
@@ -2083,6 +2108,12 @@ function verifyServices(commands, port, envConfig) {
       url: `https://127.0.0.1:${port}/api/ready`,
       insecure: true,
     });
+    waitForHealth(commands, {
+      label: "Cloudx supervised terminals",
+      url: `https://127.0.0.1:${port}/api/ready/terminals`,
+      insecure: true,
+      requestTimeoutSeconds: 60,
+    });
   } catch (error) {
     console.error(
       "Service health verification failed. Recent service state follows.",
@@ -2148,7 +2179,7 @@ export function waitForHealth(
       const body = separator < 0 ? "" : response.slice(0, separator);
       let startupFailed = false;
       try {
-        startupFailed = JSON.parse(body)?.code === "documentation_startup_failed";
+        startupFailed = ["documentation_startup_failed", "terminal_supervision_failed"].includes(JSON.parse(body)?.code);
       } catch {
         // HTTP errors without a JSON body still follow their status code.
       }
