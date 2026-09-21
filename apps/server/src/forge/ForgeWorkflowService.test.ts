@@ -3376,6 +3376,180 @@ describe("Forge issue auto review", () => {
     return new ForgeProviderUnavailableError("timeout", "request", { retryable: true, retryAfterMs });
   }
 
+  async function activeReview(status: "starting" | "running" = "running") {
+    const f = await automaticIssue();
+    let liveWorkers: ForgeWorker[] = [];
+    const save = f.deps.store.write;
+    f.deps.store.write = async workers => { liveWorkers = workers; await save(workers); };
+    f.codingReport(); await f.poll();
+    f.report(undefined);
+    // Launch and poll are serialized; retain a starting snapshot to exercise its observation guard.
+    liveWorkers.find(worker => worker.kind === "review")!.status = status;
+    f.runtime.close.mockClear();
+    f.runtime.pause.mockClear();
+    f.reports.remove.mockClear();
+    return f;
+  }
+
+  it.each((["getIssue", "getChangeRequest"] as const).flatMap(operation =>
+    (["starting", "running"] as const).map(status => ({ operation, status })),
+  ))("preserves a $status reviewer when metadata observation $operation times out", async ({ operation, status }) => {
+    const f = await activeReview(status);
+    const reviewer = f.currentReview();
+    const launchSignal = f.runtime.launch.mock.calls.at(-1)![1]!;
+    f.provider[operation].mockRejectedValueOnce(transientProviderFailure());
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", error: expect.stringContaining(operation) });
+    expect(f.currentIssue().error).toContain("issue #1");
+    expect(f.currentIssue().error).toContain("review #7");
+    expect(f.currentReview()).toMatchObject({ status, tabId: reviewer.tabId, attemptId: reviewer.attemptId, feedbackDigest: reviewer.feedbackDigest });
+    expect(launchSignal.aborted).toBe(false);
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.runtime.pause).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", error: undefined });
+    expect(f.currentReview()).toMatchObject({ status, tabId: reviewer.tabId, attemptId: reviewer.attemptId });
+    expect(launchSignal.aborted).toBe(false);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.reports.prepare).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["getIssue", "getChangeRequest"] as const)("retains a report through metadata observation %s unavailability without bypassing its delay", async operation => {
+    const f = await activeReview();
+    const reviewer = f.currentReview();
+    f.provider[operation].mockRejectedValueOnce(transientProviderFailure(60_000));
+    await f.poll();
+    const reads = f.provider[operation].mock.calls.length;
+    f.provider.getChangeRequestStatus.mockClear();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    f.advanceTime(1_000);
+    await f.service.poll();
+    const draft = f.currentReview().draft!;
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { id: reviewer.attemptId, status: "draft", body: "Ready" } });
+    f.advanceTime(58_999);
+    await f.service.poll();
+    expect(f.provider[operation]).toHaveBeenCalledTimes(reads);
+    expect(f.provider.getChangeRequestStatus).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+
+    f.change.mergeable = false;
+    f.advanceTime(1);
+    await f.service.poll();
+    await f.poll();
+    expect(f.currentReview().draft).toMatchObject({ ...draft, status: "posted" });
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider[operation].mock.invocationCallOrder[reads]).toBeLessThan(f.provider.postReview.mock.invocationCallOrder[0]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.mergeable = true;
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+  });
+
+  it("preserves the active reviewer and eventual draft when metadata observation recovery is exhausted", async () => {
+    const f = await activeReview();
+    const reviewer = f.currentReview();
+    const launchSignal = f.runtime.launch.mock.calls.at(-1)![1]!;
+    f.provider.getChangeRequest.mockRejectedValue(transientProviderFailure());
+    await f.poll();
+    for (const delay of [5_000, 15_000, 30_000, 60_000]) {
+      f.advanceTime(delay);
+      await f.service.poll();
+    }
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringContaining("Automatic recovery exhausted") });
+    expect(f.currentReview()).toMatchObject({ status: "running", tabId: reviewer.tabId, attemptId: reviewer.attemptId });
+    expect(launchSignal.aborted).toBe(false);
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { id: reviewer.attemptId, status: "draft" } });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    f.provider.getChangeRequest.mockResolvedValue(f.change);
+    f.change.mergeable = false;
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the reviewer when merged-request metadata observation times out before confirming issue closure", async () => {
+    const f = await activeReview();
+    const reviewer = f.currentReview();
+    const launchSignal = f.runtime.launch.mock.calls.at(-1)![1]!;
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.provider.getIssue.mockRejectedValueOnce(transientProviderFailure());
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", error: expect.stringContaining("getIssue") });
+    expect(f.currentReview()).toMatchObject({ status: "running", tabId: reviewer.tabId, attemptId: reviewer.attemptId });
+    expect(launchSignal.aborted).toBe(false);
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    f.provider.getIssue.mockResolvedValue({ ...await f.provider.getIssue(), state: "closed" });
+    await f.poll();
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each((["pause", "stop"] as const).flatMap(action =>
+    (["scheduled", "in flight"] as const).map(stage => ({ action, stage })),
+  ))("honors $action of the reviewer during $stage metadata observation recovery", async ({ action, stage }) => {
+    const f = await activeReview();
+    const reviewer = f.currentReview();
+    const launchSignal = f.runtime.launch.mock.calls.at(-1)![1]!;
+    f.provider.getChangeRequest.mockRejectedValueOnce(transientProviderFailure());
+    await f.poll();
+    const reading = deferred<void>();
+    const response = deferred<ForgeChangeRequest>();
+    let polling: Promise<void> | undefined;
+    if (stage === "in flight") {
+      f.provider.getChangeRequest.mockImplementationOnce(() => { reading.resolve(); return response.promise; });
+      polling = f.poll();
+      await reading.promise;
+    }
+    const controlling = f.service[action](reviewer.id);
+    response.reject(transientProviderFailure());
+    if (polling) await polling;
+    else await response.promise.catch(() => {});
+    await controlling;
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    f.advanceTime(60_000); await f.poll();
+    expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(f.currentReview().status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(launchSignal.aborted).toBe(true);
+    expect(f.runtime.pause).toHaveBeenCalledWith(reviewer.tabId);
+    expect(f.reports.remove).toHaveBeenCalledWith(reviewer.attemptId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["head", "closed issue", "closed request", "merged request"])("revalidates %s after metadata observation recovers before posting a retained report", async changed => {
+    const f = await activeReview();
+    f.provider.getChangeRequest.mockRejectedValueOnce(transientProviderFailure());
+    await f.poll();
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    if (changed === "head") f.change.headSha = "c".repeat(40);
+    else if (changed === "closed issue") f.provider.getIssue.mockResolvedValue({ ...await f.provider.getIssue(), state: "closed" });
+    else if (changed === "closed request") f.change.state = "closed";
+    else { f.change.merged = true; f.change.state = "merged"; }
+    await f.poll();
+    expect(f.currentIssue().status).toBe(changed === "merged request" ? "paused" : "failed");
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
   it("recovers a transient merge check on the scheduled poll without replaying approved workers", async () => {
     const f = await approvedIssue();
     const review = f.currentReview();

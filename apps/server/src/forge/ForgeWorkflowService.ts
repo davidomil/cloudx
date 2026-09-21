@@ -161,6 +161,14 @@ interface ProviderRecovery {
   retryMessage?: string;
 }
 
+class ForgeProviderObservationError extends ForgeProviderUnavailableError {
+  constructor(worker: Pick<ForgeWorker, "number" | "changeNumber">, operation: "getChangeRequest" | "getIssue", cause: ForgeProviderUnavailableError) {
+    super(cause.failure, "request", cause);
+    this.cause = cause;
+    this.message = `${operation} for issue #${worker.number}, review #${worker.changeNumber}: ${cause.message}`;
+  }
+}
+
 interface ManualContinuation {
   message: string;
   previousError?: string;
@@ -948,7 +956,8 @@ export class ForgeWorkflowService {
             worker.status = "completed";
             await this.persist();
             if (worker.autoPost && !this.autoReviewParent(worker)) await this.postDraft(worker);
-            if (worker.issueWorkerId) this.nextAutoReviewCheckAt.delete(worker.issueWorkerId);
+            if (worker.issueWorkerId && !this.providerRecoveries.has(worker.issueWorkerId))
+              this.nextAutoReviewCheckAt.delete(worker.issueWorkerId);
             this.deps.notify(
               "Review complete",
               `${worker.title}: ${worker.draft.comments.length} suggested comments.`,
@@ -1064,10 +1073,13 @@ export class ForgeWorkflowService {
     if (worker.mergeAttempted || worker.pendingPublication ||
       !["awaiting_review", "awaiting_merge", "paused", "stopped", "failed"].includes(worker.status)) return false;
     const review = this.autoReviewer(worker);
-    if (review && (["starting", "running"].includes(review.status) ||
-      review.draft && ["posting", "post_failed"].includes(review.draft.status))) return false;
-    this.operations.get(worker.id)?.abort(unavailable);
-    this.operations.delete(worker.id);
+    if (review?.draft && ["posting", "post_failed"].includes(review.draft.status)) return false;
+    const activeReview = review && ["starting", "running"].includes(review.status);
+    if (activeReview && !(unavailable instanceof ForgeProviderObservationError && unavailable.retryable)) return false;
+    if (!activeReview) {
+      this.operations.get(worker.id)?.abort(unavailable);
+      this.operations.delete(worker.id);
+    }
     this.nextAutoReviewCheckAt.delete(worker.id);
     if (unavailable.retryable) {
       const now = Date.now();
@@ -1162,18 +1174,26 @@ export class ForgeWorkflowService {
     this.requireConfirmedPublication(worker.repository, worker.changeNumber);
     const provider = this.providerFor(worker);
     const signal = this.operations.get(worker.id)?.signal;
-    const change = await provider.getChangeRequest(worker.changeNumber);
+    const change = await this.observeProvider(worker, "getChangeRequest", () => provider.getChangeRequest(worker.changeNumber!));
     signal?.throwIfAborted();
     this.observeMergeConflict(worker, change);
     if (await this.reconcileMergedChange(worker, { change, signal })) return;
     requirePublicationRequest(worker, change);
     if (change.headSha !== worker.headSha)
       throw new Error("The request head changed outside this issue loop. Inspect the published work before resuming.");
-    const issue = await provider.getIssue(worker.number);
+    const issue = await this.observeProvider(worker, "getIssue", () => provider.getIssue(worker.number));
     signal?.throwIfAborted();
     if (issue.number !== worker.number || issue.state !== "open")
       throw new Error("Auto review requires the original issue to remain open.");
     return { issue, change };
+  }
+  private async observeProvider<T>(worker: Pick<ForgeWorker, "number" | "changeNumber">, operation: "getChangeRequest" | "getIssue", read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (error) {
+      if (error instanceof ForgeProviderUnavailableError) throw new ForgeProviderObservationError(worker, operation, error);
+      throw error;
+    }
   }
   private async waitForAutoReview(worker: ForgeWorker, reason: string, startedAt?: string): Promise<void> {
     const loop = worker.autoReview!;
@@ -1205,6 +1225,8 @@ export class ForgeWorkflowService {
       throw new Error("The previous merge must be reconciled with the provider. Forge will not repeat it.");
     let context = await this.autoReviewContext(worker);
     if (!context) return;
+    const recovery = this.providerRecoveries.get(worker.id);
+    if (recovery && worker.error === recovery.retryMessage) worker.error = undefined;
     if (review && ["starting", "running"].includes(review.status)) {
       await this.persist();
       return;
@@ -1900,7 +1922,7 @@ export class ForgeWorkflowService {
     );
     let issuesClosed = change.linkedIssues.every(issue => issue.state === "closed");
     for (const issueNumber of new Set(associated.filter(candidate => candidate.kind === "issue").map(candidate => candidate.number))) {
-      const issue = await provider.getIssue(issueNumber);
+      const issue = await this.observeProvider({ number: issueNumber, changeNumber: number }, "getIssue", () => provider.getIssue(issueNumber));
       if (issue.number !== issueNumber) throw new Error("Completion status does not match this issue.");
       if (issue.state !== "closed") issuesClosed = false;
     }
