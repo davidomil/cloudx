@@ -5,10 +5,11 @@ import type { TerminalProcess, TerminalProcessFactory, TerminalSpawnOptions } fr
 import type { TerminalExit } from "./TerminalSupervisor.js";
 import { MAX_TERMINAL_SCREEN_BYTES, type TerminalScreenSnapshot } from "./TerminalScreen.js";
 import {
-  isTerminalResponse, readTerminalMessages, sendTerminalMessage, terminalReplay,
+  isTerminalResponse, readTerminalMessages, sendTerminalMessage,
   MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES,
   TERMINAL_REPLAY_BYTES, validateTerminalSocket, type TerminalRequest, type TerminalResponse
 } from "./TerminalBrokerProtocol.js";
+import { TerminalReplayBuffer } from "./TerminalReplayBuffer.js";
 
 export { terminalSocketPath } from "./TerminalBrokerProtocol.js";
 
@@ -43,7 +44,7 @@ class DurableTerminalProcess implements TerminalProcess {
   private screen?: TerminalScreenSnapshot;
   private screenBytes = 0;
   private screenComplete = false;
-  private output = "";
+  private readonly output: TerminalReplayBuffer;
   private outputAttached = false;
   private exit?: TerminalExit;
   private disconnected?: Error;
@@ -53,7 +54,8 @@ class DurableTerminalProcess implements TerminalProcess {
   private termination?: Promise<void>;
   private terminating?: { resolve: () => void; reject: (error: Error) => void };
 
-  constructor(private readonly socket: Socket, private readonly replayBytes: number) {
+  constructor(private readonly socket: Socket, replayBytes: number) {
+    this.output = new TerminalReplayBuffer(replayBytes);
     socket.on("error", (error) => this.disconnect(error));
     socket.on("close", () => {
       if (!this.detached && !this.terminated) this.disconnect(new Error("The terminal broker connection closed. The running terminal was not confirmed stopped."));
@@ -86,8 +88,9 @@ class DurableTerminalProcess implements TerminalProcess {
     this.dataListeners.add(listener);
     if (!this.outputAttached) {
       this.outputAttached = true;
-      if (this.output) listener(this.output);
-      this.output = "";
+      const output = this.output.snapshot();
+      if (output) listener(output);
+      this.output.clear();
     }
     return () => { this.dataListeners.delete(listener); };
   }
@@ -163,7 +166,7 @@ class DurableTerminalProcess implements TerminalProcess {
         break;
       case "data":
         if (this.screen && !this.screenComplete) return this.invalidScreen();
-        if (!this.outputAttached) this.output = terminalReplay(this.output + response.data, this.replayBytes);
+        if (!this.outputAttached) this.output.append(response.data);
         if (this.screen) this.appendScreen(response.data);
         for (const listener of this.dataListeners) listener(response.data);
         break;

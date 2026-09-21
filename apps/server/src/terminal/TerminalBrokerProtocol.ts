@@ -71,14 +71,6 @@ export function sendTerminalMessage(socket: Socket, message: TerminalRequest | T
   return socket.write(encoded);
 }
 
-export function terminalReplay(output: string, bytes: number): string {
-  const encoded = Buffer.from(output);
-  if (encoded.length <= bytes) return output;
-  let start = encoded.length - bytes;
-  while ((encoded[start]! & 0xc0) === 0x80) start += 1;
-  return encoded.subarray(start).toString("utf8");
-}
-
 export function isTerminalRequest(value: unknown): value is TerminalRequest {
   if (!isRecord(value)) return false;
   switch (value.type) {

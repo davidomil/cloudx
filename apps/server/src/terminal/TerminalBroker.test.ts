@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DurableTerminalProcessFactory } from "./DurableTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
-import { isTerminalRequest, isTerminalResponse, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
+import { isTerminalRequest, isTerminalResponse, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalSocketPath } from "./TerminalBrokerProtocol.js";
 import type { TerminalProducer } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 
@@ -359,12 +359,10 @@ describe("durable terminal broker", () => {
     await expect(factory.attach("invalid-screen")).rejects.toThrow("incomplete or inconsistent");
   });
 
-  it("uses a short stable socket path and retains complete Unicode characters in replay", () => {
+  it("uses a short stable socket path", () => {
     expect(Buffer.byteLength(terminalSocketPath(`/a/${"long-path/".repeat(40)}`))).toBeLessThan(104);
     expect(terminalSocketPath("/a/../b")).toBe(terminalSocketPath("/b"));
     expect(terminalSocketPath("/a")).not.toBe(terminalSocketPath("/b"));
-    expect(terminalReplay("old😀new", 6)).toBe("new");
-    expect(terminalReplay("old😀new", 7)).toBe("😀new");
   });
 
   it.each([
