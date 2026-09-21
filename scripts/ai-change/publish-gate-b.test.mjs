@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import {
   canonicalPublicationAuthorization,
@@ -60,6 +60,76 @@ const publishGateBCandidateForDirectTest = (
   options,
   transport = directTestTransport,
 ) => publishCandidateForDirectTest(options, transport);
+
+describe("smart HTTP command fixtures", () => {
+  it.each([
+    { name: "absent input", input: undefined },
+    { name: "empty text", input: "" },
+    { name: "empty request body", input: Buffer.alloc(0) },
+  ])("accepts an already-exited command with $name", async ({ input }) => {
+    const result = await runBinaryProcess(
+      process.execPath,
+      ["-e", 'process.stdout.write("response");'],
+      { input },
+      spawnExitedProcess,
+    );
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stderr: Buffer.alloc(0),
+      stdout: Buffer.from("response"),
+    });
+  });
+
+  it("fails when an already-exited command cannot receive required input", async () => {
+    const result = await runBinaryProcess(
+      process.execPath,
+      ["-e", "process.exit(0);"],
+      { input: Buffer.from("required request body") },
+      spawnExitedProcess,
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString("utf8")).toContain("EPIPE");
+  });
+
+  it("stops and awaits a command that closes stdin before required input arrives", async () => {
+    let child;
+    let closed = false;
+    const result = await runBinaryProcess(
+      process.execPath,
+      ["-e", 'require("node:fs").closeSync(0); setInterval(() => {}, 1_000);'],
+      { input: Buffer.alloc(1024 * 1024) },
+      (...args) => {
+        child = spawnFixtureProcess(...args);
+        child.once("close", () => {
+          closed = true;
+        });
+        return child;
+      },
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr.toString("utf8")).toContain("EPIPE");
+    expect(closed).toBe(true);
+    expect(child.signalCode).toBe("SIGKILL");
+  });
+
+  it("delivers a binary request body and closes stdin", async () => {
+    const input = Buffer.from([0xff, 0x00, 0x61]);
+    const result = await runBinaryProcess(
+      process.execPath,
+      ["-e", "process.stdin.pipe(process.stdout);"],
+      { input },
+    );
+
+    expect(result).toEqual({
+      exitCode: 0,
+      stderr: Buffer.alloc(0),
+      stdout: input,
+    });
+  });
+});
 
 describe("Gate B candidate publisher", () => {
   it("awaits private runner process-group exhaustion without exposing a token", async () => {
@@ -2601,15 +2671,41 @@ function runTextProcess(command, args, options = {}) {
   }));
 }
 
-function runBinaryProcess(command, args, options = {}) {
+function spawnFixtureProcess(command, args, options) {
+  const child = spawn(command, args, options);
+  const closed = new Promise((resolve) => child.once("close", resolve));
+  onTestFinished(async () => {
+    child.kill("SIGKILL");
+    await closed;
+  });
+  return child;
+}
+
+function spawnExitedProcess(command, args, options) {
+  const child = spawnFixtureProcess(command, args, options);
+  const deadline = Date.now() + 2_000;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    if (["Z", "X"].includes(state)) return child;
+    Atomics.wait(pause, 0, 0, 1);
+  }
+  child.kill("SIGKILL");
+  throw new Error("The command did not exit before stdin delivery.");
+}
+
+function runBinaryProcess(command, args, options = {}, spawnProcess = spawn) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, {
+    const hasInput = options.input?.length > 0;
+    const child = spawnProcess(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"],
     });
     const stdout = [];
     const stderr = [];
+    let inputFailed = false;
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
     child.on("error", (error) => {
@@ -2617,12 +2713,19 @@ function runBinaryProcess(command, args, options = {}) {
     });
     child.on("close", (exitCode) =>
       resolve({
-        exitCode: Number.isInteger(exitCode) ? exitCode : 1,
+        exitCode: !inputFailed && Number.isInteger(exitCode) ? exitCode : 1,
         stderr: Buffer.concat(stderr),
         stdout: Buffer.concat(stdout),
       }),
     );
-    child.stdin.end(options.input);
+    if (hasInput) {
+      child.stdin.once("error", (error) => {
+        inputFailed = true;
+        stderr.push(Buffer.from(error.message));
+        child.kill("SIGKILL");
+      });
+      child.stdin.end(options.input);
+    }
   });
 }
 

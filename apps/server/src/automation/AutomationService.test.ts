@@ -786,7 +786,7 @@ describe("AutomationService", () => {
     await expect(run).resolves.toMatchObject({ sample: { status: "cancelled" } });
   });
 
-  it("does not finish disposal before a real automation process group is empty", async () => {
+  it.each(["stable process list", "unrelated process exit"])("does not finish disposal before a real automation process group is empty with %s", async (scenario) => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-automation-service-process-dispose-"));
     const pidFile = path.join(dataDir, "descendant.pid");
     const repository = new AutomationRepository(dataDir);
@@ -806,13 +806,28 @@ describe("AutomationService", () => {
     await service.saveGroup(processDisposalGroup(pidFile));
     const run = service.startTest("process-dispose", {});
     const processGroup = await recordedProcessGroup(pidFile);
+    const signalsSent = vi.spyOn(process, "kill");
+    const readDirectory = fs.readdir;
+    const processListing = vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+      if (scenario === "unrelated process exit" && args[0] === "/proc" && args[1]?.withFileTypes) {
+        // Node resolves unknown Dirent types with lstat, which can race a process exit.
+        throw Object.assign(new Error("ENOENT: no such file or directory, lstat '/proc/2147483647'"), { code: "ENOENT" });
+      }
+      return readDirectory(...args);
+    });
     try {
-      const disposal = service.dispose();
-      await disposal;
+      await service.dispose();
 
-      expect(await processGroupHasRunningMember(processGroup)).toBe(false);
-      await expect(run).resolves.toMatchObject({ sample: { status: "cancelled" } });
+      const hasRunningMember = await processGroupHasRunningMember(processGroup);
+      const { sample } = await run;
+      expect(hasRunningMember, JSON.stringify(sample.trace)).toBe(false);
+      expect(sample.status).toBe("cancelled");
+      expect(sample.trace.at(-1)).toMatchObject({ level: "warn", message: "Automation run was cancelled." });
+      expect(signalsSent).toHaveBeenCalledWith(-processGroup, "SIGTERM");
+      expect(signalsSent).toHaveBeenCalledWith(-processGroup, "SIGKILL");
     } finally {
+      processListing.mockRestore();
+      signalsSent.mockRestore();
       await terminateProcessGroup(processGroup);
     }
   });
@@ -1277,7 +1292,7 @@ function processDisposalGroup(pidFile: string): AutomationGroup {
           typeId: "primitive:bash.exec",
           position: { x: 200, y: 0 },
           config: {
-            script: `bash --noprofile --norc -c 'trap "" TERM; printf "%s" "$$" > "$1"; exec </dev/null >/dev/null 2>&1; while :; do :; done' bash '${pidFile.replaceAll("'", `'"'"'`)}' &\nwhile :; do :; done`,
+            script: `bash --noprofile --norc -c 'trap "" TERM; printf "%s" "$$" > "$1"; exec sleep 60 </dev/null >/dev/null 2>&1' bash '${pidFile.replaceAll("'", `'"'"'`)}' &\nwait`,
             timeoutMs: 10_000,
           },
         },
@@ -1307,10 +1322,10 @@ async function recordedProcessGroup(file: string): Promise<number> {
 }
 
 async function processGroupHasRunningMember(processGroup: number): Promise<boolean> {
-  const entries = await fs.readdir("/proc", { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-    const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => undefined);
+  const entries = await fs.readdir("/proc");
+  for (const pid of entries) {
+    if (!/^\d+$/u.test(pid)) continue;
+    const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined);
     if (!stat) continue;
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
     if (Number(fields[2]) === processGroup && fields[0] !== "Z" && fields[0] !== "X") return true;

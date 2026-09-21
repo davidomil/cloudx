@@ -2211,10 +2211,10 @@ async function recordedProcessGroup(file: string, groups: Set<number>): Promise<
 }
 
 async function processGroupHasRunningMember(processGroup: number): Promise<boolean> {
-  const entries = await fs.readdir("/proc", { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-    const stat = await fs.readFile(`/proc/${entry.name}/stat`, "utf8").catch(() => undefined);
+  const entries = await fs.readdir("/proc");
+  for (const pid of entries) {
+    if (!/^\d+$/u.test(pid)) continue;
+    const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => undefined);
     if (!stat) continue;
     const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
     if (Number(fields[2]) === processGroup && fields[0] !== "Z" && fields[0] !== "X") return true;
