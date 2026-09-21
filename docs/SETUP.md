@@ -245,8 +245,9 @@ The Settings button and `./install.sh --update` run the same dependency,
 build, restart, and readiness steps. Settings runs the installer
 unattended in a separate user service.
 
-The button requires the standard installed CloudX user services, a clean
-checkout, and noninteractive sudo access for installer prerequisites.
+The button requires the standard installed CloudX user services, no staged or
+unstaged changes to tracked files, and noninteractive sudo access for installer
+prerequisites. Unrelated untracked files and directories are allowed.
 Development checkouts and custom services use the terminal commands
 below. Missing permissions and authentication fail without opening
 password or Codex login prompts.
@@ -277,11 +278,16 @@ does the operational refresh:
   changing packages or the checkout. Standard units must belong to this checkout
   and use its saved environment file; custom definitions require the explicit
   web-service mode below. Reload pending unit edits before updating.
-- Requires a clean checkout, fetches `origin/main`, and fast-forwards to that
-  commit. Detached checkouts and branches without an upstream are supported.
-  Local changes and commits absent from `origin/main` are rejected without
-  resetting or stashing them. The command no longer follows the current branch's
-  upstream, and it reloads the updated installer before installing dependencies.
+- Requires no staged or unstaged changes to tracked files, fetches `origin/main`,
+  and fast-forwards to that commit. Detached checkouts and branches without an
+  upstream are supported. Unrelated untracked files and directories are allowed
+  and preserved through the fast-forward and installer reload. Git rejects
+  non-ignored untracked paths that the update would overwrite, naming the
+  conflicting files or directories. Move those paths before trying again; a
+  collision leaves local files and HEAD unchanged and stops the update before
+  package installation or service changes. Tracked changes and commits absent
+  from `origin/main` are rejected without resetting or stashing them. The updater
+  reloads the updated installer before installing dependencies.
 - Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
   Cloudx npm commands run. Updates require an existing Node.js executable for the
   initial ownership checks.
@@ -329,9 +335,12 @@ Preview update without changing the system:
 ./install.sh --update --dry-run --yes
 ```
 
-Dry runs perform read-only checkout and service inspection. They print the
-planned fetch and build operations; remote availability and ancestry are checked
-when the real fetch runs.
+Dry runs perform read-only checkout and service inspection. Unrelated untracked
+files and directories do not block the preview. Dry runs print planned fetch,
+merge, and build operations without running them. Remote availability, target
+ancestry, and untracked-path collision checks require a real fetch and
+fast-forward attempt; dry-run success does not establish that the update can
+complete.
 
 To update an existing custom web service, run from its checkout and identify its
 unit and HTTPS port explicitly:

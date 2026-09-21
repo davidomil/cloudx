@@ -194,7 +194,7 @@ export function helpText() {
     "       node scripts/install-cloudx.mjs [options]",
     "",
     "Options:",
-    "  --update           Fast-forward this clean checkout to origin/main and update its installation.",
+    "  --update           Fast-forward to origin/main; requires no tracked changes. Unrelated untracked files are allowed.",
     "  --target-commit <sha>  Update to this exact commit from origin; requires --update.",
     "  --non-interactive  Update without password or login prompts; requires existing non-interactive sudo and Codex authentication.",
     "  --update-codex     Update only Codex CLI to the latest npm release; leave Cloudx and services unchanged.",
@@ -1063,6 +1063,11 @@ export async function runInstaller(options = {}) {
       updatedCommit: env.CLOUDX_INSTALL_UPDATED_COMMIT,
       targetCommit: options.targetCommit,
     });
+    if (dryRun) {
+      console.log(
+        "Dry run: remote availability, target ancestry, and untracked-path collisions require a real fetch and fast-forward attempt; these checks were not performed.",
+      );
+    }
     if (options.cliArgs && !dryRun && !env.CLOUDX_INSTALL_UPDATED_COMMIT) {
       return runner.run(
         process.execPath,

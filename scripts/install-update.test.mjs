@@ -29,6 +29,51 @@ function git(cwd, ...args) {
     { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
   ).trim();
 }
+function writeFile(root, file, contents) {
+  const destination = path.join(root, file);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.writeFileSync(destination, contents);
+}
+function publishFile(fixture, file, contents) {
+  writeFile(fixture.author, file, contents);
+  git(fixture.author, "add", "--", file);
+  git(fixture.author, "commit", "-m", "TEST: upstream file");
+  git(fixture.author, "push", "origin", "main");
+  fixture.latest = git(fixture.author, "rev-parse", "HEAD");
+}
+function updateCli(fixture, ...args) {
+  const bin = directory();
+  const serviceLog = path.join(bin, "service-calls");
+  fs.writeFileSync(
+    path.join(bin, "systemctl"),
+    [
+      "#!/bin/sh",
+      'printf "%s\\n" "$*" >> "$CLOUDX_TEST_SERVICE_LOG"',
+      '[ "$1" = --user ] && [ "$2" = show ] || exit 19',
+      'printf "LoadState=loaded\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"',
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  const result = spawnSync(process.execPath, [
+    "scripts/install-cloudx.mjs", "--update", "--service", "preview.service",
+    "--port", "3002", "--yes", ...args,
+  ], {
+    cwd: fixture.root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      CLOUDX_TEST_CHECKOUT: fixture.root,
+      CLOUDX_TEST_SERVICE_LOG: serviceLog,
+      CLOUDX_INSTALL_UPDATED_COMMIT: "",
+      LC_ALL: "C",
+    },
+  });
+  return {
+    ...result,
+    serviceCalls: fs.readFileSync(serviceLog, "utf8").trim().split("\n"),
+  };
+}
 function checkout({ includeInstaller = false } = {}) {
   const dir = directory();
   git(dir, "init", "--bare", "--initial-branch=main", "origin.git");
@@ -106,13 +151,13 @@ describe("updating the installed checkout from main", () => {
     },
   );
 
-  it.each(["unstaged", "staged", "untracked", "ahead", "diverged"])(
+  it.each(["unstaged", "staged", "ahead", "diverged"])(
     "preserves %s work and rejects the update",
     (kind) => {
       const fixture = checkout();
       if (kind === "ahead")
         git(fixture.root, "pull", "--ff-only", "origin", "main");
-      const file = kind === "untracked" ? "local-file" : "version";
+      const file = "version";
       fs.writeFileSync(path.join(fixture.root, file), "local work\n");
       if (["staged", "ahead", "diverged"].includes(kind))
         git(fixture.root, "add", file);
@@ -128,8 +173,43 @@ describe("updating the installed checkout from main", () => {
       expect(fs.readFileSync(path.join(fixture.root, file), "utf8")).toBe(
         "local work\n",
       );
-      if (["unstaged", "staged", "untracked"].includes(kind))
+      if (["unstaged", "staged"].includes(kind))
         expect(fixture.mutations).toEqual([]);
+    },
+  );
+
+  it.each(["main", "selected commit"])(
+    "preserves unrelated untracked files through an update to %s and reload",
+    (target) => {
+      const fixture = checkout();
+      publishFile(fixture, "diagnostics/upstream.txt", "upstream file\n");
+      const localFiles = [
+        "local notes.txt",
+        "diagnostics/nested/local notes.txt",
+        "scratch/deep/notes.txt",
+      ];
+      const contents = Buffer.from([0, 1, 2, 255, 10]);
+      for (const file of localFiles) writeFile(fixture.root, file, contents);
+      const options = {
+        repoRoot: fixture.root,
+        ...(target === "selected commit" ? { targetCommit: fixture.latest } : {}),
+      };
+
+      expect(updateCheckout(fixture.commands, options)).toBe(fixture.latest);
+      fixture.mutations.length = 0;
+      expect(updateCheckout(fixture.commands, {
+        ...options,
+        updatedCommit: fixture.latest,
+      })).toBe(fixture.latest);
+
+      expect(fixture.mutations).toEqual([]);
+      expect(git(fixture.root, "rev-parse", "HEAD")).toBe(fixture.latest);
+      for (const file of localFiles) {
+        expect(fs.readFileSync(path.join(fixture.root, file))).toEqual(contents);
+        expect(git(fixture.root, "ls-files", "--", file)).toBe("");
+      }
+      expect(fs.readFileSync(path.join(fixture.root, "diagnostics/upstream.txt"), "utf8"))
+        .toBe("upstream file\n");
     },
   );
 
@@ -470,6 +550,83 @@ describe("documentation service readiness", () => {
 });
 
 describe("installer update entrypoints", () => {
+  it("reloads the production checkout check with unrelated untracked work", () => {
+    const fixture = checkout({ includeInstaller: true });
+    publishFile(fixture, "scripts/install-cloudx.mjs", [
+      'import { updateCheckout } from "./install-update.mjs";',
+      'import { execFileSync } from "node:child_process";',
+      'const commands = { inspect: (command, args) => execFileSync(command, args, { encoding: "utf8" }).trim() };',
+      'updateCheckout(commands, { repoRoot: process.cwd(), updatedCommit: process.env.CLOUDX_INSTALL_UPDATED_COMMIT });',
+      'console.log("updated checkout accepted after reload");',
+    ].join("\n"));
+    const file = "local diagnostics/nested/notes.txt";
+    writeFile(fixture.root, file, "keep these notes\n");
+
+    const result = updateCli(fixture);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("updated checkout accepted after reload");
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(fixture.latest);
+    expect(fs.readFileSync(path.join(fixture.root, file), "utf8"))
+      .toBe("keep these notes\n");
+  });
+
+  it.each([
+    ["file replacing a file", "local notes.txt", "local notes.txt"],
+    ["directory replacing a file", "local notes", "local notes/upstream.txt"],
+    ["file replacing a directory", "local notes/nested/notes.txt", "local notes"],
+  ])("rejects an upstream %s before installing packages or changing services", (_name, localFile, upstreamFile) => {
+    const fixture = checkout({ includeInstaller: true });
+    publishFile(fixture, upstreamFile, "upstream content\n");
+    writeFile(fixture.root, localFile, "irreplaceable local notes\n");
+    const beforeHead = git(fixture.root, "rev-parse", "HEAD");
+    const beforeStatus = git(fixture.root, "status", "--porcelain");
+    const beforeIndex = git(fixture.root, "ls-files", "--stage");
+
+    const result = updateCli(fixture);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/would be overwritten by merge|would lose untracked files/);
+    expect(result.stderr).toContain("local notes");
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(beforeHead);
+    expect(git(fixture.root, "status", "--porcelain")).toBe(beforeStatus);
+    expect(git(fixture.root, "ls-files", "--stage")).toBe(beforeIndex);
+    expect(fs.readFileSync(path.join(fixture.root, localFile), "utf8"))
+      .toBe("irreplaceable local notes\n");
+    expect(fs.readFileSync(path.join(fixture.root, "version"), "utf8"))
+      .toBe("one\n");
+    expect(result.stdout).not.toMatch(/npm ci|apt-get|updated installer executed/);
+    expect(result.serviceCalls).toHaveLength(1);
+    expect(result.serviceCalls[0]).toMatch(/^--user show preview\.service /);
+  });
+
+  it.each(["unrelated", "colliding"])("previews updates with %s untracked files without fetching or merging", (kind) => {
+    const fixture = checkout({ includeInstaller: true });
+    if (kind === "colliding") publishFile(fixture, "local notes.txt", "upstream content\n");
+    writeFile(fixture.root, "local notes.txt", "keep these notes\n");
+    writeFile(fixture.root, "local diagnostics/nested/notes.txt", "nested notes\n");
+    const beforeHead = git(fixture.root, "rev-parse", "HEAD");
+    const beforeRefs = git(fixture.root, "show-ref");
+    const beforeStatus = git(fixture.root, "status", "--porcelain");
+    const beforeIndex = git(fixture.root, "ls-files", "--stage");
+
+    const result = updateCli(fixture, "--dry-run");
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("untracked-path collisions require a real fetch");
+    expect(result.stdout).toContain("npm ci");
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(beforeHead);
+    expect(git(fixture.root, "show-ref")).toBe(beforeRefs);
+    expect(git(fixture.root, "status", "--porcelain")).toBe(beforeStatus);
+    expect(git(fixture.root, "ls-files", "--stage")).toBe(beforeIndex);
+    expect(fs.existsSync(path.join(fixture.root, ".git/FETCH_HEAD"))).toBe(false);
+    expect(fs.readFileSync(path.join(fixture.root, "local notes.txt"), "utf8"))
+      .toBe("keep these notes\n");
+    expect(fs.readFileSync(path.join(fixture.root, "local diagnostics/nested/notes.txt"), "utf8"))
+      .toBe("nested notes\n");
+    expect(result.serviceCalls).toHaveLength(1);
+  });
+
   it("accepts a complete target commit only in update mode", () => {
     const targetCommit = "b".repeat(40);
     expect(
