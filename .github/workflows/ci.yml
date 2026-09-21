@@ -52,6 +52,52 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - run: npm run test:coverage
       - run: npm run build
+      - name: Upload terminal diagnostics from the full coverage run
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terminal-diagnostics-${{ github.sha }}
+          path: test-results/terminal/
+          if-no-files-found: warn
+          retention-days: 14
+
+  terminal-stress:
+    name: Terminal stress (Node 22, 2 CPUs, 7 GiB)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build the pinned terminal stress environment
+        run: docker build --pull --tag cloudx-terminal-stress:${{ github.sha }} --file containers/ci/terminal-stress.Dockerfile .
+      - name: Repeat terminal coverage with fixed resource limits
+        run: |
+          install -d test-results/terminal-stress
+          docker run --rm \
+            --init \
+            --user "$(id -u):$(id -g)" \
+            --network none \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 512 \
+            --cpus 2 \
+            --memory 7g \
+            --memory-swap 7g \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=2g,mode=1777 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=8g,mode=1777 \
+            --volume "${PWD}/test-results/terminal-stress:/work/test-results/terminal-stress:rw" \
+            cloudx-terminal-stress:${{ github.sha }}
+      - name: Upload every terminal stress outcome and diagnostic
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: terminal-stress-${{ github.sha }}
+          path: test-results/terminal-stress/
+          if-no-files-found: error
+          retention-days: 14
 
   asr:
     name: ASR (pytest)
@@ -244,6 +290,7 @@ jobs:
       [
         policy,
         typescript,
+        terminal-stress,
         python-services,
         browser,
         isolated-verifier,
@@ -256,6 +303,7 @@ jobs:
         env:
           POLICY_RESULT: ${{ needs.policy.result }}
           TYPESCRIPT_RESULT: ${{ needs.typescript.result }}
+          TERMINAL_STRESS_RESULT: ${{ needs.terminal-stress.result }}
           PYTHON_RESULT: ${{ needs.python-services.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}
           ISOLATED_VERIFIER_RESULT: ${{ needs.isolated-verifier.result }}
