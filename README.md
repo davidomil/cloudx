@@ -1,187 +1,44 @@
-# Cloudx
+# CloudX
 
-Cloudx is a local-first mobile workbench for Codex CLI. Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control.
+CloudX is a local-first desktop workbench for production development
+with Codex. Organize agent sessions, terminals, files, worktrees,
+documentation and issue workflows in one browser workspace on your Linux
+machine.
 
-Cloudx is built for long-running agent work: multiple Codex terminals, split
-panes, file browsing, rendered diffs, worktree management, local dashboard
-previews, and constrained voice commands backed by local Faster Whisper.
+Use split panes to implement a change, inspect its diff, run checks and
+view the local application together. Save that arrangement as a layout
+template and reopen it for another project. Mobile access and voice
+control are available when useful.
 
-Cloudx is intentionally local-first. Your code, credentials, shell tools, and
-Codex login stay on your machine. Private by default. Tailnet recommended.
-Public internet unsupported.
+**Start here:** [Install](docs/SETUP.md) · [Plugin
+guides](docs/plugins/README.md) · [Demo
+workspaces](docs/DEMO_WORKSPACES.md) · [Documentation
+index](docs/README.md)
 
-Do not expose Cloudx to the public internet. It can spawn terminals, send text
-to shells and Codex, read and edit files under configured roots, and embed local
-dashboards with token-bearing URLs. Keep Cloudx on localhost and put an
-authenticated reverse proxy such as Tailscale Serve in front of it for remote
-access whenever possible. An explicit `0.0.0.0` bind is available for a trusted,
-firewalled LAN, but Cloudx does not authenticate direct LAN clients.
+## Desktop workspaces
 
-## Screenshots
+The screenshots below show the current UI with disposable demo projects
+and synthetic content. They illustrate workspace layouts, not results
+from a live Codex run or connected issue tracker. [Reproduce the
+demos](docs/DEMO_WORKSPACES.md).
 
-These screenshots use a throwaway demo workspace and avoid local paths, host
-names, and dashboard tokens.
+![Desktop development workspace with Codex, files, terminal checks and a
+local application
+preview](docs/screenshots/cloudx-desktop-development.png)
 
-### Desktop Workspace
+_Development and review: keep the implementation, changed files and
+verification visible._
 
-![Cloudx workspace window showing a Codex terminal, file browser, and local dashboard](docs/screenshots/cloudx-split-panes.png)
+![Desktop knowledge workspace with documentation, reusable instructions
+and an automation graph](docs/screenshots/cloudx-desktop-knowledge.png)
 
-### Mobile Portrait
+_Knowledge and automation: keep reference material and repeatable
+workflow steps beside the project._
 
-<p align="center">
-  <img src="docs/screenshots/cloudx-mobile-portrait.png" width="390" alt="Cloudx mobile portrait workspace showing stacked panes and the bottom voice command bar">
-</p>
+## Start a project
 
-## Features
-
-- Responsive desktop and phone UI tuned for quick mobile sessions.
-- Server-backed workspace windows with independent pane layouts, default work
-  directories, quick name search, and AI-assisted context search.
-- tmux-like panes with movable plugin tabs.
-- Layout templates that save the current pane/tab arrangement and reopen it on a
-  different project path.
-- Codex terminal and standard shell terminal plugins, including clipboard image
-  paste into Codex tabs as workspace-backed `@` file references.
-- File browser plugin with voice-exposed read/write actions, active file search,
-  optional Git setup controls, changed-file badges in the tree, and rendered
-  per-file diffs.
-- Worktree manager plugin for creating or cloning a bare repository and managing
-  project worktree folders.
-- Local web plugin for dashboards such as Understand Anything.
-- Jira plugin for Jira Cloud issue dashboards, comments, transitions, issue
-  links, browser links, helper skills, and automation triggers from polling or
-  a manual play action in the Jira panel.
-- Documentation archive plugin for portable local knowledge ingestion, search,
-  source viewing, invalidation, assisted answers, queued imports, and automatic
-  Codex rule/skill injection.
-- Dynamic settings for global AI/microphone controls and plugin-owned options
-  such as file-browser Git diff visibility.
-- Shared path autocomplete for tab, window, and template directory fields.
-- Voice control using browser audio, local Faster Whisper, and
-  `gpt-5.6-luna`.
-- HTTPS on port `3001` with a local self-signed certificate for microphone
-  access.
-
-## Repository Map
-
-- `apps/server`: Fastify server, plugin host, sessions, terminals, local-web
-  proxy, ASR bridge, and voice controller.
-- `apps/web`: React/Vite UI.
-- `packages/plugin-api`: plugin contracts.
-- `packages/shared`: shared domain types and validation helpers.
-- `services/asr`: local Faster Whisper service.
-- `services/documentation-indexer`: local FastAPI documentation archive indexer,
-  extraction pipeline, and retrieval tests.
-- `debug_tooling/documentation-validation`: optional validation runner for the
-  documentation archive.
-- `containers/ci`: credential-free no-network verifier image.
-- `docs/AI_CHANGE_PROCESS.md`: AI-assisted contribution guidance and optional
-  machine-managed automation interfaces.
-- `docs/MEMORY_PLUGIN_GUIDE.md`: source-grounded documentation archive guide.
-- `docs/MOTIVATION.md`: why this exists.
-- `docs/WEB_APP_PLAN.md`: product and architecture plan.
-- `docs/SETUP.md`: install, service, HTTPS, and ASR details.
-- `docs/SECURITY_MODEL.md`: threat model, current limits, and deployment guidance.
-
-## GitHub Plugin Metadata Installs
-
-Cloudx can install plugin metadata from a public or credential-helper-backed
-GitHub HTTPS repository:
-
-```bash
-curl -sS -X POST http://127.0.0.1:3001/api/plugins/install \
-  -H 'content-type: application/json' \
-  -d '{"url":"https://github.com/owner/repo"}'
-```
-
-The repository must contain `.cloudx-plugin/plugin.json`:
-
-```json
-{
-  "schemaVersion": 1,
-  "id": "example-plugin",
-  "acronym": "EXP",
-  "displayName": "Example Plugin",
-  "description": "Short plugin description."
-}
-```
-
-Installed GitHub plugins are enabled as non-creatable placeholder descriptors
-after metadata validation. Cloudx does not execute third-party plugin code in
-this install path.
-
-## Jira Integration
-
-Cloudx includes a built-in Jira Cloud plugin. Configure it in Settings > Jira
-with the Jira site URL, Atlassian account email, and Jira API token. The token is
-stored as a plugin secret outside normal `config.json` and is not returned by
-`/api/config`.
-
-Create a Jira tab to view assigned work grouped by Epic by default. The panel can
-refresh dashboard issues, open Jira browser links, view comments and transitions,
-add comments, transition issues, and fire the `jira.issueManualRun` automation
-trigger from an issue row.
-
-Jira hooks expose search, bounded all-page search, current user, metadata, issue
-read/write, comments, transitions, links, URL generation, and one-shot polling.
-Jira polling is disabled by default. When enabled, Cloudx polls bounded JQL and
-emits automation triggers for created, updated, transitioned, newly assigned,
-assigned-to-me, and comment-created events.
-
-## Automation Workflows
-
-The Automation tab composes trigger events, plugin hooks, primitives, and
-converters into saved graphs. It can run from manual UI triggers such as Jira's
-issue play action or from plugin-owned triggers such as Jira polling events.
-Poll-based Jira triggers are exposed only to plugins and automation; external
-HTTP callers use the explicit manual Jira trigger instead.
-
-Python and Bash execution primitives are available for graph steps that need
-custom code. Python code can call automation-exposed Cloudx hooks with
-`cloudx.call_hook(...)`; see `docs/AUTOMATION_CODE_EXECUTION.md` for hook ID
-format, examples, outputs, and runtime limits.
-
-## Codex Image Paste
-
-Codex terminal tabs accept pasted PNG, JPEG, WebP, and GIF clipboard images.
-Cloudx saves each image under `.cloudx/pasted-images/` in the tab workspace and
-inserts an `@.cloudx/pasted-images/...` reference into the Codex prompt. Standard
-shell terminal tabs do not intercept image paste.
-
-Every Cloudx Codex terminal uses the same managed safety and capability defaults:
-Codex runs in explicit `--yolo` mode, local memories and Codex Apps are disabled,
-and Agent Plugins are disabled so their skills cannot enter the session. Cloudx
-enables only its selected and system skills plus the bundled `imagegen` skill;
-user, administrator, and repository skills discovered outside that set are
-disabled in the tab's generated Codex home. When the user's base Codex config
-omits a model, Cloudx defaults to `gpt-6-astra`. Explicit model, reasoning-effort,
-and display preferences are preserved.
-
-Reloading the browser page reattaches the same running terminal tab and restores
-its retained output, including a full replay buffer. The terminal process stays
-owned by the running Cloudx server. Restarting the Cloudx service ends those
-processes; changing a config file does not change the model inside an already
-running Codex process.
-
-New tabs keep isolated configuration and skills in
-`<data-dir>/codex-launches/<tab-id>` and use the original Codex home's shared
-SQLite state and complete sessions corpus. Cloudx sets `CODEX_SQLITE_HOME` only
-when it is absent or blank; explicit environment and native configuration
-precedence remain intact. Cloudx does not open or copy SQLite databases during
-tab creation. Initial native indexing or reconciliation is a separate operation;
-steady-state startup performance still requires native measurement.
-
-To resume, choose **Resume picker**, **Resume last**, or **Resume ID** in the New
-tab dialog. All modes use shared sessions automatically; there is no source
-selector. Resume requests must omit the removed `sourceId` field. Retired
-`codex-homes` directories are no longer discovered or selectable, and their unique
-state is not imported automatically. Shared launch views keep their history and
-binding when restarted. Retire unused old homes separately after checking that no
-process uses them and preserving any unique history.
-
-## Quick Start
-
-On Ubuntu 22.04 or newer, the guided installer is the easiest path:
+On Ubuntu 22.04 or newer, clone the repository and run the guided
+installer:
 
 ```bash
 git clone https://github.com/davidomil/cloudx
@@ -189,227 +46,106 @@ cd cloudx
 ./install.sh
 ```
 
-It shows each phase before running it. The bootstrap stage installs Ubuntu
-packages, including jq for JSON helper scripts, the PDF, spreadsheet, image,
-and media keyframe extraction tools used by the documentation archive plus the
-Quarto, Pandoc, and TeX Live toolchain used to render the memory-plugin PDF
-guide. It then installs Node.js 22 when needed, verifies `node -v` and
-`npm -v`, and falls back to Ubuntu's
-`npm` package if npm is still missing. The wizard checks Git 2.36+ for the
-Worktree Manager and, on older Ubuntu Git packages such as 22.04's 2.34.x,
-offers to install the current stable Git package from `ppa:git-core/ppa`.
-The wizard then installs Cloudx npm dependencies, installs and checks the pinned
-Codex CLI 0.153.4 release,
-prepares the Faster Whisper ASR environment, prepares the documentation archive
-indexer environment, downloads the local ASR model, writes Cloudx config, and
-optionally installs user-level services for Cloudx, ASR, and the documentation
-indexer. On NVIDIA systems, the wizard reads `nvidia-smi`; Linux driver
-525.60.13 or newer selects CUDA ASR, installs the required Python cuBLAS/cuDNN
-runtime wheels, and uses `int8_float16` on smaller GPUs such as 4GB cards. Each
-question includes a short explanation of what the choice changes. The optional
-`whisper.cpp` step is not needed for CPU-only or NVIDIA CUDA installs because
-Faster Whisper handles those paths; use it only for an alternate compiled
-backend such as Intel Arc SYCL. The installer prints the local Cloudx URL when
-it finishes. Fresh installs bind to loopback. Updates preserve an explicit
-`0.0.0.0` bind only when an exact browser origin is also configured in
-`CLOUDX_TRUSTED_ORIGINS`; otherwise they restore the loopback default.
+The installer prepares dependencies, prompts for allowed workspace
+roots, and can install user services. Open the HTTPS URL it prints. See
+[setup](docs/SETUP.md) for prerequisites, updates, manual development
+startup and service configuration.
 
-Preview the installer without changing the system:
+1.  Open **Workspace windows**, choose **Create window**, and select
+    your project directory.
+2.  Use **Add tab to this pane** to open **Codex Terminal** in that
+    project.
+3.  Use **Split columns** or **Split rows** to add **Files**,
+    **Terminal**, or **Local Web** beside it. Drag tabs between panes as
+    the task changes.
+4.  Inspect the changes, run the project checks, and review the result.
+5.  Open **Layout templates \> Save current layout as template** to
+    reuse the arrangement.
 
-```bash
-./install.sh --dry-run --yes
-```
+For parallel branches, start with
+[Worktrees](docs/plugins/worktree-manager.md). For issue-driven work,
+configure [Jira](docs/plugins/jira.md) or [Forge
+Workers](docs/plugins/forge.md). [Rules &
+Skills](docs/plugins/rules-skills.md) supplies reusable instructions;
+[Documentation](docs/plugins/documentation.md) keeps source material
+searchable.
 
-Add `--verbose` to install, update, or uninstall commands when debugging. It
-prints command working directories, safe installer environment values, captured
-stdout/stderr from probes, and service health-check context.
+## Choose the tools for the task
 
-For runtime debugging after Cloudx is installed, set `CLOUDX_LOG_LEVEL=debug`
-or `CLOUDX_LOG_LEVEL=trace` in the Cloudx environment file and restart the
-service. Runtime debug logs include plugin catalog loading, GitHub plugin
-installation phases, plugin contribution sync, request context, terminal,
-workspace, and voice workflow diagnostics.
+| Task                         | Plugins                                                                                                                                         |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implement and verify         | [Codex Terminal](docs/plugins/codex-terminal.md), [Terminal](docs/plugins/standard-terminal.md), [Files](docs/plugins/file-browser.md)          |
+| Manage project context       | [Worktrees](docs/plugins/worktree-manager.md), [Local Web](docs/plugins/local-web.md), [Rules & Skills](docs/plugins/rules-skills.md)           |
+| Research and coordinate work | [Documentation](docs/plugins/documentation.md), [Jira](docs/plugins/jira.md), [Forge Workers](docs/plugins/forge.md)                            |
+| Repeat a workflow            | [Automation](docs/plugins/automation.md), [Notifications](docs/plugins/notifications.md)                                                        |
+| Configure and navigate       | [Codex Settings](docs/plugins/codex-settings.md), [Workspace Controls](docs/plugins/workspace-control.md), [Audio AI](docs/plugins/audio-ai.md) |
 
-Update an existing install after pulling the latest checkout:
+All built-in plugins have a usage guide.
 
-```bash
-./install.sh --update
-```
+## Host access and remote use
 
-Remove Cloudx-managed services and local install artifacts:
+CloudX can execute host commands, edit files under configured roots and
+access configured integrations. It is a single-developer tool with
+powerful host access. Keep it on localhost or behind an authenticated
+private reverse proxy; public internet exposure is unsupported. Direct
+trusted-LAN access requires explicit configuration and firewall
+restrictions. Read the [security model](docs/SECURITY_MODEL.md) before
+enabling remote access.
 
-```bash
-./install.sh --uninstall
-```
+Workspace storage is local. Codex and configured external integrations
+still contact their providers; local-first does not mean all processing
+is offline. Microphone input uses the local ASR service before AI
+command planning.
 
-The default uninstall keeps `~/.config/cloudx/cloudx.env`, runtime data, the
-downloaded ASR model, and systemd linger. Active Cloudx services must stop
-successfully before the installer removes units or managed environments.
+## Develop and verify
 
-Manual development startup is still available when prerequisites are already
-installed:
+With the [prerequisites](docs/SETUP.md#requirements) installed, prepare
+the checkout.
 
 ```bash
 npm ci
 npm run build
+```
+
+Start the independent terminal service and leave it running.
+
+```bash
+npm run terminals -w @cloudx/server
+```
+
+In another terminal, start the web server.
+
+```bash
 npm run dev
 ```
 
-To run the Vite frontend separately, admit its exact origin on the backend:
-
-```bash
-CLOUDX_TRUSTED_ORIGINS=http://127.0.0.1:5173 npm run dev
-```
-
-Then start Vite in another terminal:
-
-```bash
-npm run dev:web
-```
-
-Open `https://127.0.0.1:3001`. For phone access, proxy the localhost service
-through a private tailnet. Add the proxy's exact public origin (without a
-trailing slash) to `~/.config/cloudx/cloudx.env` before starting Cloudx:
-
-```bash
-printf '%s\n' 'CLOUDX_TRUSTED_ORIGINS=https://build-host.example.ts.net' \
-  >> ~/.config/cloudx/cloudx.env
-tailscale serve --bg https+insecure://localhost:3001
-```
-
-Use Tailscale grants or ACLs so only the intended users and devices can reach
-the node. For a direct trusted-LAN deployment, follow
-[`docs/SECURITY_MODEL.md`](docs/SECURITY_MODEL.md#direct-trusted-lan-access) and
-restrict the port with the host firewall.
-
-For voice control:
-
-```bash
-UV_PROJECT_ENVIRONMENT="$PWD/services/asr/.venv" \
-  ~/.local/share/cloudx/uv/bin/uv sync --locked --project services/asr --extra dev
-services/asr/.venv/bin/uvicorn cloudx_asr.main:app \
-  --app-dir services/asr/src --host 127.0.0.1 --port 7810
-```
-
-The ASR service defaults to the small CPU model. See `docs/SETUP.md` for the
-installer details, large-v3 Faster Whisper setup, GPU/CPU choices, and systemd
-service install.
-
-For the local documentation archive:
-
-```bash
-npm run documentation:setup
-npm run documentation:start
-```
-
-This installs the PDF/image/table extraction stack plus YouTube transcript,
-playlist metadata, YouTube keyframe capture, and media enrichment support, then
-starts the Turbovec-backed indexer at `http://127.0.0.1:7820`, which is the
-Cloudx default `CLOUDX_DOCUMENTATION_URL`. Create a Documentation tab in Cloudx
-to upload files, add local paths, ingest URLs or YouTube playlists, add copied
-text or media transcripts, search active knowledge, inspect full source chunks
-and extracted artifacts, invalidate stale sources, remove sources from active
-search, and manage archive ZIP export/import. Portable manifest inspection and
-Turbovec index rebuild are available through the documentation helper, plugin
-hooks, and local indexer API.
-
-The documentation service requires Python 3.11 or newer (the installer uses
-3.12). Setup provisions the pinned MiniLM model and verifies its artifact hashes.
-Provisioning uses `CLOUDX_DOCUMENTATION_MODEL_DIR` when configured, otherwise
-`CLOUDX_DOCUMENTATION_DATA_DIR/models/minilm` (default `.cloudx/documentation/models/minilm`).
-The standalone `cloudx-documentation-model [directory]` command uses the same defaults.
-Startup requires those local assets; inference does not download models. Hybrid
-search combines lexical evidence with learned sentence embeddings. Model and
-tokenizer revisions, runtime versions, pooling rules and artifact hashes identify
-each index profile. Portable exports retain archive-local model assets; an
-externally configured model directory is represented by pinned provisioning
-references in the manifest.
-
-Documentation rules and skills are synced automatically as CloudX system
-contributions when the server starts, so Codex tabs can use the archive without
-a separate install step.
-
-Documentation AI assistance is enabled by default when global AI control is on.
-If it is disabled, the Documentation tab still supports manual source-text
-search and full source inspection, but assisted answers and post-ingest AI
-enrichment are unavailable.
-
-Source refresh, source reanalysis, and AI re-enrichment are separate operations.
-AI enrichment uses archive-owned, revision-bound batch checkpoints; interrupted
-runs resume only when explicitly requested. Source campaigns rebuild selected
-retained revisions without AI. See the [documentation lifecycle guide](docs/architecture/documentation-lifecycle.md)
-for hooks, source families, retained media, schema version 2, and irreversible
-purge. The former direct `/documents/{id}/enrich` API is retired in favor of
-validated enrichment runs.
-
-The documentation archive is portable as one directory. Stop writes, then back
-up or move `.cloudx/documentation` or the directory named by
-`CLOUDX_DOCUMENTATION_DATA_DIR`. After changing the directory, restart the
-indexer and verify `/stats` reports `archiveLocality.ok: true`.
-
-Render the memory plugin guide PDF locally after documentation changes when a
-PDF artifact is needed:
-
-```bash
-npm run docs:memory:pdf
-```
-
-If the signed-in Codex account cannot use the configured planner model, disable
-Settings > Global > Voice commands. This hides typed and microphone voice
-command submission without disabling the rest of Cloudx.
-
-## Configuration
-
-Common environment variables:
-
-- `CLOUDX_HOST`: bind host, default `127.0.0.1`. The only network-facing value
-  accepted is the explicit IPv4 wildcard `0.0.0.0`, and it requires at least
-  one exact browser origin in `CLOUDX_TRUSTED_ORIGINS`.
-- `CLOUDX_PORT`: app port, default `3001`.
-- `CLOUDX_TRUSTED_ORIGINS`: comma-separated additional canonical HTTP(S)
-  origins for Vite or an authenticated reverse proxy. The built-in loopback
-  service origin is always trusted and must not be repeated. An absent variable adds no
-  extra origin; an empty value, duplicate, path, query, fragment, credential,
-  trailing slash, or noncanonical origin fails startup.
-- `CLOUDX_LOG_LEVEL`: server log level, one of `fatal`, `error`, `warn`, `info`, `debug`, `trace`, or `silent`; default `info`.
-- `CLOUDX_ALLOWED_ROOTS`: path-delimited allowed roots, default `~`.
-- `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI executable for assistant-backed terminals and tools.
-- `CLOUDX_TOOL_PATH`: path-delimited command directories prepended to Cloudx child processes.
-- `CLOUDX_ASR_URL`: ASR endpoint, default `http://127.0.0.1:7810`.
-- `CLOUDX_ASR_DEVICE`: Faster Whisper device, `cpu` or `cuda`.
-- `CLOUDX_ASR_COMPUTE_TYPE`: Faster Whisper compute profile, for example `int8`, `int8_float16`, or `float16`.
-- `CLOUDX_VOICE_AUDIO_UPLOAD_MAX_BYTES`: shared HTTP and WebSocket ASR audio admission limit, default `26214400` (25 MiB); must be a positive integer no greater than `536870912` (512 MiB).
-- `CLOUDX_DOCUMENTATION_URL`: documentation indexer endpoint, default `http://127.0.0.1:7820`.
-- `CLOUDX_DOCUMENTATION_HOST`: documentation indexer bind address, default `127.0.0.1`.
-- `CLOUDX_DOCUMENTATION_PORT`: documentation indexer port, default `7820`.
-- `CLOUDX_DOCUMENTATION_TIMEOUT_MS`: documentation indexer and AI enrichment timeout, default `1800000`.
-- `CLOUDX_DOCUMENTATION_RESPONSE_MAX_BYTES`: maximum indexer response size, default `8388608`.
-- `CLOUDX_DOCUMENTATION_UPLOAD_MAX_BYTES`: browser/server/indexer documentation upload cap, default `268435456`.
-- `CLOUDX_DOCUMENTATION_IMPORT_UPLOAD_MAX_BYTES`: indexer archive import upload cap, default `1073741824`.
-- `CLOUDX_DOCUMENTATION_ALLOW_PRIVATE_URL_INGEST`: set to `true` only for trusted private URL ingest sources.
-- `CLOUDX_DOCUMENTATION_DATA_DIR`: portable documentation archive directory, default `.cloudx/documentation`.
-- `CLOUDX_DOCUMENTATION_MODEL_DIR`: pinned MiniLM assets directory, default `models/minilm` within the documentation archive.
-- `CLOUDX_DOCUMENTATION_RETRIEVAL_PROFILE`: `minilm` by default; `diagnostic-hash` explicitly selects the nonsemantic feature-hash profile for diagnostics.
-- `CLOUDX_VOICE_MODEL`: planner model, default `gpt-5.6-luna`.
-- `CLOUDX_VOICE_DEBUG_TRANSCRIPTS`: log raw transcripts and planner text.
-
-## Engineering Status
-
-Cloudx was built through heavy agent-assisted and vibe-coding workflows. It is
-useful, but it is not a hardened service. The current security posture is
-documented in `docs/SECURITY_MODEL.md`.
-
-## Verify
+Both processes must use the same `CLOUDX_DATA_DIR` and allowed roots.
+Open `https://127.0.0.1:3001`. The server serves the built web app. For
+Vite development and optional ASR/documentation services, follow
+[setup](docs/SETUP.md).
 
 ```bash
 npm run typecheck
 npm test
 npm run build
-services/documentation-indexer/.venv/bin/python -m pytest services/documentation-indexer/tests
-services/asr/.venv/bin/python -m pytest services/asr/tests
 ```
+
+Use the [testing map](docs/architecture/testing-map.md) for focused
+tests, browser checks and Python service tests.
+[CONTRIBUTING.md](CONTRIBUTING.md) describes the contribution workflow.
+
+| Path                             | Responsibility                                                          |
+| -------------------------------- | ----------------------------------------------------------------------- |
+| `apps/server`                    | Host capabilities, sessions, plugins, persistence and service adapters. |
+| `apps/web`                       | React/Vite workspace and interaction state.                             |
+| `packages/shared`                | Serializable contracts and validation helpers.                          |
+| `packages/plugin-api`            | Plugin, hook and contribution interfaces.                               |
+| `services/documentation-indexer` | Archive extraction, indexing and retrieval.                             |
+| `services/asr`                   | Local speech transcription.                                             |
+
+Repository map.
 
 ## License
 
-MIT. Forks and copies must keep the copyright and license notice, which credits
-the original author.
+MIT. Forks and copies must retain the copyright and license notice. See
+[LICENSE](LICENSE).

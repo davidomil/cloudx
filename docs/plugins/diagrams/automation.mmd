@@ -1,0 +1,8 @@
+flowchart TD
+  A["Create disabled automation"] --> B["Add trigger, actions and connections"]
+  B --> C["Validate graph"]
+  C --> D["Run test with fixture"]
+  D --> E["Inspect status and trace"]
+  E -->|"Ready"| F["Save and enable"]
+  E -->|"Adjust"| B
+  F --> G["Real event executes saved graph"]

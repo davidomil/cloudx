@@ -1,0 +1,7 @@
+flowchart TB
+  A[Open project in Files] --> B{Inspect or transfer}
+  B -->|Inspect| C[Browse or search]
+  C --> D[Preview file or Git diff]
+  B -->|Transfer| E[Upload, download, or extract]
+  D --> F[Edit with Codex or Terminal]
+  F --> G[Refresh and review]

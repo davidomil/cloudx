@@ -1,0 +1,7 @@
+flowchart TB
+  A[Choose project directory and template] --> B{Session}
+  B -->|New| C[Start Codex]
+  B -->|Resume| D[Select saved conversation]
+  D --> C
+  C --> E[Give task and inspect changes]
+  E --> F[Review in Files and validate in Terminal]
