@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
-import type { ForgeWorker } from "@cloudx/shared";
+import type { ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import react from "@vitejs/plugin-react";
 import { createServer as createHttpServer, type Server } from "node:http";
 import path from "node:path";
@@ -41,7 +41,13 @@ test.afterAll(async () => {
   );
 });
 
-async function workers(page: Page, holdFirstContinuation = false) {
+async function workers(
+  page: Page,
+  options: {
+    holdFirstContinuation?: boolean;
+    historyScreen?: ForgeWorkerHistory["screen"];
+  } = {},
+) {
   const repository = {
     provider: "github" as const,
     apiUrl: "https://api.github.com",
@@ -103,7 +109,7 @@ async function workers(page: Page, holdFirstContinuation = false) {
             history: {
               tabId: `${body.input.id}-terminal`,
               capturedAt: "2026-09-21T12:00:00.000Z",
-              screen: {
+              screen: options.historyScreen ?? {
                 cols: 100,
                 rows: 30,
                 data: `Starting deployment check\r\n${Array.from({ length: 80 }, (_, index) => `Checking dependency ${index + 1}`).join("\r\n")}\r\n\x1b[31mDeployment check failed: missing dependency.\x1b[0m\x1b[?1003h`,
@@ -113,7 +119,7 @@ async function workers(page: Page, holdFirstContinuation = false) {
         });
       case "forge.worker.continue": {
         continuations.push(body);
-        if (holdFirstContinuation && continuations.length === 1) {
+        if (options.holdFirstContinuation && continuations.length === 1) {
           held = route;
           requested();
           return;
@@ -281,10 +287,103 @@ for (const worker of [
   });
 }
 
+test("preserves near-limit worker history through mobile fitting and repeated resizing", async ({
+  page,
+}, testInfo) => {
+  const firstDiagnostic = "line-0000: earliest failure diagnostic";
+  const lastDiagnostic = "line-0999: final failure diagnostic";
+  const lines = Array.from(
+    { length: 1000 },
+    (_, index) => `line-${String(index).padStart(4, "0")}: dependency check`,
+  );
+  lines[0] = firstDiagnostic;
+  lines[lines.length - 1] = lastDiagnostic;
+  const fixture = await workers(page, {
+    historyScreen: {
+      cols: 100,
+      rows: 30,
+      data: lines.map((line) => line.padEnd(100, ".")).join("\r\n"),
+    },
+  });
+  await page.getByRole("button", { name: "View worker", exact: true }).click();
+  const output = page.getByRole("region", {
+    name: "Saved worker terminal output",
+  });
+  const visibleLines = output.locator(".xterm-accessibility-tree");
+  await expect(visibleLines).toContainText(lastDiagnostic);
+  const browserInput = await page.context().newCDPSession(page);
+
+  for (const [stage, viewport] of [
+    page.viewportSize()!,
+    { width: 390, height: 844 },
+    { width: 1440, height: 960 },
+    { width: 320, height: 700 },
+    { width: 1440, height: 960 },
+  ].entries()) {
+    await page.setViewportSize(viewport);
+    await expect(output).toBeInViewport({ ratio: 1 });
+    for (const edge of ["first", "last"]) {
+      if (
+        testInfo.project.name === "mobile-chromium" &&
+        (await output.locator(".terminal-mobile-scroll-rail").isVisible())
+      ) {
+        const rail = (await output
+          .locator(".terminal-mobile-scroll-rail")
+          .boundingBox())!;
+        const x = rail.x + rail.width / 2;
+        await browserInput.send("Input.dispatchTouchEvent", {
+          type: "touchStart",
+          touchPoints: [{ x, y: rail.y + rail.height / 2 }],
+        });
+        await browserInput.send("Input.dispatchTouchEvent", {
+          type: "touchMove",
+          touchPoints: [
+            { x, y: edge === "first" ? rail.y - 1 : rail.y + rail.height + 1 },
+          ],
+        });
+        await browserInput.send("Input.dispatchTouchEvent", {
+          type: "touchEnd",
+          touchPoints: [],
+        });
+      } else {
+        await output.hover();
+        const scrollbar = output.locator(".xterm .scrollbar.vertical");
+        const track = (await scrollbar.boundingBox())!;
+        const thumb = (await scrollbar.locator(".slider").boundingBox())!;
+        await page.mouse.move(
+          thumb.x + thumb.width / 2,
+          thumb.y + thumb.height / 2,
+        );
+        await page.mouse.down();
+        await page.mouse.move(
+          track.x + track.width / 2,
+          edge === "first" ? track.y : track.y + track.height,
+        );
+        await page.mouse.up();
+      }
+      await expect(visibleLines).toContainText(
+        edge === "first" ? firstDiagnostic : lastDiagnostic,
+      );
+      if (edge === "first" && (stage === 1 || stage === 4)) {
+        const name = `earliest-worker-history-${viewport.width}px`;
+        const screenshot = testInfo.outputPath(`${name}.png`);
+        await page.screenshot({ path: screenshot });
+        await testInfo.attach(name, {
+          path: screenshot,
+          contentType: "image/png",
+        });
+      }
+    }
+  }
+  await browserInput.detach();
+  expect(fixture.historyRequests).toEqual(["issue-worker"]);
+  expect(fixture.continuations).toEqual([]);
+});
+
 test("retains a failed message and allows an explicit retry", async ({
   page,
 }) => {
-  const fixture = await workers(page, true);
+  const fixture = await workers(page, { holdFirstContinuation: true });
   await page.getByRole("button", { name: "Continue with message" }).click();
   const form = page.getByRole("form", {
     name: "Continue worker with a message",
