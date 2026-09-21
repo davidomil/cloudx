@@ -6,6 +6,7 @@ import { parse } from "smol-toml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { HookRegistry } from "../hooks/HookRegistry.js";
+import { readCodexLaunchPreferences, writeCodexLaunchPreferences } from "./CodexLaunchPreferences.js";
 import { CodexSettingsPlugin } from "./CodexSettingsPlugin.js";
 import { CodexSettingsService } from "./CodexSettingsService.js";
 import { CodexStateSources } from "./CodexStateSources.js";
@@ -37,6 +38,105 @@ async function fixture(config?: string) {
 }
 
 describe("shared Codex settings", () => {
+  it("defaults installed Codex skills to disabled except image generation without writing on read", async () => {
+    const f = await fixture();
+    for (const id of ["imagegen", "slides", "skill-creator"]) {
+      const directory = path.join(f.home, "skills", ".system", id);
+      await fs.mkdir(directory, { recursive: true });
+      await fs.writeFile(path.join(directory, "SKILL.md"), `# ${id}`);
+    }
+    await expect(f.service.read()).resolves.toMatchObject({
+      yoloMode: true, autoTrustWorkspace: false, reasoningEffort: null, webSearch: null, personality: null,
+      defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "skill-creator", enabled: false, available: true }, { id: "slides", enabled: false, available: true }],
+    });
+    await expect(fs.stat(f.configPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("shares saved launch, skill, and behavior defaults across instances and applies them only to new overlays", async () => {
+    const original = '# Keep personal settings\ncustom = "keep"\n';
+    const f = await fixture(original);
+    for (const id of ["imagegen", "slides"]) {
+      const directory = path.join(f.home, "skills", ".system", id);
+      await fs.mkdir(directory, { recursive: true });
+      await fs.writeFile(path.join(directory, "SKILL.md"), `# ${id}`);
+    }
+    const second = f.instance("second");
+    const launch = (tabId: string) => materializeCodexTemplate(undefined, { CODEX_HOME: f.home, HOME: f.root }, { dataDir: second.dataDir, sources: second.sources, tabId, cwd: f.root });
+    const before = await launch("before");
+    const settings = await f.service.read();
+    const saved = await f.service.update({ expectedRevision: settings.revision, yoloMode: false, autoTrustWorkspace: true,
+      defaultSkills: { imagegen: false, slides: true }, reasoningEffort: "high", webSearch: "live", personality: "pragmatic" });
+    await expect(second.service.read()).resolves.toEqual(saved);
+    const after = await launch("after");
+    expect(before.args).toContain("--yolo");
+    expect(after.args).not.toContain("--yolo");
+    expect(before.overlay!.skillPaths.some(file => file.endsWith("/imagegen/SKILL.md"))).toBe(true);
+    expect(after.overlay!.skillPaths.some(file => file.endsWith("/imagegen/SKILL.md"))).toBe(false);
+    expect(after.overlay!.skillPaths.some(file => file.endsWith("/slides/SKILL.md"))).toBe(true);
+    const launched = parse(await fs.readFile(after.overlay!.configPath, "utf8"));
+    expect(launched).toMatchObject({ model_reasoning_effort: "high", web_search: "live", personality: "pragmatic", projects: { [f.root]: { trust_level: "trusted" } } });
+    expect(launched.cloudx).toBeUndefined();
+    expect(parse(await fs.readFile(before.overlay!.configPath, "utf8")).projects).toBeUndefined();
+    const text = await fs.readFile(f.configPath, "utf8");
+    expect(text).toContain(original);
+    expect(readCodexLaunchPreferences(text)).toMatchObject({ yoloMode: false, autoTrustWorkspace: true, defaultSkills: { imagegen: false, slides: true } });
+    expect(parse(text).projects).toBeUndefined();
+  });
+
+  it.each([
+    '# personal comment\n[features]\nfast_mode = false\n',
+    'features.fast_mode = false\n',
+    'features = { fast_mode = false }\n',
+    'instructions = """\n# CloudX launch preferences: invalid marker inside a string\n"""\n',
+  ])("edits managed launch preferences without discarding unrelated TOML or comments %#", async config => {
+    const f = await fixture(config);
+    const skill = path.join(f.home, "skills", ".system", "imagegen");
+    await fs.mkdir(skill, { recursive: true });
+    await fs.writeFile(path.join(skill, "SKILL.md"), "# imagegen");
+    const settings = await f.service.read();
+    const first = await f.service.update({ expectedRevision: settings.revision, yoloMode: false, autoTrustWorkspace: true, defaultSkills: { imagegen: false } });
+    await f.service.update({ expectedRevision: first.revision, yoloMode: true });
+    const saved = await fs.readFile(f.configPath, "utf8");
+    expect(readCodexLaunchPreferences(saved)).toEqual({ yoloMode: true, autoTrustWorkspace: true, defaultSkills: { imagegen: false } });
+    expect(saved).toContain(config);
+    expect(parse(saved)).toEqual(parse(config));
+  });
+
+  it("removes native behavior overrides while preserving unknown existing choices on unrelated saves", async () => {
+    const f = await fixture('model_reasoning_effort = "future-effort"\nweb_search = "future-search"\npersonality = "future-personality"\n');
+    const settings = await f.service.read();
+    const saved = await f.service.update({ expectedRevision: settings.revision, yoloMode: false });
+    expect(saved).toMatchObject({ reasoningEffort: "future-effort", webSearch: "future-search", personality: "future-personality" });
+    const reset = await f.service.update({ expectedRevision: saved.revision, reasoningEffort: null, webSearch: null, personality: null });
+    expect(reset).toMatchObject({ reasoningEffort: null, webSearch: null, personality: null });
+    expect(parse(await fs.readFile(f.configPath, "utf8"))).toEqual({});
+  });
+
+  it("allows disabling a saved skill that is no longer installed without allowing it to be enabled", async () => {
+    const f = await fixture(writeCodexLaunchPreferences("", { yoloMode: true, autoTrustWorkspace: false, defaultSkills: { imagegen: true, slides: true } }));
+    const settings = await f.service.read();
+    expect(settings.defaultSkills).toContainEqual({ id: "slides", enabled: true, available: false });
+    expect(settings.defaultSkills).toContainEqual({ id: "imagegen", enabled: true, available: false });
+    await expect(f.service.update({ expectedRevision: settings.revision, defaultSkills: { slides: true } })).rejects.toThrow(/no longer installed/);
+    const saved = await f.service.update({ expectedRevision: settings.revision, defaultSkills: { slides: false, imagegen: false } });
+    expect(saved.defaultSkills.every(skill => !skill.enabled)).toBe(true);
+  });
+
+  it("rejects a missing or caller-invented default skill before saving any fields", async () => {
+    const f = await fixture('model = "original-model"\n');
+    const settings = await f.service.read();
+    await expect(f.service.update({ expectedRevision: settings.revision, yoloMode: false, defaultSkills: { absent: true } })).rejects.toThrow(/no longer installed/);
+    expect(await fs.readFile(f.configPath, "utf8")).toBe('model = "original-model"\n');
+  });
+
+  it.each(['# CloudX launch preferences: {"yoloMode":"true"}', '# CloudX launch preferences: {"autoTrustWorkspace":1}', '# CloudX launch preferences: {"defaultSkills":[]}', '# CloudX launch preferences: {"defaultSkills":{"imagegen":"yes"}}', 'web_search = false'])
+  ("rejects invalid persisted settings without exposing unrelated values: %s", async malformed => {
+    const f = await fixture(`private_token = "synthetic-private-token"\n${malformed}\n`);
+    await expect(f.service.read()).rejects.toThrow(/Codex|CloudX/);
+    const message = await f.service.read().catch((error: Error) => error.message);
+    expect(message).not.toContain("synthetic-private-token");
+  });
+
   it("makes a saved model visible to another CloudX instance and after reopening", async () => {
     const f = await fixture('model = "original-model"\nservice_tier = "priority"\n');
     const second = f.instance("second");
@@ -61,7 +161,7 @@ describe("shared Codex settings", () => {
     expect(await fs.readFile(f.configPath, "utf8")).toBe(original.replace("'original-model'", '"chosen-model"'));
     expect(saved).toMatchObject({ model: "chosen-model", serviceTier: "flex", fastModeEnabled: false });
     expect(JSON.stringify(saved)).not.toContain("synthetic-private-token");
-    expect(Object.keys(saved).sort()).toEqual(["fastModeEnabled", "model", "revision", "serviceTier"]);
+    expect(Object.keys(saved).sort()).toEqual(["autoTrustWorkspace", "defaultSkills", "fastModeEnabled", "model", "personality", "reasoningEffort", "revision", "serviceTier", "webSearch", "yoloMode"]);
   });
 
   it.each(["priority", "default", "flex"] as const)("saves service tier %s and enables Codex's fast-mode feature", async (serviceTier) => {
@@ -386,6 +486,14 @@ describe("Codex settings plugin boundary", () => {
     { path: "/private/config.toml" },
     { codexHome: "/private" },
     { fastModeEnabled: true },
+    { yoloMode: "true" },
+    { autoTrustWorkspace: null },
+    { reasoningEffort: "imaginary" },
+    { webSearch: true },
+    { personality: "funny" },
+    { defaultSkills: [] },
+    { defaultSkills: { "../private": true } },
+    { defaultSkills: { imagegen: "yes" } },
   ])("rejects invalid settings input before the service can change files %#", async (invalid) => {
     const f = await pluginFixture();
     const settings = await f.service.read();

@@ -399,6 +399,7 @@ export async function materializeCodexTemplate(
     ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
     : undefined;
   if (overlay) {
+    if (!overlay.yoloMode) args.splice(args.indexOf("--yolo"), 1);
     env.CODEX_HOME = overlay.codexHome;
     env.CLOUDX_RULES_SKILLS_DIR = overlay.rulesSkillsRoot;
     env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";

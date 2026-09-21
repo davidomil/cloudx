@@ -4,6 +4,7 @@ import type { CodexGlobalSettings, CodexGlobalSettingsUpdate } from "@cloudx/sha
 import { parse } from "smol-toml";
 import { parseTOML, type AST } from "toml-eslint-parser";
 
+import { discoverCodexDefaultSkills, readCodexLaunchPreferences, writeCodexLaunchPreferences } from "./CodexLaunchPreferences.js";
 import type { CodexStateSources, ResolvedCodexStateSource } from "./CodexStateSources.js";
 
 export class CodexSettingsService {
@@ -12,14 +13,15 @@ export class CodexSettingsService {
   async read(signal?: AbortSignal): Promise<CodexGlobalSettings> {
     const source = await this.sources.resolve(signal);
     const text = await this.sources.readConfig(source, signal);
-    return settingsFromConfig(source, text);
+    return settingsFromConfig(source, text, await discoverCodexDefaultSkills(this.sources.originalHome));
   }
 
   async update(input: CodexGlobalSettingsUpdate, signal?: AbortSignal): Promise<CodexGlobalSettings> {
     validateUpdate(input);
     const source = await this.sources.resolve(signal);
     const original = await this.sources.readConfig(source, signal);
-    const current = settingsFromConfig(source, original);
+    const defaultSkills = await discoverCodexDefaultSkills(this.sources.originalHome);
+    const current = settingsFromConfig(source, original, defaultSkills);
     if (input.expectedRevision !== current.revision)
       throw new Error("Shared Codex settings changed. Reload before saving again.");
 
@@ -29,16 +31,37 @@ export class CodexSettingsService {
       text = editRootSetting(text, "service_tier", input.serviceTier);
       if (input.serviceTier !== null) text = enableServiceTiers(text);
     }
+    for (const [field, key] of Object.entries(nativeSettings)) {
+      const value = input[field as keyof typeof nativeSettings];
+      if (value !== undefined) text = editRootSetting(text, key, value);
+    }
+    if (input.yoloMode !== undefined || input.autoTrustWorkspace !== undefined || input.defaultSkills !== undefined) {
+      const preferences = readCodexLaunchPreferences(text);
+      if (input.yoloMode !== undefined) preferences.yoloMode = input.yoloMode;
+      if (input.autoTrustWorkspace !== undefined) preferences.autoTrustWorkspace = input.autoTrustWorkspace;
+      for (const [id, enabled] of Object.entries(input.defaultSkills ?? {})) {
+        if (!defaultSkills.some(skill => skill.id === id) && (enabled || !current.defaultSkills.some(skill => skill.id === id)))
+          throw new Error("Selected Codex default skill is no longer installed. Reload before saving again.");
+        preferences.defaultSkills[id] = enabled;
+      }
+      text = writeCodexLaunchPreferences(text, preferences);
+    }
     if (text === (original ?? "")) return current;
-    const settings = settingsFromConfig(source, text);
+    const settings = settingsFromConfig(source, text, defaultSkills);
     await this.sources.replaceConfig(source, original, text, signal);
     return settings;
   }
 }
 
+const nativeSettings = {
+  reasoningEffort: "model_reasoning_effort",
+  webSearch: "web_search",
+  personality: "personality",
+} as const;
+
 function validateUpdate(input: CodexGlobalSettingsUpdate): void {
   if (!input || typeof input !== "object" || Array.isArray(input)
-    || Object.keys(input).some((key) => !["expectedRevision", "model", "serviceTier"].includes(key))
+    || Object.keys(input).some((key) => !["expectedRevision", "model", "serviceTier", "yoloMode", "autoTrustWorkspace", "defaultSkills", ...Object.keys(nativeSettings)].includes(key))
     || typeof input.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(input.expectedRevision))
     throw new Error("Invalid shared Codex settings update.");
   if (input.model !== undefined && input.model !== null
@@ -47,13 +70,27 @@ function validateUpdate(input: CodexGlobalSettingsUpdate): void {
   if (input.serviceTier !== undefined && input.serviceTier !== null
     && !["priority", "default", "flex"].includes(input.serviceTier))
     throw new Error("Invalid Codex service tier.");
+  for (const key of ["yoloMode", "autoTrustWorkspace"] as const) {
+    if (input[key] !== undefined && typeof input[key] !== "boolean") throw new Error(`Codex ${key} must be a boolean.`);
+  }
+  const choices = {
+    reasoningEffort: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+    webSearch: ["disabled", "cached", "indexed", "live"],
+    personality: ["none", "friendly", "pragmatic"],
+  };
+  for (const key of Object.keys(choices) as (keyof typeof choices)[]) {
+    if (input[key] !== undefined && input[key] !== null && !choices[key].includes(input[key])) throw new Error(`Invalid Codex ${key}.`);
+  }
+  if (input.defaultSkills !== undefined && (!input.defaultSkills || typeof input.defaultSkills !== "object" || Array.isArray(input.defaultSkills)
+    || Object.entries(input.defaultSkills).some(([id, enabled]) => !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id) || typeof enabled !== "boolean")))
+    throw new Error("Invalid Codex default skills selection.");
 }
 
-function settingsFromConfig(source: ResolvedCodexStateSource, text: string | undefined): CodexGlobalSettings {
+function settingsFromConfig(source: ResolvedCodexStateSource, text: string | undefined, defaultSkills: { id: string }[]): CodexGlobalSettings {
   let config;
   try { config = parse(text ?? ""); }
   catch { throw new Error("Shared Codex configuration contains invalid TOML. Fix config.toml before editing settings."); }
-  for (const key of ["model", "service_tier"]) {
+  for (const key of ["model", "service_tier", ...Object.values(nativeSettings)]) {
     if (config[key] !== undefined && typeof config[key] !== "string")
       throw new Error(`Codex configuration ${key} must be a string.`);
   }
@@ -63,7 +100,16 @@ function settingsFromConfig(source: ResolvedCodexStateSource, text: string | und
   const fastMode = (features as Record<string, unknown> | undefined)?.fast_mode;
   if (fastMode !== undefined && typeof fastMode !== "boolean")
     throw new Error("Codex configuration features.fast_mode must be a boolean.");
+  const preferences = readCodexLaunchPreferences(text);
   return {
+    yoloMode: preferences.yoloMode,
+    autoTrustWorkspace: preferences.autoTrustWorkspace,
+    defaultSkills: [...new Set([...defaultSkills.map(skill => skill.id), ...Object.keys(preferences.defaultSkills)])].sort().map(id => ({
+      id, enabled: preferences.defaultSkills[id] ?? false, available: defaultSkills.some(skill => skill.id === id),
+    })),
+    reasoningEffort: config.model_reasoning_effort as string | undefined ?? null,
+    webSearch: config.web_search as string | undefined ?? null,
+    personality: config.personality as string | undefined ?? null,
     revision: createHash("sha256").update(JSON.stringify([source.home, source.dev, source.ino, text ?? null])).digest("hex"),
     model: config.model as string | undefined ?? null,
     serviceTier: config.service_tier as string | undefined ?? null,
