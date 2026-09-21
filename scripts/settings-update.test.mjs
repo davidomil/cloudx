@@ -215,7 +215,7 @@ describe("installed Settings updater", () => {
     ).toBe(false);
   });
 
-  it("uses the shared clean checkout guard without fetching or merging in the request", () => {
+  it("uses the shared tracked-change guard without fetching or merging in the request", () => {
     const fixture = installation();
     fixture.host.dirty = true;
     expect(() =>
@@ -223,7 +223,7 @@ describe("installed Settings updater", () => {
     ).toThrow("local changes");
     expect(fixture.updater.start(TARGET_COMMIT)).toMatchObject({
       available: false,
-      unavailableReason: expect.stringContaining("checkout must be clean"),
+      unavailableReason: expect.stringContaining("no tracked changes"),
     });
     expect(fixture.calls.some(([command]) => command === "systemd-run")).toBe(
       false,

@@ -171,11 +171,11 @@ export function inspectUpdateCheckout(commands, repoRoot) {
     commands.inspect("git", [
       "status",
       "--porcelain",
-      "--untracked-files=normal",
+      "--untracked-files=no",
     ])
   ) {
     throw new Error(
-      "The checkout has local changes. Commit or move them before updating; no local work was changed.",
+      "The checkout has local changes to tracked files. Commit them before updating; no local work was changed.",
     );
   }
   return commands.inspect("git", ["rev-parse", "HEAD"]);
