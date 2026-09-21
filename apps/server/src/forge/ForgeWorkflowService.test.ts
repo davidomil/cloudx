@@ -3399,6 +3399,53 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps an interrupted publication credential refresh for explicit retry across restart", async () => {
+    const f = await automaticIssue();
+    f.codingReport();
+    f.runtime.publishBranch.mockRejectedValueOnce(new Error("GitHub rejected workflow changes."));
+    await f.poll();
+    const publication = f.currentIssue().pendingPublication;
+    vi.mocked(f.deps.refreshPublicationCredentials).mockRejectedValueOnce(
+      new ForgeProviderUnavailableError("rate_limited", "authentication", { retryable: true, retryAfterMs: 10_000 }),
+    );
+
+    await f.service.resume(f.issue.id, placement);
+    const restarted = new ForgeWorkflowService(f.deps);
+    f.advanceTime(10_000);
+    await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", pendingPublication: publication });
+    expect(f.currentIssue().providerRetryAt).toBeUndefined();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.deps.refreshPublicationCredentials).toHaveBeenCalledOnce();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+
+    expect(await restarted.resume(f.issue.id, placement)).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha });
+    expect(f.deps.refreshPublicationCredentials).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("retains automatic publication recovery after a successful credential refresh", async () => {
+    const f = await automaticIssue();
+    f.codingReport();
+    f.runtime.publishBranch
+      .mockRejectedValueOnce(new Error("GitHub rejected workflow changes."))
+      .mockRejectedValueOnce(new ForgeProviderUnavailableError("rate_limited", "authentication", { retryable: true, retryAfterMs: 10_000 }));
+    await f.poll();
+    const publication = f.currentIssue().pendingPublication;
+
+    expect(await f.service.resume(f.issue.id, placement)).toMatchObject({
+      status: "paused", providerRetryAt: expect.any(String), pendingPublication: publication,
+    });
+    f.advanceTime(10_000);
+    await f.service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha });
+    expect(f.deps.refreshPublicationCredentials).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(3);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.runtime.launch.mock.calls.filter(([worker]) => worker.id === f.issue.id)).toHaveLength(1);
+  });
+
   it("does not schedule an uncertain publication write even when its error is rate limiting", async () => {
     const f = await automaticIssue();
     f.codingReport();

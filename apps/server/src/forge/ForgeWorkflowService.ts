@@ -731,6 +731,7 @@ export class ForgeWorkflowService {
     worker.status = "starting";
     await this.persist();
     let retainReport = false;
+    let refreshingPublicationCredentials = false;
     try {
       const provider = this.providerFor(worker);
       if (!recoveringResources) await this.recoverResources(worker);
@@ -755,8 +756,11 @@ export class ForgeWorkflowService {
       }
       if (worker.kind === "issue" && worker.pendingPublication) {
         await this.quiesce(worker);
-        if (refreshPublicationCredentials && !worker.pendingPublication.headSha)
+        if (refreshPublicationCredentials && !worker.pendingPublication.headSha) {
+          refreshingPublicationCredentials = true;
           await this.deps.refreshPublicationCredentials(worker.repository, controller.signal);
+          refreshingPublicationCredentials = false;
+        }
         if (worker.pendingPublication.confirmationStartedAt)
           worker.pendingPublication.confirmationStartedAt = new Date(Date.now()).toISOString();
         await this.issueReady(worker);
@@ -825,7 +829,7 @@ export class ForgeWorkflowService {
       }
       await this.launch(worker, placement, { item, change, issue });
     } catch (error) {
-      await this.fail(worker, error, { retainReport });
+      await this.fail(worker, error, { retainReport, retryProvider: !refreshingPublicationCredentials });
     }
     return structuredClone(worker);
   }

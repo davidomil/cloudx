@@ -1952,7 +1952,9 @@ describe.skipIf(process.platform !== "linux")(
       expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
     });
 
-    it.each([undefined, "read", "write"] as const)("retries saved publication in the same process with newly approved workflow permission %s", async permission => {
+    it.each(([undefined, "read", "write"] as const).flatMap(permission =>
+      [false, true].map(cooldown => ({ permission, cooldown })),
+    ))("retries saved publication in the same process with workflow permission $permission and cooldown=$cooldown", async ({ permission, cooldown }) => {
       const approvedToken = "worker-workflows-write";
       const approvedAuthorization = "Authorization: Basic " + Buffer.from(`x-access-token:${approvedToken}`).toString("base64");
       const gitFixture = await installGitFixture(false,
@@ -1974,6 +1976,8 @@ describe.skipIf(process.platform !== "linux")(
       const exchanges: string[] = [];
       let granted: "read" | "write" | undefined;
       const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async url => {
+        if (String(url) === "https://api.github.com/repos/cloudx/test/issues/1")
+          return new Response(null, { status: 429, headers: { "retry-after": "10" } });
         const installation = String(url).match(/\/app\/installations\/(42|43)\/access_tokens$/)?.[1];
         if (!installation) throw new Error(`Unexpected fixture request: ${url}`);
         exchanges.push(installation);
@@ -1983,6 +1987,7 @@ describe.skipIf(process.platform !== "linux")(
           permissions: { contents: "write", ...(installation === "42" && granted ? { workflows: granted } : {}) },
         });
       });
+      const clock = vi.spyOn(Date, "now");
       try {
         await settings.gitAccess(expectedRepository, "worker");
         const reviewerAccess = await settings.gitAccess(expectedRepository, "reviewer");
@@ -2023,7 +2028,7 @@ describe.skipIf(process.platform !== "linux")(
           notify: vi.fn(),
         });
         const placement = { windowId: "window", paneId: "pane" };
-        const worker = await service.startIssue(expectedRepository, 1, placement);
+        const worker = await service.startIssue(expectedRepository, 1, placement, cooldown);
         expect(worker.status, worker.error).toBe("running");
         await fs.mkdir(path.join(worker.worktreePath!, ".github", "workflows"), { recursive: true });
         await fs.writeFile(path.join(worker.worktreePath!, ".github", "workflows", "ci.yml"), "name: CI\non: push\njobs: {}\n");
@@ -2052,6 +2057,26 @@ describe.skipIf(process.platform !== "linux")(
         expect(exchanges).toEqual(["42", "43"]);
 
         granted = permission;
+        if (cooldown) {
+          let now = Date.now();
+          clock.mockImplementation(() => now);
+          await expect(settings.provider(expectedRepository, "worker").getIssue(1))
+            .rejects.toMatchObject({ failure: "rate_limited", retryAfterMs: 10_000 });
+          const blocked = await service.resume(worker.id, placement);
+          expect(blocked).toMatchObject({ status: "failed", error: expect.stringMatching(/rate limit/i), pendingPublication: { report } });
+          expect(blocked.providerRetryAt).toBeUndefined();
+          expect(exchanges).toEqual(["42", "43"]);
+          expect(await pushes()).toHaveLength(1);
+
+          now += 10_000;
+          await service.poll();
+          expect(stored[0]).toMatchObject({ status: "failed", pendingPublication: { report } });
+          expect(exchanges).toEqual(["42", "43"]);
+          expect(await pushes()).toHaveLength(1);
+          expect(provider.createChangeRequest).not.toHaveBeenCalled();
+          expect(launch).toHaveBeenCalledOnce();
+          expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(completedHead);
+        }
         if (permission !== "write") {
           const blocked = await service.resume(worker.id, placement);
           expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("Workflows: write"), pendingPublication: { report } });
@@ -2087,6 +2112,7 @@ describe.skipIf(process.platform !== "linux")(
         expect(exchanges.filter(installation => installation === "43")).toHaveLength(1);
         await service.dispose();
       } finally {
+        clock.mockRestore();
         fetcher.mockRestore();
       }
     }, 15_000);
