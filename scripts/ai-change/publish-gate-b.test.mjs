@@ -81,10 +81,10 @@ describe("smart HTTP command fixtures", () => {
     });
   });
 
-  it("fails when an already-exited command cannot receive required input", async () => {
+  it("fails when an exited command closed stdin before required input arrives", async () => {
     const result = await runBinaryProcess(
       process.execPath,
-      ["-e", "process.exit(0);"],
+      ["-e", 'require("node:fs").closeSync(0); process.exit(0);'],
       { input: Buffer.from("required request body") },
       spawnExitedProcess,
     );
