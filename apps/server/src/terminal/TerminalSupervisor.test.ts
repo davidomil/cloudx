@@ -15,6 +15,55 @@ afterEach(async () => {
 });
 
 describe("TerminalSupervisor ownership receipts", () => {
+  it("retains execution-bound evidence after a command exits before startup is observed", async () => {
+    const fixture = await supervisorFixture(true);
+    await fixture.receipt("ready", fixture.identity);
+    await fixture.receipt("complete", { ...fixture.identity, exitCode: 23 });
+    fixture.exit();
+
+    await expect(fixture.supervisor.ready()).resolves.toBeUndefined();
+    await expect(fixture.supervisor.terminate()).resolves.toBeUndefined();
+    expect(await fixture.supervisor.completion).toEqual({ event: { exitCode: 23 } });
+    expect(await fs.readdir(fixture.directory)).toEqual(["complete.json", "ready.json"]);
+  });
+
+  it.each([
+    { executionId: "another-execution" },
+    { bootId: "another-boot" },
+    { pidNamespace: "pid:[another-namespace]" },
+    { started: "0" },
+    { started: 123 },
+    { started: undefined }
+  ])("rejects startup and completion evidence with a changed binding: %j", async (changed) => {
+    const fixture = await supervisorFixture(true);
+    await fixture.receipt("ready", { ...fixture.identity, ...changed });
+    await expect(fixture.supervisor.ready()).rejects.toThrow("invalid ownership receipt");
+    await fixture.receipt("ready", fixture.identity);
+    await fixture.receipt("complete", { ...fixture.identity, exitCode: 0, ...changed });
+    fixture.exit();
+
+    await expect(fixture.supervisor.terminate()).rejects.toThrow("without confirming its descendants stopped");
+    expect(await fs.readdir(fixture.directory)).toEqual(["complete.json", "ready.json"]);
+  });
+
+  it("requires matching startup evidence before accepting durable completion", async () => {
+    const fixture = await supervisorFixture(true);
+    await fixture.receipt("complete", { ...fixture.identity, exitCode: 0 });
+    fixture.exit();
+
+    await expect(fixture.supervisor.terminate()).rejects.toThrow("without confirming its descendants stopped");
+    await expect(fs.access(fixture.directory)).resolves.toBeUndefined();
+  });
+
+  it("retains the execution's error receipt when completion cannot be proven", async () => {
+    const fixture = await supervisorFixture(true);
+    await fixture.receipt("error", { ...fixture.identity, message: "Execution binding is invalid" });
+    fixture.exit();
+
+    await expect(fixture.supervisor.terminate()).rejects.toThrow("Execution binding is invalid");
+    expect(await fs.readdir(fixture.directory)).toEqual(["error.json"]);
+  });
+
   it("accepts completed ownership when the command exits before startup is observed", async () => {
     const fixture = await supervisorFixture();
     await fixture.receipt("complete", { pid: process.pid, exitCode: 23 });
@@ -106,7 +155,7 @@ describe("TerminalSupervisor ownership receipts", () => {
   });
 });
 
-async function supervisorFixture() {
+async function supervisorFixture(durable = false) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-receipt-test-"));
   directories.push(directory);
   let exit!: () => void;
@@ -115,9 +164,15 @@ async function supervisorFixture() {
     onExit: (listener: () => void) => { exit = listener; return { dispose() {} }; },
     kill: vi.fn()
   };
-  const supervisor = new TerminalSupervisor(native as unknown as IPty, directory);
+  const execution = { executionId: "test-execution", bootId: "test-boot", pidNamespace: "pid:[test-namespace]", directory };
+  const stat = await fs.readFile(`/proc/${process.pid}/stat`, "utf8");
+  const identity = {
+    executionId: execution.executionId, bootId: execution.bootId, pidNamespace: execution.pidNamespace,
+    pid: process.pid, started: stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]!
+  };
+  const supervisor = new TerminalSupervisor(native as unknown as IPty, directory, durable ? execution : undefined);
   return {
-    directory, native, supervisor, exit: () => exit(),
+    directory, native, supervisor, identity, exit: () => exit(),
     receipt: (name: string, value: unknown) => fs.writeFile(path.join(directory, `${name}.json`), JSON.stringify(value))
   };
 }

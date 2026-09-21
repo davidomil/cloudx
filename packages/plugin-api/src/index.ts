@@ -168,7 +168,15 @@ export type PluginRuleContribution = Omit<CloudxRule, "scope"> & {
 export interface PluginSessionLaunchOptions {
   authorizeProjectTrust?: () => Promise<string>;
   prepareCodexSession?: (launch: PreparedCodexLaunch) => Promise<string>;
+  prepareTerminalExecution?: (tabId: string) => Promise<TerminalExecutionBinding>;
   ownerPluginId?: PluginId;
+}
+
+export interface TerminalExecutionBinding {
+  executionId: string;
+  directory: string;
+  bootId: string;
+  pidNamespace: string;
 }
 
 export interface PreparedCodexLaunch {

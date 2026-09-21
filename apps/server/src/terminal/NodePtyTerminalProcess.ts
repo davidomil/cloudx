@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { IPty } from "node-pty";
 
-import type { TerminalProducer, TerminalProducerFactory } from "./TerminalProcess.js";
+import type { TerminalProducer, TerminalProducerFactory, TerminalSpawnOptions } from "./TerminalProcess.js";
 import { TerminalSupervisor, type TerminalExit } from "./TerminalSupervisor.js";
 
 export class NodePtyTerminalProcess implements TerminalProducer {
@@ -78,7 +78,7 @@ export class NodePtyTerminalProcess implements TerminalProducer {
 }
 
 export class NodePtyTerminalProcessFactory implements TerminalProducerFactory {
-  async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProducer> {
+  async spawn(command: string, args: string[], options: TerminalSpawnOptions): Promise<TerminalProducer> {
     if (process.platform !== "linux") throw new Error("Owned terminal processes currently require Linux subreaper support.");
     let pty: typeof import("node-pty");
     try {
@@ -89,17 +89,18 @@ export class NodePtyTerminalProcessFactory implements TerminalProducerFactory {
 
     const helper = fileURLToPath(new URL("../../helpers/terminal-supervisor.py", import.meta.url));
     await fs.access(helper).catch(() => { throw new Error("The bundled terminal-supervisor.py helper is required for terminal tabs."); });
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-"));
+    const directory = options.execution?.directory ?? await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-"));
+    if (options.execution && (await fs.readdir(directory)).length) throw new Error("Terminal execution receipt directory must be empty before launch.");
     let supervisor: TerminalSupervisor | undefined;
     try {
-      const native = pty.spawn("python3", ["-I", "-S", helper, directory, String(process.pid), command, ...args], {
+      const native = pty.spawn("python3", ["-I", "-S", helper, directory, String(process.pid), JSON.stringify(options.execution ?? null), command, ...args], {
         name: "xterm-256color",
         cwd: options.cwd,
         env: options.env,
         cols: options.cols,
         rows: options.rows
       });
-      supervisor = new TerminalSupervisor(native, directory);
+      supervisor = new TerminalSupervisor(native, directory, options.execution);
       const terminal = new NodePtyTerminalProcess(native, supervisor);
       await supervisor.ready();
       return terminal;
@@ -108,7 +109,7 @@ export class NodePtyTerminalProcessFactory implements TerminalProducerFactory {
         try { await supervisor.terminate(); } catch (cleanupError) {
           throw new AggregateError([error, cleanupError], `${error instanceof Error ? error.message : "Terminal supervisor startup failed."} Terminal ownership could not be confirmed.`);
         }
-      } else await fs.rm(directory, { recursive: true, force: true });
+      } else if (!options.execution) await fs.rm(directory, { recursive: true, force: true });
       throw error;
     }
   }
