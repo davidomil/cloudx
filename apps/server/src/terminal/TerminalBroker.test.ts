@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DurableTerminalProcessFactory } from "./DurableTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
-import { isTerminalRequest, isTerminalResponse, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalReplay, terminalSocketPath } from "./TerminalBrokerProtocol.js";
+import { isTerminalRequest, isTerminalResponse, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalSocketPath } from "./TerminalBrokerProtocol.js";
 import type { TerminalProducer } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 
@@ -55,6 +55,23 @@ describe("durable terminal broker", () => {
     expect(process.terminate).toHaveBeenCalledOnce();
     expect(process.resumeOutput).not.toHaveBeenCalled();
     if (close === "terminate") expect(received).toBe(data);
+  });
+
+  it("resumes output parsed while the producer is alive before termination", async () => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("drained-before-close"));
+    const data = "x".repeat(256 * 1024);
+    let received = "";
+    terminal.onData((chunk) => { received += chunk; });
+    process.data(data);
+    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(received).toBe(data));
+    expect(process.resumeOutput).toHaveBeenCalledOnce();
+    expect(process.terminate).not.toHaveBeenCalled();
+
+    await terminal.terminate();
+    expect(process.terminate).toHaveBeenCalledOnce();
+    expect(process.resumeOutput).toHaveBeenCalledOnce();
   });
 
   it("resumes parsing after rejected termination and retains a recoverable session", async () => {
@@ -342,12 +359,10 @@ describe("durable terminal broker", () => {
     await expect(factory.attach("invalid-screen")).rejects.toThrow("incomplete or inconsistent");
   });
 
-  it("uses a short stable socket path and retains complete Unicode characters in replay", () => {
+  it("uses a short stable socket path", () => {
     expect(Buffer.byteLength(terminalSocketPath(`/a/${"long-path/".repeat(40)}`))).toBeLessThan(104);
     expect(terminalSocketPath("/a/../b")).toBe(terminalSocketPath("/b"));
     expect(terminalSocketPath("/a")).not.toBe(terminalSocketPath("/b"));
-    expect(terminalReplay("old😀new", 6)).toBe("new");
-    expect(terminalReplay("old😀new", 7)).toBe("😀new");
   });
 
   it.each([

@@ -1,27 +1,184 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CloudxUpdateChannel, CloudxUpdatePreview } from "@cloudx/shared";
 import { CloudxUpdateService } from "./CloudxUpdateService.js";
 
+const installed = "a".repeat(40);
+const target = "b".repeat(40);
+const selection = { channel: "main" as const, targetCommit: target };
+const checked = (channel: CloudxUpdateChannel = "main", currentCommit = installed): CloudxUpdatePreview => ({
+  channel, currentCommit, checkedAt: "2026-09-15T00:00:00Z", state: "available",
+  target: { commit: target, name: "main", url: `https://github.com/davidomil/cloudx/commit/${target}` },
+  changelog: [], changelogComplete: true,
+});
+
 describe("CloudxUpdateService", () => {
-  it.each(["status", "start"] as const)("runs the source updater with bounded %s arguments", async action => {
-    const status = { available: false, unavailableReason: "Open the installed CloudX service." };
-    const execute = vi.fn(async () => ({ stdout: JSON.stringify(status) }));
-    const service = new CloudxUpdateService("/workspace with spaces/data", execute);
-    expect(await service[action]()).toEqual(status);
+  let dataDir: string;
+  beforeEach(() => { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-service-")); });
+  afterEach(() => { fs.rmSync(dataDir, { recursive: true, force: true }); });
+
+  function fixture() {
+    const execute = vi.fn(async (file: string, _args: string[]) => ({ stdout: file === "git" ? installed : '{"available":true}' }));
+    const catalog = { preview: vi.fn(async (channel: CloudxUpdateChannel, currentCommit: string) => checked(channel, currentCommit)) };
+    const service = new CloudxUpdateService(dataDir, execute, catalog);
+    return { execute, catalog, service };
+  }
+
+  it("keeps local run monitoring independent of remote release lookup", async () => {
+    const { service, execute, catalog } = fixture();
+    expect(await service.status()).toEqual({ available: true });
     expect(execute).toHaveBeenCalledWith(process.execPath, [
-      path.resolve("scripts/settings-update.mjs"), action, "/workspace with spaces/data", String(process.pid)
+      path.resolve("scripts/settings-update.mjs"), "status", dataDir, String(process.pid),
+    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+    expect(catalog.preview).not.toHaveBeenCalled();
+  });
+
+  it("defaults to main and persists the chosen release cycle across service restarts", async () => {
+    const { service, execute, catalog } = fixture();
+    expect((await service.preview()).channel).toBe("main");
+    expect((await service.selectChannel("releases")).channel).toBe("releases");
+    const restarted = new CloudxUpdateService(dataDir, execute, catalog);
+    expect((await restarted.preview()).channel).toBe("releases");
+    expect(fs.readdirSync(dataDir)).toEqual(["cloudx-update-channel.json"]);
+  });
+
+  it("pins the checked release commit when starting the managed installer", async () => {
+    const { service, execute } = fixture();
+    await service.selectChannel("releases");
+    expect(await service.start({ channel: "releases", targetCommit: target })).toEqual({ available: true });
+    expect(execute).toHaveBeenLastCalledWith(process.execPath, [
+      path.resolve("scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target,
     ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
   });
 
+  it.each(["never checked", "changed target", "changed channel", "changed checkout", "ahead", "diverged", "unavailable"])("rejects an unsafe launch: %s", async scenario => {
+    const { service, catalog, execute } = fixture();
+    const preview = checked();
+    if (["ahead", "diverged", "unavailable"].includes(scenario)) preview.state = scenario as CloudxUpdatePreview["state"];
+    catalog.preview.mockResolvedValue(preview);
+    if (scenario !== "never checked") await service.preview();
+    if (scenario === "changed channel") await service.selectChannel("releases");
+    if (scenario === "changed checkout") execute.mockImplementation(async file => ({ stdout: file === "git" ? "c".repeat(40) : '{"available":true}' }));
+    await expect(service.start({ ...selection, targetCommit: scenario === "changed target" ? "c".repeat(40) : target })).rejects.toMatchObject({ statusCode: 409 });
+    expect(execute.mock.calls.some(([, args]) => args[1] === "start")).toBe(false);
+  });
+
+  it("allows dependency updates at the checked current commit", async () => {
+    const { service, catalog, execute } = fixture();
+    catalog.preview.mockResolvedValue({ ...checked(), state: "current", target: { ...checked().target!, commit: installed } });
+    await service.preview();
+    await service.start({ channel: "main", targetCommit: installed });
+    expect(execute.mock.calls.at(-1)![1].at(-1)).toBe(installed);
+  });
+
+  it("coalesces concurrent remote checks, while an explicit later check refreshes the target", async () => {
+    const { service, catalog } = fixture();
+    let finish!: (preview: CloudxUpdatePreview) => void;
+    catalog.preview.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = service.preview();
+    const second = service.preview();
+    await vi.waitFor(() => expect(catalog.preview).toHaveBeenCalledOnce());
+    finish(checked());
+    expect(await first).toEqual(await second);
+    await service.preview();
+    expect(catalog.preview).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a failed remote check from authorizing the old target", async () => {
+    const { service, catalog } = fixture();
+    await service.preview();
+    catalog.preview.mockResolvedValue({ ...checked(), state: "unavailable", message: "GitHub rate limit reached." });
+    await service.preview();
+    await expect(service.start(selection)).rejects.toMatchObject({ statusCode: 409 });
+  });
+
+  it("preserves a selected channel when its remote release check is unavailable", async () => {
+    const { service, catalog } = fixture();
+    catalog.preview.mockImplementation(async (channel, currentCommit) => ({ ...checked(channel, currentCommit), state: "unavailable" }));
+    expect((await service.selectChannel("releases")).state).toBe("unavailable");
+    expect(JSON.parse(fs.readFileSync(path.join(dataDir, "cloudx-update-channel.json"), "utf8"))).toEqual({ channel: "releases" });
+  });
+
+  it("rejects a launch when a concurrent refresh invalidates its target during the Git check", async () => {
+    const { service, catalog, execute } = fixture();
+    await service.preview();
+    let finishGit!: (value: { stdout: string }) => void;
+    let delayGit = true;
+    execute.mockImplementation(async file => {
+      if (file === "git" && delayGit) {
+        delayGit = false;
+        return new Promise(resolve => { finishGit = resolve; });
+      }
+      return { stdout: file === "git" ? installed : '{"available":true}' };
+    });
+    const starting = service.start(selection);
+    await vi.waitFor(() => expect(finishGit).toBeTypeOf("function"));
+    catalog.preview.mockResolvedValue({ ...checked(), state: "unavailable" });
+    await service.preview();
+    const rejected = expect(starting).rejects.toMatchObject({ statusCode: 409 });
+    finishGit({ stdout: installed });
+    await rejected;
+    expect(execute.mock.calls.some(([, args]) => args[1] === "start")).toBe(false);
+  });
+
+  it("does not replace corrupt persisted channel settings with a default", async () => {
+    const { service, catalog } = fixture();
+    fs.writeFileSync(path.join(dataDir, "cloudx-update-channel.json"), '{"channel":"nightly"}');
+    await expect(service.preview()).rejects.toMatchObject({ statusCode: 503 });
+    expect(catalog.preview).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid channels and commits before invoking host commands", async () => {
+    const { service, execute } = fixture();
+    await expect(service.selectChannel("nightly" as CloudxUpdateChannel)).rejects.toThrow("releases or main");
+    await expect(service.start({ channel: "main", targetCommit: "--upload-pack=bad" })).rejects.toThrow("checked target commit");
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("prevents selection changes and duplicate starts during a launch", async () => {
+    const { service, execute } = fixture();
+    await service.preview();
+    let finish!: (value: { stdout: string }) => void;
+    execute.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = service.start(selection);
+    await expect(service.selectChannel("releases")).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.start(selection)).rejects.toMatchObject({ statusCode: 409 });
+    finish({ stdout: '{"available":true}' });
+    await first;
+  });
+
+  it("preserves a running job and prevents changing its channel", async () => {
+    const { service, execute } = fixture();
+    const running = { available: true, run: { id: "running", state: "running", startedAt: "2026-09-15T00:00:00Z", message: "Updating." } };
+    execute.mockResolvedValue({ stdout: JSON.stringify(running) });
+    expect(await service.start(selection)).toEqual(running);
+    await expect(service.selectChannel("releases")).rejects.toMatchObject({ statusCode: 409 });
+    expect(fs.existsSync(path.join(dataDir, "cloudx-update-channel.json"))).toBe(false);
+  });
+
   it.each(["invalid JSON", '{"available":"yes"}'])("rejects unverifiable runner output", async stdout => {
-    const service = new CloudxUpdateService("/data", async () => ({ stdout }));
+    const service = new CloudxUpdateService(dataDir, async () => ({ stdout }));
     await expect(service.status()).rejects.toMatchObject({ statusCode: 503, message: expect.stringContaining("could not be verified") });
   });
 
+  it("rejects an unknown local revision without querying GitHub", async () => {
+    const { service, execute, catalog } = fixture();
+    execute.mockResolvedValue({ stdout: "HEAD" });
+    await expect(service.preview()).rejects.toMatchObject({ statusCode: 503 });
+    expect(catalog.preview).not.toHaveBeenCalled();
+  });
+
   it("does not disclose subprocess output or attempt a second start when launch is uncertain", async () => {
-    const execute = vi.fn(async () => { throw new Error("secret from stderr"); });
-    const service = new CloudxUpdateService("/data", execute);
-    await expect(service.start()).rejects.toMatchObject({ statusCode: 503, message: expect.not.stringContaining("secret") });
-    expect(execute).toHaveBeenCalledTimes(1);
+    const { service, execute } = fixture();
+    await service.preview();
+    execute.mockImplementation(async (file, args) => {
+      if (args[1] === "start") throw new Error("secret from stderr");
+      return { stdout: file === "git" ? installed : '{"available":true}' };
+    });
+    await expect(service.start(selection)).rejects.toMatchObject({ statusCode: 503, message: expect.not.stringContaining("secret") });
+    expect(execute.mock.calls.filter(([, args]) => args[1] === "start")).toHaveLength(1);
+    expect(await service.status()).toEqual({ available: true });
   });
 });

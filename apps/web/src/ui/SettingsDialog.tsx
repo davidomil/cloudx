@@ -204,7 +204,7 @@ export function SettingsDialog({
     description: "Update CloudX and the tools managed by its installer.",
     entries: [{
       id: "cloudx-update",
-      searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout",
+      searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout release channel cycle main changelog pull requests",
       content: <CloudxUpdatePanel update={cloudxUpdate} />
     }]
   });

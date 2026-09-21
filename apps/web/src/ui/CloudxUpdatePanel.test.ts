@@ -3,7 +3,7 @@
 import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CloudxUpdateStatus } from "@cloudx/shared";
+import type { CloudxUpdateChannel, CloudxUpdatePreview, CloudxUpdateStatus } from "@cloudx/shared";
 
 import { CloudxUpdatePanel, useCloudxUpdate } from "./CloudxUpdatePanel.js";
 import { updateWindow } from "../api.js";
@@ -13,6 +13,12 @@ import { WorkspaceWriteCoordinator } from "./workspaceWriteCoordinator.js";
 let root: Root | undefined;
 const reload = vi.fn();
 const available: CloudxUpdateStatus = { available: true };
+const mainPreview: CloudxUpdatePreview = {
+  channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00.000Z", state: "available",
+  target: { commit: "b".repeat(40), name: "main", url: "https://github.com/davidomil/cloudx/commit/" + "b".repeat(40) },
+  changelog: [{ number: 82, title: "Choose an update channel", url: "https://github.com/davidomil/cloudx/pull/82" }],
+  changelogComplete: true, compareUrl: "https://github.com/davidomil/cloudx/compare/main"
+};
 const run = (state: "running" | "succeeded" | "failed" = "running", id = "update-1"): CloudxUpdateStatus => ({
   available: true,
   run: { id, state, message: state === "running" ? "Installing updates." : state === "failed" ? "Installer failed: repository has local changes." : "CloudX is up to date.", startedAt: "2026-09-15T04:00:00.000Z" }
@@ -34,14 +40,16 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
-function reply(status: CloudxUpdateStatus, code = 200) { return new Response(JSON.stringify(status), { status: code }); }
+function reply(status: CloudxUpdateStatus | CloudxUpdatePreview, code = 200) { return new Response(JSON.stringify(status), { status: code }); }
 
-async function mount(saveWorkspace: () => Promise<void> = async () => undefined) {
+async function mount(saveWorkspace: () => Promise<void> = async () => undefined, previewFetch = async (_init?: RequestInit) => reply(mainPreview), initiallyOpen = true) {
+  const statusFetch = globalThis.fetch;
+  vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/preview") ? previewFetch(init) : statusFetch(url, init));
   const container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
   function Harness() {
-    const [open, setOpen] = useState(true);
+    const [open, setOpen] = useState(initiallyOpen);
     const update = useCloudxUpdate(open, saveWorkspace, reload);
     return createElement("div", {},
       createElement("button", { onClick: () => setOpen(value => !value) }, "Toggle settings"),
@@ -60,8 +68,147 @@ function button(label: string) {
 
 async function click(label: string) { await act(async () => button(label).click()); }
 async function poll() { await act(async () => vi.advanceTimersByTimeAsync(2_000)); }
+async function selectChannel(channel: CloudxUpdateChannel) {
+  await act(async () => {
+    const select = document.querySelector("select")!;
+    select.value = channel;
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
 
 describe("CloudX updates", () => {
+  it("checks remote updates only while Settings is open and never during run polling", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(run())));
+    const previewFetch = vi.fn(async () => reply(mainPreview));
+    await mount(undefined, previewFetch, false);
+    expect(previewFetch).not.toHaveBeenCalled();
+    await poll();
+    expect(previewFetch).not.toHaveBeenCalled();
+    await click("Toggle settings");
+    expect(previewFetch).toHaveBeenCalledOnce();
+    await poll();
+    await poll();
+    expect(previewFetch).toHaveBeenCalledOnce();
+    await click("Check update status");
+    expect(previewFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("persists Releases and restores the server selection when Settings reopens", async () => {
+    const fetch = vi.fn(async () => reply(available));
+    vi.stubGlobal("fetch", fetch);
+    let stored = mainPreview;
+    const previewFetch = vi.fn(async (init?: RequestInit) => {
+      if (init?.method === "PUT") stored = { ...mainPreview, channel: JSON.parse(init.body as string).channel, target: { ...mainPreview.target!, name: "v0.2.0" } };
+      return reply(stored);
+    });
+    const container = await mount(undefined, previewFetch);
+    expect(container.textContent).toContain("New changes are available on main.");
+    await selectChannel("releases");
+    expect(previewFetch.mock.calls[1]?.[0]).toMatchObject({ method: "PUT", body: JSON.stringify({ channel: "releases" }) });
+    expect(container.textContent).toContain("A new release is available.");
+    expect(container.querySelector('a[href="https://github.com/davidomil/cloudx/pull/82"]')?.textContent).toBe("#82 Choose an update channel");
+    expect(container.querySelector("time")?.dateTime).toBe(mainPreview.checkedAt);
+    await click("Toggle settings");
+    await click("Toggle settings");
+    expect(container.querySelector("select")?.value).toBe("releases");
+    expect(previewFetch.mock.calls.at(-1)?.[0]?.method).toBeUndefined();
+  });
+
+  it("disables selection and launch during channel checks and ignores an obsolete response after reopening", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    let finishSelection!: (response: Response) => void;
+    let selectionSignal: AbortSignal | undefined;
+    const previewFetch = vi.fn(async (init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        selectionSignal = init.signal as AbortSignal;
+        return new Promise<Response>(resolve => { finishSelection = resolve; });
+      }
+      return reply(mainPreview);
+    });
+    const container = await mount(undefined, previewFetch);
+    await selectChannel("releases");
+    expect(container.querySelector("select")?.disabled).toBe(true);
+    expect(button("Update CloudX and dependencies").disabled).toBe(true);
+    expect(button("Check update status").disabled).toBe(true);
+    await selectChannel("main");
+    expect(previewFetch).toHaveBeenCalledTimes(2);
+    await click("Toggle settings");
+    expect(selectionSignal?.aborted).toBe(true);
+    await click("Toggle settings");
+    await act(async () => finishSelection(reply({ ...mainPreview, channel: "releases" })));
+    expect(container.querySelector("select")?.value).toBe("main");
+    expect(container.textContent).toContain("New changes are available on main.");
+    expect(container.textContent).not.toContain("A new release is available.");
+  });
+
+  it("shows partial changelogs and links to all changes without claiming the list is complete", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, changelogComplete: false, message: "GitHub returned only part of the comparison." }));
+    expect(container.textContent).not.toContain("The changelog is incomplete");
+    expect(container.textContent).toContain("GitHub returned only part of the comparison.");
+    expect(container.querySelector(`a[href="${mainPreview.compareUrl}"]`)?.textContent).toBe("View all changes on GitHub");
+    expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
+
+  it("labels an incomplete changelog when the preview has no explanation", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, changelogComplete: false }));
+    expect(container.textContent).toContain("The changelog is incomplete; some changes may be missing.");
+  });
+
+  it("keeps a rejected target visible after the local status becomes available again", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init?: RequestInit) => reply(init?.method === "POST"
+      ? { available: false, unavailableReason: "The selected target changed. Check for updates again." }
+      : available, init?.method === "POST" ? 409 : 200)));
+    const container = await mount();
+    await click("Update CloudX and dependencies");
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("The selected target changed. Check for updates again.");
+    expect(button("Update CloudX and dependencies").disabled).toBe(true);
+    await click("Check update status");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
+
+  it.each(["ahead", "diverged", "unavailable"] as const)("prevents an update when the channel is %s", async state => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state, message: "Check the repository before updating." }));
+    expect(container.textContent).toContain("Check the repository before updating.");
+    expect(button("Update CloudX and dependencies").disabled).toBe(true);
+    expect(container.querySelector("select")?.disabled).toBe(false);
+  });
+
+  it("allows dependency updates when the selected commit is already installed", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit, changelog: [] }));
+    expect(container.textContent).toContain("CloudX is up to date with main. You can still update dependencies.");
+    expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
+
+  it("disables launch after a preview error and recovers on an explicit check", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const previewFetch = vi.fn().mockRejectedValueOnce(new Error("GitHub is unavailable.")).mockResolvedValueOnce(reply(mainPreview));
+    const container = await mount(undefined, previewFetch);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("GitHub is unavailable.");
+    expect(button("Update CloudX and dependencies").disabled).toBe(true);
+    await click("Check update status");
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
+
+  it("bounds an unresponsive preview and allows an explicit new check", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const previewFetch = vi.fn((init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init!.signal!.addEventListener("abort", () => reject(new Error("Preview request timed out.")));
+    }));
+    const container = await mount(undefined, previewFetch);
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Preview request timed out.");
+    expect(button("Update CloudX and dependencies").disabled).toBe(true);
+    expect(button("Check update status").disabled).toBe(false);
+    await poll();
+    expect(previewFetch).toHaveBeenCalledOnce();
+  });
+
   it("blocks launch when an already-running layout PATCH fails and keeps the save error visible", async () => {
     let rejectSave!: (error: Error) => void;
     const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
@@ -196,7 +343,7 @@ describe("CloudX updates", () => {
     await act(async () => finishSaving());
     await click("Updating CloudX…");
     expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
-    expect(fetch.mock.calls.find(([, init]) => init?.method === "POST")?.[1]).toMatchObject({ body: "{}", headers: { "content-type": "application/json" } });
+    expect(fetch.mock.calls.find(([, init]) => init?.method === "POST")?.[1]).toMatchObject({ body: JSON.stringify({ channel: "main", targetCommit: mainPreview.target!.commit }), headers: { "content-type": "application/json" } });
     await click("Toggle settings");
     current = run("succeeded");
     await poll();

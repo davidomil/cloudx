@@ -144,11 +144,19 @@ async function pressKey(target: HTMLElement, key: string, shiftKey = false) {
 describe("Settings navigation and search", () => {
   it("finds the Updates action by the tools and dependencies it updates", async () => {
     const start = vi.fn(async () => undefined);
-    const { container } = await mount({ cloudxUpdate: { status: { available: true }, starting: false, checking: false, start, check: vi.fn() } });
+    const { container } = await mount({ cloudxUpdate: {
+      status: { available: true }, channel: "main", previewLoading: false, starting: false, checking: false, start, check: vi.fn(), selectChannel: vi.fn(),
+      preview: {
+        channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "current", changelog: [], changelogComplete: true,
+        target: { commit: "a".repeat(40), name: "main", url: "https://github.com/davidomil/cloudx/tree/main" }
+      }
+    } });
     await search(container, "Codex dependencies");
     expect(tab(container, "Updates").getAttribute("aria-selected")).toBe("true");
     await click(button(activePanel(container), "Update CloudX and dependencies"));
     expect(start).toHaveBeenCalledOnce();
+    await search(container, "release channel");
+    expect(tab(container, "Updates").getAttribute("aria-selected")).toBe("true");
   });
 
   it("opens General and exposes one associated panel for each visible category", async () => {

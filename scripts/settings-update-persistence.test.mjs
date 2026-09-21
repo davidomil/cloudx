@@ -19,6 +19,19 @@ describe("Settings update workspace durability", () => {
   let app, root, directory, coordinator, controller, services, current, windowId, dom;
   const reload = vi.fn();
   const start = vi.fn();
+  const preview = {
+    channel: "main",
+    currentCommit: "a".repeat(40),
+    checkedAt: "2026-09-15T00:00:00Z",
+    state: "available",
+    target: {
+      commit: "b".repeat(40),
+      name: "main",
+      url: `https://github.com/davidomil/cloudx/commit/${"b".repeat(40)}`,
+    },
+    changelog: [],
+    changelogComplete: true,
+  };
   const running = { available: true, run: { id: "update-1", state: "running", message: "Updating.", startedAt: "2026-09-15T00:00:00Z" } };
   const requests = [];
 
@@ -36,7 +49,12 @@ describe("Settings update workspace durability", () => {
     const config = loadConfig({ CLOUDX_DATA_DIR: directory, CLOUDX_ALLOWED_ROOTS: directory, CLOUDX_LOG_LEVEL: "silent",
       CLOUDX_TRUSTED_ORIGINS: "http://localhost", CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9", CLOUDX_AUTOMATION_START_DISABLED: "true" });
     services = buildServices(config);
-    services.updates = { status: async () => current, start };
+    services.updates = {
+      status: async () => current,
+      preview: async () => preview,
+      selectChannel: async channel => ({ ...preview, channel }),
+      start,
+    };
     app = await buildServer(config, services);
     const window = await services.workspace.createWindow({ name: "Main", defaultCwd: directory });
     windowId = window.id;
@@ -143,6 +161,7 @@ describe("Settings update workspace durability", () => {
           await act(async () => controller.start());
           await settle();
           expect(start).toHaveBeenCalledOnce();
+          expect(start).toHaveBeenCalledWith({ channel: "main", targetCommit: preview.target.commit });
         } else {
           expect(reload).toHaveBeenCalledOnce();
           await act(async () => controller.check());

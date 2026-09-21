@@ -6,13 +6,14 @@ import { PluginSessionMissingError } from "@cloudx/plugin-api";
 import type { TerminalProducer, TerminalProducerFactory } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
 import {
-  isTerminalRequest, readTerminalMessages, terminalReplay,
+  isTerminalRequest, readTerminalMessages,
   TERMINAL_REPLAY_BYTES, validateTerminalSocketDirectory,
   type TerminalRequest
 } from "./TerminalBrokerProtocol.js";
 
 import { TerminalBrokerOutput } from "./TerminalBrokerOutput.js";
 import { TerminalScreen } from "./TerminalScreen.js";
+import { TerminalReplayBuffer } from "./TerminalReplayBuffer.js";
 
 const PAUSE_OUTPUT_BYTES = 256 * 1024;
 const RESUME_OUTPUT_BYTES = 64 * 1024;
@@ -20,7 +21,7 @@ const RESUME_OUTPUT_BYTES = 64 * 1024;
 interface OwnedTerminal {
   process: TerminalProducer;
   screen: TerminalScreen;
-  output: string;
+  output: TerminalReplayBuffer;
   exit?: TerminalExit;
   termination?: Promise<void>;
   clients: Map<Socket, { output: TerminalBrokerOutput; dispose: () => void }>;
@@ -100,7 +101,7 @@ export class TerminalBroker {
           });
           if (socket.destroyed) { dispose(); return; }
           owned.clients.set(socket, { output, dispose });
-          output.replay(owned.output);
+          output.replay(owned.output.snapshot());
           output.screen(screen);
           output.send({ type: "ready" });
           socket.setTimeout(0);
@@ -148,14 +149,14 @@ export class TerminalBroker {
     let process: TerminalProducer;
     try { process = await this.factory.spawn(request.command, request.args, request.options); }
     catch (error) { screen.dispose(); throw error; }
-    const terminal: OwnedTerminal = { process, screen, output: "", clients: new Map() };
+    const terminal: OwnedTerminal = { process, screen, output: new TerminalReplayBuffer(this.replayBytes), clients: new Map() };
     this.terminals.set(request.sessionId, terminal);
     let pendingBytes = 0;
     let paused = false;
     let exited = false;
     await screen.attach((data) => {
       pendingBytes -= Buffer.byteLength(data);
-      terminal.output = terminalReplay(terminal.output + data, this.replayBytes);
+      terminal.output.append(data);
       if (paused && !exited && pendingBytes <= RESUME_OUTPUT_BYTES) {
         paused = false;
         process.resumeOutput();

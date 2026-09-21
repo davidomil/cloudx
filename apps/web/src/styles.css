@@ -6864,6 +6864,10 @@ a:hover svg {
   justify-self: start;
 }
 
+.cloudx-update-settings select {
+  min-height: 44px;
+}
+
 .settings-section h3,
 .settings-plugin-section h4 {
   margin: 0;

@@ -10,6 +10,15 @@ export const UPDATE_SERVICE_NAMES = [
 export const TERMINAL_SERVICE_NAME = "cloudx-terminal.service";
 export const SERVICE_NAMES = [...UPDATE_SERVICE_NAMES, TERMINAL_SERVICE_NAME];
 
+export function updateCommit(value) {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/.test(value)) {
+    throw new Error(
+      "Update target must be a 40-character lowercase commit SHA.",
+    );
+  }
+  return value;
+}
+
 export function updatePort(value, label = "Port") {
   if (
     !/^\d+$/.test(String(value)) ||
@@ -174,13 +183,18 @@ export function inspectUpdateCheckout(commands, repoRoot) {
 
 export function updateCheckout(
   commands,
-  { repoRoot, dryRun = false, updatedCommit },
+  { repoRoot, dryRun = false, updatedCommit, targetCommit },
 ) {
+  if (targetCommit !== undefined) updateCommit(targetCommit);
   const head = inspectUpdateCheckout(commands, repoRoot);
   if (updatedCommit) {
     if (head !== updatedCommit)
       throw new Error(
         "The checkout changed while reloading the updated installer. Run the update again.",
+      );
+    if (targetCommit !== undefined && updatedCommit !== targetCommit)
+      throw new Error(
+        "The reloaded installer does not match the selected update commit.",
       );
     return head;
   }
@@ -189,26 +203,28 @@ export function updateCheckout(
     "fetch",
     "--no-tags",
     "origin",
-    "+refs/heads/main:refs/remotes/origin/main",
+    targetCommit ?? "+refs/heads/main:refs/remotes/origin/main",
   ]);
   if (dryRun) {
     commands.run("git", [
       "merge",
       "--ff-only",
       "--no-edit",
-      "refs/remotes/origin/main",
+      targetCommit ?? "refs/remotes/origin/main",
     ]);
     return undefined;
   }
   const target = commands.inspect("git", [
     "rev-parse",
-    "refs/remotes/origin/main^{commit}",
+    `${targetCommit ?? "refs/remotes/origin/main"}^{commit}`,
   ]);
+  if (targetCommit !== undefined && target !== targetCommit)
+    throw new Error("The selected update SHA does not identify a commit.");
   if (
     !commands.statusOk("git", ["merge-base", "--is-ancestor", head, target])
   ) {
     throw new Error(
-      "This checkout contains commits not contained in origin/main. Resolve the branch before updating; no commits were reset or merged.",
+      `This checkout contains commits not contained in ${targetCommit ? "the selected update commit" : "origin/main"}. Resolve the branch before updating; no commits were reset or merged.`,
     );
   }
   commands.run("git", ["merge", "--ff-only", "--no-edit", target]);
