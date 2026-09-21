@@ -20,7 +20,11 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
-const initial: CodexGlobalSettings = { revision: "first", model: "initial-model", serviceTier: "priority", fastModeEnabled: true };
+const initial: CodexGlobalSettings = {
+  revision: "first", model: "initial-model", serviceTier: "priority", fastModeEnabled: true,
+  yoloMode: true, autoTrustWorkspace: false, defaultSkills: [{ id: "imagegen", enabled: true, available: true }],
+  reasoningEffort: null, webSearch: null, personality: null
+};
 const config: CloudxConfigResponse = { globalFields: [], plugins: [], values: { global: {}, plugins: {} } };
 
 async function mount(read: () => Promise<CodexGlobalSettings> = async () => initial, initialCategoryId?: string) {
@@ -85,6 +89,27 @@ describe("Codex settings in the Settings window", () => {
     await fill(container, "Search settings", "default model");
     expect(model(container).value).toBe("draft-model");
     expect(calls).toHaveLength(readCount);
+  });
+
+  it.each(["yolo", "trust workspace", "skills", "reasoning effort", "web search", "personality"])("finds Codex settings by %s", async query => {
+    const { container } = await mount();
+    await fill(container, "Search settings", query);
+    expect(container.querySelector(codexTab)?.getAttribute("aria-selected")).toBe("true");
+    expect(model(container)).not.toBeNull();
+  });
+
+  it("preserves permission and skill drafts when navigating away and back", async () => {
+    const { container, calls } = await mount(undefined, "codex");
+    await click(container, '[aria-label="YOLO mode"]');
+    await click(container, '[aria-label="Automatically trust workspace"]');
+    await click(container, '[aria-label="Enable imagegen"]');
+    await click(container, '[role="tab"][aria-label="General"]');
+    await click(container, codexTab);
+    expect(container.querySelector<HTMLInputElement>('[aria-label="YOLO mode"]')!.checked).toBe(false);
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Automatically trust workspace"]')!.checked).toBe(true);
+    expect(container.querySelector<HTMLInputElement>('[aria-label="Enable imagegen"]')!.checked).toBe(false);
+    await click(container, 'button[type="submit"]');
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", yoloMode: false, autoTrustWorkspace: true, defaultSkills: { imagegen: false } });
   });
 
   it("saves Codex defaults independently of the CloudX footer Save", async () => {

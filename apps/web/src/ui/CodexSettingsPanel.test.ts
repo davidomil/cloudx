@@ -16,7 +16,12 @@ afterEach(async () => {
   document.body.replaceChildren();
 });
 
-const initial: CodexGlobalSettings = { revision: "first", model: "gpt-6-astra", serviceTier: "priority", fastModeEnabled: true };
+const initial: CodexGlobalSettings = {
+  revision: "first", model: "gpt-6-astra", serviceTier: "priority", fastModeEnabled: true,
+  yoloMode: true, autoTrustWorkspace: false,
+  defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: false, available: true }],
+  reasoningEffort: null, webSearch: null, personality: null
+};
 type HookHandler = (hook: string, input: Record<string, unknown>) => CodexGlobalSettings | Promise<CodexGlobalSettings>;
 
 async function mount(settings = initial, handler?: HookHandler, strict = false) {
@@ -41,6 +46,9 @@ async function mount(settings = initial, handler?: HookHandler, strict = false) 
 
 function model(container: Element) { return container.querySelector<HTMLInputElement>('input[aria-label="Default model"]')!; }
 function mode(container: Element) { return container.querySelector<HTMLSelectElement>('select[aria-label="Fast mode"]')!; }
+function checkbox(container: Element, label: string) { return container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!; }
+function select(container: Element, label: string) { return container.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`)!; }
+async function toggle(container: Element, label: string) { await act(async () => checkbox(container, label).click()); }
 function button(container: Element, name: string) {
   const found = [...container.querySelectorAll("button")].find(button => button.textContent?.trim() === name);
   if (!found) throw new Error(`Missing button: ${name}`);
@@ -69,6 +77,124 @@ describe("global Codex settings editor", () => {
     expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(container.textContent).toContain("Shared by CloudX instances using the same Codex home.");
     expect(container.textContent).toContain("Running sessions keep their current settings.");
+    expect(checkbox(container, "YOLO mode").checked).toBe(true);
+    expect(checkbox(container, "Automatically trust workspace").checked).toBe(false);
+    expect(checkbox(container, "Enable imagegen").checked).toBe(true);
+    expect(checkbox(container, "Enable browser").checked).toBe(false);
+    expect(container.textContent).toContain("Bypasses the sandbox and approval prompts.");
+    expect(container.textContent).toContain("Explicitly untrusted workspaces are rejected");
+  });
+
+  it("saves only changed permissions, skills, and native defaults", async () => {
+    const updated = { ...initial, revision: "second", yoloMode: false, autoTrustWorkspace: true,
+      defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: true, available: true }],
+      reasoningEffort: "high", webSearch: "indexed", personality: "friendly" };
+    const { container, calls } = await mount(initial, hook => hook === "codex-settings.read" ? initial : updated);
+    await toggle(container, "YOLO mode");
+    await toggle(container, "Automatically trust workspace");
+    await toggle(container, "Enable browser");
+    await fill(select(container, "Reasoning effort"), "high");
+    await fill(select(container, "Web search"), "indexed");
+    await fill(select(container, "Personality"), "friendly");
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)).toEqual({ hook: "codex-settings.update", input: {
+      expectedRevision: "first", yoloMode: false, autoTrustWorkspace: true, defaultSkills: { browser: true },
+      reasoningEffort: "high", webSearch: "indexed", personality: "friendly"
+    } });
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
+    expect(checkbox(container, "Enable browser").checked).toBe(true);
+  });
+
+  it("preserves unknown native defaults while a skill changes and removes explicitly reset defaults", async () => {
+    const settings = { ...initial, reasoningEffort: "future-effort", webSearch: "future-search", personality: "future-personality" };
+    const { container, calls } = await mount(settings);
+    expect(select(container, "Reasoning effort").value).toBe("future-effort");
+    expect(select(container, "Web search").value).toBe("future-search");
+    expect(select(container, "Personality").value).toBe("future-personality");
+    await toggle(container, "Enable imagegen");
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", defaultSkills: { imagegen: false } });
+    await fill(select(container, "Reasoning effort"), "");
+    await fill(select(container, "Web search"), "");
+    await fill(select(container, "Personality"), "");
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", reasoningEffort: null, webSearch: null, personality: null });
+  });
+
+  it("discards all new drafts on Reload and uses the current installed skills", async () => {
+    let settings = initial;
+    const { container, calls } = await mount(initial, () => settings);
+    await toggle(container, "YOLO mode");
+    await toggle(container, "Automatically trust workspace");
+    await toggle(container, "Enable browser");
+    await fill(select(container, "Reasoning effort"), "high");
+    await fill(select(container, "Web search"), "live");
+    await fill(select(container, "Personality"), "friendly");
+    settings = { ...initial, revision: "external", defaultSkills: [{ id: "new-skill", enabled: false, available: true }], personality: "pragmatic" };
+    await click(container, "Reload");
+    expect(checkbox(container, "YOLO mode").checked).toBe(true);
+    expect(checkbox(container, "Automatically trust workspace").checked).toBe(false);
+    expect(checkbox(container, "Enable browser")).toBeNull();
+    expect(checkbox(container, "Enable new-skill").checked).toBe(false);
+    expect(select(container, "Reasoning effort").value).toBe("");
+    expect(select(container, "Web search").value).toBe("");
+    expect(select(container, "Personality").value).toBe("pragmatic");
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
+    expect(calls.every(call => call.hook === "codex-settings.read")).toBe(true);
+  });
+
+  it("has no changes after permission and skill toggles are undone", async () => {
+    const { container } = await mount();
+    for (const label of ["YOLO mode", "Automatically trust workspace", "Enable imagegen", "Enable browser"]) {
+      await toggle(container, label);
+      expect(button(container, "Save Codex settings").disabled).toBe(false);
+      await toggle(container, label);
+      expect(button(container, "Save Codex settings").disabled).toBe(true);
+    }
+  });
+
+  it("disables new controls and retains their draft across a pending save and remount", async () => {
+    const pending = deferred<CodexGlobalSettings>();
+    const { container, calls, editor, remount } = await mount(initial, hook => hook === "codex-settings.read" ? initial : pending.promise);
+    await toggle(container, "YOLO mode");
+    await toggle(container, "Enable browser");
+    await fill(select(container, "Reasoning effort"), "high");
+    await click(container, "Save Codex settings");
+    await remount();
+    expect([...container.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")].every(control => control.disabled)).toBe(true);
+    expect(checkbox(container, "YOLO mode").checked).toBe(false);
+    expect(checkbox(container, "Enable browser").checked).toBe(true);
+    expect(select(container, "Reasoning effort").value).toBe("high");
+    await act(async () => {
+      editor.setYoloMode(true);
+      editor.setAutoTrustWorkspace(true);
+      editor.setDefaultSkill("browser", false);
+      editor.selectNativeSetting("reasoningEffort", "low");
+    });
+    expect(editor.getSnapshot()).toMatchObject({ yoloMode: false, autoTrustWorkspace: false, reasoningEffort: "high", defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: true, available: true }] });
+    expect(calls).toHaveLength(2);
+    await act(async () => pending.resolve({ ...initial, yoloMode: false, reasoningEffort: "high", defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: true, available: true }] }));
+    expect(button(container, "Save Codex settings").disabled).toBe(true);
+    expect(checkbox(container, "Enable browser").disabled).toBe(false);
+  });
+
+  it("shows an empty skill catalog without inventing selectable skills", async () => {
+    const { container } = await mount({ ...initial, defaultSkills: [] });
+    expect(container.textContent).toContain("No default skills are provided by this Codex installation.");
+    expect(checkbox(container, "Enable imagegen")).toBeNull();
+  });
+
+  it("allows disabling missing skills and prevents enabling unavailable skills", async () => {
+    const { container, calls } = await mount({ ...initial, defaultSkills: [
+      { id: "imagegen", enabled: true, available: false }, { id: "browser", enabled: false, available: false }
+    ] });
+    expect(container.textContent).toContain("Not installed.");
+    expect(checkbox(container, "Enable imagegen").disabled).toBe(false);
+    expect(checkbox(container, "Enable browser").disabled).toBe(true);
+    await toggle(container, "Enable imagegen");
+    expect(checkbox(container, "Enable imagegen").disabled).toBe(true);
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", defaultSkills: { imagegen: false } });
   });
 
   it("saves changed model and fast mode with the revision that was loaded", async () => {

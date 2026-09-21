@@ -9,18 +9,31 @@ export const serviceTiers: { value: ServiceTier; label: string }[] = [
   { value: "default", label: "Off" },
   { value: "flex", label: "Flex" }
 ];
+export const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
+export const webSearchModes = ["disabled", "cached", "live", "indexed"] as const;
+export const personalities = ["none", "friendly", "pragmatic"] as const;
+type NativeSetting = "reasoningEffort" | "webSearch" | "personality";
 
 interface EditorState {
   settings?: CodexGlobalSettings;
   model: string;
   serviceTier: string;
   modeSelected: boolean;
+  yoloMode: boolean;
+  autoTrustWorkspace: boolean;
+  defaultSkills: CodexGlobalSettings["defaultSkills"];
+  reasoningEffort: string;
+  webSearch: string;
+  personality: string;
   busy: "loading" | "saving" | null;
   error?: string;
   saved: boolean;
 }
 
-const initialState: EditorState = { model: "", serviceTier: "", modeSelected: false, busy: "loading", saved: false };
+const initialState: EditorState = {
+  model: "", serviceTier: "", modeSelected: false, yoloMode: true, autoTrustWorkspace: false,
+  defaultSkills: [], reasoningEffort: "", webSearch: "", personality: "", busy: "loading", saved: false
+};
 
 export class CodexSettingsEditor {
   private state = initialState;
@@ -61,7 +74,7 @@ export class CodexSettingsEditor {
   }
 
   get canSave() {
-    return !this.state.busy && this.validModel && (this.modelChanged || this.modeChanged);
+    return !this.state.busy && this.validModel && Object.keys(this.changedSettings()).length > 0;
   }
 
   setModel(model: string): void {
@@ -76,16 +89,30 @@ export class CodexSettingsEditor {
     if (!this.state.busy && this.selectedTier) this.update({ modeSelected: true, saved: false });
   }
 
+  setYoloMode(yoloMode: boolean): void {
+    if (!this.state.busy) this.update({ yoloMode, saved: false });
+  }
+
+  setAutoTrustWorkspace(autoTrustWorkspace: boolean): void {
+    if (!this.state.busy) this.update({ autoTrustWorkspace, saved: false });
+  }
+
+  setDefaultSkill(id: string, enabled: boolean): void {
+    if (!this.state.busy) this.update({ defaultSkills: this.state.defaultSkills.map(skill => skill.id === id ? { ...skill, enabled } : skill), saved: false });
+  }
+
+  selectNativeSetting(field: NativeSetting, value: string): void {
+    if (!this.state.busy) this.update({ [field]: value, saved: false });
+  }
+
   async reload(): Promise<void> {
     if (!this.state.busy) await this.read();
   }
 
   async save(): Promise<void> {
-    const { settings, model } = this.state;
+    const { settings } = this.state;
     if (!settings || !this.canSave || !this.callHook) return;
-    const update: CodexGlobalSettingsUpdate = { expectedRevision: settings.revision };
-    if (this.modelChanged) update.model = model || null;
-    if (this.modeChanged) update.serviceTier = this.selectedTier ?? null;
+    const update: CodexGlobalSettingsUpdate = { expectedRevision: settings.revision, ...this.changedSettings() };
     const version = ++this.requestVersion;
     this.update({ busy: "saving", error: undefined, saved: false });
     try {
@@ -120,7 +147,29 @@ export class CodexSettingsEditor {
   }
 
   private acceptSettings(settings: CodexGlobalSettings, saved: boolean): void {
-    this.update({ settings, model: settings.model ?? "", serviceTier: settings.serviceTier ?? "", modeSelected: false, saved });
+    this.update({
+      settings, model: settings.model ?? "", serviceTier: settings.serviceTier ?? "", modeSelected: false,
+      yoloMode: settings.yoloMode, autoTrustWorkspace: settings.autoTrustWorkspace, defaultSkills: settings.defaultSkills,
+      reasoningEffort: settings.reasoningEffort ?? "", webSearch: settings.webSearch ?? "", personality: settings.personality ?? "", saved
+    });
+  }
+
+  private changedSettings(): Omit<CodexGlobalSettingsUpdate, "expectedRevision"> {
+    const { settings, model, yoloMode, autoTrustWorkspace, defaultSkills, reasoningEffort, webSearch, personality } = this.state;
+    if (!settings) return {};
+    const update: Omit<CodexGlobalSettingsUpdate, "expectedRevision"> = {};
+    if (this.modelChanged) update.model = model || null;
+    if (this.modeChanged) update.serviceTier = this.selectedTier ?? null;
+    if (yoloMode !== settings.yoloMode) update.yoloMode = yoloMode;
+    if (autoTrustWorkspace !== settings.autoTrustWorkspace) update.autoTrustWorkspace = autoTrustWorkspace;
+    if (reasoningEffort !== (settings.reasoningEffort ?? "")) update.reasoningEffort = reasoningEfforts.find(value => value === reasoningEffort) ?? null;
+    if (webSearch !== (settings.webSearch ?? "")) update.webSearch = webSearchModes.find(value => value === webSearch) ?? null;
+    if (personality !== (settings.personality ?? "")) update.personality = personalities.find(value => value === personality) ?? null;
+    const skillChanges = Object.fromEntries(defaultSkills
+      .filter(skill => settings.defaultSkills.find(saved => saved.id === skill.id)?.enabled !== skill.enabled)
+      .map(skill => [skill.id, skill.enabled]));
+    if (Object.keys(skillChanges).length) update.defaultSkills = skillChanges;
+    return update;
   }
 
   private update(change: Partial<EditorState>): void {
