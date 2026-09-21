@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+const MAX_AUXILIARY_THREADS = 32;
 const TOKEN_ENV = "CLOUDX_CODEX_WORKER_TOKEN";
 
 /** Observe the native protocol between the actual worker and its native TUI. */
@@ -17,13 +18,27 @@ export class CodexWorkerTurn {
     this.request = undefined;
     this.turn = undefined;
     this.earlyCompletions = [];
+    this.auxiliaryThreadRequests = new Set();
+    this.auxiliaryThreads = new Set();
   }
 
   fromClient(message) {
+    if (message.method === "thread/start" && message.params?.threadSource === "system" && message.params?.ephemeral === true) {
+      if (message.id == null) throw new Error("Native auxiliary thread/start is missing its request identity.");
+      if (this.auxiliaryThreadRequests.size + this.auxiliaryThreads.size >= MAX_AUXILIARY_THREADS)
+        throw new Error("Native auxiliary thread tracking exceeded its limit.");
+      this.auxiliaryThreadRequests.add(message.id);
+      return;
+    }
+    if (message.method === "thread/unsubscribe") {
+      this.auxiliaryThreads.delete(message.params?.threadId);
+      return;
+    }
     if (message.method !== "turn/start") return;
     const threadId = message.params?.threadId;
     if (typeof threadId !== "string" || !threadId || message.id == null)
       throw new Error("Native worker turn/start is missing its request or thread identity.");
+    if (this.auxiliaryThreads.has(threadId)) return;
     if (this.request) throw new Error("A Forge attempt cannot start another Codex turn.");
     if (this.binding.expectedThreadId && threadId !== this.binding.expectedThreadId)
       throw new Error("Native worker selected a different conversation than its prepared thread.");
@@ -31,6 +46,17 @@ export class CodexWorkerTurn {
   }
 
   fromServer(message) {
+    // Only the reply to an observed ephemeral system-thread request can admit
+    // auxiliary turns. Request-ID prefixes and thread notifications are not proof.
+    if (!message.method && this.auxiliaryThreadRequests.delete(message.id)) {
+      const threadId = message.result?.thread?.id;
+      if (!message.error && typeof threadId === "string" && threadId) {
+        if (threadId === this.request?.threadId || threadId === this.binding.expectedThreadId)
+          throw new Error("Native auxiliary creation returned the worker thread.");
+        this.auxiliaryThreads.add(threadId);
+      }
+      return;
+    }
     if (!this.request || this.turn?.status !== undefined && this.turn.status !== "running") return;
     if (!this.turn && message.id === this.request.id && !message.method) {
       const turnId = message.result?.turn?.id;
