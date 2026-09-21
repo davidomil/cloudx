@@ -12,6 +12,7 @@ import type {
   ForgeReviewDraft,
   ForgeReviewSubmission,
   ForgeWorker,
+  ForgeWorkerHistory,
 } from "@cloudx/shared";
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
@@ -31,6 +32,7 @@ export interface ForgeSettings {
 }
 interface Runtime {
   isActive(tabId: string): boolean;
+  workerHistory(id: string): Promise<ForgeWorkerHistory | undefined>;
   recover(
     id: string,
   ): Promise<{
@@ -249,6 +251,13 @@ export class ForgeWorkflowService {
       }
     };
     return this.loaded ? snapshot() : this.exclusive(snapshot);
+  }
+  workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
+    const read = async () => {
+      this.requireWorker(id);
+      return this.deps.runtime.workerHistory(id);
+    };
+    return this.loaded ? read() : this.exclusive(read);
   }
   startIssue(repository: ForgeRepository, number: number, placement: ForgePlacement, autoReview = false): Promise<ForgeWorker> {
     return this.exclusive(() => this.createWorker(repository, "issue", number, false, placement, autoReview));

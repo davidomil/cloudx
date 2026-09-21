@@ -1,9 +1,10 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
-import type { ForgeWorker } from "@cloudx/shared";
+import type { ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import react from "@vitejs/plugin-react";
 import { createServer as createHttpServer, type Server } from "node:http";
 import path from "node:path";
 import { createServer, type ViteDevServer } from "vite";
+import { TerminalScreen } from "../../apps/server/src/terminal/TerminalScreen.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let server: ViteDevServer;
@@ -41,7 +42,13 @@ test.afterAll(async () => {
   );
 });
 
-async function workers(page: Page, holdFirstContinuation = false) {
+async function workers(
+  page: Page,
+  options: {
+    holdFirstContinuation?: boolean;
+    historyScreen?: ForgeWorkerHistory["screen"];
+  } = {},
+) {
   const repository = {
     provider: "github" as const,
     apiUrl: "https://api.github.com",
@@ -79,6 +86,7 @@ async function workers(page: Page, holdFirstContinuation = false) {
     input: Record<string, unknown>;
     tabId: string;
   }> = [];
+  const historyRequests: string[] = [];
   let held!: Route;
   let requested!: () => void;
   const pending = new Promise<void>((resolve) => {
@@ -95,9 +103,24 @@ async function workers(page: Page, holdFirstContinuation = false) {
         });
       case "forge.issues.list":
         return route.fulfill({ json: { items: [] } });
+      case "forge.worker.history":
+        historyRequests.push(body.input.id);
+        return route.fulfill({
+          json: {
+            history: {
+              tabId: `${body.input.id}-terminal`,
+              capturedAt: "2026-09-21T12:00:00.000Z",
+              screen: options.historyScreen ?? {
+                cols: 100,
+                rows: 30,
+                data: `Starting deployment check\r\n${Array.from({ length: 80 }, (_, index) => `Checking dependency ${index + 1}`).join("\r\n")}\r\n\x1b[31mDeployment check failed: missing dependency.\x1b[0m\x1b[?1003h`,
+              },
+            },
+          },
+        });
       case "forge.worker.continue": {
         continuations.push(body);
-        if (holdFirstContinuation && continuations.length === 1) {
+        if (options.holdFirstContinuation && continuations.length === 1) {
           held = route;
           requested();
           return;
@@ -116,6 +139,7 @@ async function workers(page: Page, holdFirstContinuation = false) {
   await page.getByRole("button", { name: "Workers (2)", exact: true }).click();
   return {
     continuations,
+    historyRequests,
     pending,
     fail: () =>
       held.fulfill({
@@ -129,6 +153,83 @@ for (const worker of [
   { kind: "issue", number: 7, status: "failed" },
   { kind: "review", number: 12, status: "completed" },
 ]) {
+  test(`views the ${worker.status} ${worker.kind} worker history without restarting it`, async ({
+    page,
+  }, testInfo) => {
+    const sockets: string[] = [];
+    page.on("websocket", (socket) => sockets.push(socket.url()));
+    const fixture = await workers(page);
+    const tab = page.getByRole("tab", {
+      name: new RegExp(`${worker.kind} #${worker.number}`, "i"),
+    });
+    await tab.click();
+    await page
+      .getByRole("button", { name: "View worker", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("Latest saved terminal · read only");
+    const output = dialog.getByRole("region", {
+      name: "Saved worker terminal output",
+    });
+    await expect(output.locator(".xterm-accessibility-tree")).toContainText(
+      "Deployment check failed: missing dependency.",
+    );
+    await expect(output).toBeInViewport({ ratio: 1 });
+    const bounds = (await output.boundingBox())!;
+    expect(bounds.width).toBeGreaterThan(250);
+    expect(bounds.height).toBeGreaterThan(200);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(
+      page.viewportSize()!.width,
+    );
+    const screenshot = testInfo.outputPath("saved-worker-history.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("saved-worker-history", {
+      path: screenshot,
+      contentType: "image/png",
+    });
+
+    await output.hover();
+    const beforeScrolling = await output
+      .locator(".xterm-accessibility-tree")
+      .textContent();
+    await page.mouse.wheel(0, -10_000);
+    await expect(output.locator(".xterm-accessibility-tree")).not.toHaveText(
+      beforeScrolling!,
+    );
+    if (testInfo.project.name === "mobile-chromium") {
+      const rail = (await output
+        .locator(".terminal-mobile-scroll-rail")
+        .boundingBox())!;
+      await page.touchscreen.tap(rail.x + rail.width / 2, rail.y + 1);
+    } else {
+      await output.locator("textarea").focus();
+      for (let index = 0; index < 4; index++)
+        await page.keyboard.press("Shift+PageUp");
+    }
+    await expect(output.locator(".xterm-accessibility-tree")).toContainText(
+      "Starting deployment check",
+    );
+    await dialog.getByRole("button", { name: "Close worker terminal" }).click();
+    await expect(dialog).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "View worker", exact: true })
+      .click();
+    await expect(output.locator(".xterm-accessibility-tree")).toContainText(
+      "Deployment check failed: missing dependency.",
+    );
+    await output.locator("textarea").focus();
+    await page.keyboard.type("do not run this");
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    expect(fixture.historyRequests).toEqual([
+      `${worker.kind}-worker`,
+      `${worker.kind}-worker`,
+    ]);
+    expect(fixture.continuations).toEqual([]);
+    expect(sockets).toEqual([]);
+    await expect(tab).toContainText(worker.status);
+  });
+
   test(`continues the selected ${worker.status} ${worker.kind} worker with a multiline message`, async ({
     page,
   }, testInfo) => {
@@ -187,10 +288,205 @@ for (const worker of [
   });
 }
 
+async function scrollWorkerHistoryTo(
+  page: Page,
+  edge: "first" | "last",
+  touch: boolean,
+) {
+  const output = page.getByRole("region", {
+    name: "Saved worker terminal output",
+  });
+  const rail = output.locator(".terminal-mobile-scroll-rail");
+  if (touch && (await rail.isVisible())) {
+    const browserInput = await page.context().newCDPSession(page);
+    const track = (await rail.boundingBox())!;
+    const x = track.x + track.width / 2;
+    await browserInput.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x, y: track.y + track.height / 2 }],
+    });
+    await browserInput.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [
+        { x, y: edge === "first" ? track.y - 1 : track.y + track.height + 1 },
+      ],
+    });
+    await browserInput.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+    await browserInput.detach();
+  } else {
+    await output.hover();
+    const scrollbar = output.locator(".xterm .scrollbar.vertical");
+    const track = (await scrollbar.boundingBox())!;
+    const thumb = await scrollbar.locator(".slider").boundingBox();
+    if (!thumb) return;
+    await page.mouse.move(
+      thumb.x + thumb.width / 2,
+      thumb.y + thumb.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(
+      track.x + track.width / 2,
+      edge === "first" ? track.y : track.y + track.height,
+    );
+    await page.mouse.up();
+  }
+}
+
+for (const scenario of [
+  { name: "after shortening", height: 960, cursor: "\x1b[H" },
+  { name: "on initial short display", height: 540, cursor: "\x1b[H" },
+  {
+    name: "with saved origin mode and scroll margins",
+    height: 540,
+    cursor: "\x1b[2;10r\x1b[?6h\x1b[H",
+  },
+]) {
+  test(`preserves worker history below the saved cursor ${scenario.name}`, async ({
+    page,
+  }, testInfo) => {
+    const diagnostics = Array.from(
+      { length: 30 },
+      (_, index) => `line-${String(index).padStart(4, "0")}: diagnostic`,
+    );
+    const screen = new TerminalScreen(100, 30);
+    let historyScreen: ForgeWorkerHistory["screen"];
+    try {
+      screen.write(diagnostics.join("\r\n") + scenario.cursor);
+      historyScreen = await screen.snapshot();
+    } finally {
+      await screen.dispose();
+    }
+    await page.setViewportSize({
+      width: scenario.height === 960 ? 1440 : 390,
+      height: scenario.height,
+    });
+    const sockets: string[] = [];
+    page.on("websocket", (socket) => sockets.push(socket.url()));
+    const fixture = await workers(page, { historyScreen });
+    await page
+      .getByRole("button", { name: "View worker", exact: true })
+      .click();
+    const output = page.getByRole("region", {
+      name: "Saved worker terminal output",
+    });
+    const visibleLines = output.locator(".xterm-accessibility-tree");
+    await expect(visibleLines).toContainText(diagnostics.at(-1)!);
+
+    for (const viewport of [
+      { width: 390, height: 540 },
+      { width: 1440, height: 960 },
+      { width: 320, height: 540 },
+      { width: 1440, height: 960 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await expect(output).toBeInViewport({ ratio: 1 });
+      if (viewport.height === 540) {
+        await expect
+          .poll(() => visibleLines.locator("[role='listitem']").count())
+          .toBeLessThan(30);
+      }
+      for (const edge of ["first", "last"] as const) {
+        await scrollWorkerHistoryTo(
+          page,
+          edge,
+          testInfo.project.name === "mobile-chromium",
+        );
+        await expect(visibleLines).toContainText(
+          edge === "first" ? diagnostics[0] : diagnostics.at(-1)!,
+        );
+      }
+      if (viewport.width === 390) {
+        const screenshot = testInfo.outputPath("short-worker-diagnostics.png");
+        await page.screenshot({ path: screenshot });
+        await testInfo.attach("short-worker-diagnostics", {
+          path: screenshot,
+          contentType: "image/png",
+        });
+      }
+    }
+    await expect(visibleLines).toContainText(diagnostics.join(""));
+    const screenshot = testInfo.outputPath("restored-worker-diagnostics.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("restored-worker-diagnostics", {
+      path: screenshot,
+      contentType: "image/png",
+    });
+    expect(fixture.historyRequests).toEqual(["issue-worker"]);
+    expect(fixture.continuations).toEqual([]);
+    expect(sockets).toEqual([]);
+  });
+}
+
+test("preserves near-limit worker history through mobile fitting and repeated resizing", async ({
+  page,
+}, testInfo) => {
+  const firstDiagnostic = "line-0000: earliest failure diagnostic";
+  const lastDiagnostic = "line-0999: final failure diagnostic";
+  const lastDiagnosticEnd = "END-0999";
+  const lines = Array.from(
+    { length: 1000 },
+    (_, index) => `line-${String(index).padStart(4, "0")}: dependency check`,
+  );
+  lines[0] = firstDiagnostic;
+  lines[lines.length - 1] =
+    lastDiagnostic.padEnd(100 - lastDiagnosticEnd.length, ".") +
+    lastDiagnosticEnd;
+  const fixture = await workers(page, {
+    historyScreen: {
+      cols: 100,
+      rows: 30,
+      data: lines.map((line) => line.padEnd(100, ".")).join("\r\n"),
+    },
+  });
+  await page.getByRole("button", { name: "View worker", exact: true }).click();
+  const output = page.getByRole("region", {
+    name: "Saved worker terminal output",
+  });
+  const visibleLines = output.locator(".xterm-accessibility-tree");
+  await expect(visibleLines).toContainText(lastDiagnostic);
+
+  for (const [stage, viewport] of [
+    page.viewportSize()!,
+    { width: 390, height: 844 },
+    { width: 1440, height: 960 },
+    { width: 320, height: 700 },
+    { width: 1440, height: 960 },
+  ].entries()) {
+    await page.setViewportSize(viewport);
+    await expect(output).toBeInViewport({ ratio: 1 });
+    for (const edge of ["first", "last"] as const) {
+      await scrollWorkerHistoryTo(
+        page,
+        edge,
+        testInfo.project.name === "mobile-chromium",
+      );
+      await expect(visibleLines).toContainText(
+        edge === "first" ? firstDiagnostic : lastDiagnostic,
+      );
+      if (edge === "last")
+        await expect(visibleLines).toContainText(lastDiagnosticEnd);
+      if (edge === "first" && (stage === 1 || stage === 4)) {
+        const name = `earliest-worker-history-${viewport.width}px`;
+        const screenshot = testInfo.outputPath(`${name}.png`);
+        await page.screenshot({ path: screenshot });
+        await testInfo.attach(name, {
+          path: screenshot,
+          contentType: "image/png",
+        });
+      }
+    }
+  }
+  expect(fixture.historyRequests).toEqual(["issue-worker"]);
+  expect(fixture.continuations).toEqual([]);
+});
+
 test("retains a failed message and allows an explicit retry", async ({
   page,
 }) => {
-  const fixture = await workers(page, true);
+  const fixture = await workers(page, { holdFirstContinuation: true });
   await page.getByRole("button", { name: "Continue with message" }).click();
   const form = page.getByRole("form", {
     name: "Continue worker with a message",

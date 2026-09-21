@@ -11,6 +11,7 @@ import {
   type CodexReasoningEffort,
   type ForgeRepository,
   type ForgeCredentialRole,
+  type ForgeWorkerHistory,
   type WorkspaceTab,
 } from "@cloudx/shared";
 
@@ -24,6 +25,7 @@ import { forgeLog, type ForgeLogger } from "./ForgeLog.js";
 import { validateRepository } from "./providers/ForgeCredentials.js";
 import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecution } from "./ForgeExecution.js";
+import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -38,6 +40,7 @@ export interface ForgeRuntimeDependencies {
   sessions: Pick<
     SessionStore,
     | "getTab"
+    | "getSession"
     | "getContextDirectory"
     | "listTabs"
     | "executePluginAction"
@@ -145,10 +148,16 @@ export class ForgeRuntime {
   private readonly ownedTabs = new Map<string, OwnedTab>();
   private readonly reviewConversations: Pick<ForgeReviewConversation, "prepare">;
   private readonly executions: ForgeExecutionRecovery;
+  private readonly history: ForgeWorkerHistoryStore;
 
   constructor(private readonly dependencies: ForgeRuntimeDependencies) {
     this.reviewConversations = dependencies.reviewConversations ?? new ForgeReviewConversation(dependencies.dataDir);
     this.executions = new ForgeExecutionRecovery(dependencies.dataDir);
+    this.history = new ForgeWorkerHistoryStore(dependencies.dataDir);
+  }
+
+  workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
+    return this.history.read(id);
   }
 
   isActive(tabId: string): boolean {
@@ -572,6 +581,7 @@ export class ForgeRuntime {
     await this.requireWorkerTab(tabId);
     await this.dependencies.sessions.executePluginAction(tabId, "stop", {});
     await this.recordQuiescence(tabId);
+    await this.captureHistory(tabId);
   }
 
   async close(tabId: string): Promise<void> {
@@ -594,6 +604,7 @@ export class ForgeRuntime {
         owned.quiescent = true;
         await this.tabManifest(tabId).write(owned);
       }
+      await this.captureHistory(tabId);
       if (owned?.context) await this.assertContextIdentity(owned.context);
       await this.dependencies.sessions.discardPreparedTab(tabId);
     } else if (owned && !owned.closed && !owned.quiescent) {
@@ -1570,6 +1581,17 @@ export class ForgeRuntime {
     if (!owned) throw new Error("Worker tab ownership record is missing.");
     owned.quiescent = true;
     await this.tabManifest(tabId).write(owned);
+  }
+
+  private async captureHistory(tabId: string): Promise<void> {
+    const tab = this.dependencies.sessions.getTab(tabId);
+    const workerId = tab.pluginMetadata?.["forge-workers"]?.workerId;
+    if (typeof workerId !== "string") throw new Error("Worker history requires its owned worker identity.");
+    const session = this.dependencies.sessions.getSession(tabId);
+    if (!session.attachTerminal) throw new Error("This worker does not support terminal history.");
+    const { screen, dispose } = await session.attachTerminal(() => {});
+    try { await this.history.write(workerId, { tabId, capturedAt: new Date().toISOString(), screen }); }
+    finally { dispose(); }
   }
 
   private async captureTab(tab: WorkspaceTab, owned: OwnedTab): Promise<void> {

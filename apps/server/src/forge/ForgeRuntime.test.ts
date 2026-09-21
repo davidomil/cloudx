@@ -74,6 +74,7 @@ function dependencies({ trustRepository = true } = {}): ForgeRuntimeDependencies
     pathPolicy: new PathPolicy([root]),
     sessions: {
       getTab: vi.fn(),
+      getSession: vi.fn(() => ({ attachTerminal: async () => ({ screen: { data: "Saved terminal output", cols: 100, rows: 30 }, dispose() {} }) }) as unknown as ReturnType<ForgeRuntimeDependencies["sessions"]["getSession"]>),
       getContextDirectory: vi.fn(),
       listTabs: vi.fn(() => []),
       executePluginAction: vi.fn(async () => ({})),
@@ -2294,6 +2295,48 @@ if (hangMerge || hangFetch) {
 }
 
 describe("ForgeRuntime Codex tabs", () => {
+  it.each(["pause", "close"] as const)("retains final terminal output through %s, tab cleanup and runtime restart", async action => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    await runtime.recover(workspace.id);
+    let output = "Before stop";
+    const dispose = vi.fn();
+    vi.mocked(deps.sessions.executePluginAction).mockImplementation(async () => { output += "\r\nFinal output after termination"; return {}; });
+    vi.mocked(deps.sessions.getSession).mockReturnValue({ attachTerminal: async () => ({ screen: { data: output, cols: 100, rows: 30 }, dispose }) } as unknown as ReturnType<typeof deps.sessions.getSession>);
+    vi.mocked(deps.sessions.discardPreparedTab).mockImplementation(async () => { vi.mocked(deps.sessions.listTabs).mockReturnValue([]); });
+
+    await runtime[action](tab.id);
+    const history = await new ForgeRuntime(deps).workerHistory(workspace.id);
+    expect(history).toEqual({ tabId: tab.id, capturedAt: expect.any(String), screen: { data: "Before stop\r\nFinal output after termination", cols: 100, rows: 30 } });
+    expect(dispose).toHaveBeenCalledOnce();
+    if (action === "pause") await runtime.close(tab.id);
+    await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    expect((await new ForgeRuntime(deps).workerHistory(workspace.id))?.screen.data).toContain("Final output after termination");
+    expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
+  });
+
+  it.each(["storage failure", "unsupported session"])("preserves the stopped tab when history capture fails: %s", async failure => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    await runtime.recover(workspace.id);
+    const dispose = vi.fn();
+    vi.mocked(deps.sessions.getSession).mockReturnValue({ attachTerminal: failure === "unsupported session" ? undefined : async () => ({ screen: { data: "Preserve this output", cols: 100, rows: 30 }, dispose }) } as ReturnType<typeof deps.sessions.getSession>);
+    if (failure === "storage failure") await fs.writeFile(path.join(deps.dataDir, "forge-workers", "history"), "Not a directory");
+
+    await expect(runtime.close(tab.id)).rejects.toThrow(failure === "unsupported session" ? /does not support terminal history/ : /directory/);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledWith(tab.id, "stop", {});
+    expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledTimes(failure === "unsupported session" ? 0 : 1);
+  });
+
   it.each([
     { review: false, approved: false },
     { review: false, approved: undefined },

@@ -29,6 +29,7 @@ async function fixture() {
     continueWorker: vi.fn(async () => ({ id: "worker" })),
     omitDiscussionReply: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
+    workerHistory: vi.fn(async () => undefined as import("@cloudx/shared").ForgeWorkerHistory | undefined),
     markReview: vi.fn(async () => {}),
     saveReview: vi.fn(async () => ({ id: "worker" })),
     submitReview: vi.fn(async () => ({ id: "worker" })),
@@ -57,6 +58,30 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections, logger };
 }
 describe("Forge plugin boundary", () => {
+  it.each(["ui", "http"] as const)("reads retained history through %s without starting a worker", async kind => {
+    const { hooks, workflow, logger } = await fixture();
+    const history = { tabId: "tab-1", capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "Private terminal history", cols: 100, rows: 30 } };
+    workflow.workerHistory.mockResolvedValue(history);
+    await expect(hooks.call("forge.worker.history", { id: "worker" }, { caller: { kind } })).resolves.toEqual({ history });
+    expect(workflow.workerHistory).toHaveBeenCalledExactlyOnceWith("worker");
+    expect(workflow.startIssue).not.toHaveBeenCalled();
+    expect(JSON.stringify(Object.values(logger).flatMap(log => log.mock.calls))).not.toContain(history.screen.data);
+  });
+
+  it.each([{ id: undefined }, { id: "" }, { id: 7 }, { id: "w".repeat(129) }, { id: "worker", path: "/private" }])("rejects malformed history input before dispatch %#", async input => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.history", input, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.workerHistory).not.toHaveBeenCalled();
+  });
+
+  it("reports missing history explicitly and keeps the read hook unavailable to automation", async () => {
+    const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.history", { id: "worker" }, { caller: { kind: "ui" } })).resolves.toEqual({ history: undefined });
+    workflow.workerHistory.mockClear();
+    await expect(hooks.call("forge.worker.history", { id: "worker" }, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.workerHistory).not.toHaveBeenCalled();
+  });
+
   it.each([{ kind: "ui", length: 40 }, { kind: "http", length: 40 }, { kind: "ui", length: 64 }, { kind: "http", length: 64 }] as const)("omits only the displayed reply through $kind at its $length-character head", async ({ kind, length }) => {
     const { hooks, workflow } = await fixture();
     const input = { id: "worker", discussionId: "discussion-1", headSha: "a".repeat(length), body: "Fixed the timeout.\nThe reproduction passes." };
