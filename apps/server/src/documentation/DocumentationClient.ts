@@ -120,6 +120,16 @@ export class DocumentationServiceUnavailableError extends Error {
   }
 }
 
+export class DocumentationStartupError extends Error {
+  readonly statusCode = 503;
+
+  constructor(readonly code: "documentation_startup_failed" | "documentation_startup_initializing") {
+    super(code === "documentation_startup_failed"
+      ? "Documentation archive initialization failed. Check cloudx-documentation.service logs, correct the error, and restart the service."
+      : "Documentation archive is initializing. Large archives may take several minutes.");
+  }
+}
+
 export class DocumentationClient {
   private readonly timeoutMs: number;
   private readonly responseMaxBytes: number;
@@ -542,7 +552,7 @@ export class DocumentationClient {
       const response = await this.fetchService(pathname, { ...init, signal: scope.signal });
       const text = await readBoundedText(response, this.responseMaxBytes);
       if (!response.ok) {
-        throw Object.assign(new Error(errorMessage(text, response.status)), { statusCode: response.status });
+        throw documentationResponseError(text, response.status);
       }
       const value = text ? JSON.parse(text) : {};
       if (!isRecord(value)) {
@@ -802,6 +812,21 @@ function errorMessage(text: string, status: number): string {
     return text;
   }
   return text;
+}
+
+function documentationResponseError(text: string, statusCode: number): Error {
+  if (statusCode === 503) {
+    let value: unknown;
+    try {
+      value = JSON.parse(text);
+    } catch {
+      return Object.assign(new Error(errorMessage(text, statusCode)), { statusCode });
+    }
+    if (isRecord(value) && (value.code === "documentation_startup_failed" || value.code === "documentation_startup_initializing")) {
+      return new DocumentationStartupError(value.code);
+    }
+  }
+  return Object.assign(new Error(errorMessage(text, statusCode)), { statusCode });
 }
 
 function appendUrlPath(basePath: string, appendPath: string): string {
