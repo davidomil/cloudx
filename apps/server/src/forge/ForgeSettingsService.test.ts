@@ -39,18 +39,45 @@ async function applicationFixture() {
   f.credentials.set("reviewer", { ...workerApp, appId: "app_2", installationId: "43" });
   const exchanges: { url: string; body: unknown }[] = [];
   const authorizations: string[] = [];
+  const permissions = { worker: { contents: "write" }, reviewer: { contents: "read" } } as Record<ForgeCredentialRole, Record<string, string>>;
   const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, options) => {
     if (String(url).endsWith("/access_tokens")) {
       exchanges.push({ url: String(url), body: JSON.parse(String(options?.body)) });
-      return Response.json({ token: "installation-" + exchanges.length, expires_at: new Date(Date.now() + 3_600_000).toISOString() });
+      return Response.json({ token: "installation-" + exchanges.length, expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: permissions[String(url).includes("/42/") ? "worker" : "reviewer"] });
     }
     authorizations.push(new Headers(options?.headers).get("authorization")!);
     return Response.json({ items: [], incomplete_results: false });
   });
-  return { ...f, exchanges, authorizations, fetcher };
+  return { ...f, exchanges, authorizations, fetcher, permissions };
 }
 
 describe("installation tokens across Forge provider acquisitions", () => {
+  it("refreshes publication authorization after approval while preserving the reviewer cache", async () => {
+    const f = await applicationFixture();
+    await f.settings.provider(repository, "worker").listIssues();
+    const reviewer = await f.settings.gitAccess(repository, "reviewer");
+    f.permissions.worker.workflows = "write";
+
+    await f.settings.refreshPublicationCredentials(repository);
+    await f.settings.provider(repository, "worker").listIssues();
+    expect(await f.settings.gitAccess(repository, "worker")).toMatchObject({ authorization: "Basic " + Buffer.from("x-access-token:installation-3").toString("base64") });
+    expect(await f.settings.gitAccess(repository, "reviewer")).toEqual(reviewer);
+    expect(f.exchanges.map(exchange => exchange.url)).toEqual([
+      "https://api.github.com/app/installations/42/access_tokens",
+      "https://api.github.com/app/installations/43/access_tokens",
+      "https://api.github.com/app/installations/42/access_tokens",
+    ]);
+    expect(f.authorizations).toEqual(["Bearer installation-1", "Bearer installation-3"]);
+    expect(f.credentials.get("worker")).toBe(workerApp);
+  });
+
+  it("rejects publication refresh for a different repository before reading credentials", async () => {
+    const f = await applicationFixture();
+    expect(() => f.settings.refreshPublicationCredentials({ ...repository, projectPath: "org/other" })).toThrow("different repository");
+    expect(f.connections.credential).not.toHaveBeenCalled();
+    expect(f.fetcher).not.toHaveBeenCalled();
+  });
+
   it.each(["request", "authentication"] as const)("shares the %s cooldown across provider instances and roles", async operation => {
     const f = await fixture();
     f.credentials.set("worker", operation === "authentication" ? workerApp : { kind: "token", token: "worker-private" });

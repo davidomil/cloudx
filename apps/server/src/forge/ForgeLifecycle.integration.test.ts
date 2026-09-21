@@ -1439,6 +1439,7 @@ class LifecycleFixture {
     this.store = new ForgeWorkflowStore(new PluginDataStore(this.dataDir));
     this.reports = new ForgeWorkerReports(this.dataDir);
     this.workflowDependencies = {
+      refreshPublicationCredentials: vi.fn(async () => {}),
       runtime,
       store: this.store,
       reports: this.reports,

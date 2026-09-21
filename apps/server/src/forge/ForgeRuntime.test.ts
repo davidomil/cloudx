@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { statSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -8,12 +8,16 @@ import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import type { WorkspaceTab } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
+import type { ConfigService } from "../configService.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
 import type { ForgeLogger } from "./ForgeLog.js";
 import type { ReviewConversationBinding } from "./ForgeReviewConversation.js";
+import { ForgeSettingsService } from "./ForgeSettingsService.js";
+import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
+import { ForgeWorkerReports } from "./ForgeWorkflowStore.js";
 import {
   ForgeRuntime,
   ForgeBranchConflictError,
@@ -1949,6 +1953,171 @@ describe.skipIf(process.platform !== "linux")(
       expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
     });
 
+    it.each(([undefined, "read", "write"] as const).flatMap(permission =>
+      [false, true].map(cooldown => ({ permission, cooldown })),
+    ))("retries saved publication in the same process with workflow permission $permission and cooldown=$cooldown", async ({ permission, cooldown }) => {
+      const approvedToken = "worker-workflows-write";
+      const approvedAuthorization = "Authorization: Basic " + Buffer.from(`x-access-token:${approvedToken}`).toString("base64");
+      const gitFixture = await installGitFixture(false,
+        "remote: refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission",
+        approvedAuthorization);
+      const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+      const applications = {
+        worker: { kind: "github-app" as const, appId: "worker_app", installationId: "42", privateKey },
+        reviewer: { kind: "github-app" as const, appId: "reviewer_app", installationId: "43", privateKey },
+      };
+      const config = { getPluginConfig: () => ({
+        ...expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker",
+        workerModel: codingModel.model, workerReasoningEffort: codingModel.reasoningEffort,
+        reviewModel: codingModel.model, reviewReasoningEffort: codingModel.reasoningEffort, maxRunMinutes: 60,
+      }) } as unknown as ConfigService;
+      const settings = new ForgeSettingsService(config, {
+        credential: (_repository, role) => applications[role], workerAuthors: () => [],
+      });
+      const exchanges: string[] = [];
+      let granted: "read" | "write" | undefined;
+      const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async url => {
+        if (String(url) === "https://api.github.com/repos/cloudx/test/issues/1")
+          return new Response(null, { status: 429, headers: { "retry-after": "10" } });
+        const installation = String(url).match(/\/app\/installations\/(42|43)\/access_tokens$/)?.[1];
+        if (!installation) throw new Error(`Unexpected fixture request: ${url}`);
+        exchanges.push(installation);
+        return Response.json({
+          token: installation === "43" ? "reviewer-token" : granted === "write" ? approvedToken : `worker-without-workflows-${exchanges.length}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          permissions: { contents: "write", ...(installation === "42" && granted ? { workflows: granted } : {}) },
+        });
+      });
+      const clock = vi.spyOn(Date, "now");
+      try {
+        await settings.gitAccess(expectedRepository, "worker");
+        const reviewerAccess = await settings.gitAccess(expectedRepository, "reviewer");
+        const deps = dependencies();
+        deps.gitAccess = (repository, role, signal) => settings.gitAccess(repository, role, signal);
+        delete deps.git;
+        runtime = new ForgeRuntime(deps);
+        const launch = vi.spyOn(runtime, "launch").mockResolvedValue("implementation-tab");
+        vi.spyOn(runtime, "pause").mockResolvedValue();
+        vi.spyOn(runtime, "close").mockResolvedValue();
+        const prepareWorkspace = vi.spyOn(runtime, "prepareWorkspace");
+        const reports = new ForgeWorkerReports(deps.dataDir);
+        const prepareReport = vi.spyOn(reports, "prepare");
+        const readReport = vi.spyOn(reports, "read");
+        let stored: ForgeWorker[] = [];
+        const change: ForgeChangeRequest = {
+          number: 7, title: "Add workflow diagnostics", body: "", url: "https://github.com/cloudx/test/pull/7",
+          state: "open", labels: [], author: "worker", updatedAt: "", draft: false,
+          headSha, headBranch: "", baseBranch: "main", baseSha: headSha, targetHeadSha: headSha,
+          merged: false, mergeable: true, requiresBaseUpdate: false, reviewReady: true, approved: false,
+          unresolvedDiscussions: 0, linkedIssues: [], comments: [],
+        };
+        const provider = {
+          getIssue: vi.fn(async () => ({ number: 1, title: change.title, body: "Add workflow diagnostics", state: "open", comments: [] })),
+          findChangeRequestByBranch: vi.fn(async () => undefined),
+          createChangeRequest: vi.fn(async () => structuredClone(change)),
+          getChangeRequest: vi.fn(async () => structuredClone(change)),
+          getChangeRequestStatus: vi.fn(async () => structuredClone(change)),
+        };
+        const service = new ForgeWorkflowService({
+          runtime, reports, settings: () => settings.settings(),
+          refreshPublicationCredentials: (repository, signal) => settings.refreshPublicationCredentials(repository, signal),
+          provider: () => provider as unknown as ReturnType<ForgeWorkflowDependencies["provider"]>,
+          store: {
+            read: async () => structuredClone(stored),
+            write: async workers => { stored = structuredClone(workers); },
+          },
+          notify: vi.fn(),
+        });
+        const placement = { windowId: "window", paneId: "pane" };
+        const worker = await service.startIssue(expectedRepository, 1, placement, cooldown);
+        expect(worker.status, worker.error).toBe("running");
+        await fs.mkdir(path.join(worker.worktreePath!, ".github", "workflows"), { recursive: true });
+        await fs.writeFile(path.join(worker.worktreePath!, ".github", "workflows", "ci.yml"), "name: CI\non: push\njobs: {}\n");
+        await git(worker.worktreePath!, "add", ".github/workflows/ci.yml");
+        await git(worker.worktreePath!, "commit", "-m", "TEST: add workflow diagnostics");
+        const completedHead = await git(worker.worktreePath!, "rev-parse", "HEAD");
+        change.headSha = completedHead;
+        change.headBranch = worker.branch!;
+        const report = { kind: "issue", title: change.title, body: "Workflow diagnostics validated.", resolvedDiscussionIds: [], discussionReplies: [] };
+        const { reportPath } = await prepareReport.mock.results[0]!.value;
+        await fs.writeFile(reportPath, JSON.stringify(report));
+        const pushes = async () => (await fs.readFile(gitFixture.records, "utf8")).trim().split("\n")
+          .map(line => JSON.parse(line) as { args: string[]; env: Record<string, string> })
+          .filter(record => record.args.includes("push"));
+
+        await service.poll();
+        expect(stored[0]).toMatchObject({ status: "failed", error: expect.stringContaining("Workflows: write"), pendingPublication: { report } });
+        expect(stored[0]!.pendingPublication!.headSha).toBeUndefined();
+        expect(stored[0]!.providerRetryAt).toBeUndefined();
+        expect(await pushes()).toHaveLength(1);
+        expect(exchanges).toEqual(["42", "43"]);
+        expect(provider.createChangeRequest).not.toHaveBeenCalled();
+        expect(await git(origin, "branch", "--list", worker.branch!)).toBe("");
+        await service.poll();
+        expect(await pushes()).toHaveLength(1);
+        expect(exchanges).toEqual(["42", "43"]);
+
+        granted = permission;
+        if (cooldown) {
+          let now = Date.now();
+          clock.mockImplementation(() => now);
+          await expect(settings.provider(expectedRepository, "worker").getIssue(1))
+            .rejects.toMatchObject({ failure: "rate_limited", retryAfterMs: 10_000 });
+          const blocked = await service.resume(worker.id, placement);
+          expect(blocked).toMatchObject({ status: "failed", error: expect.stringMatching(/rate limit/i), pendingPublication: { report } });
+          expect(blocked.providerRetryAt).toBeUndefined();
+          expect(exchanges).toEqual(["42", "43"]);
+          expect(await pushes()).toHaveLength(1);
+
+          now += 10_000;
+          await service.poll();
+          expect(stored[0]).toMatchObject({ status: "failed", pendingPublication: { report } });
+          expect(exchanges).toEqual(["42", "43"]);
+          expect(await pushes()).toHaveLength(1);
+          expect(provider.createChangeRequest).not.toHaveBeenCalled();
+          expect(launch).toHaveBeenCalledOnce();
+          expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(completedHead);
+        }
+        if (permission !== "write") {
+          const blocked = await service.resume(worker.id, placement);
+          expect(blocked).toMatchObject({ status: "failed", error: expect.stringContaining("Workflows: write"), pendingPublication: { report } });
+          expect(blocked.providerRetryAt).toBeUndefined();
+          expect(exchanges).toEqual(["42", "43", "42"]);
+          expect(await pushes()).toHaveLength(1);
+          expect(provider.createChangeRequest).not.toHaveBeenCalled();
+          expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(completedHead);
+          await service.poll();
+          expect(exchanges).toHaveLength(3);
+          expect(await pushes()).toHaveLength(1);
+          granted = "write";
+        }
+        const published = await service.resume(worker.id, placement);
+        expect(published).toMatchObject({ status: "awaiting_review", headSha: completedHead, changeNumber: change.number, worktreePath: worker.worktreePath, branch: worker.branch });
+        expect(published.pendingPublication).toBeUndefined();
+        expect(published.error).toBeUndefined();
+        expect(exchanges).toEqual(permission === "write" ? ["42", "43", "42"] : ["42", "43", "42", "42"]);
+        const pushRecords = await pushes();
+        expect(pushRecords).toHaveLength(2);
+        expect(pushRecords[0]!.env.GIT_CONFIG_VALUE_1).not.toBe(approvedAuthorization);
+        expect(pushRecords[1]!.env.GIT_CONFIG_VALUE_1).toBe(approvedAuthorization);
+        for (const pushed of pushRecords) expect(pushed.args).toContain(`${completedHead}:refs/heads/${worker.branch}`);
+        expect(await git(origin, "rev-parse", worker.branch!)).toBe(completedHead);
+        expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(completedHead);
+        expect(await git(worker.worktreePath!, "status", "--porcelain")).toBe("");
+        expect(provider.createChangeRequest).toHaveBeenCalledExactlyOnceWith({ title: report.title, body: `${report.body}\n\nCloses #1`, headBranch: worker.branch, baseBranch: "main" });
+        expect(launch).toHaveBeenCalledOnce();
+        expect(prepareWorkspace).toHaveBeenCalledOnce();
+        expect(prepareReport).toHaveBeenCalledOnce();
+        expect(readReport).toHaveBeenCalledOnce();
+        expect(await settings.gitAccess(expectedRepository, "reviewer")).toEqual(reviewerAccess);
+        expect(exchanges.filter(installation => installation === "43")).toHaveLength(1);
+        await service.dispose();
+      } finally {
+        clock.mockRestore();
+        fetcher.mockRestore();
+      }
+    }, 15_000);
+
     it("uses reviewer authorization only for fetching the two exact review commits", async () => {
       const fixture = await installGitFixture();
       const deps = dependencies();
@@ -2082,7 +2251,7 @@ describe.skipIf(process.platform !== "linux")(
   },
 );
 
-async function installGitFixture(hangFetch: boolean | "review-base" | "merge" = false, pushError?: string) {
+async function installGitFixture(hangFetch: boolean | "review-base" | "merge" = false, pushError?: string, acceptedPushAuthorization?: string) {
   const actualGit = (await execute("which", ["git"])).stdout.trim();
   const bin = path.join(root, "bin");
   const records = path.join(root, "git-processes.jsonl");
@@ -2097,7 +2266,8 @@ const args = process.argv.slice(2);
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
 fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
 const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
-if (args.includes("push") && ${JSON.stringify(pushError)} !== undefined) {
+if (args.includes("push") && ${JSON.stringify(pushError)} !== undefined &&
+    (${JSON.stringify(acceptedPushAuthorization)} === undefined || process.env.GIT_CONFIG_VALUE_1 !== ${JSON.stringify(acceptedPushAuthorization)})) {
   fs.writeSync(2, ${JSON.stringify(pushError)});
   process.exit(1);
 }

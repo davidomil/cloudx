@@ -201,6 +201,13 @@ Workflows permission, Forge displays the required **Workflows: write**
 permission and retains the completion report and checkout. The error
 message excludes raw Git stderr.
 
+Before **Retry publication** pushes a saved commit, Forge refreshes the
+worker App’s installation token and checks its effective **Workflows:
+write** permission. If approval is still missing, Forge retains the
+publication and waits for another explicit retry. After approval, it
+publishes the saved commit and report without restarting CloudX or
+rerunning implementation. The reviewer’s cached token is unchanged.
+
 An existing App needs its owner to update the registration; installing a
 CloudX version with the new manifest does not update that App’s grant.
 GitHub requires approval of the additional repository permission for the

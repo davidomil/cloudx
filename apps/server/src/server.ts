@@ -1346,6 +1346,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const settingsForForge: ForgeSettingsService = forgeSettings;
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),
+    refreshPublicationCredentials: (repository, signal) => settingsForForge.refreshPublicationCredentials(repository, signal),
     logger,
     provider: (repository, role, signal, context) => settingsForForge.provider(repository, role, signal,
       context ? diagnostic => forgeLog(logger, "warn", "provider_request_failed", { ...context, forgeRequest: diagnostic }) : undefined),
