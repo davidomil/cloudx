@@ -390,19 +390,24 @@ describe("SessionStore voice actions", () => {
     const window = workspace!.getActiveWindow();
     const authorizeProjectTrust = vi.fn(async () => root);
     const prepareCodexSession = vi.fn(async () => "01a08470-d118-7b72-b1df-439e72e5c744");
+    const codexTurn = { workerId: "worker", attemptId: "attempt", receiptPath: path.join(root, "turn.json") };
     try {
-      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust, prepareCodexSession });
+      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust, prepareCodexSession, codexTurn });
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
       expect(plugin.lastInput?.prepareCodexSession).toBe(prepareCodexSession);
+      expect(plugin.lastInput?.codexTurn).toEqual(codexTurn);
+      expect(JSON.stringify(tab)).not.toContain("codexTurn");
       expect(JSON.stringify(tab)).not.toContain("authorizeProjectTrust");
       expect(JSON.stringify(tab)).not.toContain("prepareCodexSession");
       await store.restartTab(tab.id);
+      expect(plugin.lastInput?.codexTurn).toEqual(codexTurn);
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
       expect(plugin.lastInput?.prepareCodexSession).toBe(prepareCodexSession);
       await store.discardPreparedTab(tab.id);
       await store.createTab({ pluginId: plugin.id, cwd: root });
       expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
       expect(plugin.lastInput?.prepareCodexSession).toBeUndefined();
+      expect(plugin.lastInput?.codexTurn).toBeUndefined();
     } finally {
       await store.dispose();
       await fs.rm(root, { recursive: true, force: true });
@@ -415,11 +420,12 @@ describe("SessionStore voice actions", () => {
     try {
       await workspaceCommands!.createTab({
         pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId,
-        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root, prepareCodexSession: "spoofed-thread" },
-        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root, prepareCodexSession: "spoofed-thread" } }
+        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root, prepareCodexSession: "spoofed-thread", codexTurn: { receiptPath: "/spoofed" } },
+        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root, prepareCodexSession: "spoofed-thread", codexTurn: { receiptPath: "/spoofed" } } }
       });
       expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
       expect(plugin.lastInput?.prepareCodexSession).toBeUndefined();
+      expect(plugin.lastInput?.codexTurn).toBeUndefined();
     } finally {
       await store.dispose();
       await fs.rm(root, { recursive: true, force: true });

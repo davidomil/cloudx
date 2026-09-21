@@ -58,6 +58,58 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it.each(["issue", "review"] as const)("keeps the %s final response visible and waits for native completion before handoff", async kind => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
+    const fixture = await LifecycleFixture.create();
+    if (kind === "review") await fixture.seedReview();
+    const started = kind === "issue"
+      ? await fixture.workflow.startIssue(repository, 1, fixture.placement)
+      : await fixture.workflow.startReview(repository, 7, true, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(started, false);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "running", completion: { report: { kind }, turn: { status: "running" } } });
+    expect(await processIsRunning(receipt.pid)).toBe(true);
+    expect(fixture.gitPushes).toEqual([]);
+    expect(fixture.provider.submissions).toEqual([]);
+    expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).not.toContain("FORGE_FIXTURE_FINAL_RESPONSE");
+
+    fixture.factory.processes[0]!.write("finish the response\n");
+    await vi.waitFor(async () => expect(await fixture.workflowDependencies.runtime.readTurnCompletion(started.id, started.attemptId!)).toMatchObject({ status: "completed" }), { timeout: 5_000, interval: 20 });
+    await fixture.workflow.poll();
+    await fixture.workflow.poll();
+    const completed = await fixture.worker(started.id);
+    expect(completed.status, completed.error).toBe(kind === "issue" ? "awaiting_review" : "completed");
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    expect(fixture.sessions.getTab(started.tabId!).status).toBe("completed");
+    expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).toContain("FORGE_FIXTURE_FINAL_RESPONSE");
+    const history = await fixture.workflow.workerHistory(started.id);
+    expect(history).toMatchObject({ tabId: started.tabId, screen: { data: expect.stringContaining("FORGE_FIXTURE_FINAL_RESPONSE") } });
+    expect(await new ForgeRuntime(fixture.runtimeDependencies).workerHistory(started.id)).toEqual(history);
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect((await fixture.worker(started.id)).status).toBe(kind === "issue" ? "awaiting_review" : "completed");
+    expect(fixture.gitPushes).toHaveLength(kind === "issue" ? 1 : 0);
+    expect(fixture.provider.submissions).toHaveLength(kind === "review" ? 1 : 0);
+  }, 20_000);
+
+  it("reaps an owned detached child before publishing a successfully completed turn", async () => {
+    vi.stubEnv("FORGE_FIXTURE_OWNED_CHILD", "true");
+    const fixture = await LifecycleFixture.create();
+    const worker = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(worker);
+    expect(receipt.ownedChildPid).toEqual(expect.any(Number));
+    expect(await processIsRunning(receipt.ownedChildPid!)).toBe(true);
+    const publish = fixture.workflowDependencies.runtime.publishBranch.bind(fixture.workflowDependencies.runtime);
+    const publishing = vi.spyOn(fixture.workflowDependencies.runtime, "publishBranch").mockImplementation(async (...args) => {
+      expect(await processIsRunning(receipt.pid)).toBe(false);
+      expect(await processIsRunning(receipt.ownedChildPid!)).toBe(false);
+      return publish(...args);
+    });
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_review" });
+    expect(publishing).toHaveBeenCalledOnce();
+    expect(fixture.gitPushes).toHaveLength(1);
+  }, 20_000);
+
   it.each([
     [17, "failed", "Terminal exited with code 17."],
     [0, "completed", "Terminal exited cleanly."]
@@ -73,7 +125,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.reports.read(started.attemptId!)).toBeUndefined();
     await fixture.workflow.poll();
 
-    expect(await fixture.worker(started.id)).toMatchObject({ status: "failed", error: "The Codex tab ended without a completion report. Inspect the worker before resuming." });
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "failed", error: expect.stringContaining("without successful native turn completion or a completion report") });
     expect(fixture.sessions.listTabs()).toEqual([]);
     expect(fixture.factory.processes).toHaveLength(1);
     const history = await fixture.workflow.workerHistory(started.id);
@@ -96,7 +148,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
     const published = await fixture.worker(started.id);
     expect(published).toMatchObject({ status: "awaiting_review", headSha: receipt.headSha, changeNumber: 7 });
-    expect(fixture.sessions.getTab(started.tabId!).status).toBe("stopped");
+    expect(fixture.sessions.getTab(started.tabId!).status).toBe("completed");
     expect(await git(fixture.origin, "rev-parse", published.branch!)).toBe(receipt.headSha);
     const manifest = JSON.parse(await fs.readFile(path.join(fixture.dataDir, "forge-workers", "tabs", `${started.tabId}.json`), "utf8"));
     expect(manifest.quiescent).toBe(true);
@@ -114,10 +166,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.poll();
 
     expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", worktreePath: started.worktreePath, draft: { id: started.attemptId, status: "draft", headSha } });
-    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(fixture.sessions.getTab(started.tabId!).status).toBe("completed");
     expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
     expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
-    await fixture.expectDisposedAttempt(receipt);
+    await fixture.expectFinishedAttempt(receipt);
     expect(fixture.factory.processes).toHaveLength(1);
   }, 15_000);
 
@@ -224,9 +276,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
   }, 15_000);
 
   it("blocks an issue resume after repository settings change and preserves unfinished work until they are restored", async () => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
-    await fixture.completedAssistantTurn(started);
+    await fixture.completedAssistantTurn(started, false);
     await fixture.workflow.pause(started.id);
     const unfinished = path.join(started.worktreePath!, "unfinished.txt");
     await fs.writeFile(unfinished, "Retain unfinished issue work.\n");
@@ -243,6 +296,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fs.readFile(unfinished, "utf8")).toBe("Retain unfinished issue work.\n");
     expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(head);
 
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "false");
     await fixture.config.update({ plugins: { forge: { ...repository } } });
     const resumed = await fixture.workflow.resume(started.id, fixture.placement);
     expect(resumed).toMatchObject({ id: started.id, status: "running", worktreePath: started.worktreePath });
@@ -271,12 +325,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(started.status, started.error).toBe("running");
     const receipt = await fixture.completedAssistantTurn(started);
     expect(fixture.config.getPluginConfig("forge")).not.toHaveProperty("trustedRepository");
-    expect((await fixture.nativeStarts()).sort()).toEqual(["app-server", "tui"]);
+    expect((await fixture.nativeStarts()).sort()).toEqual(["app-server", "app-server", "tui"]);
     expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
     await fixture.workflow.poll();
     expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", draft: { headSha } });
     expect(fixture.provider.submissions).toEqual([]);
-    await fixture.expectDisposedAttempt(receipt);
+    await fixture.expectFinishedAttempt(receipt);
   }, 20_000);
 
   it("blocks a reviewer for a different configured repository and resumes after settings are restored", async () => {
@@ -304,12 +358,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(resumed).toMatchObject({ id: blocked.id, worktreePath: blocked.worktreePath, headSha });
     expect((await fs.stat(resumed.worktreePath!)).ino).toBe(checkout.ino);
     const receipt = await fixture.completedAssistantTurn(resumed);
-    expect((await fixture.nativeStarts()).sort()).toEqual(["app-server", "tui"]);
+    expect((await fixture.nativeStarts()).sort()).toEqual(["app-server", "app-server", "tui"]);
     expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
     await fixture.workflow.poll();
     expect(await fixture.worker(blocked.id)).toMatchObject({ status: "completed", draft: { headSha } });
     expect(fixture.provider.submissions).toEqual([]);
-    await fixture.expectDisposedAttempt(receipt);
+    await fixture.expectFinishedAttempt(receipt);
   }, 20_000);
 
   it("preserves a reviewer conversation when repository settings change and resumes after they are restored", async () => {
@@ -339,7 +393,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fs.readdir(path.join(fixture.dataDir, "codex-launches"))).toEqual(views);
     expect(await fixture.workspaceRecord(first.id)).toMatchObject({ launchPending: false, reviewConversation: binding });
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
-    await fixture.expectDisposedAttempt(firstReceipt);
+    await fixture.expectFinishedAttempt(firstReceipt);
 
     await fixture.config.update({ plugins: { forge: { ...repository } } });
     const resumed = await fixture.workflow.resume(first.id, fixture.placement);
@@ -357,8 +411,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.poll();
     expect(await fixture.worker(first.id)).toMatchObject({ status: "completed", reviewHistory: [firstDraft], draft: { headSha: nextHead } });
     expect(fixture.provider.submissions).toEqual([]);
-    await fixture.expectDisposedAttempt(firstReceipt);
-    await fixture.expectDisposedAttempt(receipt);
+    await fixture.expectFinishedAttempt(firstReceipt);
+    await fixture.expectFinishedAttempt(receipt);
   }, 25_000);
 
   it("implements an issue, reconciles a delayed publication, replies to feedback, then merges the approved result", async () => {
@@ -380,7 +434,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
     const awaiting = await fixture.worker(started.id);
     expect(awaiting).toMatchObject({ status: "awaiting_review", changeNumber: 7 });
-    expect(fixture.sessions.getTab(started.tabId!).status).toBe("stopped");
+    expect(fixture.sessions.getTab(started.tabId!).status).toBe("completed");
     expect(await processIsRunning(first.pid)).toBe(false);
     expect(await git(fixture.origin, "rev-parse", awaiting.branch!)).toBe(awaiting.headSha);
     expect(await fs.readFile(path.join(awaiting.worktreePath!, "solution.txt"), "utf8")).toBe("Issue resolved\n");
@@ -465,8 +519,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(firstDraft).toMatchObject({ id: firstReview.attemptId, startedAt: firstReview.startedAt, status: "posted" });
     expect((await fs.stat(firstReview.worktreePath!)).isDirectory()).toBe(true);
     expect(await processIsRunning(firstReviewReceipt.pid)).toBe(false);
-    expect(fixture.sessions.listTabs().map(tab => tab.id)).not.toContain(firstReview.tabId);
-    await fixture.expectDisposedAttempt(firstReviewReceipt);
+    expect(fixture.sessions.getTab(firstReview.tabId!).status).toBe("completed");
+    await fixture.expectFinishedAttempt(firstReviewReceipt);
 
     const revision = await fixture.runningWorker("issue");
     expect(revision.id).toBe(started.id);
@@ -513,7 +567,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     for (const worker of [started, firstReview, secondReview]) await expectMissing(worker.worktreePath!);
     for (const receipt of [firstImplementation, firstReviewReceipt, secondImplementation, secondReviewReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await fixture.expectDisposedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt);
     }
   }, 30_000);
 
@@ -546,7 +600,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(started.worktreePath!, reviewer.worktreePath!);
     for (const receipt of [implementation, reviewed]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await fixture.expectDisposedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt);
     }
   }, 20_000);
 
@@ -760,7 +814,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     for (const worker of [started, firstReview]) await expectMissing(worker.worktreePath!);
     for (const receipt of [implementation, firstReviewReceipt, resolution, secondReviewReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await fixture.expectDisposedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt);
     }
   }, 25_000);
 
@@ -906,7 +960,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     for (const worker of [started, firstReview, secondReview]) await expectMissing(worker.worktreePath!);
     for (const receipt of [implementation, firstReviewReceipt, secondReviewReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await fixture.expectDisposedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt);
     }
   }, 30_000);
 
@@ -914,9 +968,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const fixture = await LifecycleFixture.create({ autoReview: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     await fixture.completedAssistantTurn(started);
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
-    const receipt = await fixture.completedAssistantTurn(reviewer);
+    const receipt = await fixture.completedAssistantTurn(reviewer, false);
 
     await fixture.workflow[action](action === "pause" ? started.id : reviewer.id);
     const expectedStatus = action === "pause" ? "paused" : "stopped";
@@ -930,6 +985,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.factory.processes).toHaveLength(2);
     expect(fixture.gitPushes).toHaveLength(1);
 
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "false");
     await fixture.workflow.resume(started.id, fixture.placement);
     const resumed = await fixture.runningWorker("review");
     expect(resumed).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, issueWorkerId: started.id, headSha: reviewer.headSha, startedAt: reviewer.startedAt });
@@ -947,9 +1003,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const fixture = await LifecycleFixture.create({ autoReview: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     await fixture.completedAssistantTurn(started);
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
-    const receipt = await fixture.completedAssistantTurn(reviewer);
+    const receipt = await fixture.completedAssistantTurn(reviewer, false);
 
     await fixture.restartWorkflow();
     expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", autoReview: { enabled: true, phase: "reviewing", placement: fixture.placement, reviewWorkerId: reviewer.id } });
@@ -957,12 +1014,14 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await processIsRunning(receipt.pid)).toBe(false);
     expect((await fs.stat(reviewer.worktreePath!)).isDirectory()).toBe(true);
     expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
-    await fixture.expectDisposedAttempt(receipt);
+    expect((await fs.stat(receipt.reportPath)).isFile()).toBe(true);
+    await expectMissing(receipt.tabContextPath);
     fixture.advanceTime(5_001);
     await fixture.workflow.poll();
     expect(fixture.factory.processes).toHaveLength(2);
     expect(fixture.provider.submissions).toEqual([]);
 
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "false");
     await fixture.workflow.resume(started.id, fixture.placement);
     const resumed = await fixture.runningWorker("review");
     expect(resumed).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, issueWorkerId: started.id, headSha: reviewer.headSha, startedAt: reviewer.startedAt });
@@ -980,15 +1039,17 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     const implementation = await fixture.completedAssistantTurn(started);
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
     await fixture.workflow.poll();
     const reviewer = await fixture.runningWorker("review");
-    const receipt = await fixture.completedAssistantTurn(reviewer);
+    const receipt = await fixture.completedAssistantTurn(reviewer, false);
     if (interruption === "restart") await fixture.restartWorkflow();
     else await fixture.workflow[interruption](reviewer.id);
     expect(await processIsRunning(receipt.pid)).toBe(false);
 
     const targetHead = await fixture.conflictMainWithIssue();
     fixture.provider.detectConflicts = true;
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "false");
     await fixture.workflow.resume(interruption === "stop" ? started.id : reviewer.id, fixture.placement);
     const resumed = await fixture.runningWorker("review");
     expect(resumed).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, headSha: implementation.headSha });
@@ -1032,10 +1093,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.poll();
     expect(await fixture.worker(reviewer.id)).toMatchObject({ draft: { status: "post_failed", event: "request_changes", headSha: reviewer.headSha }, worktreePath: reviewer.worktreePath });
     expect(await processIsRunning(receipt.pid)).toBe(false);
-    expect(fixture.sessions.listTabs().map(tab => tab.id)).not.toContain(reviewer.tabId);
+    expect(fixture.sessions.getTab(reviewer.tabId!).status).toBe("completed");
     expect((await fs.stat(reviewer.worktreePath!)).isDirectory()).toBe(true);
     expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
-    await fixture.expectDisposedAttempt(receipt);
+    await fixture.expectFinishedAttempt(receipt);
     fixture.advanceTime(5_001);
     await fixture.workflow.poll();
     await expect(fixture.workflow.resume(started.id, fixture.placement)).rejects.toThrow(/reconciled.*will not repost/i);
@@ -1137,7 +1198,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await processIsRunning(codingReceipt.pid)).toBe(false);
     await expectMissing(coding.worktreePath!, review.worktreePath!);
     for (const receipt of [codingReceipt, reviewReceipt]) {
-      await fixture.expectDisposedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt);
       await expectMissing(path.dirname(receipt.tabContextPath));
     }
     expect(fixture.sessions.listTabs().map(tab => tab.id)).toEqual([unrelatedTab.id]);
@@ -1206,11 +1267,11 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const reviewed = await fixture.worker(started.id);
     expect(reviewed).toMatchObject({ status: "completed", draft: { status: "draft", headSha: reviewHead, comments: [{ body: "Explain the public return value.", path: "review.txt", line: 1, side: "RIGHT" }] } });
     expect(fixture.provider.submissions).toEqual([]);
-    expect(fixture.sessions.listTabs()).toEqual([]);
+    expect(fixture.sessions.getTab(started.tabId!).status).toBe("completed");
     expect(await processIsRunning(receipt.pid)).toBe(false);
     expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
     expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
-    await fixture.expectDisposedAttempt(receipt);
+    await fixture.expectFinishedAttempt(receipt);
 
     await fixture.workflow.saveReview(started.id, reviewed.draft!.id, {
       event: "request_changes",
@@ -1239,8 +1300,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(firstReceipt.previousMessages).toHaveLength(1);
     const checkout = await fs.stat(first.worktreePath!);
     await fixture.workflow.poll();
-    expect(fixture.sessions.listTabs()).toEqual([]);
-    await fixture.expectDisposedAttempt(firstReceipt);
+    expect(fixture.sessions.getTab(first.tabId!).status).toBe("completed");
+    await fixture.expectFinishedAttempt(firstReceipt);
     const initialDraft = (await fixture.worker(first.id)).draft!;
     await fixture.workflow.saveReview(first.id, initialDraft.id, {
       event: "request_changes",
@@ -1276,8 +1337,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(secondReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
     expect(await git(second.worktreePath!, "status", "--porcelain")).toBe("");
     await fixture.workflow.poll();
-    expect(fixture.sessions.listTabs()).toEqual([]);
-    await fixture.expectDisposedAttempt(secondReceipt);
+    expect(fixture.sessions.getTab(second.tabId!).status).toBe("completed");
+    await fixture.expectFinishedAttempt(secondReceipt);
 
     const completed = await fixture.worker(first.id);
     expect(completed).toMatchObject({ status: "completed", reviewHistory: [firstDraft], draft: { id: second.attemptId, startedAt: second.startedAt, headSha: nextHead, status: "draft" } });
@@ -1298,7 +1359,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(first.worktreePath!);
     for (const receipt of [firstReceipt, secondReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
-      await fixture.expectDisposedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt);
     }
     const retainedConversation = await fs.readFile(firstReceipt.sessionPath!, "utf8");
     expect(retainedConversation).toContain(firstHead);
@@ -1346,6 +1407,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
 interface AssistantReceipt {
   pid: number;
+  ownedChildPid?: number;
   trustedProjectPath: string;
   gitAuthorizationPresent: boolean;
   args: string[];
@@ -1523,7 +1585,7 @@ class LifecycleFixture {
   }
 
   async startIssueThatExitsBeforeRegistration(exitCode: number): Promise<ForgeWorker> {
-    await fs.writeFile(path.join(this.root, "fixture-assistant.mjs"), `#!/bin/sh\nprintf 'FORGE_FIXTURE_EARLY_EXIT\\n'\nexit ${exitCode}\n`, { mode: 0o700 });
+    await fs.writeFile(path.join(this.root, "fixture-assistant.mjs"), `#!/bin/sh\ncase "$*" in *app-server*) cat >/dev/null;; *) printf 'FORGE_FIXTURE_EARLY_EXIT\\n'; exit ${exitCode};; esac\n`, { mode: 0o700 });
     const ready = TerminalSupervisor.prototype.ready;
     const readiness = vi.spyOn(TerminalSupervisor.prototype, "ready").mockImplementation(async function(this: TerminalSupervisor) {
       await ready.call(this);
@@ -1581,7 +1643,7 @@ class LifecycleFixture {
     return { worker, receipt, showCurrentHead: () => stale.mockRestore() };
   }
 
-  async completedAssistantTurn(worker: ForgeWorker): Promise<AssistantReceipt> {
+  async completedAssistantTurn(worker: ForgeWorker, waitForCompletion = true): Promise<AssistantReceipt> {
     expect(worker, worker.error).toMatchObject({ status: "running", tabId: expect.any(String), attemptId: expect.any(String) });
     const receiptPath = path.join(this.root, "receipts", `${worker.attemptId}.json`);
     await vi.waitFor(async () => {
@@ -1591,6 +1653,9 @@ class LifecycleFixture {
         const output = session ? this.sessions.getSession(session.id).snapshot().recentOutput : "The terminal closed.";
         throw new Error(`Waiting for fixture completion report: ${output}`);
       }
+    }, { timeout: 8_000, interval: 20 });
+    await vi.waitFor(async () => {
+      expect(await this.workflowDependencies.runtime.readTurnCompletion(worker.id, worker.attemptId!)).toMatchObject({ workerId: worker.id, attemptId: worker.attemptId, ...(waitForCompletion ? { status: "completed" } : {}) });
     }, { timeout: 8_000, interval: 20 });
     const receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")) as AssistantReceipt;
     receipt.tabContextPath = this.sessions.getTab(worker.tabId!).contextPath!;
@@ -1699,9 +1764,16 @@ test("retains the target behavior and issue fix", () => {
     return JSON.parse(await fs.readFile(path.join(this.dataDir, "forge-workers", "workspaces", `${id}.json`), "utf8"));
   }
 
-  async expectDisposedAttempt(receipt: AssistantReceipt): Promise<void> {
-    await expectMissing(receipt.tabContextPath, receipt.reportPath, receipt.contextPath);
-    if (!receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
+  async expectFinishedAttempt(receipt: AssistantReceipt): Promise<void> {
+    await expectMissing(receipt.reportPath, receipt.contextPath);
+    const tab = this.sessions.listTabs().find(tab => tab.contextPath === receipt.tabContextPath);
+    if (tab) {
+      expect(tab.status).toBe("completed");
+      expect((await fs.stat(receipt.tabContextPath)).isFile()).toBe(true);
+      return;
+    }
+    await expectMissing(receipt.tabContextPath);
+    if (!receipt.localReview || !receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
       await expectMissing(receipt.codexHome);
       return;
     }
@@ -1845,10 +1917,11 @@ const sourceAuth = '{"OPENAI_API_KEY":"fixture-only-not-a-real-key"}\n';
 const fakeAssistant = `#!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { parse } from ${JSON.stringify(import.meta.resolve("smol-toml"))};
+import WebSocket from ${JSON.stringify(import.meta.resolve("ws"))};
 const args = process.argv.slice(2);
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, "native-start-" + process.pid + ".json"), JSON.stringify({ mode: args.includes("app-server") ? "app-server" : "tui" }));
 const sessionFile = id => path.join(process.env.CODEX_HOME, "sessions", "fixture", "rollout-" + id + ".jsonl");
@@ -1863,6 +1936,7 @@ function readConversation(id) {
   return { id, cwd: meta.payload.cwd, ephemeral: false, path: meta.payload.fixtureOriginPath, messages };
 }
 if (args.includes("app-server")) {
+  const turns = new Map();
   for await (const line of createInterface({ input: process.stdin })) {
     const request = JSON.parse(line);
     fs.appendFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, "app-server-" + process.pid + ".jsonl"), JSON.stringify(request) + "\\n");
@@ -1896,6 +1970,20 @@ if (args.includes("app-server")) {
         result = { thread: conversation };
       }
       else if (request.method === "thread/unsubscribe") result = { status: "unsubscribed" };
+      else if (request.method === "turn/start") {
+        readConversation(request.params.threadId);
+        const turn = { id: randomUUID(), status: "inProgress", items: [] };
+        turns.set(request.params.threadId, turn);
+        result = { turn };
+        console.log(JSON.stringify({ method: "turn/started", params: { threadId: request.params.threadId, turn } }));
+      } else if (request.method === "fixture/complete") {
+        const turn = turns.get(request.params.threadId);
+        if (!turn || turn.id !== request.params.turnId) throw new Error("The completion must belong to the active fixture turn.");
+        turn.status = "completed";
+        turn.items = [{ type: "agentMessage", id: randomUUID(), phase: "final_answer", text: "FORGE_FIXTURE_FINAL_RESPONSE" }];
+        console.log(JSON.stringify({ method: "turn/completed", params: { threadId: request.params.threadId, turn } }));
+        result = {};
+      }
       else throw new Error("Unexpected fixture app-server method: " + request.method);
       console.log(JSON.stringify({ id: request.id, result }));
     } catch (error) {
@@ -1910,6 +1998,27 @@ if (config.projects?.[trustedProjectPath]?.trust_level !== "trusted") {
   await new Promise(() => setInterval(() => {}, 1000));
 }
 const prompt = args.at(-1);
+const remote = args[args.indexOf("--remote") + 1];
+if (!args.includes("--remote")) throw new Error("Every Forge turn must use its owned app-server connection.");
+const socket = new WebSocket(remote, { headers: { Authorization: "Bearer " + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
+const pending = new Map();
+let requestId = 0;
+socket.on("message", data => {
+  const message = JSON.parse(data.toString());
+  if (!pending.has(message.id)) return;
+  const { resolve, reject } = pending.get(message.id);
+  pending.delete(message.id);
+  if (message.error) reject(new Error(message.error.message)); else resolve(message.result);
+});
+await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+function request(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = ++requestId;
+    pending.set(id, { resolve, reject });
+    socket.send(JSON.stringify({ id, method, params }));
+  });
+}
+await request("initialize", { clientInfo: { name: "fixture-tui", version: "1" } });
 const reportPath = JSON.parse(prompt.split("Write only valid JSON to ")[1].split(" by writing ")[0]);
 const contextPath = JSON.parse(prompt.split("Read the complete current task and feedback from ")[1].split(" before beginning.")[0]);
 const context = JSON.parse(fs.readFileSync(contextPath, "utf8"));
@@ -1923,10 +2032,11 @@ if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
 }
 const isReview = prompt.startsWith("Review the exact checked-out commit");
 const resumedSessionId = args.includes("resume") ? args[args.indexOf("resume") + 1] : undefined;
-const conversation = resumedSessionId ? readConversation(resumedSessionId) : undefined;
+const conversation = resumedSessionId ? readConversation(resumedSessionId) : (await request("thread/start", { cwd: trustedProjectPath, ephemeral: false })).thread;
 if (isReview && !conversation) throw new Error("The reviewer must resume its exact Codex conversation.");
-if (conversation && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
+if (isReview && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
 if (conversation && conversation.cwd !== trustedProjectPath) throw new Error("The resumed conversation belongs to a different checkout.");
+const { turn } = await request("turn/start", { threadId: conversation.id, input: [{ type: "text", text: prompt }] });
 if (isReview && process.env.FORGE_FIXTURE_HOLD_REVIEW === "true") {
   console.log("FORGE_FIXTURE_REVIEW_WAITING");
   await new Promise(resolve => process.stdin.once("data", resolve));
@@ -1969,7 +2079,15 @@ const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
 const report = isReview
   ? review
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", rebase, discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
-const receipt = { pid: process.pid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview, sessionId: conversation?.id, resumedSessionId, sessionPath: conversation?.path, previousMessages: conversation?.messages };
+let ownedChildPid;
+if (process.env.FORGE_FIXTURE_OWNED_CHILD === "true") {
+  const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000);"], { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  await new Promise(resolve => child.once("message", resolve));
+  ownedChildPid = child.pid;
+  child.disconnect();
+  child.unref();
+}
+const receipt = { pid: process.pid, ownedChildPid, trustedProjectPath, gitAuthorizationPresent: Object.entries(process.env).some(([key, value]) => key.startsWith("GIT_CONFIG_VALUE_") && value?.includes("Authorization:")), args, templateId: process.env.CLOUDX_PERSONALITY_TEMPLATE_ID, skillIds: process.env.CLOUDX_ENABLED_SKILL_IDS, codexHome: process.env.CODEX_HOME, reportPath, contextPath, context, headSha, localReview, sessionId: conversation?.id, resumedSessionId, sessionPath: conversation?.path, previousMessages: conversation?.messages };
 if (conversation) {
   const messages = [{ role: "user", content: prompt }, { role: "assistant", content: JSON.stringify(report) }];
   for (const message of messages) fs.appendFileSync(conversation.path, JSON.stringify({ timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role: message.role, content: [{ type: message.role === "user" ? "input_text" : "output_text", text: message.content }] } }) + "\\n");
@@ -1979,6 +2097,14 @@ process.on("SIGUSR2", () => process.exit(0));
 fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
 fs.renameSync(reportPath + ".tmp", reportPath);
 console.log("FORGE_FIXTURE_REPORT_READY");
+if (process.env.FORGE_FIXTURE_HOLD_COMPLETION === "true") {
+  process.stdin.resume();
+  await new Promise(resolve => process.stdin.once("data", resolve));
+}
+console.log("FORGE_FIXTURE_FINAL_RESPONSE");
+await request("fixture/complete", { threadId: conversation.id, turnId: turn.id });
+process.stdin.resume();
+process.stdin.on("data", data => { if (data.toString().includes("/quit")) process.exit(0); });
 setInterval(() => {}, 1000);
 }
 `;

@@ -567,3 +567,71 @@ describe("Saved review rounds", () => {
     expect(() => parseWorkers([{ ...reviewer, reviewHistory: [{ ...previous, publication: { commentIds: ["same", "same"] } }] }])).toThrow(/unique/i);
   });
 });
+
+describe("Saved native worker completion", () => {
+  const attemptId = "33333333-3333-4333-8333-333333333333";
+  const turn = { workerId: worker.id, attemptId, threadId: "native-thread", turnId: "native-turn", status: "completed" };
+  const completion = { attemptId, deadlineAt: "2026-09-21T07:00:00.000Z", turn, report };
+
+  it.each(["running", "completed", "interrupted", "failed"])("preserves %s separately from the report across persistence", status => {
+    const saved = { ...worker, attemptId, completion: { ...completion, turn: { ...turn, status } } };
+    expect(parseWorkers([saved])[0]).toEqual(saved);
+  });
+
+  it("persists either signal before the other and keeps proof after report-file cleanup", () => {
+    for (const checkpoint of [{ ...completion, turn: undefined }, { ...completion, report: undefined }, completion]) {
+      expect(parseWorkers([{ ...worker, completion: checkpoint }])[0].completion).toEqual(checkpoint);
+    }
+  });
+
+  it.each([
+    { ...completion, attemptId: "invalid" },
+    { ...completion, attemptId: reviewWorkerId },
+    { ...completion, deadlineAt: "tomorrow" },
+    { ...completion, turn: { ...turn, workerId: reviewWorkerId } },
+    { ...completion, turn: { ...turn, attemptId: reviewWorkerId } },
+    { ...completion, turn: { ...turn, threadId: "" } },
+    { ...completion, turn: { ...turn, turnId: undefined } },
+    { ...completion, turn: { ...turn, status: "inProgress" } },
+    { ...completion, turn: { ...turn, status: ["completed"] } },
+    { ...completion, turn: { ...turn, error: {} } },
+    { ...completion, report: { kind: "issue" } },
+    { ...completion, report: { kind: "review", headSha, event: "approve", body: "Reviewed", comments: [] } },
+  ])("rejects mismatched or malformed evidence %#", completion => {
+    expect(() => parseWorkers([{ ...worker, attemptId, completion }])).toThrow();
+  });
+
+  it("binds review completion evidence to the reviewed revision", () => {
+    const review = { kind: "review", headSha, event: "approve", body: "Reviewed", comments: [] };
+    const saved = { ...worker, kind: "review", attemptId, headSha, completion: { ...completion, report: review } };
+    expect(parseWorkers([saved])[0].completion?.report).toEqual(review);
+    expect(() => parseWorkers([{ ...saved, headSha: "b".repeat(40) }])).toThrow(/revision/);
+  });
+});
+
+describe("Completion deadline evidence", () => {
+  const attemptId = "33333333-3333-4333-8333-333333333333";
+  const turn = { workerId: worker.id, attemptId, threadId: "thread", turnId: "turn", status: "completed" };
+  const completion = { attemptId, deadlineAt: "2026-09-21T07:00:00.000Z", readyAt: "2026-09-21T06:59:59.000Z", report, turn };
+
+  it("keeps the successful handoff timestamp for publication retry after its deadline", () => {
+    expect(parseWorkers([{ ...worker, completion }])[0].completion).toEqual(completion);
+  });
+
+  it.each([
+    { ...completion, readyAt: completion.deadlineAt },
+    { ...completion, readyAt: "2026-09-21T07:00:01.000Z" },
+    { ...completion, readyAt: "invalid" },
+    { ...completion, report: undefined },
+    { ...completion, turn: undefined },
+    { ...completion, turn: { ...turn, status: "interrupted" } },
+    { ...completion, reportError: "Invalid JSON" },
+  ])("rejects a handoff without both successful signals before the deadline %#", completion => {
+    expect(() => parseWorkers([{ ...worker, completion }])).toThrow();
+  });
+
+  it("retains the invalid report reason independently of native completion", () => {
+    const failed = { attemptId, deadlineAt: completion.deadlineAt, turn, reportError: "Invalid completion report: Expected a JSON object." };
+    expect(parseWorkers([{ ...worker, completion: failed }])[0].completion).toEqual(failed);
+  });
+});

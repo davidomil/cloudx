@@ -1,4 +1,4 @@
-import { MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { isForgeTurnCompletion, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeIssueCompletionReport,
@@ -389,6 +389,25 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.completion !== undefined) {
+      const completion = object(worker.completion);
+      const attemptId = nonblankText(completion.attemptId, "completion attempt", 36);
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(attemptId) ||
+        worker.attemptId !== undefined && worker.attemptId !== attemptId)
+        throw new Error("Completion evidence must match the worker attempt.");
+      const deadlineAt = isoTimestamp(completion.deadlineAt, "completion deadline");
+      const turn = completion.turn;
+      if (turn !== undefined && (!isForgeTurnCompletion(turn) || turn.workerId !== worker.id || turn.attemptId !== attemptId))
+        throw new Error("Native turn completion must match the worker and attempt.");
+      const report = completion.report === undefined ? undefined : parseWorkerReport(completion.report);
+      const reportError = completion.reportError === undefined ? undefined : nonblankText(completion.reportError, "completion report error", 100_000);
+      const readyAt = completion.readyAt === undefined ? undefined : isoTimestamp(completion.readyAt, "completion handoff timestamp");
+      if (report && reportError || readyAt && (!report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || Date.parse(readyAt) >= Date.parse(deadlineAt)))
+        throw new Error("A completion handoff requires a valid report and successful native turn before its deadline.");
+      if (report && (report.kind !== worker.kind || worker.attemptId !== undefined && report.kind === "review" && report.headSha !== worker.headSha))
+        throw new Error("Saved completion report must match the worker revision.");
+      parsed.completion = { attemptId, deadlineAt, ...(readyAt ? { readyAt } : {}), ...(turn === undefined ? {} : { turn: turn as NonNullable<ForgeWorker["completion"]>["turn"] }), ...(report ? { report } : {}), ...(reportError ? { reportError } : {}) };
+    }
     if (worker.mergeConflict !== undefined) {
       const conflict = object(worker.mergeConflict);
       const headSha = commitSha(conflict.headSha, "conflict head");

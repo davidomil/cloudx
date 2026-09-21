@@ -82,9 +82,11 @@ current section. Use **X** to dismiss the view; the worker keeps
 running. Reopen **View worker** to return to the same terminal. Escape
 stays with the terminal while it has focus.
 
-The agent implements and commits the change. Forge publishes the branch,
-opens the PR/MR, pauses and sends a ready-for-review notification. Pause
-and Stop retain unfinished issue work.
+The agent implements and commits the change. Forge saves its report and
+waits for the matching native Codex turn to complete successfully. It
+preserves the final response, stops the worker and its owned
+descendants, then publishes the branch and opens the PR/MR. Pause and
+Stop retain unfinished work.
 
 After review, click **Resume**. Codex assesses the latest issue and
 PR/MR comments. Completion merges only when the current head is approved
@@ -161,8 +163,9 @@ again.
 
 Select a request and click **Review** to retain a draft, or **Review and
 post** to publish automatically. Each request keeps one reviewer,
-checkout and Codex conversation. A finished review closes its terminal;
-the next review opens a new terminal that resumes the same conversation.
+checkout and Codex conversation. A finished review retains its completed
+terminal and final response. The next review opens a new terminal that
+resumes the same conversation.
 
 Reviewers fetch the selected request’s exact head and pinned base commit
 into their retained checkout and inspect the complete local Git
@@ -225,6 +228,15 @@ instructions](https://docs.github.com/en/apps/maintaining-github-apps/modifying-
   and publishes the completed commit without another implementation run,
   including after a server restart.
 
+Forge persists the attempt, native thread and turn identity, report,
+deadline, and successful handoff checkpoint. A report alone never
+authorizes publication. Interrupted or failed turns, invalid or missing
+reports, and deadline expiry retain the checkout and evidence with a
+specific error. Resume retries an unsuccessful attempt explicitly;
+publication retries reuse successful completion without another coding
+turn. Automatic branch updates that do not launch Codex need no turn
+completion.
+
 Restart recovery consults persisted workspace and tab ownership. If a
 terminal disappeared without verified process quiescence, Forge
 preserves its resources and reports `cleanup_failed`. Inspect the
@@ -243,11 +255,12 @@ store. Missing context, a changed store or unresolved conversation
 initialization stops the launch for inspection. Forge does not select
 the latest conversation or silently create replacement context.
 
-Completed reviews remove their temporary terminals, reports and
-generated launch files. Forge retains the original session-directory
-links so native Codex history paths remain valid; later launch
-directories are removed. The retained links contain no generated
-instructions or credentials.
+Completed reviews keep their terminal visible until the next attempt or
+cleanup. Forge saves completed reports in worker state and removes their
+temporary report files. When retiring the terminal, Forge removes
+generated launch files while retaining the original session-directory
+links so native Codex history paths remain valid. The retained links
+contain no generated instructions or credentials.
 
 Worker logs can rotate without invalidating ownership during pause and
 restart. Recovery verifies the private context directory before removing

@@ -277,7 +277,7 @@ export class SessionStore {
       this.tabs.set(id, tab);
       this.initialInputs.set(id, request.initialInput);
       if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
-      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession, prepareTerminalExecution: launchOptions.prepareTerminalExecution });
+      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession, prepareTerminalExecution: launchOptions.prepareTerminalExecution, codexTurn: launchOptions.codexTurn });
       this.unpublishedTabIds.add(id);
       const session = await plugin.createSession({
         tab,
@@ -289,6 +289,7 @@ export class SessionStore {
         authorizeProjectTrust: this.launchOptions.get(id)?.authorizeProjectTrust,
         prepareCodexSession: this.launchOptions.get(id)?.prepareCodexSession,
         prepareTerminalExecution: this.launchOptions.get(id)?.prepareTerminalExecution,
+        codexTurn: this.launchOptions.get(id)?.codexTurn,
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
@@ -794,6 +795,7 @@ export class SessionStore {
         authorizeProjectTrust: this.launchOptions.get(tabId)?.authorizeProjectTrust,
         prepareCodexSession: this.launchOptions.get(tabId)?.prepareCodexSession,
         prepareTerminalExecution: this.launchOptions.get(tabId)?.prepareTerminalExecution,
+        codexTurn: this.launchOptions.get(tabId)?.codexTurn,
         runtimeContext,
         app: this.createAppContext(plugin.id, tabId),
         controls: this.createControls(tabId),

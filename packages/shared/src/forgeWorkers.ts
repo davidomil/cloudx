@@ -1,4 +1,4 @@
-import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication } from "./forge.js";
+import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication, ForgeReviewSubmission } from "./forge.js";
 
 export const FORGE_PLUGIN_ID = "forge";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
@@ -31,6 +31,30 @@ export interface ForgeWorkerHistory {
   capturedAt: string;
   screen: { data: string; cols: number; rows: number };
 }
+export interface ForgeTurnCompletion {
+  workerId: string;
+  attemptId: string;
+  threadId: string;
+  turnId: string;
+  status: "running" | "completed" | "interrupted" | "failed";
+  error?: string;
+}
+export interface ForgeWorkerCompletion {
+  attemptId: string;
+  deadlineAt: string;
+  readyAt?: string;
+  turn?: ForgeTurnCompletion;
+  report?: ForgeIssueCompletionReport | (ForgeReviewSubmission & { kind: "review" });
+  reportError?: string;
+}
+export function isForgeTurnCompletion(value: unknown): value is ForgeTurnCompletion {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const turn = value as Record<string, unknown>;
+  return ["workerId", "attemptId", "threadId", "turnId"].every(key =>
+    typeof turn[key] === "string" && turn[key].trim().length > 0 && turn[key].length <= 256) &&
+    typeof turn.status === "string" && ["running", "completed", "interrupted", "failed"].includes(turn.status) &&
+    (turn.error === undefined || typeof turn.error === "string" && turn.error.length <= 100_000);
+}
 export interface ForgeWorker {
   id: string;
   kind: "issue" | "review";
@@ -45,6 +69,7 @@ export interface ForgeWorker {
   branch?: string;
   tabId?: string;
   attemptId?: string;
+  completion?: ForgeWorkerCompletion;
   publicationState?: "creating" | "uncertain" | "created";
   mergeConflict?: {
     headSha: string;

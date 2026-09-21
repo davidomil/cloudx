@@ -10,12 +10,15 @@ import type {
   WorkspacePlugin
 } from "@cloudx/plugin-api";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
+import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory, TerminalProducer } from "../terminal/TerminalProcess.js";
 import { TerminalScreen } from "../terminal/TerminalScreen.js";
@@ -51,7 +54,17 @@ export const CODEX_TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions(
   enterTextDescription:
     "Type into an interactive Codex CLI terminal. For voice, send the coding instruction Codex should receive, usually as natural language rather than a shell command.",
   enterTextHandlesUnhandledVoice: true
-}).concat(codexReadinessAction());
+}).concat(codexReadinessAction(), {
+  name: "finish",
+  description: "Close an owned Codex conversation after its exact native turn completed successfully.",
+  voiceExposed: false,
+  automationExposed: false,
+  inputSchema: {
+    type: "object", properties: { threadId: { type: "string" }, turnId: { type: "string" } },
+    required: ["threadId", "turnId"], additionalProperties: false
+  },
+  outputSchema: { type: "object", properties: { completed: { type: "boolean" } }, additionalProperties: false }
+});
 
 export class CodexTerminalPlugin implements WorkspacePlugin {
   readonly id = "codex-terminal";
@@ -137,7 +150,20 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     await input.controls.setRestoreInput?.(restoredInput);
     const command = launchTemplate.command;
     const launchArgs = [...launchTemplate.args, ...conversation?.launchArgs() ?? [], ...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
-    const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
+    const resume = codexResumeInput(restoredInput);
+    const launch = input.codexTurn
+      ? buildLoginShellCommandLaunch(process.execPath, [
+        fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
+        JSON.stringify({
+          binding: { ...input.codexTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) },
+          command,
+          serverArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS,
+            ...(launchTemplate.args.includes("--yolo") ? ["--config", 'approval_policy="never"', "--config", 'sandbox_mode="danger-full-access"'] : []),
+            "app-server", "--listen", "stdio://"],
+          tuiArgs: launchArgs
+        })
+      ], launchTemplate.env)
+      : buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
     const execution = await input.prepareTerminalExecution?.(input.tab.id);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
@@ -155,6 +181,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceKind: "codex-terminal",
       voiceSummary: launchTemplate.voiceSummary,
       templateName: launchTemplate.templateName,
+      nativeTurn: input.codexTurn,
       restoreInput: () => restoredInput,
       observeConversation: () => conversation?.observe(identity => {
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
@@ -595,6 +622,7 @@ interface TerminalSessionOptions {
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
   templateName?: string;
+  nativeTurn?: PluginSessionLaunchOptions["codexTurn"];
   restoreInput?(): Record<string, unknown>;
   observeConversation?(): (() => void) | undefined;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
@@ -670,6 +698,7 @@ export class CodexTerminalSession implements PluginSession {
   private outputPaused = false;
   private recentOutput = "";
   private stopped = false;
+  private finishing = false;
   private status: WorkspaceTab["status"];
   private statusMessage: string | undefined;
   private readiness: TerminalReadinessSnapshot = { state: "starting", reason: "Waiting for terminal output.", changedAt: Date.now() };
@@ -726,6 +755,11 @@ export class CodexTerminalSession implements PluginSession {
       this.clearPendingSubmitTimers();
       this.clearReadyQuietTimer();
       this.setReadiness("closed", "Terminal process exited.");
+      if (this.finishing && !this.stopped) {
+        const completed = event.exitCode === 0 && !event.signal && !event.reason;
+        this.setStatus(completed ? "completed" : "failed", completed ? "Codex turn completed." : `Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`} during completion.`);
+        return;
+      }
       if (this.stopped) {
         this.setStatus("stopped", "Terminal was stopped.");
         return;
@@ -812,6 +846,46 @@ export class CodexTerminalSession implements PluginSession {
   async terminate(): Promise<void> {
     await this.stopTerminal();
     await this.screen.dispose();
+  }
+
+  private async finishTerminal(threadId: string, turnId: string): Promise<void> {
+    const binding = this.options.nativeTurn;
+    if (!binding) throw new Error("This terminal has no owned native Codex turn.");
+    const receipt = await readNativeTurnArtifact(binding.receiptPath);
+    if (!isForgeTurnCompletion(receipt) || receipt.workerId !== binding.workerId || receipt.attemptId !== binding.attemptId || receipt.threadId !== threadId || receipt.turnId !== turnId || receipt.status !== "completed")
+      throw new Error("The owned native Codex turn has not completed successfully.");
+    if (this.stopped) throw new Error("Codex completion was cancelled.");
+    this.finishing = true;
+    this.clearPendingSubmitTimers();
+    this.clearReadyQuietTimer();
+    if (!this.terminalClosed) {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { unsubscribe(); reject(new Error("Codex did not finish its visible conversation before the shutdown deadline.")); }, 5_000);
+        const unsubscribe = this.terminalProcess.onExit(event => {
+          clearTimeout(timer);
+          unsubscribe();
+          if (this.stopped) reject(new Error("Codex completion was cancelled."));
+          else if (event.exitCode === 0 && !event.signal && !event.reason) resolve();
+          else reject(new Error(`Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`} during completion.`));
+        });
+        // Leave through the native TUI before releasing its supervised process tree.
+        this.terminalProcess.write("\u0015/quit");
+        this.submit();
+      });
+    }
+    await this.terminalProcess.terminate();
+    const final = await readNativeTurnArtifact(`${binding.receiptPath}.final.json`);
+    if (isRecord(final) && final.workerId === receipt.workerId && final.attemptId === receipt.attemptId && final.threadId === receipt.threadId && final.turnId === receipt.turnId && typeof final.text === "string") {
+      const output = `\r\nCodex final response:\r\n${final.text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").replace(/\n/g, "\r\n")}\r\n`;
+      this.recentOutput = trimRecentOutput(this.recentOutput + output, this.replayBytes);
+      this.writeScreen(output);
+    }
+    await this.screen.flush();
+    if (this.stopped) throw new Error("Codex completion was cancelled.");
+    this.terminalClosed = true;
+    this.stopObservingConversation?.();
+    this.setReadiness("closed", "Codex turn completed.");
+    this.setStatus("completed", "Codex turn completed.");
   }
 
   private async stopTerminal(): Promise<void> {
@@ -923,6 +997,9 @@ export class CodexTerminalSession implements PluginSession {
     }
     if (action === "stop") {
       return this.stopTerminal().then(() => ({ stopped: true }));
+    }
+    if (action === "finish") {
+      return this.finishTerminal(requireString(input.threadId, "threadId"), requireString(input.turnId, "turnId")).then(() => ({ completed: true }));
     }
     throw new Error(`Unsupported Codex terminal action: ${action}`);
   }
@@ -1090,6 +1167,21 @@ export class CodexTerminalSession implements PluginSession {
       message: typeof exitCode === "number" ? "Command finished successfully." : "Command finished."
     });
   }
+}
+
+async function readNativeTurnArtifact(filePath: string): Promise<unknown> {
+  let file;
+  try { file = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+  try {
+    const stat = await file.stat();
+    const limit = 2 * 1024 * 1024;
+    if (!stat.isFile() || stat.size > limit) throw new Error("Native Codex turn evidence is invalid or exceeds the size limit.");
+    const buffer = Buffer.alloc(limit + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > limit) throw new Error("Native Codex turn evidence exceeds the size limit.");
+    return JSON.parse(buffer.subarray(0, bytesRead).toString("utf8"));
+  } finally { await file.close(); }
 }
 
 function trimRecentOutput(output: string, maxBytes: number): string {

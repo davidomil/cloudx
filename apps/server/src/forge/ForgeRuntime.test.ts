@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import type { ForgeChangeRequest, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import type { ConfigService } from "../configService.js";
@@ -189,7 +189,7 @@ function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorks
       throw error;
     }
   });
-  const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Review the next commit.", windowId: "window", paneId: "pane" };
+  const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Review the next commit.", windowId: "window", paneId: "pane" };
   return { request, resumedIds, lastTab: () => lastTab!, launchPath: () => path.join(deps.dataDir, "codex-launches", lastTab.id) };
 }
 
@@ -238,7 +238,7 @@ describe("ForgeRuntime diagnostics", () => {
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare();
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Private task prompt", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Private task prompt", windowId: "window", paneId: "pane" });
     vi.mocked(deps.sessions.getTab).mockReturnValue(workerTab(workspace));
     await runtime.pause("codex-1");
     await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
@@ -1566,7 +1566,7 @@ describe("ForgeRuntime owned branch updates", () => {
     runtime = new ForgeRuntime(deps);
 
     expect(await runtime.launch({
-      id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel,
+      id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1",
       prompt: "Resume the preserved rebase", windowId: "window", paneId: "pane",
     })).toBe(tab.id);
     await expect(runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead })).rejects.toThrow("Stop the worker process");
@@ -2337,6 +2337,196 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(dispose).toHaveBeenCalledTimes(failure === "unsupported session" ? 0 : 1);
   });
 
+  async function nativeWorker() {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const tab = workerTab(workspace);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
+    const request = {
+      id: workspace.id, attemptId: "attempt-1", worktreePath: workspace.worktreePath,
+      templateId: "worker", ...codingModel, prompt: "Resolve the issue.", windowId: "window", paneId: "pane",
+    };
+    await runtime.launch(request);
+    const tracking = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.codexTurn!;
+    const completion: ForgeTurnCompletion = {
+      workerId: workspace.id, attemptId: request.attemptId,
+      threadId: randomUUID(), turnId: randomUUID(), status: "completed",
+    };
+    const receipt = (value: unknown) => fs.writeFile(tracking.receiptPath, JSON.stringify(value));
+    return { deps, workspace, tab, request, tracking, completion, receipt };
+  }
+
+  it("waits for its native turn before successful shutdown and retains the receipt after retirement", async () => {
+    const { deps, workspace, tab, request, tracking, completion, receipt } = await nativeWorker();
+    expect(tracking).toEqual({ workerId: workspace.id, attemptId: request.attemptId,
+      receiptPath: path.join(deps.dataDir, "forge-workers", "turns", workspace.id, `${request.attemptId}.json`) });
+    expect(await runtime.readTurnCompletion(workspace.id, request.attemptId)).toBeUndefined();
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("has not completed successfully");
+    await receipt({ ...completion, status: "running" });
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("has not completed successfully");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("Stop the worker process");
+
+    await receipt(completion);
+    runtime = new ForgeRuntime(deps);
+    expect(await runtime.readTurnCompletion(workspace.id, request.attemptId)).toEqual(completion);
+    await runtime.finish(tab.id, completion);
+    await runtime.finish(tab.id, completion);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledExactlyOnceWith(tab.id, "finish", { threadId: completion.threadId, turnId: completion.turnId });
+    expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+    expect(await runtime.publishBranch(workspace)).toBe(headSha);
+    await runtime.close(tab.id);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledOnce();
+    expect(await new ForgeRuntime(deps).readTurnCompletion(workspace.id, request.attemptId)).toEqual(completion);
+    await expect(runtime.launch(request)).rejects.toThrow("already has native turn evidence");
+  });
+
+  it("retains the final response after successful shutdown and runtime restart", async () => {
+    const { deps, workspace, tab, completion, receipt } = await nativeWorker();
+    let output = "Report written";
+    const dispose = vi.fn();
+    vi.mocked(deps.sessions.getSession).mockReturnValue({ attachTerminal: async () => ({ screen: { data: output, cols: 100, rows: 30 }, dispose }) } as unknown as ReturnType<typeof deps.sessions.getSession>);
+    vi.mocked(deps.sessions.executePluginAction).mockImplementation(async () => { output += "\r\nFinal response after native completion"; return {}; });
+    await receipt({ ...completion, status: "running" });
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("has not completed successfully");
+    expect(await runtime.workerHistory(workspace.id)).toBeUndefined();
+
+    await receipt(completion);
+    await runtime.finish(tab.id, completion);
+    expect(await new ForgeRuntime(deps).workerHistory(workspace.id)).toEqual({ tabId: tab.id, capturedAt: expect.any(String), screen: { data: "Report written\r\nFinal response after native completion", cols: 100, rows: 30 } });
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
+  it("preserves a completed tab when history storage fails and captures it on the next handoff", async () => {
+    const { deps, workspace, tab, completion, receipt } = await nativeWorker();
+    await receipt(completion);
+    const historyPath = path.join(deps.dataDir, "forge-workers", "history");
+    await fs.writeFile(historyPath, "Not a directory");
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow(/directory/);
+    expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+
+    await fs.rename(historyPath, `${historyPath}.blocked`);
+    runtime = new ForgeRuntime(deps);
+    await runtime.finish(tab.id, completion);
+    expect((await runtime.workerHistory(workspace.id))?.screen.data).toBe("Saved terminal output");
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledExactlyOnceWith(tab.id, "finish", { threadId: completion.threadId, turnId: completion.turnId });
+    expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+  });
+
+  it.each(["interrupted", "failed"] as const)("preserves a %s native turn without successful shutdown", async status => {
+    const { deps, workspace, tab, request, completion, receipt } = await nativeWorker();
+    const failure = { ...completion, status, error: "The native turn did not succeed." };
+    await receipt(failure);
+    expect(await runtime.readTurnCompletion(workspace.id, request.attemptId)).toEqual(failure);
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("has not completed successfully");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    await runtime.pause(tab.id);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledExactlyOnceWith(tab.id, "stop", {});
+    expect(await runtime.readTurnCompletion(workspace.id, request.attemptId)).toEqual(failure);
+  });
+
+  it.each([{ workerId: "another-worker" }, { attemptId: "earlier-attempt" }])("ignores native receipts belonging to %j", async mismatch => {
+    const { deps, workspace, tab, request, completion, receipt } = await nativeWorker();
+    await receipt({ ...completion, ...mismatch });
+    expect(await runtime.readTurnCompletion(workspace.id, request.attemptId)).toBeUndefined();
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("has not completed successfully");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+  });
+
+  it.each([{ status: "done" }, { threadId: "" }, { turnId: undefined }, { error: 42 }])("rejects malformed native completion evidence: %j", async invalid => {
+    const { workspace, request, completion, receipt } = await nativeWorker();
+    await receipt({ ...completion, ...invalid });
+    await expect(runtime.readTurnCompletion(workspace.id, request.attemptId)).rejects.toThrow("native turn receipt is invalid");
+    expect((await fs.stat(workspace.worktreePath)).isDirectory()).toBe(true);
+  });
+
+  it.each([{ workerId: "another-worker" }, { attemptId: "earlier-attempt" }, { status: "running" as const }])("requires an owned successful checkpoint before native finish: %j", async mismatch => {
+    const { deps, tab, completion, receipt } = await nativeWorker();
+    await receipt(completion);
+    await expect(runtime.finish(tab.id, { ...completion, ...mismatch })).rejects.toThrow("checkpoint does not match");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+  });
+
+  it.each(["threadId", "turnId"] as const)("rejects a completed receipt whose %s changed after its checkpoint was saved", async changedIdentity => {
+    const { deps, workspace, tab, request, completion, receipt } = await nativeWorker();
+    await receipt({ ...completion, status: "running" });
+    const observed = await runtime.readTurnCompletion(workspace.id, request.attemptId);
+    expect(observed).toEqual({ ...completion, status: "running" });
+    await receipt({ ...completion, [changedIdentity]: randomUUID() });
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("no longer matches its saved thread and turn");
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("Stop the worker process");
+
+    await receipt(completion);
+    await runtime.finish(tab.id, completion);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledExactlyOnceWith(tab.id, "finish", {
+      threadId: completion.threadId, turnId: completion.turnId,
+    });
+  });
+
+  it("recovers an existing native worker tab and completes it through the same process controls", async () => {
+    const { deps, workspace, tab, completion, receipt } = await nativeWorker();
+    const options = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!;
+    const execution = await options.prepareTerminalExecution!(tab.id);
+    const stat = await fs.readFile(`/proc/${process.pid}/stat`, "utf8");
+    const supervisor = { executionId: execution.executionId, bootId: execution.bootId,
+      pidNamespace: execution.pidNamespace, pid: process.pid, started: stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] };
+    await fs.writeFile(path.join(execution.directory, "ready.json"), JSON.stringify(supervisor));
+    await receipt(completion);
+    vi.mocked(deps.sessions.executePluginAction).mockImplementation(async (_tabId, action, input) => {
+      expect(action).toBe("finish");
+      expect(input).toEqual({ threadId: completion.threadId, turnId: completion.turnId });
+      await fs.writeFile(path.join(execution.directory, "complete.json"), JSON.stringify({ ...supervisor, exitCode: 0 }));
+      tab.status = "completed";
+      return {};
+    });
+
+    runtime = new ForgeRuntime(deps);
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [tab.id] });
+    expect(runtime.isActive(tab.id)).toBe(true);
+    expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
+    await runtime.finish(tab.id, completion);
+    expect(runtime.isActive(tab.id)).toBe(false);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledOnce();
+    expect(deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+    expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    expect(await runtime.publishBranch(workspace)).toBe(headSha);
+  });
+
+  it("keeps publication blocked until matching supervisor evidence confirms every descendant stopped", async () => {
+    const { deps, workspace, tab, completion, receipt } = await nativeWorker();
+    const options = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!;
+    const execution = await options.prepareTerminalExecution!(tab.id);
+    const stat = await fs.readFile(`/proc/${process.pid}/stat`, "utf8");
+    const supervisor = { executionId: execution.executionId, bootId: execution.bootId,
+      pidNamespace: execution.pidNamespace, pid: process.pid, started: stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] };
+    await fs.writeFile(path.join(execution.directory, "ready.json"), JSON.stringify(supervisor));
+    await receipt(completion);
+    await expect(runtime.finish(tab.id, completion)).rejects.toThrow("descendants stopped");
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("Stop the worker process");
+
+    await fs.writeFile(path.join(execution.directory, "complete.json"), JSON.stringify({ ...supervisor, exitCode: 0 }));
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([]);
+    runtime = new ForgeRuntime(deps);
+    await runtime.finish(tab.id, completion);
+    expect(await runtime.publishBranch(workspace)).toBe(headSha);
+    expect(deps.sessions.executePluginAction).toHaveBeenCalledExactlyOnceWith(tab.id, "finish", { threadId: completion.threadId, turnId: completion.turnId });
+  });
+
+  it("preserves resources when the successful turn has no evidence that its disappeared process ended", async () => {
+    const { deps, workspace, tab, completion, receipt } = await nativeWorker();
+    await receipt(completion);
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([]);
+    await expect(new ForgeRuntime(deps).finish(tab.id, completion)).rejects.toThrow("does not prove its descendants ended");
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("Stop the worker process");
+    expect((await fs.stat(workspace.worktreePath)).isDirectory()).toBe(true);
+  });
+
   it.each([
     { review: false, approved: false },
     { review: false, approved: undefined },
@@ -2350,7 +2540,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const workspace = await prepare("unapproved-worker", review);
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
 
-    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Work on the repository.", windowId: "window", paneId: "pane" })).rejects.toThrow("must match the current Forge settings");
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Work on the repository.", windowId: "window", paneId: "pane" })).rejects.toThrow("must match the current Forge settings");
 
     expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
     expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
@@ -2473,7 +2663,7 @@ describe("ForgeRuntime Codex tabs", () => {
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
     vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
     vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" });
     await fs.rename(context, `${context}-displaced`);
     await fs.mkdir(context);
     await fs.writeFile(tab.contextPath!, "Unrelated replacement");
@@ -2511,7 +2701,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const deps = dependencies();
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => { throw new Error("Invalid repository settings."); } });
     const workspace = await prepare();
-    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Invalid repository settings.");
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Invalid repository settings.");
     expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
     expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
   });
@@ -2520,7 +2710,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const deps = dependencies();
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => true });
     const workspace = await prepare();
-    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" };
+    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" };
     vi.mocked(deps.workspaceCommands.createTab).mockRejectedValueOnce(new PluginSessionNotStartedError(new Error("Project trust was revoked.")));
     await expect(runtime.launch(request)).rejects.toThrow("Project trust was revoked.");
     expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
@@ -2538,7 +2728,7 @@ describe("ForgeRuntime Codex tabs", () => {
       expect(await options?.authorizeProjectTrust?.()).toBe(await fs.realpath(workspace.worktreePath));
       return { tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
     });
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" });
     expect(isRepositoryTrusted).toHaveBeenCalledWith(expectedRepository);
     const authorize = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust!;
     expect(await authorize()).toBe(await fs.realpath(workspace.worktreePath));
@@ -2567,7 +2757,7 @@ describe("ForgeRuntime Codex tabs", () => {
     runtime = new ForgeRuntime({ ...deps, isRepositoryTrusted: () => true });
     const workspace = await prepare();
     vi.mocked(deps.workspaceCommands.createTab).mockResolvedValue({ tab: workerTab(workspace) } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
-    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" });
     const authorize = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust!;
     await fs.rename(workspace.worktreePath, `${workspace.worktreePath}-displaced`);
     await fs.mkdir(workspace.worktreePath);
@@ -2595,7 +2785,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const request = {
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker", ...codingModel,
+      templateId: "worker", ...codingModel, attemptId: "attempt-1",
       prompt: "Resolve the issue using this context.",
       windowId: "window-1",
       paneId: "pane-1",
@@ -2611,7 +2801,9 @@ describe("ForgeRuntime Codex tabs", () => {
         windowId: "window-1",
         paneId: "pane-1",
       }),
-      { ownerPluginId: "forge", authorizeProjectTrust: expect.any(Function), prepareTerminalExecution: expect.any(Function) },
+      { ownerPluginId: "forge", authorizeProjectTrust: expect.any(Function), prepareTerminalExecution: expect.any(Function),
+        codexTurn: { workerId: workspace.id, attemptId: request.attemptId,
+          receiptPath: path.join(deps.dataDir, "forge-workers", "turns", workspace.id, `${request.attemptId}.json`) } },
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
@@ -2639,7 +2831,7 @@ describe("ForgeRuntime Codex tabs", () => {
     const request = {
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "missing", ...codingModel,
+      templateId: "missing", ...codingModel, attemptId: "attempt-1",
       prompt: "Resolve",
       windowId: "window-1",
       paneId: "pane-1",
@@ -2713,7 +2905,7 @@ describe("ForgeRuntime Codex tabs", () => {
     await runtime.launch({
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker", ...codingModel,
+      templateId: "worker", ...codingModel, attemptId: "attempt-1",
       prompt: "Review context",
       windowId: "window",
       paneId: "pane",
@@ -2747,7 +2939,7 @@ describe("ForgeRuntime Codex tabs", () => {
     await runtime.launch({
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker", ...codingModel,
+      templateId: "worker", ...codingModel, attemptId: "attempt-1",
       prompt: "Review context",
       windowId: "window",
       paneId: "pane",
@@ -2780,7 +2972,7 @@ describe("ForgeRuntime Codex tabs", () => {
     await runtime.launch({
       id: workspace.id,
       worktreePath: workspace.worktreePath,
-      templateId: "worker", ...codingModel,
+      templateId: "worker", ...codingModel, attemptId: "attempt-1",
       prompt: "Review context",
       windowId: "window",
       paneId: "pane",
@@ -2809,7 +3001,7 @@ describe("ForgeRuntime Codex tabs", () => {
       expect(JSON.parse(await fs.readFile(tabFile, "utf8"))).toMatchObject({ tabId: tab.id, workerId: workspace.id, execution });
       throw new Error("Server died before the process was spawned");
     });
-    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" };
+    const request = { id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" };
     await expect(runtime.launch(request)).rejects.toThrow("Server died");
     runtime = new ForgeRuntime(deps);
     expect((await runtime.recover(workspace.id)).tabIds).toEqual([tab.id]);
@@ -2832,7 +3024,7 @@ describe("ForgeRuntime Codex tabs", () => {
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare();
     vi.mocked(deps.workspaceCommands.createTab).mockRejectedValue(new Error("Server died before preparing a tab"));
-    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Server died");
+    await expect(runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel, attemptId: "attempt-1", prompt: "Resolve", windowId: "window", paneId: "pane" })).rejects.toThrow("Server died");
     await expect(new ForgeRuntime(deps).recover(workspace.id)).rejects.toThrow("Reboot the host");
     const file = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
     const owned = JSON.parse(await fs.readFile(file, "utf8"));
@@ -2875,7 +3067,7 @@ describe("ForgeRuntime Codex tabs", () => {
       runtime.launch({
         id: workspace.id,
         worktreePath: workspace.worktreePath,
-        templateId: "worker", ...codingModel,
+        templateId: "worker", ...codingModel, attemptId: "attempt-1",
         prompt: "Review context",
         windowId: "window",
         paneId: "pane",

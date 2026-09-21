@@ -81,6 +81,8 @@ function fixture() {
     })),
     refreshReviewWorkspace: vi.fn(async (_workspace: unknown, _revision: unknown, _signal?: AbortSignal) => {}),
     launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
+    readTurnCompletion: vi.fn(async (workerId: string, attemptId: string) => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: (await reports.read.getMockImplementation()?.(attemptId) ? "completed" : "running") as "running" | "completed" | "interrupted" | "failed", error: undefined as string | undefined })),
+    finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
     cleanup: vi.fn(async () => {}),
@@ -216,7 +218,7 @@ describe("Manual worker continuation", () => {
     expect(continued.attemptId).not.toBe(f.worker.attemptId);
     expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
-    expect(f.reports.remove).toHaveBeenCalledWith(f.worker.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(f.worker.attemptId);
     expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({ item: expect.objectContaining({ body: f.issue.body }), manualContinuation: { message } }));
     expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({
       id: f.worker.id, worktreePath: f.worker.worktreePath,
@@ -351,10 +353,13 @@ describe("Manual worker continuation", () => {
     expect(f.runtime.launch).toHaveBeenCalledOnce();
   });
 
-  it("preserves a retained completion report and requires Resume to reconcile it", async () => {
+  it("preserves a retained successful native completion report and requires Resume to reconcile it", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await f.service.dispose();
+    const saved = f.stored()[0];
+    saved.completion!.turn = { workerId: worker.id, attemptId: worker.attemptId!, threadId: "saved-thread", turnId: "saved-turn", status: "completed" };
+    await f.deps.store.write([saved]);
     const service = new ForgeWorkflowService(f.deps);
     await service.dashboard();
     const before = f.stored();
@@ -388,11 +393,10 @@ describe("Manual worker continuation", () => {
     expect(f.runtime.launch).toHaveBeenCalledOnce();
     expect(continued).toMatchObject({ status: "rejected", reason: new Error(action === "dispose" ? "CloudX is shutting down." : "Worker stopped by user.") });
     expect(controlled.status).toBe("fulfilled");
-    expect(f.stored()[0]).toEqual({ ...before, status: action === "dispose" ? "paused" : "stopped", attemptId: action === "dispose" ? worker.attemptId : undefined, updatedAt: expect.any(String) });
+    expect(f.stored()[0]).toEqual({ ...before, status: action === "dispose" ? "paused" : "stopped", attemptId: worker.attemptId, updatedAt: expect.any(String) });
     expect(f.reports.read).toHaveBeenCalledExactlyOnceWith(worker.attemptId);
     expect(f.reports.prepare).toHaveBeenCalledOnce();
-    if (action === "dispose") expect(f.reports.remove).not.toHaveBeenCalled();
-    else expect(f.reports.remove).toHaveBeenCalledExactlyOnceWith(worker.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalled();
     expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.provider.getIssue).toHaveBeenCalledOnce();
@@ -454,10 +458,9 @@ describe("Manual worker continuation", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(continued).toMatchObject({ status: "rejected", reason: new Error("Worker stopped by user.") });
     expect(stopped.status).toBe("fulfilled");
-    expect(f.stored().find(worker => worker.id === f.issue.id)).toMatchObject({ status: "stopped", attemptId: undefined, worktreePath: f.issue.worktreePath, branch: f.issue.branch });
+    expect(f.stored().find(worker => worker.id === f.issue.id)).toMatchObject({ status: "stopped", attemptId, worktreePath: f.issue.worktreePath, branch: f.issue.branch });
     expect(f.stored().find(worker => worker.id === f.reviewer.id)).toMatchObject({ status: "completed", draft: f.draft, worktreePath: f.reviewer.worktreePath, branch: f.reviewer.branch });
-    expect(f.reports.remove).toHaveBeenCalledTimes(previousRemovals + 1);
-    expect(f.reports.remove).toHaveBeenLastCalledWith(attemptId);
+    expect(f.reports.remove).toHaveBeenCalledTimes(previousRemovals);
     expect(f.provider.getChangeRequest).toHaveBeenCalledTimes(previousReads);
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
   });
@@ -573,7 +576,7 @@ describe("Manual worker continuation", () => {
     const f = await pausedIssue();
     f.runtime.launch.mockRejectedValueOnce(new Error("The selected model is unavailable."));
     await expect(f.service.continueWorker(f.worker.id, "Continue with the missing case.", placement)).rejects.toThrow("selected model is unavailable");
-    expect(f.stored()[0]).toMatchObject({ status: "failed", worktreePath: f.worker.worktreePath, error: "The selected model is unavailable.", attemptId: undefined });
+    expect(f.stored()[0]).toMatchObject({ status: "failed", worktreePath: f.worker.worktreePath, error: "The selected model is unavailable.", attemptId: expect.any(String) });
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.runtime.publishBranch).not.toHaveBeenCalled();
   });
@@ -724,9 +727,10 @@ describe("Reusable review workers", () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Verified", comments: [] });
+    f.runtime.finish.mockRejectedValueOnce(new Error("Process ownership is uncertain"));
     f.runtime.close.mockRejectedValue(new Error("Process ownership is uncertain"));
     await f.service.poll();
-    expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", draft: { id: worker.attemptId, status: "draft", body: "Verified" } });
+    expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", completion: { report: { kind: "review", body: "Verified" }, turn: { status: "completed" } } });
     expect(f.provider.postReview).not.toHaveBeenCalled();
     f.runtime.close.mockResolvedValue(undefined);
     const restarted = new ForgeWorkflowService(f.deps);
@@ -972,7 +976,7 @@ describe("Forge issue and review workflows", () => {
     );
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
-  it("retains editable review drafts and the checkout after removing the review tab", async () => {
+  it("retains editable review drafts, conversation and checkout after finishing the review tab", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     f.reports.read.mockResolvedValue({
@@ -983,7 +987,7 @@ describe("Forge issue and review workflows", () => {
       comments: [{ body: "Check null", path: "src/a.ts", line: 2 }],
     });
     await f.service.poll();
-    expect(f.runtime.close).toHaveBeenCalledWith("tab-1");
+    expect(f.runtime.finish).toHaveBeenCalledWith("tab-1", expect.objectContaining({ status: "completed" }));
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.provider.postReview).not.toHaveBeenCalled();
     await f.service.saveReview(worker.id, f.stored().find(saved => saved.id === worker.id)!.draft!.id, {
@@ -1053,6 +1057,7 @@ describe("Forge issue and review workflows", () => {
   it("does not treat cleanup failure as successful completion", async () => {
     const f = fixture();
     await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.runtime.finish.mockRejectedValueOnce(new Error("Owned checkout changed"));
     f.runtime.close.mockRejectedValue(new Error("Owned checkout changed"));
     f.reports.read.mockResolvedValue({
       kind: "review",
@@ -1065,6 +1070,251 @@ describe("Forge issue and review workflows", () => {
     expect((await f.service.dashboard()).workers[0]?.status).toBe(
       "cleanup_failed",
     );
+  });
+});
+
+describe("Forge native turn completion", () => {
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+  const issueReport = { kind: "issue", title: "Fix", body: "The final checks passed.", discussionReplies: [], resolvedDiscussionIds: [] };
+  function turn(worker: ForgeWorker, status: "running" | "completed" | "interrupted" | "failed" = "running") {
+    return { workerId: worker.id, attemptId: worker.attemptId!, threadId: `thread-${worker.id}`, turnId: `turn-${worker.attemptId}`, status, error: undefined as string | undefined };
+  }
+  async function attempt(category: "initial issue" | "feedback fix" | "manual continuation" | "conflict resolution" | "standalone review" | "automatic review" | "resumed review") {
+    const f = fixture();
+    let worker: ForgeWorker;
+    if (category === "standalone review" || category === "resumed review") {
+      worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+      if (category === "resumed review") {
+        f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "comment", body: "First review", comments: [] });
+        await f.service.poll();
+        worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+      }
+    } else {
+      worker = await f.service.startIssue(f.deps.settings().repository, 1, placement, category === "automatic review");
+      if (category === "manual continuation") {
+        await f.service.pause(worker.id);
+        worker = await f.service.continueWorker(worker.id, "Check the final validation output.", placement);
+      } else if (category !== "initial issue") {
+        f.reports.read.mockResolvedValue(issueReport);
+        await f.service.poll();
+        if (category === "automatic review") worker = f.stored().find(saved => saved.kind === "review")!;
+        else if (category === "conflict resolution") {
+          f.change.hasConflicts = true;
+          f.runtime.completeIssueRebase.mockImplementation(async () => f.change.headSha = "c".repeat(40));
+          worker = await f.service.rebaseAndResolve(worker.id, placement);
+        } else worker = await f.service.resume(worker.id, placement);
+      }
+    }
+    f.reports.read.mockResolvedValue(undefined);
+    const report = worker.kind === "review"
+      ? { kind: "review", headSha: f.change.headSha, event: "comment", body: "The final checks passed.", comments: [] }
+      : { ...issueReport, ...(category === "conflict resolution" ? { rebase: { outcome: "resolved", validation: "passed", details: "Conflict regression passed." } } : {}) };
+    const completion = turn(worker);
+    f.runtime.readTurnCompletion.mockResolvedValue(completion);
+    f.runtime.finish.mockClear();
+    f.runtime.pause.mockClear();
+    f.runtime.close.mockClear();
+    f.runtime.publishBranch.mockClear();
+    f.provider.postReview.mockClear();
+    f.reports.remove.mockClear();
+    return { ...f, worker, report, completion };
+  }
+
+  it.each(["initial issue", "feedback fix", "manual continuation", "conflict resolution", "standalone review", "automatic review", "resumed review"] as const)(
+    "retains the %s report until its native turn completes and hands off exactly once", async category => {
+      const f = await attempt(category);
+      const launches = f.runtime.launch.mock.calls.length;
+      f.reports.read.mockResolvedValue(f.report);
+      await f.service.poll();
+      expect(f.stored().find(worker => worker.id === f.worker.id)).toMatchObject({ status: "running", completion: { attemptId: f.worker.attemptId, report: f.report, turn: f.completion } });
+      expect(f.runtime.finish).not.toHaveBeenCalled();
+      expect(f.runtime.pause).not.toHaveBeenCalled();
+      expect(f.runtime.close).not.toHaveBeenCalled();
+      expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+      expect(f.provider.postReview).not.toHaveBeenCalled();
+      expect(f.reports.remove).not.toHaveBeenCalled();
+
+      f.completion.status = "completed";
+      await f.service.poll();
+      await f.service.poll();
+      expect(f.runtime.finish).toHaveBeenCalledOnce();
+      expect(f.runtime.finish).toHaveBeenCalledWith(f.worker.tabId, f.completion);
+      expect(f.runtime.pause).not.toHaveBeenCalled();
+      expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+      if (f.worker.kind === "issue") {
+        expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+        expect(f.stored().find(worker => worker.id === f.worker.id)?.status).toBe("awaiting_review");
+      } else {
+        expect(f.stored().find(worker => worker.id === f.worker.id)).toMatchObject({ status: "completed", draft: { status: category === "automatic review" ? "posted" : "draft" } });
+        expect(f.provider.postReview).toHaveBeenCalledTimes(category === "automatic review" ? 1 : 0);
+      }
+    },
+  );
+
+  it("persists successful completion before the report arrives and ignores duplicate completions", async () => {
+    const f = await attempt("initial issue");
+    f.completion.status = "completed";
+    await f.service.poll();
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "running", completion: { turn: f.completion } });
+    expect(f.runtime.finish).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    await f.service.poll();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.finish).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["workerId", "attemptId", "threadId", "turnId"] as const)("ignores a completed event with a different %s", async field => {
+    const f = await attempt("initial issue");
+    await f.service.poll();
+    f.reports.read.mockResolvedValue(f.report);
+    f.runtime.readTurnCompletion.mockResolvedValue({ ...f.completion, status: "completed", [field]: "another-identity" });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "running", completion: { report: f.report, turn: f.completion } });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.runtime.finish).not.toHaveBeenCalled();
+    f.runtime.readTurnCompletion.mockResolvedValue({ ...f.completion, status: "completed" });
+    await f.service.poll();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["interrupted", "failed"] as const)("retains the report and names a native %s turn without publishing", async status => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue(f.report);
+    f.completion.status = status;
+    f.completion.error = status === "failed" ? "The model backend failed." : undefined;
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", completion: { report: f.report, turn: f.completion }, error: expect.stringMatching(new RegExp(status, "i")) });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.runtime.finish).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("retains a report when process exit has no successful native completion", async () => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue(f.report);
+    f.runtime.isActive.mockReturnValue(false);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", completion: { report: f.report }, error: expect.stringMatching(/completion|turn/i) });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.runtime.finish).not.toHaveBeenCalled();
+  });
+
+  it.each(["running", "completed"] as const)("expires the persisted deadline with a %s turn and preserves the available evidence", async status => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = await attempt("initial issue");
+    f.completion.status = status;
+    if (status === "running") f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    const completion = f.stored()[0].completion!;
+    vi.setSystemTime(new Date(completion.deadlineAt).getTime() + 1);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", attemptId: f.worker.attemptId, completion, error: expect.stringMatching(/deadline|timed out|report/i) });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed report and keeps its attempt files for inspection", async () => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue({ kind: "issue", title: 42 });
+    f.completion.status = "completed";
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", attemptId: f.worker.attemptId });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it("keeps cancellation responsive while waiting for the final native completion", async () => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    await f.service.pause(f.worker.id);
+    f.completion.status = "completed";
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "paused", completion: { report: f.report } });
+    expect(f.runtime.pause).toHaveBeenCalledWith(f.worker.tabId);
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it.each(["resume", "continue"] as const)("starts a new turn on %s after cancellation while retaining the unfinished attempt's report", async action => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    await f.service.pause(f.worker.id);
+    const resumed = action === "resume"
+      ? await f.service.resume(f.worker.id, placement)
+      : await f.service.continueWorker(f.worker.id, "Finish validation before publishing.", placement);
+    expect(resumed).toMatchObject({ status: "running", worktreePath: f.worker.worktreePath });
+    expect(resumed.attemptId).not.toBe(f.worker.attemptId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalledWith(f.worker.attemptId);
+  });
+
+  it("retries a malformed completed report through a new attempt while retaining the invalid report file", async () => {
+    const f = await attempt("initial issue");
+    f.completion.status = "completed";
+    f.reports.read.mockResolvedValue({ kind: "issue", title: 42 });
+    await f.service.poll();
+    const resumed = await f.service.resume(f.worker.id, placement);
+    expect(resumed).toMatchObject({ status: "running", worktreePath: f.worker.worktreePath });
+    expect(resumed.attemptId).not.toBe(f.worker.attemptId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalledWith(f.worker.attemptId);
+  });
+
+  it("rejects report and completion arriving after the deadline and retries only on explicit Resume", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = await attempt("initial issue");
+    const deadline = f.stored()[0].completion!.deadlineAt;
+    f.reports.read.mockResolvedValue(f.report);
+    f.completion.status = "completed";
+    vi.setSystemTime(new Date(deadline).getTime() + 1);
+    await f.service.poll();
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", completion: { turn: f.completion, report: f.report }, error: expect.stringMatching(/deadline|timed out/i) });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    const resumed = await f.service.resume(f.worker.id, placement);
+    expect(resumed).toMatchObject({ status: "running" });
+    expect(resumed.attemptId).not.toBe(f.worker.attemptId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(f.worker.attemptId);
+  });
+
+  it("blocks publication while an owned descendant prevents successful process shutdown", async () => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue(f.report);
+    f.completion.status = "completed";
+    f.runtime.finish.mockRejectedValue(new Error("An owned child process is still alive."));
+    f.runtime.close.mockRejectedValue(new Error("An owned child process is still alive."));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("child process"), completion: { report: f.report, turn: f.completion } });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it("recovers saved successful completion and report after restart without launching another turn", async () => {
+    const f = await attempt("initial issue");
+    f.reports.read.mockResolvedValue(f.report);
+    f.completion.status = "completed";
+    f.runtime.finish.mockRejectedValueOnce(new Error("Shutdown was interrupted."));
+    await f.service.poll();
+    f.reports.read.mockResolvedValue(undefined);
+    f.runtime.readTurnCompletion.mockResolvedValue({ ...f.completion, status: "running" });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.resume(f.worker.id, placement);
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review" });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
   });
 });
 
@@ -1144,7 +1394,7 @@ describe("Forge interruption and stale completion boundaries", () => {
       "post_failed",
     );
   });
-  it("reconciles restarted issue and review workers without launching another agent", async () => {
+  it("keeps owned native issue and review turns running across workflow reconstruction", async () => {
     const f = fixture();
     await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await f.service.startReview(f.deps.settings().repository, 7, false, placement);
@@ -1154,7 +1404,7 @@ describe("Forge interruption and stale completion boundaries", () => {
     const restarted = new ForgeWorkflowService(f.deps);
     const dashboard = await restarted.dashboard();
     expect(
-      dashboard.workers.every((worker) => worker.status === "paused"),
+      dashboard.workers.every((worker) => worker.status === "running"),
     ).toBe(true);
     expect(f.runtime.launch).not.toHaveBeenCalled();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
@@ -1271,6 +1521,7 @@ describe("Forge publication and feedback reconciliation", () => {
     expect(f.runtime.close).toHaveBeenCalledWith(worker.tabId);
     expect(f.stored()[0].attemptId).toBe(worker.attemptId);
     write.mockRestore();
+    f.runtime.isActive.mockReturnValue(false);
 
     const restarted = new ForgeWorkflowService(f.deps);
     expect((await restarted.dashboard()).workers[0]).toMatchObject({ status: "paused", attemptId: worker.attemptId });
@@ -1528,6 +1779,7 @@ describe("Forge publication and feedback reconciliation", () => {
   it("preserves review-and-post intent after explicit cleanup recovery", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    f.runtime.finish.mockRejectedValueOnce(new Error("Cleanup unavailable"));
     f.runtime.close.mockRejectedValue(new Error("Cleanup unavailable"));
     f.reports.read.mockResolvedValue({
       kind: "review",
@@ -1590,6 +1842,7 @@ describe("Forge ownership recovery", () => {
       : undefined;
     await f.deps.store.write([{ ...worker, status, pendingPublication, changeNumber: pendingPublication ? 7 : undefined }]);
     f.runtime.recover.mockResolvedValue({ workspace: undefined, tabIds: [worker.tabId!] });
+    f.runtime.isActive.mockReturnValue(false);
     const reason = "Worker execution is still live. Stop its supervisor, then use Resume. Local resources were preserved.";
     f.runtime.close.mockRejectedValue(new Error(reason));
     f.runtime.launch.mockClear();
@@ -1696,6 +1949,7 @@ describe("Forge ownership recovery", () => {
   it.each([false, true])("finishes recovered review shutdown without relaunching (automatic posting: %s)", async (autoPost) => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, autoPost, placement);
+    f.runtime.finish.mockRejectedValueOnce(new Error("Owned checkout changed"));
     f.runtime.close.mockRejectedValue(new Error("Owned checkout changed"));
     f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "comment", body: "Review", comments: [] });
     await f.service.poll();
@@ -3109,6 +3363,7 @@ describe("Forge issue auto review", () => {
   it("resumes an interrupted rebase on the saved target after restart and target advancement", async () => {
     const f = await resolvingIssue();
     const checkpoint = f.currentIssue().rebaseRecovery;
+    f.runtime.isActive.mockReturnValue(false);
     f.change.baseSha = "d".repeat(40);
     f.reports.read.mockResolvedValue(undefined);
     const restarted = new ForgeWorkflowService(f.deps);
@@ -3222,7 +3477,10 @@ describe("Forge issue auto review", () => {
         f.codingReport(); await f.poll();
         const reviewer = f.currentReview();
         let service = f.service;
-        if (interruption === "restart") service = new ForgeWorkflowService(f.deps);
+        if (interruption === "restart") {
+          f.runtime.isActive.mockReturnValue(false);
+          service = new ForgeWorkflowService(f.deps);
+        }
         else if (interruption !== "active") await service[interruption](reviewer.id);
         f.change.hasConflicts = true;
         f.reports.read.mockResolvedValue(undefined);
@@ -3652,7 +3910,7 @@ describe("Forge issue auto review", () => {
     expect(f.currentReview().status).toBe(action === "pause" ? "paused" : "stopped");
     expect(launchSignal.aborted).toBe(true);
     expect(f.runtime.pause).toHaveBeenCalledWith(reviewer.tabId);
-    expect(f.reports.remove).toHaveBeenCalledWith(reviewer.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(reviewer.attemptId);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
@@ -3813,7 +4071,7 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
     expect(f.currentReview()).toMatchObject({ status: "completed", draft: { status: "posted", event: "approve" } });
     if (action !== "disable") expect(f.currentIssue().status).toBe(action === "stop" ? "stopped" : "paused");
-    if (action === "restart") expect(f.currentIssue().error).toMatch(/CloudX restarted/);
+    if (action === "restart") expect(f.currentIssue().error).toMatch(/timed out/);
     else expect(f.currentIssue().error).toBeUndefined();
   });
 
