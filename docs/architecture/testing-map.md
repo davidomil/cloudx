@@ -37,6 +37,58 @@ must fetch this tag and its history before running the publisher tests. The
 tests validate exact commit, tree, parent, and changed-path identities and fail
 clearly when their history prerequisite is missing.
 
+## Terminal reliability stress
+
+The terminal stress job runs three fresh Node 22 V8 coverage processes
+with two CPUs, 7 GiB RAM and no swap. It repeats the broker and Unicode
+replay tests plus the full 32 MiB real-PTY recovery case. Every attempt
+and case keeps its outcome and duration; any failure, missing required
+case or skipped selected case fails the job.
+
+Terminal diagnostics checkpoint once per second and at phase changes.
+They retain received byte counts, a 4 KiB UTF-8 output tail, 64 recent
+phase and producer events, total pause/resume/exit counts, Node version
+and observed resource limits. A timeout or caught recovery failure
+preserves the first failure snapshot before cleanup.
+
+CI uploads terminal diagnostics from ordinary coverage and all stress
+evidence even when tests fail. Stress artifacts include `results.json`,
+per-attempt `vitest.json` and diagnostics, coverage summaries, and
+`throughput.json`. Failure snapshots also print to stderr for the
+isolated verifier’s existing bounded log capture.
+
+Each stress command retains at most 64 KiB of stdout and stderr tails. A
+separate process measures replay append and snapshot throughput without
+a speed threshold. Correctness assertions and existing recovery
+deadlines remain unchanged; whole-repository coverage thresholds remain
+in the ordinary coverage job.
+
+Run the same environment locally with the following commands. Use an
+empty `test-results/terminal-stress` directory and move previous
+evidence before another run. `npm run test:terminal-stress` is the
+runner entry point inside the required container environment; it rejects
+other runtime limits.
+
+```bash
+docker build --pull --tag cloudx-terminal-stress --file containers/ci/terminal-stress.Dockerfile .
+install -d test-results/terminal-stress
+docker run --rm \
+  --init \
+  --user "$(id -u):$(id -g)" \
+  --network none \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 512 \
+  --cpus 2 \
+  --memory 7g \
+  --memory-swap 7g \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=2g,mode=1777 \
+  --tmpfs /work:rw,exec,nosuid,nodev,size=8g,mode=1777 \
+  --volume "${PWD}/test-results/terminal-stress:/work/test-results/terminal-stress:rw" \
+  cloudx-terminal-stress
+```
+
 ## Useful Area Coverage
 
 | Area                      | Likely evidence                                                                                                                   |

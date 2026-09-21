@@ -59,7 +59,8 @@
     "test:coverage": "vitest run --coverage --reporter=dot",
     "test:policy": "vitest run scripts/ai-change",
     "typecheck": "tsc -b",
-    "verify": "node scripts/ai-change/verify.mjs"
+    "verify": "node scripts/ai-change/verify.mjs",
+    "test:terminal-stress": "node scripts/terminal-stress/run.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",

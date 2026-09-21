@@ -9,6 +9,7 @@ import { TerminalBroker } from "./TerminalBroker.js";
 import { isTerminalRequest, isTerminalResponse, MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_MESSAGE_BYTES, readTerminalMessages, terminalSocketPath } from "./TerminalBrokerProtocol.js";
 import type { TerminalProducer } from "./TerminalProcess.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
+import { retainTerminalDiagnostics, type TerminalDiagnostics } from "./testing/TerminalDiagnostics.js";
 
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -36,39 +37,46 @@ describe("durable terminal broker", () => {
     await restored.terminate();
   });
 
-  it.each(["terminate", "stop broker"] as const)("drains parsed output without resuming an exited producer during %s", async (close) => {
-    const { factory, process, broker } = await fixture();
-    const terminal = await factory.spawn("shell", [], options("paused-close"));
-    const data = "x".repeat(256 * 1024);
-    let received = "";
-    terminal.onData((chunk) => { received += chunk; });
-    process.terminate.mockImplementationOnce(async () => {
-      process.data(data);
-      expect(process.pauseOutput).toHaveBeenCalledOnce();
-      process.exit({ exitCode: 0 });
+  for (const close of ["terminate", "stop broker"] as const) {
+    it(`drains parsed output without resuming an exited producer during ${close}`, async context => {
+      const diagnostics = retainTerminalDiagnostics(context, close === "terminate" ? "exit-before-drain-terminal" : "exit-before-drain-broker");
+      const { factory, process, broker } = await fixture(undefined, diagnostics);
+      const terminal = await factory.spawn("shell", [], options("paused-close"));
+      const data = "x".repeat(256 * 1024);
+      let received = "";
+      terminal.onData((chunk) => { received += chunk; });
+      process.terminate.mockImplementationOnce(async () => {
+        process.data(data);
+        expect(process.pauseOutput).toHaveBeenCalledOnce();
+        process.exit({ exitCode: 0 });
+      });
+      diagnostics.enterPhase("exit before parsing completes");
+      if (close === "terminate") await terminal.terminate();
+      else {
+        await broker.stop();
+        cleanups.pop();
+      }
+      expect(process.terminate).toHaveBeenCalledOnce();
+      expect(process.resumeOutput).not.toHaveBeenCalled();
+      if (close === "terminate") expect(received).toBe(data);
     });
-    if (close === "terminate") await terminal.terminate();
-    else {
-      await broker.stop();
-      cleanups.pop();
-    }
-    expect(process.terminate).toHaveBeenCalledOnce();
-    expect(process.resumeOutput).not.toHaveBeenCalled();
-    if (close === "terminate") expect(received).toBe(data);
-  });
+  }
 
-  it("resumes output parsed while the producer is alive before termination", async () => {
-    const { factory, process } = await fixture();
+  it("resumes output parsed while the producer is alive before termination", async context => {
+    const diagnostics = retainTerminalDiagnostics(context, "drain-before-exit");
+    const { factory, process } = await fixture(undefined, diagnostics);
     const terminal = await factory.spawn("shell", [], options("drained-before-close"));
     const data = "x".repeat(256 * 1024);
     let received = "";
     terminal.onData((chunk) => { received += chunk; });
+    diagnostics.enterPhase("parse while producer is alive");
     process.data(data);
     expect(process.pauseOutput).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(received).toBe(data));
     expect(process.resumeOutput).toHaveBeenCalledOnce();
     expect(process.terminate).not.toHaveBeenCalled();
 
+    diagnostics.enterPhase("terminate after resuming output");
     await terminal.terminate();
     expect(process.terminate).toHaveBeenCalledOnce();
     expect(process.resumeOutput).toHaveBeenCalledOnce();
@@ -400,11 +408,11 @@ async function respondingBroker(messages: unknown[]) {
   return new DurableTerminalProcessFactory(socketPath, { spawn: vi.fn() });
 }
 
-async function fixture(replayBytes?: number) {
+async function fixture(replayBytes?: number, diagnostics?: TerminalDiagnostics) {
   const directory = await temporaryDirectory();
   const socketPath = path.join(directory, "broker.sock");
   const process = new FakeTerminal();
-  const spawn = vi.fn(async () => process);
+  const spawn = vi.fn(async () => diagnostics ? diagnostics.observe(process) : process);
   const broker = new TerminalBroker(socketPath, { spawn }, replayBytes);
   await broker.start();
   cleanups.push(() => broker.stop());
