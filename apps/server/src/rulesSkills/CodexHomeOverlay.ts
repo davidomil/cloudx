@@ -17,6 +17,7 @@ import {
 } from "./RulesSkillsCatalogService.js";
 import type { CloudxRule, CloudxSkill } from "@cloudx/shared";
 import type { CodexStateSources, ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
+import { discoverCodexDefaultSkills, readCodexLaunchPreferences } from "../plugins/CodexLaunchPreferences.js";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -39,6 +40,7 @@ export interface CodexHomeOverlay {
   disabledSkillPaths: string[];
   systemRules: CloudxRule[];
   systemSkills: CloudxSkill[];
+  yoloMode: boolean;
 }
 
 interface SkillMaterializationSource {
@@ -47,22 +49,28 @@ interface SkillMaterializationSource {
 }
 
 const GENERATED_CONFIG_MARKER = "# CloudX managed Codex defaults for this tab.";
-const IMAGEGEN_SKILL_RELATIVE_PATH = path.join("skills", ".system", "imagegen");
 
 export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptions): Promise<CodexHomeOverlay> {
   const baseEnv = options.baseEnv ?? process.env;
   const sourceCodexHome = options.sources.originalHome;
   const sourceConfig = await options.sources.readConfig(options.source);
   const config = prepareOverlayConfig(sourceConfig, options.source.home);
+  const preferences = readCodexLaunchPreferences(sourceConfig);
   if (options.trustedProjectPath !== undefined) {
     const projectPath = options.trustedProjectPath;
     if (!path.isAbsolute(projectPath) || projectPath !== options.cwd || await fsp.realpath(projectPath) !== projectPath) {
       throw new Error("Project trust authorization must match the canonical working directory.");
     }
     trustProject(config, projectPath);
+  } else if (preferences.autoTrustWorkspace) {
+    if (!options.cwd || !path.isAbsolute(options.cwd)) throw new Error("Automatic project trust requires an absolute working directory.");
+    await automaticallyTrustProject(config, await fsp.realpath(options.cwd));
   }
-  const imagegen = await optionalLstat(path.join(sourceCodexHome, IMAGEGEN_SKILL_RELATIVE_PATH, "SKILL.md"));
-  if (!imagegen?.isFile()) throw new Error("Required Codex imagegen skill is missing.");
+  const installedSkills = await discoverCodexDefaultSkills(sourceCodexHome);
+  const defaultSkillIds = Object.entries(preferences.defaultSkills).filter(([, enabled]) => enabled).map(([id]) => id).sort();
+  for (const id of defaultSkillIds) {
+    if (!installedSkills.some((skill) => skill.id === id)) throw new Error(`Required Codex ${id} skill is missing.`);
+  }
   const codexHome = await options.sources.bind(options.tabId, options.source);
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
   if (options.resetCodexHome !== false) {
@@ -79,7 +87,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, ".credentials.json"), path.join(codexHome, ".credentials.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
-  const stagedSkillPaths = await materializeSelectedSkills(sourceCodexHome, staging, rulesSkillsRoot, options.resolved, systemSkills);
+  const stagedSkillPaths = await materializeSelectedSkills(sourceCodexHome, staging, rulesSkillsRoot, options.resolved, systemSkills, defaultSkillIds);
   const skillPaths = stagedSkillPaths.map((skillPath) => path.join(codexHome, path.relative(staging, skillPath)));
   const disabledSkillPaths = await discoverDisabledSkillPaths(options.cwd, baseEnv.HOME?.trim() || os.homedir());
   const configPath = path.join(codexHome, "config.toml");
@@ -97,7 +105,8 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     skillPaths,
     disabledSkillPaths,
     systemRules,
-    systemSkills
+    systemSkills,
+    yoloMode: preferences.yoloMode
   };
   } finally { await fsp.rm(staging, { recursive: true, force: true }); }
 }
@@ -206,13 +215,12 @@ async function materializeSelectedSkills(
   codexHome: string,
   rulesSkillsRoot: string,
   resolved: ResolvedPersonalityTemplate | undefined,
-  systemSkills: CloudxSkill[]
+  systemSkills: CloudxSkill[],
+  defaultSkillIds: string[]
 ): Promise<string[]> {
   await fsp.rm(path.join(codexHome, "skills", "cloudx"), { recursive: true, force: true });
   await fsp.rm(path.join(codexHome, "skills", "cloudx-system"), { recursive: true, force: true });
   await fsp.rm(path.join(codexHome, "skills", "cloudx-exceptions"), { recursive: true, force: true });
-  const imagegenSourceDir = path.join(sourceCodexHome, IMAGEGEN_SKILL_RELATIVE_PATH);
-  const imagegenTargetDir = path.join(codexHome, "skills", "cloudx-exceptions", "imagegen");
   const sources = [
     ...(resolved?.skills ?? []).map((skill) => ({
       sourceDir: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)),
@@ -232,10 +240,12 @@ async function materializeSelectedSkills(
     await fsp.mkdir(path.dirname(source.targetDir), { recursive: true });
     await linkOrCopyIfExists(source.sourceDir, source.targetDir);
   }
-  await copyRequiredSkill(imagegenSourceDir, imagegenTargetDir, "imagegen");
+  for (const id of defaultSkillIds) {
+    await copyRequiredSkill(path.join(sourceCodexHome, "skills", ".system", id), path.join(codexHome, "skills", "cloudx-exceptions", id), id);
+  }
   return [
     ...uniqueSources.map((source) => path.join(source.targetDir, "SKILL.md")),
-    path.join(imagegenTargetDir, "SKILL.md")
+    ...defaultSkillIds.map((id) => path.join(codexHome, "skills", "cloudx-exceptions", id, "SKILL.md"))
   ];
 }
 
@@ -257,6 +267,21 @@ function trustProject(config: TomlTable, projectPath: string): void {
   if (project.trust_level !== undefined && project.trust_level !== "trusted") throw new Error("Codex project trust_level must be trusted or untrusted.");
   projects[projectPath] = { ...project, trust_level: "trusted" };
   config.projects = projects;
+}
+
+async function automaticallyTrustProject(config: TomlTable, projectPath: string): Promise<void> {
+  const projectAncestors = new Set(ancestors(projectPath));
+  for (const [configuredPath, project] of Object.entries(tomlTable(config.projects, "projects"))) {
+    if (!path.isAbsolute(configuredPath) || !project || typeof project !== "object" || Array.isArray(project) || project instanceof Date || project.trust_level !== "untrusted") continue;
+    let canonicalPath;
+    try { canonicalPath = await fsp.realpath(configuredPath); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (projectAncestors.has(canonicalPath)) throw new Error("Codex source config explicitly marks this project or an ancestor as untrusted.");
+  }
+  trustProject(config, projectPath);
 }
 
 async function writeOverlayConfig(

@@ -15,6 +15,7 @@ import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
+import { readCodexLaunchPreferences, writeCodexLaunchPreferences, type CodexLaunchPreferences } from "./CodexLaunchPreferences.js";
 
 class FakeTerminalProcess implements TerminalProcess {
   written = "";
@@ -259,6 +260,94 @@ describe("CodexTerminalPlugin", () => {
 
   it("requires an isolated Codex overlay to authorize project trust", async () => {
     await expect(materializeCodexTemplate(undefined, {}, { cwd: "/tmp", authorizeProjectTrust: async () => "/tmp" })).rejects.toThrow(/overlay/);
+  });
+
+  it.each([true, false])("uses the saved YOLO launch choice %s without changing native permissions", async (yoloMode) => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const original = withLaunchPreferences(stringify({ approval_policy: "on-request", sandbox_mode: "workspace-write", cloudx: { unrelated: "keep" } }), { yoloMode });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } });
+      expect(factory.args?.join(" ").includes("--yolo")).toBe(yoloMode);
+      const config = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
+      expect(config).toMatchObject({ approval_policy: "on-request", sandbox_mode: "workspace-write" });
+      expect(config.cloudx).toEqual({ unrelated: "keep" });
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+      session.stop?.();
+    });
+  });
+
+  it("automatically trusts only the canonical launched workspace in its overlay", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const alias = path.join(root, "workspace-alias");
+      await fs.symlink(root, alias);
+      const original = withLaunchPreferences(stringify({ projects: { "/other": { trust_level: "untrusted" } } }), { autoTrustWorkspace: true });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      const session = await plugin.createSession({ tab, cwd: alias, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } });
+      expect(parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8")).projects).toEqual({
+        "/other": { trust_level: "untrusted" }, [root]: { trust_level: "trusted" }
+      });
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+      session.stop?.();
+    });
+  });
+
+  it("does not override an explicitly untrusted workspace when automatic trust is enabled", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      await fs.writeFile(path.join(home, "config.toml"), withLaunchPreferences(stringify({ projects: { [root]: { trust_level: "untrusted" } } }), { autoTrustWorkspace: true }));
+      await expect(plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } })).rejects.toThrow(/untrusted/);
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
+  it.each(["canonical", "alias"])("refuses to automatically trust a child of an untrusted repository recorded by its %s path", async (recordedPath) => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const cwd = path.join(root, "packages", "app");
+      await fs.mkdir(cwd, { recursive: true });
+      await fs.mkdir(path.join(root, ".git"));
+      const alias = path.join(root, "repository-alias");
+      await fs.symlink(root, alias);
+      const deniedPath = recordedPath === "canonical" ? root : alias;
+      const original = withLaunchPreferences(stringify({ projects: { [deniedPath]: { trust_level: "untrusted" } } }), { autoTrustWorkspace: true });
+      await fs.writeFile(path.join(home, "config.toml"), original);
+      await expect(plugin.createSession({ tab, cwd, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } })).rejects.toThrow(/ancestor as untrusted/);
+      expect(factory.spawns).toBe(0);
+      expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
+    });
+  });
+
+  it("still enforces Forge trust authorization when automatic workspace trust is enabled", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      await fs.writeFile(path.join(home, "config.toml"), withLaunchPreferences("", { autoTrustWorkspace: true }));
+      await expect(plugin.createSession({
+        tab, cwd: root, authorizeProjectTrust: async () => { throw new Error("Repository consent was revoked."); },
+        controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() }
+      })).rejects.toThrow("Repository consent was revoked.");
+      expect(factory.spawns).toBe(0);
+    });
+  });
+
+  it("copies only enabled built-in skills and removes disabled copies on the next overlay", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      await seedExternalSkill(path.join(home, "skills", ".system"), "skill-creator");
+      const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } });
+      const skillRoot = path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-exceptions");
+      await expect(fs.stat(path.join(skillRoot, "imagegen", "SKILL.md"))).resolves.toBeDefined();
+      await expect(fs.stat(path.join(skillRoot, "skill-creator", "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
+
+      await fs.writeFile(path.join(home, "config.toml"), withLaunchPreferences("", { defaultSkills: { imagegen: false, "skill-creator": true } }));
+      await session.applyRuntimeContext!({});
+      await expect(fs.stat(path.join(skillRoot, "imagegen", "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(skillRoot, "skill-creator", "SKILL.md"))).resolves.toBeDefined();
+
+      await fs.writeFile(path.join(home, "config.toml"), withLaunchPreferences("", { defaultSkills: { imagegen: false, "skill-creator": false } }));
+      await fs.rm(path.join(home, "skills", ".system"), { recursive: true });
+      await session.applyRuntimeContext!({});
+      await expect(fs.stat(skillRoot)).rejects.toMatchObject({ code: "ENOENT" });
+      const config = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
+      expect(config.skills).toMatchObject({ bundled: { enabled: false } });
+      expect(JSON.stringify(config.skills)).not.toContain("cloudx-exceptions");
+      session.stop?.();
+    });
   });
 
   it.each(["config", "binding"])("settles a launch deadline while %s open is held, without later writes or spawn", async (stage) => {
@@ -1444,6 +1533,10 @@ async function seedSystemSkill(dataDir: string, id: string, name: string, descri
     `---\nname: "${id}"\ndescription: "${description}"\ncloudx_name: "${name}"\n---\n\n${body}\n`,
     "utf8"
   );
+}
+
+function withLaunchPreferences(text: string, preferences: Partial<CodexLaunchPreferences>): string {
+  return writeCodexLaunchPreferences(text, { ...readCodexLaunchPreferences(undefined), ...preferences });
 }
 
 async function seedImagegenSkill(codexHome: string): Promise<void> {

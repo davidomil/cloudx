@@ -20,6 +20,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { parse } from "smol-toml";
+import { readCodexLaunchPreferences } from "../../apps/server/src/plugins/CodexLaunchPreferences.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let testRoot: string;
@@ -473,6 +474,128 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await openCodexSettings(page, isMobile);
   await expect(model).toHaveValue("");
   await expect(fastMode).toHaveValue("");
+});
+
+test("Codex Settings saves permissions, installed skills, and behavior defaults across reloads", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const home = path.join(testRoot, "codex-home");
+  const slides = path.join(home, "skills", ".system", "slides");
+  await fs.mkdir(slides, { recursive: true });
+  await fs.writeFile(
+    path.join(slides, "SKILL.md"),
+    "# Synthetic slides skill\n",
+  );
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const yolo = settings.getByRole("checkbox", {
+    name: "YOLO mode",
+    exact: true,
+  });
+  const trust = settings.getByRole("checkbox", {
+    name: "Automatically trust workspace",
+    exact: true,
+  });
+  const imagegen = settings.getByRole("checkbox", {
+    name: "Enable imagegen",
+    exact: true,
+  });
+  const slideSkill = settings.getByRole("checkbox", {
+    name: "Enable slides",
+    exact: true,
+  });
+  const reasoning = settings.getByRole("combobox", {
+    name: "Reasoning effort",
+    exact: true,
+  });
+  const search = settings.getByRole("combobox", {
+    name: "Web search",
+    exact: true,
+  });
+  const personality = settings.getByRole("combobox", {
+    name: "Personality",
+    exact: true,
+  });
+  const save = settings.getByRole("button", {
+    name: "Save Codex settings",
+    exact: true,
+  });
+  await expect(yolo).toBeChecked();
+  await expect(trust).not.toBeChecked();
+  await expect(imagegen).toBeChecked();
+  await expect(slideSkill).not.toBeChecked();
+  const yoloControl = await yolo.boundingBox();
+  const yoloLabel = await yolo.locator("..").locator("span").boundingBox();
+  expect(yoloControl!.width).toBeLessThanOrEqual(24);
+  expect(yoloLabel!.x).toBeGreaterThan(yoloControl!.x + yoloControl!.width);
+  expect(
+    (await yolo.locator("..").boundingBox())!.height,
+  ).toBeGreaterThanOrEqual(44);
+  await reasoning.selectOption("high");
+  await search.selectOption("live");
+  await personality.selectOption("pragmatic");
+  await yolo.uncheck();
+  await trust.check();
+  await imagegen.uncheck();
+  await slideSkill.check();
+  await navigateCodexSettings(page, "search");
+  await expect(yolo).not.toBeChecked();
+  await expect(trust).toBeChecked();
+  await expect(slideSkill).toBeChecked();
+  await expectCodexSettingsFits(page);
+  await save.click();
+  await expect(settings.getByRole("status")).toHaveText(
+    "Global Codex settings saved.",
+  );
+  expect(
+    parse(await fs.readFile(path.join(home, "config.toml"), "utf8")),
+  ).toEqual({
+    model_reasoning_effort: "high",
+    web_search: "live",
+    personality: "pragmatic",
+  });
+  expect(
+    readCodexLaunchPreferences(
+      await fs.readFile(path.join(home, "config.toml"), "utf8"),
+    ),
+  ).toEqual({
+    yoloMode: false,
+    autoTrustWorkspace: true,
+    defaultSkills: { imagegen: false, slides: true },
+  });
+  await trust.scrollIntoViewIfNeeded();
+  await captureSample(page, testInfo, "codex-expanded-permissions-skills");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await openCodexSettings(page, isMobile);
+  await expect(yolo).not.toBeChecked();
+  await expect(trust).toBeChecked();
+  await expect(imagegen).not.toBeChecked();
+  await expect(slideSkill).toBeChecked();
+  await expect(reasoning).toHaveValue("high");
+  await expect(search).toHaveValue("live");
+  await expect(personality).toHaveValue("pragmatic");
+  await expect(save).toBeDisabled();
+  await reasoning.selectOption("");
+  await search.selectOption("");
+  await personality.selectOption("");
+  await trust.uncheck();
+  await save.click();
+  await expect(settings.getByRole("status")).toHaveText(
+    "Global Codex settings saved.",
+  );
+  expect(
+    parse(await fs.readFile(path.join(home, "config.toml"), "utf8")),
+  ).toEqual({});
+  expect(
+    readCodexLaunchPreferences(
+      await fs.readFile(path.join(home, "config.toml"), "utf8"),
+    ),
+  ).toEqual({
+    yoloMode: false,
+    autoTrustWorkspace: false,
+    defaultSkills: { imagegen: false, slides: true },
+  });
 });
 
 test("Codex settings opens inside Settings without creating a workspace tab and is absent from New tab", async ({
