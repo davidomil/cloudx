@@ -304,7 +304,7 @@ export class SettingsUpdater {
         ...status,
         available: false,
         unavailableReason:
-          "The checkout must be clean before updating. Commit or move local changes and run the installer from a terminal if Git needs attention.",
+          "The checkout must have no tracked changes before updating. Commit tracked changes and run the installer from a terminal if Git needs attention. Unrelated untracked files are allowed.",
       };
     }
     const record = {
