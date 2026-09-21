@@ -1,0 +1,6 @@
+flowchart TD
+  A[Automation step] --> B[Send Notification]
+  B --> C[In-app toast and bell history]
+  B --> D{Browser permission granted?}
+  D -->|Yes| E[Browser notification]
+  D -->|No| F[In-app message remains available]

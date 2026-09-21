@@ -1,0 +1,8 @@
+flowchart TD
+  A["Select issue · Start work"] --> B["Implement and test in isolated checkout"]
+  B --> C["Publish branch and PR or MR"]
+  C --> D["Review current revision"]
+  D -->|"Changes requested"| B
+  D -->|"Approved"| E["Check feedback, discussions and mergeability"]
+  E --> F["Merge and clean owned resources"]
+  D -->|"Clarification needed"| G["Pause for human input"]
