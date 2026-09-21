@@ -62,7 +62,7 @@ function fixture() {
   let stored: ForgeWorker[] = [];
   const runtime = {
     isActive: vi.fn(() => true),
-    recover: vi.fn(async (_id: string) => ({
+    recover: vi.fn(async (_id: string): ReturnType<ForgeWorkflowDependencies["runtime"]["recover"]> => ({
       workspace: undefined as
         | {
             id: string;
@@ -285,7 +285,7 @@ describe("Manual worker continuation", () => {
   });
 
   it.each([
-    { status: "cleanup_failed" }, { status: "completed" },
+    { status: "cleanup_failed", tabId: undefined }, { status: "completed" },
     { pendingPublication: { report: { kind: "issue", title: "Fix", body: "Complete", discussionReplies: [], resolvedDiscussionIds: [] }, repliedDiscussionIds: [] } },
     { publicationState: "uncertain" }, { publicationState: "creating" }, { mergeAttempted: true },
     { rebaseRecovery: { phase: "publishing" } }, { rebaseRecovery: { phase: "reviewing" } },
@@ -1517,6 +1517,77 @@ describe("Forge worker controls during startup", () => {
 });
 
 describe("Forge ownership recovery", () => {
+  it.each(["running", "starting", "awaiting_publication"] as const)("keeps the ownership reason and returns a blocked worker on repeated Resume after restarting %s", async status => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const pendingPublication = status === "awaiting_publication"
+      ? { report: { kind: "issue" as const, title: "Fix", body: "Ready", discussionReplies: [], resolvedDiscussionIds: [] }, repliedDiscussionIds: [] }
+      : undefined;
+    await f.deps.store.write([{ ...worker, status, pendingPublication, changeNumber: pendingPublication ? 7 : undefined }]);
+    f.runtime.recover.mockResolvedValue({ workspace: undefined, tabIds: [worker.tabId!] });
+    const reason = "Worker execution is still live. Stop its supervisor, then use Resume. Local resources were preserved.";
+    f.runtime.close.mockRejectedValue(new Error(reason));
+    f.runtime.launch.mockClear();
+    f.provider.getIssue.mockClear();
+    const restarted = new ForgeWorkflowService(f.deps);
+
+    expect((await restarted.dashboard()).workers[0]).toMatchObject({ status: "cleanup_failed", error: reason, attemptId: worker.attemptId, pendingPublication });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(await restarted.resume(worker.id, placement)).toMatchObject({ status: "cleanup_failed", error: reason, tabId: worker.tabId, attemptId: worker.attemptId, pendingPublication });
+      expect(f.stored()[0]).toMatchObject({ status: "cleanup_failed", error: reason });
+    }
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.getIssue).not.toHaveBeenCalled();
+    expect(f.provider.getChangeRequestStatus).not.toHaveBeenCalled();
+    expect(f.provider.getChangeRequest).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+
+    f.runtime.close.mockResolvedValue(undefined);
+    const recovered = new ForgeWorkflowService(f.deps);
+    expect((await recovered.dashboard()).workers[0]).toMatchObject({ status: "paused", tabId: undefined, worktreePath: worker.worktreePath, pendingPublication });
+    expect((await new ForgeWorkflowService(f.deps).dashboard()).workers[0]?.status).toBe("paused");
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("recovers a blocked launch whose durable terminal ID was never saved in workflow state", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.deps.store.write([{ ...worker, status: "cleanup_failed", tabId: undefined, error: "Worker execution is still live." }]);
+    f.runtime.recover.mockResolvedValue({ workspace: undefined, tabIds: ["owned-tab"] });
+    const restarted = new ForgeWorkflowService(f.deps);
+    expect((await restarted.dashboard()).workers[0]).toMatchObject({ status: "paused", tabId: undefined, attemptId: worker.attemptId, worktreePath: worker.worktreePath });
+    expect(f.runtime.close).toHaveBeenCalledExactlyOnceWith("owned-tab");
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("keeps unrelated cleanup failures blocked when startup finds no terminal to retire", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const blocked = { ...worker, status: "cleanup_failed" as const, tabId: undefined, error: "New local work does not match the merged head" };
+    await f.deps.store.write([blocked]);
+    expect((await new ForgeWorkflowService(f.deps).dashboard()).workers[0]).toMatchObject(blocked);
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it("pauses a blocked launch when recovery proves it ended before its terminal record was saved", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.deps.store.write([{ ...worker, status: "cleanup_failed", tabId: undefined, error: "Worker launch was interrupted." }]);
+    f.runtime.recover.mockResolvedValue({ tabIds: [], executionEnded: true });
+    expect((await new ForgeWorkflowService(f.deps).dashboard()).workers[0]).toMatchObject({ status: "paused", attemptId: worker.attemptId, worktreePath: worker.worktreePath });
+    expect((await new ForgeWorkflowService(f.deps).dashboard()).workers[0]?.status).toBe("paused");
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("resumes preserved issue work after ownership recovery succeeds (published request: %s)", async (published) => {
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
@@ -1533,7 +1604,7 @@ describe("Forge ownership recovery", () => {
     expect((await f.service.dashboard()).workers[0]?.status).toBe("cleanup_failed");
 
     f.runtime.recover.mockClear();
-    await expect(f.service.resume(worker.id, placement)).rejects.toThrow("Owned context file changed");
+    expect(await f.service.resume(worker.id, placement)).toMatchObject({ status: "cleanup_failed", error: "Owned context file changed" });
     expect(f.runtime.recover).toHaveBeenCalledTimes(1);
     expect(f.runtime.launch).toHaveBeenCalledTimes(1);
     expect(f.stored()[0]?.status).toBe("cleanup_failed");

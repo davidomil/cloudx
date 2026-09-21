@@ -138,11 +138,13 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const command = launchTemplate.command;
     const launchArgs = [...launchTemplate.args, ...conversation?.launchArgs() ?? [], ...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
     const launch = buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
+    const execution = await input.prepareTerminalExecution?.(input.tab.id);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
       env: launchTemplate.env,
       cols: 100,
       rows: 30,
+      ...(execution ? { execution } : {}),
       ...(!input.tab.ownerPluginId ? { sessionId: input.tab.id } : {})
     });
     return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {

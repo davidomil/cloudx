@@ -1,5 +1,8 @@
+import type { TerminalExecutionBinding } from "@cloudx/plugin-api";
 import type { TerminalScreenSnapshot } from "./TerminalScreen.js";
 import type { TerminalExit } from "./TerminalSupervisor.js";
+
+export type { TerminalExecutionBinding } from "@cloudx/plugin-api";
 
 export interface TerminalProcess {
   onData(listener: (data: string) => void): () => void;
@@ -20,6 +23,7 @@ export interface TerminalSpawnOptions {
   cols: number;
   rows: number;
   sessionId?: string;
+  execution?: TerminalExecutionBinding;
 }
 
 export interface TerminalProcessFactory {

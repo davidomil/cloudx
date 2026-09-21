@@ -117,6 +117,50 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.factory.processes).toHaveLength(1);
   }, 15_000);
 
+  it("recovers lost terminal ownership without a clean workflow shutdown and resumes the same dirty checkout", async () => {
+    const fixture = await LifecycleFixture.create({ largeOutput: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    expect(started.status, started.error).toBe("running");
+    const checkout = await fs.stat(started.worktreePath!);
+    await fs.writeFile(path.join(started.worktreePath!, "README.md"), "Unfinished tracked change\n");
+    await fs.writeFile(path.join(started.worktreePath!, "unfinished.txt"), "Untracked work\n");
+    const tabManifest = path.join(fixture.dataDir, "forge-workers", "tabs", `${started.tabId}.json`);
+    const ownership = JSON.parse(await fs.readFile(tabManifest, "utf8"));
+    expect(ownership).toMatchObject({ closed: false, quiescent: false, execution: { executionId: expect.any(String), bootId: expect.any(String) } });
+    await expect(fixture.sessions.restartTab(started.tabId!)).rejects.toThrow("Resume the worker through Forge");
+    expect(fixture.sessions.getSession(started.tabId!).snapshot().status).not.toBe("stopped");
+    const providerCalls = fixture.providerRoles.length;
+    const gitCalls = fixture.gitAccessRoles.length;
+
+    // Reconstruct while the original supervisor is still alive: no dispose/pause/stop.
+    await fixture.loseTerminalRegistry();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("still alive") });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      expect(await fixture.workflow.resume(started.id, fixture.placement)).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("still alive") });
+    }
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect(fixture.providerRoles).toHaveLength(providerCalls);
+    expect(fixture.gitAccessRoles).toHaveLength(gitCalls);
+
+    // Only the supervisor records completion; Forge never records a clean stop.
+    await fixture.factory.processes[0]!.terminate();
+    expect(JSON.parse(await fs.readFile(tabManifest, "utf8"))).toMatchObject({ closed: false, quiescent: false });
+    await fixture.loseTerminalRegistry();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", attemptId: started.attemptId, worktreePath: started.worktreePath });
+    expect(JSON.parse(await fs.readFile(tabManifest, "utf8"))).toMatchObject({ closed: true, quiescent: true });
+    await fixture.loseTerminalRegistry();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused" });
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect(await fs.readFile(path.join(started.worktreePath!, "README.md"), "utf8")).toBe("Unfinished tracked change\n");
+    expect(await fs.readFile(path.join(started.worktreePath!, "unfinished.txt"), "utf8")).toBe("Untracked work\n");
+    expect((await fs.stat(started.worktreePath!)).ino).toBe(checkout.ino);
+    const resumed = await fixture.workflow.resume(started.id, fixture.placement);
+    expect(resumed).toMatchObject({ status: "running", worktreePath: started.worktreePath });
+    expect(resumed.tabId).not.toBe(started.tabId);
+    expect(fixture.factory.processes).toHaveLength(2);
+    await fixture.workflow.pause(resumed.id);
+  }, 20_000);
+
   it("cleans a paused worker after log rotation and a server restart", async () => {
     const fixture = await LifecycleFixture.create({ largeOutput: true });
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
@@ -1342,6 +1386,7 @@ class LifecycleFixture {
   readonly runtimeDependencies: ForgeRuntimeDependencies;
   readonly config: ConfigService;
   private readonly plugins = new PluginRegistry();
+  private readonly lostSessions: SessionStore[] = [];
   readonly models: Pick<ForgeSettings, "workerModel" | "workerReasoningEffort" | "reviewModel" | "reviewReasoningEffort"> = {
     workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max",
   };
@@ -1487,6 +1532,15 @@ class LifecycleFixture {
     process.kill(receipt.pid, "SIGUSR2");
     await expect(exited).resolves.toEqual({ exitCode: 0 });
     expect(await processIsRunning(receipt.pid)).toBe(false);
+  }
+
+  async loseTerminalRegistry(): Promise<void> {
+    this.lostSessions.push(this.sessions);
+    this.sessions = new SessionStore(this.plugins, new PathPolicy([this.root]), new TabContextService(this.dataDir), undefined, this.workspace, this.catalog);
+    this.runtimeDependencies.sessions = this.sessions;
+    this.runtimeDependencies.workspaceCommands = new WorkspaceCommandService(this.sessions, this.workspace);
+    this.workflow = new ForgeWorkflowService({ ...this.workflowDependencies, runtime: new ForgeRuntime(this.runtimeDependencies) });
+    await this.workflow.dashboard();
   }
 
   async restartWorkflow(): Promise<void> {
@@ -1658,6 +1712,7 @@ test("retains the target behavior and issue fix", () => {
     } finally {
       await Promise.all(this.factory.processes.map((terminal) => terminal.terminate()));
       await this.sessions.dispose();
+      for (const sessions of this.lostSessions) await sessions.dispose();
       await this.sources.dispose();
       await fs.rm(this.root, { recursive: true, force: true });
     }
