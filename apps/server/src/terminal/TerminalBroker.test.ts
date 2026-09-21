@@ -42,8 +42,11 @@ describe("durable terminal broker", () => {
     const data = "x".repeat(256 * 1024);
     let received = "";
     terminal.onData((chunk) => { received += chunk; });
-    process.data(data);
-    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    process.terminate.mockImplementationOnce(async () => {
+      process.data(data);
+      expect(process.pauseOutput).toHaveBeenCalledOnce();
+      process.exit({ exitCode: 0 });
+    });
     if (close === "terminate") await terminal.terminate();
     else {
       await broker.stop();
@@ -52,6 +55,23 @@ describe("durable terminal broker", () => {
     expect(process.terminate).toHaveBeenCalledOnce();
     expect(process.resumeOutput).not.toHaveBeenCalled();
     if (close === "terminate") expect(received).toBe(data);
+  });
+
+  it("resumes output parsed while the producer is alive before termination", async () => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("drained-before-close"));
+    const data = "x".repeat(256 * 1024);
+    let received = "";
+    terminal.onData((chunk) => { received += chunk; });
+    process.data(data);
+    expect(process.pauseOutput).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(received).toBe(data));
+    expect(process.resumeOutput).toHaveBeenCalledOnce();
+    expect(process.terminate).not.toHaveBeenCalled();
+
+    await terminal.terminate();
+    expect(process.terminate).toHaveBeenCalledOnce();
+    expect(process.resumeOutput).toHaveBeenCalledOnce();
   });
 
   it("resumes parsing after rejected termination and retains a recoverable session", async () => {
