@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 import { createServer as createHttpServer, type Server } from "node:http";
 import path from "node:path";
 import { createServer, type ViteDevServer } from "vite";
+import { TerminalScreen } from "../../apps/server/src/terminal/TerminalScreen.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let server: ViteDevServer;
@@ -287,17 +288,152 @@ for (const worker of [
   });
 }
 
+async function scrollWorkerHistoryTo(
+  page: Page,
+  edge: "first" | "last",
+  touch: boolean,
+) {
+  const output = page.getByRole("region", {
+    name: "Saved worker terminal output",
+  });
+  const rail = output.locator(".terminal-mobile-scroll-rail");
+  if (touch && (await rail.isVisible())) {
+    const browserInput = await page.context().newCDPSession(page);
+    const track = (await rail.boundingBox())!;
+    const x = track.x + track.width / 2;
+    await browserInput.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x, y: track.y + track.height / 2 }],
+    });
+    await browserInput.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [
+        { x, y: edge === "first" ? track.y - 1 : track.y + track.height + 1 },
+      ],
+    });
+    await browserInput.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+    await browserInput.detach();
+  } else {
+    await output.hover();
+    const scrollbar = output.locator(".xterm .scrollbar.vertical");
+    const track = (await scrollbar.boundingBox())!;
+    const thumb = await scrollbar.locator(".slider").boundingBox();
+    if (!thumb) return;
+    await page.mouse.move(
+      thumb.x + thumb.width / 2,
+      thumb.y + thumb.height / 2,
+    );
+    await page.mouse.down();
+    await page.mouse.move(
+      track.x + track.width / 2,
+      edge === "first" ? track.y : track.y + track.height,
+    );
+    await page.mouse.up();
+  }
+}
+
+for (const scenario of [
+  { name: "after shortening", height: 960, cursor: "\x1b[H" },
+  { name: "on initial short display", height: 540, cursor: "\x1b[H" },
+  {
+    name: "with saved origin mode and scroll margins",
+    height: 540,
+    cursor: "\x1b[2;10r\x1b[?6h\x1b[H",
+  },
+]) {
+  test(`preserves worker history below the saved cursor ${scenario.name}`, async ({
+    page,
+  }, testInfo) => {
+    const diagnostics = Array.from(
+      { length: 30 },
+      (_, index) => `line-${String(index).padStart(4, "0")}: diagnostic`,
+    );
+    const screen = new TerminalScreen(100, 30);
+    let historyScreen: ForgeWorkerHistory["screen"];
+    try {
+      screen.write(diagnostics.join("\r\n") + scenario.cursor);
+      historyScreen = await screen.snapshot();
+    } finally {
+      await screen.dispose();
+    }
+    await page.setViewportSize({
+      width: scenario.height === 960 ? 1440 : 390,
+      height: scenario.height,
+    });
+    const sockets: string[] = [];
+    page.on("websocket", (socket) => sockets.push(socket.url()));
+    const fixture = await workers(page, { historyScreen });
+    await page
+      .getByRole("button", { name: "View worker", exact: true })
+      .click();
+    const output = page.getByRole("region", {
+      name: "Saved worker terminal output",
+    });
+    const visibleLines = output.locator(".xterm-accessibility-tree");
+    await expect(visibleLines).toContainText(diagnostics.at(-1)!);
+
+    for (const viewport of [
+      { width: 390, height: 540 },
+      { width: 1440, height: 960 },
+      { width: 320, height: 540 },
+      { width: 1440, height: 960 },
+    ]) {
+      await page.setViewportSize(viewport);
+      await expect(output).toBeInViewport({ ratio: 1 });
+      if (viewport.height === 540) {
+        await expect
+          .poll(() => visibleLines.locator("[role='listitem']").count())
+          .toBeLessThan(30);
+      }
+      for (const edge of ["first", "last"] as const) {
+        await scrollWorkerHistoryTo(
+          page,
+          edge,
+          testInfo.project.name === "mobile-chromium",
+        );
+        await expect(visibleLines).toContainText(
+          edge === "first" ? diagnostics[0] : diagnostics.at(-1)!,
+        );
+      }
+      if (viewport.width === 390) {
+        const screenshot = testInfo.outputPath("short-worker-diagnostics.png");
+        await page.screenshot({ path: screenshot });
+        await testInfo.attach("short-worker-diagnostics", {
+          path: screenshot,
+          contentType: "image/png",
+        });
+      }
+    }
+    await expect(visibleLines).toContainText(diagnostics.join(""));
+    const screenshot = testInfo.outputPath("restored-worker-diagnostics.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("restored-worker-diagnostics", {
+      path: screenshot,
+      contentType: "image/png",
+    });
+    expect(fixture.historyRequests).toEqual(["issue-worker"]);
+    expect(fixture.continuations).toEqual([]);
+    expect(sockets).toEqual([]);
+  });
+}
+
 test("preserves near-limit worker history through mobile fitting and repeated resizing", async ({
   page,
 }, testInfo) => {
   const firstDiagnostic = "line-0000: earliest failure diagnostic";
   const lastDiagnostic = "line-0999: final failure diagnostic";
+  const lastDiagnosticEnd = "END-0999";
   const lines = Array.from(
     { length: 1000 },
     (_, index) => `line-${String(index).padStart(4, "0")}: dependency check`,
   );
   lines[0] = firstDiagnostic;
-  lines[lines.length - 1] = lastDiagnostic;
+  lines[lines.length - 1] =
+    lastDiagnostic.padEnd(100 - lastDiagnosticEnd.length, ".") +
+    lastDiagnosticEnd;
   const fixture = await workers(page, {
     historyScreen: {
       cols: 100,
@@ -311,7 +447,6 @@ test("preserves near-limit worker history through mobile fitting and repeated re
   });
   const visibleLines = output.locator(".xterm-accessibility-tree");
   await expect(visibleLines).toContainText(lastDiagnostic);
-  const browserInput = await page.context().newCDPSession(page);
 
   for (const [stage, viewport] of [
     page.viewportSize()!,
@@ -322,48 +457,17 @@ test("preserves near-limit worker history through mobile fitting and repeated re
   ].entries()) {
     await page.setViewportSize(viewport);
     await expect(output).toBeInViewport({ ratio: 1 });
-    for (const edge of ["first", "last"]) {
-      if (
-        testInfo.project.name === "mobile-chromium" &&
-        (await output.locator(".terminal-mobile-scroll-rail").isVisible())
-      ) {
-        const rail = (await output
-          .locator(".terminal-mobile-scroll-rail")
-          .boundingBox())!;
-        const x = rail.x + rail.width / 2;
-        await browserInput.send("Input.dispatchTouchEvent", {
-          type: "touchStart",
-          touchPoints: [{ x, y: rail.y + rail.height / 2 }],
-        });
-        await browserInput.send("Input.dispatchTouchEvent", {
-          type: "touchMove",
-          touchPoints: [
-            { x, y: edge === "first" ? rail.y - 1 : rail.y + rail.height + 1 },
-          ],
-        });
-        await browserInput.send("Input.dispatchTouchEvent", {
-          type: "touchEnd",
-          touchPoints: [],
-        });
-      } else {
-        await output.hover();
-        const scrollbar = output.locator(".xterm .scrollbar.vertical");
-        const track = (await scrollbar.boundingBox())!;
-        const thumb = (await scrollbar.locator(".slider").boundingBox())!;
-        await page.mouse.move(
-          thumb.x + thumb.width / 2,
-          thumb.y + thumb.height / 2,
-        );
-        await page.mouse.down();
-        await page.mouse.move(
-          track.x + track.width / 2,
-          edge === "first" ? track.y : track.y + track.height,
-        );
-        await page.mouse.up();
-      }
+    for (const edge of ["first", "last"] as const) {
+      await scrollWorkerHistoryTo(
+        page,
+        edge,
+        testInfo.project.name === "mobile-chromium",
+      );
       await expect(visibleLines).toContainText(
         edge === "first" ? firstDiagnostic : lastDiagnostic,
       );
+      if (edge === "last")
+        await expect(visibleLines).toContainText(lastDiagnosticEnd);
       if (edge === "first" && (stage === 1 || stage === 4)) {
         const name = `earliest-worker-history-${viewport.width}px`;
         const screenshot = testInfo.outputPath(`${name}.png`);
@@ -375,7 +479,6 @@ test("preserves near-limit worker history through mobile fitting and repeated re
       }
     }
   }
-  await browserInput.detach();
   expect(fixture.historyRequests).toEqual(["issue-worker"]);
   expect(fixture.continuations).toEqual([]);
 });

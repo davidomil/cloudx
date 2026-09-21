@@ -32,7 +32,8 @@ export function ForgeWorkerHistoryPanel({ history, uiScale }: { history: ForgeWo
     let disposed = false;
     const observer = new ResizeObserver(() => fit.fit());
     // Saved mouse tracking must not consume scrolling or text selection.
-    terminal.write(`${history.screen.data}\x1b[?1000l\x1b[?25l`, () => {
+    // Keep the hidden cursor on the last saved row so height reductions cannot discard output.
+    terminal.write(`${history.screen.data}\x1b[?1000l\x1b[?25l\x1b[?6l\x1b[${history.screen.rows};1H`, () => {
       if (disposed) return;
       // Reserve one row per saved cell so even the narrowest fit retains history.
       terminal.options.scrollback = terminal.buffer.normal.length * terminal.cols;
