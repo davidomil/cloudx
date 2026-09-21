@@ -1,6 +1,7 @@
 import { createRoot } from "react-dom/client";
 import { ForgePanel } from "../../../apps/web/src/ui/ForgePanel.js";
 import { fetchJson } from "../../../apps/web/src/api.js";
+import "@xterm/xterm/css/xterm.css";
 import "../../../apps/web/src/styles.css";
 
 createRoot(document.getElementById("root")!).render(

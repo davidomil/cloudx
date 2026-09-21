@@ -76,6 +76,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.worker(started.id)).toMatchObject({ status: "failed", error: "The Codex tab ended without a completion report. Inspect the worker before resuming." });
     expect(fixture.sessions.listTabs()).toEqual([]);
     expect(fixture.factory.processes).toHaveLength(1);
+    const history = await fixture.workflow.workerHistory(started.id);
+    expect(history).toMatchObject({ tabId: started.tabId, screen: { data: expect.stringContaining("FORGE_FIXTURE_EARLY_EXIT") } });
+    expect(await new ForgeRuntime(fixture.runtimeDependencies).workerHistory(started.id)).toEqual(history);
+    expect(fixture.factory.processes).toHaveLength(1);
     await expect(terminal.terminate()).resolves.toBeUndefined();
     expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
     expect(fixture.gitPushes).toEqual([]);
@@ -172,6 +176,9 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       fixture.factory.processes[0]!.write("emit fixture output\n");
       const receipt = await fixture.completedAssistantTurn(started);
       await fixture.workflow.pause(started.id);
+      const history = await fixture.workflow.workerHistory(started.id);
+      expect(history).toMatchObject({ tabId: started.tabId, screen: { data: expect.stringContaining("FORGE_FIXTURE_REPORT_READY") } });
+      expect(fixture.factory.processes).toHaveLength(1);
       const rotated = await fs.stat(contextPath, { bigint: true });
       expect(rotated.ino).not.toBe(original.ino);
       expect(rotated.size).toBeLessThanOrEqual(64_000n);
@@ -181,6 +188,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       const restarted = new ForgeRuntime(fixture.runtimeDependencies);
       expect((await restarted.recover(started.id)).tabIds).toEqual([started.tabId]);
       await restarted.close(started.tabId!);
+      expect(await restarted.workerHistory(started.id)).toEqual(history);
+      expect(fixture.factory.processes).toHaveLength(1);
       await expectMissing(path.dirname(contextPath), receipt.codexHome);
       expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
     } finally {
@@ -1513,7 +1522,7 @@ class LifecycleFixture {
   }
 
   async startIssueThatExitsBeforeRegistration(exitCode: number): Promise<ForgeWorker> {
-    await fs.writeFile(path.join(this.root, "fixture-assistant.mjs"), `#!/bin/sh\nexit ${exitCode}\n`, { mode: 0o700 });
+    await fs.writeFile(path.join(this.root, "fixture-assistant.mjs"), `#!/bin/sh\nprintf 'FORGE_FIXTURE_EARLY_EXIT\\n'\nexit ${exitCode}\n`, { mode: 0o700 });
     const ready = TerminalSupervisor.prototype.ready;
     const readiness = vi.spyOn(TerminalSupervisor.prototype, "ready").mockImplementation(async function(this: TerminalSupervisor) {
       await ready.call(this);
