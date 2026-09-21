@@ -39,9 +39,13 @@ graph can first run with a generated sample fixture.
     Message** to `Jira issue selected` in the inspector.
 3.  Select **Validate graph**, then **Run test**. Open **Automation
     runs** and inspect the status and trace for `Jira issue selected`.
-4.  Under **Test Cases**, select **Add** to retain a fixture. Set
-    **Expected Trace Text** to the same message; run the test again.
-5.  Select **Save automation**, then **Enable automation**. Return to a
+4.  Under **Test Cases**, select **Add** to create a test case. Copy the
+    JSON shown under **Sample Run** into the new case’s **Trigger
+    Payload**, replacing the empty `{}`.
+5.  Set **Expected Status** to `succeeded` and **Expected Trace Text**
+    to `Jira issue selected`. Select **Run test** with that case
+    selected; verify that the run succeeds and both assertions pass.
+6.  Select **Save automation**, then **Enable automation**. Return to a
     Jira issue and select its play action to generate the real event.
 
 ## Test and inspect changes
