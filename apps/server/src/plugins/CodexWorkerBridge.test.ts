@@ -18,6 +18,120 @@ const binding = { workerId: "worker", attemptId: "attempt", receiptPath: "/unuse
 const start = { id: 4, method: "turn/start", params: { threadId: "thread" } };
 const response = { id: 4, result: { turn: { id: "turn", status: "inProgress" } } };
 const complete = (status = "completed", threadId = "thread", turnId = "turn") => ({ method: "turn/completed", params: { threadId, turn: { id: turnId, status } } });
+const titleThreadStart = { id: "temporary-structured-thread", method: "thread/start", params: { threadSource: "system", ephemeral: true } };
+const titleThreadResponse = { id: titleThreadStart.id, result: { thread: { id: "title-thread" } } };
+const titleTurnStart = { id: "temporary-structured-turn", method: "turn/start", params: { threadId: "title-thread", outputSchema: { type: "object", properties: { title: { type: "string" } } } } };
+
+it.each(["before worker start", "before worker reply", "during worker turn", "after worker completion"])("keeps title generation separate %s", timing => {
+  const saved: unknown[] = [];
+  const finals: unknown[] = [];
+  const owner = new CodexWorkerTurn({ ...binding, expectedThreadId: "thread" }, (value: unknown) => saved.push(value), (value: unknown) => finals.push(value));
+  if (timing !== "before worker start") owner.fromClient(start);
+  if (["during worker turn", "after worker completion"].includes(timing)) owner.fromServer(response);
+  if (timing === "after worker completion") owner.fromServer(complete());
+  const workerEvidence = [...saved];
+  owner.fromClient(titleThreadStart);
+  owner.fromServer(titleThreadResponse);
+  owner.fromClient(titleTurnStart);
+  owner.fromServer({ id: titleTurnStart.id, result: { turn: { id: "title-turn", status: "inProgress" } } });
+  owner.fromServer({ method: "turn/started", params: { threadId: "title-thread", turn: { id: "title-turn", status: "inProgress" } } });
+  const item = { type: "agentMessage", phase: "final_answer", text: '{"title":"Auxiliary title"}' };
+  owner.fromServer({ method: "item/completed", params: { threadId: "title-thread", turnId: "title-turn", item } });
+  for (const status of ["failed", "interrupted", "completed"]) {
+    const completion = complete(status, "title-thread", "title-turn");
+    owner.fromServer({ ...completion, params: { ...completion.params, turn: { ...completion.params.turn, items: [item], error: { message: "Auxiliary failure" } } } });
+  }
+  expect(saved).toEqual(workerEvidence);
+  expect(finals).toEqual([]);
+  if (timing === "before worker start") owner.fromClient(start);
+  if (["before worker start", "before worker reply"].includes(timing)) owner.fromServer(response);
+  owner.fromServer(complete());
+  expect(saved).toEqual([
+    { workerId: "worker", attemptId: "attempt", threadId: "thread", turnId: "turn", status: "running" },
+    { workerId: "worker", attemptId: "attempt", threadId: "thread", turnId: "turn", status: "completed" }
+  ]);
+  expect(() => owner.fromClient({ ...start, id: 5 })).toThrow("another Codex turn");
+});
+
+it("correlates auxiliary creation by request identity regardless of request ID spelling", () => {
+  const saved = vi.fn();
+  const owner = new CodexWorkerTurn(binding, saved);
+  owner.fromClient(start);
+  owner.fromClient({ ...titleThreadStart, id: 7 });
+  owner.fromServer({ ...titleThreadResponse, id: "7" });
+  expect(() => owner.fromClient(titleTurnStart)).toThrow("another Codex turn");
+  owner.fromServer({ ...titleThreadResponse, id: 7 });
+  owner.fromClient({ ...titleTurnStart, id: 8 });
+  owner.fromServer({ id: 8, error: { message: "Title generation unavailable" } });
+  expect(saved).not.toHaveBeenCalled();
+  owner.fromServer(response);
+  owner.fromServer(complete());
+  expect(saved).toHaveBeenLastCalledWith(expect.objectContaining({ threadId: "thread", turnId: "turn", status: "completed" }));
+});
+
+it.each([
+  { name: "unconfirmed creation", request: titleThreadStart, reply: undefined },
+  { name: "unrelated response", request: titleThreadStart, reply: { ...titleThreadResponse, id: "unrelated" } },
+  { name: "creation notification", request: titleThreadStart, reply: { ...titleThreadResponse, method: "thread/started" } },
+  { name: "failed creation", request: titleThreadStart, reply: { id: titleThreadStart.id, error: { message: "Start failed" } } },
+  { name: "malformed creation", request: titleThreadStart, reply: { id: titleThreadStart.id, result: { thread: { id: "" } } } },
+  { name: "persistent system thread", request: { ...titleThreadStart, params: { threadSource: "system", ephemeral: false } }, reply: titleThreadResponse },
+  { name: "ephemeral user thread", request: { ...titleThreadStart, params: { threadSource: "cli", ephemeral: true } }, reply: titleThreadResponse },
+  { name: "missing system source", request: { ...titleThreadStart, params: { ephemeral: true } }, reply: titleThreadResponse },
+  { name: "missing ephemeral flag", request: { ...titleThreadStart, params: { threadSource: "system" } }, reply: titleThreadResponse },
+  { name: "non-boolean ephemeral flag", request: { ...titleThreadStart, params: { threadSource: "system", ephemeral: "true" } }, reply: titleThreadResponse }
+])("rejects unknown turns with title-like IDs after $name", ({ request, reply }) => {
+  const owner = new CodexWorkerTurn(binding, () => undefined);
+  owner.fromClient(start);
+  owner.fromServer(response);
+  owner.fromClient(request);
+  if (reply) owner.fromServer(reply);
+  expect(() => owner.fromClient(titleTurnStart)).toThrow("another Codex turn");
+});
+
+it("does not reclassify the worker thread as an auxiliary thread", () => {
+  const owner = new CodexWorkerTurn(binding, () => undefined);
+  owner.fromClient(start);
+  owner.fromServer(response);
+  owner.fromClient(titleThreadStart);
+  expect(() => owner.fromServer({ id: titleThreadStart.id, result: { thread: { id: "thread" } } })).toThrow("worker thread");
+  expect(() => owner.fromClient({ ...start, id: titleTurnStart.id })).toThrow("another Codex turn");
+});
+
+it("forgets failed auxiliary creation and unsubscribed auxiliary threads", () => {
+  const owner = new CodexWorkerTurn(binding, () => undefined);
+  owner.fromClient(start);
+  owner.fromServer(response);
+  owner.fromClient(titleThreadStart);
+  owner.fromServer({ id: titleThreadStart.id, error: { message: "Start failed" } });
+  owner.fromServer(titleThreadResponse);
+  expect(() => owner.fromClient(titleTurnStart)).toThrow("another Codex turn");
+  owner.fromClient({ ...titleThreadStart, id: "next-creation" });
+  owner.fromServer({ ...titleThreadResponse, id: "next-creation" });
+  owner.fromClient(titleTurnStart);
+  owner.fromClient({ id: "unsubscribe", method: "thread/unsubscribe", params: { threadId: "title-thread" } });
+  expect(() => owner.fromClient({ ...titleTurnStart, id: "next-turn" })).toThrow("another Codex turn");
+});
+
+it("requires request identities for auxiliary threads and their turns", () => {
+  const owner = new CodexWorkerTurn(binding, () => undefined);
+  expect(() => owner.fromClient({ ...titleThreadStart, id: undefined })).toThrow("missing its request identity");
+  owner.fromClient(titleThreadStart);
+  owner.fromServer(titleThreadResponse);
+  expect(() => owner.fromClient({ ...titleTurnStart, id: undefined })).toThrow("missing its request or thread identity");
+});
+
+it.each([false, true])("bounds auxiliary tracking and releases capacity (confirmed=%s)", confirmed => {
+  const owner = new CodexWorkerTurn(binding, () => undefined);
+  for (let id = 0; id < 32; id++) {
+    owner.fromClient({ ...titleThreadStart, id });
+    if (confirmed) owner.fromServer({ id, result: { thread: { id: `auxiliary-${id}` } } });
+  }
+  expect(() => owner.fromClient(titleThreadStart)).toThrow("tracking exceeded its limit");
+  if (confirmed) owner.fromClient({ id: "unsubscribe", method: "thread/unsubscribe", params: { threadId: "auxiliary-0" } });
+  else owner.fromServer({ id: 0, error: { message: "Start failed" } });
+  expect(() => owner.fromClient(titleThreadStart)).not.toThrow();
+});
 
 it.each(["completed", "interrupted", "failed"])("pins the actual turn/start identity and records native %s once", status => {
   const saved: unknown[] = [];
@@ -123,13 +237,14 @@ it.each(["signalled exit", "cancellation before exit", "cancellation during clea
   expect(session.snapshot().status).toBe(scenario === "signalled exit" ? "failed" : "stopped");
 });
 
-it("retains the native final response even when the visible client exits before rendering it and reaps descendants", async () => {
+it("waits past auxiliary completion, retains the worker final response before rendering, and reaps descendants", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-bridge-"));
   directories.push(directory);
   const command = path.join(directory, "codex.mjs");
   const receiptPath = path.join(directory, "turn.json");
   const reportPath = path.join(directory, "report.json");
   const releasePath = path.join(directory, "release-final");
+  const titleCompletedPath = path.join(directory, "title-completed");
   const childPath = path.join(directory, "child.pid");
   const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
   await fs.writeFile(command, `#!/usr/bin/env node
@@ -143,7 +258,17 @@ if (process.argv.includes('app-server')) {
   const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
   readline.createInterface({ input: process.stdin }).on('line', line => {
     const message = JSON.parse(line);
+    if (message.method === 'thread/start') {
+      send(${JSON.stringify(titleThreadResponse)});
+      return;
+    }
     if (message.method !== 'turn/start') return;
+    if (message.params.threadId === 'title-thread') {
+      send({ id: message.id, result: { turn: { id: 'title-turn', status: 'inProgress' } } });
+      send({ method: 'item/completed', params: { threadId: 'title-thread', turnId: 'title-turn', item: { type: 'agentMessage', phase: 'final_answer', text: '{"title":"Auxiliary title"}' } } });
+      send(${JSON.stringify(complete("completed", "title-thread", "title-turn"))});
+      return;
+    }
     send({ id: message.id, result: { turn: { id: 'turn', status: 'inProgress' } } });
     fs.writeFileSync(${JSON.stringify(reportPath)}, '{}');
     const release = setInterval(() => {
@@ -157,7 +282,13 @@ if (process.argv.includes('app-server')) {
   const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
   socket.on('open', () => socket.send(JSON.stringify(${JSON.stringify(start)})));
   // Intentionally omit rendering the final event: shutdown must retain it anyway.
-  socket.on('message', () => {});
+  socket.on('message', data => {
+    const message = JSON.parse(data.toString());
+    if (message.id === 4) socket.send(JSON.stringify(${JSON.stringify(titleThreadStart)}));
+    if (message.id === ${JSON.stringify(titleThreadStart.id)}) socket.send(JSON.stringify(${JSON.stringify(titleTurnStart)}));
+    if (message.method === 'turn/completed' && message.params.threadId === 'title-thread')
+      fs.writeFileSync(${JSON.stringify(titleCompletedPath)}, 'completed');
+  });
   process.stdin.setRawMode(true);
   process.stdin.on('data', data => { if (data.toString().includes('/quit')) { process.stdout.write('Native conversation closed.\\r\\n', () => process.exit(0)); } });
 }
@@ -170,7 +301,9 @@ if (process.argv.includes('app-server')) {
   const session = new CodexTerminalSession(tab, terminal, undefined, { closeOnExit: false, nativeTurn: { ...binding, receiptPath } });
   try {
     await expect.poll(async () => fs.access(reportPath).then(() => true, () => false)).toBe(true);
+    await expect.poll(async () => fs.access(titleCompletedPath).then(() => true, () => false)).toBe(true);
     await expect.poll(async () => fs.readFile(receiptPath, "utf8").then(text => JSON.parse(text).status, () => undefined)).toBe("running");
+    await expect(fs.access(`${receiptPath}.final.json`)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(session.handleAction("finish", { threadId: "thread", turnId: "turn" })).rejects.toThrow("not completed successfully");
     expect(session.hasExited()).toBe(false);
     await fs.writeFile(releasePath, "release");
@@ -179,6 +312,7 @@ if (process.argv.includes('app-server')) {
     await session.handleAction("finish", { threadId: "thread", turnId: "turn" });
     expect(session.snapshot()).toMatchObject({ status: "completed" });
     expect(session.snapshot().recentOutput).toContain("The delayed final response is preserved.");
+    expect(session.snapshot().recentOutput).not.toContain("Auxiliary title");
     const screen = await session.attachTerminal(() => undefined);
     expect(screen.screen.data).toContain("The delayed final response is preserved.");
     screen.dispose();

@@ -11,21 +11,30 @@ import { CODEX_SUBMIT_DELAY_MS, CodexTerminalSession } from "./CodexTerminalPlug
 const codex = process.env.CLOUDX_NATIVE_CODEX;
 
 // Uses the installed Codex protocol and TUI with a local synthetic provider; no credentials or external model service.
-it.skipIf(!codex)("completes the installed native worker turn and gracefully closes its visible conversation", async () => {
+it.skipIf(!codex)("preserves the native worker completion while Codex generates its hidden thread title", async () => {
+  expect(path.isAbsolute(codex!)).toBe(true);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-worker-"));
   const home = path.join(root, "home");
   const finalText = "The native final response remains visible after handoff.";
+  const title = "Verify native worker completion";
+  const providerRequests: string[] = [];
   const provider = createServer((request, response) => {
-    request.resume();
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", chunk => { body += chunk; });
     request.on("end", () => {
-      const message = { type: "message", id: "msg_native", role: "assistant", phase: "final_answer", status: "completed", content: [{ type: "output_text", text: finalText, annotations: [] }] };
+      const input = JSON.parse(body);
+      const purpose = input.text?.format?.schema?.properties?.title ? "title" : "worker";
+      providerRequests.push(purpose);
+      const text = purpose === "title" ? JSON.stringify({ title }) : finalText;
+      const message = { type: "message", id: `msg_${purpose}`, role: "assistant", phase: "final_answer", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
       response.writeHead(200, { "content-type": "text/event-stream" });
       for (const event of [
-        { type: "response.created", response: { id: "resp_native", status: "in_progress", output: [] } },
+        { type: "response.created", response: { id: `resp_${purpose}`, status: "in_progress", output: [] } },
         { type: "response.output_item.added", output_index: 0, item: { ...message, status: "in_progress", content: [] } },
-        { type: "response.output_text.delta", item_id: message.id, output_index: 0, content_index: 0, delta: finalText },
+        { type: "response.output_text.delta", item_id: message.id, output_index: 0, content_index: 0, delta: text },
         { type: "response.output_item.done", output_index: 0, item: message },
-        { type: "response.completed", response: { id: "resp_native", status: "completed", output: [message], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+        { type: "response.completed", response: { id: `resp_${purpose}`, status: "completed", output: [message], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
       ]) response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
       response.end();
     });
@@ -34,13 +43,14 @@ it.skipIf(!codex)("completes the installed native worker turn and gracefully clo
   const address = provider.address() as { port: number };
   let terminal;
   try {
-    await fs.mkdir(home);
+    await fs.mkdir(home, { mode: 0o700 });
     await fs.writeFile(path.join(home, "config.toml"), [
       'model = "cloudx-native"', 'model_provider = "cloudx-native"',
       'approval_policy = "never"', 'sandbox_mode = "danger-full-access"',
       '[model_providers.cloudx-native]', 'name = "CloudX native test"',
       `base_url = "http://127.0.0.1:${address.port}/v1"`,
-      'wire_api = "responses"', 'requires_openai_auth = false', ''
+      'wire_api = "responses"', 'requires_openai_auth = false',
+      `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
     ].join("\n"));
     const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, TERM: "xterm-256color" };
     const binding = { workerId: "native-worker", attemptId: "native-attempt", receiptPath: path.join(root, "turn.json") };
@@ -58,6 +68,13 @@ it.skipIf(!codex)("completes the installed native worker turn and gracefully clo
       catch { return session.snapshot().recentOutput; }
       return receipt?.status;
     }, { timeout: 15_000 }).toBe("completed");
+    await expect.poll(() => providerRequests.includes("title") ? "title requested" : session.snapshot().recentOutput, { timeout: 5_000 }).toBe("title requested");
+    await expect.poll(() => fs.readFile(path.join(home, "session_index.jsonl"), "utf8"), { timeout: 5_000 }).toContain(title);
+    expect(providerRequests.sort()).toEqual(["title", "worker"]);
+    expect(JSON.parse(await fs.readFile(binding.receiptPath, "utf8"))).toEqual(receipt);
+    expect(JSON.parse(await fs.readFile(`${binding.receiptPath}.final.json`, "utf8"))).toMatchObject({
+      threadId: receipt!.threadId, turnId: receipt!.turnId, text: finalText
+    });
     await session.handleAction("finish", { threadId: receipt!.threadId, turnId: receipt!.turnId });
     expect(session.snapshot().status).toBe("completed");
     expect(session.snapshot().recentOutput).toContain(finalText);
