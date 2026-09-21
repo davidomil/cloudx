@@ -11,8 +11,54 @@ import {
 } from "./connections/ForgeConnectionStore.js";
 import type { ForgeRepository, ForgeWorker } from "@cloudx/shared";
 import { ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { ForgeRuntime } from "./ForgeRuntime.js";
 
 describe("Forge in the composed CloudX server", () => {
+  it("returns the blocked worker and ownership recovery action for repeated Resume requests", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-resume-ownership-http-"));
+    const config = loadConfig({
+      CLOUDX_DATA_DIR: path.join(root, "data"), CLOUDX_ALLOWED_ROOTS: root, CLOUDX_LOG_LEVEL: "silent",
+      CLOUDX_APP_SERVER_ENABLED: "false", CLOUDX_AUTOMATION_START_DISABLED: "true", CLOUDX_WEB_DIST_DIR: path.join(root, "web"),
+    });
+    const services = buildServices(config);
+    await services.pluginContributionsReady;
+    const app = await buildServer(config, services);
+    const worker: ForgeWorker = {
+      id: "33333333-3333-4333-8333-333333333333", attemptId: "44444444-4444-4444-8444-444444444444",
+      tabId: "missing-worker-tab", kind: "issue", number: 7, title: "Repair deployment", status: "running",
+      repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" },
+      repositoryPath: root, worktreePath: root, branch: "cloudx/forge/repair", baseBranch: "main", templateId: "worker", autoPost: false,
+      startedAt: "2026-09-15T12:00:00.000Z", updatedAt: "2026-09-15T12:00:00.000Z",
+    };
+    const reason = "Worker execution is still live. Stop its supervisor, then use Resume. Local resources were preserved.";
+    const recover = vi.spyOn(ForgeRuntime.prototype, "recover").mockResolvedValue({ tabIds: [worker.tabId!] });
+    const close = vi.spyOn(ForgeRuntime.prototype, "close").mockRejectedValue(new Error(reason));
+    const launch = vi.spyOn(ForgeRuntime.prototype, "launch");
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    try {
+      const store = new ForgeWorkflowStore(services.pluginData!);
+      await store.write([worker]);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await app.inject({
+          method: "POST", url: "/api/hooks/forge.worker.resume", headers: { host: "127.0.0.1:3001" },
+          payload: { input: { id: worker.id, windowId: "window-1", paneId: "pane-1" } },
+        });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toMatchObject({ result: { worker: { id: worker.id, status: "cleanup_failed", error: reason, worktreePath: root, attemptId: worker.attemptId } } });
+      }
+      expect((await store.read())[0]).toMatchObject({ status: "cleanup_failed", error: reason });
+      expect(launch).not.toHaveBeenCalled();
+      expect(fetcher).not.toHaveBeenCalled();
+    } finally {
+      recover.mockRestore();
+      close.mockRestore();
+      launch.mockRestore();
+      fetcher.mockRestore();
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("dispatches the displayed uncertain reply through the browser HTTP hook after boundary validation", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-reply-recovery-http-"));
     const config = loadConfig({

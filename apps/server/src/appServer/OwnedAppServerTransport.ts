@@ -42,7 +42,7 @@ export class OwnedAppServerTransport extends StdioAppServerTransport {
     let supervisor: TerminalSupervisor | undefined;
     const abort = () => supervisor?.kill();
     try {
-      const native = spawn("python3", ["-I", "-S", helper, directory, String(process.pid), launch.command, ...launch.configurationArgs, "app-server", "--listen", "stdio://"], {
+      const native = spawn("python3", ["-I", "-S", helper, directory, String(process.pid), "null", launch.command, ...launch.configurationArgs, "app-server", "--listen", "stdio://"], {
         cwd: launch.cwd, env: launch.env, stdio: ["pipe", "pipe", "ignore"],
       });
       if (!native.pid) {

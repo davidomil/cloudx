@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NodePtyTerminalProcessFactory } from "./NodePtyTerminalProcess.js";
-import type { TerminalProcess } from "./TerminalProcess.js";
+import type { TerminalExecutionBinding, TerminalProcess } from "./TerminalProcess.js";
 
 const fixtures: DetachedTerminalFixture[] = [];
 const terminals: TerminalProcess[] = [];
@@ -76,13 +76,15 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
     await expect(terminal.terminate()).resolves.toBeUndefined();
   });
 
-  it("cleans descendants and receipts when the hosting Node process dies", async () => {
+  it.each(["ephemeral", "durable"])("reaps descendants after SIGKILL of the Node host with %s receipts", async (retention) => {
     const directory = await DetachedTerminalFixture.prepareCommand();
+    const execution = retention === "durable" ? await executionBinding(directory) : undefined;
     const harnessFile = path.join(directory, "host.mjs");
     await fs.writeFile(harnessFile, `import fs from 'node:fs';
       import { NodePtyTerminalProcessFactory } from ${JSON.stringify(new URL("./NodePtyTerminalProcess.ts", import.meta.url).href)};
       const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [${JSON.stringify(path.join(directory, "command.mjs"))}, ${JSON.stringify(directory)}, 'alive'], {
-        cwd: ${JSON.stringify(directory)}, env: process.env, cols: 100, rows: 30
+        cwd: ${JSON.stringify(directory)}, env: process.env, cols: 100, rows: 30,
+        execution: ${JSON.stringify(execution ?? null)}
       });
       fs.writeFileSync(${JSON.stringify(path.join(directory, "supervisor-directory"))}, terminal.supervisor.directory);
       setTimeout(() => process.exit(0), 15000);
@@ -96,11 +98,21 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
       expect(supervisor?.parent).toBe(host.pid);
       const receiptDirectory = await fs.readFile(path.join(directory, "supervisor-directory"), "utf8");
       directories.push(receiptDirectory);
+      const ready = JSON.parse(await fs.readFile(path.join(receiptDirectory, "ready.json"), "utf8"));
+      if (execution) expect(ready).toEqual({
+        executionId: execution.executionId, bootId: execution.bootId, pidNamespace: execution.pidNamespace,
+        pid: supervisor!.pid, started: supervisor!.started
+      });
 
       await stopChild(host);
+      expect(host.signalCode).toBe("SIGKILL");
 
       await waitUntil(async () => !await isRunning(command) && !await isRunning(daemon) && !await isRunning(supervisor!));
-      await expect(fs.access(receiptDirectory)).rejects.toMatchObject({ code: "ENOENT" });
+      if (execution) {
+        expect(JSON.parse(await fs.readFile(path.join(receiptDirectory, "complete.json"), "utf8")))
+          .toEqual({ ...ready, exitCode: 0, signal: 9 });
+        expect(JSON.parse(await fs.readFile(path.join(receiptDirectory, "ready.json"), "utf8"))).toEqual(ready);
+      } else await expect(fs.access(receiptDirectory)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await stopChild(host);
       await stopRecordedProcesses(directory);
@@ -108,8 +120,41 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
     }
   });
 
-  it("refuses quiescence after unexpected supervisor death", async () => {
-    const fixture = await DetachedTerminalFixture.create("alive");
+  it("retains bound receipts after ordinary completion and rejects reuse of the execution directory", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-durable-test-"));
+    directories.push(directory);
+    const execution = await executionBinding(directory);
+    const options = { cwd: directory, env: process.env, cols: 100, rows: 30, execution };
+    const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", "process.exit(19)"], options);
+    terminals.push(terminal);
+
+    expect(await terminalExit(terminal)).toEqual({ exitCode: 19 });
+    await terminal.terminate();
+    const ready = JSON.parse(await fs.readFile(path.join(execution.directory, "ready.json"), "utf8"));
+    expect(ready).toMatchObject({ executionId: execution.executionId, bootId: execution.bootId, pidNamespace: execution.pidNamespace });
+    expect(JSON.parse(await fs.readFile(path.join(execution.directory, "complete.json"), "utf8"))).toEqual({ ...ready, exitCode: 19 });
+
+    await expect(new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", ""], options)).rejects.toThrow("must be empty before launch");
+    expect(await fs.readdir(execution.directory)).toEqual(["complete.json", "ready.json"]);
+  });
+
+  it.each(["bootId", "pidNamespace"] as const)("refuses a changed %s before launching and retains the error receipt", async (changed) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-invalid-binding-test-"));
+    directories.push(directory);
+    const execution = { ...await executionBinding(directory), [changed]: "unexpected-environment" };
+    const commandMarker = path.join(directory, "command-started");
+
+    await expect(new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", `require('node:fs').writeFileSync(${JSON.stringify(commandMarker)}, 'started')`], {
+      cwd: directory, env: process.env, cols: 100, rows: 30, execution
+    })).rejects.toThrow("Terminal supervisor failed to start");
+    await expect(fs.access(commandMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readdir(execution.directory)).toEqual(["error.json"]);
+    expect(JSON.parse(await fs.readFile(path.join(execution.directory, "error.json"), "utf8")))
+      .toMatchObject({ executionId: execution.executionId, message: "Terminal execution binding does not match the current boot and PID namespace" });
+  });
+
+  it.each(["ephemeral", "durable"])("refuses quiescence after unexpected supervisor death with %s receipts", async (retention) => {
+    const fixture = await DetachedTerminalFixture.create("alive", retention === "durable");
     await fixture.launcherExited();
     const command = await fixture.process("command");
     expect(command.parent).not.toBe(process.pid);
@@ -117,6 +162,21 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
 
     await expect(fixture.terminal.terminate()).rejects.toThrow("without confirming its descendants stopped");
     expect(await isRunning(await fixture.process("daemon"))).toBe(true);
+    if (fixture.execution) {
+      await expect(fs.access(path.join(fixture.execution.directory, "ready.json"))).resolves.toBeUndefined();
+      await expect(fs.access(path.join(fixture.execution.directory, "complete.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("preserves the durable execution directory when Python cannot start", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-missing-python-test-"));
+    directories.push(directory);
+    const execution = await executionBinding(directory);
+
+    await expect(new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", ""], {
+      cwd: directory, env: { ...process.env, PATH: "/cloudx-test-no-executables" }, cols: 100, rows: 30, execution
+    })).rejects.toThrow("Python 3.9 or newer");
+    expect(await fs.readdir(execution.directory)).toEqual([]);
   });
 
   it("fails clearly and removes launch receipts when Python is unavailable", async () => {
@@ -193,6 +253,16 @@ runpy.run_path(sys.argv[0], run_name='__main__')
   });
 });
 
+async function executionBinding(directory: string): Promise<TerminalExecutionBinding> {
+  const receipts = path.join(directory, "execution-receipts");
+  await fs.mkdir(receipts);
+  return {
+    executionId: "test-durable-execution", directory: receipts,
+    bootId: (await fs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim(),
+    pidNamespace: await fs.readlink("/proc/self/ns/pid")
+  };
+}
+
 async function startTerminal(command: string, args: string[]) {
   const terminal = await new NodePtyTerminalProcessFactory().spawn(command, args, {
     cwd: os.tmpdir(), env: process.env, cols: 100, rows: 30
@@ -211,7 +281,8 @@ class DetachedTerminalFixture {
   private constructor(
     readonly directory: string,
     readonly terminal: TerminalProcess,
-    readonly unrelated: ChildProcess
+    readonly unrelated: ChildProcess,
+    readonly execution?: TerminalExecutionBinding
   ) {}
 
   static async prepareCommand() {
@@ -250,14 +321,15 @@ class DetachedTerminalFixture {
     return directory;
   }
 
-  static async create(mode: "alive" | "exited") {
+  static async create(mode: "alive" | "exited", durable = false) {
     const directory = await this.prepareCommand();
+    const execution = durable ? await executionBinding(directory) : undefined;
     const unrelated = spawn(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], { stdio: "ignore" });
     try {
       const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [path.join(directory, "command.mjs"), directory, mode], {
-        cwd: directory, env: process.env, cols: 100, rows: 30
+        cwd: directory, env: process.env, cols: 100, rows: 30, execution
       });
-      const fixture = new DetachedTerminalFixture(directory, terminal, unrelated);
+      const fixture = new DetachedTerminalFixture(directory, terminal, unrelated, execution);
       fixtures.push(fixture);
       return fixture;
     } catch (error) {
