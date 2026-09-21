@@ -1,0 +1,6 @@
+flowchart TB
+  A[Choose project directory] --> B[Open Terminal tab]
+  B --> C[Run shell command on server host]
+  C --> D{Task}
+  D -->|Build or test| E[Inspect command output]
+  D -->|Development server| F[Open URL in Local Web]

@@ -1,82 +1,37 @@
-# Cloudx Launch Copy
+# CloudX project descriptions
 
-Canonical sentence:
+Use these descriptions for the repository and desktop demos. Keep
+historical version announcements in [release notes](releases/v0.1.0.md).
 
-Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control.
+## Short description
 
-## GitHub About
+A local-first desktop workbench for production development with Codex,
+terminals, files, worktrees, documentation and issue workflows.
 
-Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control.
+## Long description
 
-## GitHub Topics
+CloudX runs on your Linux workstation and brings agent sessions, code
+review, local previews, reference material and automation into reusable
+project workspaces. Mobile access and voice control remain available
+when useful. Keep it local or behind authenticated private remote
+access.
 
-- codex
-- codex-cli
-- openai-codex
-- ai-coding
-- coding-agent
-- developer-tools
-- local-first
-- self-hosted
-- mobile-first
-- web-ui
-- phone
-- voice-control
-- faster-whisper
-- terminal
-- tmux
-- worktrees
-- typescript
-- react
-- fastify
-- homelab
+## Demo title
 
-## Release
+CloudX: implement, inspect and verify a change in one desktop workspace
 
-Title:
+## Suggested topics
 
-Cloudx v0.1.0: Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control
+`codex`, `codex-cli`, `ai-coding`, `developer-tools`, `local-first`,
+`self-hosted`, `desktop-workbench`, `terminal`, `worktrees`,
+`documentation`, `automation`, `typescript`, `react`, `fastify`
 
-Notes:
-
-### What works
-
-- Mobile and desktop UI.
-- Codex terminal sessions.
-- Shell terminals.
-- File browser and diffs.
-- Worktree manager.
-- Local web dashboard panes.
-- Local Faster Whisper voice control.
-- Ubuntu installer and systemd user services.
-
-### Known limits
-
-- Trusted LAN/tailnet only.
-- Not multi-user.
-- Not a hardened public service.
-- Codex app-server integration not yet used.
-
-## Demo Title
-
-Cloudx demo: Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control
-
-## Hacker News Title
-
-Show HN: Cloudx - Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control
-
-## Reddit Title
-
-Cloudx: Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control
-
-## npm Description
-
-Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control.
-
-## Install Copy
+## Install
 
 ```bash
 git clone https://github.com/davidomil/cloudx
 cd cloudx
 ./install.sh
 ```
+
+See [setup](SETUP.md) for requirements and configuration.

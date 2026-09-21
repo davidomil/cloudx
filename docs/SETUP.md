@@ -1,7 +1,9 @@
-# Cloudx: Run and supervise Codex CLI from your phone on your own Linux build machine, with local-first sessions, panes, file tools, diffs, worktrees, and constrained voice control
+# CloudX setup and operations
 
-This guide keeps the README short and collects the operational details needed
-to run Cloudx with voice control.
+Install and operate the desktop workbench on your Linux machine. This guide
+covers the server, Codex sessions, integrations, documentation archive and
+optional speech services. For daily workflows, start with the
+[plugin guides](plugins/README.md) or [demo workspaces](DEMO_WORKSPACES.md).
 
 ## Requirements
 
@@ -163,6 +165,43 @@ wizard resolves the locked Python `nvidia-cublas-cu12` and
 chooses `CLOUDX_ASR_COMPUTE_TYPE=int8_float16` for smaller GPUs such as 4GB
 cards. Larger GPUs use `float16`. Set `"useGpu": false` in answers JSON to force
 CPU.
+
+## Manual development startup
+
+From the checkout root, install dependencies and build the workspace:
+
+```bash
+npm ci
+npm run build
+```
+
+Start the independent terminal broker in one terminal and keep it running:
+
+```bash
+npm run terminals -w @cloudx/server
+```
+
+In another terminal, start the web server:
+
+```bash
+npm run dev
+```
+
+Both processes must use the same `CLOUDX_DATA_DIR` and allowed-root
+configuration. Open `https://127.0.0.1:3001`. The server serves the built web
+app; terminal tabs require the broker even when the web page loads successfully.
+
+For frontend development with Vite, start the backend with its exact browser
+origin admitted:
+
+```bash
+CLOUDX_TRUSTED_ORIGINS=http://127.0.0.1:5173 npm run dev
+```
+
+Then run `npm run dev:web` in another terminal and use the Vite URL. The
+[documentation indexer](#documentation-archive-service) and
+[ASR service](#faster-whisper-large-model) have separate setup and startup
+instructions. Desktop terminals and files do not require microphone capture.
 
 ## Update
 
@@ -545,10 +584,8 @@ If initialization fails, the indexer returns HTTP 503 with status
 restart the service. `/ready` returns HTTP 200 only when archive health
 reports ready.
 
-Interactive terminal tabs also require the independent terminal broker. For
-development, run `npm run terminals -w @cloudx/server` in a separate terminal
-before starting the web server. Keep it running through web-server restarts.
-Both processes must use the same `CLOUDX_DATA_DIR` and allowed-root configuration.
+Interactive terminal tabs require the independent terminal broker described in
+[manual development startup](#manual-development-startup).
 
 For isolated frontend QA when another Cloudx server is already using the
 default port, run the server and Vite dev server on alternate ports:
