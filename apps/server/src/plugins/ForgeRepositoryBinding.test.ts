@@ -66,6 +66,7 @@ async function fixture(selectedRepository: ForgeRepository) {
   });
   const runtime = {
     isActive: vi.fn(() => true),
+    workerHistory: vi.fn(async () => undefined),
     recover: vi.fn(async () => ({ tabIds: [] })),
     prepareWorkspace: vi.fn(async () => ({ repositoryPath: root, worktreePath: root, branch: "feature" })),
     refreshReviewWorkspace: vi.fn(async () => {}),

@@ -77,6 +77,9 @@ export class ForgePlugin implements WorkspacePlugin {
       hook("dashboard", "Worker dashboard", "read", {}, [], async () => ({
         ...(await this.service().workflow.dashboard()),
       })),
+      hook("worker.history", "Read stopped worker terminal history", "read", { id }, ["id"], async ({ id }) => ({
+        history: await this.service().workflow.workerHistory(String(id)),
+      })),
       hook("issues.list", "List issues", "read", list, ["repository"], async ({ repository, ...query }) => ({
         ...(await this.provider(repository as ForgeRepository).listIssues(query)),
       })),

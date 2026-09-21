@@ -11,6 +11,10 @@ vi.mock("./TerminalPanel.js", () => ({
   TerminalPanel: ({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) => createElement("div", { "data-terminal-tab": tab.id, "data-active": String(active), "data-scale": uiScale }, createElement("textarea", { "aria-label": "Terminal input" }))
 }));
 
+vi.mock("./ForgeWorkerHistoryPanel.js", () => ({
+  ForgeWorkerHistoryPanel: ({ history }: { history: { screen: { data: string } } }) => createElement("pre", { "aria-label": "Saved worker terminal output" }, history.screen.data)
+}));
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const roots: Root[] = [];
@@ -90,6 +94,7 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.review.submit": { worker: reviewWorker },
       "forge.change.review": { change },
       "forge.worker.pause": { worker: { ...worker, status: "paused" } },
+      "forge.worker.history": {},
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
       "forge.worker.resume": { worker },
       "forge.worker.continue": { worker },
@@ -1894,14 +1899,65 @@ describe("ForgePanel", () => {
 
   it.each([
     { status: "starting" as const, message: "Preparing the worker terminal…" },
-    { status: "completed" as const, message: "No worker terminal is open." }
+    { status: "completed" as const, message: "No saved worker terminal history is available." }
   ])("shows $status terminal availability without launching work", async ({ status, message }) => {
     const testFixture = fixture({ workers: [{ ...worker, status, tabId: undefined }] });
     const panel = await renderPanel(testFixture, { workerTabs: [workerTab] });
     await click(panel, "View worker");
     expect(panel.querySelector("dialog")?.textContent).toContain(message);
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker."))).toBe(true);
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.")).map(call => call.hook)).toEqual(status === "starting" ? [] : ["forge.worker.history"]);
+  });
+
+  it.each(["failed", "completed", "stopped", "paused", "cleanup_failed"] as const)("opens saved %s worker output without resuming or starting work", async status => {
+    const history = { tabId: worker.tabId!, capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "npm test\r\nDeployment check failed: missing dependency.", cols: 100, rows: 30 } };
+    const testFixture = fixture({ workers: [{ ...worker, status, tabId: undefined, error: "Worker execution ended." }] }, hook => hook === "forge.worker.history" ? { history } : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "View worker");
+    expect(panel.querySelector("dialog")?.textContent).toContain("Worker execution ended.");
+    expect(panel.querySelector("dialog")?.textContent).toContain("Latest saved terminal · read only");
+    expect(panel.querySelector('[aria-label="Saved worker terminal output"]')?.textContent).toContain("Deployment check failed: missing dependency.");
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+    await click(panel, "Close worker terminal");
+    await click(panel, "View worker");
+    expect(panel.querySelector('[aria-label="Saved worker terminal output"]')).not.toBeNull();
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.history", input: { id: worker.id }, tabId: tab.id },
+      { hook: "forge.worker.history", input: { id: worker.id }, tabId: tab.id }
+    ]);
+  });
+
+  it("loads saved output for a missing paused tab and reports history read failures", async () => {
+    const pending = deferred<unknown>();
+    const testFixture = fixture({ workers: [{ ...worker, status: "paused" }] }, hook => hook === "forge.worker.history" ? pending.promise : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "View worker");
+    expect(panel.querySelector("dialog")?.textContent).toContain("Loading worker history…");
+    await act(async () => pending.reject(new Error("Worker history could not be read.")));
+    expect(panel.querySelector('dialog [role="alert"]')?.textContent).toContain("Worker history could not be read.");
+    expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
+  });
+
+  it("does not replace a resumed terminal with a late history response", async () => {
+    const pending = deferred<unknown>();
+    const stopped = { ...worker, status: "failed" as const, tabId: undefined };
+    const testFixture = fixture({ workers: [stopped] }, hook => hook === "forge.worker.history" ? pending.promise : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "View worker");
+    testFixture.dashboard.workers = [worker];
+    await click(panel, "Refresh Forge");
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
+    await act(async () => pending.resolve({ history: { tabId: "old-terminal", capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "Old run output", cols: 100, rows: 30 } } }));
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    expect(panel.querySelector('[aria-label="Saved worker terminal output"]')).toBeNull();
+  });
+
+  it("does not present a previous run as the missing current terminal", async () => {
+    const history = { tabId: "old-terminal", capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "Old run output", cols: 100, rows: 30 } };
+    const panel = await renderPanel(fixture({ workers: [worker] }, hook => hook === "forge.worker.history" ? { history } : undefined));
+    await click(panel, "View worker");
+    expect(panel.querySelector("dialog")?.textContent).toContain("The worker terminal is unavailable.");
+    expect(panel.querySelector('[aria-label="Saved worker terminal output"]')).toBeNull();
   });
 
   it("shows paused worker output only while its Forge pane is active", async () => {
@@ -1954,7 +2010,7 @@ describe("ForgePanel", () => {
     await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
     expect(document.activeElement).toBe(tabs[1]);
     expect(panel.querySelector("dialog")).toBeNull();
-    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker."))).toBe(true);
+    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker.") || call.hook === "forge.worker.history")).toBe(true);
   });
 
   it("keeps the selected worker through Resume replacing its terminal and cleanup removing it", async () => {
@@ -1987,14 +2043,14 @@ describe("ForgePanel", () => {
     testFixture.dashboard.workers[1] = { ...second, status: "completed", tabId: undefined };
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(panel.querySelector("dialog")?.textContent).toContain("No worker terminal is open.");
+    expect(panel.querySelector("dialog")?.textContent).toContain("No saved worker terminal history is available.");
     testFixture.dashboard.workers = [worker];
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     expect(panel.querySelectorAll('[role="tab"]')).toHaveLength(1);
     expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #7");
     expect(panel.querySelector("dialog")).toBeNull();
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([{ hook: "forge.worker.resume", input: { id: second.id, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" }]);
+    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.history")).toEqual([{ hook: "forge.worker.resume", input: { id: second.id, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" }]);
   });
 
   it("preserves the current pull request and its unsaved review while viewing its worker", async () => {

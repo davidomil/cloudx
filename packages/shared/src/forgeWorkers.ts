@@ -26,6 +26,11 @@ export interface ForgeIssueCompletionReport {
     details: string;
   };
 }
+export interface ForgeWorkerHistory {
+  tabId: string;
+  capturedAt: string;
+  screen: { data: string; cols: number; rows: number };
+}
 export interface ForgeWorker {
   id: string;
   kind: "issue" | "review";

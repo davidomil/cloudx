@@ -79,6 +79,7 @@ async function workers(page: Page, holdFirstContinuation = false) {
     input: Record<string, unknown>;
     tabId: string;
   }> = [];
+  const historyRequests: string[] = [];
   let held!: Route;
   let requested!: () => void;
   const pending = new Promise<void>((resolve) => {
@@ -95,6 +96,21 @@ async function workers(page: Page, holdFirstContinuation = false) {
         });
       case "forge.issues.list":
         return route.fulfill({ json: { items: [] } });
+      case "forge.worker.history":
+        historyRequests.push(body.input.id);
+        return route.fulfill({
+          json: {
+            history: {
+              tabId: `${body.input.id}-terminal`,
+              capturedAt: "2026-09-21T12:00:00.000Z",
+              screen: {
+                cols: 100,
+                rows: 30,
+                data: `Starting deployment check\r\n${Array.from({ length: 80 }, (_, index) => `Checking dependency ${index + 1}`).join("\r\n")}\r\n\x1b[31mDeployment check failed: missing dependency.\x1b[0m\x1b[?1003h`,
+              },
+            },
+          },
+        });
       case "forge.worker.continue": {
         continuations.push(body);
         if (holdFirstContinuation && continuations.length === 1) {
@@ -116,6 +132,7 @@ async function workers(page: Page, holdFirstContinuation = false) {
   await page.getByRole("button", { name: "Workers (2)", exact: true }).click();
   return {
     continuations,
+    historyRequests,
     pending,
     fail: () =>
       held.fulfill({
@@ -129,6 +146,83 @@ for (const worker of [
   { kind: "issue", number: 7, status: "failed" },
   { kind: "review", number: 12, status: "completed" },
 ]) {
+  test(`views the ${worker.status} ${worker.kind} worker history without restarting it`, async ({
+    page,
+  }, testInfo) => {
+    const sockets: string[] = [];
+    page.on("websocket", (socket) => sockets.push(socket.url()));
+    const fixture = await workers(page);
+    const tab = page.getByRole("tab", {
+      name: new RegExp(`${worker.kind} #${worker.number}`, "i"),
+    });
+    await tab.click();
+    await page
+      .getByRole("button", { name: "View worker", exact: true })
+      .click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toContainText("Latest saved terminal · read only");
+    const output = dialog.getByRole("region", {
+      name: "Saved worker terminal output",
+    });
+    await expect(output.locator(".xterm-accessibility-tree")).toContainText(
+      "Deployment check failed: missing dependency.",
+    );
+    await expect(output).toBeInViewport({ ratio: 1 });
+    const bounds = (await output.boundingBox())!;
+    expect(bounds.width).toBeGreaterThan(250);
+    expect(bounds.height).toBeGreaterThan(200);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(
+      page.viewportSize()!.width,
+    );
+    const screenshot = testInfo.outputPath("saved-worker-history.png");
+    await page.screenshot({ path: screenshot });
+    await testInfo.attach("saved-worker-history", {
+      path: screenshot,
+      contentType: "image/png",
+    });
+
+    await output.hover();
+    const beforeScrolling = await output
+      .locator(".xterm-accessibility-tree")
+      .textContent();
+    await page.mouse.wheel(0, -10_000);
+    await expect(output.locator(".xterm-accessibility-tree")).not.toHaveText(
+      beforeScrolling!,
+    );
+    if (testInfo.project.name === "mobile-chromium") {
+      const rail = (await output
+        .locator(".terminal-mobile-scroll-rail")
+        .boundingBox())!;
+      await page.touchscreen.tap(rail.x + rail.width / 2, rail.y + 1);
+    } else {
+      await output.locator("textarea").focus();
+      for (let index = 0; index < 4; index++)
+        await page.keyboard.press("Shift+PageUp");
+    }
+    await expect(output.locator(".xterm-accessibility-tree")).toContainText(
+      "Starting deployment check",
+    );
+    await dialog.getByRole("button", { name: "Close worker terminal" }).click();
+    await expect(dialog).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "View worker", exact: true })
+      .click();
+    await expect(output.locator(".xterm-accessibility-tree")).toContainText(
+      "Deployment check failed: missing dependency.",
+    );
+    await output.locator("textarea").focus();
+    await page.keyboard.type("do not run this");
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    expect(fixture.historyRequests).toEqual([
+      `${worker.kind}-worker`,
+      `${worker.kind}-worker`,
+    ]);
+    expect(fixture.continuations).toEqual([]);
+    expect(sockets).toEqual([]);
+    await expect(tab).toContainText(worker.status);
+  });
+
   test(`continues the selected ${worker.status} ${worker.kind} worker with a multiline message`, async ({
     page,
   }, testInfo) => {

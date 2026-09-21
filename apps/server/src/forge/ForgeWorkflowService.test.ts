@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
-import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
@@ -62,6 +62,7 @@ function fixture() {
   let stored: ForgeWorker[] = [];
   const runtime = {
     isActive: vi.fn(() => true),
+    workerHistory: vi.fn(async (_id: string): Promise<ForgeWorkerHistory | undefined> => undefined),
     recover: vi.fn(async (_id: string): ReturnType<ForgeWorkflowDependencies["runtime"]["recover"]> => ({
       workspace: undefined as
         | {
@@ -147,6 +148,43 @@ function deferred<T>() {
   const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
   return { promise, resolve, reject };
 }
+
+describe("Retained worker terminal history", () => {
+  it("loads the known worker after restart and reads history without launching work", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.stop(worker.id);
+    f.runtime.launch.mockClear();
+    const history = { tabId: "tab-1", capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "Stopped output", cols: 100, rows: 30 } };
+    f.runtime.workerHistory.mockResolvedValue(history);
+
+    await expect(new ForgeWorkflowService(f.deps).workerHistory(worker.id)).resolves.toEqual(history);
+    expect(f.runtime.workerHistory).toHaveBeenCalledExactlyOnceWith(worker.id);
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown workers without reading an arbitrary history file", async () => {
+    const f = fixture();
+    await expect(f.service.workerHistory("unknown")).rejects.toThrow("Unknown worker.");
+    expect(f.runtime.workerHistory).not.toHaveBeenCalled();
+  });
+
+  it("reads history while the loaded workflow waits for an active worker report", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const reading = deferred<void>();
+    const report = deferred<undefined>();
+    f.reports.read.mockImplementationOnce(() => { reading.resolve(); return report.promise; });
+    const poll = f.service.poll();
+    await reading.promise;
+    try {
+      const history = f.service.workerHistory(worker.id);
+      await vi.waitFor(() => expect(f.runtime.workerHistory).toHaveBeenCalledExactlyOnceWith(worker.id));
+      await expect(history).resolves.toBeUndefined();
+    } finally { report.resolve(undefined); await poll; }
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+});
 
 describe("Manual worker continuation", () => {
   async function pausedIssue() {
