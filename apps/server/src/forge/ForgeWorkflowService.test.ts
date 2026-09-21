@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
@@ -8,6 +11,7 @@ import {
 } from "./ForgeWorkflowService.js";
 import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
+import { ForgeWorkerReports } from "./ForgeWorkflowStore.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
@@ -1268,6 +1272,59 @@ describe("Forge native turn completion", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.runtime.publishBranch).not.toHaveBeenCalled();
     expect(f.reports.remove).not.toHaveBeenCalledWith(f.worker.attemptId);
+  });
+
+  it.each([
+    ["issue", false], ["issue", true], ["review", false], ["review", true],
+  ] as const)("continues %s work after malformed JSON while preserving its evidence (restart: %s)", async (kind, restart) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-continuation-"));
+    const f = fixture();
+    const reports = new ForgeWorkerReports(root);
+    const deps = { ...f.deps, reports };
+    let service = new ForgeWorkflowService(deps);
+    try {
+      const worker = kind === "issue"
+        ? await service.startIssue(deps.settings().repository, 1, placement)
+        : await service.startReview(deps.settings().repository, 7, false, placement);
+      const reportPath = path.join(root, "forge-reports", `${worker.attemptId}.json`);
+      const contextPath = path.join(root, "forge-reports", `${worker.attemptId}.context.json`);
+      const originalContext = await fs.readFile(contextPath, "utf8");
+      const malformedReport = '{"kind":';
+      await fs.writeFile(reportPath, malformedReport);
+      f.runtime.readTurnCompletion.mockResolvedValue(turn(worker, "completed"));
+
+      await service.poll();
+      const failed = f.stored()[0]!;
+      expect(failed).toMatchObject({
+        status: "failed", attemptId: worker.attemptId,
+        completion: { reportError: expect.stringContaining("Invalid completion report:") },
+      });
+      expect(f.runtime.launch).toHaveBeenCalledOnce();
+      if (restart) {
+        await service.dispose();
+        service = new ForgeWorkflowService(deps);
+      }
+
+      const message = "Correct the malformed report and finish validation.";
+      const continued = await service.continueWorker(worker.id, message, placement);
+      expect(continued).toMatchObject({ id: worker.id, status: "running", worktreePath: worker.worktreePath });
+      expect(continued.attemptId).not.toBe(worker.attemptId);
+      expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+      const launch = f.runtime.launch.mock.calls[1]![0];
+      expect(launch).toMatchObject({ id: worker.id, attemptId: continued.attemptId });
+      const nextContextPath = path.join(root, "forge-reports", `${continued.attemptId}.context.json`);
+      expect(launch.prompt).toContain(nextContextPath);
+      const context = JSON.parse(await fs.readFile(nextContextPath, "utf8"));
+      expect(context.manualContinuation).toEqual({ message, previousError: failed.error });
+      expect(await reports.read(continued.attemptId!)).toBeUndefined();
+      expect(await fs.readFile(reportPath, "utf8")).toBe(malformedReport);
+      expect(await fs.readFile(contextPath, "utf8")).toBe(originalContext);
+      expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+      expect(f.provider.postReview).not.toHaveBeenCalled();
+    } finally {
+      await service.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("rejects report and completion arriving after the deadline and retries only on explicit Resume", async () => {

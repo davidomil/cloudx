@@ -540,10 +540,10 @@ export class ForgeWorkflowService {
       for (const member of members) this.operations.set(member.id, controller);
       try {
         for (const member of members) {
-          if (!member.attemptId) continue;
+          if (!member.attemptId || member.completion?.reportError) continue;
           const report = await this.deps.reports.read(member.attemptId);
           controller.signal.throwIfAborted();
-          if (report !== undefined && (!member.completion || member.completion.turn?.status === "completed" && !member.completion.reportError &&
+          if (report !== undefined && (!member.completion || member.completion.turn?.status === "completed" &&
             (member.completion.readyAt || Date.now() < Date.parse(member.completion.deadlineAt))))
             throw new Error("A retained completion report must be reconciled with Resume before continuing with a message.");
         }
