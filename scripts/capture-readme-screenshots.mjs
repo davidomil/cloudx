@@ -1,467 +1,626 @@
 #!/usr/bin/env node
 
-import { execFile, spawn } from "node:child_process";
+import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { createRequire } from "node:module";
 import fs from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { chromium, expect } from "@playwright/test";
+import {
+  developmentLayout,
+  documentationResults,
+  knowledgeLayout,
+  notificationWorkflow,
+  terminalTranscripts,
+  workspacePane,
+} from "./readme-demo-fixtures.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const require = createRequire(path.join(repoRoot, "package.json"));
-const { chromium } = require("@playwright/test");
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+const screenshotDir = path.join(repoRoot, "docs/screenshots");
 const execFileAsync = promisify(execFile);
 
-const screenshotDir = path.join(repoRoot, "docs", "screenshots");
-
 async function main() {
-  const demoRoot = await createDemoWorkspace();
-  const codexFixtureBin = await createCodexFixtureBin();
-  const demoSite = await startDemoSite();
-  const cloudx = await startCloudxServer(demoRoot, codexFixtureBin);
-
+  for (const key of Object.keys(process.env))
+    if (key.startsWith("GIT_")) delete process.env[key];
+  Object.assign(process.env, {
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  });
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-desktop-demo-"));
+  let app;
+  let preview;
+  let browser;
   try {
-    const tabs = await createDemoTabs(cloudx.baseUrl, demoRoot, demoSite.url);
-    await captureScreenshots(cloudx.baseUrl, tabs, demoRoot, [demoRoot]);
+    const project = await createDemoRepository(root);
+    preview = await startPreview();
+    const server = await startCloudx(root, (runningApp) => {
+      app = runningApp;
+    });
+    app = server.app;
+    const baseUrl = server.baseUrl;
+    const templates = await createSavedTemplates(baseUrl, project, preview.url);
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      viewport: { width: 1600, height: 1000 },
+    });
+    const unexpectedRequests = [];
+    await context.route("**/*", async (route) => {
+      const url = new URL(route.request().url());
+      if (url.origin === baseUrl || url.origin === preview.url.slice(0, -1))
+        return route.continue();
+      unexpectedRequests.push(url.origin);
+      await route.abort("blockedbyclient");
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(15_000);
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await fs.mkdir(screenshotDir, { recursive: true });
+
+    await showTemplate(page, baseUrl, templates.development, project);
+    await expect(page.locator(".xterm-screen").first()).toBeVisible();
+    await expect(
+      page.frameLocator(".web-viewer-frame").locator("h1"),
+    ).toHaveText("Release readiness");
+    await openDiff(page);
+    await capture(page, "cloudx-desktop-development.png", root);
+
+    await showTemplate(page, baseUrl, templates.knowledge, project);
+    await searchDocumentation(page);
+    await expect(page.locator(".react-flow__node")).toHaveCount(2);
+    await capture(page, "cloudx-desktop-knowledge.png", root);
+
+    await capturePlugins(page, baseUrl, project, preview.url, root);
+    await captureWorkspaceControls(
+      page,
+      baseUrl,
+      templates.development,
+      project,
+      root,
+    );
+
+    assert.deepEqual(errors, [], "Browser runtime errors");
+    assert.deepEqual(
+      unexpectedRequests,
+      [],
+      "Unexpected browser network requests",
+    );
+    console.log(
+      "Captured 2 saved-and-reloaded desktop templates and 14 plugin/control screens; no browser runtime errors or non-demo requests.",
+    );
   } finally {
-    await Promise.allSettled([cloudx.stop(), closeServer(demoSite.server), fs.rm(codexFixtureBin, { recursive: true, force: true }), fs.rm(demoRoot, { recursive: true, force: true })]);
+    const cleanup = await Promise.allSettled([
+      browser?.close(),
+      app?.close(),
+      preview &&
+        new Promise((resolve, reject) =>
+          preview.server.close((error) => (error ? reject(error) : resolve())),
+        ),
+    ]);
+    await fs.rm(root, { recursive: true, force: true });
+    const failures = cleanup.filter((result) => result.status === "rejected");
+    if (failures.length)
+      throw new AggregateError(
+        failures.map((result) => result.reason),
+        "Demo cleanup failed.",
+      );
   }
 }
 
-async function createDemoWorkspace() {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-readme-demo-"));
-  await fs.mkdir(path.join(root, "docs"), { recursive: true });
-  await fs.mkdir(path.join(root, "src"), { recursive: true });
-  await fs.writeFile(
-    path.join(root, "README.md"),
-    [
-      "# Demo Workspace",
-      "",
-      "This file is opened through the Cloudx file browser.",
-      "",
-      "- Inspect files without leaving the pane layout.",
-      "- Review changed files with Git diff badges.",
-      "- Keep a local dashboard open beside the workspace.",
-      "- Save and reopen workspace windows as layout templates.",
-      "- Route voice commands through the plugin control layer.",
-      ""
-    ].join("\n")
-  );
-  await fs.writeFile(
-    path.join(root, "docs", "plan.md"),
-    [
-      "# Operator Plan",
-      "",
-      "1. Open a Codex tab.",
-      "2. Watch progress in another pane.",
-      "3. Use voice control for pane and plugin actions.",
-      ""
-    ].join("\n")
-  );
-  await fs.writeFile(path.join(root, "docs", "notes.md"), "# Notes\n\nPublic screenshot fixture.\n");
-  await fs.writeFile(path.join(root, "src", "example.ts"), "export const status = 'ready';\n");
-  await initializeDemoGitRepository(root);
-  await fs.appendFile(path.join(root, "README.md"), "\nStatus: README changed for the screenshot.\n");
-  return root;
+async function capturePlugins(page, baseUrl, project, previewUrl, root) {
+  const pluginCases = [
+    ["codex-terminal", "Codex implementation", ".xterm-screen"],
+    ["standard-terminal", "Validation terminal", ".xterm-screen"],
+    ["file-browser", "Review changes", ".file-browser-panel"],
+    ["local-web", "Local preview", ".web-viewer-frame"],
+    ["worktree-manager", "Parallel worktrees", ".worktree-manager-panel"],
+    ["documentation", "Project knowledge", ".documentation-panel"],
+    ["automation", "Review handoff", ".automation-panel"],
+    ["rules-skills", "Engineering rules", ".rules-skills-panel"],
+    ["jira", "Jira setup", ".jira-panel"],
+    ["forge", "Forge Workers setup", ".forge-panel"],
+  ];
+  for (const [pluginId, title, selector] of pluginCases) {
+    const cwd =
+      pluginId === "worktree-manager" ? path.join(root, "worktrees") : project;
+    await showPlugin(page, baseUrl, pluginId, title, cwd, previewUrl);
+    await expect(page.locator(selector).first()).toBeVisible();
+    if (pluginId === "file-browser") await openDiff(page);
+    if (pluginId === "documentation") await searchDocumentation(page);
+    if (pluginId === "worktree-manager") {
+      await expect(page.locator(selector)).toContainText("review-release");
+      await expect(page.locator(".worktree-size.unavailable")).toHaveCount(0);
+    }
+    if (pluginId === "rules-skills") {
+      await expect(page.locator(selector)).toContainText("Engineering review");
+      await page
+        .locator(".rules-skills-panel")
+        .getByRole("button", { name: /Engineering review/ })
+        .click();
+    }
+    if (pluginId === "jira")
+      await expect(page.locator(selector)).toContainText(
+        "API token must be configured",
+      );
+    if (pluginId === "forge")
+      await expect(
+        page.getByRole("button", { name: "Configure Forge", exact: true }),
+      ).toBeVisible();
+    if (pluginId === "automation")
+      await expect(page.locator(".react-flow__node")).toHaveCount(2);
+    if (pluginId === "local-web")
+      await expect(
+        page.frameLocator(".web-viewer-frame").locator("h1"),
+      ).toHaveText("Release readiness");
+    await capture(page, `cloudx-plugin-${pluginId}.png`, root);
+  }
 }
 
-async function initializeDemoGitRepository(root) {
-  await execFileAsync("git", ["init"], { cwd: root });
-  await execFileAsync("git", ["config", "user.email", "demo@example.invalid"], { cwd: root });
-  await execFileAsync("git", ["config", "user.name", "Cloudx Demo"], { cwd: root });
-  await execFileAsync("git", ["add", "."], { cwd: root });
-  await execFileAsync("git", ["commit", "-m", "Initial demo workspace"], { cwd: root });
-}
+async function captureWorkspaceControls(
+  page,
+  baseUrl,
+  template,
+  project,
+  root,
+) {
+  await showTemplate(page, baseUrl, template, project);
+  await openDiff(page);
+  await page
+    .getByRole("button", { name: "Layout templates", exact: true })
+    .click();
+  await expect(page.locator(".template-menu-row")).toHaveCount(2);
+  await capture(page, "cloudx-plugin-workspace-control.png", root);
+  await page
+    .getByRole("button", { name: "Layout templates", exact: true })
+    .click();
 
-async function createCodexFixtureBin() {
-  const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-readme-bin-"));
-  const codexPath = path.join(binDir, "codex");
-  await fs.writeFile(
-    codexPath,
-    [
-      "#!/bin/sh",
-      "printf '\\033[32mCloudx Codex demo\\033[0m\\r\\n'",
-      "printf 'model: gpt-5.3-codex-spark\\r\\n'",
-      "printf 'workdir: demo workspace\\r\\n\\r\\n'",
-      "printf '> inspect the split pane workspace and summarize next steps\\r\\n\\r\\n'",
-      "printf '%s\\r\\n' '- Reading file browser context'",
-      "printf '%s\\r\\n' '- Watching local dashboard pane'",
-      "printf '%s\\r\\n' '- Ready for voice-driven follow-up'",
-      "while true; do sleep 60; done",
-      ""
-    ].join("\n")
+  await request(baseUrl, "/api/hooks/notifications.send", {
+    input: {
+      title: "Demo review handoff",
+      body: "Inspect the release diff and validation notes.",
+      level: "info",
+    },
+  });
+  await page
+    .getByRole("button", { name: "1 notification", exact: true })
+    .click();
+  await expect(
+    page.getByRole("dialog", { name: "Notifications", exact: true }),
+  ).toBeVisible();
+  await capture(page, "cloudx-plugin-notifications.png", root);
+  await page
+    .getByRole("button", { name: "1 notification", exact: true })
+    .click();
+
+  await page.context().route("**/api/hooks/codex-settings.read", (route) =>
+    route.fulfill({
+      json: {
+        result: {
+          settings: {
+            revision: "a".repeat(64),
+            model: "demo-model",
+            serviceTier: "default",
+            fastModeEnabled: true,
+          },
+        },
+      },
+    }),
   );
-  await fs.chmod(codexPath, 0o755);
-  return binDir;
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+  await expect(
+    settings.getByRole("tab", { name: "General", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await capture(page, "cloudx-plugin-audio-ai.png", root);
+  await settings.getByRole("tab", { name: "Codex", exact: true }).click();
+  await expect(
+    settings.getByRole("textbox", { name: "Default model", exact: true }),
+  ).toHaveValue("demo-model");
+  await capture(page, "cloudx-plugin-codex-settings.png", root);
 }
 
-function startDemoSite() {
+async function createDemoRepository(root) {
+  const project = path.join(root, "release-dashboard");
+  await fs.mkdir(project, { recursive: true });
+  await fs.writeFile(
+    path.join(project, "README.md"),
+    "# Release dashboard\n\nSynthetic documentation demo.\n\nReview the release gate, check the diff, and inspect the local preview before handoff.\n",
+  );
+  await fs.writeFile(
+    path.join(project, "release-checks.ts"),
+    "export function canRelease(checksPassed: boolean, approved: boolean) {\n  return checksPassed;\n}\n",
+  );
+  const git = (...args) =>
+    execFileAsync("git", args, {
+      cwd: project,
+      env: {
+        PATH: process.env.PATH,
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+      },
+    });
+  await git("init", "--initial-branch=main");
+  await git(
+    "-c",
+    "user.name=CloudX Demo",
+    "-c",
+    "user.email=demo@example.invalid",
+    "add",
+    ".",
+  );
+  await git(
+    "-c",
+    "user.name=CloudX Demo",
+    "-c",
+    "user.email=demo@example.invalid",
+    "-c",
+    "commit.gpgSign=false",
+    "commit",
+    "-m",
+    "DEMO: seed release dashboard",
+  );
+  const worktrees = path.join(root, "worktrees");
+  await fs.mkdir(worktrees);
+  await git("clone", "--bare", project, path.join(worktrees, ".bare"));
+  await git(
+    "--git-dir",
+    path.join(worktrees, ".bare"),
+    "worktree",
+    "add",
+    path.join(worktrees, "main"),
+    "main",
+  );
+  await git(
+    "--git-dir",
+    path.join(worktrees, ".bare"),
+    "worktree",
+    "add",
+    "-b",
+    "review-release",
+    path.join(worktrees, "review-release"),
+  );
+  await fs.writeFile(
+    path.join(project, "release-checks.ts"),
+    "export function canRelease(checksPassed: boolean, approved: boolean) {\n  return checksPassed && approved;\n}\n",
+  );
+  return project;
+}
+
+async function startCloudx(root, onCreated) {
+  const { loadConfig } = await import("../apps/server/dist/config.js");
+  const { buildServer, buildServices } =
+    await import("../apps/server/dist/server.js");
+  const { CodexTerminalSession } =
+    await import("../apps/server/dist/plugins/CodexTerminalPlugin.js");
+  const port = await freePort();
+  const config = loadConfig({
+    CLOUDX_PORT: String(port),
+    CLOUDX_ALLOWED_ROOTS: root,
+    CLOUDX_DATA_DIR: path.join(root, "data"),
+    CLOUDX_APP_SERVER_ENABLED: "false",
+    CLOUDX_AUTOMATION_START_DISABLED: "true",
+    CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9",
+    CLOUDX_ASR_URL: "http://127.0.0.1:9",
+    CLOUDX_LOG_LEVEL: "silent",
+  });
+  const services = buildServices(config);
+  services.updates = {
+    status: async () => ({
+      available: false,
+      unavailableReason: "Updates are disabled in the screenshot demo.",
+    }),
+    start: async () => {
+      throw new Error("Updates are disabled in the screenshot demo.");
+    },
+  };
+  for (const [pluginId, lines] of Object.entries(terminalTranscripts)) {
+    services.plugins.get(pluginId).createSession = ({ tab, controls }) =>
+      new CodexTerminalSession(tab, new DemoTerminal(lines), controls);
+  }
+  services.documentation.summary = async () => ({
+    activeDocumentCount: 2,
+    activeChunkCount: 2,
+  });
+  services.documentation.search = async () => ({
+    results: documentationResults,
+  });
+  services.documentation.listDocuments = async () => ({
+    documents: documentationResults,
+    window: { offset: 0, limit: 50, total: 2, hasMore: false },
+  });
+  const app = await buildServer(config, services);
+  onCreated(app);
+  await services.pluginContributionsReady;
+  await services.automation.ready();
+  for (const group of await services.automation.listGroups())
+    await services.automation.deleteGroup(group.id);
+  await services.config.update({
+    global: { themeId: "minimalist-dark", microphoneEnabled: false },
+    plugins: { documentation: { aiEnrichmentEnabled: false } },
+  });
+  await services.rulesSkills.saveRule({
+    id: "verify-boundaries",
+    description: "Verify the changed behavior",
+    text: "Test the normal path and the failure boundary before handing off a change.",
+  });
+  await services.rulesSkills.saveSkill({
+    id: "release-review",
+    name: "Release review",
+    description: "Review approval and validation before release.",
+    instructions:
+      "# Release review\n\nInspect the diff. Verify the failure path. Record the validation command and result.",
+  });
+  await services.rulesSkills.saveTemplate({
+    id: "engineering-review",
+    name: "Engineering review",
+    color: "green",
+    ruleIds: ["verify-boundaries"],
+    skillIds: ["release-review"],
+  });
+  const triggers = services.triggers.list();
+  const trigger = triggers.find((item) => item.id === "worktree.created");
+  assert.ok(
+    trigger,
+    `Missing worktree creation trigger: ${triggers.map((item) => item.id).join(", ")}`,
+  );
+  const workflow = await services.automation.saveGroup(
+    notificationWorkflow(trigger.id),
+  );
+  assert.equal(workflow.enabled, false);
+  assert.equal(
+    workflow.lastValidation.valid,
+    true,
+    JSON.stringify(workflow.lastValidation),
+  );
+  await app.listen({ host: "127.0.0.1", port });
+  return { app, baseUrl: `http://127.0.0.1:${port}` };
+}
+
+class DemoTerminal {
+  constructor(lines) {
+    this.output = `${lines.join("\r\n")}\r\n`;
+  }
+  onData(listener) {
+    listener(this.output);
+    return () => {};
+  }
+  onExit() {
+    return () => {};
+  }
+  write() {
+    throw new Error("Demo terminals do not execute input.");
+  }
+  resize() {}
+  kill() {}
+  detach() {}
+  async terminate() {}
+}
+
+async function createSavedTemplates(baseUrl, project, previewUrl) {
+  const templates = {};
+  for (const kind of ["development", "knowledge"]) {
+    const state = await request(baseUrl, "/api/windows", {
+      name:
+        kind === "development"
+          ? "Implementation & review"
+          : "Knowledge & automation",
+      defaultCwd: project,
+    });
+    const windowId = state.activeWindowId;
+    const paneId = state.windows.find((window) => window.id === windowId).layout
+      .activePaneId;
+    const entries =
+      kind === "development"
+        ? [
+            ["codex", "codex-terminal", "Implementation"],
+            ["terminal", "standard-terminal", "Checks"],
+            ["files", "file-browser", "Review diff"],
+            ["web", "local-web", "Local preview"],
+          ]
+        : [
+            ["documentation", "documentation", "Release knowledge"],
+            ["rules", "rules-skills", "Engineering rules"],
+            ["automation", "automation", "Review handoff"],
+          ];
+    const tabs = {};
+    for (const [key, pluginId, title] of entries) {
+      const { tab } = await request(baseUrl, "/api/tabs", {
+        pluginId,
+        title,
+        cwd: project,
+        windowId,
+        paneId,
+        ...(pluginId === "local-web"
+          ? { initialInput: { url: previewUrl } }
+          : {}),
+      });
+      tabs[key] = tab;
+    }
+    await request(
+      baseUrl,
+      `/api/windows/${windowId}`,
+      {
+        layout:
+          kind === "development"
+            ? developmentLayout(tabs)
+            : knowledgeLayout(tabs),
+      },
+      "PATCH",
+    );
+    const { template } = await request(baseUrl, "/api/layout-templates", {
+      name:
+        kind === "development"
+          ? "Implementation & review"
+          : "Knowledge & automation",
+      basePath: project,
+      windowId,
+    });
+    assert.equal(template.tabs.length, entries.length);
+    assert.ok(template.tabs.every((tab) => tab.relativeCwd === ""));
+    templates[kind] = template;
+  }
+  return templates;
+}
+
+async function showTemplate(page, baseUrl, template, project) {
+  const { window, workspace } = await request(
+    baseUrl,
+    `/api/layout-templates/${template.id}/apply`,
+    { projectPath: project, name: template.name },
+  );
+  assert.ok(workspace.templates.some((item) => item.id === template.id));
+  assert.equal(window.name, template.name);
+  await page.goto(baseUrl);
+  await expect(page.locator(".workspace-pane")).toHaveCount(
+    template.name.startsWith("Implementation") ? 3 : 2,
+  );
+}
+
+async function showPlugin(page, baseUrl, pluginId, title, cwd, previewUrl) {
+  const state = await request(baseUrl, "/api/windows", {
+    name: `${title} · demo`,
+    defaultCwd: cwd,
+  });
+  const { tab } = await request(baseUrl, "/api/tabs", {
+    pluginId,
+    title,
+    cwd,
+    windowId: state.activeWindowId,
+    paneId: state.windows.find((window) => window.id === state.activeWindowId)
+      .layout.activePaneId,
+    ...(pluginId === "local-web" ? { initialInput: { url: previewUrl } } : {}),
+  });
+  await request(
+    baseUrl,
+    `/api/windows/${state.activeWindowId}`,
+    {
+      layout: {
+        root: workspacePane("plugin-demo", [tab]),
+        activePaneId: "plugin-demo",
+      },
+    },
+    "PATCH",
+  );
+  await page.goto(baseUrl);
+}
+
+async function openDiff(page) {
+  await page
+    .locator(".file-browser-panel")
+    .getByRole("button", { name: /release-checks\.ts/ })
+    .last()
+    .click();
+  await expect(page.locator(".file-browser-panel")).toContainText(
+    "checksPassed && approved",
+  );
+}
+
+async function searchDocumentation(page) {
+  await page.getByRole("button", { name: "Manual", exact: true }).click();
+  await page
+    .getByRole("textbox", { name: "Search", exact: true })
+    .fill("release approval");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.locator(".documentation-panel")).toContainText(
+    "Release readiness handbook",
+  );
+}
+
+async function capture(page, filename, root) {
+  await page.evaluate(
+    ({ root }) => {
+      window.cloudxDemoPathObserver?.disconnect();
+      const normalize = () => {
+        observer.disconnect();
+        const walker = document.createTreeWalker(
+          document.body,
+          NodeFilter.SHOW_TEXT,
+        );
+        while (walker.nextNode())
+          walker.currentNode.nodeValue =
+            walker.currentNode.nodeValue.replaceAll(root, "/demo");
+        for (const element of document.querySelectorAll("input, textarea"))
+          element.value = element.value.replaceAll(root, "/demo");
+        observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+      };
+      const observer = new MutationObserver(normalize);
+      window.cloudxDemoPathObserver = observer;
+      normalize();
+    },
+    { root },
+  );
+  const text = await page.locator("body").innerText();
+  for (const privateText of [
+    root,
+    os.homedir(),
+    "/home/",
+    "token=",
+    "api_key=",
+  ])
+    assert.ok(
+      !text.includes(privateText),
+      `Private text in ${filename}: ${text.split("\n").find((line) => line.includes(privateText))}`,
+    );
+  await page.screenshot({
+    path: path.join(screenshotDir, filename),
+    animations: "disabled",
+  });
+  console.log(filename);
+}
+
+async function request(baseUrl, route, body, method = "POST") {
+  const response = await fetch(`${baseUrl}${route}`, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  assert.ok(
+    response.ok,
+    `${route}: ${response.status} ${await response.clone().text()}`,
+  );
+  return response.json();
+}
+
+async function startPreview() {
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
-    response.end(`<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8">
-    <meta name="color-scheme" content="dark">
-    <style>
-      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #080b11; color: #e6f5ff; }
-      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(circle at top right, #00d4ff33, transparent 30%), #080b11; }
-      main { width: min(760px, calc(100vw - 48px)); border: 1px solid #00ff8870; background: #0e131dcc; padding: 28px; box-shadow: 0 0 28px #00d4ff28; }
-      h1 { margin: 0 0 14px; color: #00ff88; font: 800 28px/1.1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
-      p { margin: 0 0 20px; color: #b9c7d8; line-height: 1.55; }
-      .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
-      .metric { border: 1px solid #2a3650; padding: 14px; background: #111827; }
-      .metric strong { display: block; color: #00d4ff; font-size: 24px; }
-      .metric span { color: #8896aa; font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
-    </style>
-  </head>
-  <body>
-    <main class="demo-dashboard">
-      <h1>Local Dashboard</h1>
-      <p>A loopback web app can live beside files and Codex tabs without leaving Cloudx.</p>
-      <section class="grid" aria-label="Demo metrics">
-        <div class="metric"><strong>3</strong><span>Panes</span></div>
-        <div class="metric"><strong>4</strong><span>Plugins</span></div>
-        <div class="metric"><strong>Live</strong><span>Status</span></div>
-      </section>
-    </main>
-  </body>
-</html>`);
+    response.end(
+      `<!doctype html><html lang="en"><meta charset="utf-8"><style>body{margin:0;background:#151a22;color:#e6edf3;font:16px system-ui;padding:20px}small{color:#94a3b8}h1{font-size:24px;margin:12px 0}section{display:flex;gap:16px}article{padding:16px;background:#222b38;border:1px solid #405065;border-radius:8px;flex:1}strong{display:block;margin-top:12px;color:#7dd3fc}p{color:#b6c5d6;margin:0 0 18px}</style><small>RELEASE DASHBOARD · SYNTHETIC DEMO</small><h1>Release readiness</h1><p>Review the change before opening the release gate.</p><section><article>Required checks<strong>3 / 3 passed</strong></article><article>Review approval<strong>Pending</strong></article><article>Release gate<strong>Blocked</strong></article></section></html>`,
+    );
   });
-
-  return new Promise((resolve, reject) => {
+  await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("Demo site did not bind to a TCP port."));
-        return;
-      }
-      resolve({ server, url: `http://127.0.0.1:${address.port}/` });
-    });
+    server.listen(0, "127.0.0.1", resolve);
   });
+  return { server, url: `http://127.0.0.1:${server.address().port}/` };
 }
 
-async function startCloudxServer(demoRoot, codexFixtureBin) {
-  const port = await freePort();
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-readme-data-"));
-  const child = spawn(process.execPath, ["apps/server/dist/index.js"], {
-    cwd: repoRoot,
-    env: {
-      ...process.env,
-      CLOUDX_APP_SERVER_ENABLED: "false",
-      CLOUDX_ALLOWED_ROOTS: demoRoot,
-      CLOUDX_ASR_URL: "http://127.0.0.1:9",
-      CLOUDX_DATA_DIR: dataDir,
-      CLOUDX_HOST: "127.0.0.1",
-      CLOUDX_PORT: String(port),
-      PATH: `${codexFixtureBin}${path.delimiter}${process.env.PATH ?? ""}`
-    },
-    stdio: ["ignore", "pipe", "pipe"]
+async function freePort() {
+  const probe = net.createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
   });
-
-  let logs = "";
-  child.stdout.on("data", (chunk) => {
-    logs += chunk.toString();
-  });
-  child.stderr.on("data", (chunk) => {
-    logs += chunk.toString();
-  });
-
-  const baseUrl = `http://127.0.0.1:${port}`;
-  await waitForHealth(baseUrl, () => logs);
-
-  return {
-    baseUrl,
-    async stop() {
-      child.kill("SIGTERM");
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, 2000);
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-      await fs.rm(dataDir, { recursive: true, force: true });
-    }
-  };
-}
-
-async function createDemoTabs(baseUrl, demoRoot, demoSiteUrl) {
-  const codexTab = await postJson(`${baseUrl}/api/tabs`, {
-    pluginId: "codex-terminal",
-    cwd: demoRoot,
-    title: "Codex - workspace"
-  });
-  const filesTab = await postJson(`${baseUrl}/api/tabs`, {
-    pluginId: "file-browser",
-    cwd: demoRoot,
-    title: "Files - git diff"
-  });
-  const webTab = await postJson(`${baseUrl}/api/tabs`, {
-    pluginId: "local-web",
-    title: "Dashboard",
-    initialInput: { url: demoSiteUrl }
-  });
-  const workspace = await getJson(`${baseUrl}/api/workspace`);
-  await patchJson(`${baseUrl}/api/windows/${workspace.activeWindowId}`, {
-    name: "Codex Work",
-    defaultCwd: demoRoot,
-    layout: demoLayout({ codexTab: codexTab.tab, filesTab: filesTab.tab, webTab: webTab.tab })
-  });
-  await postJson(`${baseUrl}/api/windows`, {
-    name: "Docs Review",
-    defaultCwd: demoRoot
-  });
-  await postJson(`${baseUrl}/api/windows/${workspace.activeWindowId}/active`, {});
-  await postJson(`${baseUrl}/api/tabs/${codexTab.tab.id}/active`, {});
-  return {
-    codexTab: codexTab.tab,
-    filesTab: filesTab.tab,
-    webTab: webTab.tab
-  };
-}
-
-async function captureScreenshots(baseUrl, tabs, demoRoot, forbiddenText) {
-  await fs.mkdir(screenshotDir, { recursive: true });
-
-  const browser = await chromium.launch({ headless: true });
-  try {
-    const desktopPage = await prepareScreenshotPage(browser, baseUrl, demoRoot, forbiddenText, {
-      viewport: { width: 1440, height: 960 }
-    });
-    await desktopPage.screenshot({
-      path: path.join(screenshotDir, "cloudx-split-panes.png"),
-      fullPage: false
-    });
-
-    const mobilePage = await prepareScreenshotPage(browser, baseUrl, demoRoot, forbiddenText, {
-      viewport: { width: 390, height: 844 },
-      isMobile: true,
-      hasTouch: true
-    });
-    await mobilePage.screenshot({
-      path: path.join(screenshotDir, "cloudx-mobile-portrait.png"),
-      fullPage: false
-    });
-  } finally {
-    await browser.close();
-  }
-}
-
-async function prepareScreenshotPage(browser, baseUrl, demoRoot, forbiddenText, contextOptions) {
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await page.locator(".workspace-pane").first().waitFor({ timeout: 10_000 });
-  await page.locator('[data-pane-id="pane-codex"]').getByText("Cloudx Codex demo").waitFor({ timeout: 10_000 });
-  await page.locator('[data-pane-id="pane-files"] .file-list').getByRole("button", { name: /README\.md/ }).click();
-  await page.frameLocator(".web-viewer-frame").locator(".demo-dashboard").waitFor({ timeout: 10_000 });
-  await page.locator('[data-pane-id="pane-codex"]').click();
-  await normalizeVolatileUi(page, [{ from: demoRoot, to: "/workspace" }]);
-  await assertPublicSafe(page, forbiddenText);
-  return page;
-}
-
-function demoLayout(tabs) {
-  return {
-    root: {
-      type: "split",
-      id: "split-root",
-      direction: "row",
-      sizes: [52, 48],
-      children: [
-        { type: "pane", pane: { id: "pane-codex", tabIds: [tabs.codexTab.id], activeTabId: tabs.codexTab.id } },
-        {
-          type: "split",
-          id: "split-right",
-          direction: "column",
-          sizes: [54, 46],
-          children: [
-            { type: "pane", pane: { id: "pane-files", tabIds: [tabs.filesTab.id], activeTabId: tabs.filesTab.id } },
-            { type: "pane", pane: { id: "pane-web", tabIds: [tabs.webTab.id], activeTabId: tabs.webTab.id } }
-          ]
-        }
-      ]
-    },
-    activePaneId: "pane-codex"
-  };
-}
-
-async function normalizeVolatileUi(page, replacements) {
-  await page.locator(".connection-status").evaluate((element) => {
-    const icon = element.querySelector("svg");
-    element.replaceChildren();
-    if (icon) {
-      element.appendChild(icon);
-    }
-    element.setAttribute("title", "connected: 127.0.0.1:3001");
-    element.setAttribute("aria-label", "connected: 127.0.0.1:3001");
-  });
-  await page.locator(".web-viewer-toolbar input").evaluate((element) => {
-    if (element instanceof HTMLInputElement) {
-      element.value = "http://127.0.0.1:5173/";
-    }
-  });
-  await page.evaluate(({ replacements }) => {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node = walker.nextNode();
-    while (node) {
-      let value = node.nodeValue ?? "";
-      for (const replacement of replacements) {
-        value = value.split(replacement.from).join(replacement.to);
-      }
-      node.nodeValue = value;
-      node = walker.nextNode();
-    }
-    for (const element of document.querySelectorAll("input, textarea")) {
-      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-        for (const replacement of replacements) {
-          element.value = element.value.split(replacement.from).join(replacement.to);
-        }
-      }
-    }
-  }, { replacements });
-  await page.locator('[data-pane-id="pane-codex"] .xterm-rows > div, [data-pane-id="pane-codex"] .xterm-accessibility-tree > div').evaluateAll((rows, { replacements }) => {
-    for (const row of rows) {
-      let value = row.textContent ?? "";
-      for (const replacement of replacements) {
-        value = value.split(replacement.from).join(replacement.to);
-      }
-      if (value !== row.textContent) {
-        row.textContent = value;
-      }
-    }
-  }, { replacements });
-  await page.locator('[data-pane-id="pane-codex"]').evaluate((pane, { replacements }) => {
-    for (const element of pane.querySelectorAll("*")) {
-      let value = element.textContent ?? "";
-      const original = value;
-      for (const replacement of replacements) {
-        value = value.split(replacement.from).join(replacement.to);
-      }
-      if (value !== original && original.trim().startsWith("cwd:")) {
-        element.textContent = value;
-      }
-    }
-  }, { replacements });
-  await page.locator('[data-pane-id="pane-codex"] .terminal-panel').evaluate((panel) => {
-    const screen = panel.querySelector(".xterm-screen");
-    if (!(panel instanceof HTMLElement) || !(screen instanceof HTMLElement)) {
-      return;
-    }
-    const panelRect = panel.getBoundingClientRect();
-    const screenRect = screen.getBoundingClientRect();
-    const rowCount = Math.max(1, panel.querySelectorAll(".xterm-rows > div").length || 24);
-    const rowHeight = screenRect.height / rowCount;
-    const overlay = document.createElement("div");
-    overlay.textContent = "cwd: /workspace";
-    overlay.style.position = "absolute";
-    overlay.style.left = `${screenRect.left - panelRect.left}px`;
-    overlay.style.top = `${screenRect.top - panelRect.top + rowHeight}px`;
-    overlay.style.width = `${screenRect.width}px`;
-    overlay.style.height = `${rowHeight}px`;
-    overlay.style.zIndex = "3";
-    overlay.style.overflow = "hidden";
-    overlay.style.background = "#05050a";
-    overlay.style.color = "#e6edf3";
-    overlay.style.font = "13px / 1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-    overlay.style.letterSpacing = "0";
-    panel.appendChild(overlay);
-  });
-}
-
-async function assertPublicSafe(page, extraForbiddenText) {
-  const bodyText = await page.locator("body").innerText();
-  const forbidden = [os.homedir(), process.env.USER, process.env.HOSTNAME, "/home/", "token=", ...extraForbiddenText].filter(Boolean);
-  for (const value of forbidden) {
-    if (bodyText.includes(value)) {
-      const excerpt = bodyText.split("\n").find((line) => line.includes(value)) ?? "";
-      throw new Error(`Screenshot page contains private text: ${value}\n${excerpt}`);
-    }
-  }
-}
-
-async function postJson(url, body) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  if (!response.ok) {
-    throw new Error(`${url} failed with ${response.status}: ${await response.text()}`);
-  }
-  return response.json();
-}
-
-async function patchJson(url, body) {
-  const response = await fetch(url, {
-    method: "PATCH",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  if (!response.ok) {
-    throw new Error(`${url} failed with ${response.status}: ${await response.text()}`);
-  }
-  return response.json();
-}
-
-async function getJson(url) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`${url} failed with ${response.status}: ${await response.text()}`);
-  }
-  return response.json();
-}
-
-async function waitForHealth(baseUrl, readLogs) {
-  const deadline = Date.now() + 15_000;
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${baseUrl}/api/health`);
-      if (response.ok) {
-        return;
-      }
-      lastError = new Error(`health returned ${response.status}`);
-    } catch (error) {
-      lastError = error;
-    }
-    await delay(250);
-  }
-  throw new Error(`Cloudx server did not become healthy. Last error: ${lastError?.message ?? "none"}\n${readLogs()}`);
-}
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        reject(new Error("Could not allocate a TCP port."));
-        return;
-      }
-      const { port } = address;
-      server.close(() => resolve(port));
-    });
-  });
-}
-
-function closeServer(server) {
-  return new Promise((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-}
-
-function delay(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  const port = probe.address().port;
+  await new Promise((resolve, reject) =>
+    probe.close((error) => (error ? reject(error) : resolve())),
+  );
+  return port;
 }
 
 main().catch((error) => {
-  console.error(error);
-  process.exit(1);
+  console.dir(error, { depth: 8 });
+  process.exitCode = 1;
 });

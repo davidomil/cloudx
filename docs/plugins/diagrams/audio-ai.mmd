@@ -1,0 +1,6 @@
+flowchart TD
+  A[Typed command] --> C[AI planner with workspace context]
+  B[Microphone audio] --> W[Local speech transcription]
+  W --> C
+  C --> D[Validate exported plugin actions]
+  D --> E[Execute actions and show result]
