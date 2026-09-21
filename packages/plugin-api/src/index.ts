@@ -169,6 +169,7 @@ export interface PluginSessionLaunchOptions {
   authorizeProjectTrust?: () => Promise<string>;
   prepareCodexSession?: (launch: PreparedCodexLaunch) => Promise<string>;
   prepareTerminalExecution?: (tabId: string) => Promise<TerminalExecutionBinding>;
+  codexTurn?: { workerId: string; attemptId: string; receiptPath: string };
   ownerPluginId?: PluginId;
 }
 

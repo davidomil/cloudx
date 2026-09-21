@@ -8,10 +8,12 @@ import { PluginSessionNotStartedError, type PreparedCodexLaunch } from "@cloudx/
 
 import {
   RULES_SKILLS_PLUGIN_ID,
+  isForgeTurnCompletion,
   type CodexReasoningEffort,
   type ForgeRepository,
   type ForgeCredentialRole,
   type ForgeWorkerHistory,
+  type ForgeTurnCompletion,
   type WorkspaceTab,
 } from "@cloudx/shared";
 
@@ -133,6 +135,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
 interface OwnedTab {
   tabId: string;
   workerId: string;
+  attemptId?: string;
   context?: DirectoryIdentity;
   launch?: DirectoryIdentity;
   closed: boolean;
@@ -438,6 +441,7 @@ export class ForgeRuntime {
   async launch(
     input: {
       id: string;
+      attemptId: string;
       worktreePath: string;
       templateId: string;
       model: string;
@@ -482,6 +486,12 @@ export class ForgeRuntime {
       : undefined;
     if (!authorizeProjectTrust)
       throw new Error("The worker repository must match the current Forge settings before starting or resuming a worker.");
+    const receipt = this.turnReceipt(input.id, input.attemptId);
+    if (await receipt.read<unknown>() !== undefined)
+      throw new Error("This worker attempt already has native turn evidence. Resume its completion instead of starting another turn.");
+    await requireSafeDirectory(this.dependencies.dataDir, path.dirname(receipt.filePath), {
+      create: true, label: "Forge native turn directory",
+    });
     owned.launchPending = true;
     owned.launchBootId = (await executionEnvironment()).bootId;
     await this.manifest(owned.id).write(owned);
@@ -493,7 +503,7 @@ export class ForgeRuntime {
         const tab = this.dependencies.sessions.getTab(launch.tabId);
         if (tab.id !== launch.tabId || tab.cwd !== owned.worktreePath || tab.ownerPluginId !== "forge" || tab.pluginMetadata?.["forge-workers"]?.workerId !== owned.id)
           throw new Error("Reviewer conversation tab ownership does not match.");
-        const ownership: OwnedTab = { tabId: tab.id, workerId: owned.id, closed: false, quiescent: false };
+        const ownership: OwnedTab = { tabId: tab.id, workerId: owned.id, attemptId: input.attemptId, closed: false, quiescent: false };
         this.ownedTabs.set(tab.id, ownership);
         await this.captureTab(tab, ownership);
         await this.authorizeProjectTrust(owned);
@@ -522,12 +532,13 @@ export class ForgeRuntime {
     }, {
       ownerPluginId: "forge",
       authorizeProjectTrust,
+      codexTurn: { workerId: input.id, attemptId: input.attemptId, receiptPath: receipt.filePath },
       prepareTerminalExecution: async tabId => {
         preparingTabId = tabId;
         const tab = this.dependencies.sessions.getTab(tabId);
         if (tab.cwd !== owned.worktreePath || tab.ownerPluginId !== "forge" || tab.pluginMetadata?.["forge-workers"]?.workerId !== owned.id)
           throw new Error("Worker execution tab does not match its checkout ownership.");
-        const ownership = this.ownedTabs.get(tabId) ?? { tabId, workerId: owned.id, closed: false, quiescent: false };
+        const ownership = this.ownedTabs.get(tabId) ?? { tabId, workerId: owned.id, attemptId: input.attemptId, closed: false, quiescent: false };
         if (ownership.execution) throw new Error("This worker tab already owns an execution. Resume through Forge to start a new attempt.");
         ownership.execution = await this.executions.prepare();
         this.ownedTabs.set(tabId, ownership);
@@ -549,6 +560,7 @@ export class ForgeRuntime {
     const ownedTab: OwnedTab = this.ownedTabs.get(tab.id) ?? {
       tabId: tab.id,
       workerId: input.id,
+      attemptId: input.attemptId,
       closed: false,
       quiescent: false,
     };
@@ -584,6 +596,41 @@ export class ForgeRuntime {
     await this.captureHistory(tabId);
   }
 
+  async readTurnCompletion(workerId: string, attemptId: string): Promise<ForgeTurnCompletion | undefined> {
+    const completion = await this.turnReceipt(workerId, attemptId).read<unknown>();
+    if (completion === undefined) return undefined;
+    if (!isForgeTurnCompletion(completion))
+      throw new Error("The worker native turn receipt is invalid. Its report and checkout were preserved.");
+    if (completion.workerId !== workerId || completion.attemptId !== attemptId) return undefined;
+    return completion;
+  }
+
+  async finish(tabId: string, expected: ForgeTurnCompletion): Promise<void> {
+    const owned = this.ownedTabs.get(tabId) ?? await this.tabManifest(tabId).read<OwnedTab>();
+    if (!owned || owned.tabId !== tabId || !owned.attemptId || owned.closed)
+      throw new Error("The worker tab has no owned native turn attempt.");
+    if (!isForgeTurnCompletion(expected) || expected.status !== "completed" ||
+      expected.workerId !== owned.workerId || expected.attemptId !== owned.attemptId)
+      throw new Error("The successful native turn checkpoint does not match this worker attempt.");
+    const completion = await this.readTurnCompletion(owned.workerId, owned.attemptId);
+    if (completion?.status !== "completed")
+      throw new Error("The worker's native turn has not completed successfully. Its report and checkout were preserved.");
+    if (completion.threadId !== expected.threadId || completion.turnId !== expected.turnId)
+      throw new Error("The native turn receipt no longer matches its saved thread and turn. Its report and checkout were preserved.");
+    const hasTab = this.dependencies.sessions.listTabs().some(tab => tab.id === tabId);
+    if (!owned.quiescent) {
+      if (hasTab) {
+        await this.requireWorkerTab(tabId);
+        await this.dependencies.sessions.executePluginAction(tabId, "finish", { threadId: expected.threadId, turnId: expected.turnId });
+      } else if (!owned.execution) {
+        throw new Error("Worker process ownership is unresolved after its terminal disappeared. Native turn completion does not prove its descendants ended.");
+      }
+      if (owned.execution) await this.executions.assertEnded(owned.execution);
+      await this.recordQuiescence(tabId);
+    }
+    if (hasTab) await this.captureHistory(tabId);
+  }
+
   async close(tabId: string): Promise<void> {
     const owned =
       this.ownedTabs.get(tabId) ??
@@ -599,7 +646,7 @@ export class ForgeRuntime {
       throw new Error("Worker tab ownership record is missing. Restore the original ownership record before Resume; termination cannot be verified. Local resources were preserved.");
     if (this.dependencies.sessions.listTabs().some((tab) => tab.id === tabId)) {
       await this.requireWorkerTab(tabId);
-      await this.dependencies.sessions.executePluginAction(tabId, "stop", {});
+      if (!owned?.quiescent) await this.dependencies.sessions.executePluginAction(tabId, "stop", {});
       if (owned) {
         owned.quiescent = true;
         await this.tabManifest(tabId).write(owned);
@@ -1571,6 +1618,14 @@ export class ForgeRuntime {
       this.dependencies.dataDir,
       `forge-workers/tabs/${safeId(tabId)}.json`,
       "Forge tab ownership",
+    );
+  }
+
+  private turnReceipt(workerId: string, attemptId: string): JsonStateFile {
+    return new JsonStateFile(
+      this.dependencies.dataDir,
+      `forge-workers/turns/${safeId(workerId)}/${safeId(attemptId)}.json`,
+      "Forge native turn receipt",
     );
   }
 

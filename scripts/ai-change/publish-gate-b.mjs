@@ -1731,7 +1731,10 @@ function signalGateBProcessGroup(processGroup, signal) {
 async function waitForGateBProcessGroup(processGroup, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (await gateBProcessGroupHasRunningMember(processGroup)) {
-    if (Date.now() >= deadline) return false;
+    if (Date.now() >= deadline) {
+      // An asynchronous /proc read may have captured the state before exit.
+      return !(await gateBProcessGroupHasRunningMember(processGroup));
+    }
     await gateBCommandDelay(commandPollMs);
   }
   return true;

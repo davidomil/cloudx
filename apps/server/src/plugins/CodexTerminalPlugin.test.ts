@@ -91,6 +91,26 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it("binds an owned native bridge to the prepared reviewer thread and attempt", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
+      const codexTurn = { workerId: "worker", attemptId: "attempt", receiptPath: path.join(root, "turn.json") };
+      const sessionId = "01a08470-d118-7b72-b1df-439e72e5c744";
+      await plugin.createSession({
+        tab: { ...tab, ownerPluginId: "forge" }, cwd: root, codexTurn,
+        prepareCodexSession: async () => sessionId,
+        initialInput: { prompt: "Continue the review." },
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+      });
+      const command = factory.args?.at(-1);
+      expect(command).toContain("codex-worker-bridge.mjs");
+      expect(command).toContain('"attemptId":"attempt"');
+      expect(command).toContain(`"expectedThreadId":"${sessionId}"`);
+      expect(command).toContain('"app-server","--listen","stdio://"');
+      expect(command).toContain(`"resume","${sessionId}","--","Continue the review."`);
+    });
+  });
+
   it("waits for the host's prepared conversation before resuming its exact thread", async () => {
     await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
       vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
