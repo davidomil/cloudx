@@ -64,6 +64,19 @@ describe("TerminalSupervisor ownership receipts", () => {
     expect(await fs.readdir(fixture.directory)).toEqual(["error.json"]);
   });
 
+  it("includes the supervisor's diagnostic in the startup message and preserves its cause", async () => {
+    const fixture = await supervisorFixture(true);
+    const message = "Terminal supervisor execution JSON is invalid; a stale broker/server is using incompatible supervisor arguments";
+    await fixture.receipt("error", { ...fixture.identity, message });
+    fixture.exit();
+
+    await expect(fixture.supervisor.ready()).rejects.toMatchObject({
+      message: expect.stringContaining(message),
+      cause: expect.objectContaining({ message: `Terminal supervision failed: ${message}` })
+    });
+    expect(await fs.readdir(fixture.directory)).toEqual(["error.json"]);
+  });
+
   it("accepts completed ownership when the command exits before startup is observed", async () => {
     const fixture = await supervisorFixture();
     await fixture.receipt("complete", { pid: process.pid, exitCode: 23 });

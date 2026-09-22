@@ -50,7 +50,7 @@ function updateCli(fixture, ...args) {
       "#!/bin/sh",
       'printf "%s\\n" "$*" >> "$CLOUDX_TEST_SERVICE_LOG"',
       '[ "$1" = --user ] && [ "$2" = show ] || exit 19',
-      'printf "LoadState=loaded\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"',
+      'printf "LoadState=loaded\\nActiveState=inactive\\nMainPID=0\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"',
     ].join("\n"),
     { mode: 0o755 },
   );
@@ -88,6 +88,8 @@ function checkout({ includeInstaller = false } = {}) {
       "install-cloudx.mjs",
       "install-update.mjs",
       "install-terminal-upgrade.mjs",
+      "install-runtime.mjs",
+      "terminal-upgrade-recovery.mjs",
       "installer-environment.mjs",
     ])
       fs.copyFileSync(
@@ -596,8 +598,11 @@ describe("installer update entrypoints", () => {
     expect(fs.readFileSync(path.join(fixture.root, "version"), "utf8"))
       .toBe("one\n");
     expect(result.stdout).not.toMatch(/npm ci|apt-get|updated installer executed/);
-    expect(result.serviceCalls).toHaveLength(1);
-    expect(result.serviceCalls[0]).toMatch(/^--user show preview\.service /);
+    expect(result.serviceCalls).toEqual([
+      expect.stringMatching(/^--user show preview\.service /),
+      expect.stringMatching(/^--user show preview\.service /),
+      expect.stringMatching(/^--user show cloudx-terminal\.service /),
+    ]);
   });
 
   it.each(["unrelated", "colliding"])("previews updates with %s untracked files without fetching or merging", (kind) => {
@@ -624,7 +629,37 @@ describe("installer update entrypoints", () => {
       .toBe("keep these notes\n");
     expect(fs.readFileSync(path.join(fixture.root, "local diagnostics/nested/notes.txt"), "utf8"))
       .toBe("nested notes\n");
-    expect(result.serviceCalls).toHaveLength(1);
+    expect(result.serviceCalls).toEqual([
+      expect.stringMatching(/^--user show preview\.service /),
+      expect.stringMatching(/^--user show preview\.service /),
+      expect.stringMatching(/^--user show cloudx-terminal\.service /),
+    ]);
+  });
+
+  it("requires explicit terminal migration and an absolute staged-updater checkout", () => {
+    expect(parseArgs(["--update", "--migrate-terminals", "--checkout", "/installed/cloudx"]))
+      .toMatchObject({ update: true, migrateTerminals: true, repoRoot: "/installed/cloudx" });
+    for (const args of [
+      ["--migrate-terminals"], ["--update", "--migrate-terminals", "--non-interactive"],
+      ["--update", "--migrate-terminals", "--service", "custom.service", "--port", "3002"],
+      ["--checkout", "/installed/cloudx"], ["--update", "--checkout", "relative"],
+    ]) expect(() => parseArgs(args)).toThrow();
+  });
+
+  it("runs a staged updater against the installed checkout before replacing its files", () => {
+    const fixture = checkout({ includeInstaller: true });
+    const staged = directory();
+    fs.cpSync(path.join(fixture.root, "scripts"), path.join(staged, "scripts"), { recursive: true });
+    const bin = directory();
+    fs.writeFileSync(path.join(bin, "systemctl"),
+      '#!/bin/sh\nprintf "LoadState=loaded\\nActiveState=inactive\\nMainPID=0\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"\n', { mode: 0o755 });
+    const result = spawnSync(process.execPath, [path.join(staged, "scripts/install-cloudx.mjs"),
+      "--checkout", fixture.root, "--update", "--service", "preview.service", "--port", "3002", "--yes"], {
+      cwd: staged, encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CLOUDX_TEST_CHECKOUT: fixture.root },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("updated installer executed");
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(fixture.latest);
   });
 
   it("accepts a complete target commit only in update mode", () => {
@@ -667,7 +702,7 @@ describe("installer update entrypoints", () => {
     const bin = directory();
     fs.writeFileSync(
       path.join(bin, "systemctl"),
-      '#!/bin/sh\nprintf "LoadState=loaded\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"\n',
+      '#!/bin/sh\nprintf "LoadState=loaded\\nActiveState=inactive\\nMainPID=0\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"\n',
       { mode: 0o755 },
     );
     const args = [
@@ -708,7 +743,7 @@ describe("installer update entrypoints", () => {
     fs.mkdirSync(bin);
     fs.writeFileSync(
       path.join(bin, "systemctl"),
-      '#!/bin/sh\nprintf "LoadState=loaded\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"\n',
+      '#!/bin/sh\nprintf "LoadState=loaded\\nActiveState=inactive\\nMainPID=0\\nNeedDaemonReload=no\\nWorkingDirectory=%s\\n" "$CLOUDX_TEST_CHECKOUT"\n',
       { mode: 0o755 },
     );
     const result = spawnSync(
@@ -822,6 +857,8 @@ function plannedUpdate({ service = false, modelExists = false } = {}) {
       return "LoadState=not-found";
     return [
       "LoadState=loaded",
+      "ActiveState=inactive",
+      "MainPID=0",
       "NeedDaemonReload=no",
       `WorkingDirectory=${fixture.root}`,
       `FragmentPath=${path.join(unitDir, args[2])}`,
@@ -853,6 +890,21 @@ function plannedUpdate({ service = false, modelExists = false } = {}) {
 }
 
 describe("the complete updater plan", () => {
+  it.each(["cloudx.service", "cloudx-terminal.service"])("refuses a live unpinned %s before Git or package mutations", async service => {
+    const fixture = plannedUpdate();
+    fs.writeFileSync(path.join(fixture.unitDir, service), "installed service");
+    const inspect = fixture.runner.inspect.bind(fixture.runner);
+    fixture.runner.inspect = (command, args) => command === "systemctl" && args[2] === service
+      ? ["LoadState=loaded", "NeedDaemonReload=no", "ActiveState=active", "MainPID=123", "ControlGroup=/cloudx-test.service",
+        `WorkingDirectory=${fixture.root}`, `FragmentPath=${path.join(fixture.unitDir, service)}`,
+        `EnvironmentFiles=${fixture.envPath} (ignore_errors=no)`].join("\n") : inspect(command, args);
+    const before = git(fixture.root, "rev-parse", "HEAD");
+    await expect(runInstaller(fixture.options)).rejects.toThrow(`${service} cannot safely survive`);
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(before);
+    expect(fixture.runner.commands.some(({ command, args }) => command === "npm" || command === "git" && ["fetch", "merge"].includes(args[0]))).toBe(false);
+    expect(fixture.runner.writes).toEqual([]);
+  });
+
   it("uses the same complete installation plan for terminal and Settings updates", async () => {
     const fixture = plannedUpdate();
     for (const name of [
@@ -1027,8 +1079,9 @@ describe("the complete updater plan", () => {
       expect(result).toMatchObject({ port: 3002, restartServices: true });
       expect(result.urls).toEqual([origin]);
       const readiness = planned.filter((command) => command[0] === "curl");
-      expect(readiness).toHaveLength(1);
+      expect(readiness).toHaveLength(2);
       expect(readiness[0].at(-1)).toBe(`${origin}/api/ready`);
+      expect(readiness[1].at(-1)).toBe(`${origin}/api/ready/terminals`);
       expect(planned).toContainEqual([
         "systemctl",
         "--user",

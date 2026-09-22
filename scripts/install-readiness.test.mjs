@@ -118,6 +118,7 @@ it("fails immediately for an endpoint that does not provide readiness", async ()
 it.each([
   ["Documentation", { code: "documentation_startup_failed", detail: "Invalid legacy metadata for doc_123 at snapshots/metadata.json" }],
   ["Cloudx web", { status: "not-ready", code: "documentation_startup_failed", detail: "Check the documentation service logs." }],
+  ["Cloudx supervised terminals", { status: "not-ready", code: "terminal_supervision_failed", detail: "Broker terminal readiness failed: stale helper contract." }],
 ])("stops %s polling at the first permanent startup failure", async (label, unavailableBody) => {
   const { url, requests } = await readinessServer({ responseStatus: 503, unavailableBody });
   const commands = new InstallerRunner({ log: () => {} });

@@ -82,6 +82,7 @@ import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js"
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
 import { NodePtyTerminalProcessFactory } from "./terminal/NodePtyTerminalProcess.js";
 import { DurableTerminalProcessFactory, terminalSocketPath } from "./terminal/DurableTerminalProcess.js";
+import { TerminalReadiness } from "./terminal/TerminalReadiness.js";
 import { MAX_TERMINAL_SCREEN_BYTES } from "./terminal/TerminalScreen.js";
 import { SessionStateStore } from "./workspace/SessionStateStore.js";
 import { VoiceController } from "./voice/VoiceController.js";
@@ -330,6 +331,18 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         return reply.code(503).send({ status: "not-ready", code: error.code, detail: error.message });
       }
       return reply.code(503).send({ status: "not-ready" });
+    }
+  });
+
+  const terminalReadiness = new TerminalReadiness(config.dataDir,
+    new DurableTerminalProcessFactory(terminalSocketPath(config.dataDir), new NodePtyTerminalProcessFactory(), config.terminalReplayBytes));
+  app.get("/api/ready/terminals", async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    try {
+      await terminalReadiness.check();
+      return { status: "ready", broker: "ready", direct: "ready" };
+    } catch (error) {
+      return reply.code(503).send({ status: "not-ready", code: "terminal_supervision_failed", detail: error instanceof Error ? error.message : "Terminal readiness failed." });
     }
   });
 

@@ -1,7 +1,8 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { NodePtyTerminalProcessFactory } from "./NodePtyTerminalProcess.js";
@@ -19,6 +20,31 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("terminal descendant ownership", () => {
+  it.each([
+    ["legacy broker arguments", ["/bin/sh", "-c", "exit 0"], "A stale CloudX broker/server may be using incompatible supervisor arguments"],
+    ["missing execution JSON", [], "execution JSON argument is missing"],
+    ["malformed execution JSON", ["{", "/bin/true"], "execution JSON is invalid"],
+    ["missing command", ["null"], "command is missing"],
+    ["empty command", ["null", ""], "command is missing"],
+    ["invalid execution binding", ["{}", "/bin/true"], "execution binding is invalid"],
+    ["non-object execution binding", ["[]", "/bin/true"], "execution binding is invalid"]
+  ])("writes an error without readiness for %s", async (_reason, arguments_, message) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-invalid-arguments-test-"));
+    directories.push(directory);
+    const helper = fileURLToPath(new URL("../../helpers/terminal-supervisor.py", import.meta.url));
+
+    const result = spawnSync("python3", ["-I", "-S", helper, directory, String(process.pid), ...arguments_], {
+      encoding: "utf8", timeout: 5_000
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(125);
+    expect(result.stderr).toBe("");
+    expect(await fs.readdir(directory)).toEqual(["error.json"]);
+    expect(JSON.parse(await fs.readFile(path.join(directory, "error.json"), "utf8")))
+      .toEqual({ pid: result.pid, message: expect.stringContaining(message) });
+  });
+
   it.each(["alive", "exited"] as const)("stops a detached orphan when the command is %s, preserving an unrelated process", async (mode) => {
     const fixture = await DetachedTerminalFixture.create(mode);
     const daemon = await fixture.process("daemon");
@@ -146,7 +172,7 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
 
     await expect(new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", `require('node:fs').writeFileSync(${JSON.stringify(commandMarker)}, 'started')`], {
       cwd: directory, env: process.env, cols: 100, rows: 30, execution
-    })).rejects.toThrow("Terminal supervisor failed to start");
+    })).rejects.toThrow("Terminal execution binding does not match the current boot and PID namespace");
     await expect(fs.access(commandMarker)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readdir(execution.directory)).toEqual(["error.json"]);
     expect(JSON.parse(await fs.readFile(path.join(execution.directory, "error.json"), "utf8")))
@@ -203,15 +229,16 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-prctl-test-"));
     directories.push(directory);
     await fs.writeFile(path.join(directory, "python3"), `#!/usr/bin/python3
-import ctypes, pathlib, runpy, sys, types
+import ctypes, pathlib, sys, types
 def rejected(*args):
     ctypes.set_errno(1)
     return -1
 def missing_children(*args, **kwargs):
     raise FileNotFoundError('Linux child enumeration is unavailable')
 ${rejectRequirement}
-sys.argv = sys.argv[3:]
-runpy.run_path(sys.argv[0], run_name='__main__')
+source = sys.argv[4]
+sys.argv = ['-c', *sys.argv[5:]]
+exec(compile(source, '<terminal-supervisor>', 'exec'))
 `, { mode: 0o755 });
     const commandMarker = path.join(directory, "command-started");
 
@@ -219,13 +246,6 @@ runpy.run_path(sys.argv[0], run_name='__main__')
       cwd: directory, env: { ...process.env, PATH: directory }, cols: 100, rows: 30
     })).rejects.toThrow("Linux subreaper support");
     await expect(fs.access(commandMarker)).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("fails before launching a terminal if its bundled helper is missing", async () => {
-    vi.spyOn(fs, "access").mockRejectedValueOnce(Object.assign(new Error("Missing helper"), { code: "ENOENT" }));
-    await expect(new NodePtyTerminalProcessFactory().spawn(process.execPath, ["-e", ""], {
-      cwd: os.tmpdir(), env: process.env, cols: 100, rows: 30
-    })).rejects.toThrow("bundled terminal-supervisor.py helper is required");
   });
 
   it("keeps input, foreground job control, interrupts, and resize working", async () => {

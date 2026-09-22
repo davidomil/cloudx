@@ -10,6 +10,7 @@ import sys
 import time
 
 
+CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_SIGNALS = (
@@ -33,6 +34,8 @@ class TerminalSupervisor:
     def run(self):
         if sys.version_info < (3, 9):
             raise RuntimeError("Terminal supervision requires Python 3.9 or newer")
+        if not self.command or not self.command[0]:
+            raise RuntimeError("Terminal supervisor command is missing")
         self.children.read_text()
         self.own_orphaned_descendants()
         self.bind_execution()
@@ -161,8 +164,18 @@ class TerminalSupervisor:
 
 
 if __name__ == "__main__":
-    supervisor = TerminalSupervisor(sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3]), sys.argv[4:])
+    supervisor = TerminalSupervisor(sys.argv[1], int(sys.argv[2]), None, sys.argv[4:])
     try:
+        if len(sys.argv) < 4:
+            raise RuntimeError("Terminal supervisor execution JSON argument is missing")
+        try:
+            supervisor.execution = json.loads(sys.argv[3])
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Terminal supervisor execution JSON is invalid: {error}. "
+                "A stale CloudX broker/server may be using incompatible supervisor arguments; "
+                "the broker/server and helper must come from the same CloudX runtime."
+            ) from error
         sys.exit(supervisor.run())
     except Exception as error:
         supervisor.write_receipt("error", {**supervisor.identity, "message": str(error)})

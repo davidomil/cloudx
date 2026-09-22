@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { IPty } from "node-pty";
 
 import type { TerminalProducer, TerminalProducerFactory, TerminalSpawnOptions } from "./TerminalProcess.js";
 import { TerminalSupervisor, type TerminalExit } from "./TerminalSupervisor.js";
+import { terminalSupervisorSource } from "./TerminalSupervisorRuntime.js";
 
 export class NodePtyTerminalProcess implements TerminalProducer {
   private exited = false;
@@ -87,13 +87,11 @@ export class NodePtyTerminalProcessFactory implements TerminalProducerFactory {
       throw new Error("node-pty is required for interactive terminal tabs. Install it for the active Node.js version before starting Codex terminal sessions.");
     }
 
-    const helper = fileURLToPath(new URL("../../helpers/terminal-supervisor.py", import.meta.url));
-    await fs.access(helper).catch(() => { throw new Error("The bundled terminal-supervisor.py helper is required for terminal tabs."); });
     const directory = options.execution?.directory ?? await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-"));
     if (options.execution && (await fs.readdir(directory)).length) throw new Error("Terminal execution receipt directory must be empty before launch.");
     let supervisor: TerminalSupervisor | undefined;
     try {
-      const native = pty.spawn("python3", ["-I", "-S", helper, directory, String(process.pid), JSON.stringify(options.execution ?? null), command, ...args], {
+      const native = pty.spawn("python3", ["-I", "-S", "-c", terminalSupervisorSource, directory, String(process.pid), JSON.stringify(options.execution ?? null), command, ...args], {
         name: "xterm-256color",
         cwd: options.cwd,
         env: options.env,
