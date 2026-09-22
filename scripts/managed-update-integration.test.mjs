@@ -181,6 +181,41 @@ it("bundles the maintained integration and lifecycle probe with the coordinator 
     .toEqual(fs.readFileSync(path.join(coordinator, "scripts/managed-update-readiness-legacy.ts")));
 });
 
+it.each(["settings-update.mjs", "managed-update.mjs"])("loads staged %s through resume and the next handoff after checkout replacement", entrypoint => {
+  const home = directory(), checkout = directory();
+  const installed = { run: { id: "11111111-1111-4111-8111-111111111111" } };
+  new SettingsUpdater({ repoRoot: checkout, home }).stage(installed);
+  fs.cpSync(installed.coordinator, checkout, { recursive: true });
+
+  function stageFrom(source, record) {
+    return JSON.parse(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      import { SettingsUpdater } from './scripts/settings-update.mjs';
+      const [repoRoot, home, saved] = process.argv.slice(1);
+      const record = JSON.parse(saved);
+      new SettingsUpdater({ repoRoot, home }).stage(record);
+      console.log(JSON.stringify(record));
+    `, checkout, home, JSON.stringify(record)], { cwd: source, encoding: "utf8", timeout: 10_000 }));
+  }
+
+  const staged = stageFrom(checkout, { run: { id: "22222222-2222-4222-8222-222222222222" } });
+  fs.rmSync(checkout, { recursive: true });
+  fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
+  fs.writeFileSync(path.join(checkout, "scripts", entrypoint), "throw new Error('Replaced checkout must not supply the coordinator');\n");
+
+  const resumed = stageFrom(staged.coordinator, staged);
+  const next = stageFrom(staged.coordinator, { run: { id: "33333333-3333-4333-8333-333333333333" } });
+  expect(resumed).toEqual(staged);
+  expect(next.coordinator).not.toBe(staged.coordinator);
+  for (const record of [staged, resumed, next]) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(record.coordinator, "bundle.json"), "utf8"));
+    expect(() => verifySnapshot(record.coordinator, manifest)).not.toThrow();
+    expect(manifest.map(entry => entry.path)).toContain("scripts/codex-updater.mjs");
+    expect(execFileSync(process.execPath, ["--input-type=module", "--eval",
+      "await import(process.argv[1]); console.log('loaded');", pathToFileURL(path.join(record.coordinator, "scripts", entrypoint)).href],
+    { cwd: checkout, encoding: "utf8", timeout: 10_000 }).trim()).toBe("loaded");
+  }
+});
+
 it.each([
   ["command", undefined], ["invalid JSON", undefined], ["incomplete result", undefined],
   ["broker result for a direct target", "direct"], ["direct result for a broker target", undefined],
