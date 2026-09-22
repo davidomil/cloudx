@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { ConfigValue, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
+import type { ConfigValue, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
@@ -57,6 +57,7 @@ export class SessionStore {
   private readonly triggerEmissions = new Set<Promise<unknown>>();
   private readonly contextWrites = new Set<Promise<void>>();
   private readonly tabClosures = new Map<string, Promise<void>>();
+  private readonly tabOwnershipActions = new Map<string, Promise<unknown>>();
   private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
   private readonly shutdownController = new AbortController();
@@ -161,6 +162,7 @@ export class SessionStore {
   recoverTab(tabId: string, request: RecoverTabRequest): Promise<WorkspaceTab> {
     if (this.disposed) return Promise.reject(new Error("Session store is disposed."));
     if (this.tabClosures.has(tabId)) return Promise.reject(new Error("The tab is closing."));
+    if (this.tabOwnershipActions.has(tabId)) return Promise.reject(new Error("Directory ownership recovery is in progress."));
     const pending = this.tabRecoveries.get(tabId);
     if (pending) return pending;
     const recovering = this.admitAction(undefined, () => this.recoverTabNow(tabId, request));
@@ -222,6 +224,49 @@ export class SessionStore {
     }
     await this.savedSessions?.flush();
     return this.getTab(tabId);
+  }
+
+  previewTabOwnership(tabId: string): Promise<DirectoryOwnershipPreview> {
+    return this.withStoppedTab(tabId, async (plugin, input) => {
+      if (!plugin.previewOwnership) throw new Error("Directory ownership recovery is unavailable for this tab.");
+      return plugin.previewOwnership(input);
+    });
+  }
+
+  reconcileTabOwnership(tabId: string, request: DirectoryOwnershipReconciliation): Promise<WorkspaceTab> {
+    return this.withStoppedTab(tabId, async (plugin, input) => {
+      if (!plugin.reconcileOwnership) throw new Error("Directory ownership recovery is unavailable for this tab.");
+      await plugin.reconcileOwnership(input, request);
+      await this.recordRestoreFailure(input.tab, new PluginSessionMissingError("The previous terminal process ended."));
+      await this.savedSessions?.flush();
+      return this.getTab(tabId);
+    });
+  }
+
+  private withStoppedTab<T>(tabId: string, operation: (plugin: WorkspacePlugin, input: CreatePluginSessionInput) => Promise<T>): Promise<T> {
+    if (this.disposed) return Promise.reject(new Error("Session store is disposed."));
+    if (this.tabClosures.has(tabId) || this.tabRecoveries.has(tabId) || this.tabOwnershipActions.has(tabId))
+      return Promise.reject(new Error("Wait for this tab's current operation before reconciling ownership."));
+    const pending = this.admitAction(undefined, async () => {
+      const tab = this.getTab(tabId);
+      const plugin = this.plugins.get(tab.pluginId);
+      if (tab.ownerPluginId || plugin.id !== "codex-terminal" || tab.recovery?.state !== "missing")
+        throw new Error("Confirm that the Codex process ended before reconciling its source ownership.");
+      const previous = this.sessions.get(tabId);
+      if (previous && !previous.hasExited?.()) throw new Error("The Codex process is still active.");
+      // An old recovery message is insufficient: ask the broker on every request.
+      let attached: PluginSession | undefined;
+      try { attached = await this.restoreTabSession(tab); }
+      catch (error) { if (!(error instanceof PluginSessionMissingError)) throw error; }
+      if (attached) {
+        this.bindSession(tabId, attached);
+        throw new Error("The Codex process is still active. Stop it before reconciling ownership.");
+      }
+      return operation(plugin, await this.sessionInput(tab));
+    });
+    this.tabOwnershipActions.set(tabId, pending);
+    void pending.then(() => this.tabOwnershipActions.delete(tabId), () => this.tabOwnershipActions.delete(tabId));
+    return pending;
   }
 
   async flush(): Promise<void> {
@@ -648,6 +693,7 @@ export class SessionStore {
 
   private async closeTabNow(tabId: string, stopSession: boolean): Promise<void> {
     if (this.tabRecoveries.has(tabId)) await this.tabRecoveries.get(tabId)!.catch(() => {});
+    if (this.tabOwnershipActions.has(tabId)) await this.tabOwnershipActions.get(tabId)!.catch(() => {});
     let session = this.sessions.get(tabId);
     try {
       const tab = this.tabs.get(tabId);

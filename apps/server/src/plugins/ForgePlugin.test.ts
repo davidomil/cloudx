@@ -22,6 +22,8 @@ async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-plugin-"));
   roots.push(root);
   const workflow = {
+    previewOwnership: vi.fn(async () => ({ fingerprint: "a".repeat(64), directories: [] })),
+    reconcileOwnership: vi.fn(async () => ({ id: "worker" })),
     startIssue: vi.fn(async () => ({ id: "worker" })),
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
     syncAndReview: vi.fn(async () => ({ id: "worker" })),
@@ -58,6 +60,19 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections, logger };
 }
 describe("Forge plugin boundary", () => {
+  it("requires a complete ownership preview and explicit attestation at the hook boundary", async () => {
+    const { hooks, workflow } = await fixture();
+    const input = { id: "worker", fingerprint: "a".repeat(64), attestations: [{ device: "64521", filesystemId: "original-ext4", filesystemType: "ext4" }] };
+    await expect(hooks.call("forge.worker.previewOwnership", { id: "worker" }, { caller: { kind: "ui" } })).resolves.toMatchObject({ preview: { fingerprint: input.fingerprint } });
+    await hooks.call("forge.worker.reconcileOwnership", input, { caller: { kind: "ui" } });
+    expect(workflow.reconcileOwnership).toHaveBeenCalledExactlyOnceWith("worker", { fingerprint: input.fingerprint, attestations: input.attestations });
+    for (const invalid of [{ ...input, attestations: [] }, { ...input, fingerprint: "stale" }, { ...input, path: "/other" }, { ...input, attestations: [{ device: "64521" }] }]) {
+      await expect(hooks.call("forge.worker.reconcileOwnership", invalid, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    }
+    await expect(hooks.call("forge.worker.reconcileOwnership", input, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.reconcileOwnership).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["ui", "http"] as const)("reads retained history through %s without starting a worker", async kind => {
     const { hooks, workflow, logger } = await fixture();
     const history = { tabId: "tab-1", capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "Private terminal history", cols: 100, rows: 30 } };

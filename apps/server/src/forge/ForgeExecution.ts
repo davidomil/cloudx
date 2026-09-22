@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { isDurableDirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory, type OwnedDirectoryIdentity } from "../jsonStateFile.js";
 import type { TerminalExecutionBinding } from "../terminal/TerminalProcess.js";
 
@@ -57,7 +58,8 @@ export class ForgeExecutionRecovery {
   private validate(value: ForgeExecution): void {
     if (!value || !isUuid(value.executionId) || !isUuid(value.bootId) || !/^pid:\[\d+\]$/u.test(value.pidNamespace) ||
       value.directory !== path.join(this.directory(), value.executionId) || value.receiptDirectory?.path !== value.directory ||
-      !/^\d+$/u.test(value.receiptDirectory?.dev) || !/^\d+$/u.test(value.receiptDirectory?.ino))
+      !/^\d+$/u.test(value.receiptDirectory?.dev) || !/^\d+$/u.test(value.receiptDirectory?.ino) ||
+      value.receiptDirectory?.durable !== undefined && !isDurableDirectoryIdentity(value.receiptDirectory.durable))
       throw new Error("Worker execution ownership record is invalid. Local resources were preserved.");
   }
 

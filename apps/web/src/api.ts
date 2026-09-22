@@ -31,6 +31,8 @@ import type {
   PathOption,
   PluginDescriptor,
   RecoverTabRequest,
+  DirectoryOwnershipPreview,
+  DirectoryOwnershipReconciliation,
   CloudxNotification,
   SearchWorkspaceWindowsResponse,
   TabLayoutState,
@@ -694,6 +696,14 @@ export async function recoverTab(tabId: string, input: RecoverTabRequest): Promi
     method: "POST",
     body: JSON.stringify(input)
   });
+}
+
+export async function previewTabOwnership(tabId: string): Promise<DirectoryOwnershipPreview> {
+  return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/ownership/preview`, { method: "POST", body: "{}" });
+}
+
+export async function reconcileTabOwnership(tabId: string, input: DirectoryOwnershipReconciliation): Promise<WorkspaceTab> {
+  return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/ownership/reconcile`, { method: "POST", body: JSON.stringify(input) });
 }
 
 export async function runTabAction<T>(tabId: string, action: string, input: Record<string, unknown>): Promise<T> {

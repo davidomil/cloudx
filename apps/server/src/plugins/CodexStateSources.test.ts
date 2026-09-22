@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CodexStateSources } from "./CodexStateSources.js";
 
+vi.mock("../filesystemIdentity.js", () => ({ filesystemIdentity: async () => ({ filesystemType: "ef53", filesystemId: "f00d1234" }) }));
+
 const roots: string[] = [];
 afterEach(async () => {
   vi.useRealTimers();
@@ -409,3 +411,43 @@ async function heldSourceFixture(stage: string, failLate = false) {
       sources.readConfig(selected, signal),
   };
 }
+
+describe("durable Codex source ownership", () => {
+  it("keeps the bound shared source after device renumbering with matching filesystem evidence", async () => {
+    const f = await fixture();
+    const source = await f.sources.resolve();
+    const view = await f.sources.bind("durable", source);
+    await fs.writeFile(path.join(view, ".cloudx-source.json"), JSON.stringify({ version: 1, ...source, dev: "1" }));
+    await expect(f.sources.readBinding("durable")).resolves.toEqual(source);
+    await expect(f.sources.assertCurrent({ ...source, dev: "1" })).resolves.toBeUndefined();
+    await f.sources.dispose();
+  });
+
+  it("requires reviewed evidence to upgrade a blocked legacy binding and rejects stale previews", async () => {
+    const f = await fixture();
+    const source = await f.sources.resolve();
+    const view = await f.sources.bind("legacy", source);
+    const bindingPath = path.join(view, ".cloudx-source.json");
+    const legacy = { version: 1, sourceId: source.sourceId, home: source.home, ino: source.ino, dev: "1" };
+    await fs.writeFile(bindingPath, JSON.stringify(legacy));
+    await expect(f.sources.readBinding("legacy")).rejects.toThrow(/device changed from 1.*reconcile/);
+    const preview = await f.sources.previewOwnership("legacy");
+    await expect(f.sources.reconcileOwnership("legacy", { fingerprint: preview.fingerprint, attestations: [] })).rejects.toThrow(/Confirm that saved device 1/);
+    expect(JSON.parse(await fs.readFile(bindingPath, "utf8"))).toEqual(legacy);
+    await expect(f.sources.reconcileOwnership("legacy", { fingerprint: "0".repeat(64), attestations: preview.directories })).rejects.toThrow(/changed after inspection/);
+    await f.sources.reconcileOwnership("legacy", { fingerprint: preview.fingerprint, attestations: preview.directories });
+    await expect(f.sources.readBinding("legacy")).resolves.toEqual(source);
+    expect(JSON.parse(await fs.readFile(bindingPath, "utf8"))).toMatchObject({ ...source, durable: source.durable });
+    await f.sources.dispose();
+  });
+
+  it("does not permit attestation to override known filesystem replacement", async () => {
+    const f = await fixture();
+    const source = await f.sources.resolve();
+    const view = await f.sources.bind("changed", source);
+    await fs.writeFile(path.join(view, ".cloudx-source.json"), JSON.stringify({ version: 1, ...source, durable: { ...source.durable!, filesystemId: "ffff" } }));
+    await expect(f.sources.previewOwnership("changed")).rejects.toThrow(/ownership changed/);
+    await expect(f.sources.readBinding("changed")).rejects.toThrow(/ownership changed/);
+    await f.sources.dispose();
+  });
+});

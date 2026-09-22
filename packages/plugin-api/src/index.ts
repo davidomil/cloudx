@@ -2,6 +2,8 @@ import {
   UI_RENDERER_STATUS_DOT,
   type ConfigFieldDescriptor,
   type ConfigValue,
+  type DirectoryOwnershipPreview,
+  type DirectoryOwnershipReconciliation,
   type CloudxRule,
   type CloudxSkill,
   type HookDescriptor,
@@ -253,6 +255,8 @@ export interface WorkspacePlugin {
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  previewOwnership?(input: CreatePluginSessionInput): Promise<DirectoryOwnershipPreview>;
+  reconcileOwnership?(input: CreatePluginSessionInput, request: DirectoryOwnershipReconciliation): Promise<void>;
   describeRecovery?(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume?: boolean }> | { message: string; conversationId?: string; canResume?: boolean };
   retirementMessage?: string;
   descriptor(): PluginDescriptor;

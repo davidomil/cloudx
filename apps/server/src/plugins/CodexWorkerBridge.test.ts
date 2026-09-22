@@ -12,6 +12,7 @@ import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 
 const helper = new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url);
 const { CodexWorkerTurn, saveTurnReceipt } = await import(helper.href);
+const { applyLaunchPermissions } = await import(new URL("../../helpers/codex-remote-permissions.mjs", import.meta.url).href);
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true }))); });
 const binding = { workerId: "worker", attemptId: "attempt", receiptPath: "/unused" };
@@ -21,6 +22,78 @@ const complete = (status = "completed", threadId = "thread", turnId = "turn") =>
 const titleThreadStart = { id: "temporary-structured-thread", method: "thread/start", params: { threadSource: "system", ephemeral: true } };
 const titleThreadResponse = { id: titleThreadStart.id, result: { thread: { id: "title-thread" } } };
 const titleTurnStart = { id: "temporary-structured-turn", method: "turn/start", params: { threadId: "title-thread", outputSchema: { type: "object", properties: { title: { type: "string" } } } } };
+
+it.each([true, false])("preserves native writable roots and applies the selected fresh-thread YOLO policy %s", yoloMode => {
+  const request = { id: 1, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project", "/existing-writable"], approvalPolicy: "on-request", sandbox: "workspace-write", permissions: null } };
+  applyLaunchPermissions(request, { yoloMode, additionalWritableRoots: ["/cloudx-skills", "/existing-writable"] });
+  expect(request.params).toEqual({
+    runtimeWorkspaceRoots: ["/project", "/existing-writable", "/cloudx-skills"],
+    approvalPolicy: yoloMode ? "never" : "on-request", sandbox: yoloMode ? "danger-full-access" : "workspace-write", permissions: null
+  });
+});
+
+it.each(["thread/resume", "thread/fork"])("keeps native saved permission selection during %s", method => {
+  const request = { id: 1, method, params: { threadId: "saved", runtimeWorkspaceRoots: ["/project"], approvalPolicy: null, sandbox: null, permissions: null } };
+  applyLaunchPermissions(request, { yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  expect(request.params).toEqual({ threadId: "saved", runtimeWorkspaceRoots: ["/project", "/cloudx-skills"], approvalPolicy: null, sandbox: null, permissions: null });
+  const rejoin = { id: 2, method, params: { threadId: "loaded" } };
+  applyLaunchPermissions(rejoin, { yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  expect(rejoin.params).toEqual({ threadId: "loaded" });
+});
+
+it("keeps auxiliary thread permissions native and rejects unresolved new-thread roots", () => {
+  const permissions = { yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] };
+  const auxiliary = structuredClone(titleThreadStart);
+  applyLaunchPermissions(auxiliary, permissions);
+  expect(auxiliary).toEqual(titleThreadStart);
+  expect(() => applyLaunchPermissions({ method: "thread/start", params: {} }, permissions)).toThrow("resolved workspace roots");
+  expect(() => applyLaunchPermissions({ method: "thread/start", params: { runtimeWorkspaceRoots: ["relative"] } }, permissions)).toThrow("workspace roots are invalid");
+  expect(() => applyLaunchPermissions({ method: "thread/start", params: {} }, { ...permissions, additionalWritableRoots: ["relative"] })).toThrow("Invalid Codex launch permissions");
+});
+
+it("makes each selected conversation durable before its native TUI receives the reply", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-selection-bridge-"));
+  directories.push(directory);
+  const command = path.join(directory, "codex.mjs");
+  const receiptPath = path.join(directory, "selected.json");
+  const observedPath = path.join(directory, "observed.json");
+  const firstId = "01a08470-d118-7b72-b1df-439e72e5c744";
+  const secondId = "01a08470-d118-7b72-b1df-439e72e5c745";
+  const selection = { tabId: "visible-tab", executionId: firstId, receiptPath };
+  const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+import WebSocket from ${JSON.stringify(ws)};
+if (process.argv.includes('app-server')) {
+  readline.createInterface({ input: process.stdin }).on('line', line => {
+    const request = JSON.parse(line);
+    if (!['thread/start', 'thread/resume'].includes(request.method)) throw new Error('Unexpected request');
+    const thread = { id: request.id === 1 ? ${JSON.stringify(firstId)} : ${JSON.stringify(secondId)}, cwd: process.cwd() };
+    process.stdout.write(JSON.stringify({ id: request.id, result: { thread } }) + '\\n');
+  });
+} else {
+  const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
+  const observed = [];
+  socket.on('open', () => socket.send(JSON.stringify({ id: 1, method: 'thread/start', params: {} })));
+  socket.on('message', data => {
+    const reply = JSON.parse(data.toString());
+    const receipt = JSON.parse(fs.readFileSync(${JSON.stringify(receiptPath)}, 'utf8'));
+    if (receipt.sessionId !== reply.result.thread.id || receipt.executionId !== ${JSON.stringify(firstId)} || receipt.tabId !== 'visible-tab')
+      throw new Error('TUI received selection before its bound receipt was durable');
+    observed.push(receipt.sessionId);
+    if (reply.id === 1) socket.send(JSON.stringify({ id: 2, method: 'thread/resume', params: { threadId: ${JSON.stringify(secondId)} } }));
+    else fs.writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify(observed));
+  });
+}
+`, { mode: 0o755 });
+  const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
+    selection, command, serverArgs: ["app-server"], tuiArgs: []
+  })], { cwd: directory, env: process.env, cols: 100, rows: 30 });
+  try {
+    await expect.poll(async () => fs.readFile(observedPath, "utf8").then(JSON.parse, () => undefined)).toEqual([firstId, secondId]);
+  } finally { await terminal.terminate(); }
+}, 10_000);
 
 it.each(["before worker start", "before worker reply", "during worker turn", "after worker completion"])("keeps title generation separate %s", timing => {
   const saved: unknown[] = [];
