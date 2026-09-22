@@ -10,6 +10,7 @@ import type {
   CloudxLogsResponse,
   CloudxUpdatePreview,
   CloudxUpdateStatus,
+  CodexUpdateStatus,
   TabLayoutState,
   WorkspaceStateResponse,
   WorkspaceTab,
@@ -52,7 +53,20 @@ const mainUpdatePreview: CloudxUpdatePreview = {
     "b".repeat(40),
 };
 
+const installedCodex: CodexUpdateStatus = {
+  jobId: null,
+  phase: "idle",
+  installedVersion: "1.0.0",
+  outcome: null,
+  message: "Ready to update Codex.",
+  startedAt: null,
+  finishedAt: null,
+};
+
 test.beforeEach(async ({ page }) => {
+  await page.route("**/api/hooks/codex-update.read", (route) =>
+    route.fulfill({ json: { result: { update: installedCodex } } }),
+  );
   await page.route("**/api/system/update/preview", (route) =>
     route.fulfill({ json: mainUpdatePreview }),
   );
@@ -646,6 +660,170 @@ test("Codex settings opens inside Settings without creating a workspace tab and 
     0,
   );
   await expect(plugins).not.toContainText("Codex Settings");
+});
+
+test("Codex update is keyboard and touch accessible, preserves drafts, and reconnects to the server job", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  let update = installedCodex;
+  let connected = true;
+  const starts: unknown[] = [];
+  await page.route("**/api/hooks/codex-update.read", (route) =>
+    connected
+      ? route.fulfill({ json: { result: { update } } })
+      : route.abort("connectionfailed"),
+  );
+  await page.route("**/api/hooks/codex-update.start", async (route) => {
+    starts.push(route.request().postDataJSON());
+    update = {
+      ...installedCodex,
+      jobId: "browser-update",
+      phase: "updating",
+      message: "Installing the latest Codex release…",
+      startedAt: "2026-09-22T00:00:00.000Z",
+    };
+    await route.fulfill({ json: { result: { update } } });
+  });
+  const original = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  const button = control.getByRole("button", {
+    name: "Update Codex",
+    exact: true,
+  });
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  await expect(control).toContainText("Installed version: 1.0.0");
+  await model.fill("unsaved-update-draft");
+  const codexTab = page.getByRole("tab", { name: "Codex", exact: true });
+  await codexTab.focus();
+  await page.keyboard.press("Tab");
+  await expect(
+    page.getByRole("tabpanel", { name: "Codex", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(button).toBeFocused();
+  await expect(button).toBeInViewport({ ratio: 1 });
+  expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  await button.press("Enter");
+  await expect(control).toContainText("Installing the latest Codex release");
+  await expect(button).toBeDisabled();
+  await navigateCodexSettings(page, "category switches");
+  await expect(model).toHaveValue("unsaved-update-draft");
+  await expect(button).toBeDisabled();
+
+  connected = false;
+  await expect(control).toContainText("Cannot read Codex update status");
+  await expect(button).toBeDisabled();
+  connected = true;
+  update = {
+    ...update,
+    phase: "verifying",
+    message: "Verifying the updated Codex executable…",
+  };
+  await expect(control).toContainText("Verifying the updated Codex executable");
+  update = {
+    ...update,
+    phase: "succeeded",
+    installedVersion: "1.1.0",
+    outcome: "updated",
+    message: "Codex updated to 1.1.0.",
+    finishedAt: "2026-09-22T00:00:01.000Z",
+  };
+  await expect(control).toContainText("Codex updated to 1.1.0.");
+  await expect(control).toContainText("Installed version: 1.1.0");
+  await expect(model).toHaveValue("unsaved-update-draft");
+  await expect(
+    settings.getByRole("button", { name: "Save Codex settings", exact: true }),
+  ).toBeEnabled();
+  await expectCodexSettingsFits(page);
+  await control.scrollIntoViewIfNeeded();
+  await captureSample(page, testInfo, "codex-cli-update-complete");
+  await page.route("**/api/config", (route) =>
+    route.fulfill({
+      status: 500,
+      json: { message: "CloudX settings could not be saved." },
+    }),
+  );
+  await page
+    .getByRole("dialog", { name: "Settings", exact: true })
+    .getByRole("button", { name: "Save", exact: true })
+    .click();
+  await expect(page.locator(".error-banner")).toHaveText(
+    "CloudX settings could not be saved.",
+  );
+  await page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-update.read",
+  );
+  await expect(page.locator(".error-banner")).toHaveText(
+    "CloudX settings could not be saved.",
+  );
+  await page
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await openCodexSettings(page, isMobile);
+  await expect(control).toContainText("Codex updated to 1.1.0.");
+  expect(starts).toEqual([{ input: {} }]);
+  const current = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  expect(current.tabs).toEqual(original.tabs);
+});
+
+test("Codex update displays already-current and actionable failure results on narrow screens", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  let update: CodexUpdateStatus = {
+    ...installedCodex,
+    jobId: "browser-update",
+    phase: "succeeded",
+    outcome: "current",
+    message: "Codex 1.0.0 is already current.",
+    startedAt: "2026-09-22T00:00:00.000Z",
+    finishedAt: "2026-09-22T00:00:01.000Z",
+  };
+  await page.route("**/api/hooks/codex-update.read", (route) =>
+    route.fulfill({ json: { result: { update } } }),
+  );
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  await expect(control).toContainText("Codex 1.0.0 is already current.");
+  await page.setViewportSize({ width: 320, height: 640 });
+  update = {
+    ...update,
+    phase: "failed",
+    outcome: null,
+    message:
+      "Codex installation failed. Check npm network access and try again.",
+  };
+  await expect(control).toContainText("Check npm network access");
+  await expect(control).toContainText("Installed version: 1.0.0");
+  await expect(control).not.toContainText("already current");
+  const button = control.getByRole("button", {
+    name: "Update Codex",
+    exact: true,
+  });
+  await button.scrollIntoViewIfNeeded();
+  await expect(button).toBeEnabled();
+  await expect(button).toBeInViewport({ ratio: 1 });
+  expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+  expect(
+    await control.evaluate(
+      (element) => element.scrollWidth <= element.clientWidth + 1,
+    ),
+  ).toBe(true);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth + 1,
+    ),
+  ).toBe(true);
+  await captureSample(page, testInfo, "codex-cli-update-failed-mobile");
 });
 
 const settingsNavigations = ["category switches", "search filtering"] as const;

@@ -86,6 +86,7 @@ function checkout({ includeInstaller = false } = {}) {
     fs.mkdirSync(path.join(author, "scripts"));
     for (const file of [
       "install-cloudx.mjs",
+      "codex-updater.mjs",
       "install-update.mjs",
       "install-terminal-upgrade.mjs",
       "install-runtime.mjs",

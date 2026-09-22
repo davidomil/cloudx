@@ -3615,7 +3615,10 @@ a:hover svg {
   min-width: 0;
   color: var(--color-foreground);
 }
-.codex-settings-header, .codex-settings-form { max-width: 680px; }
+.codex-settings-header, .codex-settings-form, .codex-update-control { max-width: 680px; }
+.codex-update-control { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 16px; border: 1px solid var(--color-border); border-radius: 6px; overflow-wrap: anywhere; }
+.codex-update-control h3, .codex-update-control p { margin: 0; }
+.codex-update-control small { color: var(--color-muted-foreground); }
 .codex-settings-header h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: var(--font-size-md); }
 .codex-settings-header p, .codex-settings-form small { color: var(--color-muted-foreground); overflow-wrap: anywhere; }
 .codex-settings-form { display: flex; flex-direction: column; gap: 16px; }

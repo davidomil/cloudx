@@ -13,6 +13,11 @@ import {
 import { prepareTerminalUpgrade } from "./install-terminal-upgrade.mjs";
 import { prepareRuntimeUpdate } from "./install-runtime.mjs";
 import {
+  acquireCodexInstallationLock,
+  resolveCodexInstallation,
+  updateCodexInstallation,
+} from "./codex-updater.mjs";
+import {
   SERVICE_NAMES,
   TERMINAL_SERVICE_NAME,
   UPDATE_SERVICE_NAMES,
@@ -2197,33 +2202,30 @@ export function waitForHealth(
   throw failure ?? new Error(`${label} readiness startup budget was exhausted at ${url}.`);
 }
 
-function runCodexUpdater({ paths, commands, env }) {
+async function runCodexUpdater({ paths, commands, env }) {
   const savedEnv = fs.existsSync(paths.envPath)
     ? parseEnvironmentFile(fs.readFileSync(paths.envPath, "utf8"))
     : {};
-  const savedBin = savedEnv.CLOUDX_ASSISTANT_BIN;
-  if (savedBin !== undefined) {
-    if (
-      !path.isAbsolute(savedBin) ||
-      path.basename(savedBin) !== "codex" ||
-      path.basename(path.dirname(savedBin)) !== "bin"
-    ) {
-      throw new Error(
-        "Codex-only updates require CLOUDX_ASSISTANT_BIN to be an absolute npm prefix/bin/codex path. Update custom assistant executables with their own installer.",
-      );
-    }
-    paths.npmGlobalDir = path.dirname(path.dirname(savedBin));
-  } else if (savedEnv.CLOUDX_NPM_GLOBAL_DIR !== undefined) {
-    paths.npmGlobalDir = savedEnv.CLOUDX_NPM_GLOBAL_DIR;
-  }
-  if (!path.isAbsolute(paths.npmGlobalDir)) {
-    throw new Error("CLOUDX_NPM_GLOBAL_DIR must be an absolute path.");
-  }
+  const installation = resolveCodexInstallation({
+    assistantBin: savedEnv.CLOUDX_ASSISTANT_BIN ?? env.CLOUDX_ASSISTANT_BIN,
+    prefix: savedEnv.CLOUDX_NPM_GLOBAL_DIR ?? paths.npmGlobalDir,
+  });
+  paths.npmGlobalDir = installation.prefix;
 
   section("Update only Codex CLI");
-  verifyNodeAndNpm(commands);
-  const assistantBin = installCodexCli(commands, paths, env, "latest");
-  commands.run(assistantBin, ["--version"], { env: codexNpmEnv(paths, env) });
+  const { assistantBin } = installation;
+  if (commands.dryRun) {
+    verifyNodeAndNpm(commands);
+    installCodexCli(commands, paths, env, "latest");
+    commands.run(assistantBin, ["--version"], { env: codexNpmEnv(paths, env) });
+  } else {
+    const result = await updateCodexInstallation({
+      ...installation,
+      env,
+      onProgress: (stage) => console.log(`Codex: ${stage}.`),
+    });
+    console.log(`Codex ${result.installedVersion}${result.outcome === "current" ? " is already current" : " installed"}.`);
+  }
   console.log(
     "Codex CLI update complete. New Codex processes use the updated executable.",
   );
@@ -2234,17 +2236,22 @@ function installCodexCli(commands, paths, env, version = CODEX_CLI_VERSION) {
   const assistantBin = codexCliBin(paths);
   const npmEnv = codexNpmEnv(paths, env);
   commands.mkdir(paths.npmGlobalDir);
-  commands.run(
-    "npm",
-    [
-      "i",
-      "-g",
-      "--prefix",
-      paths.npmGlobalDir,
-      `@openai/codex@${version}`,
-    ],
-    { env: npmEnv },
-  );
+  const release = commands.dryRun ? () => {} : acquireCodexInstallationLock(paths.npmGlobalDir);
+  try {
+    commands.run(
+      "npm",
+      [
+        "i",
+        "-g",
+        "--prefix",
+        paths.npmGlobalDir,
+        `@openai/codex@${version}`,
+      ],
+      { env: npmEnv },
+    );
+  } finally {
+    release();
+  }
   return assistantBin;
 }
 
@@ -2360,6 +2367,7 @@ export function installServerRuntimeSchemas(runner, paths) {
 
 function commandMap(runner) {
   return {
+    dryRun: runner.dryRun,
     nonInteractive: runner.nonInteractive,
     inspect(command, args, options) {
       return runner.inspect(command, args, options);

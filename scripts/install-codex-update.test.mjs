@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { acquireCodexInstallationLock } from "./codex-updater.mjs";
 import {
   CLOUDX_NPM_GLOBAL_DIR,
   InstallerRunner,
@@ -188,18 +189,44 @@ describe("Codex-only CLI entrypoints", () => {
       const { root, home, envPath, prefix } = fixture();
       const bin = path.join(root, "tools");
       const commandLog = path.join(root, "commands.log");
+      const packageDir = path.join(prefix, "lib/node_modules/@openai/codex");
+      const manifestPath = path.join(packageDir, "package.json");
       fs.mkdirSync(bin);
       fs.mkdirSync(path.join(prefix, "bin"), { recursive: true });
+      fs.mkdirSync(path.join(packageDir, "bin"), { recursive: true });
+      fs.writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          name: "@openai/codex",
+          version: "1.0.0",
+          bin: { codex: "bin/codex.js" },
+        }),
+      );
       fs.symlinkSync(process.execPath, path.join(bin, "node"));
       fs.writeFileSync(
         path.join(bin, "npm"),
-        '#!/bin/sh\nprintf "npm %s\\n" "$*" >> "$CLOUDX_TEST_COMMAND_LOG"\nif [ "$1" = i ]; then exit "$CLOUDX_TEST_NPM_STATUS"; fi\n',
+        `#!${process.execPath}\nconst fs = require('node:fs');
+fs.appendFileSync(process.env.CLOUDX_TEST_COMMAND_LOG, 'npm ' + process.argv.slice(2).join(' ') + '\\n');
+if (process.argv[2] === 'view') console.log('"1.1.0"');
+else {
+  if (Number(process.env.CLOUDX_TEST_NPM_STATUS)) process.exit(Number(process.env.CLOUDX_TEST_NPM_STATUS));
+  const file = ${JSON.stringify(manifestPath)};
+  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
+  manifest.version = '1.1.0'; fs.writeFileSync(file, JSON.stringify(manifest));
+}\n`,
         { mode: 0o755 },
       );
       fs.writeFileSync(
-        path.join(prefix, "bin/codex"),
-        '#!/bin/sh\nprintf "codex %s\\n" "$*" >> "$CLOUDX_TEST_COMMAND_LOG"\nexit "$CLOUDX_TEST_CODEX_STATUS"\n',
+        path.join(packageDir, "bin/codex.js"),
+        `#!${process.execPath}\nconst fs = require('node:fs');
+fs.appendFileSync(process.env.CLOUDX_TEST_COMMAND_LOG, 'codex ' + process.argv.slice(2).join(' ') + '\\n');
+if (Number(process.env.CLOUDX_TEST_CODEX_STATUS)) process.exit(Number(process.env.CLOUDX_TEST_CODEX_STATUS));
+console.log('codex-cli ' + JSON.parse(fs.readFileSync(${JSON.stringify(manifestPath)}, 'utf8')).version);\n`,
         { mode: 0o755 },
+      );
+      fs.symlinkSync(
+        path.join(packageDir, "bin/codex.js"),
+        path.join(prefix, "bin/codex"),
       );
       const config = `CLOUDX_ASSISTANT_BIN=${prefix}/bin/codex\n`;
       saveConfig(envPath, config);
@@ -223,9 +250,11 @@ describe("Codex-only CLI entrypoints", () => {
         outcome === "success",
       );
       expect(fs.readFileSync(commandLog, "utf8").trim().split("\n")).toEqual([
-        "npm -v",
+        "codex --version",
+        "npm view @openai/codex@latest version --json",
         `npm i -g --prefix ${prefix} @openai/codex@latest`,
-        ...(outcome === "npm failure" ? [] : ["codex --version"]),
+        "codex --version",
+        ...(outcome === "Codex failure" ? ["codex --version"] : []),
       ]);
       expect(fs.readFileSync(envPath, "utf8")).toBe(config);
     },
@@ -273,6 +302,53 @@ describe("Codex-only CLI entrypoints", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("--update-codex cannot be combined");
       expect(result.stdout).toBe("");
+    },
+  );
+});
+
+describe("full installer coordination with Codex-only updates", () => {
+  it.each(["busy", "failed install"])(
+    "honors the same installation lock: %s",
+    async (outcome) => {
+      const { root, home, prefix } = fixture();
+      const runner = new InstallerRunner({ cwd: root, log: () => {} });
+      vi.spyOn(runner, "run").mockImplementation((command, args) => {
+        if (command === "npm" && args[0] === "i")
+          throw new Error("fixture npm failure");
+        return "";
+      });
+      vi.spyOn(runner, "capture").mockReturnValue("git version 2.50.0");
+      const release =
+        outcome === "busy" ? acquireCodexInstallationLock(prefix) : null;
+      try {
+        await expect(
+          runInstaller({
+            repoRoot: root,
+            home,
+            runner,
+            yes: true,
+            env: { CLOUDX_INSTALL_BOOTSTRAPPED: "1", PATH: "/usr/bin" },
+            osRelease: { ID: "ubuntu", VERSION_ID: "24.04" },
+            gpuDetected: false,
+            intelGpuDetected: false,
+            cudaRuntimeReady: false,
+          }),
+        ).rejects.toThrow(
+          outcome === "busy"
+            ? /Another CloudX installer/
+            : /fixture npm failure/,
+        );
+        expect(
+          runner.run.mock.calls.some(
+            ([command, args]) => command === "npm" && args[0] === "i",
+          ),
+        ).toBe(outcome !== "busy");
+        expect(
+          fs.existsSync(path.join(prefix, ".cloudx-codex-update.lock")),
+        ).toBe(outcome === "busy");
+      } finally {
+        release?.();
+      }
     },
   );
 });

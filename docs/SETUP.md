@@ -205,6 +205,47 @@ instructions. Desktop terminals and files do not require microphone capture.
 
 ## Update
 
+### Update Codex from Settings
+
+Open **Settings → Codex** to see the installed version, then select **Update
+Codex**. CloudX checks npm, installs the release tagged `latest` when needed,
+and verifies the executable with `--version`. An installation that already
+matches the release is reported as **already current**.
+
+The server owns the job and retains its result. Closing Settings or reconnecting
+does not cancel it or start another update. Updating preserves unsaved edits in
+the open settings editor, running Codex and terminal sessions, saved
+conversations, authentication, and configuration. Newly launched Codex
+processes use the updated executable. Explicitly closing the entire Settings
+dialog retains its existing draft-discard behavior.
+
+Settings requires the running server's `CLOUDX_ASSISTANT_BIN` to identify an
+absolute npm-owned `prefix/bin/codex` executable. It updates that installation,
+including a custom npm prefix. Custom wrappers and relative or PATH-only commands
+are unsupported because the login shell used for sessions can resolve a different
+executable. Configure the absolute npm executable or use the wrapper's installer.
+
+Errors identify unavailable npm, registry/network problems, prefix permissions,
+installation failure, or failed verification. Settings shows the currently usable
+version when it can verify one. Raw output stays in the private
+`codex-update/update.log` under the CloudX data directory, limited to 256 KiB;
+the browser receives status messages. The update has bounded execution and
+stops on server shutdown. Interrupted jobs are reported as failures after restart.
+
+Settings, the Codex-only CLI command, and full installer writes share a lock
+for the npm prefix. A competing update reports the installation is busy.
+If process cleanup cannot be confirmed, the job fails and keeps this lock;
+CloudX also pauses version probes until an explicit update succeeds.
+After a forcibly stopped installer or incomplete cleanup, remove
+`.cloudx-codex-update.lock` from that prefix only after confirming no installer
+is running, then select **Update Codex** again.
+
+This button does not perform a full CloudX update or restart services. Full
+installation and full update still install their pinned Codex version, which
+can replace a newer Codex-only update.
+
+### Update Codex from the CLI
+
 To update only Codex CLI to the release tagged `latest` on npm:
 
 ```bash
@@ -221,7 +262,8 @@ This mode requires existing Node.js and npm. It updates the npm prefix containin
 the saved `CLOUDX_ASSISTANT_BIN` executable, or uses `CLOUDX_NPM_GLOBAL_DIR` from
 the saved configuration or environment when no executable is saved. The default
 prefix is `~/.local/share/cloudx/npm-global`. Custom assistant wrappers and
-relative paths are rejected before installation.
+relative paths are rejected before installation. The CLI and Settings share
+executable selection, installation locking, npm installation, and verification.
 
 It verifies the updated executable with `--version`, without requiring login or
 changing authentication. It leaves the checkout, Cloudx configuration, services,

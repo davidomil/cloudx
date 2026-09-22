@@ -47,6 +47,7 @@ import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import { CodexSettingsPlugin } from "./plugins/CodexSettingsPlugin.js";
 import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
+import { CodexUpdateService } from "./plugins/CodexUpdateService.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
 import { StandardTerminalPlugin } from "./plugins/StandardTerminalPlugin.js";
@@ -135,6 +136,7 @@ export interface AppServices {
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   disposeRulesSkillsUpdates?: () => Promise<void>;
   codexStateSources?: CodexStateSources;
+  codexUpdates?: CodexUpdateService;
 }
 
 const MIN_STREAMED_AUDIO_BYTES = 128;
@@ -252,6 +254,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     const requestOwnerShutdown = settleDisposers([
       () => services.documentationIngestQueue?.dispose(),
+      () => services.codexUpdates?.dispose(),
       () => backgroundEnrichment?.dispose(),
       () => services.voice.dispose?.(),
       () => services.forgeConnections?.dispose()
@@ -744,6 +747,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   app.post<{ Params: { hookId: string }; Querystring: { stream?: string }; Body: HookCallRequest }>("/api/hooks/:hookId", async (request, reply) => {
+    if (request.params.hookId.startsWith("codex-update.")) reply.header("cache-control", "no-store");
+    if (request.params.hookId === "codex-update.start" && (!request.headers.origin || !trustedOrigins.has(request.headers.origin))) {
+      return reply.code(403).send({ error: "Start Codex updates from a trusted CloudX browser origin." });
+    }
     const body = optionalRequestBody(request.body);
     const targetTabId = optionalBodyString(body.targetTabId, "targetTabId");
     const input = optionalBodyRecord(body.input, "input") ?? {};
@@ -1286,6 +1293,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const workspace = new WorkspaceLayoutStore(config.dataDir, pathPolicy, logger);
   const terminalFactory = new DurableTerminalProcessFactory(terminalSocketPath(config.dataDir), new NodePtyTerminalProcessFactory(), config.terminalReplayBytes);
   const codexStateSources = new CodexStateSources(config.dataDir);
+  const codexUpdates = new CodexUpdateService(config.dataDir);
   const pluginData = new PluginDataStore(config.dataDir);
   const installedPlugins = new InstalledPluginService(config.dataDir, { logger });
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
@@ -1300,7 +1308,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources));
-  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources)));
+  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
@@ -1419,7 +1427,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
