@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { MISSING_SETTINGS_FILES, prepareMissingSettingsIntegration } from "./managed-update-settings-integration.mjs";
+import { SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES, prepareSessionIntegration } from "./managed-update-session-integration.mjs";
 
 const SETTINGS_FILES = [
   "apps/server/src/system/CloudxUpdateService.ts",
@@ -23,8 +24,10 @@ const TERMINAL_CONTRACT_FILE = "apps/server/src/terminal/TerminalProcess.ts";
 const SERVER_FILE = "apps/server/src/server.ts";
 const LEGACY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start">';
 const MANAGED_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">';
-export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE, LEGACY_READINESS_SOURCE, "scripts/managed-update-settings-integration.mjs"];
-export const MANAGED_INTEGRATION_FILES = [...SETTINGS_FILES, READINESS_FILE, ...MISSING_SETTINGS_FILES];
+export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE, LEGACY_READINESS_SOURCE,
+  "scripts/managed-update-settings-integration.mjs", "scripts/managed-update-session-integration.mjs", ...SESSION_PERSISTENCE_FILES];
+export const MANAGED_INTEGRATION_FILES = [...new Set([...SETTINGS_FILES, READINESS_FILE, ...MISSING_SETTINGS_FILES,
+  ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES])];
 
 // The updater remains maintained independently of the selected application.
 // Build these small integrations with the target's own dependencies and APIs.
@@ -49,7 +52,14 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
   const independentReadiness = fs.existsSync(server) && !serverSource.includes("/api/ready/terminals");
   const readiness = independentReadiness ? inspectTerminalReadiness(release) : undefined;
   if (independentReadiness) files.push(READINESS_FILE);
-  const changes = files.map(relative => {
+  const sessionRecovery = readiness?.terminalMode === "direct" && fs.existsSync(integrationPath(release, "apps/server/src/sessionStore.ts")) &&
+    !fs.existsSync(integrationPath(release, SESSION_PERSISTENCE_FILES[0]));
+  if (sessionRecovery) {
+    Object.assign(migrated, prepareSessionIntegration(relative => migrated[relative] ?? fs.readFileSync(integrationPath(release, relative), "utf8")));
+    files.push(...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES);
+  }
+  const uniqueFiles = [...new Set(files)];
+  const changes = uniqueFiles.map(relative => {
     const destination = integrationPath(release, relative);
     // A migration must not hide an operator's edits to its integration files.
     const local = execFileSync("git", ["status", "--porcelain", "--", relative], { cwd: release, encoding: "utf8" });
@@ -63,7 +73,8 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
     fs.mkdirSync(path.dirname(destination), { recursive: true });
     fs.writeFileSync(destination, content);
   }
-  return { version: 1, files, independentReadiness, ...(readiness?.terminalMode === "direct" ? { terminalMode: "direct" } : {}) };
+  return { version: 1, files: uniqueFiles, independentReadiness, ...(readiness?.terminalMode === "direct" ? { terminalMode: "direct" } : {}),
+    ...(sessionRecovery ? { sessionRecovery: "saved-tabs-v1" } : {}) };
 }
 
 export function inspectTerminalReadiness(release) {

@@ -9,8 +9,9 @@ import { expect, it } from "vitest";
 import { chromium, expect as browserExpect } from "@playwright/test";
 
 import { InstallerRunner, prepareManagedRelease } from "./install-cloudx.mjs";
-import { ManagedUpdate, UpdateHost } from "./managed-update.mjs";
+import { ManagedUpdate, UpdateHost, validateSavedTransition } from "./managed-update.mjs";
 import { writeUpdateJson } from "./managed-update-store.mjs";
+import { seedSavedTabProfile } from "./helpers/managed-update-saved-tabs-fixture.mjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const preBrokerTarget = "224a75ef7b3efced05b2c6b3b136250d9a532dc3";
@@ -21,13 +22,15 @@ const supportedHost = process.platform === "linux"
   && spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 5000 }).status === 0;
 
 it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and its required terminal services under isolated systemd units", async historicalTarget => {
-  const fixture = await HistoricalInstallation.create();
+  const fixture = await HistoricalInstallation.create({ savedTabs: historicalTarget === preBrokerTarget });
   try {
     await fixture.waitUntilReady();
+    if (fixture.savedTabs) await fixture.expectSavedTabs();
     const originalWeb = fixture.serviceState(fixture.webUnit);
     const originalBroker = fixture.serviceState(fixture.brokerUnit);
-    const update = fixture.update(historicalTarget);
+    let update = fixture.update(historicalTarget);
     expect(fixture.git(["show", `${historicalTarget}:apps/server/src/server.ts`])).not.toContain("/api/ready/terminals");
+    if (fixture.savedTabs) update = await fixture.interruptAfterActivation(update);
     expect(await update.coordinator.run()).toMatchObject({ state: "succeeded", phase: "complete" });
     expect(fixture.git(["rev-parse", "HEAD"])).toBe(historicalTarget);
     expect(update.record.transition.integration.independentReadiness).toBe(true);
@@ -37,10 +40,21 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
     if (historicalTarget === preBrokerTarget) {
       expect(update.record.transition.integration.terminalMode).toBe("direct");
       expect(fixture.serviceState(fixture.brokerUnit)).toMatchObject({ ActiveState: "inactive", MainPID: "0", ConditionResult: "no" });
-      expect(fixture.calls.filter(call => call.command === "systemctl" && call.args.includes("start") && call.args.at(-1) === fixture.brokerUnit)).toEqual([]);
+      // Resuming the interrupted activation first restarts the original broker.
+      expect(fixture.calls.filter(call => call.command === "systemctl" && call.args.includes("start") && call.args.at(-1) === fixture.brokerUnit))
+        .toHaveLength(fixture.savedTabs ? 1 : 0);
       expect(fs.existsSync(path.join(fixture.repoRoot, "apps/server/dist/terminal/broker.js"))).toBe(false);
       expect(() => process.kill(Number(originalBroker.MainPID), 0)).toThrow();
-      expect(JSON.parse(fs.readFileSync(path.join(fixture.dataDir, "sessions.json"), "utf8"))).toEqual({ version: 1, sessions: [] });
+      expect(update.record.restoreSnapshotRunId).toBeUndefined();
+      expect(update.record.transition.restoreData).toBeUndefined();
+      await fixture.expectSavedTabs({ historical: true });
+      await fixture.rejectUnrecognizedRecovery();
+      await fixture.navigateSavedWebsite();
+      const historicalWeb = fixture.serviceState(fixture.webUnit);
+      command("systemctl", ["--user", "restart", fixture.webUnit]);
+      await fixture.waitUntilReady();
+      expect(fixture.serviceState(fixture.webUnit).InvocationID).not.toBe(historicalWeb.InvocationID);
+      await fixture.expectSavedTabs({ historical: true });
     } else {
       expect(fixture.serviceState(fixture.brokerUnit).InvocationID).not.toBe(originalBroker.InvocationID);
       expect(fs.realpathSync(path.join(fixture.repoRoot, "apps/server/dist/terminal/broker.js")))
@@ -61,6 +75,7 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
       expect(JSON.parse(fixture.curl("/api/runtime"))).toMatchObject({ verification: "verified", build: { commit: brokerTarget } });
       expect(JSON.parse(fixture.curl("/api/ready/terminals"))).toMatchObject({ status: "ready" });
       expect(fs.readFileSync(path.join(fixture.dataDir, "user-data.txt"), "utf8")).toBe("Preserve the active profile across the historical transition.\n");
+      await fixture.expectSavedTabs();
     }
     expect(fixture.calls.filter(call => call.command === "systemctl" && call.args.some(arg => ["start", "stop", "restart", "kill"].includes(arg)))
       .every(call => [fixture.webUnit, fixture.brokerUnit].includes(call.args.at(-1)))).toBe(true);
@@ -82,13 +97,13 @@ class HistoricalInstallation {
   brokerUnit = `cloudx-history-broker-${randomUUID()}.service`;
   calls = [];
 
-  static async create() {
+  static async create(options = {}) {
     const fixture = new HistoricalInstallation();
-    try { await fixture.install(); return fixture; }
+    try { await fixture.install(options); return fixture; }
     catch (error) { await fixture.close(); throw error; }
   }
 
-  async install() {
+  async install({ savedTabs = false }) {
     this.port = await freePort();
     const dependencyPort = await freePort();
     for (const directory of [this.home, this.dataDir, this.stateDir]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -100,6 +115,8 @@ class HistoricalInstallation {
     fs.mkdirSync(imagegen, { recursive: true });
     fs.writeFileSync(path.join(imagegen, "SKILL.md"), "---\nname: imagegen\ndescription: Isolated fixture.\n---\nSynthetic fixture data.\n");
     fs.writeFileSync(path.join(this.dataDir, "user-data.txt"), "Preserve the active profile across the historical transition.\n");
+    if (savedTabs) this.savedTabs = seedSavedTabProfile({ root: this.root, home: this.home, dataDir: this.dataDir,
+      webUrl: `http://127.0.0.1:${dependencyPort}/saved-dashboard?token=fixture-token` });
     // Only the external ASR/documentation HTTP dependencies are stubbed.
     const dependencies = path.join(this.root, "dependencies.mjs");
     fs.writeFileSync(dependencies, `import http from 'node:http';
@@ -119,6 +136,7 @@ http.createServer((request, response) => {
       CLOUDX_APP_SERVER_ENABLED: "false", CLOUDX_AUTOMATION_START_DISABLED: "true", CLOUDX_LOG_LEVEL: "warn",
       CLOUDX_ASR_URL: `http://127.0.0.1:${dependencyPort}`, CLOUDX_DOCUMENTATION_URL: `http://127.0.0.1:${dependencyPort}`,
       CLOUDX_HTTPS_KEY_PATH: path.join(this.root, "key.pem"), CLOUDX_HTTPS_CERT_PATH: path.join(this.root, "cert.pem"),
+      ...(this.savedTabs ? { SHELL: this.savedTabs.terminalCommand, CLOUDX_ASSISTANT_BIN: this.savedTabs.terminalCommand } : {}),
     };
     fs.writeFileSync(this.envPath, Object.entries(environment).map(([key, value]) => `${key}=${value}\n`).join(""), { mode: 0o600 });
     for (const [unit, entry] of [[this.brokerUnit, "terminal/broker.js"], [this.webUnit, "index.js"]]) {
@@ -130,16 +148,107 @@ http.createServer((request, response) => {
     command("systemctl", ["--user", "start", this.webUnit]);
   }
 
-  update(targetCommit) {
-    const id = randomUUID(), runDir = path.join(this.stateDir, id);
-    fs.mkdirSync(runDir, { mode: 0o700 });
-    const record = { repoRoot: this.repoRoot, dataDir: this.dataDir, home: this.home, service: this.webUnit, coordinator: sourceRoot,
+  update(targetCommit, savedRecord) {
+    const id = savedRecord?.run.id ?? randomUUID(), runDir = path.join(this.stateDir, id);
+    if (!savedRecord) fs.mkdirSync(runDir, { mode: 0o700 });
+    const record = savedRecord ?? { repoRoot: this.repoRoot, dataDir: this.dataDir, home: this.home, service: this.webUnit, coordinator: sourceRoot,
       targetCommit, confirmInterruption: true, run: { id, state: "running", startedAt: new Date().toISOString(), message: "Historical transition fixture" } };
+    if (savedRecord) validateSavedTransition(record, runDir);
     const save = value => writeUpdateJson(path.join(this.stateDir, `${id}.json`), value);
     const host = new UpdateHost({ repoRoot: this.repoRoot, dataDir: this.dataDir, home: this.home, service: this.webUnit,
       port: this.port, runDir, save, commands: new IsolatedCommands(this, this.repoRoot),
+      recovery: savedRecord?.transition,
       prepareRelease: options => prepareManagedRelease({ ...options, runner: new IsolatedCommands(this, options.releaseRoot) }) });
-    return { record, coordinator: new ManagedUpdate({ record, save, host }) };
+    save(record);
+    return { record, runDir, coordinator: new ManagedUpdate({ record, save, host }) };
+  }
+
+  async interruptAfterActivation(update) {
+    const recordFile = path.join(this.stateDir, `${update.record.run.id}.json`);
+    const fixtureFile = path.join(this.root, "interrupted-transition.json");
+    writeUpdateJson(fixtureFile, { recordFile, runDir: update.runDir, repoRoot: this.repoRoot, home: this.home,
+      dataDir: this.dataDir, webUnit: this.webUnit, brokerUnit: this.brokerUnit, port: this.port });
+    const child = spawn(process.execPath, [path.join(sourceRoot, "scripts/helpers/managed-update-saved-tabs-fixture.mjs"), "--interrupt-after-activation", fixtureFile],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    child.stdout.on("data", bytes => { output += bytes; });
+    child.stderr.on("data", bytes => { output += bytes; });
+    const result = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => resolve({ code, signal }));
+    });
+    expect(result, output).toEqual({ code: null, signal: "SIGKILL" });
+    const saved = JSON.parse(fs.readFileSync(recordFile, "utf8"));
+    expect(saved.transition.completed).toEqual(["prepare", "quiesce", "snapshot", "activate"]);
+    expect(saved.transition.mutating).toBe(true);
+    expect(saved.restoreSnapshotRunId).toBeUndefined();
+    expect(this.git(["rev-parse", "HEAD"])).toBe(preBrokerTarget);
+    expect(this.serviceState(this.webUnit).ActiveState).toBe("inactive");
+    for (const { file, bytes } of this.savedTabs.evidence) expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(fs.existsSync(this.savedTabs.terminalLaunches)).toBe(false);
+    return this.update(saved.targetCommit, saved);
+  }
+
+  async expectSavedTabs({ historical = false } = {}) {
+    const expected = this.savedTabs;
+    const workspace = JSON.parse(this.curl("/api/workspace"));
+    expect(workspace.activeTabId).toBe("saved-shell");
+    expect(workspace.activeWindowId).toBe(expected.workspace.activeWindowId);
+    expect(workspace.windows).toEqual(expected.workspace.windows);
+    expect(workspace.tabs.map(tab => tab.id)).toEqual(expected.sessions.map(({ tab }) => tab.id));
+    for (const original of expected.sessions) {
+      const tab = workspace.tabs.find(tab => tab.id === original.tab.id);
+      const { status, indicator, updatedAt, ...identity } = original.tab;
+      expect(tab).toMatchObject(identity);
+      if (tab.pluginId.endsWith("terminal")) {
+        expect(tab.status).toBe(historical ? "stopped" : "failed");
+        expect(tab.recovery.state).toBe("missing");
+      }
+    }
+    const saved = () => JSON.parse(fs.readFileSync(path.join(this.dataDir, "sessions.json"), "utf8"));
+    await expect.poll(() => saved().sessions.map(({ tab, initialInput }) => ({ id: tab.id, initialInput })))
+      .toEqual(expected.sessions.map(({ tab, initialInput }) => ({ id: tab.id, initialInput })));
+    expect(saved().activeTabId).toBe("saved-shell");
+    const web = JSON.parse(this.curl("/api/tabs/saved-web/actions", ["--fail", "-X", "POST", "-H", "Content-Type: application/json",
+      "-H", `Origin: https://127.0.0.1:${this.port}`, "--data", JSON.stringify({ action: "get_state", input: {} })]));
+    expect(web.result.url).toBe(expected.sessions[2].initialInput.url);
+    for (const { file, bytes } of expected.evidence) expect(fs.readFileSync(file)).toEqual(bytes);
+    for (const { tab } of expected.sessions) expect(fs.readFileSync(tab.contextPath, "utf8")).toMatch(`Saved context for ${tab.id}.\n`);
+    expect(fs.existsSync(expected.terminalLaunches)).toBe(false);
+  }
+
+  async navigateSavedWebsite() {
+    const initialInput = this.savedTabs.sessions[2].initialInput;
+    const url = new URL(initialInput.url);
+    url.pathname = "/changed-on-historical-release";
+    const response = JSON.parse(this.curl("/api/tabs/saved-web/actions", ["--fail", "-X", "POST", "-H", "Content-Type: application/json",
+      "-H", `Origin: https://127.0.0.1:${this.port}`, "--data", JSON.stringify({ action: "open_url", input: { url: url.href } })]));
+    expect(response.result.url).toBe(url.href);
+    initialInput.url = url.href;
+    await expect.poll(() => JSON.parse(fs.readFileSync(path.join(this.dataDir, "sessions.json"), "utf8")).sessions
+      .find(({ tab }) => tab.id === "saved-web").initialInput.url).toBe(url.href);
+  }
+
+  async rejectUnrecognizedRecovery() {
+    const recover = body => {
+      const response = this.curl("/api/tabs/saved-codex/recover", ["-X", "POST", "-H", "Content-Type: application/json",
+        "-H", `Origin: https://127.0.0.1:${this.port}`, "--data", JSON.stringify(body), "--write-out", "\n%{http_code}"]);
+      const split = response.lastIndexOf("\n");
+      return { status: Number(response.slice(split + 1)), body: JSON.parse(response.slice(0, split)) };
+    };
+    const file = path.join(this.dataDir, "sessions.json");
+    const before = fs.readFileSync(file);
+    expect(recover({ action: "resume-conversation", sessionId: this.savedTabs.conversationId, unknown: true }))
+      .toMatchObject({ status: 400, body: { message: "Unknown recovery field." } });
+    expect(recover({ action: "unsupported" })).toMatchObject({ status: 400, body: { message: "Unknown recovery action." } });
+    expect(fs.readFileSync(file)).toEqual(before);
+    const changedConversation = recover({ action: "resume-conversation", sessionId: "12345678-1234-4234-8234-123456789def" });
+    expect(changedConversation.status).toBeGreaterThanOrEqual(400);
+    expect(changedConversation.body.message).toMatch(/preserved conversation only/i);
+    await expect.poll(() => JSON.parse(fs.readFileSync(file, "utf8")).sessions.map(({ tab, initialInput }) => ({ id: tab.id, initialInput })))
+      .toEqual(this.savedTabs.sessions.map(({ tab, initialInput }) => ({ id: tab.id, initialInput })));
+    for (const { file, bytes } of this.savedTabs.evidence) expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(fs.existsSync(this.savedTabs.terminalLaunches)).toBe(false);
   }
 
   git(args) { return command("git", args, { cwd: this.repoRoot }); }
@@ -166,6 +275,11 @@ http.createServer((request, response) => {
         });
         await page.goto(`https://127.0.0.1:${this.port}`, { waitUntil: "domcontentloaded" });
         await browserExpect(page.locator(".workspace-pane").first()).toBeVisible();
+        if (this.savedTabs) {
+          await browserExpect(page.getByRole("button", { name: "Start a new shell", exact: true })).toBeVisible();
+          await browserExpect(page.getByText(this.savedTabs.sessions[0].tab.cwd, { exact: true }).first()).toBeVisible();
+          if (!mobile) await browserExpect(page.getByRole("textbox", { name: "Exact Codex conversation ID", exact: true })).toBeVisible();
+        }
         if (mobile) {
           await page.getByRole("button", { name: "Workspace actions", exact: true }).click();
           await page.getByRole("menuitem", { name: "Settings", exact: true }).click();

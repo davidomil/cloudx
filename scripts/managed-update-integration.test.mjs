@@ -10,6 +10,8 @@ import { verifySnapshot } from "./managed-update-store.mjs";
 import { UpdateHost } from "./managed-update.mjs";
 import { verifyHistoricalTerminals } from "./managed-update-readiness.mjs";
 import { MISSING_SETTINGS_FILES } from "./managed-update-settings-integration.mjs";
+import { SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES } from "./managed-update-session-integration.mjs";
+import { inspectDataCompatibility } from "./managed-update-data.mjs";
 
 const coordinator = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const roots = [];
@@ -19,7 +21,8 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const release = fixture();
   const head = git(release, ["rev-parse", "HEAD"]);
   const integration = prepareManagedIntegration(release, coordinator);
-  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file => !MISSING_SETTINGS_FILES.includes(file)), independentReadiness: true });
+  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file =>
+    ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES].includes(file)), independentReadiness: true });
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
 });
@@ -54,24 +57,45 @@ it("rejects an inconsistent broker module beside the direct-only terminal contra
   expect(git(release, ["status", "--porcelain"])).toBe("");
 });
 
-it.each(MISSING_SETTINGS_FILES)("preserves local edits to the missing Settings integration file %s", relative => {
-  const release = directory();
-  git(release, ["init"]);
-  git(release, ["config", "user.name", "CloudX Test"]);
-  git(release, ["config", "user.email", "test@invalid"]);
-  for (const file of [...MISSING_SETTINGS_FILES, "apps/server/src/terminal/TerminalProcess.ts"]) {
-    const destination = path.join(release, file);
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.writeFileSync(destination, git(coordinator, ["show", `224a75ef7b3efced05b2c6b3b136250d9a532dc3:${file}`]));
-  }
-  git(release, ["add", "."]);
-  git(release, ["commit", "-m", "TEST: Settings before updater support"]);
+it.each([...new Set([...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, "apps/server/src/jsonStateFile.ts"])])("preserves local edits to the historical integration file %s", relative => {
+  const release = preBrokerFixture();
   fs.appendFileSync(path.join(release, relative), "\n// operator edit\n");
   expect(() => prepareManagedIntegration(release, coordinator)).toThrow(`conflicts with local changes to ${relative}`);
   expect(fs.readFileSync(path.join(release, relative), "utf8")).toContain("operator edit");
   expect(fs.existsSync(path.join(release, "apps/server/src/system/CloudxUpdateService.ts"))).toBe(false);
   expect(git(release, ["status", "--porcelain"])).toBe(`M ${relative}`);
 });
+
+it.each(["standard-terminal", "local-web"])("plans the first pre-broker downgrade with a saved %s tab without a historical snapshot", pluginId => {
+  const release = preBrokerFixture(), data = directory();
+  const sessionFile = path.join(data, "sessions.json");
+  const content = JSON.stringify({ version: 1, activeTabId: "saved-tab", sessions: [{ tab: { id: "saved-tab", pluginId,
+    cwd: data, title: "Saved tab", status: "stopped", createdAt: "2026-09-22", updatedAt: "2026-09-22",
+    indicator: { color: "yellow", label: "Stopped", updatedAt: "2026-09-22" } }, initialInput: { retained: true } }] });
+  fs.writeFileSync(sessionFile, content);
+  expect(inspectDataCompatibility(release, {}, data).compatible).toBe(false);
+  expect(prepareManagedIntegration(release, coordinator)).toMatchObject({ terminalMode: "direct", sessionRecovery: "saved-tabs-v1" });
+  const record = { transition: { release } };
+  expect(() => UpdateHost.prototype.planData.call({ envConfig: {}, paths: { dataDir: data } }, record)).not.toThrow();
+  expect(record.transition.dataCompatibility).toMatchObject({ compatible: true, sessionSchema: 1, targetSessionSchema: 1 });
+  expect(record.transition.restoreData).toBeUndefined();
+  expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
+});
+
+function preBrokerFixture() {
+  const release = directory();
+  git(release, ["init"]);
+  git(release, ["config", "user.name", "CloudX Test"]);
+  git(release, ["config", "user.email", "test@invalid"]);
+  for (const file of new Set([...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, "apps/server/src/jsonStateFile.ts", "apps/server/src/terminal/TerminalProcess.ts"])) {
+    const destination = path.join(release, file);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, git(coordinator, ["show", `224a75ef7b3efced05b2c6b3b136250d9a532dc3:${file}`]));
+  }
+  git(release, ["add", "."]);
+  git(release, ["commit", "-m", "TEST: Settings before updater support"]);
+  return release;
+}
 
 it.each([
   ["unknown spawn options", "export interface TerminalSpawnOptions { options: unknown; }\nterminate(): Promise<void>;", "does not recognize the target terminal spawn contract"],

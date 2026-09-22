@@ -216,10 +216,18 @@ factory. Readiness requires the expected output, a successful exit and
 confirmed termination. The broker service stays inactive while its
 entry point is absent.
 
-The recognized target without saved-session persistence accepts an
-empty version-1 sessions file without changing its bytes. Nonempty
-saved sessions still require a compatible reader or verified snapshot;
-the historical deployment fixture covers an empty saved-session store.
+The recognized pre-broker target receives a managed reader and writer
+for version-1 saved sessions. Saved tabs keep their IDs, layout,
+conversation evidence and inputs without requiring a previous snapshot
+from that target. Terminal tabs remain stopped until explicit recovery;
+commands and prompts are not replayed.
+
+The historical recovery panel starts a new shell in the saved directory
+or resumes the explicitly entered preserved Codex conversation. Codex
+recovery checks source ownership and transcript availability before
+launching. A different conversation must be opened explicitly in a new
+tab. Session persistence also retains new tabs, closed tabs, active
+selection and the current local-web URL across historical shutdown.
 
 Regression fixtures build the actual pinned base
 a9613fafdc0ed1765fcf72ea7d9f61de08c3914a, its predecessor
