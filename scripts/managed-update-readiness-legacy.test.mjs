@@ -32,6 +32,29 @@ it("waits for confirmed broker cleanup before probing the direct supervisor", as
   expect(fixture.factory.spawn).toHaveBeenCalledTimes(2);
 });
 
+it("probes only direct supervision when the target has no broker or attachment methods", async () => {
+  const fixture = terminalFixture({ directOnly: true });
+  await new TerminalReadiness("/profile", fixture.factory, 100, ["direct"]).check();
+  expect(fixture.factory.spawn).toHaveBeenCalledOnce();
+  expect(fixture.factory.spawn.mock.calls[0][2]).not.toHaveProperty("sessionId");
+  expect(fixture.factory.spawn.mock.calls[0][2]).not.toHaveProperty("execution");
+  expect(fixture.terminals[0].terminate).toHaveBeenCalledOnce();
+  expect(fixture.terminals[0].unsubscribe).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  ["missing marker", { output: "unexpected" }],
+  ["failed command", { exit: { exitCode: 1 } }],
+  ["no exit", { exit: null }],
+  ["unconfirmed cleanup", { cleanup: () => { throw new Error("Ownership not confirmed"); } }],
+])("rejects direct-only %s and awaits supervisor cleanup", async (_name, behavior) => {
+  const fixture = terminalFixture({ ...behavior, directOnly: true });
+  await expect(new TerminalReadiness("/profile", fixture.factory, 10, ["direct"]).check()).rejects.toThrow("Direct worker terminal readiness failed");
+  expect(fixture.factory.spawn).toHaveBeenCalledOnce();
+  expect(fixture.terminals[0].terminate).toHaveBeenCalledOnce();
+  expect(fixture.terminals[0].unsubscribe).toHaveBeenCalledTimes(2);
+});
+
 it.each([
   ["missing marker", { output: "unexpected" }, "expected marker"],
   ["nonzero exit", { exit: { exitCode: 1 } }, "exit 1"],
@@ -79,6 +102,7 @@ function terminalFixture(behavior = {}) {
       terminate: vi.fn(async () => typeof behavior.cleanup === "function" ? behavior.cleanup() : behavior.cleanup),
       detach: vi.fn(), unsubscribe
     };
+    if (behavior.directOnly) { delete terminal.onDisconnect; delete terminal.detach; }
     terminals.push(terminal);
     return terminal;
   }) };

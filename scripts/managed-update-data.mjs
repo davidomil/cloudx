@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { recognizesDirectTerminalContract } from "./managed-update-integration.mjs";
 
 const CATALOG_SCHEMA = "services/documentation-indexer/src/cloudx_documentation_indexer/catalog_schema.py";
 const SESSION_STORE = "apps/server/src/workspace/SessionStateStore.ts";
@@ -58,16 +59,19 @@ function inspectRoots(release, dataDir, archiveRoot) {
   const sessionSource = readOptional(path.join(release, SESSION_STORE));
   const sessionMatches = [...(sessionSource ?? "").matchAll(/\bvalue\.version\s*!==\s*(\d+)\b/g)];
   const targetSessionSchema = sessionMatches.length === 1 && validSchema(Number(sessionMatches[0][1])) ? Number(sessionMatches[0][1]) : null;
+  const noSessionPersistence = sessionSource === undefined && recognizesInMemorySessions(release);
   const catalog = path.join(archiveRoot, "catalog.sqlite");
   const archivePresent = regularFile(catalog, true) !== undefined;
   const archiveSchema = archivePresent ? readCatalogVersion(catalog) : 0;
   const sessions = readOptional(path.join(dataDir, "sessions.json"));
   const sessionsPresent = sessions !== undefined;
   let sessionSchema = 0;
+  let emptySessions = false;
   if (sessionsPresent) {
     const saved = JSON.parse(sessions);
     if (!saved || !validSchema(saved.version) || !Array.isArray(saved.sessions)) throw new Error("Saved sessions have an invalid schema declaration.");
     sessionSchema = saved.version;
+    emptySessions = saved.version === 1 && saved.sessions.length === 0 && Object.keys(saved).every(key => ["version", "sessions"].includes(key));
   }
   const issues = [], migrations = [];
   if (archivePresent) {
@@ -75,11 +79,27 @@ function inspectRoots(release, dataDir, archiveRoot) {
     else if (archiveSchema > targetArchiveSchema) issues.push(`The selected target supports archive schema ${targetArchiveSchema}; persisted data uses schema ${archiveSchema}.`);
     else if (archiveSchema < targetArchiveSchema) migrations.push({ component: "documentation", from: archiveSchema, to: targetArchiveSchema });
   }
-  if (sessionsPresent && (targetSessionSchema === null || sessionSchema !== targetSessionSchema))
+  if (sessionsPresent && !(noSessionPersistence && emptySessions) && (targetSessionSchema === null || sessionSchema !== targetSessionSchema))
     issues.push(`The selected target supports ${targetSessionSchema === null ? "no recognized" : targetSessionSchema} session schema; persisted sessions use schema ${sessionSchema}.`);
   return { compatible: issues.length === 0, archivePresent, archiveSchema, targetArchiveSchema,
     sessionsPresent, sessionSchema, targetSessionSchema, migrations, issues,
+    ...(noSessionPersistence ? { targetSessionPersistence: "none" } : {}),
     ...(issues.length ? { message: `${issues.join(" ")} Restore an explicitly selected compatible update snapshot while retaining newer data before continuing.` } : {}) };
+}
+
+function recognizesInMemorySessions(release) {
+  const source = readOptional(path.join(release, "apps/server/src/sessionStore.ts"));
+  if (!source?.includes("export class SessionStore {") || !source.includes("private readonly tabs = new Map<string, WorkspaceTab>();") ||
+      !source.includes("private readonly sessions = new Map<string, PluginSession>();") ||
+      /\b(?:SessionStateStore|savedSessions|JsonStateFile)\b|sessions\.json|node:fs/.test(source)) return false;
+  const constructor = source.match(/\bconstructor\(([\s\S]*?)\)\s*\{\}/)?.[1].replace(/\s/g, "");
+  const inMemoryConstructor = `private readonly plugins: PluginRegistry,
+    private readonly pathPolicy: PathPolicy, private readonly contextService: TabContextService,
+    private readonly configProvider: { getPluginConfig(pluginId: string): Record<string, ConfigValue> } = { getPluginConfig: () => ({}) },
+    private readonly workspace?: WorkspaceLayoutStore, private readonly runtimeContextResolver?: SessionRuntimeContextResolver,
+    private readonly backgroundErrorReporter: SessionBackgroundErrorReporter = reportSessionBackgroundError`.replace(/\s/g, "");
+  if (constructor !== inMemoryConstructor || readOptional(path.join(release, "apps/server/src/terminal/DurableTerminalProcess.ts")) !== undefined) return false;
+  return recognizesDirectTerminalContract(readOptional(path.join(release, "apps/server/src/terminal/TerminalProcess.ts")) ?? "");
 }
 
 function readCatalogVersion(catalog) {

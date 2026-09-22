@@ -103,6 +103,17 @@ function savedTransition({ service, externalDocumentation } = {}) {
 }
 
 describe('saved transition boundaries', () => {
+  it('accepts direct readiness only when the independent integration owns it', () => {
+    const { record, runDir } = savedTransition();
+    record.transition.integration = { version: 1, files: [], independentReadiness: true, terminalMode: 'direct' };
+    expect(() => validateSavedTransition(record, runDir)).not.toThrow();
+    record.transition.integration.independentReadiness = false;
+    expect(() => validateSavedTransition(record, runDir)).toThrow('Invalid saved managed integration');
+    record.transition.integration.independentReadiness = true;
+    record.transition.integration.terminalMode = 'unknown';
+    expect(() => validateSavedTransition(record, runDir)).toThrow('Invalid saved managed integration');
+  });
+
   it('accepts standard, custom-service and external-archive recovery records', () => {
     for (const options of [{}, { service: 'cloudx-worker@review.service' }, { externalDocumentation: '/srv/cloudx-archive' }]) {
       const { record, runDir } = savedTransition(options);

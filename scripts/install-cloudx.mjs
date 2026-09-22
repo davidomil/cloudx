@@ -609,6 +609,7 @@ export function renderTerminalService({ repoRoot: root, envPath, nodePath }) {
   return [
     "[Unit]",
     "Description=Cloudx persistent terminal sessions",
+    `ConditionPathExists=${path.join(root, "apps/server/dist/terminal/broker.js")}`,
     "",
     "[Service]",
     "Type=notify",

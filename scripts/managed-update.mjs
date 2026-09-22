@@ -127,6 +127,7 @@ export class UpdateHost {
     if (!path.isAbsolute(this.paths.dataDir)) throw new Error('CloudX data directory must be absolute.');
     if (fs.existsSync(this.paths.dataDir) && fs.realpathSync(this.paths.dataDir) !== this.paths.dataDir) throw new Error('CloudX data root must be a real directory without symlink components.');
     if (service && !this.envConfig.CLOUDX_DATA_DIR) throw new Error('Custom service EnvironmentFile must explicitly declare CLOUDX_DATA_DIR.');
+    if (recovery?.mutating && recovery.directBroker) this.inspectOwnedBrokerConfiguration(recovery.directBroker.file);
   }
 
   git(args, cwd = this.paths.repoRoot) { return this.runner.inspect('git', args, { cwd }); }
@@ -136,6 +137,7 @@ export class UpdateHost {
     const root = this.paths.repoRoot;
     delete transition.sourceFiles;
     delete transition.targetFiles;
+    delete transition.directBroker;
     if (this.git(['rev-parse', '--show-toplevel']) !== root) throw new Error('Update requires the installed checkout root.');
     transition.sourceCommit = this.git(['rev-parse', 'HEAD']);
     transition.sourceIndex = this.git(['write-tree']);
@@ -174,6 +176,7 @@ export class UpdateHost {
     transition.serviceStates = Object.fromEntries(this.target.serviceNames.map(service => [service, this.runner.inspect('systemctl', ['--user', 'show', service, '--property=ActiveState,MainPID,InvocationID'])]));
     transition.targetFiles = this.captureCheckout(transition.sourceCommit, record.targetCommit, release);
     transition.integration = prepareManagedIntegration(release, record.coordinator);
+    this.prepareDirectBroker(record);
     this.prepareRelease({ releaseRoot: release, home: this.home, envConfig: this.envConfig, standard: this.target.kind === 'standard',
       progress: (component, message) => { record.run.component = component; record.run.message = message; this.save(record); } });
     writeRuntimeBuild({ repoRoot: release, commit: record.targetCommit });
@@ -199,6 +202,49 @@ export class UpdateHost {
     writeUpdateJson(path.join(path.dirname(this.runDir), 'confirmation.json'), { repoRoot: record.repoRoot, targetCommit: record.targetCommit,
       message: 'This update needs to interrupt terminal processes. Saved tabs, layouts and known conversations remain recoverable. Commands and prompts will not be replayed. ' + (plan.recovery?.warnings ?? []).join(' ') });
     throw publicFailure('terminals', 'Confirm the disclosed terminal interruption before continuing this update.');
+  }
+
+  inspectOwnedBrokerConfiguration(expectedFile) {
+    const service = 'cloudx-terminal.service';
+    const state = inspectTerminalService(this.runner, service);
+    if (!expectedFile && (state.LoadState === 'not-found' || state.WorkingDirectory !== this.paths.repoRoot)) return;
+    if (state.LoadState !== 'loaded' || state.WorkingDirectory !== this.paths.repoRoot)
+      throw publicFailure('services', 'The terminal broker configuration no longer belongs to this checkout.');
+    const config = Object.fromEntries(this.runner.inspect('systemctl', ['--user', 'show', service, '--property=FragmentPath,DropInPaths']).split('\n').map(line => {
+      const separator = line.indexOf('=');
+      return [line.slice(0, separator), line.slice(separator + 1)];
+    }));
+    if (config.DropInPaths !== '' || !path.isAbsolute(config.FragmentPath ?? ''))
+      throw publicFailure('services', 'The direct-terminal target requires one owned terminal broker unit without drop-ins.');
+    const file = fs.realpathSync(config.FragmentPath);
+    if (expectedFile && file !== expectedFile)
+      throw publicFailure('services', 'The direct-terminal target requires one owned terminal broker unit without drop-ins.');
+    assertOwnedBrokerFile(file, this.paths.systemdDir);
+    return { file, state: Object.entries(state).map(([key, value]) => `${key}=${value}`).join('\n') };
+  }
+
+  prepareDirectBroker(record) {
+    const t = record.transition;
+    if (this.target.kind !== 'web' || t.integration?.terminalMode !== 'direct') return;
+    const broker = this.inspectOwnedBrokerConfiguration();
+    if (broker) t.directBroker = { ...broker, sha256: hashFile(broker.file) };
+  }
+
+  assertDirectBrokerUnchanged(transition) {
+    if (!transition.directBroker) return;
+    const { file, sha256 } = transition.directBroker;
+    this.inspectOwnedBrokerConfiguration(file);
+    if (hashFile(file) !== sha256)
+      throw Object.assign(publicFailure('services', 'The terminal broker unit changed during preparation. Resume to prepare against its current configuration.'), { reprepare: true });
+  }
+
+  guardDirectBroker(transition) {
+    if (!transition.directBroker) return;
+    this.assertDirectBrokerUnchanged(transition);
+    const file = transition.directBroker.file;
+    const content = fs.readFileSync(file, 'utf8');
+    const condition = `\n[Unit]\nConditionPathExists=${path.join(this.paths.repoRoot, 'apps/server/dist/terminal/broker.js')}\n`;
+    if (!content.endsWith(condition)) writeBrokerConfiguration(file, `${content}${content.endsWith('\n') ? '' : '\n'}${condition}`, this.paths.systemdDir);
   }
 
   planData(record) {
@@ -247,6 +293,7 @@ export class UpdateHost {
     for (const [relative, manifest] of Object.entries(t.buildManifests)) verifySnapshot(path.join(t.release, relative), manifest);
     this.planData(record);
     if (fs.readFileSync(this.paths.envPath, 'utf8') !== t.environmentText) throw Object.assign(publicFailure('configuration', 'Saved configuration changed during preparation. Resume to prepare a fresh release using the current configuration.'), { reprepare: true });
+    this.assertDirectBrokerUnchanged(t);
     if (this.git(['rev-parse', 'HEAD']) !== t.sourceCommit || this.localChanges() !== t.localPatch || this.git(['write-tree']) !== t.sourceIndex)
       throw Object.assign(publicFailure('checkout', 'Local work changed while the release was building. Resume to prepare a fresh release with the current local work.'), { reprepare: true });
     assertUpdaterOutsideServices(inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: t.targetRuntime }).services.map(({ service, state }) => [service, state]), fs.readFileSync);
@@ -285,7 +332,8 @@ export class UpdateHost {
       verifySnapshot(destination, manifest);
       t.snapshots.push({ root, destination, manifest });
     }
-    const configuration = [this.paths.envPath, ...this.target.serviceNames.map(name => path.join(this.paths.systemdDir, name))];
+    this.assertDirectBrokerUnchanged(t);
+    const configuration = [...new Set([this.paths.envPath, ...this.target.serviceNames.map(name => path.join(this.paths.systemdDir, name)), ...(t.directBroker ? [t.directBroker.file] : [])])];
     t.configuration = configuration.map(file => ({ file, content: fs.existsSync(file) ? fs.readFileSync(file).toString('base64') : null }));
     t.replaced = [];
     t.activationIndex = undefined;
@@ -340,6 +388,7 @@ export class UpdateHost {
       syncDirectory(path.dirname(installed));
     }
     if (this.target.kind === 'standard') activateManagedServices({ repoRoot: this.paths.repoRoot, releaseRoot: t.release, home: this.home, envConfig: this.envConfig, runner: this.runner, runtimeLaunch: { script: path.join(record.coordinator, 'scripts/managed-runtime-launch.mjs'), buildFile: path.join(t.release, 'apps/server/dist/runtime-build.json'), receiptFile: path.join(this.runDir, 'runtime.json') } });
+    this.guardDirectBroker(t);
     if (this.target.kind === 'web') fs.writeFileSync(this.paths.envPath, updateEnvironmentFile(fs.readFileSync(this.paths.envPath, 'utf8'), {
       CLOUDX_INSTALL_ROOT: this.paths.repoRoot, CLOUDX_DATA_DIR: this.paths.dataDir,
       ...(record.coordinator ? { CLOUDX_UPDATE_COORDINATOR_ROOT: record.coordinator } : {}),
@@ -357,6 +406,7 @@ export class UpdateHost {
     t.targetStarted = true;
     this.save(record);
     for (const service of this.target.serviceNames) {
+      if (t.integration?.terminalMode === 'direct' && service === 'cloudx-terminal.service') continue;
       this.runner.run('systemctl', ['--user', 'start', service]);
       if (broker) {
         const state = inspectTerminalService(this.runner, broker.service);
@@ -380,7 +430,8 @@ export class UpdateHost {
     if (t.integration?.independentReadiness) {
       try {
         const result = JSON.parse(this.runner.inspect(process.execPath, [path.join(record.coordinator, 'scripts/managed-update-readiness.mjs'), t.release, this.paths.dataDir], { timeout: 60000 }));
-        if (result.broker !== 'ready' || result.direct !== 'ready') throw new Error('Incomplete terminal readiness result.');
+        const expectedBroker = t.integration.terminalMode === 'direct' ? 'not-applicable' : 'ready';
+        if (result.broker !== expectedBroker || result.direct !== 'ready') throw new Error('Incomplete terminal readiness result.');
       } catch (error) {
         throw publicFailure('terminals', 'The historical target did not pass supervised terminal creation and cleanup. Check the private log for its supervisor or broker failure before resuming.', error);
       }
@@ -623,6 +674,11 @@ export class UpdateHost {
       }
       this.restoreCheckout(record);
       for (const { file, content } of t.configuration) {
+        if (file === t.directBroker?.file) {
+          this.inspectOwnedBrokerConfiguration(file);
+          writeBrokerConfiguration(file, Buffer.from(content, 'base64'), this.paths.systemdDir);
+          continue;
+        }
         if (content === null) fs.rmSync(file, { force: true });
         else { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, Buffer.from(content, 'base64'), { mode: 0o600, flush: true }); }
       }
@@ -643,8 +699,35 @@ export class UpdateHost {
   }
 
   restartPrevious(transition) {
+    if (transition.directBroker?.state.includes('ActiveState=active')) {
+      this.inspectOwnedBrokerConfiguration(transition.directBroker.file);
+      this.runner.run('systemctl', ['--user', 'start', 'cloudx-terminal.service']);
+    }
     for (const [service, state] of Object.entries(transition.serviceStates ?? {})) if (state.includes('ActiveState=active')) this.runner.run('systemctl', ['--user', 'start', service]);
   }
+}
+
+function brokerConfigurationPath(file, systemdDir) {
+  return typeof file === 'string' && path.dirname(file) === systemdDir && path.resolve(file) === file &&
+    /^[a-zA-Z0-9][a-zA-Z0-9_.@:-]*\.service$/.test(path.basename(file));
+}
+
+function assertOwnedBrokerFile(file, systemdDir) {
+  if (!brokerConfigurationPath(file, systemdDir)) throw publicFailure('services', 'The terminal broker unit must be inside the user service directory.');
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.getuid() || fs.realpathSync(file) !== file)
+    throw publicFailure('services', 'The terminal broker unit must be an owned regular file without linked paths.');
+  return stat;
+}
+
+function writeBrokerConfiguration(file, content, systemdDir) {
+  const stat = assertOwnedBrokerFile(file, systemdDir);
+  const temporary = `${file}.${randomUUID()}.update`;
+  try {
+    fs.writeFileSync(temporary, content, { flag: 'wx', mode: stat.mode & 0o777, flush: true });
+    fs.renameSync(temporary, file);
+    syncDirectory(path.dirname(file));
+  } finally { fs.rmSync(temporary, { force: true }); }
 }
 
 function optionalStat(file, root) {
@@ -715,6 +798,8 @@ function forgeRecords(root, restoringFiles = new Set()) {
       if (relative !== FORGE_WORKFLOW_FILE) { records[relative] = hashFile(full); return; }
       const workers = JSON.parse(fs.readFileSync(full, 'utf8'));
       if (!Array.isArray(workers)) throw new Error('Invalid saved Forge worker list.');
+      // Forge initializes an absent workflow store to an empty list on startup.
+      if (!workers.length) return;
       records[relative] = JSON.stringify(workers.map(worker => {
         // ForgeWorkflowService.persist refreshes this metadata on load and disposal.
         // Publication, retry and completion timestamps remain part of the comparison.
@@ -755,6 +840,7 @@ export function validateSavedTransition(record, runDir) {
   if (!t) return;
   if (t.integration !== undefined && (!object(t.integration) || t.integration.version !== 1 ||
       typeof t.integration.independentReadiness !== 'boolean' || !Array.isArray(t.integration.files) ||
+      t.integration.terminalMode !== undefined && (t.integration.terminalMode !== 'direct' || !t.integration.independentReadiness) ||
       t.integration.files.some(file => !MANAGED_INTEGRATION_FILES.includes(file)))) throw new Error('Invalid saved managed integration.');
   if (t.preservedSessionIds !== undefined && !validSessionIds(t.preservedSessionIds)) throw new Error('Invalid saved terminal session identities.');
   if (t.brokerStartup !== undefined && (!object(t.brokerStartup) ||
@@ -767,6 +853,10 @@ export function validateSavedTransition(record, runDir) {
       t.serviceTarget.kind !== (record.service ? 'web' : 'standard'))) throw new Error('Invalid saved service selection.');
   if (t.serviceStates !== undefined && (!object(t.serviceStates) || Object.entries(t.serviceStates).some(([name, state]) => !expectedServices.includes(name) || typeof state !== 'string')))
     throw new Error('Invalid saved service state.');
+  if (t.directBroker !== undefined && (!object(t.directBroker) || !record.service || t.integration?.terminalMode !== 'direct' ||
+      !brokerConfigurationPath(t.directBroker.file, path.join(record.home, '.config/systemd/user')) ||
+      typeof t.directBroker.state !== 'string' || !/^[a-f0-9]{64}$/.test(t.directBroker.sha256 ?? '')))
+    throw new Error('Invalid saved direct-terminal broker configuration.');
   for (const commit of [t.sourceCommit, t.sourceIndex].filter(Boolean)) updateCommit(commit);
   const environment = t.environment ?? {};
   if (!object(environment) || Object.values(environment).some(value => typeof value !== 'string') ||
@@ -807,9 +897,14 @@ export function validateSavedTransition(record, runDir) {
         artifact.previous !== `${artifact.installed}.cloudx-previous-${record.run.id}` || typeof artifact.existed !== 'boolean')
       throw new Error('Invalid saved runtime replacement.');
   }
-  const configFiles = [record.envPath ?? path.join(record.home, '.config/cloudx/cloudx.env'), ...expectedServices.map(name => path.join(record.home, '.config/systemd/user', name))];
+  const configFiles = [record.envPath ?? path.join(record.home, '.config/cloudx/cloudx.env'), ...expectedServices.map(name => path.join(record.home, '.config/systemd/user', name)), ...(t.directBroker ? [t.directBroker.file] : [])];
   if (t.configuration !== undefined && !Array.isArray(t.configuration)) throw new Error('Invalid saved service configuration.');
   for (const config of t.configuration ?? []) if (!config || !configFiles.includes(config.file) || config.content !== null && typeof config.content !== 'string') throw new Error('Invalid saved service configuration.');
+  if (t.directBroker && t.snapshotVerified) {
+    const configuration = t.configuration?.find(config => config.file === t.directBroker.file);
+    if (typeof configuration?.content !== 'string' || createHash('sha256').update(Buffer.from(configuration.content, 'base64')).digest('hex') !== t.directBroker.sha256)
+      throw new Error('The saved terminal broker configuration does not match its recovery snapshot.');
+  }
   for (const files of [t.sourceFiles, t.targetFiles]) {
     if (files === undefined) continue;
     if (!Array.isArray(files) || new Set(files.map(file => file?.relative)).size !== files.length) throw new Error('Invalid saved checkout recovery path.');

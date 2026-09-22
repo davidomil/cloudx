@@ -80,6 +80,11 @@ coordinator directory before startup. Settings continues to use the
 retained coordinator after a downgrade, including for completion status
 and the next update.
 
+For the recognized target before Settings updates existed, the prepared
+build adds the maintained Updates panel, server routes and shared
+contracts. Starting an update waits for pending workspace writes and a
+durable workspace save.
+
 The coordinator is bundled into private update state and runs in its own
 systemd user service. Browser or terminal disconnection does not cancel
 it. Moving script files alone would not isolate a process: children
@@ -157,6 +162,11 @@ completed publication cannot become a publishable draft through
 rollback. Preserve those records while resolving the reported recovery
 blocker.
 
+An absent Forge workflow store and a valid empty worker list represent
+the same ownership state. Ordinary empty-store initialization does not
+block rollback. Nonempty worker records and other Forge ownership files
+still participate in the comparison.
+
 Restoration stops brokers started by the failed transition, including
 when the original broker was inactive or absent. Only the exact
 preserved original broker invocation may remain running.
@@ -201,6 +211,16 @@ supervised process ownership and cleanup. Both broker and direct probes
 require the expected output, a successful exit and confirmed termination
 before readiness succeeds.
 
+Targets before persistent brokers use only their direct supervised
+factory. Readiness requires the expected output, a successful exit and
+confirmed termination. The broker service stays inactive while its
+entry point is absent.
+
+The recognized target without saved-session persistence accepts an
+empty version-1 sessions file without changing its bytes. Nonempty
+saved sessions still require a compatible reader or verified snapshot;
+the historical deployment fixture covers an empty saved-session store.
+
 Regression fixtures build the actual pinned base
 a9613fafdc0ed1765fcf72ea7d9f61de08c3914a, its predecessor
 26d8291b89309acb59fdea1cbe09234d41d0164f, the target before Settings
@@ -209,6 +229,10 @@ before terminal execution bindings ad72433b2d6283811fad6bfe288748f2c24b0c5e.
 They exercise supervised terminal creation and cleanup, existing-session
 attachment, original profile paths, saved update completion and
 initiation of the next update.
+
+The matrix also includes 224a75ef7b3efced05b2c6b3b136250d9a532dc3,
+before persistent terminal brokers. Its source fixture verifies direct
+process cleanup, a retained live shell and the next Settings handoff.
 
 Historical integrations must compile against the selected target’s APIs.
 Schema checks recognize catalog and session contracts; arbitrary

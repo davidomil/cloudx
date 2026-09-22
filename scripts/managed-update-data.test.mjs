@@ -81,6 +81,58 @@ it.each(["missing", "unrecognized"])("rejects persisted sessions with a %s targe
   expect(inspectDataCompatibility(f.release, f.env, f.data)).toMatchObject({ compatible: false, targetSessionSchema: null });
 });
 
+it("retains an empty schema-1 store written during shutdown when the actual pre-broker target has no session persistence", () => {
+  const f = inMemoryTargetFixture();
+  const sessionFile = path.join(f.data, "sessions.json");
+  fs.unlinkSync(sessionFile);
+  expect(inspectDataCompatibility(f.release, f.env, f.data)).toMatchObject({ compatible: true, sessionsPresent: false, targetSessionPersistence: "none" });
+  const empty = '{\n  "version": 1,\n  "sessions": []\n}\n';
+  fs.writeFileSync(sessionFile, empty);
+  expect(inspectDataCompatibility(f.release, f.env, f.data)).toMatchObject({ compatible: true, sessionSchema: 1, targetSessionSchema: null, targetSessionPersistence: "none", migrations: [] });
+  expect(fs.readFileSync(sessionFile, "utf8")).toBe(empty);
+  const snapshot = path.join(f.root, "snapshot");
+  fs.cpSync(f.data, snapshot, { recursive: true });
+  expect(inspectSnapshotCompatibility(f.release, f.env, f.data, [{ root: f.data, destination: snapshot }])).toMatchObject({ compatible: true, targetSessionPersistence: "none" });
+  expect(fs.readFileSync(path.join(snapshot, "sessions.json"), "utf8")).toBe(empty);
+});
+
+it.each([
+  { version: 1, sessions: [{ tab: { id: "saved-tab" } }] },
+  { version: 1, sessions: [], activeTabId: "saved-tab" },
+  { version: 1, sessions: [], activeTabId: null },
+  { version: 1, sessions: [], futureState: {} },
+  { version: 0, sessions: [] },
+  { version: 2, sessions: [] },
+])("keeps nonempty or unknown session metadata incompatible with the pre-broker target: %j", saved => {
+  const f = inMemoryTargetFixture(), sessionFile = path.join(f.data, "sessions.json");
+  const content = JSON.stringify(saved);
+  fs.writeFileSync(sessionFile, content);
+  expect(inspectDataCompatibility(f.release, f.env, f.data)).toMatchObject({ compatible: false, targetSessionPersistence: "none" });
+  expect(fs.readFileSync(sessionFile, "utf8")).toBe(content);
+});
+
+it.each([null, { version: "1", sessions: [] }, { version: 1, sessions: {} }])("rejects malformed saved sessions for the recognized in-memory target: %j", saved => {
+  const f = inMemoryTargetFixture();
+  fs.writeFileSync(path.join(f.data, "sessions.json"), JSON.stringify(saved));
+  expect(() => inspectDataCompatibility(f.release, f.env, f.data)).toThrow("invalid schema declaration");
+});
+
+it.each(["missing session store", "different constructor", "persistence reader", "file access", "broker", "different terminal contract"])(
+  "does not declare absent session persistence for a target with a %s", unknown => {
+    const f = inMemoryTargetFixture();
+    const store = path.join(f.release, "apps/server/src/sessionStore.ts");
+    if (unknown === "missing session store") fs.unlinkSync(store);
+    if (unknown === "different constructor") fs.writeFileSync(store, fs.readFileSync(store, "utf8").replace("private readonly workspace?: WorkspaceLayoutStore", "private readonly renamedWorkspace?: WorkspaceLayoutStore"));
+    if (unknown === "persistence reader") fs.writeFileSync(f.sessionSource, "export class SessionStateStore { read() {} }");
+    if (unknown === "file access") fs.appendFileSync(store, '\nimport fs from "node:fs";\n');
+    if (unknown === "broker") fs.writeFileSync(path.join(f.release, "apps/server/src/terminal/DurableTerminalProcess.ts"), "export class DurableTerminalProcessFactory {}");
+    if (unknown === "different terminal contract") fs.writeFileSync(path.join(f.release, "apps/server/src/terminal/TerminalProcess.ts"), "export interface TerminalProcessFactory { spawn(): unknown; }");
+    const result = inspectDataCompatibility(f.release, f.env, f.data);
+    expect(result).toMatchObject({ compatible: false, targetSessionSchema: null });
+    expect(result.targetSessionPersistence).toBeUndefined();
+  },
+);
+
 it.each(["missing", "negative", "expression", "overflow"])("does not guess a %s target catalog declaration", kind => {
   const f = fixture();
   createCatalog(f.archive, 0);
@@ -195,6 +247,17 @@ function fixture({ target = 2 } = {}) {
   fs.copyFileSync(new URL("../apps/server/src/workspace/SessionStateStore.ts", import.meta.url), sessionSource);
   fs.writeFileSync(path.join(data, "sessions.json"), JSON.stringify({ version: 1, sessions: [] }));
   return { root, release, data, archive, catalog: path.join(archive, "catalog.sqlite"), env: {}, catalogSource, sessionSource };
+}
+
+function inMemoryTargetFixture() {
+  const f = fixture();
+  fs.unlinkSync(f.sessionSource);
+  for (const relative of ["apps/server/src/sessionStore.ts", "apps/server/src/terminal/TerminalProcess.ts"]) {
+    const destination = path.join(f.release, relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, execFileSync("git", ["show", `224a75ef7b3efced05b2c6b3b136250d9a532dc3:${relative}`], { cwd: new URL("..", import.meta.url), encoding: "utf8" }));
+  }
+  return f;
 }
 
 function createCatalog(root, version) {

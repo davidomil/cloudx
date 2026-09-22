@@ -14,15 +14,16 @@ import { writeRuntimeBuild } from "./write-runtime-build.mjs";
 
 const sourceRoot = fileURLToPath(new URL("..", import.meta.url));
 const targets = [
-  ["pinned base", "a9613fafdc0ed1765fcf72ea7d9f61de08c3914a", false],
-  ["before terminal readiness endpoint", "26d8291b89309acb59fdea1cbe09234d41d0164f", true],
-  ["before Settings channel selection", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", true],
-  ["before terminal execution bindings", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", true],
+  ["pinned base", "a9613fafdc0ed1765fcf72ea7d9f61de08c3914a", false, true],
+  ["before terminal readiness endpoint", "26d8291b89309acb59fdea1cbe09234d41d0164f", true, true],
+  ["before Settings channel selection", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", true, true],
+  ["before terminal execution bindings", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", true, true],
+  ["before persistent terminal brokers", "224a75ef7b3efced05b2c6b3b136250d9a532dc3", true, false],
 ];
 const temporary = [];
 afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
-it.skipIf(process.platform !== "linux").each(targets)("builds the actual %s target with retained managed Settings and real terminal readiness", async (_name, commit, independentReadiness) => {
+it.skipIf(process.platform !== "linux").each(targets)("builds the actual %s target with retained managed Settings and real terminal readiness", async (_name, commit, independentReadiness, persistentBroker) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-managed-history-")); temporary.push(root);
   const home = path.join(root, "home"), repoRoot = path.join(root, "installed"), releaseRoot = path.join(root, "release");
   const git = (cwd, args) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -39,6 +40,7 @@ it.skipIf(process.platform !== "linux").each(targets)("builds the actual %s targ
     throw new Error(`Historical ${commit} build failed:\n${error.stdout}\n${error.stderr}`, { cause: error });
   });
   writeRuntimeBuild({ repoRoot: releaseRoot, commit });
+  expect(fs.existsSync(path.join(releaseRoot, "apps/server/dist/terminal/broker.js"))).toBe(persistentBroker);
   expect(fs.realpathSync(path.join(releaseRoot, "node_modules/@cloudx/shared"))).toBe(path.join(releaseRoot, "packages/shared"));
 
   const dataDir = path.join(repoRoot, ".cloudx"), envPath = path.join(home, ".config/cloudx/cloudx.env");
@@ -55,14 +57,14 @@ it.skipIf(process.platform !== "linux").each(targets)("builds the actual %s targ
     } });
   const env = parseEnvironmentFile(fs.readFileSync(envPath, "utf8"));
   const fixturePath = path.join(root, "fixture.json");
-  fs.writeFileSync(fixturePath, JSON.stringify({ root, home, repoRoot, releaseRoot, dataDir, envPath, completed,
+  fs.writeFileSync(fixturePath, JSON.stringify({ root, home, repoRoot, releaseRoot, dataDir, envPath, completed, persistentBroker,
     nextCommit: targets.find(([, target]) => target !== commit)[1] }));
   const script = path.join(root, "exercise.mjs");
   fs.writeFileSync(script, historicalRuntimeExercise());
   const result = await execute(process.execPath, [script, fixturePath], { cwd: repoRoot, env: { ...process.env, ...env }, timeout: 30_000, maxBuffer: 1024 * 1024 });
   const proof = JSON.parse(result.stdout);
-  expect(proof).toMatchObject({ readiness: { broker: "ready", direct: "ready" }, completedRun: completed.run.id,
-    nextTarget: targets.find(([, target]) => target !== commit)[1], dataDir, nextState: "running", retainedShell: true, clearedReadinessReceipts: true, retiredSupervisors: 2,
+  expect(proof).toMatchObject({ readiness: { broker: persistentBroker ? "ready" : "not-applicable", direct: "ready" }, completedRun: completed.run.id,
+    nextTarget: targets.find(([, target]) => target !== commit)[1], dataDir, nextState: "running", retainedShell: true, clearedReadinessReceipts: true, retiredSupervisors: persistentBroker ? 2 : 1,
     runtime: { verification: "verified", build: { commit } }, selectedChannel: "main" });
   expect(proof.updateInvocations.every(call => call.script === path.join(completed.coordinator, "scripts/settings-update.mjs") && call.cwd === repoRoot)).toBe(true);
   expect(proof.updateInvocations.map(call => call.action)).toContain("start");
@@ -78,8 +80,6 @@ const f = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const installed = relative => import(pathToFileURL(path.join(f.repoRoot, 'apps/server/dist', relative)));
 const coordinator = relative => import(pathToFileURL(path.join(f.completed.coordinator, 'scripts', relative)));
 const { loadConfig } = await installed('config.js');
-const { TerminalBroker } = await installed('terminal/TerminalBroker.js');
-const { DurableTerminalProcessFactory, terminalSocketPath } = await installed('terminal/DurableTerminalProcess.js');
 const { NodePtyTerminalProcessFactory } = await installed('terminal/NodePtyTerminalProcess.js');
 const { CloudxUpdateService } = await installed('system/CloudxUpdateService.js');
 const { CloudxUpdateCatalog } = await installed('system/CloudxUpdateCatalog.js');
@@ -89,9 +89,16 @@ const { SettingsUpdater } = await coordinator('settings-update.mjs');
 const { verifyHistoricalTerminals } = await coordinator('managed-update-readiness.mjs');
 const config = loadConfig();
 assert.equal(config.dataDir, f.dataDir);
-const socket = terminalSocketPath(config.dataDir);
-const broker = new TerminalBroker(socket, new NodePtyTerminalProcessFactory());
-const factory = new DurableTerminalProcessFactory(socket, new NodePtyTerminalProcessFactory());
+let socket;
+let broker;
+let factory = new NodePtyTerminalProcessFactory();
+if (f.persistentBroker) {
+  const { TerminalBroker } = await installed('terminal/TerminalBroker.js');
+  const { DurableTerminalProcessFactory, terminalSocketPath } = await installed('terminal/DurableTerminalProcess.js');
+  socket = terminalSocketPath(config.dataDir);
+  broker = new TerminalBroker(socket, factory);
+  factory = new DurableTerminalProcessFactory(socket, factory);
+}
 const probes = [];
 const spawn = NodePtyTerminalProcessFactory.prototype.spawn;
 NodePtyTerminalProcessFactory.prototype.spawn = async function(command, args, options) {
@@ -104,17 +111,23 @@ NodePtyTerminalProcessFactory.prototype.spawn = async function(command, args, op
 let shell;
 let app;
 try {
-  await broker.start();
-  shell = await factory.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: f.dataDir, env: process.env, cols: 100, rows: 24, sessionId: 'historical-preserved-shell' });
+  if (broker) await broker.start();
+  shell = await factory.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: f.dataDir, env: process.env, cols: 100, rows: 24,
+    ...(f.persistentBroker ? { sessionId: 'historical-preserved-shell' } : {}) });
   const readiness = await verifyHistoricalTerminals(f.releaseRoot, f.dataDir);
-  assert.equal(probes.length, 2);
+  assert.equal(probes.length, f.persistentBroker ? 2 : 1);
   for (const probe of probes) {
     assert.throws(() => process.kill(probe.pid, 0), { code: 'ESRCH' });
     assert.equal(fs.existsSync(probe.directory), false);
     if (probe.sessionId) await assert.rejects(factory.attach(probe.sessionId));
   }
-  const attached = await factory.attach('historical-preserved-shell');
-  attached.detach();
+  if (f.persistentBroker) {
+    const attached = await factory.attach('historical-preserved-shell');
+    attached.detach();
+  } else {
+    assert.equal(process.kill(shell.process.pid, 0), true);
+    assert.equal(fs.existsSync(shell.supervisor.directory), true);
+  }
   assert.deepEqual(fs.readdirSync(f.dataDir).filter(name => name.startsWith('terminal-readiness-')), []);
   const launches = [];
   let unit = { LoadState: 'not-found', ActiveState: 'inactive' };
@@ -183,9 +196,9 @@ try {
     dataDir: config.dataDir, updateInvocations, retainedShell: true, clearedReadinessReceipts: true, retiredSupervisors: probes.length, runtime, selectedChannel: selected.channel }));
 } finally {
   if (app) await app.close();
-  if (shell) { await shell.terminate(); shell.detach(); }
-  await broker.stop();
-  fs.rmSync(path.dirname(socket), { recursive: true, force: true });
+  if (shell) { await shell.terminate(); shell.detach?.(); }
+  if (broker) await broker.stop();
+  if (socket) fs.rmSync(path.dirname(socket), { recursive: true, force: true });
 }
 `;
 }

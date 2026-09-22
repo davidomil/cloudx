@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ForgeWorkflowService } from '../apps/server/src/forge/ForgeWorkflowService.ts';
 import { ForgeWorkflowStore, ForgeWorkerReports } from '../apps/server/src/forge/ForgeWorkflowStore.ts';
 import { PluginDataStore } from '../apps/server/src/plugins/PluginDataStore.ts';
-import { cleanupUpdates, FORGE_STATE, runPreparedUpdate, updateFixture, write } from './helpers/managed-update-rollback-fixture.mjs';
+import { ManagedUpdate, UpdateHost, validateSavedTransition } from './managed-update.mjs';
+import { cleanupUpdates, FORGE_STATE, git, runPreparedUpdate, updateFixture, write } from './helpers/managed-update-rollback-fixture.mjs';
 
 const services = [];
 afterEach(async () => {
@@ -44,6 +45,79 @@ async function forgeUpdate({ status = 'completed', published = status === 'compl
 }
 
 describe('Forge rollback ownership', () => {
+  it.each([false, true])('restores a profile without prior Forge state after empty-store initialization (fresh coordinator: %s)', async freshCoordinator => {
+    const f = await forgeUpdate();
+    fs.unlinkSync(f.forgeFile);
+    const start = f.host.start.bind(f.host), restore = f.host.restore.bind(f.host);
+    vi.spyOn(f.host, 'start').mockImplementation(async record => {
+      start(record);
+      f.forge.start();
+      expect((await f.forge.dashboard()).workers).toEqual([]);
+      expect(await f.store.read()).toEqual([]);
+    });
+    vi.spyOn(f.host, 'restore').mockImplementation(async record => {
+      await f.forge.dispose();
+      expect(JSON.parse(fs.readFileSync(f.forgeFile, 'utf8'))).toEqual([]);
+      if (freshCoordinator) throw new Error('Coordinator interrupted before rollback');
+      return restore(record);
+    });
+
+    const result = await runPreparedUpdate(f);
+    expect(result).toMatchObject({ state: 'failed', phase: 'verify', resumable: true });
+    let record = f.record;
+    if (freshCoordinator) {
+      record = JSON.parse(fs.readFileSync(f.recordPath, 'utf8'));
+      validateSavedTransition(record, f.host.runDir);
+      expect(record.transition).toMatchObject({ mutating: true, targetStarted: true });
+      expect(git(f.root, 'rev-parse', 'HEAD')).toBe(record.targetCommit);
+      const host = new UpdateHost({ repoRoot: f.root, home: f.host.home, dataDir: f.dataDir,
+        runDir: f.host.runDir, commands: f.commands, save: f.save, recovery: record.transition });
+      vi.spyOn(host, 'quiesce').mockImplementation(() => { throw new Error('Target retry deferred by test'); });
+      const resumed = await new ManagedUpdate({ record, save: f.save, host }).run();
+      expect(resumed).toMatchObject({ state: 'failed', phase: 'quiesce', resumable: true });
+    }
+
+    expect(record.transition).toMatchObject({ restored: true, mutating: false });
+    expect(fs.existsSync(f.forgeFile)).toBe(false);
+    expect(await f.store.read()).toEqual([]);
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(record.transition.sourceCommit);
+    expect(fs.readFileSync(path.join(f.root, 'apps/server/dist/index.js'), 'utf8')).toBe('previous runtime');
+    expect(f.states['cloudx.service'].ActiveState).toBe('active');
+    expect(f.events).toContainEqual({ action: 'start', service: 'cloudx.service', version: 'previous' });
+    const retained = record.transition.retainedFailedData[0].destination;
+    expect(JSON.parse(fs.readFileSync(path.join(retained, FORGE_STATE), 'utf8'))).toEqual([]);
+    expect(f.deps.provider).not.toHaveBeenCalled();
+    expect(f.deps.runtime.launch).not.toHaveBeenCalled();
+    expect(f.deps.runtime.recover).not.toHaveBeenCalled();
+  });
+
+  it.each(['null', '{}', '""', '[', '[null]'])('does not treat a malformed workflow store as empty: %s', async content => {
+    const f = updateFixture({ activate: false });
+    fs.unlinkSync(f.forgeFile);
+    f.commands.afterStart = service => { if (service === 'cloudx.service') write(f.forgeFile, content); };
+
+    const result = await runPreparedUpdate(f);
+
+    expect(result.state).toBe('failed');
+    expect(f.record.transition.restored).not.toBe(true);
+    expect(fs.readFileSync(f.forgeFile, 'utf8')).toBe(content);
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.record.targetCommit);
+  });
+
+  it.each(['absent', 'empty'])('does not erase a worker published after a previously %s workflow store', async initial => {
+    const f = updateFixture({ activate: false });
+    if (initial === 'absent') fs.unlinkSync(f.forgeFile);
+    else write(f.forgeFile, '[]');
+    f.commands.afterStart = service => { if (service === 'cloudx.service') f.publish(); };
+
+    const result = await runPreparedUpdate(f);
+
+    expect(result).toMatchObject({ state: 'failed', component: 'forge' });
+    expect(result.cause).toContain('prevent repeating published work');
+    expect(f.record.transition.restored).not.toBe(true);
+    expect(JSON.parse(fs.readFileSync(f.forgeFile, 'utf8'))[0].publicationId).toBe('published-review-42');
+  });
+
   it.each(['completed', 'paused', 'awaiting_review', 'stopped', 'failed'])('restores after Forge startup and shutdown only refresh the timestamp of a worker in %s state', async status => {
     const f = await forgeUpdate({ status });
     const start = f.host.start.bind(f.host), restore = f.host.restore.bind(f.host);

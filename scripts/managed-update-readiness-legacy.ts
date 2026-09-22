@@ -10,14 +10,19 @@ export class TerminalReadiness {
   constructor(
     private readonly dataDir: string,
     private readonly factory: TerminalProcessFactory,
-    private readonly exitTimeoutMs = 5_000
+    private readonly exitTimeoutMs = 5_000,
+    private readonly owners: ReadonlyArray<"broker" | "direct"> = ["broker", "direct"]
   ) {}
 
   check(): Promise<void> {
-    this.checking ??= this.probe("broker").then(() => this.probe("direct")).finally(() => {
+    this.checking ??= this.probeOwners().finally(() => {
       this.checking = undefined;
     });
     return this.checking;
+  }
+
+  private async probeOwners(): Promise<void> {
+    for (const owner of this.owners) await this.probe(owner);
   }
 
   private async probe(owner: "broker" | "direct"): Promise<void> {
@@ -37,7 +42,7 @@ export class TerminalReadiness {
     } catch (error) {
       throw new Error(`${owner === "broker" ? "Broker" : "Direct worker"} terminal readiness failed: ${error instanceof Error ? error.message : "unknown terminal failure"}`, { cause: error });
     } finally {
-      terminal?.detach?.();
+      if (terminal && "detach" in terminal && typeof terminal.detach === "function") terminal.detach();
     }
   }
 
@@ -55,7 +60,7 @@ export class TerminalReadiness {
           else output += data;
         }));
         dispose.push(terminal.onExit(resolve));
-        if (terminal.onDisconnect) dispose.push(terminal.onDisconnect(reject));
+        if ("onDisconnect" in terminal && typeof terminal.onDisconnect === "function") dispose.push(terminal.onDisconnect(reject));
       });
       if (event.exitCode !== 0 || event.signal || !output.includes(marker)) {
         throw new Error(`The supervised readiness command did not complete successfully with its expected marker (exit ${event.exitCode}${event.signal ? `, signal ${event.signal}` : ""}).`);

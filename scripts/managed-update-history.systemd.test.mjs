@@ -6,18 +6,21 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
+import { chromium, expect as browserExpect } from "@playwright/test";
 
 import { InstallerRunner, prepareManagedRelease } from "./install-cloudx.mjs";
 import { ManagedUpdate, UpdateHost } from "./managed-update.mjs";
 import { writeUpdateJson } from "./managed-update-store.mjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", "ad72433b2d6283811fad6bfe288748f2c24b0c5e"];
+const preBrokerTarget = "224a75ef7b3efced05b2c6b3b136250d9a532dc3";
+const brokerTarget = "a9613fafdc0ed1765fcf72ea7d9f61de08c3914a";
+const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", preBrokerTarget];
 const supportedHost = process.platform === "linux"
   && fs.readFileSync("/etc/os-release", "utf8").includes("ID=ubuntu")
   && spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 5000 }).status === 0;
 
-it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and its broker under isolated systemd units", async historicalTarget => {
+it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and its required terminal services under isolated systemd units", async historicalTarget => {
   const fixture = await HistoricalInstallation.create();
   try {
     await fixture.waitUntilReady();
@@ -31,14 +34,34 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
     expect(update.record.transition.runtimePlan.requiresInterruption).toBe(true);
     expect(update.record.transition.runtimePlan.stopServices).toContain("cloudx-terminal.service");
     expect(fixture.serviceState(fixture.webUnit).InvocationID).not.toBe(originalWeb.InvocationID);
-    expect(fixture.serviceState(fixture.brokerUnit).InvocationID).not.toBe(originalBroker.InvocationID);
-    expect(fs.realpathSync(path.join(fixture.repoRoot, "apps/server/dist/terminal/broker.js")))
-      .toBe(path.join(update.record.transition.release, "apps/server/dist/terminal/broker.js"));
+    if (historicalTarget === preBrokerTarget) {
+      expect(update.record.transition.integration.terminalMode).toBe("direct");
+      expect(fixture.serviceState(fixture.brokerUnit)).toMatchObject({ ActiveState: "inactive", MainPID: "0", ConditionResult: "no" });
+      expect(fixture.calls.filter(call => call.command === "systemctl" && call.args.includes("start") && call.args.at(-1) === fixture.brokerUnit)).toEqual([]);
+      expect(fs.existsSync(path.join(fixture.repoRoot, "apps/server/dist/terminal/broker.js"))).toBe(false);
+      expect(() => process.kill(Number(originalBroker.MainPID), 0)).toThrow();
+      expect(JSON.parse(fs.readFileSync(path.join(fixture.dataDir, "sessions.json"), "utf8"))).toEqual({ version: 1, sessions: [] });
+    } else {
+      expect(fixture.serviceState(fixture.brokerUnit).InvocationID).not.toBe(originalBroker.InvocationID);
+      expect(fs.realpathSync(path.join(fixture.repoRoot, "apps/server/dist/terminal/broker.js")))
+        .toBe(path.join(update.record.transition.release, "apps/server/dist/terminal/broker.js"));
+    }
     expect(update.record.transition.verifiedRuntime).toMatchObject({ verification: "verified", build: { commit: historicalTarget } });
     expect(JSON.parse(fixture.curl("/api/runtime"))).toMatchObject({ verification: "verified", build: { commit: historicalTarget } });
     expect(fixture.curl("/api/ready/terminals", ["--write-out", "%{http_code}"])).toMatch(/404$/);
     expect(fs.readdirSync(fixture.dataDir).filter(name => name.startsWith("terminal-readiness-"))).toEqual([]);
     expect(fs.readFileSync(path.join(fixture.dataDir, "user-data.txt"), "utf8")).toBe("Preserve the active profile across the historical transition.\n");
+    if (historicalTarget === preBrokerTarget) {
+      await fixture.startNextUpdateInSettings(historicalTarget, brokerTarget);
+      const next = fixture.update(brokerTarget);
+      expect(await next.coordinator.run()).toMatchObject({ state: "succeeded", phase: "complete" });
+      expect(fixture.git(["rev-parse", "HEAD"])).toBe(brokerTarget);
+      expect(fixture.serviceState(fixture.brokerUnit)).toMatchObject({ ActiveState: "active", ConditionResult: "yes" });
+      expect(fixture.serviceState(fixture.brokerUnit).InvocationID).not.toBe(originalBroker.InvocationID);
+      expect(JSON.parse(fixture.curl("/api/runtime"))).toMatchObject({ verification: "verified", build: { commit: brokerTarget } });
+      expect(JSON.parse(fixture.curl("/api/ready/terminals"))).toMatchObject({ status: "ready" });
+      expect(fs.readFileSync(path.join(fixture.dataDir, "user-data.txt"), "utf8")).toBe("Preserve the active profile across the historical transition.\n");
+    }
     expect(fixture.calls.filter(call => call.command === "systemctl" && call.args.some(arg => ["start", "stop", "restart", "kill"].includes(arg)))
       .every(call => [fixture.webUnit, fixture.brokerUnit].includes(call.args.at(-1)))).toBe(true);
   } catch (error) {
@@ -120,9 +143,43 @@ http.createServer((request, response) => {
   }
 
   git(args) { return command("git", args, { cwd: this.repoRoot }); }
-  serviceState(unit) { return Object.fromEntries(command("systemctl", ["--user", "show", unit, "--property=MainPID,InvocationID,ActiveState"]).split("\n").map(line => line.split("="))); }
+  serviceState(unit) { return Object.fromEntries(command("systemctl", ["--user", "show", unit, "--property=MainPID,InvocationID,ActiveState,ConditionResult"]).split("\n").map(line => line.split("="))); }
   curl(route, extra = ["--fail"]) { return command("curl", ["--silent", "--show-error", "--insecure", "--max-time", "3", ...extra, `https://127.0.0.1:${this.port}${route}`]); }
   async waitUntilReady() { await expect.poll(() => JSON.parse(this.curl("/api/ready")), { timeout: 15000 }).toEqual({ status: "ready" }); }
+
+  async startNextUpdateInSettings(currentCommit, targetCommit) {
+    const browser = await chromium.launch();
+    try {
+      for (const mobile of [false, true]) {
+        const page = await browser.newPage({ ignoreHTTPSErrors: true, viewport: mobile ? { width: 393, height: 851 } : { width: 1440, height: 960 }, isMobile: mobile, hasTouch: mobile });
+        const starts = [];
+        const errors = [];
+        const run = { id: randomUUID(), state: "running", phase: "prepare", targetCommit, startedAt: new Date().toISOString(), message: "Preparing the selected target." };
+        page.on("pageerror", error => errors.push(error.message));
+        await page.route("**/api/system/update/preview", route => route.fulfill({ json: {
+          channel: "main", currentCommit, checkedAt: new Date().toISOString(), state: "available", changelog: [], changelogComplete: true,
+          target: { commit: targetCommit, name: "main", url: `https://github.com/davidomil/cloudx/commit/${targetCommit}` },
+        } }));
+        await page.route("**/api/system/update", route => {
+          if (route.request().method() === "POST") starts.push(route.request().postDataJSON());
+          return route.fulfill({ json: { available: true, ...(starts.length ? { run } : {}) } });
+        });
+        await page.goto(`https://127.0.0.1:${this.port}`, { waitUntil: "domcontentloaded" });
+        await browserExpect(page.locator(".workspace-pane").first()).toBeVisible();
+        if (mobile) {
+          await page.getByRole("button", { name: "Workspace actions", exact: true }).click();
+          await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
+        } else await page.getByRole("button", { name: "Settings", exact: true }).click();
+        const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+        await settings.getByRole("searchbox", { name: "Search settings" }).fill("Updates");
+        await browserExpect(settings.getByRole("tab", { name: "Updates", exact: true })).toHaveAttribute("aria-selected", "true");
+        await settings.getByRole("button", { name: "Update CloudX and dependencies", exact: true }).click();
+        await expect.poll(() => starts).toEqual([{ channel: "main", targetCommit }]);
+        expect(errors).toEqual([]);
+        await page.close();
+      }
+    } finally { await browser.close(); }
+  }
 
   async close() {
     for (const unit of [this.webUnit, this.brokerUnit]) {

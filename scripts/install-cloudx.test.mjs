@@ -712,6 +712,7 @@ describe("install-cloudx helpers", () => {
     });
     expect(service).toContain("Type=notify\nNotifyAccess=all");
     expect(service).toContain("WorkingDirectory=/repo");
+    expect(service).toContain("ConditionPathExists=/repo/apps/server/dist/terminal/broker.js");
     expect(service).toContain("EnvironmentFile=/home/me/.config/cloudx/cloudx.env");
     expect(service).toContain("ExecStart=/usr/bin/node /repo/apps/server/dist/terminal/broker.js");
     expect(service).not.toMatch(/PartOf=|BindsTo=|KillMode=/);

@@ -9,6 +9,7 @@ import { SettingsUpdater } from "./settings-update.mjs";
 import { verifySnapshot } from "./managed-update-store.mjs";
 import { UpdateHost } from "./managed-update.mjs";
 import { verifyHistoricalTerminals } from "./managed-update-readiness.mjs";
+import { MISSING_SETTINGS_FILES } from "./managed-update-settings-integration.mjs";
 
 const coordinator = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 const roots = [];
@@ -18,7 +19,7 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const release = fixture();
   const head = git(release, ["rev-parse", "HEAD"]);
   const integration = prepareManagedIntegration(release, coordinator);
-  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file => file !== "apps/server/src/server.ts"), independentReadiness: true });
+  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file => !MISSING_SETTINGS_FILES.includes(file)), independentReadiness: true });
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
 });
@@ -33,6 +34,43 @@ it("selects the supervised readiness probe before execution bindings were suppor
   expect(fs.readFileSync(path.join(release, "apps/server/src/terminal/TerminalProcess.ts"), "utf8"))
     .toBe(legacyTerminalContract());
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
+});
+
+it("selects direct supervision for the actual pre-broker terminal contract", () => {
+  const contract = git(coordinator, ["show", "224a75ef7b3efced05b2c6b3b136250d9a532dc3:apps/server/src/terminal/TerminalProcess.ts"]);
+  const release = fixture(undefined, undefined, contract);
+  expect(prepareManagedIntegration(release, coordinator)).toMatchObject({ independentReadiness: true, terminalMode: "direct" });
+  expect(fs.readFileSync(path.join(release, "apps/server/src/terminal/TerminalReadiness.ts")))
+    .toEqual(fs.readFileSync(path.join(coordinator, "scripts/managed-update-readiness-legacy.ts")));
+});
+
+it("rejects an inconsistent broker module beside the direct-only terminal contract", () => {
+  const contract = git(coordinator, ["show", "224a75ef7b3efced05b2c6b3b136250d9a532dc3:apps/server/src/terminal/TerminalProcess.ts"]);
+  const release = fixture(undefined, undefined, contract);
+  fs.writeFileSync(path.join(release, "apps/server/src/terminal/DurableTerminalProcess.ts"), "unexpected broker contract");
+  git(release, ["add", "."]);
+  git(release, ["commit", "-m", "TEST: inconsistent broker contract"]);
+  expect(() => prepareManagedIntegration(release, coordinator)).toThrow("does not recognize the target terminal spawn contract");
+  expect(git(release, ["status", "--porcelain"])).toBe("");
+});
+
+it.each(MISSING_SETTINGS_FILES)("preserves local edits to the missing Settings integration file %s", relative => {
+  const release = directory();
+  git(release, ["init"]);
+  git(release, ["config", "user.name", "CloudX Test"]);
+  git(release, ["config", "user.email", "test@invalid"]);
+  for (const file of [...MISSING_SETTINGS_FILES, "apps/server/src/terminal/TerminalProcess.ts"]) {
+    const destination = path.join(release, file);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, git(coordinator, ["show", `224a75ef7b3efced05b2c6b3b136250d9a532dc3:${file}`]));
+  }
+  git(release, ["add", "."]);
+  git(release, ["commit", "-m", "TEST: Settings before updater support"]);
+  fs.appendFileSync(path.join(release, relative), "\n// operator edit\n");
+  expect(() => prepareManagedIntegration(release, coordinator)).toThrow(`conflicts with local changes to ${relative}`);
+  expect(fs.readFileSync(path.join(release, relative), "utf8")).toContain("operator edit");
+  expect(fs.existsSync(path.join(release, "apps/server/src/system/CloudxUpdateService.ts"))).toBe(false);
+  expect(git(release, ["status", "--porcelain"])).toBe(`M ${relative}`);
 });
 
 it.each([
@@ -119,15 +157,20 @@ it("bundles the maintained integration and lifecycle probe with the coordinator 
     .toEqual(fs.readFileSync(path.join(coordinator, "scripts/managed-update-readiness-legacy.ts")));
 });
 
-it.each(["command", "invalid JSON", "incomplete result"])("reports historical terminal %s failure before runtime attestation", failure => {
+it.each([
+  ["command", undefined], ["invalid JSON", undefined], ["incomplete result", undefined],
+  ["broker result for a direct target", "direct"], ["direct result for a broker target", undefined],
+])("reports historical terminal %s failure before runtime attestation", (failure, terminalMode) => {
   const host = Object.create(UpdateHost.prototype);
   Object.assign(host, { target: { kind: "web", origin: "https://127.0.0.1:3001" }, envConfig: {}, paths: { dataDir: coordinator },
     runner: { sleep() {}, capture() { return { status: 0, stdout: '{"status":"ready"}\n200', stderr: "" }; }, inspect(command) {
       if (command === "curl") return '{"status":"ready"}';
       if (failure === "command") throw new Error("private child diagnostic");
+      if (failure === "broker result for a direct target") return '{"broker":"ready","direct":"ready"}';
+      if (failure === "direct result for a broker target") return '{"broker":"not-applicable","direct":"ready"}';
       return failure === "invalid JSON" ? "invalid" : '{"broker":"ready"}';
     } } });
-  expect(() => host.verify({ coordinator, transition: { release: coordinator, integration: { independentReadiness: true } } }))
+  expect(() => host.verify({ coordinator, transition: { release: coordinator, integration: { independentReadiness: true, terminalMode } } }))
     .toThrow(expect.objectContaining({ component: "terminals", publicMessage: expect.stringContaining("supervisor or broker failure") }));
 });
 
