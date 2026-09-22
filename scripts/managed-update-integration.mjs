@@ -5,37 +5,56 @@ import { fileURLToPath } from "node:url";
 
 const SETTINGS_FILES = [
   "apps/server/src/system/CloudxUpdateService.ts",
+  "apps/server/src/system/CloudxUpdateCatalog.ts",
   "apps/server/src/system/CloudxUpdateRoutes.ts",
   "apps/server/src/system/RuntimeBuild.ts",
   "packages/shared/src/cloudxUpdate.ts",
   "apps/web/src/ui/CloudxUpdatePanel.tsx",
-  // Historical web builds typecheck the Settings fixture with its controller.
+  // Historical builds typecheck these fixtures with the maintained contracts.
+  "apps/server/src/system/CloudxUpdateService.test.ts",
+  "apps/server/src/system/CloudxUpdateRoutes.test.ts",
   "apps/web/src/ui/SettingsDialog.navigation.test.ts",
   "apps/web/src/cloudxUpdateApi.ts",
 ];
 const READINESS_FILE = "apps/server/src/terminal/TerminalReadiness.ts";
-export const MANAGED_INTEGRATION_FILES = [...SETTINGS_FILES, READINESS_FILE];
+const SERVER_FILE = "apps/server/src/server.ts";
+const LEGACY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start">';
+const MANAGED_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">';
+export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE];
+export const MANAGED_INTEGRATION_FILES = [...MANAGED_INTEGRATION_SOURCE_FILES, SERVER_FILE];
 
 // The updater remains maintained independently of the selected application.
 // Build these small integrations with the target's own dependencies and APIs.
 export function prepareManagedIntegration(release, coordinator = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")) {
   const files = [];
   const service = integrationPath(release, SETTINGS_FILES[0]);
+  const server = integrationPath(release, SERVER_FILE);
+  const serverSource = fs.existsSync(server) ? fs.readFileSync(server, "utf8") : "";
+  let migratedServer;
   if (fs.existsSync(service) && !fs.readFileSync(service, "utf8").includes("CLOUDX_UPDATE_COORDINATOR_ROOT")) {
     files.push(...SETTINGS_FILES);
+    if (serverSource.includes(LEGACY_SETTINGS_CONTRACT)) {
+      migratedServer = serverSource.replace(LEGACY_SETTINGS_CONTRACT, MANAGED_SETTINGS_CONTRACT);
+      files.push(SERVER_FILE);
+    } else if (!serverSource.includes(MANAGED_SETTINGS_CONTRACT)) {
+      throw new Error("Managed updater integration does not recognize the target server's Settings contract.");
+    }
   }
-  const server = integrationPath(release, "apps/server/src/server.ts");
-  const independentReadiness = fs.existsSync(server) && !fs.readFileSync(server, "utf8").includes("/api/ready/terminals");
+  const independentReadiness = fs.existsSync(server) && !serverSource.includes("/api/ready/terminals");
   if (independentReadiness) files.push(READINESS_FILE);
-  for (const relative of files) {
+  const changes = files.map(relative => {
     const destination = integrationPath(release, relative);
     // A migration must not hide an operator's edits to its integration files.
     const local = execFileSync("git", ["status", "--porcelain", "--", relative], { cwd: release, encoding: "utf8" });
     if (local.trim()) throw new Error(`Managed updater integration conflicts with local changes to ${relative}. Preserve those changes before resuming.`);
+    if (relative === SERVER_FILE) return { destination, content: migratedServer };
     const source = integrationPath(coordinator, relative);
     if (!fs.existsSync(source)) throw new Error(`Managed updater integration is missing: ${relative}`);
+    return { destination, content: fs.readFileSync(source) };
+  });
+  for (const { destination, content } of changes) {
     fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.copyFileSync(source, destination);
+    fs.writeFileSync(destination, content);
   }
   return { version: 1, files, independentReadiness };
 }

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { inspectDataCompatibility, inspectSnapshotCompatibility, inspectTargetRuntime } from './managed-update-data.mjs';
 import { MANAGED_INTEGRATION_FILES, prepareManagedIntegration } from './managed-update-integration.mjs';
 import { writeRuntimeBuild } from './write-runtime-build.mjs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { InstallerRunner, prepareManagedRelease, activateManagedServices, waitForHealth } from './install-cloudx.mjs';
 import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePort, SERVICE_NAMES } from './install-update.mjs';
 import { inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
@@ -17,6 +17,7 @@ import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDir
 
 const GENERATED = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/dist', 'apps/server/dist', 'apps/web/dist', 'services/asr/.venv', 'services/documentation-indexer/.venv'];
 const PHASES = ['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify'];
+const FORGE_WORKFLOW_FILE = `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`;
 export const CURRENT_TERMINAL_CONTRACT = { brokerProtocol: 1, supervisorContract: 'execution-json-v1', persistentSessions: true };
 const runtimeData = relative => /^(terminal-runtime|terminal-broker|terminal-recovery-[^/]+|terminal-upgrade-backup-[^/]+)(\/|$)/u.test(relative);
 
@@ -133,6 +134,8 @@ export class UpdateHost {
   prepare(record) {
     const transition = record.transition;
     const root = this.paths.repoRoot;
+    delete transition.sourceFiles;
+    delete transition.targetFiles;
     if (this.git(['rev-parse', '--show-toplevel']) !== root) throw new Error('Update requires the installed checkout root.');
     transition.sourceCommit = this.git(['rev-parse', 'HEAD']);
     transition.sourceIndex = this.git(['write-tree']);
@@ -169,6 +172,7 @@ export class UpdateHost {
     transition.environmentText = fs.readFileSync(this.paths.envPath, 'utf8');
     transition.serviceTarget = this.target;
     transition.serviceStates = Object.fromEntries(this.target.serviceNames.map(service => [service, this.runner.inspect('systemctl', ['--user', 'show', service, '--property=ActiveState,MainPID,InvocationID'])]));
+    transition.targetFiles = this.captureCheckout(transition.sourceCommit, record.targetCommit, release);
     transition.integration = prepareManagedIntegration(release, record.coordinator);
     this.prepareRelease({ releaseRoot: release, home: this.home, envConfig: this.envConfig, standard: this.target.kind === 'standard',
       progress: (component, message) => { record.run.component = component; record.run.message = message; this.save(record); } });
@@ -286,6 +290,7 @@ export class UpdateHost {
     t.replaced = [];
     t.activationIndex = undefined;
     t.failedData = [];
+    delete t.profileRestoration;
     t.snapshotVerified = true;
     this.save(record);
   }
@@ -295,8 +300,8 @@ export class UpdateHost {
     for (const [relative, manifest] of Object.entries(t.buildManifests)) verifySnapshot(path.join(t.release, relative), manifest);
     for (const snapshot of t.snapshots) verifySnapshot(snapshot.destination, snapshot.manifest);
     this.git(['update-ref', `refs/cloudx/updates/${record.run.id}`, t.sourceCommit]);
-    t.activationIntent = true;
     t.sourceFiles = this.captureCheckout(t.sourceCommit, record.targetCommit);
+    t.activationIntent = true;
     this.save(record);
     this.git(['read-tree', '-m', '-u', t.sourceCommit, record.targetCommit]);
     t.activationIndex = this.git(['write-tree']);
@@ -427,39 +432,51 @@ export class UpdateHost {
     return fs.readFileSync(file, 'utf8');
   }
 
-  captureCheckout(sourceCommit, targetCommit) {
+  captureCheckout(sourceCommit, targetCommit, root = this.paths.repoRoot) {
     const names = this.changedPaths(sourceCommit, targetCommit);
     return names.map(relative => {
-      const file = path.join(this.paths.repoRoot, relative);
-      const stat = optionalStat(file, this.paths.repoRoot);
+      const file = path.join(root, relative);
+      const stat = optionalStat(file, root);
       if (stat && !stat.isFile() && !stat.isSymbolicLink() && !stat.isDirectory()) throw new Error('Checkout transition includes an unsupported file boundary.');
       return { relative, mode: stat?.mode, type: !stat ? 'absent' : stat.isDirectory() ? 'directory' : stat.isSymbolicLink() ? 'link' : 'file',
         content: stat?.isSymbolicLink() ? fs.readlinkSync(file) : stat?.isFile() ? fs.readFileSync(file).toString('base64') : undefined };
     });
   }
 
-  restoreCheckout(record) {
+  assertCheckoutRestorable(record) {
     const t = record.transition;
     const head = this.git(['rev-parse', 'HEAD']);
     if (![t.sourceCommit, record.targetCommit].includes(head)) throw new Error('Checkout changed externally; restoration stopped to preserve local work.');
-    if (!t.activationIntent) return;
-    // Validate each changed path against either prepared or original bytes before
-    // replacing anything. A fresh local edit is a conflict, never disposable.
+    if (!t.activationIntent) return head;
+    if (!Array.isArray(t.sourceFiles) || !Array.isArray(t.targetFiles) || t.sourceFiles.length !== t.targetFiles.length ||
+        t.sourceFiles.some((entry, index) => entry.relative !== t.targetFiles[index].relative))
+      throw publicFailure('checkout', 'The saved expected checkout is incomplete. Keep the recovery directory and restore its checkout evidence before resuming.');
+    const targets = new Map(t.targetFiles.map(entry => [entry.relative, entry]));
+    // Build integration changes live only in the release, never in this checkout.
     for (const entry of t.sourceFiles) {
       const file = path.join(this.paths.repoRoot, entry.relative);
       const stat = optionalStat(file, this.paths.repoRoot);
       if (!stat) continue;
+      const expected = [entry, targets.get(entry.relative)];
       if (stat.isDirectory()) {
-        if (!containsOnlyRecoveryPaths(file, entry.relative, new Set(t.sourceFiles.map(file => file.relative)))) throw new Error(`Checkout recovery conflict: ${entry.relative}`);
+        if (!expected.some(file => file.type === 'directory') ||
+            !containsOnlyRecoveryPaths(file, entry.relative, new Set(t.sourceFiles.map(file => file.relative)))) throw new Error(`Checkout recovery conflict: ${entry.relative}`);
         continue;
       }
       if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error(`Checkout recovery conflict: ${entry.relative}`);
+      const type = stat.isSymbolicLink() ? 'link' : 'file';
       const actual = stat.isSymbolicLink() ? fs.readlinkSync(file) : fs.readFileSync(file).toString('base64');
-      const prepared = path.join(t.release, entry.relative);
-      const target = optionalStat(prepared, t.release);
-      const targetContent = target?.isSymbolicLink() ? fs.readlinkSync(prepared) : target?.isFile() ? fs.readFileSync(prepared).toString('base64') : undefined;
-      if (actual !== entry.content && actual !== targetContent) throw new Error(`Checkout recovery conflict: ${entry.relative}. Preserve the new local edit before resuming.`);
+      if (!expected.some(file => file.type === type && file.content === actual &&
+          (type === 'link' || (file.mode & 0o777) === (stat.mode & 0o777))))
+        throw new Error(`Checkout recovery conflict: ${entry.relative}. Preserve the new local edit before resuming.`);
     }
+    return head;
+  }
+
+  restoreCheckout(record) {
+    const t = record.transition;
+    const head = this.assertCheckoutRestorable(record);
+    if (!t.activationIntent) return;
     for (const entry of [...t.sourceFiles].sort((a, b) => b.relative.length - a.relative.length)) {
       const file = path.join(this.paths.repoRoot, entry.relative);
       const stat = optionalStat(file, this.paths.repoRoot);
@@ -509,34 +526,55 @@ export class UpdateHost {
   restore(record) {
     const t = record.transition;
     if (t.restored) { this.restartPrevious(t); return; }
-    if (t.targetStarted) {
+    const copyingProfile = t.snapshots?.some((snapshot, index) => snapshot.root === this.paths.dataDir && t.profileRestoration?.[index] === 'copying');
+    if (t.targetStarted && !copyingProfile) {
       try { assertTerminalMigrationSafe({ dataDir: this.paths.dataDir }); }
       catch (error) { throw publicFailure('forge', 'Forge work became active after startup. Pause or finish it before resuming restoration; its ownership records were preserved.', error); }
     }
     this.stopWriters();
-    if (t.targetStarted) {
+    if (t.targetStarted && !copyingProfile) {
       try { assertTerminalMigrationSafe({ dataDir: this.paths.dataDir }); }
       catch (error) { throw publicFailure('forge', 'Forge ownership changed while services stopped. Recover the worker before resuming restoration; its records were preserved.', error); }
     }
     this.stopStartedBroker(t);
+    this.assertCheckoutRestorable(record);
     if (t.snapshotVerified) {
       for (const snapshot of t.snapshots) verifySnapshot(snapshot.destination, snapshot.manifest);
       if (t.targetStarted || t.restoreData && t.activationIntent) {
-        for (const snapshot of t.snapshots) {
-          if (snapshot.root === this.paths.dataDir && JSON.stringify(forgeRecords(snapshot.destination)) !== JSON.stringify(forgeRecords(snapshot.root)))
-            throw publicFailure('forge', 'Forge ownership or publication records changed after the recovery snapshot. Restoration stopped to prevent repeating published work; the current profile and runtime remain intact. Preserve these records before resuming recovery.');
+        for (const [index, snapshot] of t.snapshots.entries()) {
+          if (snapshot.root !== this.paths.dataDir) continue;
+          const copying = t.profileRestoration?.[index] === 'copying';
+          const expected = forgeRecords(snapshot.destination);
+          const current = forgeRecords(snapshot.root, copying ? new Set(snapshot.manifest.filter(entry => entry.type === 'file').map(entry => entry.path)) : undefined);
+          const changed = copying ? Object.entries(current).some(([file, state]) => state !== expected[file]) : JSON.stringify(expected) !== JSON.stringify(current);
+          if (changed) throw publicFailure('forge', 'Forge ownership or publication records changed after the recovery snapshot. Restoration stopped to prevent repeating published work; the current profile and runtime remain intact. Preserve these records before resuming recovery.');
         }
         // Preserve post-activation bytes before restoring the coherent old profile.
         t.failedData ??= [];
+        t.profileRestoration ??= [];
         for (const [index, snapshot] of t.snapshots.entries()) {
-          const newer = path.join(this.runDir, `failed-data-${index}-${randomUUID()}`);
-          const manifest = snapshotTree(snapshot.root, newer, { exclude: runtimeData });
-          if (t.failedData[index]) t.retainedFailedData = [...(t.retainedFailedData ?? []), t.failedData[index]];
-          t.failedData[index] = { destination: newer, manifest };
-          this.save(record);
-          verifySnapshot(newer, manifest);
+          if (!t.profileRestoration[index]) {
+            const newer = path.join(this.runDir, `failed-data-${index}-${randomUUID()}`);
+            const manifest = snapshotTree(snapshot.root, newer, { exclude: runtimeData });
+            verifySnapshot(newer, manifest);
+            if (t.failedData[index]) t.retainedFailedData = [...(t.retainedFailedData ?? []), t.failedData[index]];
+            t.failedData[index] = { destination: newer, manifest };
+            t.profileRestoration[index] = 'copying';
+            this.save(record);
+          }
+          const newer = t.failedData[index];
+          verifySnapshot(newer.destination, newer.manifest);
+          if (t.profileRestoration[index] === 'restored') {
+            // Forge ownership was checked above; disposal may refresh updatedAt.
+            const manifest = snapshot.root === this.paths.dataDir ? snapshot.manifest.filter(entry => entry.path !== FORGE_WORKFLOW_FILE) : snapshot.manifest;
+            verifySnapshot(snapshot.root, manifest);
+            continue;
+          }
           clearProfile(snapshot.root);
           restoreSnapshot(snapshot.destination, snapshot.root, snapshot.manifest);
+          verifySnapshot(snapshot.root, snapshot.manifest);
+          t.profileRestoration[index] = 'restored';
+          this.save(record);
         }
       }
       for (const { installed, previous, existed } of [...t.replaced].reverse()) {
@@ -561,6 +599,7 @@ export class UpdateHost {
     t.snapshotVerified = false;
     t.retainedFailedData = [...(t.retainedFailedData ?? []), ...(t.failedData ?? [])];
     t.failedData = undefined;
+    delete t.profileRestoration;
     t.replaced = [];
     this.save(record);
     this.restartPrevious(t);
@@ -594,7 +633,7 @@ function failureCause(error, component) {
   return `${component} failed${Number.isInteger(error.status) ? ` with exit status ${error.status}` : error.code ? ` (${error.code})` : ''}. The private log contains the underlying command error.`;
 }
 
-function forgeRecords(root) {
+function forgeRecords(root, restoringFiles = new Set()) {
   const records = {};
   function inspect(relative) {
     const full = path.join(root, relative);
@@ -602,7 +641,22 @@ function forgeRecords(root) {
     if (!stat) return;
     if (stat.isSymbolicLink()) throw new Error('Forge ownership recovery cannot follow symlinks.');
     if (stat.isDirectory()) for (const name of fs.readdirSync(full).sort()) inspect(path.join(relative, name));
-    else if (stat.isFile() && relative.endsWith('.json')) records[relative] = hashFile(full);
+    else if (stat.isFile()) {
+      const restoring = /^(.*\.json)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.restore$/u.exec(relative);
+      if (restoring && restoringFiles.has(restoring[1])) return;
+      if (!relative.endsWith('.json')) throw new Error('Forge ownership state contains an unsupported file.');
+      if (relative !== FORGE_WORKFLOW_FILE) { records[relative] = hashFile(full); return; }
+      const workers = JSON.parse(fs.readFileSync(full, 'utf8'));
+      if (!Array.isArray(workers)) throw new Error('Invalid saved Forge worker list.');
+      records[relative] = JSON.stringify(workers.map(worker => {
+        // ForgeWorkflowService.persist refreshes this metadata on load and disposal.
+        // Publication, retry and completion timestamps remain part of the comparison.
+        if (!['paused', 'awaiting_review', 'stopped', 'completed', 'failed'].includes(worker?.status) ||
+            typeof worker.updatedAt !== 'string' || !Number.isFinite(Date.parse(worker.updatedAt))) return worker;
+        const { updatedAt, ...ownership } = worker;
+        return ownership;
+      }));
+    }
     else throw new Error('Forge ownership state contains an unsupported file.');
   }
   const pluginData = path.join(root, 'plugin-data');
@@ -659,6 +713,13 @@ export function validateSavedTransition(record, runDir) {
       throw new Error('Saved recovery data does not belong to its update.');
   };
   validateSnapshots(t.snapshots ?? [], runDir);
+  if (t.profileRestoration !== undefined && (!Array.isArray(t.profileRestoration) || !t.snapshotVerified ||
+      t.profileRestoration.length && (t.mutating !== true || t.restored === true || !(t.targetStarted === true || t.restoreData && t.activationIntent === true)) ||
+      t.profileRestoration.length > (t.snapshots?.length ?? 0) || t.profileRestoration.some((state, index) =>
+        !['copying', 'restored'].includes(state) || !t.failedData?.[index] ||
+        !canonicalPath(t.failedData[index].destination) || !inside(runDir, t.failedData[index].destination) ||
+        t.failedData[index].destination === runDir || !Array.isArray(t.failedData[index].manifest))))
+    throw new Error('Invalid saved profile restoration progress.');
   if (t.restoreData !== undefined) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.restoreSnapshotRunId ?? '') || record.restoreSnapshotRunId === record.run.id)
       throw new Error('Invalid saved restoration snapshot selection.');
@@ -676,10 +737,16 @@ export function validateSavedTransition(record, runDir) {
   const configFiles = [record.envPath ?? path.join(record.home, '.config/cloudx/cloudx.env'), ...expectedServices.map(name => path.join(record.home, '.config/systemd/user', name))];
   if (t.configuration !== undefined && !Array.isArray(t.configuration)) throw new Error('Invalid saved service configuration.');
   for (const config of t.configuration ?? []) if (!config || !configFiles.includes(config.file) || config.content !== null && typeof config.content !== 'string') throw new Error('Invalid saved service configuration.');
-  if (t.sourceFiles !== undefined && !Array.isArray(t.sourceFiles)) throw new Error('Invalid saved checkout recovery path.');
-  for (const file of t.sourceFiles ?? []) if (!file || typeof file.relative !== 'string' || !file.relative || file.relative.includes('\0') || path.isAbsolute(file.relative) ||
-      file.relative.split(/[\\/]/).some(part => ['.', '..', '', '.git'].includes(part)) || !['absent', 'directory', 'file', 'link'].includes(file.type))
-    throw new Error('Invalid saved checkout recovery path.');
+  for (const files of [t.sourceFiles, t.targetFiles]) {
+    if (files === undefined) continue;
+    if (!Array.isArray(files) || new Set(files.map(file => file?.relative)).size !== files.length) throw new Error('Invalid saved checkout recovery path.');
+    for (const file of files) if (!file || typeof file.relative !== 'string' || !file.relative || file.relative.includes('\0') || path.isAbsolute(file.relative) ||
+        file.relative.split(/[\\/]/).some(part => ['.', '..', '', '.git'].includes(part)) || !['absent', 'directory', 'file', 'link'].includes(file.type) ||
+        file.type !== 'absent' && !Number.isInteger(file.mode) || ['file', 'link'].includes(file.type) && typeof file.content !== 'string')
+      throw new Error('Invalid saved checkout recovery path.');
+  }
+  if (t.sourceFiles && t.targetFiles && (t.sourceFiles.length !== t.targetFiles.length ||
+      t.sourceFiles.some((file, index) => file.relative !== t.targetFiles[index].relative))) throw new Error('Saved checkout recovery paths do not match the expected target.');
 }
 
 export async function runManagedUpdate(recordPath) {

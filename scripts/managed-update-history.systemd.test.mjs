@@ -12,12 +12,12 @@ import { ManagedUpdate, UpdateHost } from "./managed-update.mjs";
 import { writeUpdateJson } from "./managed-update-store.mjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const historicalTarget = "26d8291b89309acb59fdea1cbe09234d41d0164f";
+const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65"];
 const supportedHost = process.platform === "linux"
   && fs.readFileSync("/etc/os-release", "utf8").includes("ID=ubuntu")
   && spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 5000 }).status === 0;
 
-it.skipIf(!supportedHost)("activates the real historical server and broker without a terminal readiness endpoint under isolated systemd units", async () => {
+it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and its broker under isolated systemd units", async historicalTarget => {
   const fixture = await HistoricalInstallation.create();
   try {
     await fixture.waitUntilReady();

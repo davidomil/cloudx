@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, expect, it } from "vitest";
-import { MANAGED_INTEGRATION_FILES, prepareManagedIntegration } from "./managed-update-integration.mjs";
+import { MANAGED_INTEGRATION_FILES, MANAGED_INTEGRATION_SOURCE_FILES, prepareManagedIntegration } from "./managed-update-integration.mjs";
 import { SettingsUpdater } from "./settings-update.mjs";
 import { verifySnapshot } from "./managed-update-store.mjs";
 import { UpdateHost } from "./managed-update.mjs";
@@ -18,9 +18,33 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const release = fixture();
   const head = git(release, ["rev-parse", "HEAD"]);
   const integration = prepareManagedIntegration(release, coordinator);
-  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES, independentReadiness: true });
+  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_SOURCE_FILES, independentReadiness: true });
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
+});
+
+it("upgrades the pre-channel server contract while preserving its unrelated source", () => {
+  const release = fixture("historical Settings", 'const historicalBehavior = true;\nupdates?: Pick<CloudxUpdateService, "status" | "start">;');
+  const integration = prepareManagedIntegration(release, coordinator);
+  expect(integration.files).toContain("apps/server/src/server.ts");
+  expect(integration.files).toContain("apps/server/src/system/CloudxUpdateCatalog.ts");
+  expect(fs.readFileSync(path.join(release, "apps/server/src/server.ts"), "utf8"))
+    .toBe('const historicalBehavior = true;\nupdates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;');
+});
+
+it("checks the entire migration before overwriting files when the legacy server has local edits", () => {
+  const release = fixture("historical Settings", 'updates?: Pick<CloudxUpdateService, "status" | "start">;');
+  const server = path.join(release, "apps/server/src/server.ts");
+  fs.appendFileSync(server, "\nlocal edit\n");
+  expect(() => prepareManagedIntegration(release, coordinator)).toThrow("conflicts with local changes to apps/server/src/server.ts");
+  expect(fs.readFileSync(server, "utf8")).toContain("local edit");
+  expect(fs.readFileSync(path.join(release, MANAGED_INTEGRATION_FILES[0]), "utf8")).toBe("historical Settings");
+});
+
+it("rejects an unknown server contract before changing its integration", () => {
+  const release = fixture("historical Settings", "unknown Settings contract");
+  expect(() => prepareManagedIntegration(release, coordinator)).toThrow("does not recognize the target server's Settings contract");
+  expect(git(release, ["status", "--porcelain"])).toBe("");
 });
 
 it("keeps a target's native managed integration and readiness when it supports those contracts", () => {
@@ -58,14 +82,18 @@ it("bundles the maintained integration and lifecycle probe with the coordinator 
   updater.stage(record);
   const manifest = JSON.parse(fs.readFileSync(path.join(record.coordinator, "bundle.json"), "utf8"));
   expect(() => verifySnapshot(record.coordinator, manifest)).not.toThrow();
-  expect(manifest.map(entry => entry.path)).toEqual(expect.arrayContaining([...MANAGED_INTEGRATION_FILES,
+  expect(manifest.map(entry => entry.path)).toEqual(expect.arrayContaining([...MANAGED_INTEGRATION_SOURCE_FILES,
     "scripts/managed-update-integration.mjs", "scripts/managed-update-readiness.mjs"]));
+  expect(manifest.map(entry => entry.path)).not.toContain("apps/server/src/server.ts");
   const next = { run: { id: "22222222-2222-4222-8222-222222222222" } };
   const { SettingsUpdater: RetainedUpdater } = await import(pathToFileURL(path.join(record.coordinator, "scripts/settings-update.mjs")));
   new RetainedUpdater({ repoRoot: coordinator, home }).stage(next);
   const nextManifest = JSON.parse(fs.readFileSync(path.join(next.coordinator, "bundle.json"), "utf8"));
   expect(() => verifySnapshot(next.coordinator, nextManifest)).not.toThrow();
   expect(next.coordinator).not.toBe(record.coordinator);
+  const { prepareManagedIntegration: retainedIntegration } = await import(pathToFileURL(path.join(next.coordinator, "scripts/managed-update-integration.mjs")));
+  const release = fixture("historical Settings", 'updates?: Pick<CloudxUpdateService, "status" | "start">;');
+  expect(retainedIntegration(release).files).toContain("apps/server/src/server.ts");
 });
 
 it.each(["command", "invalid JSON", "incomplete result"])("reports historical terminal %s failure before runtime attestation", failure => {
@@ -95,7 +123,7 @@ function directory() {
 function git(root, args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
-function fixture(service = "historical Settings", server = "/api/ready") {
+function fixture(service = "historical Settings", server = 'updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;\n/api/ready') {
   const root = directory();
   git(root, ["init"]);
   git(root, ["config", "user.name", "CloudX Test"]);
