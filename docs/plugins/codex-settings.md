@@ -19,6 +19,37 @@ settings, and session overrides may take precedence.
 
 Settings affect future launches.
 
+## Update Codex CLI
+
+The **Codex CLI** section shows the installed version. Select **Update Codex**
+to check npm and install the release tagged `latest`. Progress moves through
+checking, installation, and executable verification. CloudX reports success
+only after `--version` succeeds, or **already current** when the verified
+installation matches the release.
+
+The server keeps the update running when Settings closes or the browser
+disconnects. Reopening Settings shows the same job and its retained result.
+Updating preserves unsaved settings edits, running Codex and terminal sessions,
+conversations, authentication, and configuration. Newly launched Codex processes
+use the updated executable. Explicitly closing the entire Settings dialog still
+discards its unsaved draft, as before.
+
+The button updates the npm-owned executable configured for the running server,
+including its custom npm prefix. Custom wrappers and PATH-only commands require
+their own installer or an absolute npm `CLOUDX_ASSISTANT_BIN`. A shared
+installation lock prevents simultaneous writes by Settings and the CLI installer.
+Updates require CloudX's bundled Linux process supervisor and Python 3.9 or newer
+on the service PATH so detached installer processes are stopped before unlocking.
+
+Failures show an actionable message and the usable installed version when it
+can be verified. Raw command output stays in the private, bounded
+`codex-update/update.log` under the CloudX data directory. See
+[setup and troubleshooting](../SETUP.md#update-codex-from-settings) for
+installation requirements and interrupted-update recovery.
+
+**Update Codex** does not restart CloudX. A full CloudX update still installs
+its pinned Codex version and can replace a newer Codex-only update.
+
 ## Use it
 
 1.  Open **Settings**, then **Codex**.

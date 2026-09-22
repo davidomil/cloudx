@@ -27,6 +27,7 @@ type HookHandler = (hook: string, input: Record<string, unknown>) => CodexGlobal
 async function mount(settings = initial, handler?: HookHandler, strict = false) {
   const calls: { hook: string; input: Record<string, unknown> }[] = [];
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
+    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
     calls.push({ hook, input });
     const result = handler ? await handler(hook, input) : settings;
     return { settings: result } as unknown as T;
@@ -356,7 +357,8 @@ describe("global Codex settings editor", () => {
     await act(async () => { root.render(createElement(CodexSettingsPanel, { editor, callHook: nextCallHook })); });
     expect(model(container).value).toBe("unsaved-model");
     expect(calls).toHaveLength(1);
-    expect(nextCallHook).not.toHaveBeenCalled();
+    expect(nextCallHook).toHaveBeenCalledWith("codex-update.read", {});
+    expect(nextCallHook).not.toHaveBeenCalledWith("codex-settings.read", {});
   });
 
   it("ignores a late load after the tab owner disposes the editor", async () => {
@@ -477,7 +479,8 @@ describe("global Codex settings editor", () => {
     const first = deferred<CodexGlobalSettings>();
     const editor = new CodexSettingsEditor();
     let reads = 0;
-    const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>() => {
+    const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string) => {
+      if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
       const settings = ++reads === 1 ? await first.promise : { ...initial, model: "current-model" };
       return { settings } as unknown as T;
     };

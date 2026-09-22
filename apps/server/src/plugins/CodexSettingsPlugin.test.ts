@@ -9,6 +9,7 @@ import { HookRegistry } from "../hooks/HookRegistry.js";
 import { readCodexLaunchPreferences, writeCodexLaunchPreferences } from "./CodexLaunchPreferences.js";
 import { CodexSettingsPlugin } from "./CodexSettingsPlugin.js";
 import { CodexSettingsService } from "./CodexSettingsService.js";
+import { CodexUpdateService } from "./CodexUpdateService.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 
@@ -451,7 +452,7 @@ describe("shared Codex settings", () => {
 describe("Codex settings plugin boundary", () => {
   async function pluginFixture() {
     const f = await fixture('model = "original-model"\n');
-    const plugin = new CodexSettingsPlugin(f.service);
+    const plugin = new CodexSettingsPlugin(f.service, new CodexUpdateService(f.dataDir));
     const hooks = new HookRegistry();
     plugin.hooks.forEach((hook) => hooks.register(hook));
     return { ...f, plugin, hooks };

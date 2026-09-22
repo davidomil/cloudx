@@ -31,6 +31,7 @@ async function mount(read: () => Promise<CodexGlobalSettings> = async () => init
   const calls: { hook: string; input: Record<string, unknown> }[] = [];
   const save = vi.fn(async () => {});
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
+    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
     calls.push({ hook, input });
     return { settings: await read() } as unknown as T;
   };
@@ -91,7 +92,7 @@ describe("Codex settings in the Settings window", () => {
     expect(calls).toHaveLength(readCount);
   });
 
-  it.each(["yolo", "trust workspace", "skills", "reasoning effort", "web search", "personality"])("finds Codex settings by %s", async query => {
+  it.each(["yolo", "trust workspace", "skills", "reasoning effort", "web search", "personality", "update codex", "installed version"])("finds Codex settings by %s", async query => {
     const { container } = await mount();
     await fill(container, "Search settings", query);
     expect(container.querySelector(codexTab)?.getAttribute("aria-selected")).toBe("true");

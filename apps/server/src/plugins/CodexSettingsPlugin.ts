@@ -7,6 +7,7 @@ import {
 import type { CodexGlobalSettingsUpdate } from "@cloudx/shared";
 
 import type { CodexSettingsService } from "./CodexSettingsService.js";
+import type { CodexUpdateService } from "./CodexUpdateService.js";
 
 export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly id = "codex-settings";
@@ -20,7 +21,7 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly actions = [];
   readonly hooks: HookDefinition[];
 
-  constructor(settings: CodexSettingsService) {
+  constructor(settings: CodexSettingsService, updates: CodexUpdateService) {
     this.hooks = [
       {
         id: "codex-settings.read",
@@ -56,6 +57,26 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
         execute: async (input, context) => ({ settings: await settings.update(input as unknown as CodexGlobalSettingsUpdate, context.signal) }),
       },
     ];
+    this.hooks.push(
+      {
+        id: "codex-update.read",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Read Codex CLI update status",
+        description: "Read the installed version and retained Codex update result.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => ({ update: await updates.read() }),
+      },
+      {
+        id: "codex-update.start",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Update Codex CLI",
+        description: "Install and verify the latest Codex npm release without restarting CloudX or running sessions.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => ({ update: await updates.start() }),
+      },
+    );
   }
 
   descriptor() { return descriptorFromPlugin(this); }

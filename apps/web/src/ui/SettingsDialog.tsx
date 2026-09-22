@@ -158,7 +158,7 @@ export function SettingsDialog({
     description: "Global defaults shared by Codex sessions.",
     entries: [{
       id: "global-defaults",
-      searchText: "Default model Fast mode service tier priority standard flex shared settings reload YOLO mode sandbox approval permissions automatically trust workspace default Codex skills imagegen reasoning effort web search personality",
+      searchText: "Update Codex CLI installed version latest release Default model Fast mode service tier priority standard flex shared settings reload YOLO mode sandbox approval permissions automatically trust workspace default Codex skills imagegen reasoning effort web search personality",
       content: <CodexSettingsPanel editor={codexSettingsEditor} callHook={callHook} />,
       mountWhenVisible: true
     }]
