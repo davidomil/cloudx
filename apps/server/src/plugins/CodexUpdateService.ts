@@ -41,8 +41,10 @@ export class CodexUpdateService {
   }
 
   async start(): Promise<CodexUpdateStatus> {
-    await this.initialize();
-    if (this.readingVersion) {
+    const initialization = this.initialize();
+    const waitingForVersion = !!this.readingVersion;
+    await initialization;
+    if (waitingForVersion || this.readingVersion) {
       await this.readingVersion;
       if (this.verificationBlocked) return { ...this.state };
     }

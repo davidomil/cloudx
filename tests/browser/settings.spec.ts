@@ -807,6 +807,63 @@ test("Codex update retains a rejected start's permissions guidance after unchang
   expect(starts).toEqual([{ input: {} }]);
 });
 
+test("Codex update keeps unreadable-status guidance visible through polling and reconnect", async ({
+  page,
+  isMobile,
+}) => {
+  const message =
+    "Saved Codex update status could not be read. Check the local codex-update/status.json file before updating.";
+  const starts: unknown[] = [];
+  let connected = true;
+  let readable = false;
+  let reads = 0;
+  let disconnectedReads = 0;
+  await page.route("**/api/hooks/codex-update.read", async (route) => {
+    reads += 1;
+    if (!connected) {
+      disconnectedReads += 1;
+      await route.abort("connectionfailed");
+    } else if (!readable) {
+      await route.fulfill({ status: 500, json: { message } });
+    } else {
+      await route.fulfill({ json: { result: { update: installedCodex } } });
+    }
+  });
+  await page.route("**/api/hooks/codex-update.start", async (route) => {
+    starts.push(route.request().postDataJSON());
+    await route.fulfill({ status: 500, json: { message } });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  const button = control.getByRole("button", {
+    name: "Update Codex",
+    exact: true,
+  });
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  await expect(control).toContainText(message);
+  await expect(button).toBeDisabled();
+  await model.fill("unsaved-read-refusal-draft");
+  await expect.poll(() => reads).toBeGreaterThanOrEqual(3);
+  await expect(control).toContainText(message);
+  connected = false;
+  await expect.poll(() => disconnectedReads).toBeGreaterThanOrEqual(1);
+  await expect(control).toContainText(message);
+  await expect(button).toBeDisabled();
+  const readsBeforeReconnect = reads;
+  connected = true;
+  await expect.poll(() => reads).toBeGreaterThan(readsBeforeReconnect);
+  await expect(control).toContainText(message);
+  await expect(button).toBeDisabled();
+  await expect(model).toHaveValue("unsaved-read-refusal-draft");
+  expect(starts).toEqual([]);
+  readable = true;
+  await expect(control).toContainText("Installed version: 1.0.0");
+  await expect(control).not.toContainText(message);
+  await expect(button).toBeEnabled();
+  expect(starts).toEqual([]);
+});
+
 test("Codex update displays already-current and actionable failure results on narrow screens", async ({
   page,
   isMobile,

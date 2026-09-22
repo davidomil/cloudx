@@ -123,6 +123,17 @@ function commands(fixture) {
     .map(JSON.parse);
 }
 
+function replaceSupervisorInterpreter(fixture, source) {
+  const interpreter = path.join(fixture.root, "tools/python3");
+  const python = fs.readlinkSync(interpreter);
+  fs.unlinkSync(interpreter);
+  fs.writeFileSync(interpreter, `#!${python}\n${source}\n`, { mode: 0o755 });
+  return () => {
+    fs.unlinkSync(interpreter);
+    fs.symlinkSync(python, interpreter);
+  };
+}
+
 describe("shared Codex update", () => {
   it("updates the selected npm prefix and verifies the resulting executable", async () => {
     const fixture = installation();
@@ -487,6 +498,121 @@ describe("shared Codex update", () => {
       fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
     ).toBe(false);
   });
+
+  it.each([
+    ["Python is older than 3.9", "sys.version_info = (3, 8, 20)"],
+    [
+      "subreaper registration fails",
+      "ctypes.CDLL = lambda *args, **kwargs: types.SimpleNamespace(prctl=rejected)",
+    ],
+    [
+      "kernel child enumeration is unavailable",
+      "pathlib.Path.read_text = missing_children",
+    ],
+  ])(
+    "releases the lock after a startup rejection and permits a repaired retry: %s",
+    async (_reason, rejectRequirement) => {
+      const fixture = installation();
+      const repair = replaceSupervisorInterpreter(
+        fixture,
+        `
+import ctypes, os, pathlib, runpy, sys, types
+def rejected(*args):
+    ctypes.set_errno(1)
+    return -1
+def missing_children(*args, **kwargs):
+    raise FileNotFoundError('Private kernel child enumeration diagnostic')
+pathlib.Path(os.environ['TEST_OWNER']).write_text(sys.argv[4])
+${rejectRequirement}
+sys.argv = sys.argv[3:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+`,
+      );
+      try {
+        await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+          code: "supervision-unavailable",
+          message: expect.stringContaining("Python 3.9 or newer"),
+          usableVersion: null,
+        });
+        expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+        expect(fs.existsSync(fixture.env.TEST_VERSION_LOG)).toBe(false);
+        expect(
+          fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
+        ).toBe(false);
+        expect(
+          fs.existsSync(fs.readFileSync(fixture.env.TEST_OWNER, "utf8")),
+        ).toBe(false);
+        repair();
+        await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({
+          outcome: "updated",
+          installedVersion: "1.1.0",
+        });
+      } finally {
+        fs.rmSync(fs.readFileSync(fixture.env.TEST_OWNER, "utf8"), {
+          recursive: true,
+          force: true,
+        });
+      }
+    },
+  );
+
+  it.each([
+    ["missing error receipt", "pass", "sys.exit(125)"],
+    [
+      "malformed error receipt",
+      "(directory / 'error.json').write_text('{')",
+      "sys.exit(125)",
+    ],
+    [
+      "different supervisor",
+      "write('error', {'pid': os.getpid() + 1, 'message': 'private diagnostic'})",
+      "sys.exit(125)",
+    ],
+    [
+      "failure after readiness",
+      "write('ready', {'pid': os.getpid()}); write('error', error)",
+      "sys.exit(125)",
+    ],
+    [
+      "unexpected supervisor death",
+      "write('error', error)",
+      "os.kill(os.getpid(), signal.SIGKILL)",
+    ],
+  ])(
+    "retains the installation lock when startup rejection is unproven: %s",
+    async (_reason, receipts, exit) => {
+      const fixture = installation();
+      replaceSupervisorInterpreter(
+        fixture,
+        `
+import json, os, pathlib, signal, sys
+directory = pathlib.Path(sys.argv[4])
+pathlib.Path(os.environ['TEST_OWNER']).write_text(str(directory))
+def write(name, value):
+    (directory / (name + '.json')).write_text(json.dumps(value))
+error = {'pid': os.getpid(), 'message': 'private diagnostic'}
+${receipts}
+${exit}
+`,
+      );
+      try {
+        await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+          code: "cleanup-incomplete",
+          message: expect.not.stringContaining("private diagnostic"),
+        });
+        expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(
+          /Another CloudX installer/,
+        );
+        expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+        expect(fs.existsSync(fixture.env.TEST_VERSION_LOG)).toBe(false);
+      } finally {
+        fs.rmSync(fs.readFileSync(fixture.env.TEST_OWNER, "utf8"), {
+          recursive: true,
+          force: true,
+        });
+      }
+    },
+  );
 
   it("rejects relative and empty destinations", () => {
     for (const prefix of ["", "relative"])

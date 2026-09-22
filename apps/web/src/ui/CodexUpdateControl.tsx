@@ -19,6 +19,10 @@ const safeStartRejections = new Set([
   "Codex updates are unavailable while CloudX is stopping.",
   "Start Codex updates from a trusted CloudX browser origin.",
 ]);
+const safeReadRejections = new Set([
+  "Saved Codex update status could not be read. Check the local codex-update/status.json file before updating.",
+  "Codex update status could not be saved. Check CloudX data directory permissions.",
+]);
 
 export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
   const [view, setView] = useState<UpdateView>({ blocked: true });
@@ -32,6 +36,7 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
     let blocked = true;
     let update: CodexUpdateStatus | undefined;
     let startRejection: { jobId: CodexUpdateStatus["jobId"]; message: string } | undefined;
+    let readRejection: string | undefined;
     setView({ blocked });
 
     async function read() {
@@ -41,14 +46,16 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
         const status = parseCodexUpdateStatus(result.update);
         if (!disposed && requestRevision === revision && !submitting) {
           if (status.jobId !== startRejection?.jobId) startRejection = undefined;
+          readRejection = undefined;
           update = status;
           blocked = false;
           setView({ update, blocked, notice: startRejection?.message });
         }
-      } catch {
+      } catch (error) {
         if (!disposed && requestRevision === revision && !submitting) {
+          if (error instanceof HttpError && safeReadRejections.has(error.message)) readRejection = error.message;
           blocked = true;
-          setView({ update, blocked, notice: "Cannot read Codex update status. Checking the connection before another update can start." });
+          setView({ update, blocked, notice: readRejection ?? "Cannot read Codex update status. Checking the connection before another update can start." });
         }
       } finally {
         if (!disposed) timer = setTimeout(() => { void read(); }, 1_000);

@@ -207,6 +207,71 @@ describe("Codex CLI update in Settings", () => {
     expect(panel.starts).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "Saved Codex update status could not be read. Check the local codex-update/status.json file before updating.",
+    "Codex update status could not be saved. Check CloudX data directory permissions.",
+  ])("keeps a safe initial read refusal visible through polling and reconnect until status is readable (%s)", async message => {
+    let connected = true;
+    let readable = false;
+    const panel = await mount(async () => {
+      if (!connected) throw new Error("offline");
+      if (!readable) throw new HttpError(500, message);
+      return installed;
+    });
+    await act(async () => panel.editor.setModel("unsaved-model"));
+    expect(panel.container.textContent).toContain(message);
+    expect(panel.updateButton().disabled).toBe(true);
+    await poll();
+    await poll();
+    expect(panel.reads).toHaveBeenCalledTimes(3);
+    expect(panel.container.textContent).toContain(message);
+    connected = false;
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    expect(panel.container.textContent).not.toContain("offline");
+    expect(panel.updateButton().disabled).toBe(true);
+    connected = true;
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    await act(async () => panel.updateButton().click());
+    expect(panel.updateButton().disabled).toBe(true);
+    expect(panel.starts).not.toHaveBeenCalled();
+    expect(panel.model().value).toBe("unsaved-model");
+    readable = true;
+    await poll();
+    expect(panel.container.textContent).toContain("Installed version: 1.0.0");
+    expect(panel.container.textContent).not.toContain(message);
+    expect(panel.updateButton().disabled).toBe(false);
+    expect(panel.starts).not.toHaveBeenCalled();
+    connected = false;
+    await poll();
+    expect(panel.container.textContent).toContain("Cannot read Codex update status");
+    expect(panel.container.textContent).not.toContain(message);
+  });
+
+  it("disables updates after a safe read refusal while retaining the last known installed version", async () => {
+    const message = "Saved Codex update status could not be read. Check the local codex-update/status.json file before updating.";
+    const panel = await mount();
+    panel.reads.mockRejectedValue(new HttpError(500, message));
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    expect(panel.container.textContent).toContain("Installed version: 1.0.0");
+    expect(panel.updateButton().disabled).toBe(true);
+    await act(async () => panel.updateButton().click());
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    expect(panel.starts).not.toHaveBeenCalled();
+  });
+
+  it.each([new Error("secret private status path"), new HttpError(500, "secret private status path")])("keeps unknown read failures generic and updates disabled (%s)", async error => {
+    const panel = await mount(async () => { throw error; });
+    await poll();
+    expect(panel.container.textContent).toContain("Cannot read Codex update status");
+    expect(panel.container.textContent).not.toContain("secret private status path");
+    expect(panel.updateButton().disabled).toBe(true);
+    expect(panel.starts).not.toHaveBeenCalled();
+  });
+
   it("reads the server job after remount and ignores a late start response from the old panel", async () => {
     let status = installed;
     const response = deferred<CodexUpdateStatus>();

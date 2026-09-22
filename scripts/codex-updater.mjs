@@ -209,6 +209,26 @@ function completedCommand(directory, pid) {
   throw incompleteCleanupError();
 }
 
+function supervisorRejectedBeforeLaunch(directory, pid) {
+  try {
+    const receipts = fs.readdirSync(directory);
+    // The helper writes ready before forking. An error after readiness cannot
+    // establish whether the command or any of its descendants remain alive.
+    if (receipts.includes("ready.json") || receipts.includes("complete.json"))
+      return false;
+    const error = JSON.parse(
+      fs.readFileSync(path.join(directory, "error.json"), "utf8"),
+    );
+    return (
+      error?.pid === pid &&
+      typeof error.message === "string" &&
+      error.message.length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
 function runCommand(
   command,
   args,
@@ -343,10 +363,18 @@ function runCommand(
     child.on("error", () => {
       failure ??= supervisionUnavailable();
     });
-    child.on("close", () => {
+    child.on("close", (code, signal) => {
       if (settled) return;
       if (!child.pid) {
         settle(failure ?? supervisionUnavailable());
+        return;
+      }
+      if (
+        code === 125 &&
+        !signal &&
+        supervisorRejectedBeforeLaunch(directory, child.pid)
+      ) {
+        settle(supervisionUnavailable());
         return;
       }
       let result;
