@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -26,7 +26,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true })));
 });
 
-async function installation(options: { current?: boolean; failure?: string; gated?: boolean; noisy?: boolean } = {}) {
+async function installation(options: { current?: boolean; failure?: string; gated?: boolean; noisy?: boolean; detachedWriter?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-update-server-"));
   roots.push(root);
   const dataDir = path.join(root, "data");
@@ -38,6 +38,8 @@ async function installation(options: { current?: boolean; failure?: string; gate
   const commandLog = path.join(root, "commands.jsonl");
   const releaseFile = path.join(root, "release-install");
   const npmPid = path.join(root, "npm.pid");
+  const writerPid = path.join(root, "writer.pid");
+  const writerLog = path.join(root, "writer.log");
   await Promise.all([home, tools, path.join(prefix, "bin"), path.join(packageDir, "bin")].map(dir => fs.mkdir(dir, { recursive: true })));
   await fs.writeFile(commandLog, "");
   await fs.writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@openai/codex", version: "1.0.0", bin: { codex: "bin/codex.js" } }));
@@ -59,6 +61,7 @@ if (process.argv[2] === 'session') {
 `, { mode: 0o755 });
   await fs.symlink("../lib/node_modules/@openai/codex/bin/codex.js", executable);
   await fs.symlink(process.execPath, path.join(tools, "node"));
+  await fs.symlink(execFileSync("python3", ["-I", "-S", "-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim(), path.join(tools, "python3"));
   await fs.writeFile(path.join(tools, "npm"), `#!${process.execPath}
 const fs = require('node:fs');
 const path = require('node:path');
@@ -73,6 +76,12 @@ if (args[0] === 'view') {
   console.log(JSON.stringify(process.env.CLOUDX_TEST_LATEST));
 } else if (args[0] === 'i') {
   fs.writeFileSync(process.env.CLOUDX_TEST_NPM_PID, String(process.pid));
+  if (process.env.CLOUDX_TEST_DETACHED_WRITER === 'true') {
+    const child = require('node:child_process').spawn(process.execPath, ['-e',
+      "const fs = require('node:fs'); fs.writeFileSync(process.env.CLOUDX_TEST_WRITER_PID, String(process.pid)); setInterval(() => fs.appendFileSync(process.env.CLOUDX_TEST_WRITER_LOG, 'write'), 10);"
+    ], { detached: true, stdio: 'ignore' });
+    child.unref();
+  }
   const install = () => {
     if (process.env.CLOUDX_TEST_NOISY === 'true') fs.writeSync(1, 'synthetic-private-package-output'.repeat(20000));
     if (failure === 'permissions' || failure === 'install') {
@@ -103,6 +112,7 @@ if (args[0] === 'view') {
     CLOUDX_TEST_COMMAND_LOG: commandLog, CLOUDX_TEST_LATEST: options.current ? "1.0.0" : "1.1.0",
     CLOUDX_TEST_FAILURE: options.failure, CLOUDX_TEST_GATE: String(options.gated ?? false),
     CLOUDX_TEST_NOISY: String(options.noisy ?? false), CLOUDX_TEST_RELEASE: releaseFile, CLOUDX_TEST_NPM_PID: npmPid,
+    CLOUDX_TEST_DETACHED_WRITER: String(options.detachedWriter ?? false), CLOUDX_TEST_WRITER_PID: writerPid, CLOUDX_TEST_WRITER_LOG: writerLog,
   };
   const service = (name = "data", serviceOptions: ConstructorParameters<typeof CodexUpdateService>[2] = {}) => {
     const updates = new CodexUpdateService(path.join(root, name), env, serviceOptions);
@@ -115,7 +125,7 @@ if (args[0] === 'view') {
     expect(Number(await fs.readFile(npmPid, "utf8"))).toBeGreaterThan(0);
   }, { timeout: 10_000 });
   const release = () => fs.writeFile(releaseFile, "continue");
-  return { root, home, dataDir, prefix, tools, packageDir, executable, commandLog, npmPid, env, service, commands, waitForInstall, release };
+  return { root, home, dataDir, prefix, tools, packageDir, executable, commandLog, npmPid, writerPid, writerLog, env, service, commands, waitForInstall, release };
 }
 
 async function finished(updates: Pick<CodexUpdateService, "read">): Promise<CodexUpdateStatus> {
@@ -125,6 +135,18 @@ async function finished(updates: Pick<CodexUpdateService, "read">): Promise<Code
     expect(["succeeded", "failed"]).toContain(status.phase);
   }, { timeout: 10_000 });
   return status!;
+}
+
+async function holdExpiredVersionProbe(updates: CodexUpdateService) {
+  await updates.read();
+  let resolve!: (version: string) => void;
+  let reject!: (error: Error) => void;
+  const pending = new Promise<string>((accept, fail) => { resolve = accept; reject = fail; });
+  const readVersion = vi.spyOn(codexUpdater, "readCodexVersion").mockReturnValueOnce(pending);
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 31_000);
+  const reading = updates.read();
+  await vi.waitFor(() => expect(readVersion).toHaveBeenCalledTimes(1));
+  return { reading, resolve, reject, readVersion };
 }
 
 async function stop(child: ChildProcess) {
@@ -251,6 +273,69 @@ describe("server-owned Codex updates", () => {
     expect(await f.commands()).toEqual([]);
   });
 
+  it("keeps cleanup blocked when an update was requested before an outstanding version probe failed", async () => {
+    const f = await installation();
+    const updates = f.service();
+    const probe = await holdExpiredVersionProbe(updates);
+    const failure = new codexUpdater.CodexUpdateError("cleanup-incomplete", "Codex subprocess cleanup could not be confirmed. Inspect remaining processes before continuing.");
+    let finishUpdate!: (result: Awaited<ReturnType<typeof codexUpdater.updateCodexInstallation>>) => void;
+    const update = vi.spyOn(codexUpdater, "updateCodexInstallation").mockReturnValue(new Promise(resolve => { finishUpdate = resolve; }));
+    const starts = Promise.all([updates.start(), updates.start()]);
+    await Promise.resolve();
+    const updatesDuringProbe = update.mock.calls.length;
+
+    probe.reject(failure);
+    const failed = await probe.reading;
+    const requested = await starts;
+    finishUpdate({ installedVersion: "1.1.0", previousVersion: "1.0.0", outcome: "updated" });
+    await updates.dispose();
+
+    expect(updatesDuringProbe).toBe(0);
+    expect(update).not.toHaveBeenCalled();
+    expect(failed).toMatchObject({ phase: "failed", outcome: null, installedVersion: null, message: failure.message });
+    expect(requested).toEqual([failed, failed]);
+    expect(await updates.read()).toEqual(failed);
+    expect(JSON.parse(await fs.readFile(path.join(f.dataDir, "codex-update/status.json"), "utf8"))).toMatchObject({ verificationBlocked: true, update: failed });
+    expect(await f.service().read()).toEqual(failed);
+    expect(probe.readVersion).toHaveBeenCalledTimes(1);
+    expect(await f.commands()).toEqual([]);
+  });
+
+  it("admits only one update after the outstanding version probe finishes", async () => {
+    const f = await installation({ gated: true });
+    const updates = f.service();
+    const probe = await holdExpiredVersionProbe(updates);
+    const update = vi.spyOn(codexUpdater, "updateCodexInstallation");
+    const starts = Promise.all([updates.start(), updates.start(), updates.start()]);
+    await Promise.resolve();
+    const updatesDuringProbe = update.mock.calls.length;
+    probe.resolve("1.0.0");
+    const started = await starts;
+    await probe.reading;
+    await f.waitForInstall();
+    await f.release();
+
+    expect(updatesDuringProbe).toBe(0);
+    expect(new Set(started.map(status => status.jobId)).size).toBe(1);
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a pending update when CloudX stops during the version probe", async () => {
+    const f = await installation();
+    const updates = f.service();
+    const probe = await holdExpiredVersionProbe(updates);
+    const update = vi.spyOn(codexUpdater, "updateCodexInstallation");
+    const starting = updates.start();
+    await Promise.resolve();
+    const stopping = updates.dispose();
+    probe.resolve("1.0.0");
+    await expect(starting).rejects.toThrow(/stopping/i);
+    await Promise.all([stopping, probe.reading]);
+    expect(update).not.toHaveBeenCalled();
+    expect(await f.commands()).toEqual([]);
+  });
+
   it.each(["invalid JSON", "oversized"])("rejects %s persisted status without starting npm or exposing its contents", async corruption => {
     const f = await installation();
     const statusPath = path.join(f.dataDir, "codex-update/status.json");
@@ -262,6 +347,21 @@ describe("server-owned Codex updates", () => {
     await expect(updates.read()).rejects.not.toThrow(/synthetic-private/);
     expect(await fs.readFile(statusPath, "utf8")).toBe(content);
     expect(await f.commands()).toEqual([]);
+  });
+
+  it("rejects an unsavable start with permissions guidance and retains idle status without starting npm", async () => {
+    const f = await installation();
+    const updates = f.service();
+    const idle = await updates.read();
+    await fs.mkdir(f.dataDir, { recursive: true });
+    const statusDirectory = path.join(f.dataDir, "codex-update");
+    await fs.writeFile(statusDirectory, "blocked status storage");
+    await expect(updates.start()).rejects.toThrow("Codex update status could not be saved. Check CloudX data directory permissions.");
+    expect(await updates.read()).toEqual(idle);
+    expect(await f.commands()).toEqual([]);
+    await fs.unlink(statusDirectory);
+    await updates.start();
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
   });
 
   it.each([
@@ -374,15 +474,24 @@ describe("server-owned Codex updates", () => {
     expect(await fs.readFile(status, "utf8")).not.toContain("synthetic-private");
   });
 
-  it.each(["shutdown", "deadline"])("stops its npm child and releases the installation lock on %s", async reason => {
-    const f = await installation({ gated: true });
+  it.each([
+    ["shutdown", false], ["deadline", false], ["shutdown", true], ["deadline", true],
+  ] as const)("stops npm and releases the lock on %s (detached writer: %s)", async (reason, detachedWriter) => {
+    const f = await installation({ gated: true, detachedWriter });
     const updates = f.service("data", reason === "deadline" ? { maxDurationMs: 1000 } : {});
     await updates.start();
     await f.waitForInstall();
     const pid = Number(await fs.readFile(f.npmPid, "utf8"));
+    let writerPid: number | undefined;
+    if (detachedWriter) {
+      await vi.waitFor(async () => expect((await fs.readFile(f.writerLog, "utf8")).length).toBeGreaterThan(0));
+      writerPid = Number(await fs.readFile(f.writerPid, "utf8"));
+    }
     if (reason === "shutdown") await updates.dispose();
     else expect(await finished(updates)).toMatchObject({ phase: "failed", message: expect.stringMatching(/time|deadline/i) });
     expect(() => process.kill(pid, 0)).toThrow();
+    if (writerPid !== undefined) expect(() => process.kill(writerPid, 0)).toThrow();
+    f.env.CLOUDX_TEST_DETACHED_WRITER = "false";
     await f.release();
     const next = f.service("after-shutdown");
     await next.start();

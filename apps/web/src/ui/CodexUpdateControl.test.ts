@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexGlobalSettings, CodexUpdateStatus } from "@cloudx/shared";
 
+import { HttpError } from "../api.js";
 import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { CodexSettingsEditor } from "./CodexSettingsEditor.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
@@ -121,15 +122,64 @@ describe("Codex CLI update in Settings", () => {
     expect(panel.updateButton().disabled).toBe(false);
   });
 
-  it("reconciles a lost start response without retrying the update or exposing transport errors", async () => {
+  it.each([new Error("secret private npm log"), new HttpError(500, "secret private npm log")])("reconciles an indeterminate start without retrying the update or exposing private errors (%s)", async error => {
     let status = installed;
-    const panel = await mount(async () => status, async () => { status = updating; throw new Error("secret private npm log"); });
+    const panel = await mount(async () => status, async () => { status = updating; throw error; });
     await act(async () => panel.updateButton().click());
     expect(panel.updateButton().disabled).toBe(true);
     expect(panel.container.textContent).toContain("Could not confirm the update request");
     expect(panel.container.textContent).not.toContain("secret private npm log");
     await poll();
     expect(panel.container.textContent).toContain(updating.message);
+    expect(panel.updateButton().disabled).toBe(true);
+    status = succeeded;
+    await poll();
+    expect(panel.container.textContent).toContain(succeeded.message);
+    expect(panel.starts).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a safe start rejection visible through unchanged idle reads and reconnect until an explicit retry", async () => {
+    const message = "Codex update status could not be saved. Check CloudX data directory permissions.";
+    let connected = true;
+    const panel = await mount(async () => {
+      if (!connected) throw new Error("offline");
+      return installed;
+    }, async () => { throw new HttpError(500, message); });
+    await act(async () => panel.editor.setModel("unsaved-model"));
+    await act(async () => panel.updateButton().click());
+    expect(panel.container.textContent).toContain(message);
+    expect(panel.updateButton().disabled).toBe(true);
+    await poll();
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    expect(panel.container.textContent).not.toContain(installed.message);
+    expect(panel.updateButton().disabled).toBe(false);
+    expect(panel.model().value).toBe("unsaved-model");
+    expect(panel.starts).toHaveBeenCalledTimes(1);
+    connected = false;
+    await poll();
+    expect(panel.container.textContent).toContain("Cannot read Codex update status");
+    connected = true;
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    panel.starts.mockResolvedValueOnce(updating);
+    await act(async () => panel.updateButton().click());
+    expect(panel.container.textContent).toContain(updating.message);
+    expect(panel.container.textContent).not.toContain(message);
+    expect(panel.starts).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces a retained start rejection when a new server job appears", async () => {
+    const message = "Codex update status could not be saved. Check CloudX data directory permissions.";
+    let status = installed;
+    const panel = await mount(async () => status, async () => { throw new HttpError(500, message); });
+    await act(async () => panel.updateButton().click());
+    await poll();
+    expect(panel.container.textContent).toContain(message);
+    status = updating;
+    await poll();
+    expect(panel.container.textContent).toContain(updating.message);
+    expect(panel.container.textContent).not.toContain(message);
     expect(panel.updateButton().disabled).toBe(true);
     status = succeeded;
     await poll();

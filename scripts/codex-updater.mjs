@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const UPDATE_TIMEOUT_MS = 180_000;
@@ -177,6 +179,36 @@ function incompleteCleanupError() {
   );
 }
 
+function supervisionUnavailable() {
+  return new CodexUpdateError(
+    "supervision-unavailable",
+    "Codex updates require Linux process supervision, Python 3.9 or newer on the service PATH, and the bundled terminal-supervisor.py helper. Repair these CloudX prerequisites before updating.",
+  );
+}
+
+function completedCommand(directory, pid) {
+  try {
+    const receipt = JSON.parse(
+      fs.readFileSync(path.join(directory, "complete.json"), "utf8"),
+    );
+    if (
+      receipt?.pid === pid &&
+      Number.isInteger(receipt.exitCode) &&
+      receipt.exitCode >= 0 &&
+      receipt.exitCode <= 255 &&
+      (receipt.signal === undefined ||
+        (receipt.exitCode === 0 &&
+          Number.isInteger(receipt.signal) &&
+          receipt.signal > 0 &&
+          receipt.signal <= 64))
+    )
+      return receipt;
+  } catch {
+    /* Only the owner's completion receipt proves all descendants were reaped. */
+  }
+  throw incompleteCleanupError();
+}
+
 function runCommand(
   command,
   args,
@@ -198,15 +230,37 @@ function runCommand(
       );
       return;
     }
-    const child = spawn(command, args, {
-      env,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const helper = fileURLToPath(
+      new URL("../apps/server/helpers/terminal-supervisor.py", import.meta.url),
+    );
+    if (process.platform !== "linux" || !fs.existsSync(helper)) {
+      reject(supervisionUnavailable());
+      return;
+    }
+    const directory = fs.mkdtempSync(
+      path.join(os.tmpdir(), "cloudx-codex-command-"),
+    );
+    const child = spawn(
+      "python3",
+      [
+        "-I",
+        "-S",
+        helper,
+        directory,
+        String(process.pid),
+        "null",
+        command,
+        ...args,
+      ],
+      {
+        env,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     let stdout = "";
     let stderr = "";
     let failure;
-    let killTimer;
     let cleanupTimer;
     let stopping = false;
     let settled = false;
@@ -214,27 +268,24 @@ function runCommand(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      clearTimeout(killTimer);
       clearTimeout(cleanupTimer);
       signal?.removeEventListener("abort", cancel);
+      if (error?.code !== "cleanup-incomplete") {
+        try {
+          fs.rmSync(directory, { recursive: true, force: true });
+        } catch {
+          error ??= filesystemError();
+        }
+      }
       if (error) reject(error);
       else resolve(result);
-    };
-    const killGroup = (signalName) => {
-      if (!child.pid) return true;
-      try {
-        process.kill(-child.pid, signalName);
-        return true;
-      } catch (error) {
-        return error.code === "ESRCH";
-      }
     };
     const stop = (error) => {
       if (stopping || settled) return;
       stopping = true;
       failure ??= error;
-      killGroup("SIGTERM");
-      killTimer = setTimeout(() => killGroup("SIGKILL"), 250);
+      // Keep the subreaper alive to adopt and reap detached descendants.
+      child.kill("SIGTERM");
       cleanupTimer = setTimeout(() => {
         child.stdout.destroy();
         child.stderr.destroy();
@@ -289,18 +340,35 @@ function runCommand(
     };
     child.stdout.on("data", (chunk) => collect(chunk, false));
     child.stderr.on("data", (chunk) => collect(chunk, true));
-    child.on("error", (error) => {
-      failure ??= commandFailure(error, stderr, command);
+    child.on("error", () => {
+      failure ??= supervisionUnavailable();
     });
-    child.on("close", (code) => {
+    child.on("close", () => {
       if (settled) return;
-      if (!killGroup("SIGKILL")) {
-        settle(incompleteCleanupError());
+      if (!child.pid) {
+        settle(failure ?? supervisionUnavailable());
         return;
       }
+      let result;
+      try {
+        result = completedCommand(directory, child.pid);
+      } catch (error) {
+        settle(error);
+        return;
+      }
+      const launchError =
+        result.exitCode === 127 &&
+        /Terminal command failed to start: \[Errno 2\]/.test(stderr)
+          ? { code: "ENOENT" }
+          : result.exitCode === 127 &&
+              /Terminal command failed to start: \[Errno 13\]/.test(stderr)
+            ? { code: "EACCES" }
+            : undefined;
       settle(
         failure ??
-          (code !== 0 ? commandFailure(undefined, stderr, command) : undefined),
+          (result.exitCode !== 0 || result.signal
+            ? commandFailure(launchError, stderr, command)
+            : undefined),
         stdout.trim(),
       );
     });
@@ -335,6 +403,7 @@ export async function readCodexVersion(
         "output-limit",
         "log-unavailable",
         "cleanup-incomplete",
+        "supervision-unavailable",
       ].includes(error.code)
     )
       throw error;
@@ -387,6 +456,7 @@ export async function updateCodexInstallation({
           "output-limit",
           "log-unavailable",
           "cleanup-incomplete",
+          "supervision-unavailable",
         ].includes(error.code)
       )
         throw error;

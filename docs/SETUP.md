@@ -225,6 +225,11 @@ including a custom npm prefix. Custom wrappers and relative or PATH-only command
 are unsupported because the login shell used for sessions can resolve a different
 executable. Configure the absolute npm executable or use the wrapper's installer.
 
+Codex updates use CloudX's bundled Linux process supervisor and require Python
+3.9 or newer on the service PATH. The supervisor reaps detached descendants,
+including processes with closed output streams, before an update releases its
+installation lock.
+
 Errors identify unavailable npm, registry/network problems, prefix permissions,
 installation failure, or failed verification. Settings shows the currently usable
 version when it can verify one. Raw output stays in the private
@@ -258,7 +263,8 @@ Preview the commands without changing the system:
 ./install.sh --update-codex --dry-run
 ```
 
-This mode requires existing Node.js and npm. It updates the npm prefix containing
+This mode requires Linux, existing Node.js and npm, Python 3.9 or newer on PATH,
+and CloudX's bundled process supervisor. It updates the npm prefix containing
 the saved `CLOUDX_ASSISTANT_BIN` executable, or uses `CLOUDX_NPM_GLOBAL_DIR` from
 the saved configuration or environment when no executable is saved. The default
 prefix is `~/.local/share/cloudx/npm-global`. Custom assistant wrappers and

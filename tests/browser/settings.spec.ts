@@ -774,6 +774,39 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   expect(current.tabs).toEqual(original.tabs);
 });
 
+test("Codex update retains a rejected start's permissions guidance after unchanged idle polling", async ({
+  page,
+  isMobile,
+}) => {
+  const message =
+    "Codex update status could not be saved. Check CloudX data directory permissions.";
+  const starts: unknown[] = [];
+  let idleReadsAfterRejection = 0;
+  await page.route("**/api/hooks/codex-update.read", async (route) => {
+    if (starts.length) idleReadsAfterRejection += 1;
+    await route.fulfill({ json: { result: { update: installedCodex } } });
+  });
+  await page.route("**/api/hooks/codex-update.start", async (route) => {
+    starts.push(route.request().postDataJSON());
+    await route.fulfill({ status: 500, json: { message } });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  const button = control.getByRole("button", {
+    name: "Update Codex",
+    exact: true,
+  });
+  await expect(control).toContainText("Installed version: 1.0.0");
+  await button.click();
+  await expect(control).toContainText(message);
+  await expect.poll(() => idleReadsAfterRejection).toBeGreaterThanOrEqual(2);
+  await expect(button).toBeEnabled();
+  await expect(control).toContainText(message);
+  await expect(control).not.toContainText(installedCodex.message);
+  expect(starts).toEqual([{ input: {} }]);
+});
+
 test("Codex update displays already-current and actionable failure results on narrow screens", async ({
   page,
   isMobile,

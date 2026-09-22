@@ -42,6 +42,10 @@ export class CodexUpdateService {
 
   async start(): Promise<CodexUpdateStatus> {
     await this.initialize();
+    if (this.readingVersion) {
+      await this.readingVersion;
+      if (this.verificationBlocked) return { ...this.state };
+    }
     if (this.shutdown.signal.aborted) throw new Error("Codex updates are unavailable while CloudX is stopping.");
     if (this.active) return { ...this.state };
     const next: CodexUpdateStatus = {

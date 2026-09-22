@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { acquireCodexInstallationLock } from "./codex-updater.mjs";
 import {
@@ -203,6 +203,14 @@ describe("Codex-only CLI entrypoints", () => {
         }),
       );
       fs.symlinkSync(process.execPath, path.join(bin, "node"));
+      fs.symlinkSync(
+        execFileSync(
+          "python3",
+          ["-I", "-S", "-c", "import sys; print(sys.executable)"],
+          { encoding: "utf8" },
+        ).trim(),
+        path.join(bin, "python3"),
+      );
       fs.writeFileSync(
         path.join(bin, "npm"),
         `#!${process.execPath}\nconst fs = require('node:fs');

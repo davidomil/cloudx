@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acquireCodexInstallationLock,
   readCodexVersion,
@@ -11,6 +12,7 @@ import {
 
 const scratch = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const dir of scratch.splice(0))
     fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -29,6 +31,14 @@ function installation({ mode = "success", version = "1.0.0" } = {}) {
   fs.mkdirSync(path.join(packageDir, "bin"), { recursive: true });
   fs.mkdirSync(path.join(prefix, "bin"));
   fs.mkdirSync(path.join(root, "tools"));
+  fs.symlinkSync(
+    execFileSync(
+      "python3",
+      ["-I", "-S", "-c", "import sys; print(sys.executable)"],
+      { encoding: "utf8" },
+    ).trim(),
+    path.join(root, "tools/python3"),
+  );
   fs.writeFileSync(
     path.join(packageDir, "package.json"),
     JSON.stringify(manifest),
@@ -65,9 +75,18 @@ if (process.argv[2] === 'view') {
 } else if (mode === 'failure' || mode === 'permission') {
   console.error(mode === 'permission' ? 'EACCES SECRET-TOKEN' : 'unclassified error SECRET-TOKEN'); process.exit(1);
 } else if (mode === 'flood') process.stdout.write('x'.repeat(600000));
-else if (mode === 'timeout' || mode === 'cancel' || mode === 'escaped-child') {
-  const descendant = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'], {detached: mode === 'escaped-child', stdio:'inherit'});
+else if (['timeout', 'cancel', 'escaped-child', 'escaped-silent', 'lost-owner', 'stalled-owner'].includes(mode)) {
+  const descendant = spawn(process.execPath, ['-e', 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); setInterval(() => fs.appendFileSync(process.env.TEST_WRITES, "x"), 10)'], {detached: mode !== 'timeout' && mode !== 'cancel', stdio: mode === 'escaped-child' || mode === 'timeout' || mode === 'cancel' ? 'inherit' : 'ignore'});
   fs.writeFileSync(process.env.TEST_CHILD, String(descendant.pid));
+  if (mode.endsWith('owner')) {
+    fs.writeFileSync(process.env.TEST_OWNER, JSON.stringify({ pid: process.ppid, directory: fs.readFileSync('/proc/' + process.ppid + '/cmdline', 'utf8').split('\\0')[4] }));
+    const ready = setInterval(() => {
+      if (!fs.existsSync(process.env.TEST_WRITES)) return;
+      clearInterval(ready);
+      process.kill(process.ppid, mode === 'lost-owner' ? 'SIGKILL' : 'SIGSTOP');
+      if (mode === 'lost-owner') process.exit(0);
+    }, 10);
+  }
   process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);
 } else {
   const file = ${JSON.stringify(path.join(packageDir, "package.json"))};
@@ -89,6 +108,8 @@ else if (mode === 'timeout' || mode === 'cancel' || mode === 'escaped-child') {
       TEST_MODE: mode,
       TEST_LOG: path.join(root, "commands"),
       TEST_CHILD: path.join(root, "child"),
+      TEST_WRITES: path.join(root, "writes"),
+      TEST_OWNER: path.join(root, "owner"),
       TEST_VERSION_LOG: path.join(root, "versions"),
     },
   };
@@ -169,6 +190,36 @@ describe("shared Codex update", () => {
       code: "npm-unavailable",
       usableVersion: "1.0.0",
     });
+  });
+
+  it("reports npm executable permissions with the current usable version", async () => {
+    const fixture = installation();
+    fs.chmodSync(path.join(fixture.root, "tools/npm"), 0o600);
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+      code: "permission",
+      usableVersion: "1.0.0",
+    });
+  });
+
+  it("settles with a safe error when completed command receipts cannot be removed", async () => {
+    const fixture = installation();
+    const remove = fs.rmSync;
+    vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target).includes("cloudx-codex-command-")) {
+        remove(target, options);
+        throw Object.assign(new Error("EACCES private receipt path"), {
+          code: "EACCES",
+        });
+      }
+      return remove(target, options);
+    });
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+      code: "permission",
+      message: expect.not.stringContaining("private receipt path"),
+    });
+    expect(
+      fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
+    ).toBe(false);
   });
 
   it.each(["verification", "wrong-version"])(
@@ -294,7 +345,7 @@ describe("shared Codex update", () => {
     ).toBe(false);
   });
 
-  it("bounds the update and kills only its subprocess group before releasing the lock", async () => {
+  it("bounds the update and reaps only its descendants before releasing the lock", async () => {
     const fixture = installation({ mode: "timeout" });
     const start = Date.now();
     await expect(
@@ -314,7 +365,7 @@ describe("shared Codex update", () => {
   });
 
   it.each(["escaped-child", "version-escape"])(
-    "retains the lock when an escaped subprocess prevents confirmed cleanup: %s",
+    "reaps detached descendants before releasing the installation lock: %s",
     async (mode) => {
       const fixture = installation({ mode });
       const started = Date.now();
@@ -322,13 +373,74 @@ describe("shared Codex update", () => {
         await expect(
           updateCodexInstallation({ ...fixture, timeoutMs: 800 }),
         ).rejects.toMatchObject({
+          code: "timeout",
+          usableVersion: mode === "version-escape" ? null : "1.0.0",
+        });
+        expect(Date.now() - started).toBeLessThan(
+          mode === "version-escape" ? 7_000 : 4_000,
+        );
+        expect(
+          fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
+        ).toBe(false);
+        const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+        expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+      } finally {
+        stopEscapedFixture(fixture);
+      }
+    },
+    8_000,
+  );
+
+  it.each(["timeout", "shutdown"])(
+    "confirms a detached writer with closed streams stopped before unlocking after %s",
+    async (stop) => {
+      const fixture = installation({ mode: "escaped-silent" });
+      const controller = new AbortController();
+      const result = updateCodexInstallation({
+        ...fixture,
+        timeoutMs: stop === "timeout" ? 800 : 5_000,
+        signal: controller.signal,
+      }).catch((error) => error);
+      try {
+        await vi.waitFor(() =>
+          expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(0),
+        );
+        expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(
+          /Another CloudX installer/,
+        );
+        if (stop === "shutdown") controller.abort();
+        expect(await result).toMatchObject({
+          code: stop === "timeout" ? "timeout" : "cancelled",
+        });
+        const bytes = fs.statSync(fixture.env.TEST_WRITES).size;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(fs.statSync(fixture.env.TEST_WRITES).size).toBe(bytes);
+        const release = acquireCodexInstallationLock(fixture.prefix);
+        release();
+      } finally {
+        controller.abort();
+        await result;
+        stopEscapedFixture(fixture);
+      }
+    },
+  );
+
+  it.each(["lost-owner", "stalled-owner"])(
+    "retains the lock while cleanup is unconfirmed: %s",
+    async (mode) => {
+      const fixture = installation({ mode });
+      try {
+        await expect(
+          updateCodexInstallation({ ...fixture, timeoutMs: 800 }),
+        ).rejects.toMatchObject({
           code: "cleanup-incomplete",
           usableVersion: null,
         });
-        expect(Date.now() - started).toBeLessThan(4_000);
-        expect(
-          fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
-        ).toBe(true);
+        const bytes = fs.statSync(fixture.env.TEST_WRITES).size;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(
+          bytes,
+        );
         expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(
           /Another CloudX installer/,
         );
@@ -337,19 +449,43 @@ describe("shared Codex update", () => {
         );
       } finally {
         stopEscapedFixture(fixture);
+        const owner = JSON.parse(
+          fs.readFileSync(fixture.env.TEST_OWNER, "utf8"),
+        );
+        if (mode === "stalled-owner") {
+          process.kill(owner.pid, "SIGCONT");
+          await vi.waitFor(() =>
+            expect(fs.existsSync(`/proc/${owner.pid}`)).toBe(false),
+          );
+        }
+        fs.rmSync(owner.directory, { recursive: true, force: true });
       }
     },
   );
 
-  it("preserves incomplete cleanup errors from standalone version checks", async () => {
+  it("confirms detached descendant cleanup from standalone version checks", async () => {
     const fixture = installation({ mode: "version-escape" });
     try {
       await expect(
         readCodexVersion(fixture.assistantBin, { ...fixture, timeoutMs: 800 }),
-      ).rejects.toMatchObject({ code: "cleanup-incomplete" });
+      ).rejects.toMatchObject({ code: "timeout" });
+      const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+      expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
     } finally {
       stopEscapedFixture(fixture);
     }
+  });
+
+  it("reports missing process supervision before starting an installer", async () => {
+    const fixture = installation();
+    fs.unlinkSync(path.join(fixture.root, "tools/python3"));
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+      code: "supervision-unavailable",
+    });
+    expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+    expect(
+      fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
+    ).toBe(false);
   });
 
   it("rejects relative and empty destinations", () => {

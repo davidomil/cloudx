@@ -38,6 +38,8 @@ The button updates the npm-owned executable configured for the running server,
 including its custom npm prefix. Custom wrappers and PATH-only commands require
 their own installer or an absolute npm `CLOUDX_ASSISTANT_BIN`. A shared
 installation lock prevents simultaneous writes by Settings and the CLI installer.
+Updates require CloudX's bundled Linux process supervisor and Python 3.9 or newer
+on the service PATH so detached installer processes are stopped before unlocking.
 
 Failures show an actionable message and the usable installed version when it
 can be verified. Raw command output stays in the private, bounded

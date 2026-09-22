@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Download } from "lucide-react";
 import { parseCodexUpdateStatus, type CodexUpdateStatus } from "@cloudx/shared";
 
+import { HttpError } from "../api.js";
 import { ControlButton } from "./Control.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -13,6 +14,11 @@ interface UpdateView {
 }
 
 const activePhases = new Set<CodexUpdateStatus["phase"]>(["checking", "updating", "verifying"]);
+const safeStartRejections = new Set([
+  "Codex update status could not be saved. Check CloudX data directory permissions.",
+  "Codex updates are unavailable while CloudX is stopping.",
+  "Start Codex updates from a trusted CloudX browser origin.",
+]);
 
 export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
   const [view, setView] = useState<UpdateView>({ blocked: true });
@@ -25,6 +31,7 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
     let submitting = false;
     let blocked = true;
     let update: CodexUpdateStatus | undefined;
+    let startRejection: { jobId: CodexUpdateStatus["jobId"]; message: string } | undefined;
     setView({ blocked });
 
     async function read() {
@@ -33,9 +40,10 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
         const result = await callHook("codex-update.read", {});
         const status = parseCodexUpdateStatus(result.update);
         if (!disposed && requestRevision === revision && !submitting) {
+          if (status.jobId !== startRejection?.jobId) startRejection = undefined;
           update = status;
           blocked = false;
-          setView({ update, blocked });
+          setView({ update, blocked, notice: startRejection?.message });
         }
       } catch {
         if (!disposed && requestRevision === revision && !submitting) {
@@ -51,6 +59,7 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
       if (blocked || submitting || !update || activePhases.has(update.phase)) return;
       submitting = true;
       blocked = true;
+      startRejection = undefined;
       revision += 1;
       setView({ update, blocked, notice: "Starting Codex update…" });
       try {
@@ -61,8 +70,13 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
           blocked = false;
           setView({ update, blocked });
         }
-      } catch {
-        if (!disposed) setView({ update, blocked: true, notice: "Could not confirm the update request. Checking server status before another update can start." });
+      } catch (error) {
+        if (!disposed) {
+          if (error instanceof HttpError && safeStartRejections.has(error.message)) {
+            startRejection = { jobId: update.jobId, message: error.message };
+          }
+          setView({ update, blocked: true, notice: startRejection?.message ?? "Could not confirm the update request. Checking server status before another update can start." });
+        }
       } finally {
         revision += 1;
         submitting = false;
