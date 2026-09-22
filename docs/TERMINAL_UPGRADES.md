@@ -138,6 +138,18 @@ retains those newer bytes separately. If restoration itself stops,
 resolve its reported blocker and resume the same run. Avoid starting
 another transition or deleting its recovery data.
 
+Selected downgrade snapshots record copy progress before replacing
+active data. After a disk error or coordinator interruption, resolve the
+reported blocker and resume the same update. Recovery restores the
+previous profile before another activation attempt and still rejects
+changed Forge ownership or publication records.
+
+Checkout restoration writes each recovered file to a temporary file
+before atomically replacing its destination. Resume recognizes
+interrupted temporary writes while preserving conflicting operator
+edits. The saved source revision, index, generated runtime and
+configuration drive restoration together.
+
 Automatic restoration rechecks Forge ownership after stopping writers.
 If ownership or publication records changed since the snapshot,
 restoration stops with the current records and runtime files intact. A
@@ -183,12 +195,20 @@ factories. Standard services use the managed startup launcher to attest
 prepared artifacts. Historical custom web services receive runtime
 identity reporting through the retained update integration.
 
+Historical readiness selects the probe for the target’s terminal spawn
+contract. Targets before execution bindings use their factories’
+supervised process ownership and cleanup. Both broker and direct probes
+require the expected output, a successful exit and confirmed termination
+before readiness succeeds.
+
 Regression fixtures build the actual pinned base
-a9613fafdc0ed1765fcf72ea7d9f61de08c3914a and its predecessor
-26d8291b89309acb59fdea1cbe09234d41d0164f. They exercise supervised
-terminal creation and cleanup, existing-session attachment, original
-profile paths, saved update completion and initiation of the next
-update.
+a9613fafdc0ed1765fcf72ea7d9f61de08c3914a, its predecessor
+26d8291b89309acb59fdea1cbe09234d41d0164f, the target before Settings
+channel selection 643ad8eb1c0ebe12cf4e112d72265fbe53814b65, and the target
+before terminal execution bindings ad72433b2d6283811fad6bfe288748f2c24b0c5e.
+They exercise supervised terminal creation and cleanup, existing-session
+attachment, original profile paths, saved update completion and
+initiation of the next update.
 
 Historical integrations must compile against the selected target’s APIs.
 Schema checks recognize catalog and session contracts; arbitrary

@@ -291,6 +291,7 @@ export class UpdateHost {
     t.activationIndex = undefined;
     t.failedData = [];
     delete t.profileRestoration;
+    delete t.snapshotApplication;
     t.snapshotVerified = true;
     this.save(record);
   }
@@ -310,11 +311,19 @@ export class UpdateHost {
     t.codeActivated = true;
     this.save(record);
     if (t.restoreData) {
-      for (const snapshot of t.restoreData) {
+      t.snapshotApplication = [];
+      for (const [index, snapshot] of t.restoreData.entries()) {
         if (!t.snapshots.some(saved => saved.root === snapshot.root)) throw new Error('Restoration snapshot belongs to another data configuration.');
         verifySnapshot(snapshot.destination, snapshot.manifest);
+        if (snapshot.root === this.paths.dataDir && JSON.stringify(forgeRecords(snapshot.destination)) !== JSON.stringify(forgeRecords(snapshot.root)))
+          throw publicFailure('forge', 'Forge ownership or publication records changed since the selected snapshot. Snapshot application stopped to prevent repeating published work.');
+        t.snapshotApplication[index] = 'copying';
+        this.save(record);
         clearProfile(snapshot.root);
         restoreSnapshot(snapshot.destination, snapshot.root, snapshot.manifest);
+        verifySnapshot(snapshot.root, snapshot.manifest);
+        t.snapshotApplication[index] = 'applied';
+        this.save(record);
       }
     }
     for (const relative of t.artifacts) {
@@ -340,6 +349,7 @@ export class UpdateHost {
 
   start(record) {
     const t = record.transition;
+    delete t.snapshotApplication;
     const broker = t.runtimePlan.services.find(({ role }) => role === 'broker');
     if (broker) t.brokerStartup = {
       preservedInvocationId: broker.state.ActiveState === 'active' && !t.runtimePlan.stopServices.includes(broker.service) ? broker.state.InvocationID : null,
@@ -452,6 +462,17 @@ export class UpdateHost {
         t.sourceFiles.some((entry, index) => entry.relative !== t.targetFiles[index].relative))
       throw publicFailure('checkout', 'The saved expected checkout is incomplete. Keep the recovery directory and restore its checkout evidence before resuming.');
     const targets = new Map(t.targetFiles.map(entry => [entry.relative, entry]));
+    const recoveryPaths = new Set(t.sourceFiles.map(file => file.relative));
+    for (const entry of t.sourceFiles.filter(entry => entry.type === 'file' || entry.type === 'link')) {
+      const relative = checkoutTemporaryPath(entry.relative, record.run.id);
+      if (recoveryPaths.has(relative)) throw new Error(`Checkout recovery conflict: ${relative} is reserved by the source checkout.`);
+      const temporary = path.join(this.paths.repoRoot, relative);
+      const stat = optionalStat(temporary, this.paths.repoRoot);
+      if (!stat) continue;
+      if (t.checkoutRestoration !== 'copying' || !checkoutTemporaryMatches(temporary, stat, entry))
+        throw new Error(`Checkout recovery conflict: ${relative}. Preserve the unexpected temporary file before resuming.`);
+      recoveryPaths.add(relative);
+    }
     // Build integration changes live only in the release, never in this checkout.
     for (const entry of t.sourceFiles) {
       const file = path.join(this.paths.repoRoot, entry.relative);
@@ -460,7 +481,7 @@ export class UpdateHost {
       const expected = [entry, targets.get(entry.relative)];
       if (stat.isDirectory()) {
         if (!expected.some(file => file.type === 'directory') ||
-            !containsOnlyRecoveryPaths(file, entry.relative, new Set(t.sourceFiles.map(file => file.relative)))) throw new Error(`Checkout recovery conflict: ${entry.relative}`);
+            !containsOnlyRecoveryPaths(file, entry.relative, recoveryPaths)) throw new Error(`Checkout recovery conflict: ${entry.relative}`);
         continue;
       }
       if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error(`Checkout recovery conflict: ${entry.relative}`);
@@ -477,23 +498,34 @@ export class UpdateHost {
     const t = record.transition;
     const head = this.assertCheckoutRestorable(record);
     if (!t.activationIntent) return;
+    t.checkoutRestoration = 'copying';
+    this.save(record);
+    for (const entry of t.sourceFiles.filter(entry => entry.type === 'file' || entry.type === 'link')) {
+      const temporary = path.join(this.paths.repoRoot, checkoutTemporaryPath(entry.relative, record.run.id));
+      if (optionalStat(temporary, this.paths.repoRoot)) {
+        fs.unlinkSync(temporary);
+        syncDirectory(path.dirname(temporary));
+      }
+    }
     for (const entry of [...t.sourceFiles].sort((a, b) => b.relative.length - a.relative.length)) {
       const file = path.join(this.paths.repoRoot, entry.relative);
       const stat = optionalStat(file, this.paths.repoRoot);
       if (stat?.isDirectory()) { if (!fs.readdirSync(file).length) fs.rmdirSync(file); }
-      else if (stat) fs.unlinkSync(file);
+      else if (stat && !['file', 'link'].includes(entry.type)) fs.unlinkSync(file);
+      if (stat) syncDirectory(path.dirname(file));
     }
     for (const entry of [...t.sourceFiles].sort((a, b) => a.relative.length - b.relative.length)) {
       const file = path.join(this.paths.repoRoot, entry.relative);
       if (entry.type === 'absent') continue;
       fs.mkdirSync(path.dirname(file), { recursive: true });
       if (entry.type === 'directory') fs.mkdirSync(file, { recursive: true, mode: entry.mode & 0o777 });
-      else if (entry.type === 'link') fs.symlinkSync(entry.content, file);
-      else fs.writeFileSync(file, Buffer.from(entry.content, 'base64'), { mode: entry.mode & 0o777, flush: true });
+      else restoreCheckoutFile(file, entry, record.run.id);
       syncDirectory(path.dirname(file));
     }
     this.git(['read-tree', t.sourceIndex]);
     if (head !== t.sourceCommit) this.git(['update-ref', 'HEAD', t.sourceCommit, head]);
+    delete t.checkoutRestoration;
+    this.save(record);
   }
 
   stopWriters() {
@@ -543,9 +575,13 @@ export class UpdateHost {
       if (t.targetStarted || t.restoreData && t.activationIntent) {
         for (const [index, snapshot] of t.snapshots.entries()) {
           if (snapshot.root !== this.paths.dataDir) continue;
-          const copying = t.profileRestoration?.[index] === 'copying';
+          const applyingIndex = t.restoreData?.findIndex(selected => selected.root === snapshot.root);
+          const applying = !t.profileRestoration?.[index] && t.snapshotApplication?.[applyingIndex] === 'copying';
+          const copying = t.profileRestoration?.[index] === 'copying' || applying;
+          const copyingSnapshot = applying ? t.restoreData[applyingIndex] : snapshot;
+          if (applying) verifySnapshot(copyingSnapshot.destination, copyingSnapshot.manifest);
           const expected = forgeRecords(snapshot.destination);
-          const current = forgeRecords(snapshot.root, copying ? new Set(snapshot.manifest.filter(entry => entry.type === 'file').map(entry => entry.path)) : undefined);
+          const current = forgeRecords(snapshot.root, copying ? new Set(copyingSnapshot.manifest.filter(entry => entry.type === 'file').map(entry => entry.path)) : undefined);
           const changed = copying ? Object.entries(current).some(([file, state]) => state !== expected[file]) : JSON.stringify(expected) !== JSON.stringify(current);
           if (changed) throw publicFailure('forge', 'Forge ownership or publication records changed after the recovery snapshot. Restoration stopped to prevent repeating published work; the current profile and runtime remain intact. Preserve these records before resuming recovery.');
         }
@@ -600,6 +636,7 @@ export class UpdateHost {
     t.retainedFailedData = [...(t.retainedFailedData ?? []), ...(t.failedData ?? [])];
     t.failedData = undefined;
     delete t.profileRestoration;
+    delete t.snapshotApplication;
     t.replaced = [];
     this.save(record);
     this.restartPrevious(t);
@@ -617,6 +654,36 @@ function optionalStat(file, root) {
     if (!fs.lstatSync(parent, { throwIfNoEntry: false })?.isDirectory()) return undefined;
   }
   return fs.lstatSync(file, { throwIfNoEntry: false });
+}
+
+function checkoutTemporaryPath(file, runId) {
+  return path.join(path.dirname(file), `.cloudx-restore-${runId}-${createHash('sha256').update(path.basename(file)).digest('hex')}`);
+}
+
+function checkoutTemporaryMatches(file, stat, entry) {
+  if (entry.type === 'link') return stat.isSymbolicLink() && fs.readlinkSync(file) === entry.content;
+  if (!stat.isFile() || stat.nlink !== 1 || ![0o600, entry.mode & 0o777].includes(stat.mode & 0o777)) return false;
+  const expected = Buffer.from(entry.content, 'base64');
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const current = fs.fstatSync(fd);
+    return current.ino === stat.ino && current.dev === stat.dev && current.size <= expected.length &&
+      fs.readFileSync(fd).equals(expected.subarray(0, current.size));
+  } finally { fs.closeSync(fd); }
+}
+
+function restoreCheckoutFile(file, entry, runId) {
+  const temporary = checkoutTemporaryPath(file, runId);
+  if (entry.type === 'link') fs.symlinkSync(entry.content, temporary);
+  else {
+    const fd = fs.openSync(temporary, 'wx', 0o600);
+    try {
+      fs.writeFileSync(fd, Buffer.from(entry.content, 'base64'));
+      fs.fchmodSync(fd, entry.mode & 0o777);
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+  }
+  fs.renameSync(temporary, file);
 }
 
 function containsOnlyRecoveryPaths(directory, relative, paths) {
@@ -725,6 +792,12 @@ export function validateSavedTransition(record, runDir) {
       throw new Error('Invalid saved restoration snapshot selection.');
     validateSnapshots(t.restoreData, path.join(path.dirname(runDir), record.restoreSnapshotRunId));
   }
+  if (t.snapshotApplication !== undefined && (!Array.isArray(t.snapshotApplication) || !t.snapshotVerified ||
+      t.mutating !== true || t.restored === true || t.activationIntent !== true || !Array.isArray(t.restoreData) ||
+      t.snapshotApplication.length > t.restoreData.length || t.snapshotApplication.some((state, index) =>
+        !['copying', 'applied'].includes(state) || state === 'copying' && (index !== t.snapshotApplication.length - 1 || t.targetStarted === true) ||
+        !t.snapshots?.some(snapshot => snapshot.root === t.restoreData[index].root))))
+    throw new Error('Invalid saved downgrade snapshot application progress.');
   if (t.artifacts !== undefined && (!Array.isArray(t.artifacts) || t.artifacts.some(relative => !GENERATED.includes(relative))) ||
       t.buildManifests !== undefined && (!object(t.buildManifests) || Object.keys(t.buildManifests).some(relative => !GENERATED.includes(relative))))
     throw new Error('Invalid saved runtime artifacts.');
@@ -747,6 +820,10 @@ export function validateSavedTransition(record, runDir) {
   }
   if (t.sourceFiles && t.targetFiles && (t.sourceFiles.length !== t.targetFiles.length ||
       t.sourceFiles.some((file, index) => file.relative !== t.targetFiles[index].relative))) throw new Error('Saved checkout recovery paths do not match the expected target.');
+  if (t.checkoutRestoration !== undefined && (t.checkoutRestoration !== 'copying' || !t.snapshotVerified ||
+      t.mutating !== true || t.restored === true || t.activationIntent !== true || !Array.isArray(t.sourceFiles) || !Array.isArray(t.targetFiles) ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(record.run.id)))
+    throw new Error('Invalid saved checkout restoration progress.');
 }
 
 export async function runManagedUpdate(recordPath) {

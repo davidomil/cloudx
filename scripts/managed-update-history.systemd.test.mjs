@@ -12,7 +12,7 @@ import { ManagedUpdate, UpdateHost } from "./managed-update.mjs";
 import { writeUpdateJson } from "./managed-update-store.mjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65"];
+const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", "ad72433b2d6283811fad6bfe288748f2c24b0c5e"];
 const supportedHost = process.platform === "linux"
   && fs.readFileSync("/etc/os-release", "utf8").includes("ID=ubuntu")
   && spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 5000 }).status === 0;

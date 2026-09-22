@@ -17,6 +17,7 @@ const targets = [
   ["pinned base", "a9613fafdc0ed1765fcf72ea7d9f61de08c3914a", false],
   ["before terminal readiness endpoint", "26d8291b89309acb59fdea1cbe09234d41d0164f", true],
   ["before Settings channel selection", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", true],
+  ["before terminal execution bindings", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", true],
 ];
 const temporary = [];
 afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -61,7 +62,7 @@ it.skipIf(process.platform !== "linux").each(targets)("builds the actual %s targ
   const result = await execute(process.execPath, [script, fixturePath], { cwd: repoRoot, env: { ...process.env, ...env }, timeout: 30_000, maxBuffer: 1024 * 1024 });
   const proof = JSON.parse(result.stdout);
   expect(proof).toMatchObject({ readiness: { broker: "ready", direct: "ready" }, completedRun: completed.run.id,
-    nextTarget: targets.find(([, target]) => target !== commit)[1], dataDir, nextState: "running", retainedShell: true, clearedReadinessReceipts: true,
+    nextTarget: targets.find(([, target]) => target !== commit)[1], dataDir, nextState: "running", retainedShell: true, clearedReadinessReceipts: true, retiredSupervisors: 2,
     runtime: { verification: "verified", build: { commit } }, selectedChannel: "main" });
   expect(proof.updateInvocations.every(call => call.script === path.join(completed.coordinator, "scripts/settings-update.mjs") && call.cwd === repoRoot)).toBe(true);
   expect(proof.updateInvocations.map(call => call.action)).toContain("start");
@@ -91,12 +92,27 @@ assert.equal(config.dataDir, f.dataDir);
 const socket = terminalSocketPath(config.dataDir);
 const broker = new TerminalBroker(socket, new NodePtyTerminalProcessFactory());
 const factory = new DurableTerminalProcessFactory(socket, new NodePtyTerminalProcessFactory());
+const probes = [];
+const spawn = NodePtyTerminalProcessFactory.prototype.spawn;
+NodePtyTerminalProcessFactory.prototype.spawn = async function(command, args, options) {
+  const terminal = await spawn.call(this, command, args, options);
+  if (args.some(arg => arg.includes('CLOUDX_TERMINAL_READY:'))) {
+    probes.push({ pid: terminal.process.pid, directory: terminal.supervisor.directory, sessionId: options.sessionId });
+  }
+  return terminal;
+};
 let shell;
 let app;
 try {
   await broker.start();
   shell = await factory.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { cwd: f.dataDir, env: process.env, cols: 100, rows: 24, sessionId: 'historical-preserved-shell' });
   const readiness = await verifyHistoricalTerminals(f.releaseRoot, f.dataDir);
+  assert.equal(probes.length, 2);
+  for (const probe of probes) {
+    assert.throws(() => process.kill(probe.pid, 0), { code: 'ESRCH' });
+    assert.equal(fs.existsSync(probe.directory), false);
+    if (probe.sessionId) await assert.rejects(factory.attach(probe.sessionId));
+  }
   const attached = await factory.attach('historical-preserved-shell');
   attached.detach();
   assert.deepEqual(fs.readdirSync(f.dataDir).filter(name => name.startsWith('terminal-readiness-')), []);
@@ -164,7 +180,7 @@ try {
   assert.notEqual(savedNext.coordinator, f.releaseRoot);
   assert.ok(launches[0].includes(path.join(savedNext.coordinator, 'scripts/settings-update.mjs')));
   console.log(JSON.stringify({ readiness, completedRun: status.run.id, nextState: next.run.state, nextTarget: savedNext.targetCommit,
-    dataDir: config.dataDir, updateInvocations, retainedShell: true, clearedReadinessReceipts: true, runtime, selectedChannel: selected.channel }));
+    dataDir: config.dataDir, updateInvocations, retainedShell: true, clearedReadinessReceipts: true, retiredSupervisors: probes.length, runtime, selectedChannel: selected.channel }));
 } finally {
   if (app) await app.close();
   if (shell) { await shell.terminate(); shell.detach(); }

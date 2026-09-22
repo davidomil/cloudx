@@ -17,11 +17,13 @@ const SETTINGS_FILES = [
   "apps/web/src/cloudxUpdateApi.ts",
 ];
 const READINESS_FILE = "apps/server/src/terminal/TerminalReadiness.ts";
+const LEGACY_READINESS_SOURCE = "scripts/managed-update-readiness-legacy.ts";
+const TERMINAL_CONTRACT_FILE = "apps/server/src/terminal/TerminalProcess.ts";
 const SERVER_FILE = "apps/server/src/server.ts";
 const LEGACY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start">';
 const MANAGED_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">';
-export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE];
-export const MANAGED_INTEGRATION_FILES = [...MANAGED_INTEGRATION_SOURCE_FILES, SERVER_FILE];
+export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE, LEGACY_READINESS_SOURCE];
+export const MANAGED_INTEGRATION_FILES = [...SETTINGS_FILES, READINESS_FILE, SERVER_FILE];
 
 // The updater remains maintained independently of the selected application.
 // Build these small integrations with the target's own dependencies and APIs.
@@ -41,6 +43,7 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
     }
   }
   const independentReadiness = fs.existsSync(server) && !serverSource.includes("/api/ready/terminals");
+  const readinessSource = independentReadiness ? selectReadinessSource(release) : undefined;
   if (independentReadiness) files.push(READINESS_FILE);
   const changes = files.map(relative => {
     const destination = integrationPath(release, relative);
@@ -48,7 +51,7 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
     const local = execFileSync("git", ["status", "--porcelain", "--", relative], { cwd: release, encoding: "utf8" });
     if (local.trim()) throw new Error(`Managed updater integration conflicts with local changes to ${relative}. Preserve those changes before resuming.`);
     if (relative === SERVER_FILE) return { destination, content: migratedServer };
-    const source = integrationPath(coordinator, relative);
+    const source = integrationPath(coordinator, relative === READINESS_FILE ? readinessSource : relative);
     if (!fs.existsSync(source)) throw new Error(`Managed updater integration is missing: ${relative}`);
     return { destination, content: fs.readFileSync(source) };
   });
@@ -57,6 +60,17 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
     fs.writeFileSync(destination, content);
   }
   return { version: 1, files, independentReadiness };
+}
+
+function selectReadinessSource(release) {
+  const source = fs.readFileSync(integrationPath(release, TERMINAL_CONTRACT_FILE), "utf8");
+  const options = source.match(/export interface TerminalSpawnOptions\s*\{([^}]+)\}/)?.[1].replace(/\s/g, "");
+  const supervisedOptions = "cwd:string;env:NodeJS.ProcessEnv;cols:number;rows:number;sessionId?:string;";
+  if (!source.includes("terminate(): Promise<void>"))
+    throw new Error("Managed readiness requires the target's supervised terminal shutdown contract.");
+  if (options === supervisedOptions) return LEGACY_READINESS_SOURCE;
+  if (options === `${supervisedOptions}execution?:TerminalExecutionBinding;`) return READINESS_FILE;
+  throw new Error("Managed updater integration does not recognize the target terminal spawn contract.");
 }
 
 function integrationPath(root, relative) {

@@ -18,9 +18,30 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const release = fixture();
   const head = git(release, ["rev-parse", "HEAD"]);
   const integration = prepareManagedIntegration(release, coordinator);
-  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_SOURCE_FILES, independentReadiness: true });
+  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file => file !== "apps/server/src/server.ts"), independentReadiness: true });
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
+});
+
+it("selects the supervised readiness probe before execution bindings were supported", () => {
+  const release = fixture(undefined, undefined, legacyTerminalContract());
+  const head = git(release, ["rev-parse", "HEAD"]);
+  const integration = prepareManagedIntegration(release, coordinator);
+  expect(integration.independentReadiness).toBe(true);
+  expect(fs.readFileSync(path.join(release, "apps/server/src/terminal/TerminalReadiness.ts")))
+    .toEqual(fs.readFileSync(path.join(coordinator, "scripts/managed-update-readiness-legacy.ts")));
+  expect(fs.readFileSync(path.join(release, "apps/server/src/terminal/TerminalProcess.ts"), "utf8"))
+    .toBe(legacyTerminalContract());
+  expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
+});
+
+it.each([
+  ["unknown spawn options", "export interface TerminalSpawnOptions { options: unknown; }\nterminate(): Promise<void>;", "does not recognize the target terminal spawn contract"],
+  ["unconfirmed shutdown", "export interface TerminalSpawnOptions { cwd: string; }", "requires the target's supervised terminal shutdown contract"],
+])("rejects %s before copying any integration", (_name, contract, message) => {
+  const release = fixture(undefined, undefined, contract);
+  expect(() => prepareManagedIntegration(release, coordinator)).toThrow(message);
+  expect(git(release, ["status", "--porcelain"])).toBe("");
 });
 
 it("upgrades the pre-channel server contract while preserving its unrelated source", () => {
@@ -92,8 +113,10 @@ it("bundles the maintained integration and lifecycle probe with the coordinator 
   expect(() => verifySnapshot(next.coordinator, nextManifest)).not.toThrow();
   expect(next.coordinator).not.toBe(record.coordinator);
   const { prepareManagedIntegration: retainedIntegration } = await import(pathToFileURL(path.join(next.coordinator, "scripts/managed-update-integration.mjs")));
-  const release = fixture("historical Settings", 'updates?: Pick<CloudxUpdateService, "status" | "start">;');
+  const release = fixture("historical Settings", 'updates?: Pick<CloudxUpdateService, "status" | "start">;', legacyTerminalContract());
   expect(retainedIntegration(release).files).toContain("apps/server/src/server.ts");
+  expect(fs.readFileSync(path.join(release, "apps/server/src/terminal/TerminalReadiness.ts")))
+    .toEqual(fs.readFileSync(path.join(coordinator, "scripts/managed-update-readiness-legacy.ts")));
 });
 
 it.each(["command", "invalid JSON", "incomplete result"])("reports historical terminal %s failure before runtime attestation", failure => {
@@ -123,12 +146,17 @@ function directory() {
 function git(root, args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
-function fixture(service = "historical Settings", server = 'updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;\n/api/ready') {
+function legacyTerminalContract() {
+  return fs.readFileSync(path.join(coordinator, "apps/server/src/terminal/TerminalProcess.ts"), "utf8")
+    .replace("  execution?: TerminalExecutionBinding;\n", "");
+}
+function fixture(service = "historical Settings", server = 'updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;\n/api/ready',
+  terminal = fs.readFileSync(path.join(coordinator, "apps/server/src/terminal/TerminalProcess.ts"), "utf8")) {
   const root = directory();
   git(root, ["init"]);
   git(root, ["config", "user.name", "CloudX Test"]);
   git(root, ["config", "user.email", "test@invalid"]);
-  for (const [relative, content] of [[MANAGED_INTEGRATION_FILES[0], service], ["apps/server/src/server.ts", server]]) {
+  for (const [relative, content] of [[MANAGED_INTEGRATION_FILES[0], service], ["apps/server/src/server.ts", server], ["apps/server/src/terminal/TerminalProcess.ts", terminal]]) {
     fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
     fs.writeFileSync(path.join(root, relative), content);
   }
