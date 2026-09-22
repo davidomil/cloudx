@@ -55,6 +55,7 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
       await fixture.waitUntilReady();
       expect(fixture.serviceState(fixture.webUnit).InvocationID).not.toBe(historicalWeb.InvocationID);
       await fixture.expectSavedTabs({ historical: true });
+      await fixture.recoverPreservedConversationInBrowser();
     } else {
       expect(fixture.serviceState(fixture.brokerUnit).InvocationID).not.toBe(originalBroker.InvocationID);
       expect(fs.realpathSync(path.join(fixture.repoRoot, "apps/server/dist/terminal/broker.js")))
@@ -117,7 +118,8 @@ class HistoricalInstallation {
     fs.writeFileSync(path.join(this.dataDir, "user-data.txt"), "Preserve the active profile across the historical transition.\n");
     if (savedTabs) this.savedTabs = seedSavedTabProfile({ root: this.root, home: this.home, dataDir: this.dataDir,
       webUrl: `http://127.0.0.1:${dependencyPort}/saved-dashboard?token=fixture-token` });
-    // Only the external ASR/documentation HTTP dependencies are stubbed.
+    // ASR/documentation HTTP dependencies and the Codex executable are fixtures;
+    // CloudX services, recovery validation and supervised PTYs are production paths.
     const dependencies = path.join(this.root, "dependencies.mjs");
     fs.writeFileSync(dependencies, `import http from 'node:http';
 http.createServer((request, response) => {
@@ -194,7 +196,8 @@ http.createServer((request, response) => {
     const workspace = JSON.parse(this.curl("/api/workspace"));
     expect(workspace.activeTabId).toBe("saved-shell");
     expect(workspace.activeWindowId).toBe(expected.workspace.activeWindowId);
-    expect(workspace.windows).toEqual(expected.workspace.windows);
+    const windowIdentity = ({ updatedAt, ...window }) => window;
+    expect(workspace.windows.map(windowIdentity)).toEqual(expected.workspace.windows.map(windowIdentity));
     expect(workspace.tabs.map(tab => tab.id)).toEqual(expected.sessions.map(({ tab }) => tab.id));
     for (const original of expected.sessions) {
       const tab = workspace.tabs.find(tab => tab.id === original.tab.id);
@@ -214,7 +217,84 @@ http.createServer((request, response) => {
     expect(web.result.url).toBe(expected.sessions[2].initialInput.url);
     for (const { file, bytes } of expected.evidence) expect(fs.readFileSync(file)).toEqual(bytes);
     for (const { tab } of expected.sessions) expect(fs.readFileSync(tab.contextPath, "utf8")).toMatch(`Saved context for ${tab.id}.\n`);
-    expect(fs.existsSync(expected.terminalLaunches)).toBe(false);
+    expect(this.terminalLaunches()).toHaveLength(expected.recoveryLaunches);
+    expect(fs.existsSync(expected.terminalInput)).toBe(false);
+  }
+
+  terminalLaunches() {
+    return fs.existsSync(this.savedTabs.terminalLaunches)
+      ? fs.readFileSync(this.savedTabs.terminalLaunches, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+  }
+
+  async recoverPreservedConversationInBrowser() {
+    const browser = await chromium.launch();
+    const expected = this.savedTabs;
+    try {
+      for (const mobile of [false, true]) {
+        const page = await browser.newPage({ ignoreHTTPSErrors: true,
+          viewport: mobile ? { width: 393, height: 851 } : { width: 1440, height: 960 }, isMobile: mobile, hasTouch: mobile });
+        const errors = [], requests = [];
+        page.on("pageerror", error => errors.push(error.message));
+        page.on("request", request => {
+          if (request.url().endsWith("/recover")) requests.push({ url: new URL(request.url()).pathname, body: request.postDataJSON() });
+        });
+        await page.goto(`https://127.0.0.1:${this.port}`, { waitUntil: "domcontentloaded" });
+        const pane = page.locator('[data-pane-id="saved-right"]');
+        const recovery = pane.getByRole("region", { name: "Saved terminal recovery", exact: true });
+        const resume = recovery.getByRole("button", { name: "Resume preserved conversation", exact: true });
+        await browserExpect(recovery).toContainText(`Preserved Codex conversation: ${expected.conversationId}`);
+        await browserExpect(recovery.getByRole("textbox")).toHaveCount(0);
+        await browserExpect(resume).toBeEnabled();
+        const workspaceBefore = JSON.parse(this.curl("/api/workspace"));
+
+        fs.writeFileSync(expected.failNextLaunch, "Exit during the Codex startup grace period.\n");
+        for (const attempt of ["failed", "recovered"]) {
+          const response = page.waitForResponse(response => response.url().endsWith("/api/tabs/saved-codex/recover")
+            && response.request().method() === "POST");
+          await resume.click();
+          expect((await response).ok()).toBe(true);
+          expected.recoveryLaunches++;
+          await expect.poll(() => this.terminalLaunches().length).toBe(expected.recoveryLaunches);
+          const launch = this.terminalLaunches().at(-1);
+          expect(launch.args.slice(-2)).toEqual(["resume", expected.conversationId]);
+          expect(launch.args.join(" ")).not.toContain("NEVER_REPLAY");
+          if (attempt === "failed") {
+            await expect.poll(() => JSON.parse(this.curl("/api/workspace")).tabs.find(tab => tab.id === "saved-codex"))
+              .toMatchObject({ status: "failed", recovery: { conversationId: expected.conversationId, canResume: true } });
+            await browserExpect(recovery).toContainText("127");
+            await browserExpect(resume).toBeEnabled();
+            expect(() => process.kill(launch.pid, 0)).toThrow();
+          } else {
+            await browserExpect(recovery).toHaveCount(0);
+            expect(() => process.kill(launch.pid, 0)).not.toThrow();
+          }
+        }
+
+        expect(requests).toEqual(Array.from({ length: 2 }, () => ({ url: "/api/tabs/saved-codex/recover",
+          body: { action: "resume-conversation", sessionId: expected.conversationId } })));
+        const workspaceAfter = JSON.parse(this.curl("/api/workspace"));
+        expect(workspaceAfter.tabs.map(tab => tab.id)).toEqual(workspaceBefore.tabs.map(tab => tab.id));
+        expect(workspaceAfter.windows[0].layout.root).toEqual(workspaceBefore.windows[0].layout.root);
+        expect(workspaceAfter.tabs.find(tab => tab.id === "saved-codex")).toMatchObject({ status: "running", title: "Saved Codex" });
+        const ready = JSON.parse(this.curl("/api/tabs/saved-codex/actions", ["--fail", "-X", "POST", "-H", "Content-Type: application/json",
+          "-H", `Origin: https://127.0.0.1:${this.port}`, "--data", JSON.stringify({ action: "wait_until_ready", input: { timeoutMs: 2000 } })]));
+        expect(ready.result.ready).toBe(true);
+        expect(fs.existsSync(expected.terminalInput)).toBe(false);
+        for (const { file, bytes } of expected.evidence) expect(fs.readFileSync(file)).toEqual(bytes);
+        expect(errors).toEqual([]);
+        await page.getByRole("button", { name: /^Saved shell/ }).click();
+        await expect.poll(() => JSON.parse(this.curl("/api/workspace")).windows[0].layout.activePaneId).toBe("saved-left");
+        await page.close();
+
+        // Explicit recovery consumes the saved prompt without sending it. Restart
+        // returns the same tab to recovery for the next viewport and update.
+        delete expected.sessions[1].initialInput.prompt;
+        command("systemctl", ["--user", "restart", this.webUnit]);
+        await this.waitUntilReady();
+        for (const { pid } of this.terminalLaunches()) expect(() => process.kill(pid, 0)).toThrow();
+        await this.expectSavedTabs({ historical: true });
+      }
+    } finally { await browser.close(); }
   }
 
   async navigateSavedWebsite() {
@@ -278,7 +358,7 @@ http.createServer((request, response) => {
         if (this.savedTabs) {
           await browserExpect(page.getByRole("button", { name: "Start a new shell", exact: true })).toBeVisible();
           await browserExpect(page.getByText(this.savedTabs.sessions[0].tab.cwd, { exact: true }).first()).toBeVisible();
-          if (!mobile) await browserExpect(page.getByRole("textbox", { name: "Exact Codex conversation ID", exact: true })).toBeVisible();
+          if (!mobile) await browserExpect(page.getByRole("button", { name: "Resume preserved conversation", exact: true })).toBeEnabled();
         }
         if (mobile) {
           await page.getByRole("button", { name: "Workspace actions", exact: true }).click();

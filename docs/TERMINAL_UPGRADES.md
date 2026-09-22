@@ -223,11 +223,20 @@ from that target. Terminal tabs remain stopped until explicit recovery;
 commands and prompts are not replayed.
 
 The historical recovery panel starts a new shell in the saved directory
-or resumes the explicitly entered preserved Codex conversation. Codex
-recovery checks source ownership and transcript availability before
-launching. A different conversation must be opened explicitly in a new
-tab. Session persistence also retains new tabs, closed tabs, active
-selection and the current local-web URL across historical shutdown.
+or displays the validated preserved Codex conversation with a Resume
+preserved conversation button. Codex recovery checks source ownership,
+the saved receipt and transcript availability before enabling resume
+and again before launching. A different conversation must be opened
+explicitly in a new tab.
+
+If Codex exits during startup, the same tab offers recovery again after
+its supervisor confirms that the process tree stopped. Cleanup that
+cannot be confirmed leaves recovery disabled and retains session
+ownership. Retrying requires an explicit click and does not replay saved
+prompts.
+
+Session persistence also retains new tabs, closed tabs, active selection
+and the current local-web URL across historical shutdown.
 
 Regression fixtures build the actual pinned base
 a9613fafdc0ed1765fcf72ea7d9f61de08c3914a, its predecessor

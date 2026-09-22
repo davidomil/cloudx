@@ -43,10 +43,24 @@ export function seedSavedTabProfile({ root, home, dataDir, webUrl }) {
   const evidence = [transcriptPath,
     path.join(launch, ".cloudx-source.json"), path.join(launch, ".cloudx-conversation.json")]
     .map(file => ({ file, bytes: fs.readFileSync(file) }));
-  const terminalLaunches = path.join(root, "unexpected-terminal-launches.jsonl");
+  const terminalLaunches = path.join(root, "terminal-launches.jsonl");
+  const terminalInput = path.join(root, "terminal-input.jsonl");
+  const failNextLaunch = path.join(root, "fail-next-terminal-launch");
   const terminalCommand = path.join(root, "fixture-terminal");
-  fs.writeFileSync(terminalCommand, `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(terminalLaunches)}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`, { mode: 0o700 });
-  return { sessions, workspace, conversationId, evidence, terminalLaunches, terminalCommand };
+  fs.writeFileSync(terminalCommand, `#!${process.execPath}
+const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(terminalLaunches)}, JSON.stringify({ pid: process.pid, args: process.argv.slice(2) }) + '\\n');
+if (fs.existsSync(${JSON.stringify(failNextLaunch)})) {
+  fs.unlinkSync(${JSON.stringify(failNextLaunch)});
+  process.exit(127);
+}
+process.stdin.setRawMode(true);
+process.stdin.on('data', bytes => fs.appendFileSync(${JSON.stringify(terminalInput)}, JSON.stringify(bytes.toString()) + '\\n'));
+process.stdout.write('Preserved conversation fixture ready.\\r\\n');
+setTimeout(() => process.exit(0), 120000);
+`, { mode: 0o700 });
+  return { sessions, workspace, conversationId, evidence, terminalLaunches, terminalInput, failNextLaunch, terminalCommand,
+    recoveryLaunches: 0 };
 }
 
 // A separate process makes interruption real while each host mutation remains

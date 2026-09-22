@@ -22,7 +22,7 @@ export function prepareSessionIntegration(readSource) {
   function before(file, anchor, addition) { replace(file, anchor, addition + anchor); }
   function after(file, anchor, addition) { replace(file, anchor, anchor + addition); }
 
-  after(STORE, 'import type { ConfigValue } from "@cloudx/shared";\n', 'import type { RecoverTabRequest } from "@cloudx/shared";\nimport type { SessionStateStore } from "./workspace/SessionStateStore.js";\n');
+  after(STORE, 'import type { ConfigValue } from "@cloudx/shared";\n', 'import type { RecoverTabRequest, TabRecovery } from "@cloudx/shared";\nimport type { SessionStateStore } from "./workspace/SessionStateStore.js";\n');
   before(STORE, '  constructor(\n', `  private readonly initialInputs = new Map<string, Record<string, unknown> | undefined>();
   private readonly recoveries = new Map<string, { request: RecoverTabRequest; promise: Promise<WorkspaceTab> }>();
   private preservingSessions = false;
@@ -46,9 +46,7 @@ export function prepareSessionIntegration(readSource) {
         try {
           const plugin = this.plugins.get(tab.pluginId);
           if (plugin.panelKind === "terminal") {
-            const message = "The previous terminal was interrupted. Start a new shell or select an exact saved Codex conversation. Saved commands and prompts will not be replayed.";
-            this.updateTab(tab.id, { status: "stopped", statusMessage: message,
-              recovery: { ...tab.recovery, state: "missing", message }, indicator: indicatorForStatus("stopped", message) });
+            await this.offerTerminalRecovery(tab.id);
             continue;
           }
           const cwd = await this.pathPolicy.ensureDirectory(tab.cwd, false);
@@ -71,6 +69,46 @@ export function prepareSessionIntegration(readSource) {
   async flush(): Promise<void> {
     this.persistSessions();
     await this.savedSessions?.flush();
+  }
+
+  private async offerTerminalRecovery(tabId: string, status: WorkspaceTab["status"] = "stopped", statusMessage?: string): Promise<void> {
+    const tab = this.getTab(tabId);
+    const plugin = this.plugins.get(tab.pluginId);
+    const message = statusMessage ?? "The previous terminal was interrupted. Saved commands and prompts will not be replayed.";
+    const recovery: TabRecovery = { state: "missing", message, canResume: false };
+    this.updateTab(tabId, { status, statusMessage: message, recovery, indicator: indicatorForStatus(status, message) });
+    if (!plugin.describeRecovery) return;
+    let description;
+    try { description = await plugin.describeRecovery({ tab, initialInput: this.initialInputs.get(tabId) }); }
+    catch (error) { description = { canResume: false, message: error instanceof Error ? error.message : String(error) }; }
+    if (this.tabs.get(tabId)?.recovery === recovery && !this.sessions.has(tabId))
+      this.updateTab(tabId, { recovery: { ...recovery, ...description,
+        message: statusMessage ? statusMessage + " " + description.message : description.message } });
+  }
+
+  private recoverExitedSession(tabId: string, session: PluginSession, status: WorkspaceTab["status"], message?: string): boolean {
+    if (session.tab.ownerPluginId || session.tab.pluginId !== "codex-terminal" ||
+        !["failed", "completed"].includes(status) || !session.hasExited?.() || !session.confirmExit) return false;
+    this.disposeSessionListeners(tabId);
+    this.updateTab(tabId, { status, statusMessage: message, indicator: indicatorForStatus(status, message),
+      recovery: { state: "unavailable", canResume: false, message: "Confirming that the previous terminal stopped." } });
+    const recovery = (async () => {
+      try { await session.confirmExit!(); }
+      catch (error) {
+        if (this.sessions.get(tabId) === session) this.updateTab(tabId, { recovery: { state: "unavailable", canResume: false,
+          message: error instanceof Error ? error.message : String(error) } });
+        return;
+      }
+      if (this.sessions.get(tabId) !== session) return;
+      this.sessions.delete(tabId);
+      await this.offerTerminalRecovery(tabId, status, message);
+    })();
+    this.producerActions.add(recovery);
+    void recovery.then(() => this.producerActions.delete(recovery), error => {
+      this.producerActions.delete(recovery);
+      this.reportBackgroundError(error, "describe ended terminal", tabId);
+    });
+    return true;
   }
 
   recoverTab(tabId: string, request: RecoverTabRequest): Promise<WorkspaceTab> {
@@ -153,6 +191,10 @@ export function prepareSessionIntegration(readSource) {
 `);
   after(STORE, '  private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {\n',
     '    this.tabs.set(tabId, { ...this.getTab(tabId), recovery: undefined });\n');
+  after(STORE, '    const statusDisposer = session.onStatusChange?.((status, statusMessage) => {\n',
+    '      if (this.sessions.get(tabId) !== session || this.recoverExitedSession(tabId, session, status, statusMessage)) return;\n');
+  after(STORE, '    const current = session.snapshot();\n',
+    '    if (this.recoverExitedSession(tabId, session, current.status, current.statusMessage)) return;\n');
   after(STORE, '  private emitTabsChange(): void {\n', '    if (this.preservingSessions) return;\n    this.persistSessions();\n');
 
   after(SERVER, 'import { SessionStore } from "./sessionStore.js";\n', 'import { SessionStateStore } from "./workspace/SessionStateStore.js";\n');
@@ -171,22 +213,41 @@ export function prepareSessionIntegration(readSource) {
 
 `);
   after(PLUGINS, '  createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;\n',
-    '  recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;\n');
+    '  recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;\n' +
+    '  describeRecovery?(input: Pick<CreatePluginSessionInput, "tab" | "initialInput">): Promise<{ message: string; conversationId?: string; canResume: boolean }>;\n');
+  after(PLUGINS, 'export interface PluginSession {\n', '  hasExited?(): boolean;\n  confirmExit?(): Promise<void>;\n');
   after(PLUGINS, 'export interface PluginTabControls {\n',
     '  setRestoreInput?(initialInput: Record<string, unknown>): Promise<void>;\n');
   after(CODEX, 'import { CodexStateSources } from "./CodexStateSources.js";\n',
     'import { CodexConversationRecovery } from "./CodexConversationRecovery.js";\n');
-  before(CODEX, '  async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {\n', `  async recoverSession(input: CreatePluginSessionInput): Promise<PluginSession> {
+  before(CODEX, '  async createSession(input: CreatePluginSessionInput): Promise<PluginSession> {\n', `  async describeRecovery(input: Pick<CreatePluginSessionInput, "tab" | "initialInput">): Promise<{ message: string; conversationId?: string; canResume: boolean }> {
+    try {
+      const conversationId = await this.requirePreservedConversation(input.tab.id);
+      return { conversationId, canResume: true,
+        message: "The previous Codex process ended. Resume the preserved conversation explicitly. Saved prompts will not be replayed." };
+    } catch (error) {
+      return { canResume: false, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  private async requirePreservedConversation(tabId: string): Promise<string> {
+    if (!this.sources) throw new Error("The saved Codex source ownership is unavailable.");
+    const binding = await this.sources.readBinding(tabId);
+    if (!binding) throw new Error("The saved Codex source ownership is unavailable.");
+    await this.sources.assertCurrent(binding);
+    const conversation = new CodexConversationRecovery(this.sources.viewPath(tabId));
+    const conversationId = conversation.read()?.sessionId;
+    if (!conversationId) throw new Error("This historical release can recover the preserved conversation only. Its saved identity is unavailable.");
+    await conversation.requireTranscript(conversationId, binding.home);
+    return conversationId;
+  }
+
+  async recoverSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const resume = codexResumeInput(input.initialInput);
     if (resume?.mode !== "session" || !resume.sessionId || !this.sources)
       throw new Error("Select the exact preserved Codex conversation ID.");
-    const binding = await this.sources.readBinding(input.tab.id);
-    if (!binding) throw new Error("The saved Codex source ownership is unavailable.");
-    await this.sources.assertCurrent(binding);
-    const conversation = new CodexConversationRecovery(this.sources.viewPath(input.tab.id));
-    if (conversation.read()?.sessionId !== resume.sessionId)
+    if (await this.requirePreservedConversation(input.tab.id) !== resume.sessionId)
       throw new Error("This historical release can recover the preserved conversation only. Open another conversation explicitly in a new tab.");
-    await conversation.requireTranscript(resume.sessionId, binding.home);
     const { prompt: _prompt, ...initialInput } = input.initialInput ?? {};
     return this.createSession({ ...input, initialInput, prepareCodexSession: undefined });
   }
@@ -212,6 +273,14 @@ export function prepareSessionIntegration(readSource) {
     '    this.stopObservingConversation = options.observeConversation?.();\n');
   after(CODEX, '    this.terminalProcess.onExit((event) => {\n', '      this.stopObservingConversation?.();\n');
   after(CODEX, '  stop(): void {\n', '    this.stopObservingConversation?.();\n');
+  before(CODEX, '  stop(): void {\n', `  hasExited(): boolean { return this.terminalClosed; }
+
+  confirmExit(): Promise<void> {
+    if (!this.terminalClosed) throw new Error("The terminal has not exited.");
+    return this.terminalProcess.terminate();
+  }
+
+`);
   replace(SHARED, 'function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {', 'export function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {');
   before(SHARED, 'export interface WorkspaceTab {\n', `export interface TabRecovery {
   state: "missing" | "unavailable" | "retired";
@@ -242,19 +311,19 @@ export interface RecoverTabRequest {
 }
 
 function SavedTerminalRecovery({ tab }: { tab: WorkspaceTab }) {
-  const [sessionId, setSessionId] = useState("");
+  const sessionId = tab.recovery?.conversationId;
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   return <div className="empty-pane" role="region" aria-label="Saved terminal recovery">
     <p>{tab.recovery?.message}</p>
     <p>Directory: <code>{tab.cwd}</code></p>
-    {tab.pluginId === "codex-terminal" && <label>Exact Codex conversation ID<input aria-label="Exact Codex conversation ID" value={sessionId} onChange={event => setSessionId(event.target.value)} /></label>}
-    {["standard-terminal", "codex-terminal"].includes(tab.pluginId) && <button disabled={pending || tab.pluginId === "codex-terminal" && !sessionId.trim()} onClick={async () => {
+    {tab.pluginId === "codex-terminal" && sessionId && <p>Preserved Codex conversation: <code>{sessionId}</code></p>}
+    {["standard-terminal", "codex-terminal"].includes(tab.pluginId) && <button disabled={pending || tab.pluginId === "codex-terminal" && (!tab.recovery?.canResume || !sessionId)} onClick={async () => {
       setPending(true); setError("");
-      try { await recoverTab(tab.id, tab.pluginId === "standard-terminal" ? { action: "new-shell" } : { action: "resume-conversation", sessionId: sessionId.trim() }); }
+      try { await recoverTab(tab.id, tab.pluginId === "standard-terminal" ? { action: "new-shell" } : { action: "resume-conversation", sessionId }); }
       catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
       finally { setPending(false); }
-    }}>{tab.pluginId === "standard-terminal" ? "Start a new shell" : "Resume selected conversation"}</button>}
+    }}>{tab.pluginId === "standard-terminal" ? "Start a new shell" : "Resume preserved conversation"}</button>}
     {error && <p role="alert">{error}</p>}
   </div>;
 }

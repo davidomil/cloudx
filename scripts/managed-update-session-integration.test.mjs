@@ -270,6 +270,105 @@ describe("saved-tab recovery in the managed pre-broker target", () => {
     expect((await fixture.savedSessions.read()).sessions[1].initialInput).toEqual(fixture.input.initialInput);
   });
 
+  it("exposes the validated preserved conversation in the restored workspace without launching it", async () => {
+    const fixture = await preservedCodexConversation();
+    fixture.plugins[1] = fixture.plugin;
+    await fixture.store.restore();
+    const snapshot = await fixture.store.snapshot();
+    expect(snapshot.tabs.find(tab => tab.id === "saved-codex").recovery).toMatchObject({ conversationId, canResume: true });
+    expect((await fixture.savedSessions.read()).sessions[1].tab.recovery).toMatchObject({ conversationId, canResume: true });
+    expect(fixture.createSession).not.toHaveBeenCalled();
+    expect(fixture.factory.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(["before binding", "after binding", "clean early exit"])("permits explicit same-tab recovery after an exited Codex launch: %s", async timing => {
+    const fixture = await preservedCodexConversation();
+    fixture.createSession.mockRestore();
+    fixture.plugins[1] = fixture.plugin;
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    vi.spyOn(load("apps/server/src/rulesSkills/CodexHomeOverlay.ts"), "materializeCodexHomeOverlay").mockImplementation(async input => ({
+      codexHome: await input.sources.bind(input.tabId, input.source), rulesSkillsRoot: fixture.root, systemRules: [],
+    }));
+    const terminals = [];
+    const exitConfirmation = Promise.withResolvers();
+    fixture.factory.spawn.mockImplementation(async () => {
+      const terminal = { onData: vi.fn(() => () => {}), write: vi.fn(), resize: vi.fn(), kill: vi.fn(),
+        terminate: vi.fn(() => exitConfirmation.promise),
+        onExit: vi.fn(callback => {
+          terminal.exit = callback;
+          if (timing === "before binding" && terminals.length === 1) callback({ exitCode: 127 });
+          return () => {};
+        }) };
+      terminals.push(terminal);
+      return terminal;
+    });
+    await fixture.store.restore();
+    const request = { action: "resume-conversation", sessionId: conversationId };
+    await fixture.store.recoverTab("saved-codex", request);
+    if (timing !== "before binding") terminals[0].exit({ exitCode: timing === "clean early exit" ? 0 : 127 });
+    try {
+      expect(fixture.store.getTab("saved-codex").recovery).toMatchObject({ state: "unavailable", canResume: false });
+      expect(fixture.store.getSession("saved-codex")).toBeDefined();
+      expect(() => fixture.store.recoverTab("saved-codex", request)).toThrow("no interrupted terminal");
+      expect(fixture.factory.spawn).toHaveBeenCalledTimes(1);
+      expect(terminals[0].terminate).toHaveBeenCalledTimes(1);
+    } finally { exitConfirmation.resolve(); }
+    await vi.waitFor(() => expect(fixture.store.getTab("saved-codex")).toMatchObject({
+      status: timing === "clean early exit" ? "completed" : "failed", recovery: { conversationId, canResume: true },
+    }));
+    expect(() => fixture.store.getSession("saved-codex")).toThrow();
+    await fixture.store.flush();
+    expect((await fixture.savedSessions.read()).sessions[1].tab.recovery).toMatchObject({ conversationId, canResume: true });
+    expect(fixture.factory.spawn).toHaveBeenCalledTimes(1);
+    const recovery = fixture.store.recoverTab("saved-codex", request);
+    expect(fixture.store.recoverTab("saved-codex", request)).toBe(recovery);
+    await recovery;
+    expect(fixture.factory.spawn).toHaveBeenCalledTimes(2);
+    expect(fixture.store.getTab("saved-codex").recovery).toBeUndefined();
+    const replacement = fixture.store.getSession("saved-codex");
+    terminals[0].exit({ exitCode: 127 });
+    expect(fixture.store.getSession("saved-codex")).toBe(replacement);
+    expect(fixture.store.getTab("saved-codex").recovery).toBeUndefined();
+    const snapshot = await fixture.store.snapshot();
+    expect(snapshot.tabs.map(tab => tab.id)).toEqual(fixture.saved.sessions.map(session => session.tab.id));
+    expect(snapshot.windows.find(window => window.id === fixture.window.id).layout).toEqual(fixture.layout);
+    for (const terminal of terminals) expect(terminal.write).not.toHaveBeenCalled();
+    for (const args of fixture.factory.spawn.mock.calls) {
+      expect(JSON.stringify(args)).toContain(conversationId);
+      expect(JSON.stringify(args)).not.toMatch(/DO_NOT_REPLAY_(PROMPT|COMMAND)/);
+    }
+    replacement.setStatus("failed", "Failure without an exit confirmation");
+    expect(fixture.store.getSession("saved-codex")).toBe(replacement);
+    expect(() => fixture.store.recoverTab("saved-codex", request)).toThrow();
+  });
+
+  it("keeps ownership when the historical supervisor cannot confirm that descendants stopped", async () => {
+    const fixture = await preservedCodexConversation();
+    fixture.createSession.mockRestore();
+    fixture.plugins[1] = fixture.plugin;
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    vi.spyOn(load("apps/server/src/rulesSkills/CodexHomeOverlay.ts"), "materializeCodexHomeOverlay").mockImplementation(async input => ({
+      codexHome: await input.sources.bind(input.tabId, input.source), rulesSkillsRoot: fixture.root, systemRules: [],
+    }));
+    const { NodePtyTerminalProcess } = load("apps/server/src/terminal/NodePtyTerminalProcess.ts");
+    const { promise: completion, resolve: complete } = Promise.withResolvers();
+    const error = new Error("Terminal supervisor exited without confirming its descendants stopped.");
+    const supervisor = { completion, kill: vi.fn(), terminate: vi.fn(async () => { throw error; }) };
+    const terminal = new NodePtyTerminalProcess({ onExit: vi.fn(), onData: vi.fn() }, supervisor);
+    fixture.factory.spawn.mockResolvedValue(terminal);
+    await fixture.store.restore();
+    const request = { action: "resume-conversation", sessionId: conversationId };
+    await fixture.store.recoverTab("saved-codex", request);
+    const owned = fixture.store.getSession("saved-codex");
+    complete({ event: { exitCode: 125 }, error });
+    await vi.waitFor(() => expect(fixture.store.getTab("saved-codex")).toMatchObject({ status: "failed",
+      recovery: { state: "unavailable", canResume: false, message: error.message } }));
+    expect(supervisor.terminate).toHaveBeenCalledTimes(1);
+    expect(fixture.store.getSession("saved-codex")).toBe(owned);
+    expect(() => fixture.store.recoverTab("saved-codex", request)).toThrow();
+    expect(fixture.factory.spawn).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["stop", "exit"])("records native helper identity for a new Codex tab and removes its observer on %s", async ending => {
     const fixture = await preservedCodexConversation();
     fixture.createSession.mockRestore();
@@ -315,12 +414,24 @@ describe("saved-tab recovery in the managed pre-broker target", () => {
     }, "stale"],
   ])("rejects %s before launch without changing saved session inputs", async (_reason, corrupt, message) => {
     const fixture = await preservedCodexConversation();
-    const saved = fs.readFileSync(path.join(fixture.root, "sessions.json"));
     corrupt(fixture);
+    // Stored recovery metadata alone cannot enable a resume after validation fails.
+    fixture.saved.sessions[1].tab.recovery = { state: "missing", message: "Saved", conversationId, canResume: true };
+    await fixture.savedSessions.save(fixture.saved);
+    fixture.plugins[1] = fixture.plugin;
+    if (_reason === "different selected conversation" || _reason === "implicit conversation selection") {
+      // These request mutations leave the preserved receipt valid for discovery.
+      expect(await fixture.plugin.describeRecovery(fixture.input)).toMatchObject({ conversationId, canResume: true });
+    } else {
+      await fixture.store.restore();
+      expect(fixture.store.getTab("saved-codex").recovery).toMatchObject({ canResume: false });
+      expect(fixture.store.getTab("saved-codex").recovery.conversationId).toBeUndefined();
+    }
+    const beforeRecovery = fs.readFileSync(path.join(fixture.root, "sessions.json"));
     await expect(fixture.plugin.recoverSession(fixture.input)).rejects.toThrow(message);
     expect(fixture.createSession).not.toHaveBeenCalled();
     expect(fixture.factory.spawn).not.toHaveBeenCalled();
     expect(fixture.input.prepareCodexSession).not.toHaveBeenCalled();
-    expect(fs.readFileSync(path.join(fixture.root, "sessions.json"))).toEqual(saved);
+    expect(fs.readFileSync(path.join(fixture.root, "sessions.json"))).toEqual(beforeRecovery);
   });
 });
