@@ -56,6 +56,21 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it("exposes process startup identity without treating an unstamped development server as a verified target", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-runtime-identity-"));
+    const app = await buildServer(testConfig(root));
+    try {
+      const response = await app.inject({ method: "GET", url: "/api/runtime" });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.json()).toMatchObject({ verification: "unverified", build: null, pid: process.pid });
+      expect(response.json()).not.toHaveProperty("artifacts");
+    } finally {
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([false, true])("waits for plugin setup writes before closing (setup fails: %s)", async (fails) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-setup-shutdown-"));
     const config = testConfig(root);

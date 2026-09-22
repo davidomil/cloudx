@@ -11,12 +11,12 @@ import { NodePtyTerminalProcessFactory } from "../apps/server/src/terminal/NodeP
 import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
 import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStore.ts";
 import { WorkspaceLayoutStore } from "../apps/server/src/workspace/WorkspaceLayoutStore.ts";
-import { prepareRuntimeUpdate } from "./install-runtime.mjs";
+import { inspectRuntimeUpdate, prepareRuntimeUpdate } from "./install-runtime.mjs";
 
 const cleanups = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
-it.skipIf(process.platform !== "linux")("gates a live legacy broker before mutation, then snapshots and explicitly recovers across the helper contract upgrade", async () => {
+it.skipIf(process.platform !== "linux")("plans the missing web receipt migration, then snapshots and explicitly recovers across the helper contract upgrade", async () => {
   const installation = await legacyInstallation();
   const options = { cwd: installation.root, env: process.env, cols: 100, rows: 30, sessionId: "saved-shell" };
   const original = await installation.terminals.spawn("/bin/bash", ["--noprofile", "--norc"], options);
@@ -36,6 +36,10 @@ it.skipIf(process.platform !== "linux")("gates a live legacy broker before mutat
   });
   const legacySource = fs.readFileSync(installation.helper);
 
+  const plan = inspectRuntimeUpdate(migration);
+  expect(plan.requiresInterruption).toBe(true);
+  expect(plan.blockers).toEqual([]);
+  expect(plan.reasons.find(reason => reason.role === "web").message).toContain("terminal-runtime/web.json");
   expect(() => prepareRuntimeUpdate(migration)).toThrow("cannot safely survive an in-place update");
   expect(migration.actions).toEqual([]);
   expect(fs.readFileSync(installation.helper)).toEqual(legacySource);
@@ -44,7 +48,7 @@ it.skipIf(process.platform !== "linux")("gates a live legacy broker before mutat
   await expectSuccessfulOutput(beforeUpgrade, "LEGACY_STILL_WORKS");
 
   original.detach();
-  prepareRuntimeUpdate({ ...migration, migrateTerminals: true });
+  prepareRuntimeUpdate({ ...migration, interruptionConfirmed: true });
   expect(migration.actions).toEqual(["cloudx.service", "cloudx-terminal.service"]);
   expect(running(pid)).toBe(false);
   expect(fs.readFileSync(installation.helper)).toEqual(legacySource);
@@ -62,6 +66,35 @@ it.skipIf(process.platform !== "linux")("gates a live legacy broker before mutat
   const recovered = await installation.terminals.spawn("/bin/sh", ["-c", "printf RECOVERED_EXPLICITLY"], options);
   await expectSuccessfulOutput(recovered, "RECOVERED_EXPLICITLY");
   expect(fs.existsSync(path.join(installation.root, "replayed-command"))).toBe(false);
+}, 20_000);
+
+it.skipIf(process.platform !== "linux").each([false, true])("keeps compatible broker terminals attachable across helper replacement with web migration=%s", async migrateWeb => {
+  const installation = await legacyInstallation({ current: true });
+  const options = { cwd: installation.root, env: process.env, cols: 100, rows: 30, sessionId: "preserved-shell" };
+  const original = await installation.terminals.spawn("/bin/bash", ["--noprofile", "--norc"], options);
+  let output = "";
+  original.onData(data => { output += data; });
+  original.write("stty -echo; printf '\\nORIGINAL_PID=%s\\n' \"$$\"\n");
+  await vi.waitFor(() => expect(output).toMatch(/ORIGINAL_PID=\d+/u));
+  const pid = Number(/ORIGINAL_PID=(\d+)/u.exec(output)[1]);
+  if (migrateWeb) fs.unlinkSync(path.join(installation.dataDir, "terminal-runtime/web.json"));
+  const beforeBrokerStop = vi.fn();
+  const migration = migrationAdapter(installation, beforeBrokerStop);
+  const result = prepareRuntimeUpdate({ ...migration, interruptionConfirmed: true,
+    targetRuntime: { brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true } });
+  expect(result.plan.stopServices).toEqual(migrateWeb ? ["cloudx.service"] : []);
+  expect(migration.actions).toEqual(migrateWeb ? ["cloudx.service"] : []);
+  expect(beforeBrokerStop).not.toHaveBeenCalled();
+  fs.writeFileSync(installation.helper, "REPLACED_HELPER_MUST_NOT_BE_LOADED");
+  original.detach();
+  const attached = await installation.terminals.attach(options.sessionId);
+  let attachedOutput = "";
+  attached.onData(data => { attachedOutput += data; });
+  attached.write("printf '\\nPRESERVED_PID=%s\\n' \"$$\"\n");
+  await vi.waitFor(() => expect(attachedOutput).toContain(`PRESERVED_PID=${pid}`));
+  const spawned = await installation.terminals.spawn("/bin/sh", ["-c", "printf PINNED_HELPER_STILL_WORKS"], { ...options, sessionId: "after-replacement" });
+  await expectSuccessfulOutput(spawned, "PINNED_HELPER_STILL_WORKS");
+  await attached.terminate();
 }, 20_000);
 
 it.skipIf(process.platform !== "linux").each(["empty", "partial"])("refuses migration with %s saved sessions while preserving the live broker and original state", async kind => {
@@ -83,7 +116,7 @@ it.skipIf(process.platform !== "linux").each(["empty", "partial"])("refuses migr
 
   expect(() => prepareRuntimeUpdate({ ...migration, migrateTerminals: true })).toThrow(/Workspace tab .* has no saved session identity; broker replacement stopped/);
 
-  expect(migration.actions).toEqual(["cloudx.service"]);
+  expect(migration.actions).toEqual([]);
   expect(beforeBrokerStop).not.toHaveBeenCalled();
   expect(running(installation.broker.pid)).toBe(true);
   expect(running(pid)).toBe(true);
@@ -99,7 +132,7 @@ it.skipIf(process.platform !== "linux").each(["empty", "partial"])("refuses migr
   await attached.terminate();
 }, 20_000);
 
-async function legacyInstallation() {
+async function legacyInstallation({ current = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-legacy-upgrade-"));
   cleanups.push(() => fs.rmSync(root, { recursive: true, force: true }));
   const modules = path.join(root, "src", "terminal");
@@ -134,18 +167,29 @@ if __name__ == "__main__":
         supervisor.write_receipt("error", {**supervisor.identity, "message": str(error)})
         sys.exit(125)
 `);
+  if (current) {
+    fs.writeFileSync(helper, currentHelper);
+    fs.writeFileSync(factoryPath, factorySource);
+    fs.copyFileSync(source("TerminalSupervisorRuntime"), path.join(modules, "TerminalSupervisorRuntime.ts"));
+  }
+  const receiptSource = role => current ? `
+    import { recordTerminalRuntime } from ${JSON.stringify(source("TerminalRuntimeReceipt").href)};
+    process.env.INVOCATION_ID = '${"1".repeat(32)}';
+    await recordTerminalRuntime(${JSON.stringify(dataDir)}, '${role}');
+  ` : "";
   const socket = path.join(root, "broker.sock");
   const factoryImport = `import { NodePtyTerminalProcessFactory } from ${JSON.stringify(pathToFileURL(factoryPath).href)};`;
   const startBroker = () => startOwner(root, "broker", `${factoryImport}
     import { TerminalBroker } from ${JSON.stringify(source("TerminalBroker").href)};
     const broker = new TerminalBroker(${JSON.stringify(socket)}, new NodePtyTerminalProcessFactory());
     await broker.start();
+    ${receiptSource("broker")}
     process.on('SIGTERM', () => void broker.stop());
   `);
   const broker = await startBroker();
-  const web = await startOwner(root, "web", `${factoryImport}\nnew NodePtyTerminalProcessFactory();\nsetInterval(() => {}, 1000);`);
+  const web = await startOwner(root, "web", `${factoryImport}\nnew NodePtyTerminalProcessFactory();\n${receiptSource("web")}\nsetInterval(() => {}, 1000);`);
   return {
-    root, dataDir, helper, broker, web, startBroker,
+    root, dataDir, helper, broker, web, startBroker, current,
     terminals: new DurableTerminalProcessFactory(socket, new NodePtyTerminalProcessFactory()),
     installCurrentRuntime() {
       fs.writeFileSync(helper, currentHelper);
@@ -196,7 +240,7 @@ function migrationAdapter(installation, beforeBrokerStop) {
         const child = children[args[2]];
         const active = running(child.pid);
         return Object.entries({ LoadState: "loaded", ActiveState: active ? "active" : "inactive", MainPID: active ? String(child.pid) : "0",
-          WorkingDirectory: installation.root, ControlGroup: `/cloudx-upgrade-test-${child.pid}.service`, InvocationID: "test-invocation",
+          WorkingDirectory: installation.root, ControlGroup: `/cloudx-upgrade-test-${child.pid}.service`, InvocationID: installation.current ? "1".repeat(32) : "test-invocation",
           KillMode: "control-group", SendSIGKILL: "yes" }).map(([key, value]) => `${key}=${value}`).join("\n");
       },
       run(_command, args) {
@@ -209,6 +253,10 @@ function migrationAdapter(installation, beforeBrokerStop) {
     // Only systemd metadata/cgroup removal are simulated. Brokers, helpers,
     // terminals, snapshots, process death, and recovery run through real paths.
     readFile(file, encoding) {
+      if (installation.current) {
+        const processId = [installation.web.pid, installation.broker.pid].find(pid => file === `/proc/${pid}/cgroup`);
+        if (processId) return `0::/cloudx-upgrade-test-${processId}.service\n`;
+      }
       if (file.startsWith("/sys/fs/cgroup/cloudx-upgrade-test-")) throw Object.assign(new Error("Removed fixture cgroup"), { code: "ENOENT" });
       return fs.readFileSync(file, encoding);
     },

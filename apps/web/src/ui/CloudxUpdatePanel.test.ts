@@ -169,9 +169,9 @@ describe("CloudX updates", () => {
     expect(button("Update CloudX and dependencies").disabled).toBe(false);
   });
 
-  it.each(["ahead", "diverged", "unavailable"] as const)("prevents an update when the channel is %s", async state => {
+  it("prevents an update when the channel is unavailable", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
-    const container = await mount(undefined, async () => reply({ ...mainPreview, state, message: "Check the repository before updating." }));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state: "unavailable", message: "Check the repository before updating." }));
     expect(container.textContent).toContain("Check the repository before updating.");
     expect(button("Update CloudX and dependencies").disabled).toBe(true);
     expect(container.querySelector("select")?.disabled).toBe(false);
@@ -182,6 +182,99 @@ describe("CloudX updates", () => {
     const container = await mount(undefined, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit, changelog: [] }));
     expect(container.textContent).toContain("CloudX is up to date with main. You can still update dependencies.");
     expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
+
+  it.each(["ahead", "diverged"] as const)("allows the checked %s target with an explanation of the transition", async state => {
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => reply(init?.method === "POST" ? run() : available));
+    vi.stubGlobal("fetch", fetch);
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state }));
+    expect(container.textContent).toContain(state === "ahead" ? "will downgrade CloudX" : "will switch to that target");
+    await click("Update CloudX and dependencies");
+    expect(fetch.mock.calls.find(([, init]) => init?.method === "POST")?.[1]?.body).toBe(JSON.stringify({ channel: "main", targetCommit: mainPreview.target!.commit }));
+  });
+
+  it("waits for explicit interruption consent and retains the confirmation after reopening Settings", async () => {
+    let current: CloudxUpdateStatus = available;
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const request = JSON.parse(init.body as string);
+        current = request.confirmInterruption ? run() : { available: true, confirmation: {
+          targetCommit: mainPreview.target!.commit, message: "The running terminal service is from an older version. Replacing it will stop terminal processes; saved layouts and conversation identities remain."
+        } };
+      }
+      return reply(current);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const save = vi.fn(async () => undefined);
+    const container = await mount(save);
+    await click("Update CloudX and dependencies");
+    expect(container.textContent).toContain("Replacing it will stop terminal processes");
+    expect(button("Confirm interruption and continue").disabled).toBe(true);
+    expect(sessionStorage.getItem("cloudx.update.previousRun")).toBeNull();
+    await click("Confirm interruption and continue");
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    await click("Toggle settings");
+    await click("Toggle settings");
+    expect(button("Confirm interruption and continue").disabled).toBe(true);
+    await act(async () => (container.querySelector('input[type="checkbox"]') as HTMLInputElement).click());
+    await click("Confirm interruption and continue");
+    const requests = fetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(requests).toHaveLength(2);
+    expect(JSON.parse(requests[1]![1]!.body as string)).toEqual({ channel: "main", targetCommit: mainPreview.target!.commit, confirmInterruption: true });
+    expect(save).toHaveBeenCalledTimes(2);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it("displays recovery diagnostics and resumes the saved run when the remote catalog is unavailable", async () => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    let current: CloudxUpdateStatus = { available: true, run: { ...run("failed", id).run!, targetCommit: "c".repeat(40),
+      phase: "dependencies", component: "download", cause: "Network unavailable.", recoveryAction: "Restore connectivity, then resume this update.", resumable: true } };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") { current = run("succeeded", id); throw new TypeError("Connection closed"); }
+      return reply(current);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const container = await mount(undefined, async () => { throw new Error("GitHub unavailable."); });
+    expect(container.textContent).toContain("Phase: dependencies");
+    expect(container.textContent).toContain("Affected component: download");
+    expect(container.textContent).toContain("Cause: Network unavailable.");
+    expect(container.textContent).toContain("Recovery: Restore connectivity");
+    expect(container.textContent).toContain("Resume target: cccccccccccc");
+    expect(button("Resume update").disabled).toBe(false);
+    await click("Resume update");
+    const requests = fetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(requests[0]![1]!.body as string)).toEqual({ channel: "main", targetCommit: "c".repeat(40), resumeRunId: id });
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it.each([false, true])("requires exact snapshot consent before resuming data restoration, terminal interruption: %s", async requiresInterruption => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const snapshotId = "22222222-2222-4222-8222-222222222222";
+    let current: CloudxUpdateStatus = { available: true,
+      run: { ...run("failed", id).run!, targetCommit: mainPreview.target!.commit, resumable: true },
+      confirmation: { targetCommit: mainPreview.target!.commit, restoreSnapshotRunId: snapshotId, requiresInterruption,
+        message: "Replace active data with the snapshot captured before the earlier version. Newer data remains in the saved recovery copy." },
+    };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") current = run("running", id);
+      return reply(current);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const container = await mount(undefined, async () => { throw new Error("GitHub unavailable."); });
+    const checkboxes = container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    expect(checkboxes).toHaveLength(requiresInterruption ? 2 : 1);
+    expect(button("Confirm data restoration and continue").disabled).toBe(true);
+    await act(async () => checkboxes[0]!.click());
+    if (requiresInterruption) {
+      expect(button("Confirm data restoration and continue").disabled).toBe(true);
+      await act(async () => checkboxes[1]!.click());
+    }
+    await click("Confirm data restoration and continue");
+    const requests = fetch.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(requests[0]![1]!.body as string)).toEqual({ channel: "main", targetCommit: mainPreview.target!.commit,
+      resumeRunId: id, restoreSnapshotRunId: snapshotId, ...(requiresInterruption ? { confirmInterruption: true } : {}) });
   });
 
   it("disables launch after a preview error and recovers on an explicit check", async () => {
@@ -318,7 +411,7 @@ describe("CloudX updates", () => {
     const fetch = vi.fn(async () => reply({ available: false, unavailableReason: "Use the installed CloudX system service." }));
     vi.stubGlobal("fetch", fetch);
     const container = await mount();
-    expect(container.textContent).toContain("Codex, and installed dependencies");
+    expect(container.textContent).toContain("CloudX and its application dependencies");
     expect(container.textContent).toContain("persistent Codex and terminal tabs reconnect");
     expect(container.textContent).toContain("Running automation and voice work may stop");
     expect(container.textContent).toContain("Use the installed CloudX system service.");

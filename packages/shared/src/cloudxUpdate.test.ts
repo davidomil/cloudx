@@ -18,6 +18,27 @@ describe("CloudX update status", () => {
     expect(parseCloudxUpdateStatus(status)).toEqual(status);
   });
 
+  it("projects target-bound confirmation and recovery diagnostics without private paths", () => {
+    const status = {
+      available: true,
+      confirmation: { targetCommit: "b".repeat(40), message: "Terminal replacement interrupts active work.", restoreSnapshotRunId: "22222222-2222-4222-8222-222222222222", requiresInterruption: true },
+      run: { ...run, id: "11111111-1111-4111-8111-111111111111", state: "failed", targetCommit: "b".repeat(40), phase: "prepare",
+        component: "dependencies", cause: "Dependency download failed.", recoveryAction: "Restore network access, then resume.", resumable: true },
+    };
+    expect(parseCloudxUpdateStatus({ ...status, confirmation: { ...status.confirmation, logPath: "/private" }, run: { ...status.run, snapshot: "/private" } })).toEqual(status);
+  });
+
+  it.each([
+    { confirmation: {} }, { confirmation: { targetCommit: "main", message: "Interrupt." } },
+    { confirmation: { targetCommit: "b".repeat(40), message: "" } },
+    { confirmation: { targetCommit: "b".repeat(40), message: "Restore data.", restoreSnapshotRunId: "../snapshot" } },
+    { confirmation: { targetCommit: "b".repeat(40), message: "Restore data.", requiresInterruption: "true" } },
+    ...[{ resumable: "yes" }, { resumable: true }, { phase: 5 }, { component: [] }, { cause: "" }, { recoveryAction: {} }, { targetCommit: "main" }]
+      .map(change => ({ run: { ...run, ...change } })),
+  ])("rejects unsafe recovery or confirmation data: %j", fields => {
+    expect(() => parseCloudxUpdateStatus({ available: true, ...fields })).toThrow();
+  });
+
   it.each([null, [], {}, { available: "true" }, { available: false, unavailableReason: 5 },
     { available: true, run: [] },
     ...[{ id: "" }, { id: "x".repeat(129) }, { state: "unknown" }, { state: ["running"] }, { message: 5 }, { message: "x".repeat(4097) },
@@ -65,6 +86,15 @@ describe("CloudX update selection and preview", () => {
   it.each(["main", "releases"])("accepts a pinned %s start request", channel => {
     const request = { channel, targetCommit: "b".repeat(40) };
     expect(parseCloudxUpdateRequest(request)).toEqual(request);
+  });
+
+  it("accepts explicit interruption consent and the pinned durable run to resume", () => {
+    const request = { channel: "main", targetCommit: "b".repeat(40), confirmInterruption: true, resumeRunId: "11111111-1111-4111-8111-111111111111", restoreSnapshotRunId: "22222222-2222-4222-8222-222222222222" };
+    expect(parseCloudxUpdateRequest(request)).toEqual(request);
+  });
+
+  it.each([{ confirmInterruption: "true" }, { confirmInterruption: 1 }, { resumeRunId: "../run" }, { resumeRunId: 5 }, { resumeRunId: "" }, { restoreSnapshotRunId: "../data" }, { restoreSnapshotRunId: 5 }])("rejects unsafe confirmation and resume options: %j", fields => {
+    expect(() => parseCloudxUpdateRequest({ channel: "main", targetCommit: "b".repeat(40), ...fields })).toThrow();
   });
 
   it.each([null, [], {}, { channel: "main" }, { channel: "nightly", targetCommit: "b".repeat(40) },

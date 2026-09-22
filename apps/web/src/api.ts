@@ -15,6 +15,7 @@ import type {
   CloudxUpdateChannel,
   CloudxUpdatePreview,
   CloudxUpdateStatus,
+  CloudxUpdateRequest,
   ForgeConnectionAction,
   ForgeConnections,
   ForgeConnectionStatus,
@@ -505,8 +506,8 @@ export async function setCloudxUpdateChannel(channel: CloudxUpdateChannel, signa
   return parseCloudxUpdatePreview(await fetchJson<unknown>("/api/system/update/preview", { method: "PUT", body: JSON.stringify({ channel }), signal }));
 }
 
-export async function startCloudxUpdate(channel: CloudxUpdateChannel, targetCommit: string, signal?: AbortSignal): Promise<CloudxUpdateStatus> {
-  const response = await fetch("/api/system/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ channel, targetCommit }), signal });
+export async function startCloudxUpdate(request: CloudxUpdateRequest, signal?: AbortSignal): Promise<CloudxUpdateStatus> {
+  const response = await fetch("/api/system/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request), signal });
   if (!response.ok && response.status !== 409) throw new HttpError(response.status, errorMessageFromResponse(await response.text(), response.status));
   return parseCloudxUpdateStatus(await response.json());
 }

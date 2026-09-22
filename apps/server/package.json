@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node ../../scripts/write-runtime-build.mjs",
     "dev": "tsx watch src/index.ts",
     "terminals": "tsx src/terminal/broker.ts",
     "start": "node dist/index.js"

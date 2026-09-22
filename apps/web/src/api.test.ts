@@ -70,7 +70,7 @@ describe("api client", () => {
     expect(fetch).toHaveBeenNthCalledWith(1, "/api/system/update/preview", {
       method: "PUT", body: JSON.stringify({ channel: "releases" }), headers: { "content-type": "application/json" }, signal: undefined
     });
-    await startCloudxUpdate("releases", preview.target.commit);
+    await startCloudxUpdate({ channel: "releases", targetCommit: preview.target.commit });
     expect(fetch).toHaveBeenNthCalledWith(2, "/api/system/update", {
       method: "POST", body: JSON.stringify({ channel: "releases", targetCommit: preview.target.commit }), headers: { "content-type": "application/json" }, signal: undefined
     });

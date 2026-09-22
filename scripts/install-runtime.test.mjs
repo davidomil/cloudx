@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { assertPinnedTerminalRuntime, assertStoppedService, prepareRuntimeUpdate } from "./install-runtime.mjs";
+import { assertPinnedTerminalRuntime, assertStoppedService, inspectRuntimeUpdate, prepareRuntimeUpdate } from "./install-runtime.mjs";
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -37,7 +37,7 @@ it.each([
   const test = fixture();
   if (change) test.files["/data/terminal-runtime/broker.json"] = JSON.stringify({ ...test.receipt, ...change });
   else delete test.files["/data/terminal-runtime/broker.json"];
-  expect(test.check).toThrow(/cannot safely survive.*--migrate-terminals/);
+  expect(test.check).toThrow(/cannot safely survive.*requires confirmation/);
 });
 it("rejects a receipt from a different service cgroup", () => {
   const test = fixture("web");
@@ -63,17 +63,22 @@ it("requires kernel cgroup emptiness after service stop, including descendants",
   expect(() => assertStoppedService(commands, "cloudx.service", "/user/cloudx.service", () => "populated 0\n")).not.toThrow();
   expect(() => assertStoppedService(commands, "cloudx.service", "/user/cloudx.service", () => { throw Object.assign(new Error(), { code: "ENOENT" }); })).not.toThrow();
 });
+it("checks the original cgroup even if a stopped service definition disappears", () => {
+  const commands = { inspect: () => "LoadState=not-found" };
+  expect(() => assertStoppedService(commands, "cloudx.service", "/user/cloudx.service", () => "populated 1\n")).toThrow("still owns processes");
+  expect(() => assertStoppedService(commands, "cloudx.service", "/user/cloudx.service", () => "populated 0\n")).not.toThrow();
+});
 it("keeps the broker alive if recovery state cannot be backed up", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-migrate-")); roots.push(root);
-  fs.writeFileSync(path.join(root, "workspace.json"), "{}");
+  fs.writeFileSync(path.join(root, "workspace.json"), "{invalid");
   const actions = [];
   const commands = {
     inspect: (_cmd, args) => Object.entries(actions.length && args[2] === "cloudx.service"
       ? { ...state, ActiveState: "inactive", MainPID: "0", ControlGroup: "" } : { ...state, ControlGroup: "/cloudx-migrate-fixture.service" }).map(([k, v]) => `${k}=${v}`).join("\n"),
     run: (_cmd, args) => actions.push(args),
   };
-  expect(() => prepareRuntimeUpdate({ paths: { dataDir: root, repoRoot: "/repo" }, commands, target: { kind: "standard" }, migrateTerminals: true, log: () => {} })).toThrow("Legacy workspace has no saved session identities");
-  expect(actions).toEqual([["--user", "stop", "cloudx.service"]]);
+  expect(() => prepareRuntimeUpdate({ paths: { dataDir: root, repoRoot: "/repo" }, commands, target: { kind: "standard" }, migrateTerminals: true, log: () => {} })).toThrow("Invalid recovery state");
+  expect(actions).toEqual([]);
 });
 it("rejects a stopped main PID with surviving service descendants", () => {
   expect(() => assertPinnedTerminalRuntime({ state: { ...state, ActiveState: "inactive", MainPID: "0" }, service: "custom.service", readFile: () => "populated 1\n" })).toThrow("still owns processes");
@@ -144,3 +149,144 @@ it.each(["/", "/user/external.scope", "/user/cloudx-terminal.service-other", "/u
     expect(migration.stopped).toEqual(["cloudx.service", "cloudx-terminal.service"]);
   },
 );
+
+const currentRuntime = { brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true };
+
+function plannedRuntime() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-runtime-plan-")); roots.push(root);
+  const services = { "cloudx.service": { ...state }, "cloudx-terminal.service": { ...state } };
+  const web = fixture("web"), broker = fixture("broker");
+  const files = { ...web.files, ...broker.files, "/proc/self/cgroup": "0::/user/updater.service\n" };
+  const actions = [];
+  const options = {
+    paths: { dataDir: root, repoRoot: "/repo" }, target: { kind: "standard" }, targetRuntime: currentRuntime,
+    log: vi.fn(), commands: {
+      inspect: (_command, args) => Object.entries(services[args[2]]).map(([key, value]) => `${key}=${value}`).join("\n"),
+      run: vi.fn((_command, args) => {
+        actions.push(args[2]);
+        services[args[2]] = { ...services[args[2]], ActiveState: "inactive", MainPID: "0" };
+      }),
+    },
+    readFile: file => {
+      if (file.startsWith("/sys/fs/cgroup/")) return "populated 0\n";
+      const actual = file.startsWith(root) ? file.replace(root, "/data") : file;
+      if (!(actual in files)) throw Object.assign(new Error(`ENOENT: no such file or directory, open '${file}'`), { code: "ENOENT" });
+      return files[actual];
+    },
+  };
+  return { root, services, files, actions, options };
+}
+
+it("returns a read-only interruption plan for the missing terminal-runtime/web.json incident", () => {
+  const f = plannedRuntime();
+  delete f.files["/data/terminal-runtime/web.json"];
+  const plan = inspectRuntimeUpdate(f.options);
+  expect(plan.requiresInterruption).toBe(true);
+  expect(plan.blockers).toEqual([]);
+  expect(plan.reasons).toEqual([{ service: "cloudx.service", role: "web", message: expect.stringContaining("terminal-runtime/web.json") }]);
+  expect(f.actions).toEqual([]);
+  expect(fs.readdirSync(f.root)).toEqual([]);
+  let refusal;
+  try { prepareRuntimeUpdate(f.options); } catch (error) { refusal = error; }
+  expect(refusal.code).toBe("CLOUDX_TERMINAL_CONFIRMATION_REQUIRED");
+  expect(refusal.plan).toEqual(plan);
+  expect(f.actions).toEqual([]);
+  expect(prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true }).plan).toEqual(plan);
+  expect(f.actions).toEqual(["cloudx.service"]);
+  expect(f.services["cloudx-terminal.service"].ActiveState).toBe("active");
+});
+
+it("preserves compatible services even when interruption was previously confirmed", () => {
+  const f = plannedRuntime();
+  expect(prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true }).plan.requiresInterruption).toBe(false);
+  expect(f.actions).toEqual([]);
+});
+
+it.each([undefined, { ...currentRuntime, persistentSessions: false }, { ...currentRuntime, brokerProtocol: 2 }, { ...currentRuntime, supervisorContract: "old" }])(
+  "requires interruption when the selected target cannot use the live runtime: %j", targetRuntime => {
+    const f = plannedRuntime();
+    const plan = inspectRuntimeUpdate({ ...f.options, targetRuntime });
+    expect(plan.reasons).toHaveLength(2);
+    expect(plan.reasons.every(reason => reason.message.includes("selected target"))).toBe(true);
+    expect(f.actions).toEqual([]);
+  },
+);
+
+it("does not require receipts or target capability evidence for missing or verified stopped services", () => {
+  const f = plannedRuntime();
+  f.services["cloudx.service"] = { LoadState: "not-found" };
+  f.services["cloudx-terminal.service"] = { ...state, ActiveState: "failed", MainPID: "0" };
+  expect(inspectRuntimeUpdate({ ...f.options, targetRuntime: undefined }).requiresInterruption).toBe(false);
+  expect(f.actions).toEqual([]);
+});
+
+it("migrates an explicitly selected custom service without touching a foreign broker", () => {
+  const f = plannedRuntime();
+  f.services["custom.service"] = { ...state };
+  f.services["cloudx-terminal.service"].WorkingDirectory = "/foreign";
+  delete f.files["/data/terminal-runtime/web.json"];
+  const result = prepareRuntimeUpdate({ ...f.options, target: { kind: "web", serviceNames: ["custom.service"] }, interruptionConfirmed: true });
+  expect(result.plan.services.map(entry => entry.service)).toEqual(["custom.service"]);
+  expect(f.actions).toEqual(["custom.service"]);
+  expect(f.services["cloudx-terminal.service"].ActiveState).toBe("active");
+});
+
+it.each(["cloudx.service", "cloudx-terminal.service"])("blocks a standard update when %s belongs to another checkout", service => {
+  const f = plannedRuntime();
+  f.services[service].WorkingDirectory = "/foreign";
+  expect(inspectRuntimeUpdate(f.options).blockers).toEqual([{ service, message: expect.stringContaining("another checkout") }]);
+  expect(() => prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true })).toThrow("another checkout");
+  expect(f.actions).toEqual([]);
+});
+
+it("checks active Forge work and recovery paths during planning, before service stops", () => {
+  const f = plannedRuntime();
+  delete f.files["/data/terminal-runtime/web.json"];
+  fs.mkdirSync(path.join(f.root, "forge-workers/workspaces"), { recursive: true });
+  fs.writeFileSync(path.join(f.root, "forge-workers/workspaces/worker.json"), JSON.stringify({ id: "worker", launchPending: true, gitPending: false, cleaned: false }));
+  expect(inspectRuntimeUpdate(f.options).blockers[0].message).toContain("pending launch or Git operation");
+  expect(() => prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true })).toThrow("pending launch");
+  expect(f.actions).toEqual([]);
+  fs.rmSync(path.join(f.root, "forge-workers"), { recursive: true });
+  fs.symlinkSync("/etc/passwd", path.join(f.root, "sessions.json"));
+  expect(inspectRuntimeUpdate(f.options).blockers[0].message).toContain("owned regular file");
+  expect(f.actions).toEqual([]);
+});
+
+it("discloses lost legacy identities and snapshots exact layouts after confirmation", () => {
+  const f = plannedRuntime();
+  const bytes = '{"windows":[{"id":"old-window","layout":{"root":{"type":"pane","id":"old-pane","tabIds":["old-tab"]}}}]}\n';
+  fs.writeFileSync(path.join(f.root, "workspace.json"), bytes);
+  delete f.files["/data/terminal-runtime/web.json"];
+  const plan = inspectRuntimeUpdate(f.options);
+  expect(plan.blockers).toEqual([]);
+  expect(plan.recovery.legacySessionIdentitiesUnavailable).toBe(true);
+  expect(plan.recovery.warnings.join(" ")).toContain("cannot be restored");
+  expect(() => prepareRuntimeUpdate(f.options)).toThrow("Confirm terminal interruption");
+  expect(fs.readdirSync(f.root)).toEqual(["workspace.json"]);
+  const { recoverySnapshot } = prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true });
+  expect(fs.readFileSync(path.join(recoverySnapshot, "workspace.json"), "utf8")).toBe(bytes);
+  expect(fs.readFileSync(path.join(f.root, "workspace.json"), "utf8")).toBe(bytes);
+  expect(fs.existsSync(path.join(f.root, "sessions.json"))).toBe(false);
+  expect(JSON.parse(fs.readFileSync(path.join(recoverySnapshot, "manifest.json"), "utf8")).legacySessionIdentitiesUnavailable).toBe(true);
+});
+
+it("does not stop services or write a recovery snapshot during a dry run", () => {
+  const f = plannedRuntime();
+  delete f.files["/data/terminal-runtime/web.json"];
+  prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true, dryRun: true });
+  expect(f.actions).toEqual([]);
+  expect(fs.readdirSync(f.root)).toEqual([]);
+});
+
+it("accepts mixed termination but reports unsafe legacy termination and unstable units before stopping", () => {
+  const f = plannedRuntime();
+  delete f.files["/data/terminal-runtime/web.json"];
+  f.services["cloudx.service"].KillMode = "mixed";
+  expect(inspectRuntimeUpdate(f.options).blockers).toEqual([]);
+  f.services["cloudx.service"].KillMode = "process";
+  expect(inspectRuntimeUpdate(f.options).blockers[0].message).toContain("termination policy");
+  f.services["cloudx.service"].ActiveState = "deactivating";
+  expect(inspectRuntimeUpdate(f.options).blockers[0].message).toContain("not stable");
+  expect(f.actions).toEqual([]);
+});

@@ -145,7 +145,7 @@ describe("Settings navigation and search", () => {
   it("finds the Updates action by the tools and dependencies it updates", async () => {
     const start = vi.fn(async () => undefined);
     const { container } = await mount({ cloudxUpdate: {
-      status: { available: true }, channel: "main", previewLoading: false, starting: false, checking: false, start, check: vi.fn(), selectChannel: vi.fn(),
+      status: { available: true }, channel: "main", previewLoading: false, starting: false, checking: false, start, resume: vi.fn(), check: vi.fn(), selectChannel: vi.fn(),
       preview: {
         channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "current", changelog: [], changelogComplete: true,
         target: { commit: "a".repeat(40), name: "main", url: "https://github.com/davidomil/cloudx/tree/main" }

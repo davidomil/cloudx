@@ -3,6 +3,7 @@ import websocket from "@fastify/websocket";
 import staticPlugin from "@fastify/static";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { runtimeBuild } from "./system/RuntimeBuild.js";
 import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
@@ -314,6 +315,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     port: config.port,
     plugins: services.plugins.list().map((plugin) => plugin.id)
   }));
+
+  app.get("/api/runtime", async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    return runtimeBuild.identity;
+  });
 
   app.get("/api/ready", async (_request, reply) => {
     try {

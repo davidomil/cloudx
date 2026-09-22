@@ -1387,6 +1387,115 @@ test("Updates selects persisted release channels and shows availability and merg
   ).toBeDisabled();
 });
 
+test("Updates confirms terminal interruption and resumes the saved target after a failed phase", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const id = "11111111-1111-4111-8111-111111111111";
+  const targetCommit = mainUpdatePreview.target!.commit;
+  const requests: unknown[] = [];
+  let status: CloudxUpdateStatus = { available: true };
+  await page.route("**/api/system/update", async (route) => {
+    if (route.request().method() === "POST") {
+      const request = route.request().postDataJSON();
+      requests.push(request);
+      if (!request.confirmInterruption && !request.resumeRunId) {
+        status = {
+          available: true,
+          confirmation: {
+            targetCommit,
+            message:
+              "Replacing the legacy terminal service stops running terminal processes. Saved layouts and conversation identities remain recoverable.",
+          },
+        };
+      } else {
+        status = {
+          available: true,
+          run: {
+            id,
+            targetCommit,
+            state: request.resumeRunId ? "running" : "failed",
+            message: request.resumeRunId
+              ? "Resuming the saved update."
+              : "Dependency preparation failed.",
+            startedAt: "2026-09-22T00:00:00.000Z",
+            phase: "dependencies",
+            component: "download",
+            ...(request.resumeRunId
+              ? {}
+              : {
+                  cause: "Network unavailable.",
+                  recoveryAction: "Restore connectivity, then resume.",
+                  resumable: true,
+                }),
+          },
+        };
+      }
+    }
+    await route.fulfill({ json: status });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  let settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  await settings
+    .getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    })
+    .click();
+  const confirmation = settings.getByRole("group", {
+    name: "Confirm update interruption",
+  });
+  const proceed = confirmation.getByRole("button", {
+    name: "Confirm interruption and continue",
+  });
+  await expect(proceed).toBeDisabled();
+  await expect(confirmation).toContainText("stops running terminal processes");
+  await confirmation.getByRole("checkbox").check();
+  await proceed.scrollIntoViewIfNeeded();
+  await expect(proceed).toBeInViewport({ ratio: 0.99 });
+  await proceed.click({ trial: true });
+  await expectSettingsFits(page, isMobile);
+  await captureSample(
+    page,
+    testInfo,
+    "settings-update-interruption-confirmation",
+  );
+  expect(requests).toEqual([{ channel: "main", targetCommit }]);
+  await proceed.click();
+  await expect(settings).toContainText("Cause: Network unavailable.");
+  await expect(settings).toContainText(
+    "Recovery: Restore connectivity, then resume.",
+  );
+  await settings
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await page.route("**/api/system/update/preview", (route) =>
+    route.fulfill({ status: 503, json: { error: "GitHub unavailable." } }),
+  );
+  settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  const resume = settings.getByRole("button", {
+    name: "Resume update",
+    exact: true,
+  });
+  await expect(resume).toBeEnabled();
+  await resume.scrollIntoViewIfNeeded();
+  await expect(resume).toBeInViewport({ ratio: 1 });
+  await captureSample(page, testInfo, "settings-update-recovery");
+  await resume.click();
+  await expect(settings).toContainText("Resuming the saved update.");
+  expect(requests).toEqual([
+    { channel: "main", targetCommit },
+    { channel: "main", targetCommit, confirmInterruption: true },
+    { channel: "main", targetCommit, resumeRunId: id },
+  ]);
+});
+
 test("Updates reconnects after restart and reloads once with Settings closed", async ({
   page,
   isMobile,

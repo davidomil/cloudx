@@ -4,12 +4,19 @@ export interface CloudxUpdateRun {
   message: string;
   startedAt: string;
   finishedAt?: string;
+  targetCommit?: string;
+  phase?: string;
+  component?: string;
+  cause?: string;
+  recoveryAction?: string;
+  resumable?: boolean;
 }
 
 export interface CloudxUpdateStatus {
   available: boolean;
   unavailableReason?: string;
   run?: CloudxUpdateRun;
+  confirmation?: { targetCommit: string; message: string; restoreSnapshotRunId?: string; requiresInterruption?: boolean };
 }
 
 export type CloudxUpdateChannel = "releases" | "main";
@@ -26,9 +33,15 @@ export interface CloudxUpdatePreview {
   message?: string;
 }
 
-export interface CloudxUpdateRequest {
+export interface CloudxUpdateConsent {
+  confirmInterruption?: boolean;
+  restoreSnapshotRunId?: string;
+}
+
+export interface CloudxUpdateRequest extends CloudxUpdateConsent {
   channel: CloudxUpdateChannel;
   targetCommit: string;
+  resumeRunId?: string;
 }
 
 export function parseCloudxUpdateChannel(value: unknown): CloudxUpdateChannel {
@@ -37,10 +50,19 @@ export function parseCloudxUpdateChannel(value: unknown): CloudxUpdateChannel {
 }
 
 export function parseCloudxUpdateRequest(value: unknown): CloudxUpdateRequest {
-  if (!record(value) || Object.keys(value).length !== 2 || !commit(value.targetCommit)) {
+  if (!record(value) || Object.keys(value).some(key => !["channel", "targetCommit", "confirmInterruption", "resumeRunId", "restoreSnapshotRunId"].includes(key))
+    || !commit(value.targetCommit)
+    || (value.confirmInterruption !== undefined && typeof value.confirmInterruption !== "boolean")
+    || (value.resumeRunId !== undefined && !runId(value.resumeRunId))
+    || (value.restoreSnapshotRunId !== undefined && !runId(value.restoreSnapshotRunId))) {
     throw new Error("An update request must contain a channel and the checked target commit.");
   }
-  return { channel: parseCloudxUpdateChannel(value.channel), targetCommit: value.targetCommit };
+  return {
+    channel: parseCloudxUpdateChannel(value.channel), targetCommit: value.targetCommit,
+    ...(value.confirmInterruption === undefined ? {} : { confirmInterruption: value.confirmInterruption as boolean }),
+    ...(value.resumeRunId === undefined ? {} : { resumeRunId: value.resumeRunId as string }),
+    ...(value.restoreSnapshotRunId === undefined ? {} : { restoreSnapshotRunId: value.restoreSnapshotRunId as string }),
+  };
 }
 
 export function parseCloudxUpdatePreview(value: unknown): CloudxUpdatePreview {
@@ -98,12 +120,28 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
   }
   const result: CloudxUpdateStatus = { available: value.available };
   if (value.unavailableReason !== undefined) result.unavailableReason = value.unavailableReason as string;
+  if (value.confirmation !== undefined) {
+    if (!record(value.confirmation) || !commit(value.confirmation.targetCommit) || !text(value.confirmation.message)
+      || (value.confirmation.restoreSnapshotRunId !== undefined && !runId(value.confirmation.restoreSnapshotRunId))
+      || (value.confirmation.requiresInterruption !== undefined && typeof value.confirmation.requiresInterruption !== "boolean")) {
+      throw new Error("Invalid CloudX update confirmation.");
+    }
+    result.confirmation = {
+      targetCommit: value.confirmation.targetCommit, message: value.confirmation.message,
+      ...(value.confirmation.restoreSnapshotRunId === undefined ? {} : { restoreSnapshotRunId: value.confirmation.restoreSnapshotRunId as string }),
+      ...(value.confirmation.requiresInterruption === undefined ? {} : { requiresInterruption: value.confirmation.requiresInterruption as boolean }),
+    };
+  }
   if (value.run !== undefined) {
     const run = value.run;
     if (!record(run) || !text(run.id, 128) || !text(run.message)
       || typeof run.state !== "string" || !["running", "succeeded", "failed"].includes(run.state)
       || !timestamp(run.startedAt)
-      || (run.finishedAt !== undefined && !timestamp(run.finishedAt))) {
+      || (run.finishedAt !== undefined && !timestamp(run.finishedAt))
+      || (run.targetCommit !== undefined && !commit(run.targetCommit))
+      || ["phase", "component", "cause", "recoveryAction"].some(key => run[key] !== undefined && !text(run[key]))
+      || (run.resumable !== undefined && typeof run.resumable !== "boolean")
+      || (run.resumable === true && (run.state !== "failed" || !runId(run.id) || !commit(run.targetCommit)))) {
       throw new Error("Invalid CloudX update run.");
     }
     result.run = {
@@ -111,7 +149,13 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
       state: run.state as CloudxUpdateRun["state"],
       message: run.message as string,
       startedAt: run.startedAt as string,
-      ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt as string })
+      ...(run.finishedAt === undefined ? {} : { finishedAt: run.finishedAt as string }),
+      ...(run.targetCommit === undefined ? {} : { targetCommit: run.targetCommit as string }),
+      ...(run.phase === undefined ? {} : { phase: run.phase as string }),
+      ...(run.component === undefined ? {} : { component: run.component as string }),
+      ...(run.cause === undefined ? {} : { cause: run.cause as string }),
+      ...(run.recoveryAction === undefined ? {} : { recoveryAction: run.recoveryAction as string }),
+      ...(run.resumable === undefined ? {} : { resumable: run.resumable as boolean }),
     };
   }
   return result;
@@ -119,6 +163,10 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function runId(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
 
 function text(value: unknown, limit = 4096): value is string {

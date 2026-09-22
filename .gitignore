@@ -39,3 +39,6 @@ docs/assets/generated/ingestion-flow.*
 REVIEW_TRACKING.md
 
 *.egg-info/
+
+# Previous generated runtimes retained by the managed updater until recovery is no longer needed.
+*.cloudx-previous-*

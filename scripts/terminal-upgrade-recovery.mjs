@@ -10,6 +10,7 @@ const SAFE_ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 const FORGE_STATE = `plugin-data/forge-${createHash("sha256").update("forge").digest("hex")}.json`;
 const WORKER_GUIDANCE = "Stop or recover the worker through CloudX first. Resolve missing ownership evidence explicitly; service restarts do not prove a worker ended. Local resources were preserved.";
+const LEGACY_RECOVERY = "Legacy workspace has no saved session identities. Its exact layout will be backed up, but in-memory tabs and terminal processes cannot be restored. Record working directories and exact Codex conversation IDs before confirming interruption. No commands or prompts will be replayed.";
 
 /** Run before stopping the web service; snapshotTerminalRecovery checks again after it stops. */
 export function assertTerminalMigrationSafe({ dataDir }) {
@@ -17,13 +18,21 @@ export function assertTerminalMigrationSafe({ dataDir }) {
   snapshot.readForgeState();
 }
 
+export function inspectTerminalRecovery({ dataDir, allowLegacyState = false }) {
+  const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
+  snapshot.readForgeState();
+  snapshot.readSessions();
+  return { legacySessionIdentitiesUnavailable: snapshot.legacySessions, warnings: snapshot.legacySessions ? [LEGACY_RECOVERY] : [] };
+}
+
 /** The caller must stop the web service before this runs, and stop the broker only after it returns. */
-export function snapshotTerminalRecovery({ dataDir, log = console.warn }) {
-  const snapshot = new RecoverySnapshot(dataDir);
+export function snapshotTerminalRecovery({ dataDir, log = console.warn, allowLegacyState = false }) {
+  const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
   snapshot.readForgeState();
   snapshot.readSessions();
   if (!snapshot.files.size) return undefined;
   const backup = snapshot.save();
+  if (snapshot.legacySessions) log(LEGACY_RECOVERY);
   log(`Verified terminal recovery snapshot: ${backup}. Broker replacement interrupts processes. Reopen shells explicitly and select an exact saved Codex conversation in each existing tab; no commands or prompts are replayed.`);
   return backup;
 }
@@ -34,10 +43,12 @@ class RecoverySnapshot {
   sources = [];
   bytes = 0;
   entries = 0;
+  legacySessions = false;
 
-  constructor(dataDir) {
+  constructor(dataDir, allowLegacyState = false) {
     this.dataDir = path.resolve(dataDir);
     this.present = safeDirectory(this.dataDir, true);
+    this.allowLegacyState = allowLegacyState;
   }
 
   capture(relative, optional = false, source = path.join(this.dataDir, relative), limit = STATE_LIMIT) {
@@ -118,8 +129,10 @@ class RecoverySnapshot {
     if (!this.present) return;
     const workspace = this.json("workspace.json", true);
     const saved = this.json("sessions.json", true);
-    if (workspace !== undefined && saved === undefined && (!validWorkspace(workspace) || workspace.windows.some(window => layoutTabIds(window.layout).length)))
-      throw new Error("Legacy workspace has no saved session identities. Preserve and close its terminals manually before broker replacement; layout alone cannot restore them.");
+    if (workspace !== undefined && saved === undefined && (!validWorkspace(workspace) || workspace.windows.some(window => layoutTabIds(window.layout).length))) {
+      if (!this.allowLegacyState) throw new Error(LEGACY_RECOVERY);
+      this.legacySessions = true;
+    }
     if (saved === undefined) return;
     if (!saved || saved.version !== 1 || !Array.isArray(saved.sessions) || saved.sessions.length > FILE_LIMIT ||
         saved.sessions.some(session => !session || !validSession(session)))
@@ -187,6 +200,8 @@ class RecoverySnapshot {
         if (!readFile(source, TRANSCRIPT_LIMIT).equals(bytes)) throw new Error(`Recovery source changed during snapshot: ${source}`);
       for (const source of this.sources) assertSourceIdentity(source);
       fs.writeFileSync(path.join(backup, "manifest.json"), `${JSON.stringify({ version: 1, capturedAt: new Date().toISOString(), files, conversations: this.conversations,
+        legacySessionIdentitiesUnavailable: this.legacySessions,
+        warnings: this.legacySessions ? [LEGACY_RECOVERY] : [],
         recovery: "Keep existing tabs and layouts. Start shells explicitly. Select an exact saved Codex session in its existing tab; lastObservedSessionId is not proof of the current native selection. Never replay saved shell commands or AI prompts. Forge ownership records remain unchanged." }, null, 2)}\n`,
       { flag: "wx", mode: 0o600, flush: true });
       syncDirectories(backup);

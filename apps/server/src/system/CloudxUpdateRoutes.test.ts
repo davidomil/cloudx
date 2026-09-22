@@ -54,6 +54,28 @@ describe("CloudX update HTTP boundary", () => {
     expect(start).toHaveBeenCalledExactlyOnceWith(selection);
   });
 
+  it("passes explicit interruption consent and pinned resume identity through the trusted boundary", async () => {
+    const request = { ...selection, confirmInterruption: true, resumeRunId: "11111111-1111-4111-8111-111111111111", restoreSnapshotRunId: "22222222-2222-4222-8222-222222222222" };
+    const response = await app.inject({ method: "POST", url: "/api/system/update", headers, payload: request });
+    expect(response.statusCode).toBe(202);
+    expect(start).toHaveBeenCalledExactlyOnceWith(request);
+  });
+
+  it("returns a target-bound interruption notice without claiming the update started", async () => {
+    const confirmation = { available: true, confirmation: { targetCommit: selection.targetCommit, message: "Replacing terminals interrupts running work." } };
+    start.mockResolvedValueOnce(confirmation);
+    const response = await app.inject({ method: "POST", url: "/api/system/update", headers, payload: selection });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(confirmation);
+  });
+
+  it.each([{ confirmInterruption: "yes" }, { resumeRunId: "../run" }, { resumeRunId: "--command=bad" }, { restoreSnapshotRunId: "/arbitrary/data" }])("rejects unsafe recovery options before host work: %j", fields => {
+    return app.inject({ method: "POST", url: "/api/system/update", headers, payload: { ...selection, ...fields } }).then(response => {
+      expect(response.statusCode).toBe(400);
+      expect(start).not.toHaveBeenCalled();
+    });
+  });
+
   it.each([
     { host: "evil.example", origin: "http://localhost" },
     { host: "localhost", origin: "https://evil.example" },
