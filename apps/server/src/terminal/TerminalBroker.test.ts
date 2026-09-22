@@ -126,6 +126,27 @@ describe("durable terminal broker", () => {
     } finally { terminal.detach!(); }
   });
 
+  it("sends an already-retained exit before acknowledging attachment readiness", async () => {
+    const { factory, process, socketPath } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("exited-shell"));
+    const exited = new Promise<TerminalExit>(resolve => terminal.onExit(resolve));
+    process.exit({ exitCode: 0 });
+    await exited;
+    terminal.detach!();
+    const messages: string[] = [];
+    const socket = net.createConnection(socketPath);
+    cleanups.push(async () => { socket.destroy(); });
+    const ready = new Promise<void>(resolve => readTerminalMessages(socket, value => {
+      const type = (value as { type: string }).type;
+      messages.push(type);
+      if (type === "ready") resolve();
+    }));
+    await new Promise<void>(resolve => socket.once("connect", resolve));
+    socket.write(JSON.stringify({ type: "attach", sessionId: "exited-shell" }) + "\n");
+    await ready;
+    expect(messages.slice(-2)).toEqual(["exit", "ready"]);
+  });
+
   it.each([
     "a".repeat(MAX_TERMINAL_INPUT_BYTES),
     "b".repeat(300 * 1024),

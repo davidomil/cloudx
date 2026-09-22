@@ -18,6 +18,7 @@ type UpdateCommand = (file: string, args: string[], options: {
 
 export class CloudxUpdateService {
   private readonly repoRoot = process.env.CLOUDX_INSTALL_ROOT ?? defaultRepoRoot;
+  private readonly coordinatorRoot = process.env.CLOUDX_UPDATE_COORDINATOR_ROOT ?? this.repoRoot;
   private changing = false;
   private readonly previews = new Map<string, CloudxUpdatePreview>();
   private readonly checking = new Map<string, Promise<CloudxUpdatePreview>>();
@@ -25,6 +26,7 @@ export class CloudxUpdateService {
   constructor(private readonly dataDir: string, private readonly execute: UpdateCommand = executeFile,
     private readonly catalog: Pick<CloudxUpdateCatalog, "preview"> = new CloudxUpdateCatalog()) {
     if (!path.isAbsolute(this.repoRoot)) throw new Error("CLOUDX_INSTALL_ROOT must be an absolute checkout path.");
+    if (!path.isAbsolute(this.coordinatorRoot)) throw new Error("CLOUDX_UPDATE_COORDINATOR_ROOT must be an absolute coordinator path.");
   }
 
   status(): Promise<CloudxUpdateStatus> {
@@ -122,7 +124,7 @@ export class CloudxUpdateService {
   private async request(action: "status" | "start", request?: CloudxUpdateRequest): Promise<CloudxUpdateStatus> {
     try {
       const { stdout } = await this.execute(process.execPath, [
-        path.join(this.repoRoot, "scripts/settings-update.mjs"), action, this.dataDir, String(process.pid),
+        path.join(this.coordinatorRoot, "scripts/settings-update.mjs"), action, this.dataDir, String(process.pid),
         ...(request ? [request.targetCommit] : []),
         ...(request?.confirmInterruption ? ["--confirm-interruption"] : []),
         ...(request?.resumeRunId ? [`--resume=${request.resumeRunId}`] : []),

@@ -2,9 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Fastify from "fastify";
 import type { CloudxUpdateStatus, CloudxUpdateRequest, CloudxUpdatePreview } from "@cloudx/shared";
 import { loadConfig } from "../config.js";
 import { buildServer, buildServices } from "../server.js";
+import { registerCloudxUpdateRoutes } from "./CloudxUpdateRoutes.js";
 
 describe("CloudX update HTTP boundary", () => {
   const running = { available: true, run: { id: "update-1", state: "running" as const, message: "Updating.", startedAt: "2026-09-15T00:00:00Z" } };
@@ -52,6 +54,17 @@ describe("CloudX update HTTP boundary", () => {
     expect(accepted.statusCode).toBe(202);
     expect(accepted.json()).toEqual(running);
     expect(start).toHaveBeenCalledExactlyOnceWith(selection);
+  });
+
+  it("provides startup identity when installed into a historical server without the runtime route", async () => {
+    const historical = Fastify();
+    registerCloudxUpdateRoutes(historical, { status, start, preview, selectChannel }, []);
+    try {
+      const response = await historical.inject({ url: "/api/runtime" });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.json()).toMatchObject({ verification: "unverified", build: null, pid: process.pid });
+    } finally { await historical.close(); }
   });
 
   it("passes explicit interruption consent and pinned resume identity through the trusted boundary", async () => {

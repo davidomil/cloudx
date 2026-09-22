@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { CloudxUpdateChannel, CloudxUpdateConsent, CloudxUpdatePreview, CloudxUpdateRequest, CloudxUpdateStatus } from "@cloudx/shared";
 
-import { getCloudxUpdatePreview, getCloudxUpdateStatus, HttpError, setCloudxUpdateChannel, startCloudxUpdate } from "../api.js";
+import { getCloudxUpdatePreview, getCloudxUpdateStatus, setCloudxUpdateChannel, startCloudxUpdate } from "../cloudxUpdateApi.js";
+import { HttpError } from "../api.js";
 import { ControlButton } from "./Control.js";
 
 const pendingRunKey = "cloudx.update.pendingRun";
@@ -227,9 +228,11 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
   const { status, preview, channel, previewLoading, starting, checking, notice, error } = update;
   const running = status?.run?.state === "running";
   const canUpdate = preview?.target && preview.state !== "unavailable";
-  const canResume = status?.run?.state === "failed" && status.run.resumable;
-  const confirmation = status?.confirmation?.targetCommit === (canResume ? status.run?.targetCommit : preview?.target?.commit) ? status?.confirmation : undefined;
-  const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || Boolean(error);
+  const canResume = status?.run?.state === "failed" && status.run.resumable === true;
+  const selectedTargetDiffers = preview?.target?.commit !== status?.run?.targetCommit;
+  const confirmingResume = canResume && status?.confirmation?.targetCommit === status.run?.targetCommit;
+  const confirmation = confirmingResume || status?.confirmation?.targetCommit === preview?.target?.commit ? status?.confirmation : undefined;
+  const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || Boolean(error) || canResume && !selectedTargetDiffers;
   return <section className="settings-section browser-notification-settings cloudx-update-settings" aria-label="CloudX updates">
     <h3>Update CloudX</h3>
     <p>Update CloudX and its application dependencies.</p>
@@ -253,13 +256,13 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
     {notice ? <p role="status">{notice}</p> : null}
     {error ? <p role="alert">{error}</p> : null}
     {confirmation ? <UpdateConfirmation key={`${confirmation.targetCommit}:${confirmation.message}:${confirmation.restoreSnapshotRunId}:${confirmation.requiresInterruption}`} confirmation={confirmation}
-      disabled={canResume ? !status?.available || starting || checking : startDisabled}
-      continueUpdate={consent => canResume ? update.resume(consent) : update.start(consent)} /> : null}
+      disabled={confirmingResume ? !status?.available || starting || checking : startDisabled}
+      continueUpdate={consent => confirmingResume ? update.resume(consent) : update.start(consent)} /> : null}
     {canResume && !confirmation ? <ControlButton tone="primary" onClick={() => void update.resume()} disabled={!status?.available || starting || checking}>
       {starting ? "Resuming update…" : "Resume update"}
     </ControlButton> : null}
-    {!confirmation ? <ControlButton tone="primary" onClick={() => void update.start()} disabled={startDisabled || canResume}>
-      {starting ? "Starting update…" : running ? "Updating CloudX…" : "Update CloudX and dependencies"}
+    {!confirmation || confirmingResume && selectedTargetDiffers ? <ControlButton tone="primary" onClick={() => void update.start()} disabled={startDisabled}>
+      {starting ? "Starting update…" : running ? "Updating CloudX…" : canResume ? "Start selected target" : "Update CloudX and dependencies"}
     </ControlButton> : null}
     <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading}>Check update status</ControlButton>
     <small>The update starts immediately and continues if you close Settings.</small>

@@ -1496,6 +1496,90 @@ test("Updates confirms terminal interruption and resumes the saved target after 
   ]);
 });
 
+test("Updates starts a different selected target after preparation fails", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const failedTarget = mainUpdatePreview.target!.commit;
+  const selectedTarget = "c".repeat(40);
+  const requests: unknown[] = [];
+  let status: CloudxUpdateStatus = { available: true };
+  let preview = mainUpdatePreview;
+  await page.route("**/api/system/update/preview", async (route) => {
+    if (route.request().method() === "PUT") {
+      preview = {
+        ...mainUpdatePreview,
+        channel: "releases",
+        target: {
+          commit: selectedTarget,
+          name: "v0.2.0",
+          url: "https://github.com/davidomil/cloudx/releases/tag/v0.2.0",
+        },
+      };
+    }
+    await route.fulfill({ json: preview });
+  });
+  await page.route("**/api/system/update", async (route) => {
+    if (route.request().method() === "POST") {
+      const request = route.request().postDataJSON();
+      requests.push(request);
+      const failed = request.targetCommit === failedTarget;
+      status = {
+        available: true,
+        run: {
+          id: failed
+            ? "11111111-1111-4111-8111-111111111111"
+            : "22222222-2222-4222-8222-222222222222",
+          targetCommit: request.targetCommit,
+          state: failed ? "failed" : "running",
+          message: failed
+            ? "The selected target could not be prepared."
+            : "Preparing the selected release.",
+          startedAt: "2026-09-22T00:00:00.000Z",
+          phase: "prepare",
+          ...(failed ? { resumable: true } : {}),
+        },
+      };
+    }
+    await route.fulfill({ json: status });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  await settings
+    .getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    })
+    .click();
+  await expect(settings.getByRole("alert")).toHaveText(
+    "The selected target could not be prepared.",
+  );
+  await settings.getByLabel("Update channel").selectOption("releases");
+  await expect(settings).toContainText("Target: v0.2.0");
+  await expect(settings).toContainText("Resume target: bbbbbbbbbbbb");
+  await expect(
+    settings.getByRole("button", { name: "Resume update", exact: true }),
+  ).toBeEnabled();
+  const startSelected = settings.getByRole("button", {
+    name: "Start selected target",
+    exact: true,
+  });
+  await expect(startSelected).toBeEnabled();
+  await startSelected.scrollIntoViewIfNeeded();
+  await expect(startSelected).toBeInViewport({ ratio: 1 });
+  await expectSettingsFits(page, isMobile);
+  await captureSample(page, testInfo, "settings-update-new-target-recovery");
+  await startSelected.click();
+  await expect(settings).toContainText("Preparing the selected release.");
+  expect(requests).toEqual([
+    { channel: "main", targetCommit: failedTarget },
+    { channel: "releases", targetCommit: selectedTarget },
+  ]);
+});
+
 test("Updates reconnects after restart and reloads once with Settings closed", async ({
   page,
   isMobile,

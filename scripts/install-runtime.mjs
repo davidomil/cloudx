@@ -38,6 +38,9 @@ export function assertPinnedTerminalRuntime({ dataDir, role, service, state, rea
       || role === "broker" && receipt.pid !== Number(state.MainPID)) {
       throw new Error("Runtime receipt does not identify the process in the current service invocation.");
     }
+    if (role === "broker" && receipt.attachmentExitBeforeReady !== true) {
+      throw new Error("The running broker lacks ordered attachment exit reporting. A confirmed terminal interruption is needed to distinguish exited shells from live sessions safely.");
+    }
   } catch (error) {
     throw new Error(`${service} cannot safely survive an in-place update: ${error.message} ` +
       "The managed update requires confirmation to preserve recovery state and interrupt terminals.", { cause: error });

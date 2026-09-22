@@ -13,12 +13,13 @@ import {
 } from "./install-update.mjs";
 import { bundleCoordinator, syncDirectory, verifySnapshot, writeUpdateJson } from "./managed-update-store.mjs";
 import { inspectRuntimeUpdate } from "./install-runtime.mjs";
+import { MANAGED_INTEGRATION_FILES } from "./managed-update-integration.mjs";
 import { CURRENT_TERMINAL_CONTRACT } from "./managed-update.mjs";
 import { parseEnvironmentFile } from "./installer-environment.mjs";
 
 export const UPDATE_UNIT = "cloudx-settings-update.service";
 export const UPDATE_TIMEOUT_MS = 60 * 60 * 1000;
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = process.env.CLOUDX_INSTALL_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RUNNING_STATES = new Set([
@@ -479,8 +480,8 @@ export class SettingsUpdater {
     }
     if (this.stageCoordinator) { record.coordinator = this.stageCoordinator(record); return; }
     const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-    const files = ["settings-update.mjs", "managed-update.mjs", "managed-update-store.mjs", "managed-update-data.mjs", "managed-update-terminals.mjs", "managed-runtime-launch.mjs", "write-runtime-build.mjs", "install-cloudx.mjs", "install-update.mjs", "install-runtime.mjs", "install-terminal-upgrade.mjs", "terminal-upgrade-recovery.mjs", "installer-environment.mjs"];
-    record.coordinator = bundleCoordinator(source, path.join(this.stateDir, record.run.id, "coordinator"), files.map(file => `scripts/${file}`));
+    const files = ["settings-update.mjs", "managed-update.mjs", "managed-update-store.mjs", "managed-update-data.mjs", "managed-update-terminals.mjs", "managed-update-readiness.mjs", "managed-update-integration.mjs", "managed-runtime-launch.mjs", "write-runtime-build.mjs", "install-cloudx.mjs", "install-update.mjs", "install-runtime.mjs", "install-terminal-upgrade.mjs", "terminal-upgrade-recovery.mjs", "installer-environment.mjs"];
+    record.coordinator = bundleCoordinator(source, path.join(this.stateDir, record.run.id, "coordinator"), [...files.map(file => `scripts/${file}`), ...MANAGED_INTEGRATION_FILES]);
   }
 
   run(id) {

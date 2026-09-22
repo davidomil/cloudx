@@ -53,6 +53,27 @@ describe("CloudxUpdateService", () => {
     finally { vi.unstubAllEnvs(); }
   });
 
+  it("keeps status and the next update on the independent coordinator after a downgrade", async () => {
+    const coordinator = path.join(dataDir, "retained-coordinator");
+    vi.stubEnv("CLOUDX_INSTALL_ROOT", dataDir);
+    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", coordinator);
+    try {
+      const { service, execute } = fixture();
+      await service.status();
+      await service.preview();
+      await service.start({ channel: "main", targetCommit: target });
+      const calls = execute.mock.calls.filter(([file]) => file === process.execPath);
+      expect(calls.every(([, args]) => args[0] === path.join(coordinator, "scripts/settings-update.mjs"))).toBe(true);
+      expect(calls.at(-1)?.[1]).toEqual([path.join(coordinator, "scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("rejects a relative coordinator setting", () => {
+    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", "relative/coordinator");
+    try { expect(() => fixture()).toThrow("absolute coordinator path"); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
   it("defaults to main and persists the chosen release cycle across service restarts", async () => {
     const { service, execute, catalog } = fixture();
     expect((await service.preview()).channel).toBe("main");

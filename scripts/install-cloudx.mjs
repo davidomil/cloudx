@@ -2684,7 +2684,12 @@ export function prepareManagedRelease({ releaseRoot, home, envConfig, standard =
 export function activateManagedServices({ repoRoot, releaseRoot, home, envConfig, runner, runtimeLaunch }) {
   const paths = installerPaths({ repoRoot, home, env: { ...process.env, ...envConfig } });
   paths.dataDir = envConfig.CLOUDX_DATA_DIR ?? paths.dataDir;
-  runner.writeFile(paths.envPath, updateEnvFileContent(fs.readFileSync(paths.envPath, 'utf8'), { ...missingEnvVars(envConfig, defaultDocumentationEnvVars(paths)), CLOUDX_INSTALL_ROOT: repoRoot }));
+  runner.writeFile(paths.envPath, updateEnvFileContent(fs.readFileSync(paths.envPath, 'utf8'), {
+    ...missingEnvVars(envConfig, defaultDocumentationEnvVars(paths)),
+    CLOUDX_INSTALL_ROOT: repoRoot,
+    CLOUDX_DATA_DIR: paths.dataDir,
+    ...(runtimeLaunch ? { CLOUDX_UPDATE_COORDINATOR_ROOT: path.resolve(path.dirname(runtimeLaunch.script), '..') } : {}),
+  }));
   const prepared = installerPaths({ repoRoot: releaseRoot, home, env: envConfig });
   // Python entry points keep their original absolute interpreter paths.
   for (const key of ['pythonPath', 'uvicornPath', 'documentationPythonPath', 'documentationIndexerPath']) paths[key] = prepared[key];

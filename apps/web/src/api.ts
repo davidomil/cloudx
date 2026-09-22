@@ -12,10 +12,6 @@ import type {
   CloudxConfigValues,
   CloudxLogSource,
   CloudxLogsResponse,
-  CloudxUpdateChannel,
-  CloudxUpdatePreview,
-  CloudxUpdateStatus,
-  CloudxUpdateRequest,
   ForgeConnectionAction,
   ForgeConnections,
   ForgeConnectionStatus,
@@ -47,7 +43,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseCloudxUpdatePreview, parseCloudxUpdateStatus, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
+import { parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -494,23 +490,7 @@ export async function getLogs(source: CloudxLogSource, signal?: AbortSignal): Pr
   return { source, content: snapshot.content, capturedAt: snapshot.capturedAt, truncated: snapshot.truncated };
 }
 
-export async function getCloudxUpdateStatus(signal?: AbortSignal): Promise<CloudxUpdateStatus> {
-  return parseCloudxUpdateStatus(await fetchJson<unknown>("/api/system/update", { signal, cache: "no-store" }));
-}
-
-export async function getCloudxUpdatePreview(signal?: AbortSignal): Promise<CloudxUpdatePreview> {
-  return parseCloudxUpdatePreview(await fetchJson<unknown>("/api/system/update/preview", { signal, cache: "no-store" }));
-}
-
-export async function setCloudxUpdateChannel(channel: CloudxUpdateChannel, signal?: AbortSignal): Promise<CloudxUpdatePreview> {
-  return parseCloudxUpdatePreview(await fetchJson<unknown>("/api/system/update/preview", { method: "PUT", body: JSON.stringify({ channel }), signal }));
-}
-
-export async function startCloudxUpdate(request: CloudxUpdateRequest, signal?: AbortSignal): Promise<CloudxUpdateStatus> {
-  const response = await fetch("/api/system/update", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request), signal });
-  if (!response.ok && response.status !== 409) throw new HttpError(response.status, errorMessageFromResponse(await response.text(), response.status));
-  return parseCloudxUpdateStatus(await response.json());
-}
+export { getCloudxUpdateStatus, getCloudxUpdatePreview, setCloudxUpdateChannel, startCloudxUpdate } from "./cloudxUpdateApi.js";
 
 export async function getForgeConnections(signal?: AbortSignal): Promise<ForgeConnections> {
   return parseForgeConnections(await fetchJson<unknown>("/api/forge/connections", { signal }));

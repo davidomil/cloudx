@@ -9,6 +9,7 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 const state = { LoadState: "loaded", ActiveState: "active", MainPID: "123", InvocationID: "1".repeat(32), ControlGroup: "/user/cloudx.service", WorkingDirectory: "/repo", KillMode: "control-group", SendSIGKILL: "yes" };
 function fixture(role = "broker") {
   const receipt = { version: 1, role, pid: 123, invocationId: "1".repeat(32), started: "456", bootId: "boot", brokerProtocol: 1,
+    ...(role === "broker" ? { attachmentExitBeforeReady: true } : {}),
     supervisor: { pinned: true, contract: "execution-json-v1", sourceSha256: "a".repeat(64) } };
   const files = {
     [`/data/terminal-runtime/${role}.json`]: JSON.stringify(receipt),
@@ -200,6 +201,21 @@ it("preserves compatible services even when interruption was previously confirme
   const f = plannedRuntime();
   expect(prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true }).plan.requiresInterruption).toBe(false);
   expect(f.actions).toEqual([]);
+});
+
+it.each([undefined, false])("requires managed confirmation before replacing a broker without ordered attachment exits: %s", capability => {
+  const f = plannedRuntime();
+  const receipt = JSON.parse(f.files["/data/terminal-runtime/broker.json"]);
+  f.files["/data/terminal-runtime/broker.json"] = JSON.stringify({ ...receipt, attachmentExitBeforeReady: capability });
+  const plan = inspectRuntimeUpdate(f.options);
+  expect(plan.requiresInterruption).toBe(true);
+  expect(plan.blockers).toEqual([]);
+  expect(plan.reasons).toEqual([{ service: "cloudx-terminal.service", role: "broker", message: expect.stringContaining("ordered attachment exit reporting") }]);
+  expect(plan.stopServices).toEqual(["cloudx.service", "cloudx-terminal.service"]);
+  expect(() => prepareRuntimeUpdate(f.options)).toThrow("Confirm terminal interruption");
+  expect(f.actions).toEqual([]);
+  expect(prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true }).plan).toEqual(plan);
+  expect(f.actions).toEqual(["cloudx.service", "cloudx-terminal.service"]);
 });
 
 it.each([undefined, { ...currentRuntime, persistentSessions: false }, { ...currentRuntime, brokerProtocol: 2 }, { ...currentRuntime, supervisorContract: "old" }])(

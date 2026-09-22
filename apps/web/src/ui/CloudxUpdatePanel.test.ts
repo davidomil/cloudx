@@ -277,6 +277,82 @@ describe("CloudX updates", () => {
       resumeRunId: id, restoreSnapshotRunId: snapshotId, ...(requiresInterruption ? { confirmInterruption: true } : {}) });
   });
 
+  it.each([false, true])("starts a different checked target after preparation fails, interruption consent: %s", async requiresInterruption => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const targetCommit = "c".repeat(40);
+    let current: CloudxUpdateStatus = { available: true, run: { ...run("failed", id).run!, targetCommit: mainPreview.target!.commit,
+      phase: "prepare", message: "The selected target could not be prepared.", resumable: true } };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const request = JSON.parse(init.body as string);
+        current = requiresInterruption && !request.confirmInterruption
+          ? { ...current, confirmation: { targetCommit, message: "The selected release requires terminal interruption." } }
+          : run("running", "22222222-2222-4222-8222-222222222222");
+      }
+      return reply(current);
+    });
+    vi.stubGlobal("fetch", fetch);
+    let preview = mainPreview;
+    const container = await mount(undefined, async init => {
+      if (init?.method === "PUT") preview = { ...mainPreview, channel: "releases", target: { ...mainPreview.target!, commit: targetCommit, name: "v0.2.0" } };
+      return reply(preview);
+    });
+    await selectChannel("releases");
+    expect(button("Resume update").disabled).toBe(false);
+    expect(button("Start selected target").disabled).toBe(false);
+    await click("Start selected target");
+    if (requiresInterruption) {
+      expect(button("Confirm interruption and continue").disabled).toBe(true);
+      await act(async () => (container.querySelector('input[type="checkbox"]') as HTMLInputElement).click());
+      await click("Confirm interruption and continue");
+    }
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([, init]) => JSON.parse(init!.body as string))).toEqual([
+      { channel: "releases", targetCommit },
+      ...(requiresInterruption ? [{ channel: "releases", targetCommit, confirmInterruption: true }] : []),
+    ]);
+    expect(sessionStorage.getItem("cloudx.update.pendingRun")).toBe("22222222-2222-4222-8222-222222222222");
+  });
+
+  it("keeps the saved run resumable when the server requires restoration before a new target", async () => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const failed: CloudxUpdateStatus = { available: true, run: { ...run("failed", id).run!, targetCommit: "c".repeat(40), resumable: true } };
+    const message = "Resume the interrupted update to restore the installation before starting another update.";
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method !== "POST") return reply(failed);
+      const request = JSON.parse(init.body as string);
+      return reply(request.resumeRunId ? run("running", id) : { ...failed, available: false, unavailableReason: message });
+    });
+    vi.stubGlobal("fetch", fetch);
+    const container = await mount();
+    await click("Start selected target");
+    expect(container.textContent).toContain(message);
+    expect(button("Start selected target").disabled).toBe(true);
+    expect(button("Resume update").disabled).toBe(false);
+    await click("Resume update");
+    expect(JSON.parse(fetch.mock.calls.filter(([, init]) => init?.method === "POST").at(-1)![1]!.body as string)).toEqual({
+      channel: "main", targetCommit: failed.run!.targetCommit, resumeRunId: id,
+    });
+  });
+
+  it("allows selecting a new target while the saved target awaits data restoration consent", async () => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const targetCommit = "c".repeat(40);
+    const failed: CloudxUpdateStatus = { available: true,
+      run: { ...run("failed", id).run!, targetCommit, resumable: true },
+      confirmation: { targetCommit, restoreSnapshotRunId: "22222222-2222-4222-8222-222222222222",
+        message: "The saved target requires replacing active data with its recovery snapshot." },
+    };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => reply(init?.method === "POST" ? run() : failed));
+    vi.stubGlobal("fetch", fetch);
+    await mount();
+    expect(button("Confirm data restoration and continue").disabled).toBe(true);
+    expect(button("Start selected target").disabled).toBe(false);
+    await click("Start selected target");
+    expect(JSON.parse(fetch.mock.calls.find(([, init]) => init?.method === "POST")![1]!.body as string)).toEqual({
+      channel: "main", targetCommit: mainPreview.target!.commit,
+    });
+  });
+
   it("disables launch after a preview error and recovers on an explicit check", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
     const previewFetch = vi.fn().mockRejectedValueOnce(new Error("GitHub is unavailable.")).mockResolvedValueOnce(reply(mainPreview));

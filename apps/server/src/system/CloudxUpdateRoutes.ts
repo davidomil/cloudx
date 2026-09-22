@@ -1,8 +1,16 @@
 import type { FastifyInstance } from "fastify";
 import { parseCloudxUpdateChannel, parseCloudxUpdateRequest } from "@cloudx/shared";
 import type { CloudxUpdateService } from "./CloudxUpdateService.js";
+import { runtimeBuild } from "./RuntimeBuild.js";
 
 export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">, trustedOrigins: string[]): void {
+  // The maintained updater integration also attests historical server builds.
+  if (!app.hasRoute({ method: "GET", url: "/api/runtime" })) {
+    app.get("/api/runtime", async (_request, reply) => {
+      reply.header("cache-control", "no-store");
+      return runtimeBuild.identity;
+    });
+  }
   app.get("/api/system/update", async (_request, reply) => {
     reply.header("cache-control", "no-store");
     return updates.status();

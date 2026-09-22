@@ -17,7 +17,8 @@ export async function recordTerminalRuntime(dataDir: string, role: "web" | "brok
     invocationId: process.env.INVOCATION_ID,
     started: stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19],
     bootId: (await fs.readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim(),
-    brokerProtocol: 1, supervisor: terminalSupervisorRuntime
+    brokerProtocol: 1, supervisor: terminalSupervisorRuntime,
+    ...(role === "broker" ? { attachmentExitBeforeReady: true } : {})
   };
   const temporary = path.join(directory, `${role}.${randomUUID()}.tmp`);
   await fs.writeFile(temporary, JSON.stringify(receipt), { mode: 0o600, flag: "wx" });

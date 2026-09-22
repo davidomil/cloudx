@@ -30,14 +30,25 @@ export async function probeTerminalAttachments({ mode, sessionIds: expected }, {
   const attached = [];
   for (const id of candidates) {
     let terminal;
+    let stopObservingExit;
     try {
       terminal = await factory.attach(id);
       if (typeof terminal?.detach !== "function") throw new Error("Terminal attachment does not support detaching.");
+      if (mode === "capture") {
+        let exited = false;
+        stopObservingExit = terminal.onExit(() => { exited = true; });
+        // Durable attachments deliver a retained exit through a microtask.
+        await Promise.resolve();
+        if (exited) continue;
+      }
       attached.push(id);
     } catch (error) {
       if (mode === "capture" && isMissingSession(error)) continue;
       throw new Error(`Terminal attachment could not be verified for saved session ${id}.`, { cause: error });
-    } finally { if (typeof terminal?.detach === "function") terminal.detach(); }
+    } finally {
+      stopObservingExit?.();
+      if (typeof terminal?.detach === "function") terminal.detach();
+    }
   }
   return { sessionIds: attached };
 }

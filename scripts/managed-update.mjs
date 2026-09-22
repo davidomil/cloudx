@@ -5,11 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspectDataCompatibility, inspectSnapshotCompatibility, inspectTargetRuntime } from './managed-update-data.mjs';
+import { MANAGED_INTEGRATION_FILES, prepareManagedIntegration } from './managed-update-integration.mjs';
 import { writeRuntimeBuild } from './write-runtime-build.mjs';
 import { randomUUID } from 'node:crypto';
 import { InstallerRunner, prepareManagedRelease, activateManagedServices, waitForHealth } from './install-cloudx.mjs';
 import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePort, SERVICE_NAMES } from './install-update.mjs';
-import { inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService } from './install-runtime.mjs';
+import { inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
 import { assertTerminalMigrationSafe } from './terminal-upgrade-recovery.mjs';
 import { parseEnvironmentFile, updateEnvironmentFile } from './installer-environment.mjs';
 import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile } from './managed-update-store.mjs';
@@ -68,16 +69,18 @@ export class ManagedUpdate {
       console.error(error);
       const failedPhase = record.run.phase;
       let restored = !transition.mutating;
+      let restorationError = failedPhase === 'restore' ? error : undefined;
       if (transition.mutating && failedPhase !== 'restore') {
         try { await this.restore(); restored = true; }
-        catch (restoreError) { console.error('Restoration failed:', restoreError); }
+        catch (restoreError) { restorationError = restoreError; console.error('Restoration failed:', restoreError); }
       }
-      record.run = { ...record.run, state: 'failed', phase: failedPhase, component: error.component ?? failedPhase,
-        cause: failureCause(error, record.run.component ?? failedPhase),
+      const blocker = restorationError ?? error;
+      record.run = { ...record.run, state: 'failed', phase: failedPhase, component: blocker.component ?? failedPhase,
+        cause: failureCause(blocker, record.run.component ?? failedPhase),
         resumable: true, finishedAt: new Date().toISOString(),
         message: restored ? 'Update stopped; the previous installation is retained.' : 'Update stopped; restoration needs to continue.',
         recoveryAction: restored ? `Resolve the blocker and resume update ${record.run.id}. Details: ~/.local/state/cloudx/settings-update/${record.run.id}.log. Verified recovery data is retained.` :
-          'Resume this update to finish restoring its verified snapshot before another activation. Keep its recovery directory.' };
+          `${restorationError ? `${failureCause(restorationError, 'Restoration')} ` : ''}Resume this update to finish restoring its verified snapshot before another activation. Keep its recovery directory.` };
       if (restored) transition.completed = error.reprepare ? [] : transition.completed.filter(phase => phase === 'prepare');
       this.persist();
     }
@@ -166,14 +169,14 @@ export class UpdateHost {
     transition.environmentText = fs.readFileSync(this.paths.envPath, 'utf8');
     transition.serviceTarget = this.target;
     transition.serviceStates = Object.fromEntries(this.target.serviceNames.map(service => [service, this.runner.inspect('systemctl', ['--user', 'show', service, '--property=ActiveState,MainPID,InvocationID'])]));
+    transition.integration = prepareManagedIntegration(release, record.coordinator);
     this.prepareRelease({ releaseRoot: release, home: this.home, envConfig: this.envConfig, standard: this.target.kind === 'standard',
       progress: (component, message) => { record.run.component = component; record.run.message = message; this.save(record); } });
     writeRuntimeBuild({ repoRoot: release, commit: record.targetCommit });
-    // A target without these production readiness contracts is not a verified
-    // managed-update target. Stop here while the installed services still run.
     const server = path.join(release, 'apps/server/dist/server.js');
     const source = fs.readFileSync(server, 'utf8');
-    if (!source.includes('/api/ready/terminals')) throw publicFailure('target', 'This target predates supervised terminal readiness. Select a target with the terminal readiness contract; the installed version is unchanged.');
+    if (!source.includes('/api/ready/terminals') && !transition.integration.independentReadiness)
+      throw publicFailure('target', 'The target has neither terminal readiness nor a buildable terminal integration. The installed version is unchanged.');
     this.planData(record);
     transition.artifacts = GENERATED.filter(relative => fs.existsSync(path.join(release, relative)));
     for (const relative of transition.artifacts) {
@@ -323,14 +326,31 @@ export class UpdateHost {
       syncDirectory(path.dirname(installed));
     }
     if (this.target.kind === 'standard') activateManagedServices({ repoRoot: this.paths.repoRoot, releaseRoot: t.release, home: this.home, envConfig: this.envConfig, runner: this.runner, runtimeLaunch: { script: path.join(record.coordinator, 'scripts/managed-runtime-launch.mjs'), buildFile: path.join(t.release, 'apps/server/dist/runtime-build.json'), receiptFile: path.join(this.runDir, 'runtime.json') } });
-    if (this.target.kind === 'web') fs.writeFileSync(this.paths.envPath, updateEnvironmentFile(fs.readFileSync(this.paths.envPath, 'utf8'), { CLOUDX_INSTALL_ROOT: this.paths.repoRoot }), { mode: 0o600, flush: true });
+    if (this.target.kind === 'web') fs.writeFileSync(this.paths.envPath, updateEnvironmentFile(fs.readFileSync(this.paths.envPath, 'utf8'), {
+      CLOUDX_INSTALL_ROOT: this.paths.repoRoot, CLOUDX_DATA_DIR: this.paths.dataDir,
+      ...(record.coordinator ? { CLOUDX_UPDATE_COORDINATOR_ROOT: record.coordinator } : {}),
+    }), { mode: 0o600, flush: true });
     this.runner.run('systemctl', ['--user', 'daemon-reload']);
   }
 
   start(record) {
-    record.transition.targetStarted = true;
+    const t = record.transition;
+    const broker = t.runtimePlan.services.find(({ role }) => role === 'broker');
+    if (broker) t.brokerStartup = {
+      preservedInvocationId: broker.state.ActiveState === 'active' && !t.runtimePlan.stopServices.includes(broker.service) ? broker.state.InvocationID : null,
+    };
+    t.targetStarted = true;
     this.save(record);
-    for (const service of this.target.serviceNames) this.runner.run('systemctl', ['--user', 'start', service]);
+    for (const service of this.target.serviceNames) {
+      this.runner.run('systemctl', ['--user', 'start', service]);
+      if (broker) {
+        const state = inspectTerminalService(this.runner, broker.service);
+        if (/^[a-f0-9]{32}$/.test(state.InvocationID)) {
+          t.brokerStartup.invocationId = state.InvocationID;
+          this.save(record);
+        }
+      }
+    }
   }
 
   verify(record) {
@@ -341,8 +361,15 @@ export class UpdateHost {
       waitForHealth(this.runner, { label: 'Documentation', url: documentationReadinessUrl(this.envConfig) });
     }
     waitForHealth(this.runner, { label: 'CloudX web', url: `${origin}/api/ready`, insecure: true });
-    waitForHealth(this.runner, { label: 'Supervised terminal creation and cleanup', url: `${origin}/api/ready/terminals`, insecure: true, requestTimeoutSeconds: 60 });
     const t = record.transition;
+    if (t.integration?.independentReadiness) {
+      try {
+        const result = JSON.parse(this.runner.inspect(process.execPath, [path.join(record.coordinator, 'scripts/managed-update-readiness.mjs'), t.release, this.paths.dataDir], { timeout: 60000 }));
+        if (result.broker !== 'ready' || result.direct !== 'ready') throw new Error('Incomplete terminal readiness result.');
+      } catch (error) {
+        throw publicFailure('terminals', 'The historical target did not pass supervised terminal creation and cleanup. Check the private log for its supervisor or broker failure before resuming.', error);
+      }
+    } else waitForHealth(this.runner, { label: 'Supervised terminal creation and cleanup', url: `${origin}/api/ready/terminals`, insecure: true, requestTimeoutSeconds: 60 });
     for (const [relative, manifest] of Object.entries(t.buildManifests)) verifySnapshot(path.join(t.release, relative), manifest);
     this.planData(record);
     if (this.git(['rev-parse', 'HEAD']) !== record.targetCommit) throw new Error('Checkout changed during readiness verification.');
@@ -465,6 +492,20 @@ export class UpdateHost {
     }
   }
 
+  stopStartedBroker(transition) {
+    if (!transition.targetStarted || !transition.runtimePlan.services.some(({ role }) => role === 'broker')) return;
+    const service = 'cloudx-terminal.service';
+    const state = inspectTerminalService(this.runner, service);
+    if (state.LoadState === 'not-found') return;
+    if (state.WorkingDirectory !== this.paths.repoRoot) throw publicFailure('services', 'The terminal broker belongs to another checkout; restoration stopped before changing its runtime.');
+    if (state.ActiveState === 'active' && /^[a-f0-9]{32}$/.test(transition.brokerStartup?.preservedInvocationId ?? '') && state.InvocationID === transition.brokerStartup.preservedInvocationId) return;
+    assertUpdaterOutsideServices([[service, state]]);
+    if (!["inactive", "failed"].includes(state.ActiveState) && (!["control-group", "mixed"].includes(state.KillMode) || state.SendSIGKILL !== 'yes'))
+      throw publicFailure('services', `${service} must terminate its full control group before its runtime can be restored.`);
+    this.runner.run('systemctl', ['--user', 'stop', service]);
+    assertStoppedService(this.runner, service, state.ControlGroup);
+  }
+
   restore(record) {
     const t = record.transition;
     if (t.restored) { this.restartPrevious(t); return; }
@@ -473,13 +514,18 @@ export class UpdateHost {
       catch (error) { throw publicFailure('forge', 'Forge work became active after startup. Pause or finish it before resuming restoration; its ownership records were preserved.', error); }
     }
     this.stopWriters();
-    if (t.targetStarted && t.runtimePlan.stopServices?.includes('cloudx-terminal.service')) {
-      this.runner.run('systemctl', ['--user', 'stop', 'cloudx-terminal.service']);
-      assertStoppedService(this.runner, 'cloudx-terminal.service');
+    if (t.targetStarted) {
+      try { assertTerminalMigrationSafe({ dataDir: this.paths.dataDir }); }
+      catch (error) { throw publicFailure('forge', 'Forge ownership changed while services stopped. Recover the worker before resuming restoration; its records were preserved.', error); }
     }
+    this.stopStartedBroker(t);
     if (t.snapshotVerified) {
       for (const snapshot of t.snapshots) verifySnapshot(snapshot.destination, snapshot.manifest);
       if (t.targetStarted || t.restoreData && t.activationIntent) {
+        for (const snapshot of t.snapshots) {
+          if (snapshot.root === this.paths.dataDir && JSON.stringify(forgeRecords(snapshot.destination)) !== JSON.stringify(forgeRecords(snapshot.root)))
+            throw publicFailure('forge', 'Forge ownership or publication records changed after the recovery snapshot. Restoration stopped to prevent repeating published work; the current profile and runtime remain intact. Preserve these records before resuming recovery.');
+        }
         // Preserve post-activation bytes before restoring the coherent old profile.
         t.failedData ??= [];
         for (const [index, snapshot] of t.snapshots.entries()) {
@@ -511,6 +557,7 @@ export class UpdateHost {
     t.restored = true;
     t.activationIntent = false;
     t.targetStarted = false;
+    delete t.brokerStartup;
     t.snapshotVerified = false;
     t.retainedFailedData = [...(t.retainedFailedData ?? []), ...(t.failedData ?? [])];
     t.failedData = undefined;
@@ -585,7 +632,14 @@ export function validateSavedTransition(record, runDir) {
     throw new Error('Invalid saved installation path.');
   const t = record.transition;
   if (!t) return;
+  if (t.integration !== undefined && (!object(t.integration) || t.integration.version !== 1 ||
+      typeof t.integration.independentReadiness !== 'boolean' || !Array.isArray(t.integration.files) ||
+      t.integration.files.some(file => !MANAGED_INTEGRATION_FILES.includes(file)))) throw new Error('Invalid saved managed integration.');
   if (t.preservedSessionIds !== undefined && !validSessionIds(t.preservedSessionIds)) throw new Error('Invalid saved terminal session identities.');
+  if (t.brokerStartup !== undefined && (!object(t.brokerStartup) ||
+      t.brokerStartup.preservedInvocationId !== null && !/^[a-f0-9]{32}$/.test(t.brokerStartup.preservedInvocationId ?? '') ||
+      t.brokerStartup.invocationId !== undefined && !/^[a-f0-9]{32}$/.test(t.brokerStartup.invocationId)))
+    throw new Error('Invalid saved broker invocation identity.');
   const expectedServices = record.service ? [record.service] : SERVICE_NAMES;
   if (expectedServices.some(name => !/^[a-zA-Z0-9][a-zA-Z0-9_.@:-]*\.service$/.test(name)) ||
       t.serviceTarget && (JSON.stringify(t.serviceTarget.serviceNames) !== JSON.stringify(expectedServices) ||

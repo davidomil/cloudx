@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,11 @@ import { DurableTerminalProcessFactory, terminalSocketPath } from "../apps/serve
 import { NodePtyTerminalProcessFactory } from "../apps/server/src/terminal/NodePtyTerminalProcess.ts";
 import { TerminalBroker } from "../apps/server/src/terminal/TerminalBroker.ts";
 import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStore.ts";
+import { SessionStore } from "../apps/server/src/sessionStore.ts";
+import { PluginRegistry } from "../apps/server/src/pluginRegistry.ts";
+import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
+import { TabContextService } from "../apps/server/src/context/TabContextService.ts";
+import { StandardTerminalPlugin } from "../apps/server/src/plugins/StandardTerminalPlugin.ts";
 import { parseTerminalProbeArguments, probeTerminalAttachments } from "./managed-update-terminals.mjs";
 
 const cleanups = [];
@@ -21,7 +27,7 @@ it("captures only saved unowned terminal sessions, omitting typed missing sessio
   const detach = vi.fn();
   const factory = { attach: vi.fn(async id => {
     if (id === "missing") throw new PluginSessionMissingError("Already closed");
-    return { detach, write: () => { throw new Error("No input allowed"); } };
+    return { detach, onExit: () => () => {}, write: () => { throw new Error("No input allowed"); } };
   }) };
   const result = await probeTerminalAttachments({ mode: "capture" }, {
     factory, readSessions: async () => ({ version: 1, sessions: [saved("shell"), saved("codex", "codex-terminal"), saved("missing"),
@@ -31,6 +37,20 @@ it("captures only saved unowned terminal sessions, omitting typed missing sessio
   expect(result).toEqual({ sessionIds: ["shell", "codex"] });
   expect(factory.attach.mock.calls).toEqual([["shell"], ["codex"], ["missing"]]);
   expect(detach).toHaveBeenCalledTimes(2);
+});
+
+it("omits retained exits after observing their notification and detaches every attachment", async () => {
+  const detach = vi.fn(), unsubscribe = vi.fn();
+  const original = { version: 1, sessions: [saved("exited"), saved("live")] };
+  expect(await probeTerminalAttachments({ mode: "capture" }, {
+    factory: { attach: async id => ({ detach, onExit(listener) {
+      if (id === "exited") queueMicrotask(() => listener({ exitCode: 0 }));
+      return unsubscribe;
+    } }) }, readSessions: async () => original, isMissingSession: () => false,
+  })).toEqual({ sessionIds: ["live"] });
+  expect(detach).toHaveBeenCalledTimes(2);
+  expect(unsubscribe).toHaveBeenCalledTimes(2);
+  expect(original.sessions.map(({ tab }) => tab.id)).toEqual(["exited", "live"]);
 });
 
 it.each(["capture", "verify"])("fails %s when attachment fails without disclosing terminal error text", async mode => {
@@ -99,6 +119,45 @@ it.skipIf(process.platform !== "linux")("reattaches through a real broker withou
   await expect(probeTerminalAttachments({ mode: "verify", ...captured }, dependencies)).rejects.toThrow("saved session preserved-shell");
 }, 15_000);
 
+it.skipIf(process.platform !== "linux")("preserves a live shell while startup retires its already-exited neighbor into saved-tab recovery", async () => {
+  const f = await liveTerminal({ exitedShell: true });
+  const savedSessions = new SessionStateStore(f.root);
+  const before = await savedSessions.read();
+  const dependencies = { factory: f.factory, readSessions: () => savedSessions.read(),
+    isMissingSession: error => error instanceof PluginSessionMissingError };
+  const captured = await probeTerminalAttachments({ mode: "capture" }, dependencies);
+  expect(captured).toEqual({ sessionIds: ["preserved-shell"] });
+  expect(await savedSessions.read()).toEqual(before);
+  f.assertUntouched();
+
+  const plugins = new PluginRegistry();
+  plugins.register(new StandardTerminalPlugin(f.factory));
+  const sessions = new SessionStore(plugins, new PathPolicy([f.root]), new TabContextService(f.root),
+    undefined, undefined, undefined, undefined, savedSessions);
+  cleanups.push(() => sessions.dispose());
+  await sessions.restore();
+  expect(sessions.getTab("preserved-shell").status).toBe("running");
+  expect(sessions.getTab("exited-shell").recovery?.state).toBe("missing");
+  expect(await f.factory.attach("exited-shell").catch(error => error)).toBeInstanceOf(PluginSessionMissingError);
+  expect(await probeTerminalAttachments({ mode: "verify", ...captured }, dependencies)).toEqual(captured);
+  const recovered = (await savedSessions.read()).sessions.find(({ tab }) => tab.id === "exited-shell");
+  expect(recovered.tab.cwd).toBe(f.root);
+  expect(recovered.initialInput).toEqual({ command: "MUST_NOT_REPLAY" });
+  f.assertLiveShellUntouched();
+}, 15_000);
+
+it.skipIf(process.platform !== "linux")("excludes an exited shell when every broker message arrives in separate delayed fragments", async () => {
+  const f = await liveTerminal({ exitedShell: true });
+  const proxy = await fragmentedBroker(terminalSocketPath(f.root));
+  const captured = await probeTerminalAttachments({ mode: "capture" }, {
+    factory: proxy.factory, readSessions: () => new SessionStateStore(f.root).read(),
+    isMissingSession: error => error instanceof PluginSessionMissingError,
+  });
+  expect(captured).toEqual({ sessionIds: ["preserved-shell"] });
+  expect(proxy.messages.some(messages => messages.slice(-2).join(",") === "exit,ready")).toBe(true);
+  f.assertUntouched();
+}, 15_000);
+
 it.skipIf(process.platform !== "linux" || !fs.existsSync(path.join(releaseRoot, "apps/server/dist/terminal/DurableTerminalProcess.js")))(
   "runs the production probe child against the built release and a live terminal, returning JSON without terminal output", async () => {
     const f = await liveTerminal();
@@ -126,7 +185,48 @@ function saved(id, pluginId = "standard-terminal", cwd = "/tmp") {
     indicator: { color: "green", label: "Running", updatedAt: "now" } }, initialInput: { command: "MUST_NOT_REPLAY" } };
 }
 
-async function liveTerminal() {
+async function fragmentedBroker(socketPath) {
+  const root = directory(), proxyPath = path.join(root, "proxy.sock");
+  const sockets = new Set(), timers = new Set(), messages = [];
+  const server = net.createServer(client => {
+    const broker = net.createConnection(socketPath);
+    sockets.add(client); sockets.add(broker);
+    client.pipe(broker);
+    client.on("close", () => broker.destroy());
+    broker.on("error", () => client.destroy());
+    const delivered = []; messages.push(delivered);
+    let pending = "", forwarding = Promise.resolve();
+    broker.setEncoding("utf8");
+    broker.on("data", chunk => {
+      pending += chunk;
+      let end;
+      while ((end = pending.indexOf("\n")) >= 0) {
+        const line = pending.slice(0, end + 1); pending = pending.slice(end + 1);
+        delivered.push(JSON.parse(line).type);
+        forwarding = forwarding.then(() => new Promise(resolve => {
+          if (client.destroyed) return resolve();
+          client.write(line.slice(0, -1));
+          const delayed = { resolve, timer: setTimeout(() => {
+            timers.delete(delayed);
+            if (!client.destroyed) client.write("\n");
+            resolve();
+          }, 10) };
+          timers.add(delayed);
+        }));
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(proxyPath, resolve));
+  fs.chmodSync(proxyPath, 0o600);
+  cleanups.push(async () => {
+    for (const { timer, resolve } of timers) { clearTimeout(timer); resolve(); }
+    for (const socket of sockets) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+  });
+  return { messages, factory: new DurableTerminalProcessFactory(proxyPath, { spawn() { throw new Error("The attachment proxy cannot create terminals."); } }) };
+}
+
+async function liveTerminal({ exitedShell = false } = {}) {
   const root = directory();
   const socket = terminalSocketPath(root);
   cleanups.push(() => fs.rmSync(path.dirname(socket), { recursive: true, force: true }));
@@ -151,12 +251,23 @@ async function liveTerminal() {
   terminal.onData(data => { output += data; });
   await vi.waitFor(() => expect(output).toContain("PRIVATE_TERMINAL_OUTPUT"));
   terminal.detach();
-  await new SessionStateStore(root).save({ version: 1, sessions: [saved("preserved-shell", "standard-terminal", root), saved("already-closed", "codex-terminal", root)] });
+  const liveMutations = [...mutations];
+  if (exitedShell) {
+    const exited = await factory.spawn(process.execPath, ["-e", "process.exit(0)"], { cwd: root, env: process.env, cols: 100, rows: 30, sessionId: "exited-shell" });
+    await new Promise(resolve => exited.onExit(resolve));
+    exited.detach();
+  }
+  await new SessionStateStore(root).save({ version: 1, sessions: [saved("preserved-shell", "standard-terminal", root),
+    exitedShell ? saved("exited-shell", "standard-terminal", root) : saved("already-closed", "codex-terminal", root)] });
   const pid = Number(fs.readFileSync(pidFile, "utf8"));
-  return { root, factory, assertUntouched() {
+  const assertLiveShellUntouched = () => {
     expect(() => process.kill(pid, 0)).not.toThrow();
     expect(fs.readFileSync(launches, "utf8")).toBe("launched\n");
-    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(spawn).toHaveBeenCalledTimes(exitedShell ? 2 : 1);
+    for (const method of liveMutations) expect(method).not.toHaveBeenCalled();
+  };
+  return { root, factory, assertLiveShellUntouched, assertUntouched() {
+    assertLiveShellUntouched();
     for (const method of mutations) expect(method).not.toHaveBeenCalled();
   } };
 }
