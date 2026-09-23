@@ -15,7 +15,6 @@ import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, Forge
 import { PathPolicy } from "../pathPolicy.js";
 import * as filesystemEvidence from "../filesystemIdentity.js";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
-import { JsonStateFile } from "../jsonStateFile.js";
 import type { ConfigService } from "../configService.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
 import type { ForgeLogger } from "./ForgeLog.js";
@@ -3155,6 +3154,56 @@ describe("Legacy filesystem ownership reconciliation", () => {
     return { fingerprint: preview.fingerprint, attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })) };
   }
 
+  it.each(["during final binding read", "while staging binding"])("rejects a replaced launch directory %s and preserves both source bindings", async stage => {
+    const f = await blockedReviewer();
+    const view = f.tabs.launchPath();
+    const retained = `${view}-retained`;
+    const binding = await fs.readFile(f.sourceFile, "utf8");
+    const entries = await fs.readdir(view);
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    let replaced = false;
+    const replaceView = async () => {
+      expect(replaced).toBe(false);
+      await fs.rename(view, retained);
+      await fs.mkdir(view);
+      await fs.writeFile(f.sourceFile, binding);
+      replaced = true;
+    };
+    const isBindingStaging = (file: unknown) => path.basename(String(file)).startsWith(".cloudx-source.json.") && String(file).endsWith(".tmp");
+    const open = fs.open;
+    let bindingReads = 0;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (stage === "during final binding read" && path.basename(String(args[0])) === ".cloudx-source.json" && ++bindingReads === 2)
+        await replaceView();
+      const handle = await open(...args);
+      if (stage === "while staging binding" && isBindingStaging(args[0])) {
+        const writeFile = handle.writeFile.bind(handle);
+        handle.writeFile = async (...writeArgs) => {
+          await writeFile(...writeArgs);
+          await replaceView();
+        };
+      }
+      return handle;
+    });
+    const writeFile = fs.writeFile;
+    vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      await writeFile(...args);
+      if (stage === "while staging binding" && isBindingStaging(args[0])) await replaceView();
+    });
+
+    await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/Codex launch ownership changed/);
+
+    expect(replaced).toBe(true);
+    expect(await fs.readFile(f.sourceFile, "utf8")).toBe(binding);
+    expect(await fs.readFile(path.join(retained, ".cloudx-source.json"), "utf8")).toBe(binding);
+    expect(await fs.readdir(view)).toEqual([".cloudx-source.json"]);
+    expect(await fs.readdir(retained)).toEqual(entries);
+    for (const name of ["sessions", "archived_sessions"])
+      expect(await fs.realpath(path.join(retained, name))).toBe(path.join(conversationBinding().source.home, name));
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
   async function renderOwnershipRecovery(workspaceId: string) {
     const { JSDOM } = await vi.importActual<{ JSDOM: new (html: string, options: { url: string }) => { window: Window } }>("jsdom");
     const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
@@ -3218,10 +3267,11 @@ describe("Legacy filesystem ownership reconciliation", () => {
       const publicationPath = path.join(f.deps.dataDir, "preserved-publication.json");
       const publication = JSON.stringify({ headSha, replyingToDiscussionId: "uncertain-reply" });
       await fs.writeFile(publicationPath, publication);
-      const write = JsonStateFile.prototype.write;
-      const failure = vi.spyOn(JsonStateFile.prototype, "write").mockImplementation(async function (this: JsonStateFile, value) {
-        if (this.filePath === (interruptedRecord === "tab" ? f.tabFile : f.sourceFile)) throw new Error("Injected metadata write failure");
-        await write.call(this, value);
+      const rename = fs.rename;
+      const failure = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (interruptedRecord === "tab" ? String(to) === f.tabFile : path.basename(String(to)) === ".cloudx-source.json")
+          throw new Error("Injected metadata write failure");
+        await rename(from, to);
       });
       ui = await renderOwnershipRecovery(f.workspace.id);
       await ui.click("Inspect directory ownership");

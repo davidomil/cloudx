@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -22,7 +22,7 @@ import {
 import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
 import { CodexStateSources, type ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 import { assertDirectoryIdentity, readDirectoryIdentity, isDurableDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
-import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
+import { JsonStateFile, openOwnedDirectoryNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, stringifyJsonDocument, type OwnedDirectory } from "../jsonStateFile.js";
 import type { PathPolicy } from "../pathPolicy.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { SessionStore } from "../sessionStore.js";
@@ -701,13 +701,54 @@ export class ForgeRuntime {
           throw new Error("A removed worker directory reappeared after inspection. Inspect ownership again before reconciling.");
       if (await this.configHash(owned) !== owned.gitConfigHash)
         throw new Error("Worker Git configuration changed after inspection; its checkout was preserved.");
-      for (const record of records)
-        if (JSON.stringify(await record.file.read()) !== JSON.stringify(record.saved))
-          throw new Error("Worker ownership records changed after inspection. Inspect them again before reconciling.");
-      // Every path, record and process is validated before replacing any metadata.
-      for (const record of records) await record.file.write(record.next);
-      for (const tab of tabs) if (this.ownedTabs.has(tab.tabId)) this.ownedTabs.set(tab.tabId, tab);
+      const sourceDirectories = new Map<JsonStateFile, OwnedDirectory>();
+      try {
+        for (const record of records) {
+          const view = record.sourceDirectory;
+          if (view) sourceDirectories.set(record.file, await openOwnedDirectoryNoFollow(path.dirname(view.path), view.path, "Codex launch", view));
+        }
+        for (const record of records) {
+          const directory = sourceDirectories.get(record.file);
+          const binding = directory?.childPath(".cloudx-source.json");
+          const current = binding
+            ? await requireRegularFile(binding, "Codex source binding") && JSON.parse(await readTextFileNoFollow(binding, "Codex source binding"))
+            : await record.file.read();
+          if (JSON.stringify(current) !== JSON.stringify(record.saved))
+            throw new Error("Worker ownership records changed after inspection. Inspect them again before reconciling.");
+        }
+        for (const directory of sourceDirectories.values()) await directory.assertCurrent();
+        // Every path, record and process is validated before replacing any metadata.
+        for (const record of records) {
+          const directory = sourceDirectories.get(record.file);
+          if (directory) await this.writeReconciledSourceBinding(directory, record.next);
+          else await record.file.write(record.next);
+        }
+        for (const tab of tabs) if (this.ownedTabs.has(tab.tabId)) this.ownedTabs.set(tab.tabId, tab);
+      } finally {
+        await Promise.all([...sourceDirectories.values()].map(directory => directory.close()));
+      }
     });
+  }
+
+  private async writeReconciledSourceBinding(directory: OwnedDirectory, binding: unknown): Promise<void> {
+    await directory.assertCurrent();
+    const staging = directory.childPath(`.cloudx-source.json.${randomUUID()}.tmp`);
+    const file = await fs.open(staging, "wx", 0o600);
+    let staged = true;
+    try {
+      try {
+        await file.writeFile(stringifyJsonDocument(binding, "Codex source binding"));
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await directory.assertCurrent();
+      await fs.rename(staging, directory.childPath(".cloudx-source.json"));
+      staged = false;
+      await directory.assertCurrent();
+    } finally {
+      if (staged) await fs.unlink(staging);
+    }
   }
 
   private async ownershipReconciliation(id: string) {
@@ -721,9 +762,9 @@ export class ForgeRuntime {
       missing.add(expected.path);
       return expected;
     };
-    const records: Array<{ file: JsonStateFile; saved: unknown; next: unknown }> = [];
-    const save = (file: JsonStateFile, value: unknown) => {
-      records.push({ file, saved: structuredClone(value), next: value });
+    const records: Array<{ file: JsonStateFile; saved: unknown; next: unknown; sourceDirectory?: DirectoryIdentity }> = [];
+    const save = (file: JsonStateFile, value: unknown, sourceDirectory?: DirectoryIdentity) => {
+      records.push({ file, saved: structuredClone(value), next: value, sourceDirectory });
     };
     save(this.manifest(id), owned);
     owned.repository = await reconciliation.add(owned.repository);
@@ -758,16 +799,16 @@ export class ForgeRuntime {
         tabs.push(tab);
       }
     }
-    const views = new Set(tabs.filter(tab => tab.launch && !missing.has(tab.launch.path)).map(tab => tab.launch!.path));
+    const views = new Map(tabs.filter(tab => tab.launch && !missing.has(tab.launch.path)).map(tab => [tab.launch!.path, tab.launch!]));
     if (owned.reviewConversation) {
       const binding = owned.reviewConversation;
       const source = await reconciliation.add({ ...binding.source, path: binding.source.home });
       binding.source = { ...binding.source, dev: source.dev, ino: source.ino, durable: source.durable };
       binding.sqliteHome = await reconciliation.add(binding.sqliteHome);
       binding.originView = await reconciliation.add(binding.originView);
-      views.add(binding.originView.path);
+      views.set(binding.originView.path, binding.originView);
     }
-    for (const view of views) {
+    for (const [view, identity] of views) {
       if (path.dirname(view) !== path.join(path.resolve(this.dependencies.dataDir), "codex-launches")) throw new Error("Codex launch ownership record is invalid.");
       const file = new JsonStateFile(this.dependencies.dataDir, path.relative(this.dependencies.dataDir, path.join(view, ".cloudx-source.json")), "Codex source binding", 0o600);
       const binding = await file.read<ResolvedCodexStateSource & { version: number }>();
@@ -781,7 +822,7 @@ export class ForgeRuntime {
         const selected = await sources.resolve();
         if (selected.home !== binding.home) throw new Error("Codex source selection changed.");
         await reconciliation.add({ ...binding, path: binding.home });
-        save(file, binding);
+        save(file, binding, identity);
         Object.assign(binding, selected);
       } finally { await sources.dispose(); }
       if (owned.reviewConversation && (binding.home !== owned.reviewConversation.source.home || binding.ino !== owned.reviewConversation.source.ino))
