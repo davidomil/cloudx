@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { ForgeIssueCompletionReport, ForgeWorker } from "@cloudx/shared";
-import { parseWorkerReport, parseWorkers } from "./ForgeWorkflowValidation.js";
+import type { ForgeIssueCompletionReport, ForgeReviewScope, ForgeWorker } from "@cloudx/shared";
+import { parseReview, parseScopedReview, parseWorkerReport, parseWorkers } from "./ForgeWorkflowValidation.js";
+import { reviewScopeSummary } from "./ForgeReviewScope.js";
 
 const report: ForgeIssueCompletionReport = {
   kind: "issue",
@@ -30,6 +31,40 @@ const reviewWorkerId = "22222222-2222-4222-8222-222222222222";
 const autoReview: NonNullable<ForgeWorker["autoReview"]> = {
   enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-1" }
 };
+
+describe("Review body limits", () => {
+  const review = { kind: "review" as const, headSha, event: "approve" as const, comments: [], body: "x".repeat(100_000) };
+
+  it.each([99_999, 100_000])("accepts a %i-character worker report", length => {
+    const input = { ...review, body: "x".repeat(length) };
+    expect(parseWorkerReport(input)).toEqual(input);
+  });
+
+  it("reserves scope space for drafts without increasing worker report limits", () => {
+    expect(() => parseWorkerReport({ ...review, body: `${review.body}x` })).toThrow("Invalid review body.");
+    const draft = { ...review, body: "x".repeat(100_512) };
+    expect(parseReview(draft).body.length).toBe(100_512);
+    expect(() => parseReview({ ...draft, body: `${draft.body}x` })).toThrow("Invalid review body.");
+    expect(() => parseWorkerReport({ ...report, body: "x".repeat(100_001) })).toThrow("Invalid change body.");
+  });
+
+  it.each(["initial", "incremental", "rewritten", "unchanged"] as const)("fits a maximum-length %s report and 64-character revision evidence in a draft", kind => {
+    const previous = { headSha: "b".repeat(64), baseSha: "c".repeat(64), mergeBaseSha: "d".repeat(64) };
+    const current = { ...previous, headSha: "a".repeat(64) };
+    const scope: ForgeReviewScope = { kind, current, ...(kind === "initial" ? {} : { previous }) };
+    const report = parseWorkerReport({ ...review, headSha: current.headSha });
+    if (report.kind !== "review") throw new Error("Expected a review report.");
+    const draft = parseScopedReview(report, scope);
+    expect(draft.body).toBe(`${reviewScopeSummary(scope)}\n\n${review.body}`);
+    expect(draft.body.length).toBeLessThanOrEqual(100_512);
+    expect(draft.headSha).toBe(current.headSha);
+  });
+
+  it("rejects missing or mismatched comparison evidence before building a draft", () => {
+    expect(() => parseScopedReview(review, undefined)).toThrow(/comparison evidence/);
+    expect(() => parseScopedReview(review, { kind: "initial", current: { headSha: "b".repeat(40), baseSha: headSha, mergeBaseSha: headSha } })).toThrow(/comparison evidence/);
+  });
+});
 
 describe("Saved review comparison evidence", () => {
   const revision = { headSha, baseSha: "b".repeat(40), mergeBaseSha: "c".repeat(40) };

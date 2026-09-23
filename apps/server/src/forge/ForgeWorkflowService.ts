@@ -21,9 +21,9 @@ import type {
   ForgeWorkerHistory,
 } from "@cloudx/shared";
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
-import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
+import { parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
-import { reviewScopeInstructions, reviewScopeSummary } from "./ForgeReviewScope.js";
+import { reviewScopeInstructions } from "./ForgeReviewScope.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
 
 export interface ForgeSettings {
@@ -1003,6 +1003,7 @@ export class ForgeWorkflowService {
           if (report.kind !== worker.kind) throw new Error("Completion report does not match this worker.");
           if (report.kind === "review" && report.headSha !== worker.headSha)
             throw new Error("Review report does not match the checked out commit.");
+          if (report.kind === "review") parseScopedReview(report, completion.reviewScope);
           completion.report = report;
           this.log(worker, "info", "worker_report_received");
         }
@@ -1054,7 +1055,7 @@ export class ForgeWorkflowService {
       if (!scope || scope.current.headSha !== report.headSha)
         throw new Error("Completed review comparison evidence is missing or does not match its report. The review baseline was preserved.");
       const draft: ForgeReviewDraft = {
-        ...parseReview({ ...report, body: `${reviewScopeSummary(scope)}\n\n${report.body}` }),
+        ...parseScopedReview(report, scope),
         id: completion.attemptId, startedAt: worker.startedAt, status: "draft",
       };
       await this.deps.runtime.retainReviewBaseline(workerWorkspace(worker), scope.current, this.operations.get(worker.id)?.signal);

@@ -17,6 +17,8 @@ import { ForgeBranchConflictError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
 import type { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
+import { reviewScopeSummary } from "./ForgeReviewScope.js";
+import { validateReview } from "./providers/reviewValidation.js";
 
 function fixture() {
   const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
@@ -833,6 +835,96 @@ describe("Incremental review scope", () => {
     f.reports.read.mockResolvedValue(undefined);
     return { ...f, worker, revision, draft: f.stored()[0].draft! };
   }
+
+  async function reviewAtBodyLimit(kind: "initial" | "incremental") {
+    const f = kind === "initial" ? fixture() : await reviewedRevision();
+    if (kind === "incremental") f.change.headSha = "c".repeat(40);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-review-body-"));
+    onTestFinished(() => fs.rm(root, { recursive: true, force: true }));
+    f.deps.store = new ForgeWorkflowStore(new PluginDataStore(root));
+    await f.deps.store.write(f.stored());
+    const service = new ForgeWorkflowService(f.deps);
+    const worker = await service.startReview(f.deps.settings().repository, 7, false, placement);
+    const report = { kind: "review", headSha: f.change.headSha, event: "approve", body: "x".repeat(100_000), comments: [] };
+    f.reports.read.mockResolvedValue(report);
+    const body = `${reviewScopeSummary(worker.completion!.reviewScope!)}\n\n${report.body}`;
+    return { ...f, service, worker, report, body };
+  }
+
+  it.each(["initial", "incremental"] as const)("completes and reloads a maximum-length %s report with its scope intact", async kind => {
+    const f = await reviewAtBodyLimit(kind);
+    await f.service.poll();
+    const [completed] = await f.deps.store.read();
+    expect(completed.status, completed.error).toBe("completed");
+    expect(completed.draft?.body).toBe(f.body);
+    expect(completed.draft?.headSha).toBe(f.change.headSha);
+    expect(completed.completion?.report).toEqual(f.report);
+    expect(completed.reviewBaseline?.reviewId).toBe(f.worker.attemptId);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.dashboard();
+    await restarted.saveReview(completed.id, completed.draft!.id, completed.draft!);
+    f.reports.read.mockResolvedValue(undefined);
+    f.change.headSha = "d".repeat(40);
+    await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    const [next] = await f.deps.store.read();
+    expect(next.reviewHistory?.at(-1)?.body).toBe(f.body);
+    expect(next.completion?.reviewScope?.previous?.headSha).toBe(f.report.headSha);
+  });
+
+  it.each(["initial", "incremental"] as const)("resumes a cached maximum-length %s completion after restart and its deadline", async kind => {
+    const f = await reviewAtBodyLimit(kind);
+    const baseline = f.worker.reviewBaseline;
+    f.runtime.retainReviewBaseline.mockRejectedValueOnce(new Error("Could not retain the completed revision."));
+    await f.service.poll();
+    const [failed] = await f.deps.store.read();
+    expect(failed).toMatchObject({ status: "failed", error: "Could not retain the completed revision." });
+    expect(failed.completion?.readyAt).toEqual(expect.any(String));
+    expect(failed.completion?.report).toEqual(f.report);
+    expect(failed.reviewBaseline).toEqual(baseline);
+    expect(failed.draft).toBeUndefined();
+
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse(failed.completion!.deadlineAt) + 1);
+    onTestFinished(() => now.mockRestore());
+    f.reports.read.mockResolvedValue(undefined);
+    const launches = f.runtime.launch.mock.calls.length;
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(f.worker.id, placement);
+    expect(completed.status, completed.error).toBe("completed");
+    expect(completed.draft?.body).toBe(f.body);
+    expect(completed.draft?.headSha).toBe(f.report.headSha);
+    expect(completed.reviewBaseline?.reviewId).toBe(f.worker.attemptId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+
+    const body = `${reviewScopeSummary(completed.completion!.reviewScope!)}\n\nVerified the fix and relevant tests.`;
+    await restarted.saveReview(completed.id, completed.draft!.id, { ...completed.draft!, body });
+    f.provider.postReview.mockImplementation(async (_number, review) => { validateReview(review); return { commentIds: [] }; });
+    await restarted.submitReview(completed.id, completed.draft!.id);
+    expect(f.provider.postReview).toHaveBeenCalledWith(7, expect.objectContaining({ body, headSha: f.report.headSha }));
+    expect((await f.deps.store.read())[0].draft?.status).toBe("posted");
+  });
+
+  it.each(["initial", "incremental"] as const)("rejects an oversized %s report before checkpointing and accepts a corrected continuation", async kind => {
+    const f = await reviewAtBodyLimit(kind);
+    f.reports.read.mockResolvedValue({ ...f.report, body: `${f.report.body}x` });
+    await f.service.poll();
+    const [failed] = await f.deps.store.read();
+    expect(failed).toMatchObject({ status: "failed", completion: { reportError: expect.stringContaining("Invalid review body.") } });
+    expect(failed.completion?.readyAt).toBeUndefined();
+    expect(failed.completion?.report).toBeUndefined();
+    expect(failed.reviewBaseline).toEqual(f.worker.reviewBaseline);
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    const continued = await restarted.continueWorker(f.worker.id, "Shorten the review summary.", placement);
+    expect(continued.status).toBe("running");
+    expect(continued.attemptId).not.toBe(f.worker.attemptId);
+    f.reports.read.mockResolvedValue(f.report);
+    await restarted.poll();
+    const [completed] = await f.deps.store.read();
+    expect(completed.status, completed.error).toBe("completed");
+    expect(completed.draft?.body).toBe(f.body);
+  });
 
   it("records the full first review only after successful native completion and checkout retention", async () => {
     const f = fixture();
