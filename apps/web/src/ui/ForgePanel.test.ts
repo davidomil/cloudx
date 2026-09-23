@@ -1279,6 +1279,66 @@ describe("ForgePanel", () => {
     expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
+  it.each(["github", "gitlab"] as const)("shows delayed %s publication as one waiting status with collapsed diagnostics", async provider => {
+    const currentRepository = { ...repository, provider };
+    const waitingMessage = "The commit was pushed, but provider snapshots are still catching up. Checking once per minute until 2026-09-07T12:30:00.000Z; next check at 2026-09-07T12:04:00.000Z.";
+    const pendingPublication: NonNullable<ForgeWorker["pendingPublication"]> = {
+      ...publishingWorker.pendingPublication!,
+      nextConfirmationAt: "2026-09-07T12:04:00.000Z",
+      confirmationObservations: [
+        { observedAt: "2026-09-07T12:03:00.000Z", source: "status", reason: "mixed_heads", heads: [
+          { source: "pull request", headSha: "a".repeat(40) }, { source: "branch", headSha: "b".repeat(40) },
+        ] },
+        { observedAt: "2026-09-07T12:03:01.000Z", source: "confirmation", reason: "deferred", heads: [] },
+      ],
+    };
+    const f = fixture({ repository: currentRepository, workers: [{ ...publishingWorker, repository: currentRepository, error: waitingMessage, pendingPublication }] });
+    const panel = await renderPanel(f);
+    for (const section of ["Issues", provider === "github" ? "Pull requests" : "Merge requests", "Workers (1)"]) {
+      await click(panel, section);
+      const card = panel.querySelector(".forge-worker")!;
+      expect(Array.from(card.querySelectorAll('[role="status"]'), element => element.textContent)).toEqual([waitingMessage]);
+      expect(card.querySelector('[role="alert"]')).toBeNull();
+      expect(panel.querySelector(".forge-item-worker-error")).toBeNull();
+      expect(button(card, "Pause").disabled).toBe(false);
+      const diagnostics = card.querySelector<HTMLDetailsElement>('details[aria-label="Publication diagnostics"]')!;
+      expect(diagnostics.open).toBe(false);
+      expect(diagnostics.querySelector("summary")?.textContent).toBe("Publication diagnostics");
+      expect(diagnostics.textContent).toContain(`Previous head: ${pendingPublication.previousHeadSha}`);
+      expect(diagnostics.textContent).toContain(`Pushed head: ${pendingPublication.headSha}`);
+      expect(Array.from(diagnostics.querySelectorAll("time"), time => time.dateTime)).toEqual([
+        pendingPublication.confirmationStartedAt, pendingPublication.nextConfirmationAt,
+        "2026-09-07T12:03:00.000Z", "2026-09-07T12:03:01.000Z",
+      ]);
+      expect(diagnostics.textContent).toContain("status · mixed heads");
+      expect(diagnostics.textContent).toContain(`pull request: ${"a".repeat(40)}`);
+      expect(diagnostics.textContent).toContain(`branch: ${"b".repeat(40)}`);
+      expect(diagnostics.textContent).toContain("confirmation · deferred");
+      await act(async () => { diagnostics.querySelector("summary")!.click(); });
+      expect(diagnostics.open).toBe(true);
+    }
+    expect(f.calls.some(call => call.hook.startsWith("forge.worker."))).toBe(false);
+  });
+
+  it("shows stopped publication confirmation as an alert with the preserved diagnostics and retry action", async () => {
+    const stoppedMessage = "The commit was pushed, but publication is still not confirmed after 30 minutes. Automatic confirmation stopped. Inspect the request and Retry publication to check again without rerunning the worker.";
+    const f = fixture({ workers: [{ ...publishingWorker, status: "failed", error: stoppedMessage, pendingPublication: {
+      ...publishingWorker.pendingPublication!,
+      confirmationObservations: [{ observedAt: "2026-09-07T12:30:00.000Z", source: "confirmation", reason: "exhausted", heads: [] }],
+    } }] });
+    const panel = await renderPanel(f);
+    const card = panel.querySelector(".forge-worker")!;
+    expect(card.querySelector('[role="alert"]')?.textContent).toBe(stoppedMessage);
+    expect(card.querySelector('[role="status"]')).toBeNull();
+    expect(card.textContent).not.toContain("work continues automatically");
+    expect(card.textContent).not.toContain("Next automatic check");
+    expect(card.querySelector('[aria-label="Publication diagnostics"]')?.textContent).toContain("confirmation · exhausted");
+    await click(card, "Retry publication");
+    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+      { hook: "forge.worker.resume", input: { id: publishingWorker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+  });
+
   it.each([
     { provider: "github" as const, action: "Pause", status: "paused" as const },
     { provider: "github" as const, action: "Stop", status: "stopped" as const },
