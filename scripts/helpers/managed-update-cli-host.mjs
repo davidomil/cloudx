@@ -12,7 +12,12 @@ if (!home || !repoRoot || path.dirname(home) !== path.dirname(repoRoot)) throw n
 const unitFile = path.join(home, 'update-unit.json');
 const stateDir = path.join(home, '.local/state/cloudx/settings-update');
 const spawnSync = childProcess.spawnSync;
+const readFileSync = fs.readFileSync;
 os.homedir = () => home;
+// The mocked service owns a named cgroup even when the host's namespace root is '/'.
+fs.readFileSync = (file, ...options) => readFileSync(
+  file === '/proc/self/cgroup' || file === `/proc/${process.pid}/cgroup`
+    ? path.join(home, 'update-cgroup') : file, ...options);
 
 function commandResult(command, args, options = {}) {
   if (command === 'systemctl' && args[0] === '--user' && args[1] === 'show') {

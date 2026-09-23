@@ -100,6 +100,7 @@ function installation(failAt = 'git') {
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(path.join(home, '.config/cloudx'), { recursive: true });
   fs.mkdirSync(path.join(home, '.config/systemd/user'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'update-cgroup'), '0::/user.slice/cloudx-settings-update.service\n');
   fs.writeFileSync(path.join(home, '.config/cloudx/cloudx.env'), `CLOUDX_DATA_DIR=${dataDir}\n`);
   for (const service of SERVICE_NAMES) fs.writeFileSync(path.join(home, '.config/systemd/user', service), 'fixture unit\n');
   const logPath = record => path.join(stateDir, `${record.run.id}.log`);

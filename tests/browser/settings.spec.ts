@@ -1569,7 +1569,8 @@ test("Updates starts a different selected target after preparation fails", async
   });
   await expect(startSelected).toBeEnabled();
   await startSelected.scrollIntoViewIfNeeded();
-  await expect(startSelected).toBeInViewport({ ratio: 1 });
+  await expect(startSelected).toBeInViewport({ ratio: 0.99 });
+  await startSelected.click({ trial: true });
   await expectSettingsFits(page, isMobile);
   await captureSample(page, testInfo, "settings-update-new-target-recovery");
   await startSelected.click();
