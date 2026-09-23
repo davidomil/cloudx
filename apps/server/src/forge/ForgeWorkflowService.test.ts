@@ -2909,24 +2909,101 @@ describe("Forge publication confirmation", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
-  it.each(["open", "closed"])("honors merge completion with a linked issue still %s", async state => {
-    const f = await feedbackPublication();
+  it.each([
+    { state: "closed", restart: false, endpoint: "status" },
+    { state: "closed", restart: false, endpoint: "change" },
+    { state: "open", restart: false, endpoint: "status" },
+    { state: "open", restart: false, endpoint: "change" },
+    { state: "open", restart: true, endpoint: "status" },
+    { state: "open", restart: true, endpoint: "change" },
+  ])("honors merge completion with a linked issue $state (restart: $restart, endpoint: $endpoint)", async ({ state, restart, endpoint }) => {
+    const f = await feedbackPublication(true);
     await f.service.poll();
+    const reviewer = f.stored().find(worker => worker.kind === "review")!;
     f.change.headSha = f.publishedHead;
+    if (endpoint === "change") f.provider.getChangeRequestStatus.mockResolvedValueOnce({ ...f.change });
     f.change.merged = true;
     f.change.state = "merged";
     f.issue.state = state;
     f.advance(5_000);
     await f.service.poll();
-    if (state === "closed") {
-      expect(f.stored()).toEqual([]);
-      expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ expectedHeadSha: f.publishedHead }));
-    } else {
+    if (state === "open") {
       expect(f.stored()[0]).toMatchObject({ status: "paused", pendingPublication: { headSha: f.publishedHead } });
       expect(f.runtime.cleanup).not.toHaveBeenCalled();
+      expect(f.stored()).toHaveLength(2);
+      const waiting = structuredClone(f.stored()[0]);
+      expect(parseWorkers(f.stored())[0]).toEqual(waiting);
+      let service = f.service;
+      if (restart) {
+        await service.dispose();
+        service = new ForgeWorkflowService(f.deps);
+        await service.poll();
+        expect(f.stored()).toHaveLength(2);
+        expect(f.runtime.cleanup).not.toHaveBeenCalled();
+      }
+      f.issue.state = "closed";
+      f.advance(30_000);
+      await service.poll();
+      expect(f.stored()).toEqual([]);
+      expect(waiting).toMatchObject({ headSha: f.publishedHead, pendingPublication: { confirmed: true, report: f.report } });
+      expect(waiting.pendingPublication?.nextConfirmationAt).toBeUndefined();
     }
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: f.worker.id, expectedHeadSha: f.publishedHead }));
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: reviewer.id, expectedHeadSha: undefined }));
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
     expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { number: 8 }, { headSha: "a".repeat(40) }, { headSha: "c".repeat(40) },
+    { headBranch: "other" }, { baseBranch: "other" },
+  ])("rejects a mismatched merged publication before waiting for issue closure %#", async changed => {
+    const f = await feedbackPublication(true);
+    await f.service.poll();
+    Object.assign(f.change, { merged: true, state: "merged", headSha: f.publishedHead }, changed);
+    f.advance(5_000);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { headSha: f.publishedHead, report: f.report } });
+    expect(f.stored()[0].pendingPublication?.confirmed).not.toBe(true);
+    const reads = providerReadCounts(f);
+    f.advance(30_000);
+    await f.service.poll();
+    expect(providerReadCounts(f)).toEqual(reads);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+  });
+
+  it("retains changed local work when issue closure follows merged publication confirmation", async () => {
+    const f = await feedbackPublication(true);
+    await f.service.poll();
+    Object.assign(f.change, { merged: true, state: "merged", headSha: f.publishedHead });
+    f.advance(5_000);
+    await f.service.poll();
+    f.runtime.cleanup.mockRejectedValueOnce(new Error("New local work does not match the merged head"));
+    f.issue.state = "closed";
+    f.advance(30_000);
+    await f.service.poll();
+    expect(f.stored()).toMatchObject([{ id: f.worker.id, status: "cleanup_failed", worktreePath: "/repo/work",
+      error: "New local work does not match the merged head", pendingPublication: { confirmed: true, report: f.report } }]);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: f.worker.id, expectedHeadSha: f.publishedHead }));
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    f.advance(30_000);
+    await f.service.poll();
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+    expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
   });
 
   it("blocks review actions while a published request revision is still unconfirmed", async () => {

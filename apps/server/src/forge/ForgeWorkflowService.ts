@@ -2034,8 +2034,18 @@ export class ForgeWorkflowService {
       if (issuesClosed) await this.retireMergedWorker(candidate, change);
       else if (candidate.status !== "cleanup_failed" &&
           (["starting", "running", "awaiting_publication", "awaiting_merge"].includes(candidate.status) ||
-            candidate.autoReview?.enabled && candidate.status === "awaiting_review" || candidate.id === retryCleanupId))
+            candidate.autoReview?.enabled && candidate.status === "awaiting_review" || candidate.id === retryCleanupId)) {
+        const publication = candidate.pendingPublication;
+        if (publication?.headSha) {
+          if (change.headSha !== publication.headSha || change.headBranch !== candidate.branch || change.baseBranch !== candidate.baseBranch)
+            throw new Error("The merged request does not match the pushed publication. Inspect the retained checkout before resuming.");
+          candidate.headSha = publication.headSha;
+          publication.confirmed = true;
+          publication.nextConfirmationAt = undefined;
+        }
         await this.waitForIssueClosure(candidate, "Change request merged. Waiting for linked issues to close before cleanup.");
+        if (publication?.confirmed) await this.recordPublicationObservation(candidate, "confirmation", [], "confirmed");
+      }
     }
     return true;
   }
