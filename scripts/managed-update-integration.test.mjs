@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, expect, it } from "vitest";
 import ts from "typescript";
 import { MANAGED_INTEGRATION_FILES, MANAGED_INTEGRATION_SOURCE_FILES, prepareManagedIntegration } from "./managed-update-integration.mjs";
+import { FORGE_INTEGRATION_FILES } from "./managed-update-forge-integration.mjs";
 import { SettingsUpdater } from "./settings-update.mjs";
 import { verifySnapshot } from "./managed-update-store.mjs";
 import { UpdateHost } from "./managed-update.mjs";
@@ -23,7 +24,7 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const head = git(release, ["rev-parse", "HEAD"]);
   const integration = prepareManagedIntegration(release, coordinator);
   expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file =>
-    ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES].includes(file)), independentReadiness: true });
+    ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES, ...FORGE_INTEGRATION_FILES].includes(file)), independentReadiness: true });
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
 });

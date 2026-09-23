@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { recognizesDirectTerminalContract } from "./managed-update-integration.mjs";
@@ -6,6 +7,7 @@ import { recognizesDirectTerminalContract } from "./managed-update-integration.m
 const CATALOG_SCHEMA = "services/documentation-indexer/src/cloudx_documentation_indexer/catalog_schema.py";
 const SESSION_STORE = "apps/server/src/workspace/SessionStateStore.ts";
 const SOURCE_LIMIT = 16 * 1024 * 1024;
+const FORGE_STORE = `plugin-data/forge-${createHash("sha256").update("forge").digest("hex")}.json`;
 
 export function inspectDataCompatibility(release, env, dataDir) {
   const roots = dataRoots(release, env, dataDir);
@@ -81,10 +83,52 @@ function inspectRoots(release, dataDir, archiveRoot) {
   }
   if (sessionsPresent && !(noSessionPersistence && emptySessions) && (targetSessionSchema === null || sessionSchema !== targetSessionSchema))
     issues.push(`The selected target supports ${targetSessionSchema === null ? "no recognized" : targetSessionSchema} session schema; persisted sessions use schema ${sessionSchema}.`);
+  const forge = inspectForgeReviews(release, dataDir, issues);
   return { compatible: issues.length === 0, archivePresent, archiveSchema, targetArchiveSchema,
-    sessionsPresent, sessionSchema, targetSessionSchema, migrations, issues,
+    sessionsPresent, sessionSchema, targetSessionSchema, ...forge, migrations, issues,
     ...(noSessionPersistence ? { targetSessionPersistence: "none" } : {}),
     ...(issues.length ? { message: `${issues.join(" ")} Restore an explicitly selected compatible update snapshot while retaining newer data before continuing.` } : {}) };
+}
+
+function inspectForgeReviews(release, dataDir, issues) {
+  const saved = readOptional(path.join(dataDir, FORGE_STORE));
+  if (saved === undefined) return { forgePresent: false };
+  const workers = JSON.parse(saved);
+  if (!Array.isArray(workers) || workers.some(worker => !worker || typeof worker !== "object" || Array.isArray(worker)))
+    throw new Error("Saved Forge workers must be a valid worker list.");
+  const reviews = workers.filter(worker => worker.reviewBaseline !== undefined || worker.completion?.reviewScope !== undefined);
+  if (!reviews.length) return { forgePresent: true, forgeReviewEvidence: false };
+  const source = name => readOptional(path.join(release, "apps/server/src/forge", `${name}.ts`)) ?? "";
+  const service = source("ForgeWorkflowService"), validation = source("ForgeWorkflowValidation"), runtime = source("ForgeRuntime");
+  const native = service.includes("worker.reviewBaseline = { reviewId: draft.id, revision: scope.current }") &&
+    validation.includes("parsed.completion.reviewScope = scope") && validation.includes("parsed.reviewBaseline = { reviewId, revision }");
+  const retained = service.includes("recordManagedReview(") && validation.includes("preserveManagedReviewEvidence(worker, parsed)") &&
+    source("ManagedForgeReviewEvidence").includes("export function preserveManagedReviewEvidence(");
+  const supported = (native || retained) && runtime.includes("prepareReviewScope(") && runtime.includes("retainReviewBaseline(");
+  if (!supported) issues.push("The selected target lacks the Forge review-evidence reader and writer integration required by the saved profile.");
+  for (const worker of reviews) {
+    const latest = worker.draft ?? (Array.isArray(worker.reviewHistory) ? worker.reviewHistory.at(-1) : undefined);
+    const baseline = worker.reviewBaseline, scope = worker.completion?.reviewScope;
+    if (worker.kind !== "review" || baseline !== undefined && (!validReviewRevision(baseline?.revision) ||
+        typeof baseline?.reviewId !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(baseline.reviewId) ||
+        !latest || latest.id !== baseline.reviewId || latest.headSha !== baseline.revision.headSha))
+      issues.push("Saved Forge review baseline does not identify the most recent completed review. Preserve the profile and recover the completed review's verified Git evidence before updating.");
+    if (scope !== undefined && (!validReviewScope(scope) ||
+        worker.attemptId !== undefined && scope.current.headSha !== worker.headSha ||
+        worker.completion.report?.kind === "review" && scope.current.headSha !== worker.completion.report.headSha))
+      issues.push("Saved Forge review scope does not match its revision or completion report. Preserve the profile and recover the recorded review evidence before updating.");
+  }
+  return { forgePresent: true, forgeReviewEvidence: true, targetForgeReviewEvidence: supported ? native ? "native" : "retained" : null };
+}
+
+function validReviewRevision(value) {
+  return value && ["headSha", "baseSha", "mergeBaseSha"].every(key => typeof value[key] === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value[key]));
+}
+
+function validReviewScope(value) {
+  return value && ["initial", "incremental", "unchanged", "rewritten"].includes(value.kind) && validReviewRevision(value.current) &&
+    (value.kind === "initial" ? value.previous === undefined : validReviewRevision(value.previous)) &&
+    (!["incremental", "unchanged"].includes(value.kind) || value.previous.mergeBaseSha === value.current.mergeBaseSha);
 }
 
 function recognizesInMemorySessions(release) {

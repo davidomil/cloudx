@@ -167,6 +167,18 @@ the same ownership state. Ordinary empty-store initialization does not
 block rollback. Nonempty worker records and other Forge ownership files
 still participate in the comparison.
 
+Historical Forge integrations preserve validated review scope during
+startup and shutdown. A historical review records its pinned head, base
+and merge base, retains those Git objects, and saves the completed draft
+and baseline together. Returning to a newer version can continue from
+that completed comparison.
+
+These integrations keep ordinary metadata persistence from blocking
+rollback. New reviews, publications and ownership changes still block
+restoration that would rewind them. Preparation checks the saved review
+scope and baseline against the target reader and writer contract;
+inconsistent evidence stops the transition before activation.
+
 Restoration stops brokers started by the failed transition, including
 when the original broker was inactive or absent. Only the exact
 preserved original broker invocation may remain running.
@@ -252,8 +264,8 @@ before persistent terminal brokers. Its source fixture verifies direct
 process cleanup, a retained live shell and the next Settings handoff.
 
 Historical integrations must compile against the selected target’s APIs.
-Schema checks recognize catalog and session contracts; arbitrary
-historical or future converters are not implemented. These fixtures do
+Schema checks recognize catalog, session and Forge review evidence
+contracts; arbitrary historical or future converters are not implemented. These fixtures do
 not establish a complete historical installation matrix or cover reboot,
 power loss, disk exhaustion and network outages.
 

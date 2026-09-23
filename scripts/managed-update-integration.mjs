@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import { MISSING_SETTINGS_FILES, prepareMissingSettingsIntegration } from "./managed-update-settings-integration.mjs";
 import { CODEX_SOURCES, CODEX_IDENTITY_FILES, SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES,
   prepareCodexSourceIntegration, prepareSessionIntegration } from "./managed-update-session-integration.mjs";
+import { FORGE_SERVICE_FILE, FORGE_INTEGRATION_FILES, FORGE_INTEGRATION_SOURCE_FILES,
+  prepareManagedForgeIntegration } from "./managed-update-forge-integration.mjs";
 
 const SETTINGS_FILES = [
   "apps/server/src/system/CloudxUpdateService.ts",
@@ -26,9 +28,10 @@ const SERVER_FILE = "apps/server/src/server.ts";
 const LEGACY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start">';
 const MANAGED_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">';
 export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE, LEGACY_READINESS_SOURCE,
-  "scripts/managed-update-settings-integration.mjs", "scripts/managed-update-session-integration.mjs", ...SESSION_PERSISTENCE_FILES];
+  "scripts/managed-update-settings-integration.mjs", "scripts/managed-update-session-integration.mjs", ...SESSION_PERSISTENCE_FILES,
+  ...FORGE_INTEGRATION_SOURCE_FILES];
 export const MANAGED_INTEGRATION_FILES = [...new Set([...SETTINGS_FILES, READINESS_FILE, ...MISSING_SETTINGS_FILES,
-  ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES])];
+  ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES, ...FORGE_INTEGRATION_FILES])];
 
 // The updater remains maintained independently of the selected application.
 // Build these small integrations with the target's own dependencies and APIs.
@@ -67,6 +70,14 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
       migrated[CODEX_SOURCES] = integrated;
       files.push(CODEX_SOURCES, ...CODEX_IDENTITY_FILES);
     }
+  }
+  if (fs.existsSync(integrationPath(release, FORGE_SERVICE_FILE))) {
+    const forge = prepareManagedForgeIntegration(
+      relative => fs.readFileSync(integrationPath(release, relative), "utf8"),
+      relative => fs.readFileSync(integrationPath(coordinator, relative), "utf8"),
+    );
+    Object.assign(migrated, forge);
+    files.push(...Object.keys(forge));
   }
   const uniqueFiles = [...new Set(files)];
   const changes = uniqueFiles.map(relative => {

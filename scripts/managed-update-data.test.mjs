@@ -1,4 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
@@ -264,3 +265,82 @@ function createCatalog(root, version) {
   fs.mkdirSync(root, { recursive: true });
   execFileSync("python3", ["-I", "-S", "-c", "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute('CREATE TABLE IF NOT EXISTS retained (value TEXT)'); db.execute('PRAGMA user_version='+sys.argv[2]); db.commit(); db.close()", path.join(root, "catalog.sqlite"), String(version)]);
 }
+
+function forgeFixture() {
+  const f = fixture();
+  for (const name of ['ForgeWorkflowService', 'ForgeWorkflowValidation', 'ForgeRuntime']) {
+    const relative = `apps/server/src/forge/${name}.ts`;
+    fs.mkdirSync(path.dirname(path.join(f.release, relative)), { recursive: true });
+    fs.copyFileSync(relative, path.join(f.release, relative));
+  }
+  const id = '11111111-1111-4111-8111-111111111111';
+  const revision = { headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), mergeBaseSha: 'b'.repeat(40) };
+  const worker = { kind: 'review', draft: { id, headSha: revision.headSha }, reviewBaseline: { reviewId: id, revision },
+    completion: { reviewScope: { kind: 'initial', current: revision }, report: { kind: 'review', headSha: revision.headSha } } };
+  const store = path.join(f.data, `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`);
+  fs.mkdirSync(path.dirname(store));
+  fs.writeFileSync(store, JSON.stringify([worker]));
+  return { ...f, worker, store };
+}
+
+it('checks Forge review evidence for both the active profile and a selected snapshot without changing either', () => {
+  const f = forgeFixture();
+  const snapshot = path.join(f.root, 'snapshot');
+  fs.cpSync(f.data, snapshot, { recursive: true });
+  const before = fs.readFileSync(f.store);
+  expect(inspectDataCompatibility(f.release, {}, f.data)).toMatchObject({ compatible: true, forgePresent: true,
+    forgeReviewEvidence: true, targetForgeReviewEvidence: 'native' });
+  expect(inspectSnapshotCompatibility(f.release, {}, f.data, [{ root: f.data, destination: snapshot }])).toMatchObject({ compatible: true });
+  f.worker.reviewBaseline.reviewId = '22222222-2222-4222-8222-222222222222';
+  fs.writeFileSync(path.join(snapshot, path.relative(f.data, f.store)), JSON.stringify([f.worker]));
+  expect(inspectSnapshotCompatibility(f.release, {}, f.data, [{ root: f.data, destination: snapshot }])).toMatchObject({ compatible: false });
+  expect(fs.readFileSync(f.store)).toEqual(before);
+});
+
+it.each([
+  ['stale review', worker => { worker.draft.id = '22222222-2222-4222-8222-222222222222'; }],
+  ['different head', worker => { worker.reviewBaseline.revision.headSha = 'c'.repeat(40); }],
+  ['invalid identity', worker => { worker.draft.id = worker.reviewBaseline.reviewId = 'invalid'; }],
+  ['invalid commit', worker => { worker.reviewBaseline.revision.baseSha = 'main'; }],
+  ['missing latest review', worker => { delete worker.draft; worker.reviewHistory = {}; }],
+  ['invalid revision', worker => { worker.reviewBaseline.revision = null; }],
+  ['issue worker', worker => { worker.kind = 'issue'; }],
+  ['null scope', worker => { worker.completion.reviewScope = null; }],
+  ['missing current comparison', worker => { delete worker.completion.reviewScope.current; }],
+  ['unexpected previous comparison', worker => { worker.completion.reviewScope.previous = worker.reviewBaseline.revision; }],
+  ['incremental without previous comparison', worker => { worker.completion.reviewScope.kind = 'incremental'; }],
+  ['mismatched merge base', worker => { worker.completion.reviewScope = { kind: 'incremental', current: worker.reviewBaseline.revision,
+    previous: { ...worker.reviewBaseline.revision, mergeBaseSha: 'c'.repeat(40) } }; }],
+  ['mismatched report', worker => { worker.completion.report.headSha = 'c'.repeat(40); }],
+  ['mismatched attempt', worker => { worker.attemptId = '22222222-2222-4222-8222-222222222222'; worker.headSha = 'c'.repeat(40); }],
+])('rejects %s in saved Forge evidence before activation', (_name, change) => {
+  const f = forgeFixture();
+  change(f.worker);
+  const content = JSON.stringify([f.worker]);
+  fs.writeFileSync(f.store, content);
+  expect(inspectDataCompatibility(f.release, {}, f.data)).toMatchObject({ compatible: false });
+  expect(fs.readFileSync(f.store, 'utf8')).toBe(content);
+});
+
+it.each(['service', 'reader', 'runtime'])('requires a recognized Forge evidence %s when the profile contains review metadata', missing => {
+  const f = forgeFixture();
+  fs.unlinkSync(path.join(f.release, 'apps/server/src/forge', {
+    service: 'ForgeWorkflowService.ts', reader: 'ForgeWorkflowValidation.ts', runtime: 'ForgeRuntime.ts',
+  }[missing]));
+  expect(inspectDataCompatibility(f.release, {}, f.data)).toMatchObject({ compatible: false, targetForgeReviewEvidence: null });
+  fs.writeFileSync(f.store, '[]');
+  expect(inspectDataCompatibility(f.release, {}, f.data)).toMatchObject({ compatible: true, forgeReviewEvidence: false });
+});
+
+it.each(['null', '{}', '[null]', '[[]]', '[1]'])('rejects malformed Forge stores: %s', content => {
+  const f = forgeFixture();
+  fs.writeFileSync(f.store, content);
+  expect(() => inspectDataCompatibility(f.release, {}, f.data)).toThrow('valid worker list');
+});
+
+it('does not follow a redirected Forge workflow file', () => {
+  const f = forgeFixture();
+  fs.renameSync(f.store, `${f.store}.original`);
+  fs.symlinkSync(`${f.store}.original`, f.store);
+  expect(() => inspectDataCompatibility(f.release, {}, f.data)).toThrow('owned regular file');
+});
