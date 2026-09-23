@@ -3714,7 +3714,9 @@ describe("Legacy filesystem ownership reconciliation", () => {
     const workspaceFile = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
     const tabFile = path.join(deps.dataDir, "forge-workers", "tabs", `${tabId}.json`);
     const sourceFile = path.join(tabs.launchPath(), ".cloudx-source.json");
-    const oldDevice = "64521";
+    const checkoutDevice = (await fs.stat(workspace.worktreePath, { bigint: true })).dev;
+    const sourceDevice = (await fs.stat(sourceHome, { bigint: true })).dev;
+    const oldDevice = ((checkoutDevice > sourceDevice ? checkoutDevice : sourceDevice) + 1n).toString();
     const rewriteIdentity = async (value: unknown): Promise<void> => {
       if (!value || typeof value !== "object") return;
       const record = value as Record<string, unknown>;

@@ -300,7 +300,8 @@ describe("workspace recovery across server updates", () => {
       const bindingPath = path.join(fixture.config.dataDir, "codex-launches", tab.id, ".cloudx-source.json");
       const legacySource = JSON.parse(await fs.readFile(bindingPath, "utf8"));
       delete legacySource.durable;
-      legacySource.dev = "64521";
+      const previousDevice = (BigInt(legacySource.dev) + 1n).toString();
+      legacySource.dev = previousDevice;
       await fs.writeFile(bindingPath, JSON.stringify(legacySource));
       const blocked = await recover();
       expect(blocked.statusCode, blocked.body).toBe(500);
@@ -309,7 +310,7 @@ describe("workspace recovery across server updates", () => {
       const inspection = await app.inject({ method: "POST", url: `/api/tabs/${tab.id}/ownership/preview`, headers: { host: "localhost" }, payload: {} });
       expect(inspection.statusCode, inspection.body).toBe(200);
       const preview = inspection.json<DirectoryOwnershipPreview>();
-      expect(preview.directories).toContainEqual(expect.objectContaining({ path: home, device: "64521" }));
+      expect(preview.directories).toContainEqual(expect.objectContaining({ path: home, device: previousDevice }));
       const repaired = await app.inject({ method: "POST", url: `/api/tabs/${tab.id}/ownership/reconcile`, headers: { host: "localhost" }, payload: {
         fingerprint: preview.fingerprint,
         attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })),
