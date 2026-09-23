@@ -6,12 +6,13 @@ export default defineConfig({
   test: {
     ...base.test,
     include: [
+      "apps/server/src/plugins/CodexTerminalSession.flowControl.test.ts",
       "apps/server/src/terminal/TerminalBroker.test.ts",
       "apps/server/src/terminal/TerminalReplayBuffer.test.ts",
       "apps/server/src/sessionRecovery.server.test.ts",
     ],
     testNamePattern:
-      /durable terminal broker|terminal replay history|restores a full 32 MiB replay/,
+      /native Forge-owned terminal output|durable terminal broker|terminal replay history|restores a full 32 MiB replay/,
     retry: 0,
     maxWorkers: 2,
     coverage: {

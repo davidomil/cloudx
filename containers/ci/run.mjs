@@ -40,7 +40,8 @@ export function verificationCommands() {
       "--pretty",
       "false",
     ),
-    command(commandTimeoutMs, "npm", "run", "test:coverage"),
+    // Historical release builds share the verifier's two CPUs with coverage.
+    command(40 * 60 * 1_000, "npm", "run", "test:coverage"),
     command(commandTimeoutMs, "npm", "run", "build"),
     command(
       commandTimeoutMs,
@@ -78,7 +79,15 @@ export function verificationCommands() {
       "-q",
       { PYTHONPATH: "services/documentation-indexer/src" },
     ),
-    command(commandTimeoutMs, "npm", "run", "test:browser", { CI: "1" }),
+    command(
+      commandTimeoutMs,
+      "npm",
+      "run",
+      "test:browser",
+      "--",
+      "--workers=2",
+      { CI: "1" },
+    ),
   ];
 }
 
