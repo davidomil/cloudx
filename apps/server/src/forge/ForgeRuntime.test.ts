@@ -5,14 +5,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { act, createElement, type ComponentType } from "react";
+import { createRoot } from "react-dom/client";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import type { ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import * as filesystemEvidence from "../filesystemIdentity.js";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
+import { JsonStateFile } from "../jsonStateFile.js";
 import type { ConfigService } from "../configService.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
 import type { ForgeLogger } from "./ForgeLog.js";
@@ -148,8 +151,7 @@ async function createWorkerContext(deps: ForgeRuntimeDependencies, tab: Workspac
   return directory;
 }
 
-function conversationBinding(tabId = "review-tab-1"): ReviewConversationBinding {
-  const home = path.join(root, "shared-codex");
+function conversationBinding(tabId = "review-tab-1", home = path.join(root, "shared-codex")): ReviewConversationBinding {
   const stat = statSync(home, { bigint: true });
   const view = path.join(root, "data", "codex-launches", tabId);
   const viewStat = statSync(view, { bigint: true });
@@ -161,7 +163,7 @@ function conversationBinding(tabId = "review-tab-1"): ReviewConversationBinding 
   };
 }
 
-function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorkspace) {
+function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorkspace, home = path.join(root, "shared-codex")) {
   const tabs = new Map<string, WorkspaceTab>();
   const resumedIds: string[] = [];
   let lastTab: WorkspaceTab;
@@ -175,12 +177,11 @@ function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorks
     await createWorkerContext(deps, tab);
     const launch = path.join(deps.dataDir, "codex-launches", tab.id);
     await fs.mkdir(launch, { recursive: true });
-    const home = path.join(root, "shared-codex");
     for (const name of ["sessions", "archived_sessions"]) {
       await fs.mkdir(path.join(home, name), { recursive: true });
       await fs.symlink(path.join(home, name), path.join(launch, name));
     }
-    await fs.writeFile(path.join(launch, ".cloudx-source.json"), JSON.stringify({ version: 1, ...conversationBinding(tab.id).source }));
+    await fs.writeFile(path.join(launch, ".cloudx-source.json"), JSON.stringify({ version: 1, ...conversationBinding(tab.id, home).source }));
     await fs.writeFile(path.join(launch, "config.toml"), "Generated worker configuration");
     await fs.writeFile(path.join(launch, "auth.json"), "Private disposable authentication");
     try {
@@ -3112,16 +3113,16 @@ describe("Legacy filesystem ownership reconciliation", () => {
     vi.spyOn(filesystemEvidence, "filesystemIdentity").mockResolvedValue({ filesystemType: "ef53", filesystemId: "f00d1234" });
   });
   afterEach(() => vi.restoreAllMocks());
-  async function blockedReviewer({ legacy = true } = {}) {
+  async function blockedReviewer({ legacy = true, sourceHome = path.join(root, "shared-codex"), previousDevices = new Map<string, string>() } = {}) {
     const deps = dependencies();
     deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
-      const binding = options.binding ?? conversationBinding(launch.tabId);
+      const binding = options.binding ?? conversationBinding(launch.tabId, sourceHome);
       await options.save(binding);
       return binding.threadId!;
     }) };
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare("review-legacy", true);
-    const tabs = installReviewTabs(deps, workspace);
+    const tabs = installReviewTabs(deps, workspace, sourceHome);
     const tabId = await runtime.launch(tabs.request);
     const execution = await vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.prepareTerminalExecution!(tabId);
     const workspaceFile = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
@@ -3134,7 +3135,7 @@ describe("Legacy filesystem ownership reconciliation", () => {
       if (typeof record.dev === "string" && typeof record.ino === "string") {
         if (legacy) delete record.durable;
         else record.durable = (await readDirectoryIdentity(String(record.path ?? record.home))).durable;
-        record.dev = oldDevice;
+        record.dev = previousDevices.get(record.dev) ?? oldDevice;
       }
       await Promise.all(Object.values(record).map(rewriteIdentity));
     };
@@ -3153,6 +3154,113 @@ describe("Legacy filesystem ownership reconciliation", () => {
   function confirmations(preview: import("@cloudx/shared").DirectoryOwnershipPreview) {
     return { fingerprint: preview.fingerprint, attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })) };
   }
+
+  async function renderOwnershipRecovery(workspaceId: string) {
+    const { JSDOM } = await vi.importActual<{ JSDOM: new (html: string, options: { url: string }) => { window: Window } }>("jsdom");
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+    vi.stubGlobal("window", dom.window);
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const { DirectoryOwnershipRecovery } = await vi.importActual<{ DirectoryOwnershipRecovery: ComponentType<{
+      preview(): Promise<DirectoryOwnershipPreview>;
+      reconcile(input: DirectoryOwnershipReconciliation): Promise<void>;
+    }> }>("../../../web/src/ui/DirectoryOwnershipRecovery.js");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const rendered = createRoot(container);
+    const preview = vi.fn(() => runtime.previewOwnership(workspaceId));
+    const reconcile = vi.fn((input: DirectoryOwnershipReconciliation) => runtime.reconcileOwnership(workspaceId, input));
+    await act(async () => rendered.render(createElement(DirectoryOwnershipRecovery, { preview, reconcile })));
+    const click = async (label: string) => {
+      await act(async () => {
+        const button = Array.from(container.querySelectorAll("button")).find(candidate => candidate.textContent === label)!;
+        expect(button.disabled).toBe(false);
+        button.click();
+        if (label === "Inspect directory ownership") await preview.mock.results.at(-1)!.value;
+        if (label === "Reconcile verified ownership") await reconcile.mock.results.at(-1)!.value.catch(() => undefined);
+      });
+    };
+    return {
+      container, preview, reconcile, click,
+      async confirmMappings() {
+        await act(async () => {
+          for (const checkbox of container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) checkbox.click();
+        });
+      },
+      async close() {
+        await act(async () => rendered.unmount());
+        dom.window.close();
+        vi.unstubAllGlobals();
+      },
+    };
+  }
+
+  it.each(["tab", "source"])("completes UI recovery after the %s metadata write fails with swapped device numbers", async interruptedRecord => {
+    const sourceHome = await fs.mkdtemp("/dev/shm/cloudx-forge-source-");
+    let ui: Awaited<ReturnType<typeof renderOwnershipRecovery>> | undefined;
+    try {
+      const checkoutDevice = (await fs.stat(root)).dev.toString();
+      const sourceDevice = (await fs.stat(sourceHome)).dev.toString();
+      expect(checkoutDevice).not.toBe(sourceDevice);
+      vi.mocked(filesystemEvidence.filesystemIdentity).mockImplementation(async fd => ({
+        filesystemType: "ef53", filesystemId: (await fs.realpath(`/proc/self/fd/${fd}`)).startsWith(sourceHome) ? "bbbb" : "aaaa",
+      }));
+      const f = await blockedReviewer({ sourceHome, previousDevices: new Map([[checkoutDevice, sourceDevice], [sourceDevice, checkoutDevice]]) });
+      const files = [f.workspaceFile, f.tabFile, f.sourceFile];
+      const before = await Promise.all(files.map(async file => JSON.parse(await fs.readFile(file, "utf8"))));
+      await fs.writeFile(path.join(f.workspace.worktreePath, "README.md"), "Dirty reviewer notes\n");
+      await fs.writeFile(path.join(f.workspace.worktreePath, "unfinished.txt"), "Untracked investigation");
+      const gitStatus = await git(f.workspace.worktreePath, "status", "--porcelain");
+      const reports = new ForgeWorkerReports(f.deps.dataDir);
+      const { reportPath } = await reports.prepare(randomUUID(), { issue: "Retain original worker context" });
+      const report = JSON.stringify({ kind: "review", body: "Retain report", threadId: before[0].reviewConversation.threadId });
+      await fs.writeFile(reportPath, report);
+      const publicationPath = path.join(f.deps.dataDir, "preserved-publication.json");
+      const publication = JSON.stringify({ headSha, replyingToDiscussionId: "uncertain-reply" });
+      await fs.writeFile(publicationPath, publication);
+      const write = JsonStateFile.prototype.write;
+      const failure = vi.spyOn(JsonStateFile.prototype, "write").mockImplementation(async function (this: JsonStateFile, value) {
+        if (this.filePath === (interruptedRecord === "tab" ? f.tabFile : f.sourceFile)) throw new Error("Injected metadata write failure");
+        await write.call(this, value);
+      });
+      ui = await renderOwnershipRecovery(f.workspace.id);
+      await ui.click("Inspect directory ownership");
+      await ui.confirmMappings();
+      await ui.click("Reconcile verified ownership");
+      expect(ui.container.querySelector('[role="alert"]')?.textContent).toBe("Injected metadata write failure");
+      const partial = await Promise.all(files.map(async file => JSON.parse(await fs.readFile(file, "utf8"))));
+      expect(partial[0].worktree.dev).toBe(checkoutDevice);
+      expect(partial[0].reviewConversation.source.dev).toBe(sourceDevice);
+      expect(partial[interruptedRecord === "tab" ? 1 : 2]).toEqual(before[interruptedRecord === "tab" ? 1 : 2]);
+      failure.mockRestore();
+      runtime = new ForgeRuntime(f.deps);
+
+      await ui.click("Cancel ownership recovery");
+      await ui.click("Inspect directory ownership");
+      await ui.confirmMappings();
+      await ui.click("Reconcile verified ownership");
+
+      expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+      expect(ui.container.textContent).toContain("Directory ownership reconciled. Resume when ready.");
+      expect(ui.reconcile).toHaveBeenCalledTimes(2);
+      expect(ui.reconcile.mock.calls[1]![0].fingerprint).not.toBe(ui.reconcile.mock.calls[0]![0].fingerprint);
+      const mappings = ui.reconcile.mock.calls[1]![0].attestations;
+      expect(mappings).toContainEqual({ device: checkoutDevice, filesystemId: "bbbb", filesystemType: "ef53" });
+      expect(mappings).toHaveLength(interruptedRecord === "tab" ? 2 : 1);
+      if (interruptedRecord === "tab") expect(mappings).toContainEqual({ device: sourceDevice, filesystemId: "aaaa", filesystemType: "ef53" });
+      await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace, tabIds: [f.tabId] });
+      expect(await runtime.previewOwnership(f.workspace.id)).toMatchObject({ directories: [] });
+      expect(JSON.parse(await fs.readFile(f.workspaceFile, "utf8")).reviewConversation.threadId).toBe(before[0].reviewConversation.threadId);
+      expect(await git(f.workspace.worktreePath, "status", "--porcelain")).toBe(gitStatus);
+      expect(await fs.readFile(reportPath, "utf8")).toBe(report);
+      expect(await fs.readFile(publicationPath, "utf8")).toBe(publication);
+      expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+      expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+    } finally {
+      await ui?.close();
+      await fs.rm(sourceHome, { recursive: true, force: true });
+    }
+  });
 
   it("automatically accepts renumbering across all durable nested identities and retires the stopped execution with its reviewer thread intact", async () => {
     const f = await blockedReviewer({ legacy: false });

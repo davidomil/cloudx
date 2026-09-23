@@ -50,15 +50,16 @@ it("keeps auxiliary thread permissions native and rejects unresolved new-thread 
   expect(() => permissions.fromClient({ method: "thread/start", params: {} })).toThrow("resolved workspace roots");
   expect(() => permissions.fromClient({ method: "thread/start", params: { runtimeWorkspaceRoots: ["relative"] } })).toThrow("workspace roots are invalid");
   expect(() => new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["relative"] })).toThrow("Invalid Codex launch permissions");
-  const initial = { method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } };
+  const initial = { id: 1, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } };
   permissions.fromClient(initial);
   expect(initial.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
 });
 
-it.each(["thread/start", "thread/resume", "thread/fork"])("preserves native permission changes on new threads after initial %s", method => {
+it.each(["thread/resume", "thread/fork"])("preserves native permissions on new threads after initial %s", method => {
   const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
   permissions.fromClient({ method: "initialize", params: {} });
-  permissions.fromClient({ method, params: { runtimeWorkspaceRoots: ["/project"] } });
+  permissions.fromClient({ id: 1, method, params: { runtimeWorkspaceRoots: ["/project"] } });
+  permissions.fromServer({ id: 1, result: { thread: { id: "saved" } } });
   for (const policy of [
     { approvalPolicy: "on-request", sandbox: "workspace-write", permissions: null },
     { approvalPolicy: "on-request", sandbox: null, permissions: ":workspace" }
@@ -67,6 +68,110 @@ it.each(["thread/start", "thread/resume", "thread/fork"])("preserves native perm
     permissions.fromClient(next);
     expect(next.params).toEqual({ ...policy, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
   }
+});
+
+it.each([true, false])("retains launch YOLO choice %s across native new-thread requests until permissions change", yoloMode => {
+  const permissions = new CodexRemotePermissions({ yoloMode, additionalWritableRoots: ["/cloudx-skills"] });
+  for (const id of [1, 2, 3]) {
+    const next = { id, method: "thread/start", params: { approvalPolicy: "on-request", sandbox: "read-only", permissions: null, runtimeWorkspaceRoots: ["/project"] } };
+    permissions.fromClient(next);
+    permissions.fromServer({ id, result: { thread: { id: `thread-${id}` } } });
+    expect(next.params).toEqual({ approvalPolicy: yoloMode ? "never" : "on-request", sandbox: yoloMode ? "danger-full-access" : "read-only", permissions: null, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
+  }
+});
+
+function launchedPermissions() {
+  const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient({ id: 1, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } });
+  permissions.fromServer({ id: 1, result: { thread: { id: "selected" } } });
+  return permissions;
+}
+
+it.each([
+  { approvalPolicy: "on-request" },
+  { sandboxPolicy: { type: "workspace-write", writableRoots: ["/project"] } },
+  { permissions: ":workspace" },
+  { permissions: "custom-profile" },
+  { approvalsReviewer: "user" }
+])("preserves confirmed native policy changes through later new-thread requests: %j", policy => {
+  const permissions = launchedPermissions();
+  const update = { id: 2, method: "thread/settings/update", params: { threadId: "selected", ...policy } };
+  const original = structuredClone(update);
+  permissions.fromClient(update);
+  expect(update).toEqual(original);
+  permissions.fromServer({ id: 2, method: "thread/settings/updated", params: {} });
+  permissions.fromServer({ id: 2, result: {} });
+  for (const id of [3, 4]) {
+    const next = { id, method: "thread/start", params: { approvalPolicy: "on-request", sandbox: "workspace-write", runtimeWorkspaceRoots: ["/project"] } };
+    permissions.fromClient(next);
+    expect(next.params).toEqual({ approvalPolicy: "on-request", sandbox: "workspace-write", runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
+  }
+});
+
+it("ignores pending policy changes for a conversation that is no longer selected", () => {
+  const permissions = launchedPermissions();
+  permissions.fromClient({ id: 2, method: "thread/settings/update", params: { threadId: "selected", permissions: ":workspace" } });
+  permissions.fromClient({ id: 3, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } });
+  permissions.fromServer({ id: 3, result: { thread: { id: "next" } } });
+  permissions.fromServer({ id: 2, result: {} });
+  const next = { id: 4, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "read-only" } };
+  permissions.fromClient(next);
+  expect(next.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
+  permissions.fromServer({ id: 4, error: { message: "Cannot create thread." } });
+  permissions.fromClient({ id: 5, method: "thread/settings/update", params: { threadId: "next", permissions: ":workspace" } });
+  permissions.fromServer({ id: 5, result: {} });
+  const restricted = { id: 6, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "workspace-write" } };
+  permissions.fromClient(restricted);
+  expect(restricted.params).toMatchObject({ approvalPolicy: "on-request", sandbox: "workspace-write" });
+});
+
+it("bounds pending permission requests and releases failed and successful responses", () => {
+  const permissions = launchedPermissions();
+  const selection = (id?: number) => ({ id, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } });
+  expect(() => permissions.fromClient(selection())).toThrow("missing its identity");
+  for (let id = 2; id < 34; id++) permissions.fromClient(selection(id));
+  expect(() => permissions.fromClient(selection(2))).toThrow("reused a pending identity");
+  expect(() => permissions.fromClient(selection(34))).toThrow("pending limit");
+  permissions.fromServer({ id: 2, error: { message: "Thread unavailable." } });
+  expect(() => permissions.fromClient(selection(34))).not.toThrow();
+  permissions.fromServer({ id: 34, result: { thread: { id: "next" } } });
+  expect(() => permissions.fromClient(selection(35))).not.toThrow();
+  expect(() => permissions.fromServer({ id: 35, result: {} })).toThrow("no thread identity");
+});
+
+it("keeps launch permissions after failed, unrelated and auxiliary settings updates", () => {
+  const permissions = launchedPermissions();
+  permissions.fromClient({ id: 2, method: "thread/settings/update", params: { threadId: "selected", permissions: ":workspace" } });
+  permissions.fromServer({ id: 2, error: { message: "Permission profile is unavailable." } });
+  permissions.fromServer({ id: 2, result: {} });
+  permissions.fromClient({ id: 3, method: "thread/settings/update", params: { threadId: "selected", model: "native-model", approvalPolicy: null, permissions: null } });
+  permissions.fromServer({ id: 3, result: {} });
+  permissions.fromClient(titleThreadStart);
+  permissions.fromServer(titleThreadResponse);
+  permissions.fromClient({ id: 4, method: "thread/settings/update", params: { threadId: "title-thread", permissions: ":workspace" } });
+  permissions.fromServer({ id: 4, result: {} });
+  permissions.fromServer({ method: "thread/settings/updated", params: { threadId: "selected", permissions: ":workspace" } });
+  const next = { id: 5, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "read-only" } };
+  permissions.fromClient(next);
+  expect(next.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
+});
+
+it.each(["thread/resume", "thread/fork"])("retains saved native permissions on subsequent new threads after %s", method => {
+  const permissions = launchedPermissions();
+  permissions.fromClient({ id: 2, method: "thread/resume", params: { threadId: "missing" } });
+  permissions.fromServer({ id: 2, error: { message: "No saved conversation." } });
+  const afterFailure = { id: 3, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "read-only" } };
+  permissions.fromClient(afterFailure);
+  expect(afterFailure.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
+  permissions.fromServer({ id: 3, error: { message: "New conversation unavailable." } });
+  permissions.fromClient({ id: 4, method, params: { threadId: "resumed" } });
+  permissions.fromServer({ id: 4, result: { thread: { id: "resumed" } } });
+  const next = { id: 5, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "read-only" } };
+  permissions.fromClient(next);
+  expect(next.params).toMatchObject({ approvalPolicy: "on-request", sandbox: "read-only" });
+  const restricted = { id: 7, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "workspace-write" } };
+  permissions.fromClient(restricted);
+  expect(restricted.params).toMatchObject({ approvalPolicy: "on-request", sandbox: "workspace-write" });
 });
 
 it("makes each selected conversation durable before its native TUI receives the reply", async () => {

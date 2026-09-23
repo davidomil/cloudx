@@ -436,9 +436,16 @@ describe("durable Codex source ownership", () => {
     await expect(f.sources.reconcileOwnership("legacy", { fingerprint: preview.fingerprint, attestations: [] })).rejects.toThrow(/Confirm that saved device 1/);
     expect(JSON.parse(await fs.readFile(bindingPath, "utf8"))).toEqual(legacy);
     await expect(f.sources.reconcileOwnership("legacy", { fingerprint: "0".repeat(64), attestations: preview.directories })).rejects.toThrow(/changed after inspection/);
+    const rename = vi.spyOn(fs, "rename");
     await f.sources.reconcileOwnership("legacy", { fingerprint: preview.fingerprint, attestations: preview.directories });
+    expect(rename).toHaveBeenCalledOnce();
+    const [staging, committedBinding] = rename.mock.calls[0]!.map(String);
+    expect(staging).toMatch(/^\/proc\/self\/fd\/\d+\/\.cloudx-binding-.*\.tmp$/u);
+    expect(committedBinding).toBe(path.join(path.dirname(staging!), ".cloudx-source.json"));
     await expect(f.sources.readBinding("legacy")).resolves.toEqual(source);
     expect(JSON.parse(await fs.readFile(bindingPath, "utf8"))).toMatchObject({ ...source, durable: source.durable });
+    expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
+    expect(await fs.readdir(view)).toEqual([".cloudx-source.json"]);
     await f.sources.dispose();
   });
 
@@ -452,13 +459,15 @@ describe("durable Codex source ownership", () => {
     await f.sources.dispose();
   });
 
-  it.each(["after inspection", "before writing"])("preserves a replaced launch directory %s instead of reconciling into it", async stage => {
+  it.each(["after inspection", "before writing", "during final binding read", "while staging binding"])("preserves a replaced launch directory %s instead of reconciling into it", async stage => {
     const f = await fixture();
     const source = await f.sources.resolve();
     const view = await f.sources.bind("replaced-view", source);
     const binding = path.join(view, ".cloudx-source.json");
     const legacy = { version: 1, sourceId: source.sourceId, home: source.home, ino: source.ino, dev: "1" };
     await fs.writeFile(binding, JSON.stringify(legacy));
+    await fs.mkdir(path.join(f.home, "sessions"));
+    await fs.symlink(path.join(f.home, "sessions"), path.join(view, "sessions"));
     const preview = await f.sources.previewOwnership("replaced-view");
     const replaceView = async () => {
       await fs.rename(view, `${view}-retained`);
@@ -466,11 +475,27 @@ describe("durable Codex source ownership", () => {
       await fs.writeFile(binding, JSON.stringify(legacy));
     };
     if (stage === "after inspection") await replaceView();
-    else {
+    else if (stage === "before writing") {
       const assertCurrent = DirectoryOwnershipReconciler.prototype.assertCurrent;
       vi.spyOn(DirectoryOwnershipReconciler.prototype, "assertCurrent").mockImplementationOnce(async function (this: DirectoryOwnershipReconciler) {
         await assertCurrent.call(this);
         await replaceView();
+      });
+    } else {
+      const open = fs.open;
+      let bindingReads = 0;
+      vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        if (stage === "during final binding read" && path.basename(String(args[0])) === ".cloudx-source.json" && ++bindingReads === 2)
+          await replaceView();
+        const handle = await open(...args);
+        if (stage === "while staging binding" && String(args[0]).endsWith(".tmp")) {
+          const writeFile = handle.writeFile.bind(handle);
+          handle.writeFile = async (...writeArgs) => {
+            await writeFile(...writeArgs);
+            await replaceView();
+          };
+        }
+        return handle;
       });
     }
 
@@ -478,6 +503,9 @@ describe("durable Codex source ownership", () => {
       .rejects.toThrow(stage === "after inspection" ? /changed after inspection/ : /Codex launch ownership changed/);
     expect(JSON.parse(await fs.readFile(binding, "utf8"))).toEqual(legacy);
     expect(JSON.parse(await fs.readFile(path.join(`${view}-retained`, ".cloudx-source.json"), "utf8"))).toEqual(legacy);
+    expect(await fs.readdir(view)).toEqual([".cloudx-source.json"]);
+    expect(await fs.readdir(`${view}-retained`)).toEqual([".cloudx-source.json", "sessions"]);
+    expect(await fs.realpath(path.join(`${view}-retained`, "sessions"))).toBe(path.join(f.home, "sessions"));
     await f.sources.dispose();
   });
 });

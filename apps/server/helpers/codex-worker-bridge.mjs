@@ -164,6 +164,7 @@ export async function runWorkerBridge(launch) {
           if (socket.readyState !== WebSocket.OPEN) throw new Error("Native worker emitted a message without its visible client.");
           if (socket.bufferedAmount > MAX_MESSAGE_BYTES) throw new Error("Native worker client cannot keep up with output.");
           selection?.fromServer(message);
+          permissions?.fromServer(message);
           turn?.fromServer(message);
           socket.send(line);
         }

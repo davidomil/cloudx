@@ -6,7 +6,7 @@ import path from "node:path";
 
 import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation } from "@cloudx/shared";
 import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
-import { JsonStateFile } from "../jsonStateFile.js";
+import { openOwnedDirectoryNoFollow, stringifyJsonDocument } from "../jsonStateFile.js";
 
 import { assertDirectoryIdentity, readDirectoryIdentity, sameDirectoryIdentity, isDurableDirectoryIdentity, type DurableDirectoryIdentity } from "../directoryIdentity.js";
 
@@ -248,12 +248,37 @@ export class CodexStateSources {
       const { reconciliation, preview, selected, record, view } = await this.ownershipReconciliation(tabId, check);
       reconciliation.validate(preview, input);
       await reconciliation.assertCurrent();
-      assertDirectoryIdentity(view, await readDirectoryIdentity(view.path, "Codex launch"), "Codex launch");
-      if (JSON.stringify(await this.bindingRecord(tabId, check)) !== JSON.stringify(record))
-        throw new Error("Codex source binding changed after inspection. Inspect it again before reconciling.");
-      check();
-      await new JsonStateFile(this.dataDir, path.relative(this.dataDir, path.join(this.viewPath(tabId), BINDING)), "Codex source binding", 0o600)
-        .write({ version: 1, ...selected });
+      const ownedView = await openOwnedDirectoryNoFollow(path.dirname(view.path), view.path, "Codex launch", view);
+      const binding = ownedView.childPath(BINDING);
+      const staging = ownedView.childPath(`.cloudx-binding-${randomUUID()}.tmp`);
+      let staged = false;
+      try {
+        if (JSON.stringify(await this.readBindingRecord(binding, check)) !== JSON.stringify(record))
+          throw new Error("Codex source binding changed after inspection. Inspect it again before reconciling.");
+        await ownedView.assertCurrent();
+        check();
+        const file = await this.dependencies.fs.open(staging, "wx", 0o600);
+        staged = true;
+        try {
+          check();
+          await file.writeFile(stringifyJsonDocument({ version: 1, ...selected }, "Codex source binding"));
+          check();
+          await file.sync();
+        } finally {
+          await this.cleanup(() => file.close());
+        }
+        await ownedView.assertCurrent();
+        check();
+        await this.dependencies.fs.rename(staging, binding);
+        staged = false;
+        await ownedView.assertCurrent();
+      } finally {
+        try {
+          if (staged) await this.cleanup(() => this.dependencies.fs.unlink(staging));
+        } finally {
+          await this.cleanup(() => ownedView.close());
+        }
+      }
     });
   }
 
@@ -352,10 +377,14 @@ export class CodexStateSources {
     await this.directory(this.dataDir, check);
     await this.directory(path.dirname(view), check);
     await this.directory(view, check);
+    return this.readBindingRecord(path.join(view, BINDING), check);
+  }
+
+  private async readBindingRecord(binding: string, check: () => void): Promise<ResolvedCodexStateSource> {
     let value: unknown;
     try {
       value = JSON.parse(
-        (await this.readText(path.join(view, BINDING), 4096, check))!,
+        (await this.readText(binding, 4096, check))!,
       );
     } catch {
       check();

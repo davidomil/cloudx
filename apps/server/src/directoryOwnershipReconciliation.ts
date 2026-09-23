@@ -17,7 +17,7 @@ export class DirectoryOwnershipReconciler {
   preview(records: unknown): DirectoryOwnershipPreview {
     return {
       fingerprint: createHash("sha256").update(JSON.stringify({ records, identities: this.identities })).digest("hex"),
-      directories: [...new Map(this.identities.map(({ saved, current }) => [JSON.stringify([saved.path, saved.dev, current.dev]), {
+      directories: [...new Map(this.identities.filter(({ saved, current }) => !sameDirectoryIdentity(saved, current)).map(({ saved, current }) => [JSON.stringify([saved.path, saved.dev, current.dev]), {
         path: saved.path, device: saved.dev, currentDevice: current.dev,
         filesystemId: current.durable!.filesystemId, filesystemType: current.durable!.filesystemType,
       }])).values()],
