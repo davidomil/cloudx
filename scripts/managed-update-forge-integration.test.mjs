@@ -24,6 +24,23 @@ it.each(['2e69451b065e265db2a296e465ed306a33ab8f88', 'c664071e04091db6be78df09d8
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
 });
 
+it('adds continuation to a native target without replacing its comparison and ownership implementation', () => {
+  const target = file => historical(file, '7604d8d');
+  const migrated = prepareManagedForgeIntegration(target, maintained);
+  expect(Object.keys(migrated)).toEqual([FORGE_SERVICE_FILE]);
+  expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
+});
+
+it.each(['a9613faf', '2e69451b', 'c664071e'])('adds continuation to previously integrated %s targets', async commit => {
+  const source = historical('scripts/managed-update-forge-integration.mjs', '540da2c');
+  const previous = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+  const target = file => historical(file, commit);
+  const integrated = previous.prepareManagedForgeIntegration(target, maintained);
+  const migrated = prepareManagedForgeIntegration(file => integrated[file] ?? target(file), maintained);
+  expect(Object.keys(migrated)).toEqual([FORGE_SERVICE_FILE]);
+  expect(prepareManagedForgeIntegration(file => migrated[file] ?? integrated[file] ?? target(file), maintained)).toEqual({});
+});
+
 it.each([
   [FORGE_RUNTIME_FILE, '    let mergeBases: string[];'],
   [FORGE_SERVICE_FILE, '            worker.draft = { ...parseReview(report), status: "draft" };'],

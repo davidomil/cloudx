@@ -18,7 +18,7 @@ afterEach(async () => {
   cleanupHistoricalForge();
 });
 
-async function originalProfile() {
+async function originalProfile(targetCommit) {
   const history = historicalForge('c664071e', { integrate: false });
   const f = updateFixture({ activate: false, originalWeb: 'active' });
   fs.unlinkSync(f.forgeFile);
@@ -61,20 +61,23 @@ async function originalProfile() {
     expect(worker.reviewBaseline).toBeUndefined();
     expect(worker.completion).toBeUndefined();
   }
-  const currentStore = new ForgeWorkflowStore(new PluginDataStore(f.dataDir));
-  const currentRuntime = new ForgeRuntime(runtimeDeps);
+  const target = targetCommit ? historicalForge(targetCommit) :
+    { ForgeWorkflowService, ForgeWorkflowStore, ForgeRuntime, PluginDataStore };
+  const currentStore = new target.ForgeWorkflowStore(new target.PluginDataStore(f.dataDir));
+  const currentRuntime = new target.ForgeRuntime(runtimeDeps);
   vi.spyOn(currentRuntime, 'launch').mockImplementation(async () => randomUUID());
   vi.spyOn(currentRuntime, 'recover');
   vi.spyOn(currentRuntime, 'close').mockResolvedValue();
   function restartCurrent() {
-    const service = new ForgeWorkflowService({ store: currentStore, reports, runtime: currentRuntime,
+    const service = new target.ForgeWorkflowService({ store: currentStore, reports, runtime: currentRuntime,
       provider: () => provider, settings, notify: vi.fn() });
     services.push(service);
     return service;
   }
   const current = restartCurrent();
+  if (targetCommit) f.record.transition.release = target.root;
   const relative = 'apps/server/src/forge/ForgeWorkflowValidation.ts';
-  write(path.join(f.record.transition.release, relative), fs.readFileSync(relative, 'utf8'));
+  if (!targetCommit) write(path.join(f.record.transition.release, relative), fs.readFileSync(relative, 'utf8'));
   return { ...f, saved, currentStore, current, currentRuntime, restartCurrent, provider };
 }
 
@@ -96,8 +99,10 @@ it('loads every original 0.1.3 review on upgrade and preserves posted receipts w
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
-it.each(['draft', 'posted'])('starts a fresh full review after an original 0.1.3 %s review', async status => {
-  const f = await originalProfile();
+const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', '2e69451b', '39d42ec9', '7604d8d'];
+it.each(continuationTargets.flatMap(target => ['draft', 'posted'].map(status => ({ target, status }))))(
+  'starts a fresh full review after an original 0.1.3 $status review on $target', async ({ target, status }) => {
+  const f = await originalProfile(target);
   f.host.planData(f.record);
   expect(f.record.transition.dataCompatibility.compatible).toBe(true);
   const before = (await f.current.dashboard()).workers;
@@ -114,6 +119,8 @@ it.each(['draft', 'posted'])('starts a fresh full review after an original 0.1.3
   const next = await f.current.startReview(original.repository, original.number, false, { windowId: 'window', paneId: 'pane' });
   expect(next.status, next.error).toBe('running');
   expect(next.id).not.toBe(original.id);
+  expect(JSON.parse(fs.readFileSync(path.join(f.dataDir, 'forge-workers', 'workspaces', `${next.id}.json`), 'utf8')))
+    .toMatchObject({ id: next.id, worktreePath: next.worktreePath });
   expect(next.reviewBaseline).toBeUndefined();
   expect(next.completion.reviewScope).toEqual({ kind: 'initial', current: {
     headSha: f.record.targetCommit, baseSha: f.record.transition.sourceCommit, mergeBaseSha: f.record.transition.sourceCommit,
@@ -133,8 +140,9 @@ it.each(['draft', 'posted'])('starts a fresh full review after an original 0.1.3
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
-it.each(['posting', 'post_failed'])('requires reconciliation of an original 0.1.3 %s review before starting another', async status => {
-  const f = await originalProfile();
+it.each(continuationTargets.flatMap(target => ['posting', 'post_failed'].map(status => ({ target, status }))))(
+  'requires reconciliation of an original 0.1.3 $status review on $target before starting another', async ({ target, status }) => {
+  const f = await originalProfile(target);
   const original = f.saved.find(worker => worker.draft.status === 'draft');
   original.draft.status = status;
   write(f.forgeFile, JSON.stringify(f.saved));
@@ -148,6 +156,40 @@ it.each(['posting', 'post_failed'])('requires reconciliation of an original 0.1.
   const saved = await f.currentStore.read();
   expect(saved).toHaveLength(f.saved.length);
   expect(saved.find(worker => worker.id === original.id)).toMatchObject({ status: 'completed', draft: { status: 'post_failed' } });
+  expect(f.provider.postReview).toHaveBeenCalledOnce();
+}, 15000);
+
+it.each([
+  { target: 'a9613faf', missing: 'ownership' },
+  { target: '2e69451b', missing: 'ownership' },
+  { target: '7604d8d', missing: 'ownership' },
+  { target: '7604d8d', missing: 'baseline' },
+])('retains modern $missing protection on $target', async ({ target, missing }) => {
+  const f = await originalProfile(target);
+  const original = f.saved.find(worker => worker.draft.status === 'draft');
+  const modern = await f.current.startReview(original.repository, 9, false, { windowId: 'window', paneId: 'pane' });
+  expect(modern.status, modern.error).toBe('running');
+  await f.current.dispose();
+  const workers = await f.currentStore.read();
+  const saved = workers.find(worker => worker.id === modern.id);
+  Object.assign(saved, { status: 'completed', attemptId: undefined, tabId: undefined, completion: undefined,
+    draft: { ...original.draft, id: randomUUID(), startedAt: modern.startedAt, status: 'draft' } });
+  if (missing === 'ownership') {
+    saved.reviewBaseline = { reviewId: saved.draft.id, revision: modern.completion.reviewScope.current };
+    fs.unlinkSync(path.join(f.dataDir, 'forge-workers', 'workspaces', `${modern.id}.json`));
+  }
+  await f.currentStore.write(workers);
+  const restarted = f.restartCurrent();
+  const prepare = vi.spyOn(f.currentRuntime, 'prepareWorkspace');
+  f.currentRuntime.launch.mockClear();
+
+  const rejected = await restarted.startReview(original.repository, 9, false, { windowId: 'window', paneId: 'pane' });
+  expect(rejected.id).toBe(modern.id);
+  expect(rejected.status).not.toBe('running');
+  expect(rejected.error).toContain(missing === 'ownership' ? 'ownership record is missing or invalid' : 'no verified baseline evidence');
+  expect(prepare).not.toHaveBeenCalled();
+  expect(f.currentRuntime.launch).not.toHaveBeenCalled();
+  expect(await f.currentStore.read()).toHaveLength(workers.length);
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 

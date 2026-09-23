@@ -5,8 +5,8 @@ export const FORGE_EVIDENCE_FILE = "apps/server/src/forge/ManagedForgeReviewEvid
 export const FORGE_INTEGRATION_FILES = [FORGE_RUNTIME_FILE, FORGE_SERVICE_FILE, FORGE_VALIDATION_FILE, FORGE_EVIDENCE_FILE];
 export const FORGE_INTEGRATION_SOURCE_FILES = ["scripts/managed-update-forge-integration.mjs", FORGE_RUNTIME_FILE, FORGE_EVIDENCE_FILE];
 
-// Historical reviewers keep their full-review workflow. Only its persisted
-// comparison evidence and retained Git objects are owned by this integration.
+// Historical reviewers keep their full-review workflow. Retain its evidence
+// and continue cleaned original reviews in a new owned workspace.
 export function prepareManagedForgeIntegration(readTarget, readCoordinator) {
   const changes = Object.fromEntries(FORGE_INTEGRATION_FILES.slice(0, 3).map(file => [file, readTarget(file)]));
   const service = changes[FORGE_SERVICE_FILE], validation = changes[FORGE_VALIDATION_FILE], runtime = changes[FORGE_RUNTIME_FILE];
@@ -16,7 +16,9 @@ export function prepareManagedForgeIntegration(readTarget, readCoordinator) {
   const integrated = service.includes("captureManagedReviewScope(") && validation.includes("preserveManagedReviewEvidence(worker, parsed);");
   if (native.every(Boolean) || integrated && native[2] && readTarget(FORGE_EVIDENCE_FILE).includes("export function preserveManagedReviewEvidence(")) {
     const reader = retainHistoricalDraftReader(validation);
-    return reader === validation ? {} : { [FORGE_VALIDATION_FILE]: reader };
+    const continuation = retainReviewContinuation(service);
+    return { ...(reader === validation ? {} : { [FORGE_VALIDATION_FILE]: reader }),
+      ...(continuation === service ? {} : { [FORGE_SERVICE_FILE]: continuation }) };
   }
   if (native.some(Boolean) || integrated) throw new Error("Managed Forge review integration does not recognize the target evidence contract.");
 
@@ -124,7 +126,69 @@ export function prepareManagedForgeIntegration(readTarget, readCoordinator) {
     replace(FORGE_VALIDATION_FILE, '    return { kind: "review", ...parseReview(report) };',
       '    text(report.body, "review body", 100_000);\n    return { kind: "review", ...parseReview(report) };');
   changes[FORGE_VALIDATION_FILE] = retainHistoricalDraftReader(changes[FORGE_VALIDATION_FILE]);
+  changes[FORGE_SERVICE_FILE] = retainReviewContinuation(changes[FORGE_SERVICE_FILE]);
   return changes;
+}
+
+function retainReviewContinuation(service) {
+  function replace(before, after) {
+    if (service.split(before).length !== 2)
+      throw new Error("Managed Forge review integration does not recognize the target continuation contract.");
+    service = service.replace(before, after);
+  }
+  const reviewers = `    const reviewers = kind === "review" ? this.reviewWorkers(repository, number) : [];
+    if (reviewers.some(worker => worker.draft && ["posting", "post_failed"].includes(worker.draft.status)))
+      throw new Error("The previous review submission must be reconciled before starting another review.");`;
+  const retained = service.includes("worker.retainedWorkspace");
+  const selection = `${reviewers}
+    const reviewer = reviewers${retained ? ".filter(worker => !worker.retainedWorkspace)" : ""}.at(-1);
+    if (reviewer?.worktreePath)`;
+  if (service.includes("  private async startReviewRound(")) {
+    if (!service.includes(selection)) {
+      const previous = [
+        `    const reviewer = kind === "review" ? this.workers.find(worker =>
+      worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository)) : undefined;
+    if (reviewer)`,
+        `    const reviewer = kind === "review"
+      ? this.reviewWorkers(repository, number).filter(worker => !worker.retainedWorkspace).at(-1)
+      : undefined;
+    if (reviewer)`,
+      ].find(candidate => service.includes(candidate));
+      if (!previous) throw new Error("Managed Forge review integration does not recognize the target reviewer selection.");
+      replace(previous, selection);
+    }
+  } else if (!service.includes(reviewers)) {
+    const create = "    const now = new Date().toISOString();\n    const worker: ForgeWorker = {";
+    replace(create, `${reviewers}\n${create}`);
+  }
+  if (!service.includes("  private reviewWorkers(")) {
+    replace("  pause(id: string): Promise<ForgeWorker> {", `  private reviewWorkers(repository: ForgeRepository, number: number): ForgeWorker[] {
+    return this.workers.filter(worker => worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository))
+      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  }
+  private previousReviews(worker: ForgeWorker): ForgeReviewDraft[] {
+    const reviews = this.reviewWorkers(worker.repository, worker.number).flatMap(reviewer => {
+      const saved = reviewer as ForgeWorker & { reviewHistory?: ForgeReviewDraft[] };
+      return [...(saved.reviewHistory ?? []), ...(saved.draft ? [saved.draft] : [])];
+    }) as Array<ForgeReviewDraft & { startedAt: string }>;
+    return reviews.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  }
+  pause(id: string): Promise<ForgeWorker> {`);
+  }
+  const context = "      reviewScope ? { ...context, reviewScope, previousReviews: this.previousReviews(worker) } :";
+  if (!service.includes(context)) {
+    const scoped = "      reviewScope ? { ...context, reviewScope, previousReviews: [...(worker.reviewHistory ?? []), ...(worker.draft ? [worker.draft] : [])] } :";
+    if (service.includes(scoped)) replace(scoped, context);
+    else {
+      const prepare = "    const { reportPath, contextPath } = await this.deps.reports.prepare(\n      worker.attemptId,\n";
+      replace(prepare, prepare + context + "\n");
+    }
+  }
+  if (!service.includes("if (reviewScope) instructions +=") && !service.includes("review the full pinned PR/MR comparison")) {
+    replace("Both commits and their history are already fetched. Compare with git diff",
+      "Read previousReviews and current feedback; verify earlier findings against the current code. Both commits and their history are already fetched; review the full pinned PR/MR comparison with git diff");
+  }
+  return service;
 }
 
 function integrateSeparateReviewWorkers(changes, replace) {
