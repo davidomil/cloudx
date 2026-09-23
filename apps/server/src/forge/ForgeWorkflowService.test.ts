@@ -2398,7 +2398,7 @@ describe("Forge direct decision validation", () => {
 describe("Forge publication confirmation", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  async function feedbackPublication() {
+  async function feedbackPublication(retainReviewer = false) {
     let now = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const f = fixture();
@@ -2407,6 +2407,12 @@ describe("Forge publication confirmation", () => {
     await f.service.poll();
     const previousHead = f.change.headSha;
     const publishedHead = "b".repeat(40);
+    if (retainReviewer) {
+      const reviewer = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+      f.reports.read.mockResolvedValue({ kind: "review", headSha: previousHead, body: "Cover null input", event: "request_changes", comments: [] });
+      await f.service.poll();
+      expect(f.stored().find(saved => saved.id === reviewer.id)).toMatchObject({ status: "completed", draft: { status: "posted" } });
+    }
     f.change.comments = [{ id: "comment-1", discussionId: "thread-1", body: "Cover null input", author: "reviewer", resolved: false }];
     await f.service.resume(worker.id, placement);
     const report = { kind: "issue", title: "Address review", body: "Null handling tested", discussionReplies: [{ discussionId: "thread-1", body: "Added and verified the regression." }], resolvedDiscussionIds: ["thread-1"] };
@@ -2414,6 +2420,123 @@ describe("Forge publication confirmation", () => {
     f.runtime.publishBranch.mockResolvedValue(publishedHead);
     return { ...f, worker, previousHead, publishedHead, report, advance: (ms: number) => { now += ms; } };
   }
+
+  function providerReadCounts(f: ReturnType<typeof fixture>) {
+    return {
+      status: f.provider.getChangeRequestStatus.mock.calls.length,
+      change: f.provider.getChangeRequest.mock.calls.length,
+      issue: f.provider.getIssue.mock.calls.length,
+      branch: f.provider.findChangeRequestByBranch.mock.calls.length,
+    };
+  }
+
+  describe("retained reviewer publication polling", () => {
+    it.each([false, true])("respects deferred cadence and resumes completion checks after confirmation (restart: %s)", async restart => {
+      const f = await feedbackPublication(true);
+      await f.service.poll();
+      f.advance(120_000);
+      await f.service.poll();
+      expect(f.stored()[0].error).toMatch(/once per minute/);
+      const checkpoint = structuredClone(f.stored()[0].pendingPublication);
+      const reads = providerReadCounts(f);
+      let service = f.service;
+      if (restart) {
+        await service.dispose();
+        service = new ForgeWorkflowService(f.deps);
+        await service.poll();
+      }
+      f.advance(30_000);
+      await service.poll();
+      expect(providerReadCounts(f)).toEqual(reads);
+      expect(f.stored()[0].pendingPublication).toEqual(checkpoint);
+
+      f.advance(30_000);
+      await service.poll();
+      expect(providerReadCounts(f)).toEqual({ ...reads, status: reads.status + 1 });
+      f.change.headSha = f.publishedHead;
+      f.advance(60_000);
+      await service.poll();
+      await service.poll();
+      expect(f.stored()[0]).toMatchObject({ status: "awaiting_review", headSha: f.publishedHead });
+      expect(f.stored()[0].pendingPublication).toBeUndefined();
+      expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+      expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+      expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+      expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+      expect(f.provider.resolveDiscussion).toHaveBeenCalledOnce();
+
+      const confirmedReads = providerReadCounts(f);
+      f.advance(30_000);
+      await service.poll();
+      expect(providerReadCounts(f)).toEqual({ ...confirmedReads, status: confirmedReads.status + 1, change: confirmedReads.change + 1 });
+      expect(f.provider.replyToDiscussion).toHaveBeenCalledOnce();
+      expect(f.provider.resolveDiscussion).toHaveBeenCalledOnce();
+    });
+
+    it.each(["exhaustion", "status error", "change error"] as const)("stops all associated provider reads after %s, including restart", async reason => {
+      const f = await feedbackPublication(true);
+      await f.service.poll();
+      f.advance(120_000);
+      await f.service.poll();
+      if (reason === "exhaustion") {
+        f.advance(28 * 60_000);
+      } else {
+        f.change.headSha = f.publishedHead;
+        f.provider[reason === "status error" ? "getChangeRequestStatus" : "getChangeRequest"]
+          .mockRejectedValue(new ForgeProviderUnavailableError("timeout", "request"));
+        f.advance(60_000);
+      }
+      const beforeStop = providerReadCounts(f);
+      await f.service.poll();
+      expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { headSha: f.publishedHead, report: f.report } });
+      expect(f.stored()[0].pendingPublication!.confirmationObservations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ reason: reason === "exhaustion" ? "exhausted" : "provider_error" }),
+      ]));
+      const stoppedReads = providerReadCounts(f);
+      expect(stoppedReads).toEqual({ ...beforeStop,
+        status: beforeStop.status + (reason === "exhaustion" ? 0 : 1),
+        change: beforeStop.change + (reason === "change error" ? 1 : 0),
+      });
+      f.advance(60_000);
+      await f.service.poll();
+      expect(providerReadCounts(f)).toEqual(stoppedReads);
+      await f.service.dispose();
+      const restarted = new ForgeWorkflowService(f.deps);
+      await restarted.poll();
+      f.advance(60_000);
+      await restarted.poll();
+      expect(providerReadCounts(f)).toEqual(stoppedReads);
+      expect(f.stored()[0].status).toBe("failed");
+      expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+      expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+      expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+      expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { number: 8 },
+      { repository: { provider: "gitlab" as const } },
+      { repository: { apiUrl: "https://other.example/api" } },
+      { repository: { projectPath: "other/project" } },
+    ])("keeps completion checks for an unrelated request %#", async unrelated => {
+      const f = await feedbackPublication(true);
+      await f.service.poll();
+      await f.service.dispose();
+      const reviewer = f.stored().find(worker => worker.kind === "review")!;
+      const other = { ...reviewer, id: randomUUID(), number: unrelated.number ?? reviewer.number,
+        repository: { ...reviewer.repository, ...unrelated.repository } };
+      await f.deps.store.write([...f.stored(), other]);
+      const reads = providerReadCounts(f);
+      const provider = vi.spyOn(f.deps, "provider");
+      const restarted = new ForgeWorkflowService(f.deps);
+      await restarted.poll();
+      expect(provider).toHaveBeenCalledExactlyOnceWith(other.repository, "reviewer", expect.any(AbortSignal), expect.objectContaining({ workerId: other.id }));
+      expect(providerReadCounts(f)).toEqual({ ...reads, status: reads.status + 1 });
+      expect(f.provider.getChangeRequestStatus).toHaveBeenLastCalledWith(other.number);
+      expect(f.stored()[0].status).toBe("awaiting_publication");
+    });
+  });
 
   it("automatically continues confirmed publication without another push, worker run, or reply", async () => {
     const f = await feedbackPublication();

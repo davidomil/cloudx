@@ -1976,7 +1976,9 @@ export class ForgeWorkflowService {
     for (const worker of [...this.workers]) {
       if (this.disposed) return;
       const number = changeNumber(worker);
-      if (!number || worker.status === "cleanup_failed" || hasUnconfirmedPublication(worker) || !this.workers.includes(worker)) continue;
+      if (!number || worker.status === "cleanup_failed" || !this.workers.includes(worker)) continue;
+      if (this.workers.some(candidate => hasUnconfirmedPublication(candidate) && candidate.changeNumber === number &&
+        sameRepository(candidate.repository, worker.repository))) continue;
       if (recovering.some(candidate => changeNumber(candidate) === number && sameRepository(candidate.repository, worker.repository))) continue;
       const key = JSON.stringify([worker.repository.provider, worker.repository.apiUrl, worker.repository.projectPath, number]);
       if (checked.has(key)) continue;
