@@ -1344,19 +1344,39 @@ describe("Incremental review scope", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(1);
   });
 
-  it("retains the previous baseline when the completed revision cannot be protected from Git collection", async () => {
+  it("retains the previous baseline and report until a restarted Resume protects the completed revision", async () => {
     const f = await reviewedRevision();
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-review-handoff-"));
+    onTestFinished(() => fs.rm(root, { recursive: true, force: true }));
+    const reports = new ForgeWorkerReports(root);
+    const prepared = vi.spyOn(reports, "prepare");
+    const removed = vi.spyOn(reports, "remove");
+    f.deps.reports = reports;
+    f.reports.read.mockImplementation(id => reports.read(id));
     f.change.headSha = "c".repeat(40);
     const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const { reportPath, contextPath } = await prepared.mock.results[0].value;
+    const report = JSON.stringify({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    await fs.writeFile(reportPath, report);
+    const context = await fs.readFile(contextPath);
     f.runtime.retainReviewBaseline.mockRejectedValueOnce(new Error("The reviewed commit could not be retained."));
-    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
     await f.service.poll();
-    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, completion: { report: { headSha: f.change.headSha } } });
+    expect(f.stored()[0]).toMatchObject({ status: "failed", attemptId: next.attemptId, reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, completion: { report: { headSha: f.change.headSha } } });
+    expect(await fs.readFile(reportPath)).toEqual(Buffer.from(report));
+    expect(await fs.readFile(contextPath)).toEqual(context);
+    expect(removed).not.toHaveBeenCalled();
     expect(f.stored()[0].draft).toBeUndefined();
     expect(f.provider.postReview).not.toHaveBeenCalled();
     const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.dashboard();
+    expect(await fs.readFile(reportPath)).toEqual(Buffer.from(report));
+    expect(await fs.readFile(contextPath)).toEqual(context);
     const completed = await restarted.resume(next.id, placement);
     expect(completed).toMatchObject({ status: "completed", reviewBaseline: { reviewId: next.attemptId, revision: { ...f.revision, headSha: f.change.headSha } } });
+    expect(completed.attemptId).toBeUndefined();
+    expect(removed).toHaveBeenCalledExactlyOnceWith(next.attemptId);
+    await expect(fs.lstat(reportPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(contextPath)).rejects.toMatchObject({ code: "ENOENT" });
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
