@@ -8,6 +8,8 @@ import { CodexStateSources } from "../plugins/CodexStateSources.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
 import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
 
+vi.mock("../filesystemIdentity.js", () => ({ filesystemIdentity: async () => ({ filesystemType: "ef53", filesystemId: "f00d1234" }) }));
+
 const threadId = "01a08470-d118-7b72-b1df-439e72e5c744";
 let root: string;
 let dataDir: string;
@@ -222,4 +224,19 @@ it.each(["view", "history link"])("preserves a replaced reviewer %s during retir
 
   await expect(retireReviewSessionView(dataDir, launch.tabId, expected, binding!)).rejects.toThrow(/ownership changed|history link changed/i);
   expect(await fs.readFile(path.join(view, "auth.json"), "utf8")).toBe("Preserve replacement evidence");
+});
+
+it("resumes the existing reviewer thread when every durable source and view device number changed", async () => {
+  const first = new ConversationTransport();
+  await new ForgeReviewConversation(dataDir, async () => first).prepare(launch, options());
+  binding!.source.dev = "1";
+  binding!.sqliteHome.dev = "1";
+  binding!.originView.dev = "1";
+  const bindingPath = path.join(launch.env.CODEX_HOME!, ".cloudx-source.json");
+  const source = JSON.parse(await fs.readFile(bindingPath, "utf8"));
+  await fs.writeFile(bindingPath, JSON.stringify({ ...source, dev: "1" }));
+  const second = new ConversationTransport();
+  expect(await new ForgeReviewConversation(dataDir, async () => second).prepare(launch, options())).toBe(threadId);
+  expect(second.requests.map(request => request.method)).toEqual(["initialize", "initialized", "thread/resume", "thread/unsubscribe"]);
+  expect(binding!.threadId).toBe(threadId);
 });

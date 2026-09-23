@@ -6,10 +6,11 @@ import type { FastifyInstance } from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
-import { listTabLayoutPanes, type CreateTabResponse, type WorkspaceStateResponse, type WorkspaceTab } from "@cloudx/shared";
+import { listTabLayoutPanes, type CreateTabResponse, type DirectoryOwnershipPreview, type WorkspaceStateResponse, type WorkspaceTab } from "@cloudx/shared";
 import { loadConfig } from "./config.js";
 import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
+import * as filesystemEvidence from "./filesystemIdentity.js";
 import { CODEX_CLOSE_ON_EXIT_GRACE_MS } from "./plugins/CodexTerminalPlugin.js";
 import { buildServer, buildServices } from "./server.js";
 import { SessionStateStore } from "./workspace/SessionStateStore.js";
@@ -80,6 +81,12 @@ describe("workspace recovery across server updates", () => {
         });
         expect(response.statusCode, response.body).toBe(400);
       }
+      for (const payload of [{}, { fingerprint: "bad", attestations: [] }, { fingerprint: "a".repeat(64), attestations: [{ device: "64521" }] }]) {
+        const response = await restored.app.inject({ method: "POST", url: `/api/tabs/${first.tab.id}/ownership/reconcile`, headers: { host: "localhost" }, payload });
+        expect(response.statusCode, response.body).toBe(400);
+      }
+      const unexpectedPreviewInput = await restored.app.inject({ method: "POST", url: `/api/tabs/${first.tab.id}/ownership/preview`, headers: { host: "localhost" }, payload: { path: "/other" } });
+      expect(unexpectedPreviewInput.statusCode, unexpectedPreviewInput.body).toBe(400);
       expect(fixture.spawn).toHaveBeenCalledTimes(2);
 
       const recover = () => restored.app.inject({
@@ -221,6 +228,7 @@ describe("workspace recovery across server updates", () => {
     let releaseShutdown = () => {};
     let stopping: Promise<void> | undefined;
     try {
+      vi.spyOn(filesystemEvidence, "filesystemIdentity").mockResolvedValue({ filesystemType: "ef53", filesystemId: "f00d1234" });
       const home = path.join(fixture.root, "codex-home");
       await fs.mkdir(path.join(home, "sessions"), { recursive: true });
       const skill = path.join(home, "skills", ".system", "imagegen");
@@ -289,6 +297,27 @@ describe("workspace recovery across server updates", () => {
         method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" },
         payload: { action: "resume-conversation", sessionId: conversationId }
       });
+      const bindingPath = path.join(fixture.config.dataDir, "codex-launches", tab.id, ".cloudx-source.json");
+      const legacySource = JSON.parse(await fs.readFile(bindingPath, "utf8"));
+      delete legacySource.durable;
+      legacySource.dev = "64521";
+      await fs.writeFile(bindingPath, JSON.stringify(legacySource));
+      const blocked = await recover();
+      expect(blocked.statusCode, blocked.body).toBe(500);
+      expect(blocked.body).toContain("device changed");
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+      const inspection = await app.inject({ method: "POST", url: `/api/tabs/${tab.id}/ownership/preview`, headers: { host: "localhost" }, payload: {} });
+      expect(inspection.statusCode, inspection.body).toBe(200);
+      const preview = inspection.json<DirectoryOwnershipPreview>();
+      expect(preview.directories).toContainEqual(expect.objectContaining({ path: home, device: "64521" }));
+      const repaired = await app.inject({ method: "POST", url: `/api/tabs/${tab.id}/ownership/reconcile`, headers: { host: "localhost" }, payload: {
+        fingerprint: preview.fingerprint,
+        attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })),
+      } });
+      expect(repaired.statusCode, repaired.body).toBe(200);
+      expect(repaired.json<WorkspaceTab>()).toMatchObject({ id: tab.id, recovery: { state: "missing" } });
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
+      expect((await workspaceSnapshot(app)).windows).toEqual(before.windows);
       for (const response of await Promise.all([recover(), recover()])) {
         expect(response.statusCode, response.body).toBe(200);
         expect(response.json<WorkspaceTab>()).toMatchObject({ id: tab.id, title: tab.title, cwd: fixture.root, status: "running" });
@@ -297,10 +326,11 @@ describe("workspace recovery across server updates", () => {
       expect(services.sessions).toBe(sessions);
       expect(fixture.spawn).toHaveBeenCalledTimes(3);
       const [, args, options] = fixture.spawn.mock.calls[2]!;
-      expect(args).toContain(conversationId);
-      expect(args).toContain("gpt-6-astra");
-      expect(args).toContain('model_reasoning_effort="max"');
-      expect(args).not.toContain("Do not repeat this work");
+      const launch = JSON.parse(args[1]!) as { tuiArgs: string[] };
+      expect(launch.tuiArgs).toContain(conversationId);
+      expect(launch.tuiArgs).toContain("gpt-6-astra");
+      expect(launch.tuiArgs).toContain('model_reasoning_effort="max"');
+      expect(launch.tuiArgs).not.toContain("Do not repeat this work");
       expect(options).toMatchObject({ cwd: fixture.root, sessionId: tab.id, env: { CLOUDX_PERSONALITY_TEMPLATE_ID: "default-codex" } });
       const replacement = sessions.getSession(tab.id);
       expect(replacement).not.toBe(previous);

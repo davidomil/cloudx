@@ -5,12 +5,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { act, createElement, type ComponentType } from "react";
+import { createRoot } from "react-dom/client";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import type { ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
+import * as filesystemEvidence from "../filesystemIdentity.js";
+import { readDirectoryIdentity } from "../directoryIdentity.js";
 import type { ConfigService } from "../configService.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
 import type { ForgeLogger } from "./ForgeLog.js";
@@ -146,8 +150,7 @@ async function createWorkerContext(deps: ForgeRuntimeDependencies, tab: Workspac
   return directory;
 }
 
-function conversationBinding(tabId = "review-tab-1"): ReviewConversationBinding {
-  const home = path.join(root, "shared-codex");
+function conversationBinding(tabId = "review-tab-1", home = path.join(root, "shared-codex")): ReviewConversationBinding {
   const stat = statSync(home, { bigint: true });
   const view = path.join(root, "data", "codex-launches", tabId);
   const viewStat = statSync(view, { bigint: true });
@@ -159,7 +162,7 @@ function conversationBinding(tabId = "review-tab-1"): ReviewConversationBinding 
   };
 }
 
-function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorkspace) {
+function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorkspace, home = path.join(root, "shared-codex")) {
   const tabs = new Map<string, WorkspaceTab>();
   const resumedIds: string[] = [];
   let lastTab: WorkspaceTab;
@@ -173,12 +176,11 @@ function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorks
     await createWorkerContext(deps, tab);
     const launch = path.join(deps.dataDir, "codex-launches", tab.id);
     await fs.mkdir(launch, { recursive: true });
-    const home = path.join(root, "shared-codex");
     for (const name of ["sessions", "archived_sessions"]) {
       await fs.mkdir(path.join(home, name), { recursive: true });
       await fs.symlink(path.join(home, name), path.join(launch, name));
     }
-    await fs.writeFile(path.join(launch, ".cloudx-source.json"), JSON.stringify({ version: 1, ...conversationBinding(tab.id).source }));
+    await fs.writeFile(path.join(launch, ".cloudx-source.json"), JSON.stringify({ version: 1, ...conversationBinding(tab.id, home).source }));
     await fs.writeFile(path.join(launch, "config.toml"), "Generated worker configuration");
     await fs.writeFile(path.join(launch, "auth.json"), "Private disposable authentication");
     try {
@@ -3100,5 +3102,375 @@ describe("ForgeRuntime Codex tabs", () => {
       runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
     ).rejects.toThrow("launch is unresolved");
     expect((await fs.stat(workspace.worktreePath)).isDirectory()).toBe(true);
+  });
+});
+
+
+describe("Legacy filesystem ownership reconciliation", () => {
+  beforeEach(() => {
+    // Exercise persisted ext4 evidence independently of the runner's mount type.
+    vi.spyOn(filesystemEvidence, "filesystemIdentity").mockResolvedValue({ filesystemType: "ef53", filesystemId: "f00d1234" });
+  });
+  afterEach(() => vi.restoreAllMocks());
+  async function blockedReviewer({ legacy = true, sourceHome = path.join(root, "shared-codex"), previousDevices = new Map<string, string>() } = {}) {
+    const deps = dependencies();
+    deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
+      const binding = options.binding ?? conversationBinding(launch.tabId, sourceHome);
+      await options.save(binding);
+      return binding.threadId!;
+    }) };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("review-legacy", true);
+    const tabs = installReviewTabs(deps, workspace, sourceHome);
+    const tabId = await runtime.launch(tabs.request);
+    const execution = await vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.prepareTerminalExecution!(tabId);
+    const workspaceFile = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const tabFile = path.join(deps.dataDir, "forge-workers", "tabs", `${tabId}.json`);
+    const sourceFile = path.join(tabs.launchPath(), ".cloudx-source.json");
+    const oldDevice = "64521";
+    const rewriteIdentity = async (value: unknown): Promise<void> => {
+      if (!value || typeof value !== "object") return;
+      const record = value as Record<string, unknown>;
+      if (typeof record.dev === "string" && typeof record.ino === "string") {
+        if (legacy) delete record.durable;
+        else record.durable = (await readDirectoryIdentity(String(record.path ?? record.home))).durable;
+        record.dev = previousDevices.get(record.dev) ?? oldDevice;
+      }
+      await Promise.all(Object.values(record).map(rewriteIdentity));
+    };
+    for (const file of [workspaceFile, tabFile, sourceFile]) {
+      const record = JSON.parse(await fs.readFile(file, "utf8"));
+      await rewriteIdentity(record);
+      if (file === tabFile) record.execution.bootId = randomUUID();
+      await fs.writeFile(file, JSON.stringify(record));
+    }
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([]);
+    vi.mocked(deps.sessions.getTab).mockReturnValue(undefined as never);
+    runtime = new ForgeRuntime(deps);
+    return { deps, workspace, tabs, tabId, execution, workspaceFile, tabFile, sourceFile, oldDevice, authorize: vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.authorizeProjectTrust! };
+  }
+
+  function confirmations(preview: import("@cloudx/shared").DirectoryOwnershipPreview) {
+    return { fingerprint: preview.fingerprint, attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })) };
+  }
+
+  it.each(["during final binding read", "while staging binding"])("rejects a replaced launch directory %s and preserves both source bindings", async stage => {
+    const f = await blockedReviewer();
+    const view = f.tabs.launchPath();
+    const retained = `${view}-retained`;
+    const binding = await fs.readFile(f.sourceFile, "utf8");
+    const entries = await fs.readdir(view);
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    let replaced = false;
+    const replaceView = async () => {
+      expect(replaced).toBe(false);
+      await fs.rename(view, retained);
+      await fs.mkdir(view);
+      await fs.writeFile(f.sourceFile, binding);
+      replaced = true;
+    };
+    const isBindingStaging = (file: unknown) => path.basename(String(file)).startsWith(".cloudx-source.json.") && String(file).endsWith(".tmp");
+    const open = fs.open;
+    let bindingReads = 0;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (stage === "during final binding read" && path.basename(String(args[0])) === ".cloudx-source.json" && ++bindingReads === 2)
+        await replaceView();
+      const handle = await open(...args);
+      if (stage === "while staging binding" && isBindingStaging(args[0])) {
+        const writeFile = handle.writeFile.bind(handle);
+        handle.writeFile = async (...writeArgs) => {
+          await writeFile(...writeArgs);
+          await replaceView();
+        };
+      }
+      return handle;
+    });
+    const writeFile = fs.writeFile;
+    vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      await writeFile(...args);
+      if (stage === "while staging binding" && isBindingStaging(args[0])) await replaceView();
+    });
+
+    await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/Codex launch ownership changed/);
+
+    expect(replaced).toBe(true);
+    expect(await fs.readFile(f.sourceFile, "utf8")).toBe(binding);
+    expect(await fs.readFile(path.join(retained, ".cloudx-source.json"), "utf8")).toBe(binding);
+    expect(await fs.readdir(view)).toEqual([".cloudx-source.json"]);
+    expect(await fs.readdir(retained)).toEqual(entries);
+    for (const name of ["sessions", "archived_sessions"])
+      expect(await fs.realpath(path.join(retained, name))).toBe(path.join(conversationBinding().source.home, name));
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
+  async function renderOwnershipRecovery(workspaceId: string) {
+    const { JSDOM } = await vi.importActual<{ JSDOM: new (html: string, options: { url: string }) => { window: Window } }>("jsdom");
+    const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
+    vi.stubGlobal("window", dom.window);
+    vi.stubGlobal("document", dom.window.document);
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const { DirectoryOwnershipRecovery } = await vi.importActual<{ DirectoryOwnershipRecovery: ComponentType<{
+      preview(): Promise<DirectoryOwnershipPreview>;
+      reconcile(input: DirectoryOwnershipReconciliation): Promise<void>;
+    }> }>("../../../web/src/ui/DirectoryOwnershipRecovery.js");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const rendered = createRoot(container);
+    const preview = vi.fn(() => runtime.previewOwnership(workspaceId));
+    const reconcile = vi.fn((input: DirectoryOwnershipReconciliation) => runtime.reconcileOwnership(workspaceId, input));
+    await act(async () => rendered.render(createElement(DirectoryOwnershipRecovery, { preview, reconcile })));
+    const click = async (label: string) => {
+      await act(async () => {
+        const button = Array.from(container.querySelectorAll("button")).find(candidate => candidate.textContent === label)!;
+        expect(button.disabled).toBe(false);
+        button.click();
+        if (label === "Inspect directory ownership") await preview.mock.results.at(-1)!.value;
+        if (label === "Reconcile verified ownership") await reconcile.mock.results.at(-1)!.value.catch(() => undefined);
+      });
+    };
+    return {
+      container, preview, reconcile, click,
+      async confirmMappings() {
+        await act(async () => {
+          for (const checkbox of container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) checkbox.click();
+        });
+      },
+      async close() {
+        await act(async () => rendered.unmount());
+        dom.window.close();
+        vi.unstubAllGlobals();
+      },
+    };
+  }
+
+  it.each(["tab", "source"])("completes UI recovery after the %s metadata write fails with swapped device numbers", async interruptedRecord => {
+    const sourceHome = await fs.mkdtemp("/dev/shm/cloudx-forge-source-");
+    let ui: Awaited<ReturnType<typeof renderOwnershipRecovery>> | undefined;
+    try {
+      const checkoutDevice = (await fs.stat(root)).dev.toString();
+      const sourceDevice = (await fs.stat(sourceHome)).dev.toString();
+      expect(checkoutDevice).not.toBe(sourceDevice);
+      vi.mocked(filesystemEvidence.filesystemIdentity).mockImplementation(async fd => ({
+        filesystemType: "ef53", filesystemId: (await fs.realpath(`/proc/self/fd/${fd}`)).startsWith(sourceHome) ? "bbbb" : "aaaa",
+      }));
+      const f = await blockedReviewer({ sourceHome, previousDevices: new Map([[checkoutDevice, sourceDevice], [sourceDevice, checkoutDevice]]) });
+      const files = [f.workspaceFile, f.tabFile, f.sourceFile];
+      const before = await Promise.all(files.map(async file => JSON.parse(await fs.readFile(file, "utf8"))));
+      await fs.writeFile(path.join(f.workspace.worktreePath, "README.md"), "Dirty reviewer notes\n");
+      await fs.writeFile(path.join(f.workspace.worktreePath, "unfinished.txt"), "Untracked investigation");
+      const gitStatus = await git(f.workspace.worktreePath, "status", "--porcelain");
+      const reports = new ForgeWorkerReports(f.deps.dataDir);
+      const { reportPath } = await reports.prepare(randomUUID(), { issue: "Retain original worker context" });
+      const report = JSON.stringify({ kind: "review", body: "Retain report", threadId: before[0].reviewConversation.threadId });
+      await fs.writeFile(reportPath, report);
+      const publicationPath = path.join(f.deps.dataDir, "preserved-publication.json");
+      const publication = JSON.stringify({ headSha, replyingToDiscussionId: "uncertain-reply" });
+      await fs.writeFile(publicationPath, publication);
+      const rename = fs.rename;
+      const failure = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (interruptedRecord === "tab" ? String(to) === f.tabFile : path.basename(String(to)) === ".cloudx-source.json")
+          throw new Error("Injected metadata write failure");
+        await rename(from, to);
+      });
+      ui = await renderOwnershipRecovery(f.workspace.id);
+      await ui.click("Inspect directory ownership");
+      await ui.confirmMappings();
+      await ui.click("Reconcile verified ownership");
+      expect(ui.container.querySelector('[role="alert"]')?.textContent).toBe("Injected metadata write failure");
+      const partial = await Promise.all(files.map(async file => JSON.parse(await fs.readFile(file, "utf8"))));
+      expect(partial[0].worktree.dev).toBe(checkoutDevice);
+      expect(partial[0].reviewConversation.source.dev).toBe(sourceDevice);
+      expect(partial[interruptedRecord === "tab" ? 1 : 2]).toEqual(before[interruptedRecord === "tab" ? 1 : 2]);
+      failure.mockRestore();
+      runtime = new ForgeRuntime(f.deps);
+
+      await ui.click("Cancel ownership recovery");
+      await ui.click("Inspect directory ownership");
+      await ui.confirmMappings();
+      await ui.click("Reconcile verified ownership");
+
+      expect(ui.container.querySelector('[role="alert"]')).toBeNull();
+      expect(ui.container.textContent).toContain("Directory ownership reconciled. Resume when ready.");
+      expect(ui.reconcile).toHaveBeenCalledTimes(2);
+      expect(ui.reconcile.mock.calls[1]![0].fingerprint).not.toBe(ui.reconcile.mock.calls[0]![0].fingerprint);
+      const mappings = ui.reconcile.mock.calls[1]![0].attestations;
+      expect(mappings).toContainEqual({ device: checkoutDevice, filesystemId: "bbbb", filesystemType: "ef53" });
+      expect(mappings).toHaveLength(interruptedRecord === "tab" ? 2 : 1);
+      if (interruptedRecord === "tab") expect(mappings).toContainEqual({ device: sourceDevice, filesystemId: "aaaa", filesystemType: "ef53" });
+      await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace, tabIds: [f.tabId] });
+      expect(await runtime.previewOwnership(f.workspace.id)).toMatchObject({ directories: [] });
+      expect(JSON.parse(await fs.readFile(f.workspaceFile, "utf8")).reviewConversation.threadId).toBe(before[0].reviewConversation.threadId);
+      expect(await git(f.workspace.worktreePath, "status", "--porcelain")).toBe(gitStatus);
+      expect(await fs.readFile(reportPath, "utf8")).toBe(report);
+      expect(await fs.readFile(publicationPath, "utf8")).toBe(publication);
+      expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+      expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+    } finally {
+      await ui?.close();
+      await fs.rm(sourceHome, { recursive: true, force: true });
+    }
+  });
+
+  it("automatically accepts renumbering across all durable nested identities and retires the stopped execution with its reviewer thread intact", async () => {
+    const f = await blockedReviewer({ legacy: false });
+    const recorded = JSON.parse(await fs.readFile(f.workspaceFile, "utf8")).reviewConversation;
+    await expect(f.authorize()).resolves.toBe(f.workspace.worktreePath);
+    await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace, tabIds: [f.tabId] });
+    await runtime.close(f.tabId);
+    await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace, tabIds: [] });
+    expect(JSON.parse(await fs.readFile(f.workspaceFile, "utf8")).reviewConversation).toEqual(recorded);
+    expect((await fs.stat(recorded.originView.path)).isDirectory()).toBe(true);
+    expect((await fs.stat(recorded.source.home)).isDirectory()).toBe(true);
+    expect(await git(f.workspace.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+  });
+
+  it("repairs every nested legacy identity after reboot while preserving checkout work, report, publication, and native review thread", async () => {
+    const f = await blockedReviewer();
+    await fs.writeFile(path.join(f.workspace.worktreePath, "README.md"), "Dirty reviewer notes\n");
+    await fs.writeFile(path.join(f.workspace.worktreePath, "unfinished.txt"), "Untracked investigation");
+    const reports = new ForgeWorkerReports(f.deps.dataDir);
+    const { reportPath: report } = await reports.prepare(randomUUID(), { issue: "Retain original worker context" });
+    const publication = path.join(f.deps.dataDir, "preserved-publication.json");
+    await fs.writeFile(report, JSON.stringify({ kind: "review", body: "Retain report", threadId: conversationBinding().threadId }));
+    await fs.writeFile(publication, JSON.stringify({ headSha, replyingToDiscussionId: "uncertain-reply" }));
+    const unchanged = await Promise.all([report, publication].map(file => fs.readFile(file, "utf8")));
+    const gitStatus = await git(f.workspace.worktreePath, "status", "--porcelain");
+    await expect(f.authorize()).rejects.toThrow(/device changed/);
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    const paths = preview.directories.map(directory => directory.path);
+    expect(paths).toEqual(expect.arrayContaining([
+      f.workspace.worktreePath, path.join(f.workspace.worktreePath, ".git"),
+      path.dirname(f.tabs.lastTab().contextPath!), f.tabs.launchPath(), f.execution.directory,
+      conversationBinding().source.home,
+    ]));
+    const before = await Promise.all([f.workspaceFile, f.tabFile, f.sourceFile].map(file => fs.readFile(file, "utf8")));
+    await expect(runtime.reconcileOwnership(f.workspace.id, { fingerprint: preview.fingerprint, attestations: [] })).rejects.toThrow("Confirm that saved device");
+    expect(await Promise.all([f.workspaceFile, f.tabFile, f.sourceFile].map(file => fs.readFile(file, "utf8")))).toEqual(before);
+    await runtime.reconcileOwnership(f.workspace.id, confirmations(preview));
+    expect(await Promise.all([report, publication].map(file => fs.readFile(file, "utf8")))).toEqual(unchanged);
+    expect(await git(f.workspace.worktreePath, "status", "--porcelain")).toBe(gitStatus);
+    expect(await fs.readFile(path.join(f.workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Untracked investigation");
+    const owned = JSON.parse(await fs.readFile(f.workspaceFile, "utf8"));
+    expect(owned.reviewConversation.threadId).toBe(conversationBinding().threadId);
+    for (const identity of [owned.repository, owned.worktree, owned.gitDirectory, owned.reviewConversation.source, owned.reviewConversation.sqliteHome, owned.reviewConversation.originView]) {
+      expect(identity.dev).not.toBe(f.oldDevice);
+      expect(identity.durable.filesystemId).toBeTruthy();
+    }
+    const tab = JSON.parse(await fs.readFile(f.tabFile, "utf8"));
+    for (const identity of [tab.context, tab.launch, tab.execution.receiptDirectory]) {
+      expect(identity.dev).not.toBe(f.oldDevice);
+      expect(identity.durable.filesystemId).toBeTruthy();
+    }
+    expect(JSON.parse(await fs.readFile(f.sourceFile, "utf8")).durable.filesystemId).toBeTruthy();
+    await expect(f.authorize()).resolves.toBe(f.workspace.worktreePath);
+    await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace, tabIds: [f.tabId] });
+    await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/changed after inspection/);
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a retained source after cleanup already removed its disposable context", async () => {
+    const f = await blockedReviewer();
+    const tab = JSON.parse(await fs.readFile(f.tabFile, "utf8"));
+    tab.context = await readDirectoryIdentity(tab.context.path);
+    tab.launch = await readDirectoryIdentity(tab.launch.path);
+    await fs.writeFile(f.tabFile, JSON.stringify(tab));
+    const owned = JSON.parse(await fs.readFile(f.workspaceFile, "utf8"));
+    owned.reviewConversation.originView = await readDirectoryIdentity(owned.reviewConversation.originView.path);
+    owned.reviewConversation.sqliteHome = await readDirectoryIdentity(owned.reviewConversation.sqliteHome.path);
+    const sourceIdentity = await readDirectoryIdentity(owned.reviewConversation.source.home);
+    Object.assign(owned.reviewConversation.source, { dev: sourceIdentity.dev, ino: sourceIdentity.ino, durable: sourceIdentity.durable });
+    await fs.writeFile(f.workspaceFile, JSON.stringify(owned));
+    await fs.writeFile(path.join(f.workspace.worktreePath, "unfinished.txt"), "Retain investigation");
+
+    await expect(runtime.close(f.tabId)).rejects.toThrow("Codex source binding is stale");
+    await expect(fs.lstat(tab.context.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.parse(await fs.readFile(f.tabFile, "utf8"))).toMatchObject({ closed: false, quiescent: true });
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    expect(preview.directories.some(directory => directory.path === tab.context.path)).toBe(false);
+    await runtime.reconcileOwnership(f.workspace.id, confirmations(preview));
+    await runtime.close(f.tabId);
+    expect(JSON.parse(await fs.readFile(f.tabFile, "utf8"))).toMatchObject({ closed: true });
+    expect(JSON.parse(await fs.readFile(f.workspaceFile, "utf8")).reviewConversation.threadId).toBe(owned.reviewConversation.threadId);
+    expect(await fs.readFile(path.join(f.workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Retain investigation");
+    expect((await fs.stat(owned.reviewConversation.originView.path)).isDirectory()).toBe(true);
+  });
+
+  it("accepts an already removed execution directory only after execution quiescence is proven", async () => {
+    const f = await blockedReviewer();
+    await fs.rm(f.execution.directory, { recursive: true });
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    expect(preview.directories.some(directory => directory.path === f.execution.directory)).toBe(false);
+    const tab = JSON.parse(await fs.readFile(f.tabFile, "utf8"));
+    const oldBoot = tab.execution.bootId;
+    tab.execution.bootId = f.execution.bootId;
+    await fs.writeFile(f.tabFile, JSON.stringify(tab));
+    await expect(runtime.previewOwnership(f.workspace.id)).rejects.toThrow("launch receipt is missing");
+    tab.execution.bootId = oldBoot;
+    await fs.writeFile(f.tabFile, JSON.stringify(tab));
+    await runtime.reconcileOwnership(f.workspace.id, confirmations(preview));
+    await runtime.close(f.tabId);
+    expect(JSON.parse(await fs.readFile(f.tabFile, "utf8"))).toMatchObject({ closed: true });
+  });
+
+  it("rejects a removed disposable context that reappears after inspection", async () => {
+    const f = await blockedReviewer();
+    const context = path.dirname(f.tabs.lastTab().contextPath!);
+    await fs.rm(context, { recursive: true });
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    await fs.mkdir(context);
+    const before = await fs.readFile(f.workspaceFile, "utf8");
+    await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/changed|reappeared/);
+    expect(await fs.readFile(f.workspaceFile, "utf8")).toBe(before);
+    expect((await fs.stat(context)).isDirectory()).toBe(true);
+  });
+
+  it.each(["origin", "source", "checkout"])("keeps a missing required reviewer %s blocked", async kind => {
+    const f = await blockedReviewer();
+    const required = kind === "origin" ? f.tabs.launchPath() : kind === "source" ? conversationBinding().source.home : f.workspace.worktreePath;
+    await fs.rename(required, `${required}-missing`);
+    const before = await fs.readFile(f.workspaceFile, "utf8");
+    await expect(runtime.previewOwnership(f.workspace.id)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(f.workspaceFile, "utf8")).toBe(before);
+  });
+
+  it("rejects a stale inspected manifest and preserves all metadata", async () => {
+    const f = await blockedReviewer();
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    const tab = JSON.parse(await fs.readFile(f.tabFile, "utf8"));
+    tab.quiescent = true;
+    await fs.writeFile(f.tabFile, JSON.stringify(tab));
+    const before = await Promise.all([f.workspaceFile, f.tabFile, f.sourceFile].map(file => fs.readFile(file, "utf8")));
+    await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/changed after inspection/);
+    expect(await Promise.all([f.workspaceFile, f.tabFile, f.sourceFile].map(file => fs.readFile(file, "utf8")))).toEqual(before);
+  });
+
+  it("rejects live workers and missing execution evidence before repairing any legacy identity", async () => {
+    const f = await blockedReviewer();
+    vi.mocked(f.deps.sessions.listTabs).mockReturnValue([f.tabs.lastTab()]);
+    vi.mocked(f.deps.sessions.getTab).mockReturnValue(f.tabs.lastTab());
+    await expect(runtime.previewOwnership(f.workspace.id)).rejects.toThrow("Stop the worker process");
+    vi.mocked(f.deps.sessions.listTabs).mockReturnValue([]);
+    vi.mocked(f.deps.sessions.getTab).mockReturnValue(undefined as never);
+    const tab = JSON.parse(await fs.readFile(f.tabFile, "utf8"));
+    tab.execution.bootId = f.execution.bootId;
+    await fs.writeFile(f.tabFile, JSON.stringify(tab));
+    await expect(runtime.previewOwnership(f.workspace.id)).rejects.toThrow("launch receipt is missing");
+    expect(JSON.parse(await fs.readFile(f.workspaceFile, "utf8")).worktree.dev).toBe(f.oldDevice);
+  });
+
+  it.each(["replacement", "symlink"])("preserves a nested %s directory despite a valid device attestation", async kind => {
+    const f = await blockedReviewer();
+    const preview = await runtime.previewOwnership(f.workspace.id);
+    const context = path.dirname(f.tabs.lastTab().contextPath!);
+    await fs.rename(context, `${context}-original`);
+    if (kind === "symlink") await fs.symlink(`${context}-original`, context);
+    else await fs.mkdir(context);
+    const before = await fs.readFile(f.workspaceFile, "utf8");
+    await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/ownership changed|symbolic links/);
+    expect(await fs.readFile(f.workspaceFile, "utf8")).toBe(before);
+    expect(await fs.readFile(path.join(`${context}-original`, "context.md"), "utf8")).toBe("Worker context");
   });
 });

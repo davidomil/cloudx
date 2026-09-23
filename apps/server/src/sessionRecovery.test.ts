@@ -79,6 +79,46 @@ async function fixture() {
 }
 
 describe("workspace recovery after server updates", () => {
+  it("reconciles an explicitly inspected stopped source without resuming, and rechecks broker ownership", async () => {
+    const { running, factory, createStore } = await fixture();
+    const terminal = new StandardTerminalPlugin(factory);
+    const preview = { fingerprint: "a".repeat(64), directories: [{ path: "/source", device: "64521", currentDevice: "64519", filesystemId: "original", filesystemType: "ext4" }] };
+    const previewOwnership = vi.fn(async () => preview);
+    const reconcileOwnership = vi.fn(async () => {});
+    const plugin = {
+      ...terminal.descriptor(), id: "codex-terminal", actions: [],
+      descriptor: () => ({ ...terminal.descriptor(), id: "codex-terminal" }),
+      createSession: terminal.createSession.bind(terminal), restoreSession: terminal.restoreSession.bind(terminal),
+      previewOwnership, reconcileOwnership,
+    };
+    const before = createStore();
+    before.plugins.register(plugin);
+    const { tab } = await before.open("codex-terminal");
+    const liveTerminal = running.get(tab.id)!;
+    await expect(before.sessions.previewTabOwnership(tab.id)).rejects.toThrow("Confirm that the Codex process ended");
+    await before.sessions.dispose();
+    running.clear();
+    const after = createStore();
+    after.plugins.register(plugin);
+    await after.sessions.restore();
+    const unchanged = after.workspace.snapshot();
+    expect(await after.sessions.previewTabOwnership(tab.id)).toEqual(preview);
+    const request = { fingerprint: preview.fingerprint, attestations: [{ device: "64521", filesystemId: "original", filesystemType: "ext4" }] };
+    expect(await after.sessions.reconcileTabOwnership(tab.id, request)).toMatchObject({ id: tab.id, recovery: { state: "missing" } });
+    expect(reconcileOwnership).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ tab: expect.objectContaining({ id: tab.id }) }), request);
+    expect(after.workspace.snapshot()).toEqual(unchanged);
+    expect(factory.spawn).toHaveBeenCalledOnce();
+
+    factory.attach.mockRejectedValueOnce(new Error("Broker ownership unavailable."));
+    await expect(after.sessions.previewTabOwnership(tab.id)).rejects.toThrow("Broker ownership unavailable");
+    expect(previewOwnership).toHaveBeenCalledOnce();
+    running.set(tab.id, liveTerminal);
+    await expect(after.sessions.reconcileTabOwnership(tab.id, request)).rejects.toThrow("still active");
+    expect(reconcileOwnership).toHaveBeenCalledOnce();
+    expect(factory.spawn).toHaveBeenCalledOnce();
+    await after.sessions.dispose();
+  });
+
   it("restores original tabs, panes, selection, and current viewer URL without launching another terminal", async () => {
     const { root, running, factory, createStore } = await fixture();
     const before = createStore();

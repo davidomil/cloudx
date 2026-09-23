@@ -7,7 +7,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
-import { isAutomationGraphDocument, isUsableTabLayoutState } from "@cloudx/shared";
+import { isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState } from "@cloudx/shared";
 import type { HookCallContext } from "@cloudx/plugin-api";
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
@@ -561,6 +561,16 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       if (action !== "resume-conversation" || !/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) throwBadRequest("sessionId must be an exact conversation ID for resume-conversation.");
     }
     return services.sessions.recoverTab(request.params.tabId, { action, sessionId });
+  });
+
+  app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/ownership/preview", async request => {
+    if (Object.keys(optionalRequestBody(request.body)).length) throwBadRequest("Ownership preview does not accept input fields.");
+    return services.sessions.previewTabOwnership(request.params.tabId);
+  });
+
+  app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/ownership/reconcile", async request => {
+    if (!isDirectoryOwnershipReconciliation(request.body)) throwBadRequest("Invalid directory ownership reconciliation.");
+    return services.sessions.reconcileTabOwnership(request.params.tabId, request.body);
   });
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/files/download", async (request, reply) => {

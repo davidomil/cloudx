@@ -55,6 +55,7 @@
     "testenv:start:lan": "CLOUDX_TEST_HOST=0.0.0.0 npm run testenv:start",
     "testenv:stop": "node scripts/setup-test-environment.mjs --stop",
     "test": "vitest run",
+    "test:codex-recovery": "node scripts/test-codex-recovery.mjs",
     "test:browser": "playwright test",
     "test:coverage": "vitest run --coverage --reporter=dot",
     "test:policy": "vitest run scripts/ai-change",

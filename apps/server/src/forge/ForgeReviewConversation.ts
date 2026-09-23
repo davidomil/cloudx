@@ -5,10 +5,11 @@ import { isRecord, type CodexReasoningEffort } from "@cloudx/shared";
 
 import { AppServerClient, type AppServerTransport } from "../appServer/AppServerClient.js";
 import { AppServerOwnershipError, OwnedAppServerTransport } from "../appServer/OwnedAppServerTransport.js";
+import { readDirectoryIdentity, sameDirectoryIdentity, isDurableDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
 import { openOwnedDirectoryNoFollow, type OwnedDirectoryIdentity } from "../jsonStateFile.js";
-import { CodexStateSources, type ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
+import { CodexStateSources, sameCodexSource, type ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 
-interface ConversationDirectory { path: string; dev: string; ino: string }
+type ConversationDirectory = DirectoryIdentity;
 
 export interface ReviewConversationBinding {
   source: ResolvedCodexStateSource;
@@ -140,7 +141,10 @@ export async function retireReviewSessionView(dataDir: string, tabId: string, ex
   try {
     if (sources.viewPath(tabId) !== expected.path) throw new Error("Reviewer session view ownership does not match.");
     const isOrigin = expected.path === originView.path;
-    if (isOrigin && !sameDirectory(expected, originView)) throw new Error("Reviewer conversation origin view ownership changed.");
+    if (isOrigin) {
+      const current = await directory(expected.path);
+      if (!sameDirectory(expected, current) || !sameDirectory(originView, current)) throw new Error("Reviewer conversation origin view ownership changed.");
+    }
     const view = await openReviewSessionView(sources, expected, source);
     try {
       const retained = new Set(isOrigin ? [".cloudx-source.json", "sessions", "archived_sessions"] : []);
@@ -157,7 +161,7 @@ async function openReviewSessionView(sources: CodexStateSources, expected: Owned
   const tabId = path.basename(expected.path);
   if (sources.viewPath(tabId) !== expected.path) throw new Error("Reviewer session view ownership does not match.");
   const bound = await sources.readBinding(tabId);
-  if (!bound || !sameSource(bound, source)) throw new Error("Reviewer session source changed; its view was preserved.");
+  if (!bound || !sameSource(source, bound)) throw new Error("Reviewer session source changed; its view was preserved.");
   await sources.assertCurrent(source);
   const view = await openOwnedDirectoryNoFollow(path.dirname(expected.path), expected.path, "Reviewer session view", expected);
   try {
@@ -174,19 +178,11 @@ async function openReviewSessionView(sources: CodexStateSources, expected: Owned
 }
 
 async function directory(candidate: string): Promise<ConversationDirectory> {
-  const resolved = await fs.realpath(candidate);
-  const stat = await fs.stat(resolved, { bigint: true });
-  if (!stat.isDirectory()) throw new Error("Codex conversation storage must be a directory.");
-  return { path: resolved, dev: stat.dev.toString(), ino: stat.ino.toString() };
+  return readDirectoryIdentity(candidate, "Codex conversation storage");
 }
 
-function sameDirectory(left: ConversationDirectory, right: ConversationDirectory): boolean {
-  return left.path === right.path && left.dev === right.dev && left.ino === right.ino;
-}
-
-function sameSource(left: ResolvedCodexStateSource, right: ResolvedCodexStateSource): boolean {
-  return left.sourceId === right.sourceId && left.home === right.home && left.dev === right.dev && left.ino === right.ino;
-}
+const sameDirectory = sameDirectoryIdentity;
+const sameSource = sameCodexSource;
 
 function isThreadId(value: unknown): value is string {
   return typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/iu.test(value);
@@ -195,7 +191,8 @@ function isThreadId(value: unknown): value is string {
 export function isReviewConversationBinding(value: unknown): value is ReviewConversationBinding {
   if (!isRecord(value) || !isRecord(value.source) || !isRecord(value.sqliteHome) || !isRecord(value.originView)) return false;
   const { source, sqliteHome, originView } = value;
-  return source.sourceId === "shared" && typeof source.home === "string" && path.isAbsolute(source.home) &&
+  return [source.durable, sqliteHome.durable, originView.durable].every(value => value === undefined || isDurableDirectoryIdentity(value)) &&
+    source.sourceId === "shared" && typeof source.home === "string" && path.isAbsolute(source.home) &&
     [source.dev, source.ino, sqliteHome.dev, sqliteHome.ino, originView.dev, originView.ino].every(part => typeof part === "string" && /^\d+$/u.test(part)) &&
     typeof sqliteHome.path === "string" && path.isAbsolute(sqliteHome.path) &&
     typeof originView.path === "string" && path.isAbsolute(originView.path) &&

@@ -2032,7 +2032,7 @@ if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
 }
 const isReview = prompt.startsWith("Review the exact checked-out commit");
 const resumedSessionId = args.includes("resume") ? args[args.indexOf("resume") + 1] : undefined;
-const conversation = resumedSessionId ? readConversation(resumedSessionId) : (await request("thread/start", { cwd: trustedProjectPath, ephemeral: false })).thread;
+const conversation = resumedSessionId ? readConversation(resumedSessionId) : (await request("thread/start", { cwd: trustedProjectPath, runtimeWorkspaceRoots: [trustedProjectPath], ephemeral: false })).thread;
 if (isReview && !conversation) throw new Error("The reviewer must resume its exact Codex conversation.");
 if (isReview && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
 if (conversation && conversation.cwd !== trustedProjectPath) throw new Error("The resumed conversation belongs to a different checkout.");

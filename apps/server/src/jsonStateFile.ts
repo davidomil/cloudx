@@ -4,6 +4,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 
+import { assertDirectoryIdentity, directoryIdentityFromHandle, type DirectoryIdentity } from "./directoryIdentity.js";
+
 import { isDirectChildPath, isSameOrChildPath } from "./pathBoundary.js";
 
 interface DirectoryOptions {
@@ -63,11 +65,7 @@ export interface OwnedRegularFile {
   close(): Promise<void>;
 }
 
-export interface OwnedDirectoryIdentity {
-  path: string;
-  dev: string;
-  ino: string;
-}
+export type OwnedDirectoryIdentity = DirectoryIdentity;
 
 export interface OwnedDirectory {
   readonly identity: OwnedDirectoryIdentity;
@@ -89,8 +87,8 @@ export async function openOwnedDirectoryNoFollow(rootPath: string, directoryPath
     if (!expected) await fsp.mkdir(anchoredDirectory, { mode: 0o700 });
     directory = await openDirectoryNoFollow(anchoredDirectory, label);
     const stat = await directory.stat({ bigint: true });
-    const identity = { path: resolvedDirectory, dev: stat.dev.toString(), ino: stat.ino.toString() };
-    if (expected && (identity.dev !== expected.dev || identity.ino !== expected.ino)) throw new Error(`${label} ownership changed; the replacement was preserved.`);
+    const identity = await directoryIdentityFromHandle(directory, resolvedDirectory, label, stat);
+    if (expected) assertDirectoryIdentity(expected, identity, label);
     const handle = directory;
     let closed = false;
     const assertOpen = () => { if (closed) throw new Error(`${label} ownership handles are closed.`); };

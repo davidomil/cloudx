@@ -69,6 +69,11 @@ class CapturingFactory implements TerminalProcessFactory {
   env: NodeJS.ProcessEnv | undefined;
   process: FakeTerminalProcess | undefined;
 
+  bridgeLaunch(): { command: string; serverArgs: string[]; tuiArgs: string[]; selection: { tabId: string; executionId: string; receiptPath: string }; permissions: { yoloMode: boolean; additionalWritableRoots: string[] } } {
+    const command = this.args!.at(-1)!;
+    return JSON.parse(command.slice(command.indexOf("'{") + 1, -1).replaceAll("'\\''", "'"));
+  }
+
   async spawn(command: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; cols: number; rows: number }): Promise<TerminalProcess> {
     this.spawns += 1;
     this.command = command;
@@ -135,9 +140,9 @@ describe("CodexTerminalPlugin", () => {
       expect(factory.spawns).toBe(0);
       release("01a08470-d118-7b72-b1df-439e72e5c744");
       await creation;
-      expect(factory.args?.at(-1)).toContain("resume 01a08470-d118-7b72-b1df-439e72e5c744 -- 'Review the next commit.'");
-      expect(factory.args?.at(-1)).toContain("--model gpt-6-astra");
-      expect(factory.args?.at(-1)).toContain('model_reasoning_effort="max"');
+      expect(factory.bridgeLaunch().tuiArgs.slice(-4)).toEqual(["resume", "01a08470-d118-7b72-b1df-439e72e5c744", "--", "Review the next commit."]);
+      expect(factory.bridgeLaunch().tuiArgs).toContain("gpt-6-astra");
+      expect(factory.bridgeLaunch().tuiArgs).toContain('model_reasoning_effort="max"');
     });
   });
 
@@ -229,7 +234,8 @@ describe("CodexTerminalPlugin", () => {
       expect(parse(await fs.readFile(configPath, "utf8")).projects).toEqual(expectedProjects);
       expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
       expect(factory.spawns).toBe(1);
-      expect(factory.args?.join(" ")).toContain("--yolo");
+      expect(factory.bridgeLaunch().tuiArgs).not.toContain("--yolo");
+      expect(factory.bridgeLaunch().serverArgs).toContain('sandbox_mode="danger-full-access"');
       authorizeProjectTrust.mockRejectedValueOnce(new Error("Repository consent was revoked."));
       await expect(session.applyRuntimeContext!({})).rejects.toThrow("Repository consent was revoked.");
       session.stop?.();
@@ -287,7 +293,10 @@ describe("CodexTerminalPlugin", () => {
       const original = withLaunchPreferences(stringify({ approval_policy: "on-request", sandbox_mode: "workspace-write", cloudx: { unrelated: "keep" } }), { yoloMode });
       await fs.writeFile(path.join(home, "config.toml"), original);
       const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } });
-      expect(factory.args?.join(" ").includes("--yolo")).toBe(yoloMode);
+      expect(factory.bridgeLaunch().tuiArgs).not.toContain("--yolo");
+      expect(factory.bridgeLaunch().serverArgs.includes('sandbox_mode="danger-full-access"')).toBe(yoloMode);
+      expect(factory.bridgeLaunch().tuiArgs).not.toContain("--add-dir");
+      expect(factory.bridgeLaunch().permissions).toEqual({ yoloMode, additionalWritableRoots: [path.join(root, "data", "rules-skills")] });
       const config = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
       expect(config).toMatchObject({ approval_policy: "on-request", sandbox_mode: "workspace-write" });
       expect(config.cloudx).toEqual({ unrelated: "keep" });
@@ -738,8 +747,9 @@ describe("CodexTerminalPlugin", () => {
     });
 
     expect(factory.args?.[0]).toBe("-lc");
-    expect(factory.args?.[1]).toContain("exec /usr/bin/codex");
-    expect(factory.args?.[1]).toContain("--add-dir");
+    expect(factory.bridgeLaunch().command).toBe("/usr/bin/codex");
+    expect(factory.bridgeLaunch().tuiArgs).not.toContain("--add-dir");
+    expect(factory.bridgeLaunch().permissions.additionalWritableRoots).toEqual([path.join(dataDir, "rules-skills")]);
     expect(factory.args?.[1]).not.toContain("Review carefully.");
     expect(factory.args?.[1]).not.toContain("Code review skill instructions.");
     expect(factory.env).toMatchObject({
@@ -824,7 +834,7 @@ describe("CodexTerminalPlugin", () => {
       const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined }, initialInput: { model: "gpt-6-astra", reasoningEffort, prompt: "Inspect the assigned work." } });
       expect(factory.spawns).toBe(1);
       expect(factory.command).toBe("/bin/bash");
-      expect(factory.args?.[1]).toContain(`--model gpt-6-astra --config 'model_reasoning_effort="${reasoningEffort}"' -- 'Inspect the assigned work.'`);
+      expect(factory.bridgeLaunch().tuiArgs.slice(-6)).toEqual(["--model", "gpt-6-astra", "--config", `model_reasoning_effort="${reasoningEffort}"`, "--", "Inspect the assigned work."]);
       expect(parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"))).toMatchObject({ model: "gpt-5.3-codex", model_reasoning_effort: "medium" });
       expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(inherited);
       session.stop?.();
@@ -1736,13 +1746,52 @@ describe("Codex conversation recovery after process loss", () => {
         controls: { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput }
       });
       const identity = new CodexConversationRecovery(factory.env!.CODEX_HOME!);
-      await fs.writeFile(identity.receiptPath, JSON.stringify({ sessionId: conversationId, cwd: root }));
+      await fs.writeFile(identity.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...factory.bridgeLaunch().selection, sessionId: conversationId, cwd: root }));
       await vi.waitFor(() => expect(setRestoreInput).toHaveBeenLastCalledWith(expect.objectContaining({
         model: "gpt-6-astra", reasoningEffort: "max", codexRuntimeContext: runtimeContext,
         resume: { mode: "session", sessionId: conversationId }
       })));
       expect(session.restoreInput?.()).toMatchObject({ resume: { mode: "session", sessionId: conversationId } });
       session.stop?.();
+    });
+  });
+
+  it("recovers the durable selected conversation when the web observer did not save its last change", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const initialInput = structuredClone(previous.restoreInput?.());
+      const selection = factory.bridgeLaunch().selection;
+      expect(initialInput).toMatchObject({ codexExecutionId: selection.executionId });
+      Object.assign(factory.process!, { detach: vi.fn() });
+      previous.detach?.();
+      await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: conversationId, cwd: root }));
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId } }) + "\n");
+      const description = await plugin.describeRecovery({ tab, cwd: root, controls, initialInput });
+      expect(description).toMatchObject({ canResume: true, conversationId });
+      expect(factory.spawns).toBe(1);
+      await expect(plugin.describeRecovery({ tab, cwd: root, controls, initialInput: { ...initialInput, codexExecutionId: "old-execution" } })).resolves.toMatchObject({
+        canResume: false, message: expect.stringContaining("different tab or execution")
+      });
+      previous.stop?.();
+    });
+  });
+
+  it("keeps selected identity through web reconnection without another launch or prompt", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const initialInput = structuredClone(previous.restoreInput?.());
+      const selection = factory.bridgeLaunch().selection;
+      Object.assign(factory.process!, { detach: vi.fn() });
+      previous.detach?.();
+      await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: conversationId, cwd: root }));
+      Object.assign(factory, { attach: vi.fn(async () => factory.process!) });
+      const restored = await plugin.restoreSession({ tab, cwd: root, controls, initialInput });
+      expect(restored.restoreInput?.()).toMatchObject({ codexExecutionId: selection.executionId, resume: { mode: "session", sessionId: conversationId } });
+      expect(factory.spawns).toBe(1);
+      expect(factory.process!.written).toBe("");
+      restored.stop?.();
     });
   });
 
@@ -1753,6 +1802,24 @@ describe("Codex conversation recovery after process loss", () => {
     await expect(plugin.describeRecovery(input)).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("exact conversation ID was not saved") });
     await expect(plugin.recoverSession(input)).rejects.toThrow("Select a saved session");
     expect(factory.spawns).toBe(0);
+  });
+
+  it("validates the user's exact choice before binding a legacy tab with no saved source", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const input = { tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: conversationId } } };
+      await expect(plugin.describeRecovery(input)).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("launch context is unavailable") });
+      await expect(plugin.recoverSession(input)).rejects.toThrow("transcript");
+      expect(factory.spawns).toBe(0);
+      await fs.mkdir(path.join(home, "sessions"), { recursive: true });
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId } }) + "\n");
+      const session = await plugin.recoverSession(input);
+      expect(session.restoreInput?.()).toMatchObject({ resume: { mode: "session", sessionId: conversationId } });
+      expect(controls.setRestoreInput).toHaveBeenLastCalledWith(expect.objectContaining({ resume: { mode: "session", sessionId: conversationId } }));
+      expect(factory.bridgeLaunch().tuiArgs.slice(-2)).toEqual(["resume", conversationId]);
+      expect(JSON.parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, ".cloudx-source.json"), "utf8"))).toMatchObject({ home });
+      session.stop?.();
+    });
   });
 
   it.each(["receipt", "launch input"])("requires explicit selection when the last identity comes from %s", async source => {
@@ -1775,7 +1842,7 @@ describe("Codex conversation recovery after process loss", () => {
       expect(factory.spawns).toBe(1);
 
       const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: selectedId } } });
-      expect(factory.args?.at(-1)).toContain(`resume ${selectedId}`);
+      expect(factory.bridgeLaunch().tuiArgs.slice(-2)).toEqual(["resume", selectedId]);
       expect(factory.args?.at(-1)).not.toContain(conversationId);
       recovered.stop?.();
     });
@@ -1791,9 +1858,9 @@ describe("Codex conversation recovery after process loss", () => {
       const initialInput = { ...previous.restoreInput?.(), resume: { mode: "session", sessionId: conversationId } };
       await expect(plugin.describeRecovery({ tab, cwd: root, controls, initialInput })).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("cannot be confirmed") });
       const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput, prepareCodexSession: async () => { throw new Error("Must not prepare another conversation"); } });
-      expect(factory.args?.at(-1)).toContain(`resume ${conversationId}`);
+      expect(factory.bridgeLaunch().tuiArgs.slice(-2)).toEqual(["resume", conversationId]);
       expect(factory.args?.at(-1)).toContain("--cd");
-      expect(factory.args?.at(-1)).toContain("--model gpt-6-astra");
+      expect(factory.bridgeLaunch().tuiArgs).toContain("gpt-6-astra");
       expect(factory.args?.at(-1)).not.toContain("Do not replay");
       expect(factory.env?.CLOUDX_PERSONALITY_TEMPLATE_ID).toBe("original");
       expect(recovered.restoreInput?.()).not.toHaveProperty("prompt");

@@ -10,12 +10,13 @@ import type {
   WorkspacePlugin
 } from "@cloudx/plugin-api";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -146,16 +147,25 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       restoredInput = { ...restoredInput, resume: { mode: "session", sessionId } };
     }
     const conversation = launchTemplate.overlay ? new CodexConversationRecovery(launchTemplate.overlay.codexHome) : undefined;
+    const selection = conversation ? { tabId: input.tab.id, executionId: randomUUID(), receiptPath: conversation.receiptPath } : undefined;
+    restoredInput = { ...restoredInput, codexExecutionId: selection?.executionId };
     await conversation?.reset();
     await input.controls.setRestoreInput?.(restoredInput);
     const command = launchTemplate.command;
-    const launchArgs = [...launchTemplate.args, ...conversation?.launchArgs() ?? [], ...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
+    const useBridge = Boolean(input.codexTurn || selection);
+    const sessionArgs = [...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
+    const launchArgs = useBridge ? buildCodexRemoteTuiArgs(launchTemplate.args, sessionArgs) : [...launchTemplate.args, ...sessionArgs];
     const resume = codexResumeInput(restoredInput);
-    const launch = input.codexTurn
+    const launch = useBridge
       ? buildLoginShellCommandLaunch(process.execPath, [
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
         JSON.stringify({
-          binding: { ...input.codexTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) },
+          ...(input.codexTurn ? { binding: { ...input.codexTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
+          ...(selection ? { selection } : {}),
+          permissions: {
+            yoloMode: launchTemplate.args.includes("--yolo"),
+            additionalWritableRoots: launchTemplate.overlay ? [launchTemplate.overlay.rulesSkillsRoot] : []
+          },
           command,
           serverArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS,
             ...(launchTemplate.args.includes("--yolo") ? ["--config", 'approval_policy="never"', "--config", 'sandbox_mode="danger-full-access"'] : []),
@@ -184,6 +194,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       nativeTurn: input.codexTurn,
       restoreInput: () => restoredInput,
       observeConversation: () => conversation?.observe(identity => {
+        if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
+          throw new Error("Codex conversation identity belongs to a different tab or execution.");
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
@@ -225,6 +237,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceSummary: "Existing interactive Codex CLI session.",
       restoreInput: () => restoredInput,
       observeConversation: () => conversation?.observe(identity => {
+        if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
+          throw new Error("Codex conversation identity belongs to a different tab or execution.");
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
@@ -251,12 +265,13 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
     try {
       const resume = codexResumeInput(input.initialInput);
-      const conversationId = conversation?.read()?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
+      const identity = conversation?.readForExecution(input.tab.id, input.initialInput?.codexExecutionId);
+      const conversationId = identity?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
       if (!conversationId) return { message: "The previous Codex process ended. Its exact conversation ID was not saved. Select a saved session.", canResume: false };
       await this.requireConversation(input.tab.id, conversationId);
-      // Codex queues SessionStart until the next prompt. A receipt or launch ID
-      // cannot confirm the selected conversation after an idle /resume or /new.
-      return { message: "The previous Codex process ended. Its current conversation cannot be confirmed from the last saved ID. Select a saved session.", canResume: false };
+      if (!identity?.selection)
+        return { message: "The previous Codex process ended. Its current conversation cannot be confirmed from the last recorded ID. Select a saved session.", canResume: false };
+      return { message: "The previous Codex process ended. Resume its saved selected conversation in this panel.", conversationId, canResume: true };
     } catch (error) {
       return { message: error instanceof Error ? error.message : "Codex conversation recovery is unavailable.", canResume: false };
     }
@@ -265,7 +280,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   async recoverSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const resume = codexResumeInput(input.initialInput);
     if (resume?.mode !== "session" || !resume.sessionId) throw new Error("The exact Codex conversation ID is unavailable. Select a saved session.");
-    await this.requireConversation(input.tab.id, resume.sessionId);
+    await this.requireConversation(input.tab.id, resume.sessionId, true);
     const { prompt: _prompt, codexRuntimeContext, ...initialInput } = input.initialInput ?? {};
     return this.startSession({
       ...input, initialInput, prepareCodexSession: undefined,
@@ -273,13 +288,36 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     }, true);
   }
 
-  private async requireConversation(tabId: string, conversationId: string): Promise<void> {
+  async previewOwnership(input: CreatePluginSessionInput): Promise<DirectoryOwnershipPreview> {
+    if (!this.sources) throw new Error("The Codex conversation store is unavailable. Check Codex settings before reconciling its ownership.");
+    return this.sources.previewOwnership(input.tab.id);
+  }
+
+  async reconcileOwnership(input: CreatePluginSessionInput, request: DirectoryOwnershipReconciliation): Promise<void> {
+    if (!this.sources) throw new Error("The Codex conversation store is unavailable. Check Codex settings before reconciling its ownership.");
+    await this.sources.reconcileOwnership(input.tab.id, request);
+  }
+
+  private async requireConversation(tabId: string, conversationId: string, bindExplicitSelection = false): Promise<void> {
     if (!this.sources) throw new Error("The Codex conversation store is unavailable. Select a saved session after checking Codex settings.");
-    const source = await this.sources.readBinding(tabId);
-    if (!source) throw new Error("The saved Codex launch context is unavailable. Select a saved session after checking Codex settings.");
+    const savedSource = await this.sources.readBinding(tabId);
+    if (!savedSource && !bindExplicitSelection) throw new Error("The saved Codex launch context is unavailable. Select a saved session after checking Codex settings.");
+    const source = savedSource ?? await this.sources.resolve();
     await this.sources.assertCurrent(source);
     await new CodexConversationRecovery(this.sources.viewPath(tabId)).requireTranscript(conversationId, source.home);
+    if (!savedSource) await this.sources.bind(tabId, source);
   }
+}
+
+export function buildCodexRemoteTuiArgs(configurationArgs: readonly string[], sessionArgs: readonly string[]): string[] {
+  // Permission overrides belong to the backend: the remote TUI rejects /resume when they are also passed as CLI flags.
+  const args: string[] = [];
+  for (let index = 0; index < configurationArgs.length; index++) {
+    const argument = configurationArgs[index]!;
+    if (argument === "--add-dir") { index++; continue; }
+    if (argument !== "--yolo") args.push(argument);
+  }
+  return [...args, ...sessionArgs];
 }
 
 export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<string, unknown>): string[] {

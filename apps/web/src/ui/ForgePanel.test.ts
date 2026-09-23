@@ -143,6 +143,32 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("previews original/current directory ownership and requires a verified mapping before repair", async () => {
+    const preview = { fingerprint: "a".repeat(64), directories: [
+      { path: "/repo", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ext4" },
+      { path: "/repo/.git", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ext4" },
+    ] };
+    const testFixture = fixture({ workers: [{ ...worker, status: "cleanup_failed" }] }, hook => {
+      if (hook === "forge.worker.previewOwnership") return { preview };
+      if (hook === "forge.worker.reconcileOwnership") return { worker };
+    });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Inspect directory ownership");
+    const recovery = panel.querySelector('[aria-label="Directory ownership recovery"]')!;
+    expect(recovery.textContent).toContain("Legacy records cannot prove");
+    expect(recovery.textContent).toContain("/repo/.git");
+    expect(button(recovery, "Reconcile verified ownership").disabled).toBe(true);
+    const attestations = recovery.querySelectorAll<HTMLInputElement>('input[type="checkbox"]');
+    expect(attestations).toHaveLength(1);
+    await act(async () => attestations[0].click());
+    await click(recovery, "Reconcile verified ownership");
+    expect(testFixture.calls).toContainEqual({ hook: "forge.worker.reconcileOwnership", tabId: tab.id, input: {
+      id: worker.id, fingerprint: preview.fingerprint, attestations: [{ device: "64521", filesystemId: "original-root", filesystemType: "ext4" }],
+    } });
+    expect(testFixture.calls.some(call => call.hook === "forge.worker.resume")).toBe(false);
+    expect(recovery.textContent).toContain("Directory ownership reconciled");
+  });
+
   it.each(["github", "gitlab"] as const)("previews the uncertain %s reply in issues, requests, and worker tabs", async provider => {
     const currentRepository = { ...repository, provider };
     const panel = await renderPanel(fixture({ repository: currentRepository, workers: [{ ...uncertainReplyWorker, repository: currentRepository }] }));
