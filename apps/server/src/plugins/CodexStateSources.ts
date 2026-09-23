@@ -245,9 +245,10 @@ export class CodexStateSources {
 
   reconcileOwnership(tabId: string, input: DirectoryOwnershipReconciliation): Promise<void> {
     return this.work(undefined, async check => {
-      const { reconciliation, preview, selected, record } = await this.ownershipReconciliation(tabId, check);
+      const { reconciliation, preview, selected, record, view } = await this.ownershipReconciliation(tabId, check);
       reconciliation.validate(preview, input);
       await reconciliation.assertCurrent();
+      assertDirectoryIdentity(view, await readDirectoryIdentity(view.path, "Codex launch"), "Codex launch");
       if (JSON.stringify(await this.bindingRecord(tabId, check)) !== JSON.stringify(record))
         throw new Error("Codex source binding changed after inspection. Inspect it again before reconciling.");
       check();
@@ -270,9 +271,8 @@ export class CodexStateSources {
       if (stat && (!stat.isSymbolicLink() || await this.dependencies.fs.realpath(link) !== path.join(selected.home, name)))
         throw new Error("Codex session history link changed; its view was preserved.");
     }
-    await reconciliation.add(view);
     check();
-    return { reconciliation, selected, record, preview: reconciliation.preview({ record, view }) };
+    return { reconciliation, selected, record, view, preview: reconciliation.preview({ record, view }) };
   }
 
   async bind(

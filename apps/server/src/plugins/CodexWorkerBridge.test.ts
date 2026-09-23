@@ -12,7 +12,7 @@ import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 
 const helper = new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url);
 const { CodexWorkerTurn, saveTurnReceipt } = await import(helper.href);
-const { applyLaunchPermissions } = await import(new URL("../../helpers/codex-remote-permissions.mjs", import.meta.url).href);
+const { CodexRemotePermissions } = await import(new URL("../../helpers/codex-remote-permissions.mjs", import.meta.url).href);
 const directories: string[] = [];
 afterEach(async () => { await Promise.all(directories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true }))); });
 const binding = { workerId: "worker", attemptId: "attempt", receiptPath: "/unused" };
@@ -25,7 +25,7 @@ const titleTurnStart = { id: "temporary-structured-turn", method: "turn/start", 
 
 it.each([true, false])("preserves native writable roots and applies the selected fresh-thread YOLO policy %s", yoloMode => {
   const request = { id: 1, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project", "/existing-writable"], approvalPolicy: "on-request", sandbox: "workspace-write", permissions: null } };
-  applyLaunchPermissions(request, { yoloMode, additionalWritableRoots: ["/cloudx-skills", "/existing-writable"] });
+  new CodexRemotePermissions({ yoloMode, additionalWritableRoots: ["/cloudx-skills", "/existing-writable"] }).fromClient(request);
   expect(request.params).toEqual({
     runtimeWorkspaceRoots: ["/project", "/existing-writable", "/cloudx-skills"],
     approvalPolicy: yoloMode ? "never" : "on-request", sandbox: yoloMode ? "danger-full-access" : "workspace-write", permissions: null
@@ -34,21 +34,39 @@ it.each([true, false])("preserves native writable roots and applies the selected
 
 it.each(["thread/resume", "thread/fork"])("keeps native saved permission selection during %s", method => {
   const request = { id: 1, method, params: { threadId: "saved", runtimeWorkspaceRoots: ["/project"], approvalPolicy: null, sandbox: null, permissions: null } };
-  applyLaunchPermissions(request, { yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient(request);
   expect(request.params).toEqual({ threadId: "saved", runtimeWorkspaceRoots: ["/project", "/cloudx-skills"], approvalPolicy: null, sandbox: null, permissions: null });
   const rejoin = { id: 2, method, params: { threadId: "loaded" } };
-  applyLaunchPermissions(rejoin, { yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient(rejoin);
   expect(rejoin.params).toEqual({ threadId: "loaded" });
 });
 
 it("keeps auxiliary thread permissions native and rejects unresolved new-thread roots", () => {
-  const permissions = { yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] };
+  const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
   const auxiliary = structuredClone(titleThreadStart);
-  applyLaunchPermissions(auxiliary, permissions);
+  permissions.fromClient(auxiliary);
   expect(auxiliary).toEqual(titleThreadStart);
-  expect(() => applyLaunchPermissions({ method: "thread/start", params: {} }, permissions)).toThrow("resolved workspace roots");
-  expect(() => applyLaunchPermissions({ method: "thread/start", params: { runtimeWorkspaceRoots: ["relative"] } }, permissions)).toThrow("workspace roots are invalid");
-  expect(() => applyLaunchPermissions({ method: "thread/start", params: {} }, { ...permissions, additionalWritableRoots: ["relative"] })).toThrow("Invalid Codex launch permissions");
+  expect(() => permissions.fromClient({ method: "thread/start", params: {} })).toThrow("resolved workspace roots");
+  expect(() => permissions.fromClient({ method: "thread/start", params: { runtimeWorkspaceRoots: ["relative"] } })).toThrow("workspace roots are invalid");
+  expect(() => new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["relative"] })).toThrow("Invalid Codex launch permissions");
+  const initial = { method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } };
+  permissions.fromClient(initial);
+  expect(initial.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
+});
+
+it.each(["thread/start", "thread/resume", "thread/fork"])("preserves native permission changes on new threads after initial %s", method => {
+  const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient({ method: "initialize", params: {} });
+  permissions.fromClient({ method, params: { runtimeWorkspaceRoots: ["/project"] } });
+  for (const policy of [
+    { approvalPolicy: "on-request", sandbox: "workspace-write", permissions: null },
+    { approvalPolicy: "on-request", sandbox: null, permissions: ":workspace" }
+  ]) {
+    const next = { method: "thread/start", params: { ...policy, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] } };
+    permissions.fromClient(next);
+    expect(next.params).toEqual({ ...policy, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
+  }
 });
 
 it("makes each selected conversation durable before its native TUI receives the reply", async () => {

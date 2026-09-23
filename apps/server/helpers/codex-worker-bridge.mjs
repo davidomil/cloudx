@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
-import { applyLaunchPermissions } from "./codex-remote-permissions.mjs";
+import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -129,6 +129,7 @@ export async function runWorkerBridge(launch) {
     value => saveTurnReceipt(`${launch.binding.receiptPath}.final.json`, value)) : undefined;
   const selection = launch.selection ? new CodexConversationSelection(launch.selection,
     value => saveTurnReceipt(launch.selection.receiptPath, value)) : undefined;
+  const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
   if (!turn && !selection) throw new Error("A native bridge execution binding is required.");
   let finishing = false;
   const fail = error => {
@@ -173,7 +174,7 @@ export async function runWorkerBridge(launch) {
     socket.on("message", data => {
       try {
         const message = JSON.parse(data.toString());
-        applyLaunchPermissions(message, launch.permissions);
+        permissions?.fromClient(message);
         selection?.fromClient(message);
         turn?.fromClient(message);
         const line = `${JSON.stringify(message)}\n`;

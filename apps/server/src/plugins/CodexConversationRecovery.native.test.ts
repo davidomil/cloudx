@@ -100,7 +100,10 @@ it.skipIf(!codexBinary)("requires selection after native resume changes conversa
   }
 }, 30_000);
 
-it.skipIf(!codexBinary)("durably follows native idle new and resume selection across observer and process loss", async () => {
+it.skipIf(!codexBinary).each([
+  { name: "durably follows native idle new and resume selection across observer and process loss", editFirstPrompt: false },
+  { name: "preserves native permission changes through first-prompt editing and process loss", editFirstPrompt: true }
+])("$name", async ({ editFirstPrompt }) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-selection-"));
   const home = path.join(root, "home");
   const skills = path.join(root, "skills");
@@ -148,7 +151,8 @@ it.skipIf(!codexBinary)("durably follows native idle new and resume selection ac
       JSON.stringify({
         selection: { tabId: tab.id, executionId: execution, receiptPath: recovery.receiptPath },
         permissions: { yoloMode: true, additionalWritableRoots: [skills] },
-        command: codexBinary, serverArgs: ["app-server", "--listen", "stdio://"],
+        command: codexBinary,
+        serverArgs: ["--config", 'approval_policy="never"', "--config", 'sandbox_mode="danger-full-access"', "app-server", "--listen", "stdio://"],
         tuiArgs: buildCodexRemoteTuiArgs(["--yolo", "--no-alt-screen", "--add-dir", skills], ["--cd", root, "--model", "cloudx-native", ...args])
       })
     ], { cwd: root, env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, TERM: "xterm-256color" }, cols: 100, rows: 30 });
@@ -195,27 +199,52 @@ it.skipIf(!codexBinary)("durably follows native idle new and resume selection ac
     expect(transcript.find(item => item.type === "turn_context")?.payload).toMatchObject({ approval_policy: "never", sandbox_policy: { type: "danger-full-access" } });
     expect(transcript.find(item => item.type === "session_meta")?.payload.runtime_workspace_roots).toEqual(expect.arrayContaining([root, skills]));
 
-    await submit("/new");
-    await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
-    const empty = recovery.read()!.sessionId;
-    expect(empty).toBeTruthy();
-    expect(requests.filter(value => value === "conversation")).toHaveLength(1);
-    await submit(`/resume ${original}`);
-    await expect.poll(() => recovery.read()?.sessionId === original ? original : output, { timeout: 5_000 }).toBe(original);
-    expect(requests.filter(value => value === "conversation")).toHaveLength(1);
+    let selected = original;
+    if (editFirstPrompt) {
+      await submit("/permissions");
+      await expect.poll(() => output).toContain("1. Ask for approval");
+      output = "";
+      terminal!.write("1");
+      await expect.poll(() => output).toContain("Permissions updated");
+      terminal!.write("\u001b");
+      await new Promise(resolve => setTimeout(resolve, 150));
+      terminal!.write("\u001b");
+      await new Promise(resolve => setTimeout(resolve, 150));
+      terminal!.write("\r");
+      await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
+      selected = recovery.read()!.sessionId;
+      expect(selected).toBeTruthy();
+      output = "";
+      await submit("");
+      await expect.poll(() => output, { timeout: 10_000 }).toContain("The conversation is saved.");
+      const editedTranscript = (await fs.readFile(recovery.read()!.transcriptPath!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(editedTranscript.find(item => item.type === "turn_context")?.payload).toMatchObject({
+        approval_policy: "on-request", sandbox_policy: { type: "workspace-write", writable_roots: expect.arrayContaining([skills]) }
+      });
+      expect(editedTranscript.find(item => item.type === "session_meta")?.payload.runtime_workspace_roots).toEqual(expect.arrayContaining([root, skills]));
+    } else {
+      await submit("/new");
+      await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
+      expect(recovery.read()!.sessionId).toBeTruthy();
+      expect(requests.filter(value => value === "conversation")).toHaveLength(1);
+      await submit(`/resume ${original}`);
+      await expect.poll(() => recovery.read()?.sessionId === original ? original : output, { timeout: 5_000 }).toBe(original);
+    }
+    const conversationCount = editFirstPrompt ? 2 : 1;
+    expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
 
     // The terminal supervisor stops both the visible TUI and backend. No prompt is replayed.
     await terminal!.terminate();
     terminal = undefined;
     const persisted = new CodexConversationRecovery(sources.viewPath(tab.id)).read();
-    expect(persisted).toMatchObject({ sessionId: original, selection: { tabId: tab.id, executionId } });
-    expect(await plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: original });
-    await launch(["resume", original], restartedExecutionId);
+    expect(persisted).toMatchObject({ sessionId: selected, selection: { tabId: tab.id, executionId } });
+    expect(await plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: selected });
+    await launch(["resume", selected], restartedExecutionId);
     await expect.poll(() => {
       const identity = new CodexConversationRecovery(sources.viewPath(tab.id)).read();
       return identity?.selection?.executionId === restartedExecutionId ? identity : output;
-    }, { timeout: 10_000 }).toMatchObject({ sessionId: original, selection: { executionId: restartedExecutionId } });
-    expect(requests.filter(value => value === "conversation")).toHaveLength(1);
+    }, { timeout: 10_000 }).toMatchObject({ sessionId: selected, selection: { executionId: restartedExecutionId } });
+    expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
   } finally {
     stopObserving?.();
     await terminal?.terminate();

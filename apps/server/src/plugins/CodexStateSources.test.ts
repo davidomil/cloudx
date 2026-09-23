@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CodexStateSources } from "./CodexStateSources.js";
+import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
 
 vi.mock("../filesystemIdentity.js", () => ({ filesystemIdentity: async () => ({ filesystemType: "ef53", filesystemId: "f00d1234" }) }));
 
@@ -448,6 +449,35 @@ describe("durable Codex source ownership", () => {
     await fs.writeFile(path.join(view, ".cloudx-source.json"), JSON.stringify({ version: 1, ...source, durable: { ...source.durable!, filesystemId: "ffff" } }));
     await expect(f.sources.previewOwnership("changed")).rejects.toThrow(/ownership changed/);
     await expect(f.sources.readBinding("changed")).rejects.toThrow(/ownership changed/);
+    await f.sources.dispose();
+  });
+
+  it.each(["after inspection", "before writing"])("preserves a replaced launch directory %s instead of reconciling into it", async stage => {
+    const f = await fixture();
+    const source = await f.sources.resolve();
+    const view = await f.sources.bind("replaced-view", source);
+    const binding = path.join(view, ".cloudx-source.json");
+    const legacy = { version: 1, sourceId: source.sourceId, home: source.home, ino: source.ino, dev: "1" };
+    await fs.writeFile(binding, JSON.stringify(legacy));
+    const preview = await f.sources.previewOwnership("replaced-view");
+    const replaceView = async () => {
+      await fs.rename(view, `${view}-retained`);
+      await fs.mkdir(view);
+      await fs.writeFile(binding, JSON.stringify(legacy));
+    };
+    if (stage === "after inspection") await replaceView();
+    else {
+      const assertCurrent = DirectoryOwnershipReconciler.prototype.assertCurrent;
+      vi.spyOn(DirectoryOwnershipReconciler.prototype, "assertCurrent").mockImplementationOnce(async function (this: DirectoryOwnershipReconciler) {
+        await assertCurrent.call(this);
+        await replaceView();
+      });
+    }
+
+    await expect(f.sources.reconcileOwnership("replaced-view", { fingerprint: preview.fingerprint, attestations: preview.directories }))
+      .rejects.toThrow(stage === "after inspection" ? /changed after inspection/ : /Codex launch ownership changed/);
+    expect(JSON.parse(await fs.readFile(binding, "utf8"))).toEqual(legacy);
+    expect(JSON.parse(await fs.readFile(path.join(`${view}-retained`, ".cloudx-source.json"), "utf8"))).toEqual(legacy);
     await f.sources.dispose();
   });
 });
