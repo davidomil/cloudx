@@ -80,9 +80,10 @@ coordinator directory before startup. Settings continues to use the
 retained coordinator after a downgrade, including for completion status
 and the next update.
 
-For the recognized target before Settings updates existed, the prepared
+For recognized targets before Settings updates existed, the prepared
 build adds the maintained Updates panel, server routes and shared
-contracts. Starting an update waits for pending workspace writes and a
+contracts. The panel fits the target's existing Settings categories or
+sections. Starting an update waits for pending workspace writes and a
 durable workspace save.
 
 The coordinator is bundled into private update state and runs in its own
@@ -228,7 +229,7 @@ factory. Readiness requires the expected output, a successful exit and
 confirmed termination. The broker service stays inactive while its
 entry point is absent.
 
-The recognized pre-broker target receives a managed reader and writer
+Recognized pre-broker targets receive a managed reader and writer
 for version-1 saved sessions. Saved tabs keep their IDs, layout,
 conversation evidence and inputs without requiring a previous snapshot
 from that target. Terminal tabs remain stopped until explicit recovery;
@@ -260,8 +261,13 @@ attachment, original profile paths, saved update completion and
 initiation of the next update.
 
 The matrix also includes 224a75ef7b3efced05b2c6b3b136250d9a532dc3,
-before persistent terminal brokers. Its source fixture verifies direct
-process cleanup, a retained live shell and the next Settings handoff.
+before persistent terminal brokers, and CloudX 0.1.3 at
+c664071e04091db6be78df09d8c91a1975e9313c, before Codex settings.
+Both source fixtures verify direct process cleanup, a retained live shell
+and the next Settings handoff. The 0.1.3 integration retains review draft
+identities and Git evidence through its older Forge completion workflow.
+An interrupted report cleanup resumes the saved completed draft without
+launching another review.
 
 Historical integrations must compile against the selected target’s APIs.
 Schema checks recognize catalog, session and Forge review evidence

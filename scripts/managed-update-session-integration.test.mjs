@@ -14,44 +14,45 @@ import { CODEX_SOURCES, SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES,
 import { inspectTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
 
 const historicalCommit = "224a75ef7b3efced05b2c6b3b136250d9a532dc3";
-const sources = new Map();
-function historical(file) {
-  if (!sources.has(file)) sources.set(file, execFileSync("git", ["show", `${historicalCommit}:${file}`], { encoding: "utf8" }));
-  return sources.get(file);
-}
-const settings = prepareMissingSettingsIntegration(historical);
-const beforeSessions = file => settings[file] ?? historical(file);
-const migrated = prepareSessionIntegration(beforeSessions);
 const copied = Object.fromEntries(SESSION_PERSISTENCE_FILES.map(file => [file, fs.readFileSync(file, "utf8")]));
 const require = createRequire(import.meta.url);
-const modules = new Map();
 
 // Execute the migration's historical production classes, including their real
 // validators and filesystem persistence, without requiring a historical build.
-function load(file, overrides = {}, cache = modules) {
-  if (cache.has(file)) return cache.get(file).exports;
-  const source = overrides[file] ?? migrated[file] ?? settings[file] ?? copied[file] ?? (file === "packages/shared/src/cloudxUpdate.ts" ? fs.readFileSync(file, "utf8") : historical(file));
-  const compiled = ts.transpileModule(source, { fileName: file, reportDiagnostics: true,
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, esModuleInterop: true } });
-  expect(compiled.diagnostics).toEqual([]);
-  const module = { exports: {} };
-  cache.set(file, module);
-  const dependency = name => {
-    if (name.startsWith("node:")) return require(name);
-    if (name.startsWith("@cloudx/")) return load(`packages/${name.slice(8)}/src/index.ts`, overrides, cache);
-    if (name.startsWith(".")) return load(path.posix.normalize(path.posix.join(path.posix.dirname(file), name)).replace(/\.js$/, ".ts"), overrides, cache);
-    return require(name);
-  };
-  const javascript = compiled.outputText.replaceAll("import.meta.url", JSON.stringify(pathToFileURL(path.resolve(file)).href));
-  new Function("require", "module", "exports", javascript)(dependency, module, module.exports);
-  return module.exports;
+function historicalRuntime(commit) {
+  const sources = new Map();
+  function historical(file) {
+    if (!sources.has(file)) sources.set(file, execFileSync("git", ["show", `${commit}:${file}`], { encoding: "utf8" }));
+    return sources.get(file);
+  }
+  const settings = prepareMissingSettingsIntegration(historical);
+  const migrated = prepareSessionIntegration(file => settings[file] ?? historical(file));
+  const modules = new Map();
+  function load(file, overrides = {}, cache = modules) {
+    if (cache.has(file)) return cache.get(file).exports;
+    const source = overrides[file] ?? migrated[file] ?? settings[file] ?? copied[file] ?? (file === "packages/shared/src/cloudxUpdate.ts" ? fs.readFileSync(file, "utf8") : historical(file));
+    const compiled = ts.transpileModule(source, { fileName: file, reportDiagnostics: true,
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, esModuleInterop: true } });
+    expect(compiled.diagnostics).toEqual([]);
+    const module = { exports: {} };
+    cache.set(file, module);
+    const dependency = name => {
+      if (name.startsWith("node:")) return require(name);
+      if (name.startsWith("@cloudx/")) return load(`packages/${name.slice(8)}/src/index.ts`, overrides, cache);
+      if (name.startsWith(".")) return load(path.posix.normalize(path.posix.join(path.posix.dirname(file), name)).replace(/\.js$/, ".ts"), overrides, cache);
+      return require(name);
+    };
+    const javascript = compiled.outputText.replaceAll("import.meta.url", JSON.stringify(pathToFileURL(path.resolve(file)).href));
+    new Function("require", "module", "exports", javascript)(dependency, module, module.exports);
+    return module.exports;
+  }
+  return { historical, migrated, load };
 }
 
-const { SessionStore } = load("apps/server/src/sessionStore.ts");
+const runtime = historicalRuntime(historicalCommit);
+const { historical, migrated, load } = runtime;
 const { SessionStateStore } = load("apps/server/src/workspace/SessionStateStore.ts");
-const { WorkspaceLayoutStore } = load("apps/server/src/workspace/WorkspaceLayoutStore.ts");
 const { CodexTerminalPlugin } = load("apps/server/src/plugins/CodexTerminalPlugin.ts");
-const { CodexStateSources } = load("apps/server/src/plugins/CodexStateSources.ts");
 const fixtures = [];
 const conversationId = "12345678-1234-4234-8234-123456789abc";
 
@@ -64,7 +65,10 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function savedWorkspace() {
+async function savedWorkspace(target = runtime) {
+  const { SessionStore } = target.load("apps/server/src/sessionStore.ts");
+  const { SessionStateStore } = target.load("apps/server/src/workspace/SessionStateStore.ts");
+  const { WorkspaceLayoutStore } = target.load("apps/server/src/workspace/WorkspaceLayoutStore.ts");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-saved-tab-migration-"));
   const timestamp = "2026-09-22T00:00:00.000Z";
   const saved = { version: 1, activeTabId: "saved-shell", sessions: [
@@ -103,8 +107,10 @@ async function savedWorkspace() {
   return fixture;
 }
 
-async function preservedCodexConversation() {
-  const fixture = await savedWorkspace();
+async function preservedCodexConversation(target = runtime) {
+  const { CodexTerminalPlugin } = target.load("apps/server/src/plugins/CodexTerminalPlugin.ts");
+  const { CodexStateSources } = target.load("apps/server/src/plugins/CodexStateSources.ts");
+  const fixture = await savedWorkspace(target);
   const codexHome = path.join(fixture.root, "codex-home");
   fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
   const tab = fixture.saved.sessions[1].tab;
@@ -132,6 +138,44 @@ describe("saved-tab recovery in the managed pre-broker target", () => {
     expect(Object.keys(migrated)).toEqual(SESSION_INTEGRATION_FILES);
     expect(MISSING_SETTINGS_FILES).toContain("apps/server/src/server.ts");
     expect(() => prepareSessionIntegration(file => migrated[file])).toThrow("does not recognize");
+  });
+
+  it("restores and explicitly resumes saved conversations on actual 0.1.3 without a Codex preparation callback", async () => {
+    const target = historicalRuntime("c664071e04091db6be78df09d8c91a1975e9313c");
+    const fixture = await preservedCodexConversation(target);
+    fixture.createSession.mockRestore();
+    fixture.plugins[1] = fixture.plugin;
+    vi.spyOn(target.load("apps/server/src/rulesSkills/CodexHomeOverlay.ts"), "materializeCodexHomeOverlay").mockImplementation(async input => ({
+      codexHome: await input.sources.bind(input.tabId, input.source), rulesSkillsRoot: fixture.root, systemRules: [],
+    }));
+    const terminal = { onData: vi.fn(() => () => {}), onExit: vi.fn(() => () => {}), kill: vi.fn(), write: vi.fn() };
+    fixture.factory.spawn.mockResolvedValue(terminal);
+    await fixture.store.restore();
+    expect(fixture.factory.spawn).not.toHaveBeenCalled();
+    expect(fixture.store.getTab("saved-codex").recovery).toMatchObject({ conversationId, canResume: true });
+    expect((await fixture.store.snapshot()).windows.find(window => window.id === fixture.window.id).layout).toEqual(fixture.layout);
+
+    await fixture.store.recoverTab("saved-codex", { action: "resume-conversation", sessionId: conversationId });
+    expect(fixture.factory.spawn).toHaveBeenCalledTimes(1);
+    const launch = JSON.stringify(fixture.factory.spawn.mock.calls[0]);
+    expect(launch).toContain(conversationId);
+    expect(launch).toContain("codex-conversation-hook.mjs");
+    expect(launch).not.toMatch(/DO_NOT_REPLAY_(PROMPT|COMMAND)/);
+    expect(terminal.write).not.toHaveBeenCalled();
+    expect(fixture.input.prepareCodexSession).not.toHaveBeenCalled();
+    expect((await fixture.savedSessions.read()).sessions[1].initialInput)
+      .toEqual({ model: "saved-model", resume: { mode: "session", sessionId: conversationId } });
+    expect(fixture.store.getTab("saved-codex").recovery).toBeUndefined();
+
+    const tab = await fixture.store.createTab({ pluginId: "codex-terminal", cwd: fixture.root, initialInput: { model: "saved-model" } });
+    const receipt = path.join(fixture.sources.viewPath(tab.id), ".cloudx-conversation.json");
+    execFileSync(process.execPath, [path.resolve("apps/server/helpers/codex-conversation-hook.mjs"), receipt], {
+      input: JSON.stringify({ hook_event_name: "SessionStart", session_id: conversationId, cwd: tab.cwd, transcript_path: fixture.transcript }),
+    });
+    await vi.waitFor(async () => {
+      expect((await fixture.savedSessions.read()).sessions.find(session => session.tab.id === tab.id).initialInput)
+        .toEqual({ model: "saved-model", resume: { mode: "session", sessionId: conversationId } });
+    });
   });
 
   it("preserves native durable source ownership and rejects an unknown historical reader", () => {

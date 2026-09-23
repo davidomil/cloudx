@@ -19,6 +19,7 @@ const targets = [
   ["before Settings channel selection", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", true, true],
   ["before terminal execution bindings", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", true, true],
   ["before persistent terminal brokers", "224a75ef7b3efced05b2c6b3b136250d9a532dc3", true, false],
+  ["before Codex settings (0.1.3)", "c664071e04091db6be78df09d8c91a1975e9313c", true, false],
 ];
 const temporary = [];
 afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });

@@ -9,17 +9,30 @@ import { cleanupHistoricalForge, historicalForge } from './helpers/managed-updat
 
 const sources = new Map();
 const maintained = file => fs.readFileSync(file, 'utf8');
-function historical(file) {
-  if (!sources.has(file)) sources.set(file, execFileSync('git', ['show', `2e69451b065e265db2a296e465ed306a33ab8f88:${file}`], { encoding: 'utf8' }));
-  return sources.get(file);
+function historical(file, commit = '2e69451b065e265db2a296e465ed306a33ab8f88') {
+  const key = `${commit}:${file}`;
+  if (!sources.has(key)) sources.set(key, execFileSync('git', ['show', key], { encoding: 'utf8' }));
+  return sources.get(key);
 }
 afterEach(cleanupHistoricalForge);
 
-it('preserves the native reader/writer contract and accepts an already integrated historical target', () => {
+it.each(['2e69451b065e265db2a296e465ed306a33ab8f88', 'c664071e04091db6be78df09d8c91a1975e9313c'])('preserves the native reader/writer contract and accepts integrated %s', commit => {
+  const target = file => historical(file, commit);
   expect(prepareManagedForgeIntegration(maintained, maintained)).toEqual({});
-  const migrated = prepareManagedForgeIntegration(historical, maintained);
+  const migrated = prepareManagedForgeIntegration(target, maintained);
   expect(Object.keys(migrated)).toEqual(FORGE_INTEGRATION_FILES);
-  expect(prepareManagedForgeIntegration(file => migrated[file] ?? historical(file), maintained)).toEqual({});
+  expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
+});
+
+it.each([
+  [FORGE_RUNTIME_FILE, '    let mergeBases: string[];'],
+  [FORGE_SERVICE_FILE, '            worker.draft = { ...parseReview(report), status: "draft" };'],
+  [FORGE_VALIDATION_FILE, 'function parseSavedReview(value: unknown): ForgeReviewDraft {'],
+])('rejects an unrecognized separate-review-worker contract in %s', (file, anchor) => {
+  expect(() => prepareManagedForgeIntegration(name => {
+    const source = historical(name, 'c664071e04091db6be78df09d8c91a1975e9313c');
+    return name === file ? source.replace(anchor, 'unknown contract') : source;
+  }, maintained)).toThrow('does not recognize');
 });
 
 it.each([

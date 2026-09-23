@@ -15,14 +15,16 @@ import { seedSavedTabProfile } from "./helpers/managed-update-saved-tabs-fixture
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const preBrokerTarget = "224a75ef7b3efced05b2c6b3b136250d9a532dc3";
+const preCodexSettingsTarget = "c664071e04091db6be78df09d8c91a1975e9313c";
+const directTargets = [preBrokerTarget, preCodexSettingsTarget];
 const brokerTarget = "a9613fafdc0ed1765fcf72ea7d9f61de08c3914a";
-const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", preBrokerTarget];
+const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65", "ad72433b2d6283811fad6bfe288748f2c24b0c5e", ...directTargets];
 const supportedHost = process.platform === "linux"
   && fs.readFileSync("/etc/os-release", "utf8").includes("ID=ubuntu")
   && spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 5000 }).status === 0;
 
 it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and its required terminal services under isolated systemd units", async historicalTarget => {
-  const fixture = await HistoricalInstallation.create({ savedTabs: historicalTarget === preBrokerTarget });
+  const fixture = await HistoricalInstallation.create({ savedTabs: directTargets.includes(historicalTarget) });
   try {
     await fixture.waitUntilReady();
     if (fixture.savedTabs) await fixture.expectSavedTabs();
@@ -37,7 +39,7 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
     expect(update.record.transition.runtimePlan.requiresInterruption).toBe(true);
     expect(update.record.transition.runtimePlan.stopServices).toContain("cloudx-terminal.service");
     expect(fixture.serviceState(fixture.webUnit).InvocationID).not.toBe(originalWeb.InvocationID);
-    if (historicalTarget === preBrokerTarget) {
+    if (directTargets.includes(historicalTarget)) {
       expect(update.record.transition.integration.terminalMode).toBe("direct");
       expect(fixture.serviceState(fixture.brokerUnit)).toMatchObject({ ActiveState: "inactive", MainPID: "0", ConditionResult: "no" });
       // Resuming the interrupted activation first restarts the original broker.
@@ -66,7 +68,7 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
     expect(fixture.curl("/api/ready/terminals", ["--write-out", "%{http_code}"])).toMatch(/404$/);
     expect(fs.readdirSync(fixture.dataDir).filter(name => name.startsWith("terminal-readiness-"))).toEqual([]);
     expect(fs.readFileSync(path.join(fixture.dataDir, "user-data.txt"), "utf8")).toBe("Preserve the active profile across the historical transition.\n");
-    if (historicalTarget === preBrokerTarget) {
+    if (directTargets.includes(historicalTarget)) {
       await fixture.startNextUpdateInSettings(historicalTarget, brokerTarget);
       const next = fixture.update(brokerTarget);
       expect(await next.coordinator.run()).toMatchObject({ state: "succeeded", phase: "complete" });
@@ -185,7 +187,7 @@ http.createServer((request, response) => {
     expect(saved.transition.completed).toEqual(["prepare", "quiesce", "snapshot", "activate"]);
     expect(saved.transition.mutating).toBe(true);
     expect(saved.restoreSnapshotRunId).toBeUndefined();
-    expect(this.git(["rev-parse", "HEAD"])).toBe(preBrokerTarget);
+    expect(this.git(["rev-parse", "HEAD"])).toBe(saved.targetCommit);
     expect(this.serviceState(this.webUnit).ActiveState).toBe("inactive");
     for (const { file, bytes } of this.savedTabs.evidence) expect(fs.readFileSync(file)).toEqual(bytes);
     expect(fs.existsSync(this.savedTabs.terminalLaunches)).toBe(false);
@@ -389,9 +391,13 @@ http.createServer((request, response) => {
           await page.getByRole("button", { name: "Workspace actions", exact: true }).click();
           await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
         } else await page.getByRole("button", { name: "Settings", exact: true }).click();
-        const settings = page.getByRole("dialog", { name: "Settings", exact: true });
-        await settings.getByRole("searchbox", { name: "Search settings" }).fill("Updates");
-        await browserExpect(settings.getByRole("tab", { name: "Updates", exact: true })).toHaveAttribute("aria-selected", "true");
+        const settings = page.locator(".settings-dialog");
+        if (currentCommit === preCodexSettingsTarget) {
+          await browserExpect(settings.getByRole("region", { name: "Updates", exact: true })).toBeVisible();
+        } else {
+          await settings.getByRole("searchbox", { name: "Search settings" }).fill("Updates");
+          await browserExpect(settings.getByRole("tab", { name: "Updates", exact: true })).toHaveAttribute("aria-selected", "true");
+        }
         await settings.getByRole("button", { name: "Update CloudX and dependencies", exact: true }).click();
         await expect.poll(() => starts).toEqual([{ channel: "main", targetCommit }]);
         expect(errors).toEqual([]);

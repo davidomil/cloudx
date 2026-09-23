@@ -37,8 +37,8 @@ function completedReview() {
   };
 }
 
-it.each([false, true])('restores after actual historical Forge persistence and failed readiness (fresh Resume: %s)', async resume => {
-  const history = historicalForge();
+it.each(['2e69451b', 'c664071e'].flatMap(commit => [false, true].map(resume => [commit, resume])))('restores after %s Forge persistence and failed readiness (fresh Resume: %s)', async (commit, resume) => {
+  const history = historicalForge(commit);
   const f = updateFixture({ activate: false, originalWeb: 'active' });
   const currentStore = new ForgeWorkflowStore(new PluginDataStore(f.dataDir));
   await currentStore.write([completedReview()]);
@@ -120,7 +120,7 @@ async function reviewRoundTrip({ commit, ...options } = {}) {
     write(path.join(f.dataDir, 'forge-reports', `${worker.attemptId}.json`), JSON.stringify({ kind: 'review', headSha: change.headSha,
       event: 'approve', body: `Reviewed ${change.headSha}`, comments: [] }));
     await instance.service.poll();
-    const completed = (await instance.service.dashboard()).workers[0];
+    const completed = (await instance.service.dashboard()).workers.find(candidate => candidate.id === worker.id);
     expect(completed.status, completed.error).toBe('completed');
     return completed;
   }
@@ -155,6 +155,69 @@ it.each(['2e69451b', 'a9613faf', '643ad8eb', '224a75ef'])('downgrades to %s, com
   expect(next.status, next.error).toBe('running');
   expect(next.completion.reviewScope).toMatchObject({ kind: 'unchanged', current: revision, previous: revision });
   expect(next.reviewHistory).toEqual([f.initial.draft, second.draft]);
+  expect(f.provider.postReview).toHaveBeenCalledOnce();
+}, 20000);
+
+it('preserves current reviews and edits a separate 0.1.3 review before upgrading from its retained baseline', async () => {
+  const f = await reviewRoundTrip({ commit: 'c664071e' });
+  const downgraded = f.serviceFor(f.history);
+  expect((await downgraded.service.dashboard()).workers[0]).toMatchObject({
+    draft: f.initial.draft, reviewBaseline: f.initial.reviewBaseline,
+  });
+  f.change.number = 8;
+  f.change.headSha = f.record.targetCommit;
+  const second = await f.finishReview(downgraded, await downgraded.service.startReview(f.initial.repository, 8, false, f.placement));
+  expect(second.reviewBaseline).toEqual({ reviewId: second.draft.id, revision: second.completion.reviewScope.current });
+  expect(second.draft).toMatchObject({ id: second.completion.attemptId, startedAt: second.startedAt });
+  await downgraded.service.saveReview(second.id, { body: 'Edited historical review', comments: [], event: 'approve' });
+  await downgraded.service.dispose();
+  const persisted = await downgraded.store.read();
+  expect(persisted[0]).toMatchObject({ draft: f.initial.draft, reviewBaseline: f.initial.reviewBaseline });
+  expect(persisted[1]).toMatchObject({ draft: { ...second.draft, body: 'Edited historical review' }, reviewBaseline: second.reviewBaseline });
+  const revision = second.reviewBaseline.revision;
+  for (const [name, sha] of [['head', revision.headSha], ['base', revision.baseSha], ['merge-base', revision.mergeBaseSha]])
+    expect(git(second.worktreePath, 'rev-parse', `refs/cloudx/reviews/${revision.headSha}/${revision.baseSha}/${name}`)).toBe(sha);
+  const upgraded = f.serviceFor(f.currentClasses);
+  const next = await upgraded.service.startReview(f.initial.repository, 8, false, f.placement);
+  expect(next.status, next.error).toBe('running');
+  expect(next.completion.reviewScope).toMatchObject({ kind: 'unchanged', current: revision, previous: revision });
+  expect(next.reviewHistory).toEqual([persisted[1].draft]);
+  expect(f.provider.postReview).toHaveBeenCalledOnce();
+}, 20000);
+
+it.each(['retention', 'cleanup'])('preserves 0.1.3 review evidence when %s fails before a return upgrade', async failure => {
+  const f = await reviewRoundTrip({ commit: 'c664071e' });
+  const downgraded = f.serviceFor(f.history);
+  f.change.number = 8;
+  f.change.headSha = f.record.targetCommit;
+  const worker = await downgraded.service.startReview(f.initial.repository, 8, false, f.placement);
+  write(path.join(f.dataDir, 'forge-reports', `${worker.attemptId}.json`), JSON.stringify({ kind: 'review', headSha: f.change.headSha,
+    event: 'approve', body: 'Historical completed review', comments: [] }));
+  if (failure === 'retention')
+    vi.spyOn(downgraded.runtime, 'retainReviewBaseline').mockRejectedValue(new Error('Retained evidence unavailable'));
+  else vi.spyOn(f.reports, 'remove').mockRejectedValueOnce(new Error('Interrupted report cleanup'));
+  await downgraded.service.poll();
+  const failed = (await downgraded.service.dashboard()).workers.find(candidate => candidate.id === worker.id);
+  expect(failed.status).toBe('failed');
+  expect(await f.reports.read(worker.attemptId)).toBeDefined();
+  expect(fs.existsSync(worker.worktreePath)).toBe(true);
+  if (failure === 'cleanup') {
+    downgraded.runtime.launch.mockClear();
+    const resumed = await downgraded.service.resume(worker.id, f.placement);
+    expect(resumed).toMatchObject({ status: 'completed', draft: failed.draft, reviewBaseline: failed.reviewBaseline });
+    expect(downgraded.runtime.launch).not.toHaveBeenCalled();
+  }
+  await downgraded.service.dispose();
+  const upgraded = f.serviceFor(f.currentClasses);
+  const loaded = (await upgraded.service.dashboard()).workers.find(candidate => candidate.id === worker.id);
+  if (failure === 'retention') {
+    expect(loaded.draft).toBeUndefined();
+    expect(loaded.reviewBaseline).toBeUndefined();
+  } else {
+    expect(loaded).toMatchObject({ draft: { id: worker.attemptId }, reviewBaseline: { reviewId: worker.attemptId } });
+    expect(loaded.status).toBe('completed');
+    expect(upgraded.runtime.launch).not.toHaveBeenCalled();
+  }
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 20000);
 
@@ -241,11 +304,12 @@ it('preserves the completed pre-native review before cleanup fails, then loads i
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 20000);
 
-it.each(['2e69451b', '224a75ef'])('keeps report and saved-draft body limits compatible across %s', commit => {
+it.each(['2e69451b', '224a75ef', 'c664071e'])('keeps report and saved-draft body limits compatible across %s', commit => {
   const history = historicalForge(commit);
   const validation = history.load('apps/server/src/forge/ForgeWorkflowValidation.ts');
   const saved = completedReview();
   const report = { ...saved.completion.report, body: 'a'.repeat(100_001) };
+  expect(validation.parseWorkerReport({ kind: 'issue', title: 'Issue completed', body: 'Validation passed' }).kind).toBe('issue');
   expect(() => validation.parseWorkerReport(report)).toThrow();
   saved.draft.body = 'a'.repeat(100_512);
   expect(validation.parseWorkers([saved])[0].draft.body).toHaveLength(100_512);

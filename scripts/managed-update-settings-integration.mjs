@@ -46,7 +46,7 @@ export function prepareMissingSettingsIntegration(readSource) {
   // These are the existing serialized persistence and capacity-error contracts.
   requireAnchor(WORKSPACE, '  private async persist(requireDurable = false, state: WorkspacePersistenceState = this.persistenceState()): Promise<void> {');
   requireAnchor(WORKSPACE, '        if (requireDurable) {\n          throw error;\n        }');
-  insertAfter(SHARED, 'export * from "./codexSettings.js";\n', 'export * from "./cloudxUpdate.js";\n');
+  insertAfter(SHARED, 'export * from "./forgeConnections.js";\n', 'export * from "./cloudxUpdate.js";\n');
 
   insertAfter(APP, 'import { SettingsDialog } from "./SettingsDialog.js";\n', 'import { useCloudxUpdate } from "./CloudxUpdatePanel.js";\n');
   insertAfter(APP, '  getWorkspace,\n', '  persistWorkspace,\n  persistWindowLayout,\n');
@@ -58,7 +58,13 @@ export function prepareMissingSettingsIntegration(readSource) {
   insertAfter(SETTINGS, 'import { ControlButton } from "./Control.js";\n', 'import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";\n');
   insertAfter(SETTINGS, 'export function SettingsDialog({\n  config,\n', '  cloudxUpdate,\n');
   insertAfter(SETTINGS, '  config: CloudxConfigResponse;\n', '  cloudxUpdate?: CloudxUpdateController;\n');
-  insertBefore(SETTINGS, '  const searchWords = query.trim().toLowerCase().split(/\\s+/).filter(Boolean);', `  if (cloudxUpdate) categories.push({
+  const categories = '  const categories: SettingsCategory[] = [{\n';
+  const sections = '  const globalFields = config.globalFields.filter(isUserVisibleConfigField);\n';
+  if (changes[SETTINGS].includes(categories) === changes[SETTINGS].includes(sections))
+    throw new Error("Managed updater integration does not recognize the target's Settings layout.");
+  if (changes[SETTINGS].includes(categories)) {
+    requireAnchor(SETTINGS, categories);
+    insertBefore(SETTINGS, '  const searchWords = query.trim().toLowerCase().split(/\\s+/).filter(Boolean);', `  if (cloudxUpdate) categories.push({
     id: "updates",
     label: "Updates",
     description: "Update CloudX and the tools managed by its installer.",
@@ -70,7 +76,28 @@ export function prepareMissingSettingsIntegration(readSource) {
   });
 
 `);
+  } else {
+    requireAnchor(SETTINGS, sections);
+    insertAfter(SETTINGS, '        {children}\n', `        {cloudxUpdate ? (
+          <section className="settings-section" aria-label="Updates">
+            <h3>Updates</h3>
+            <CloudxUpdatePanel update={cloudxUpdate} />
+          </section>
+        ) : null}
+`);
+  }
 
+  if (!changes[API].includes("export class HttpError extends Error {")) {
+    insertBefore(API, 'export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {\n', `export class HttpError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
+`);
+    replace(API, '    throw new Error(errorMessageFromResponse(text, response.status));',
+      '    throw new HttpError(response.status, errorMessageFromResponse(text, response.status));');
+  }
   insertAfter(API, '  WorkspaceStateResponse,\n', '  TabLayoutState,\n');
   insertAfter(API, 'export async function getWorkspace(): Promise<WorkspaceStateResponse> {\n  return fetchJson("/api/workspace");\n}\n', `
 export async function persistWorkspace(): Promise<void> {

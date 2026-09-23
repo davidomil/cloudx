@@ -17,6 +17,7 @@ export const SESSION_PERSISTENCE_FILES = ["apps/server/src/workspace/SessionStat
 // saved format as the source and next release. Terminal creation stays explicit.
 export function prepareSessionIntegration(readSource) {
   const changes = Object.fromEntries(SESSION_INTEGRATION_FILES.map(file => [file, readSource(file)]));
+  const preparesCodexSession = changes[CODEX].includes("input.prepareCodexSession");
   function replace(file, before, after) {
     if (changes[file].split(before).length !== 2)
       throw new Error(`Managed session recovery does not recognize the target contract in ${file}.`);
@@ -254,13 +255,15 @@ export function prepareSessionIntegration(readSource) {
     if (await this.requirePreservedConversation(input.tab.id) !== resume.sessionId)
       throw new Error("This historical release can recover the preserved conversation only. Open another conversation explicitly in a new tab.");
     const { prompt: _prompt, ...initialInput } = input.initialInput ?? {};
-    return this.createSession({ ...input, initialInput, prepareCodexSession: undefined });
+    return this.createSession({ ...input, initialInput${preparesCodexSession ? ", prepareCodexSession: undefined" : ""} });
   }
 
 `);
-  before(CODEX, '    if (input.prepareCodexSession) {\n', '    let restoredInput = { ...input.initialInput };\n');
-  after(CODEX, '      initialArgs = buildCodexLaunchArgs([], { ...input.initialInput, resume: { mode: "session", sessionId } });\n',
-    '      restoredInput = { ...restoredInput, resume: { mode: "session", sessionId } };\n');
+  after(CODEX, '    let initialArgs: string[];\n', '    let restoredInput = { ...input.initialInput };\n');
+  if (preparesCodexSession) {
+    after(CODEX, '      initialArgs = buildCodexLaunchArgs([], { ...input.initialInput, resume: { mode: "session", sessionId } });\n',
+      '      restoredInput = { ...restoredInput, resume: { mode: "session", sessionId } };\n');
+  }
   before(CODEX, '    const command = launchTemplate.command;\n', `    const conversation = launchTemplate.overlay ? new CodexConversationRecovery(launchTemplate.overlay.codexHome) : undefined;
     await input.controls.setRestoreInput?.(restoredInput);
 `);
