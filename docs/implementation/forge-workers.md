@@ -98,9 +98,10 @@ pause.
 data-fig-alt="Issue work publishes a request and pauses. Resume assesses current feedback, then either pauses again or merges and cleans owned resources."
 alt="Resume assesses current feedback before merge eligibility." />
 
-After merge, Forge removes its owned checkout and worker artifacts.
-Ownership changes, dirty files or a local commit different from the
-published head block cleanup and preserve the resources.
+After merge and issue closure, Forge removes clean owned checkouts.
+Checkouts with retained files remain available for recovery in the Workers
+view. Ownership changes or a local commit different from the published
+head block cleanup and preserve the resources.
 
 ## Auto review
 
@@ -108,8 +109,9 @@ Enable **Auto review** beside **Start work** to run the issue through
 implementation, review and correction until approval. The coding worker
 keeps its checkout, and each request reuses one reviewer conversation
 across revisions. Forge merges the approved revision after the
-repository checks pass and removes the associated workers once the
-linked issues are closed.
+repository checks pass and retires the associated workers once the
+linked issues are closed. Workers with retained files remain visible
+with their recovery location.
 
 A reviewer that finds no issues explicitly approves. Actionable findings
 request changes and send the issue back to coding. A review that needs
@@ -205,6 +207,36 @@ current review summary, outcome and comments, then **Save draft** or
 **Submit review**. Inline comments also expose file, line and diff side.
 **Mark as approved** and **Mark as request changes** submit directly
 through the reviewer identity.
+
+## Completed commits and retained files
+
+Forge supports completed commits with deliberately retained tracked
+edits and untracked files. The issue report’s handoff names the intended
+commit, marks it ready or needs_work, lists each retained path, and
+explains what remains. The worker must validate committed content
+independently when local edits affect the tests.
+
+Before publication, Forge records the commit and checks the declared
+paths against the checkout. It fingerprints retained file contents and
+staged changes. Publication and review use the recorded commit; a
+changed head or retained file state blocks verification.
+
+An unfinished implementation or invalid initial handoff preserves the
+report and checkout. Use Continue with message to finish the work or
+explain which files should remain outside the commit. Resume does not
+repeatedly retry that rejected handoff. Once publication may have
+started, reconcile its saved checkpoint before changing the intended
+commit.
+
+After merge and issue closure, cleanup retains the complete checkout
+whenever working files remain, including ignored files. It preserves the
+Git index and staged contents. A clean checkout can be removed;
+ownership or head mismatches still block cleanup.
+
+The Workers view shows the retained checkout location and paths,
+including after completion. Copy needed files from that location and
+inspect its Git index for staged edits. A retained completed checkout
+stays available for recovery; start a new worker for further work.
 
 ## Recovery and limits
 

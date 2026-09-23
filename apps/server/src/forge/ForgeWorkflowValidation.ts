@@ -34,6 +34,31 @@ function commitSha(value: unknown, name: string): string {
     throw new Error(`Invalid ${name}.`);
   return result;
 }
+function retainedPaths(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 10_000)
+    throw new Error("Retained files must contain at most 10000 paths.");
+  const paths = value.map(value => {
+    const path = text(value, "retained file path", 4096);
+    if (!path || path.includes("\\") || path.includes("\0") || /^[a-z]:/i.test(path) ||
+      path.split("/").some(part => !part || part === "." || part === ".."))
+      throw new Error("Retained file paths must be relative without dot segments.");
+    return path;
+  });
+  if (new Set(paths).size !== paths.length)
+    throw new Error("Retained file paths must be unique.");
+  return paths;
+}
+function parseIssueHandoff(value: unknown): NonNullable<ForgeIssueCompletionReport["handoff"]> {
+  const input = object(value);
+  if (input.status !== "ready" && input.status !== "needs_work")
+    throw new Error("Invalid issue handoff status.");
+  return {
+    headSha: commitSha(input.headSha, "issue handoff commit"),
+    status: input.status,
+    retainedPaths: retainedPaths(input.retainedPaths),
+    details: nonblankText(input.details, "issue handoff details", 100_000),
+  };
+}
 function isoTimestamp(value: unknown, name: string): string {
   const result = text(value, name, 24);
   const timestamp = Date.parse(result);
@@ -188,6 +213,8 @@ export function parseWorkerReport(
   | ({ kind: "review" } & ForgeReviewSubmission) {
   const report = object(value);
   if (report.kind === "review") {
+    if (report.handoff !== undefined)
+      throw new Error("Only issue reports can include a publication handoff.");
     if (report.rebase !== undefined)
       throw new Error("Only issue reports can report a rebase resolution.");
     text(report.body, "review body", MAX_FORGE_REVIEW_REPORT_BODY_LENGTH);
@@ -227,6 +254,7 @@ export function parseWorkerReport(
     body,
     resolvedDiscussionIds: [...new Set(ids)] as string[],
     discussionReplies,
+    ...(report.handoff !== undefined ? { handoff: parseIssueHandoff(report.handoff) } : {}),
     ...(report.rebase !== undefined ? { rebase: parseRebaseReport(report.rebase) } : {}),
   };
 }
@@ -309,6 +337,19 @@ function parsePendingPublication(
     : text(input.headSha, "published head", 64);
   if (headSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(headSha))
     throw new Error("Invalid published head.");
+  let handoff: NonNullable<ForgeWorker["pendingPublication"]>["handoff"];
+  if (input.handoff !== undefined) {
+    const saved = object(input.handoff);
+    handoff = { headSha: commitSha(saved.headSha, "publication handoff commit"), retainedPaths: retainedPaths(saved.retainedPaths) };
+    if (input.baseUpdate !== undefined || headSha !== undefined && headSha.toLowerCase() !== handoff.headSha.toLowerCase())
+      throw new Error("Publication must preserve the handoff commit.");
+  }
+  const capturedPaths = new Set(handoff?.retainedPaths);
+  if (report.handoff && (report.handoff.status !== "ready" || !handoff ||
+    report.handoff.headSha.toLowerCase() !== handoff.headSha.toLowerCase() ||
+    report.handoff.retainedPaths.length !== handoff.retainedPaths.length ||
+    report.handoff.retainedPaths.some(path => !capturedPaths.has(path))))
+    throw new Error("Publication handoff must match the ready issue report.");
   let baseUpdate: NonNullable<ForgeWorker["pendingPublication"]>["baseUpdate"];
   if (input.baseUpdate !== undefined) {
     const update = object(input.baseUpdate);
@@ -361,6 +402,7 @@ function parsePendingPublication(
     throw new Error("Discussion reply progress requires a published head.");
   return {
     report,
+    ...(handoff ? { handoff } : {}),
     ...(baseUpdate ? { baseUpdate } : {}),
     ...(headSha !== undefined ? { headSha } : {}),
     ...(previousHeadSha !== undefined ? { previousHeadSha } : {}),
@@ -472,11 +514,14 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       const report = completion.report === undefined ? undefined : parseWorkerReport(completion.report);
       const reportError = completion.reportError === undefined ? undefined : nonblankText(completion.reportError, "completion report error", 100_000);
       const readyAt = completion.readyAt === undefined ? undefined : isoTimestamp(completion.readyAt, "completion handoff timestamp");
+      const continuationRequired = completion.continuationRequired === undefined ? undefined : nonblankText(completion.continuationRequired, "required worker continuation", 100_000);
+      if (continuationRequired && (worker.kind !== "issue" || !report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || worker.pendingPublication !== undefined))
+        throw new Error("Required continuation needs a successful issue completion without pending publication.");
       if (report && reportError || readyAt && (!report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || Date.parse(readyAt) >= Date.parse(deadlineAt)))
         throw new Error("A completion handoff requires a valid report and successful native turn before its deadline.");
       if (report && (report.kind !== worker.kind || worker.attemptId !== undefined && report.kind === "review" && report.headSha !== worker.headSha))
         throw new Error("Saved completion report must match the worker revision.");
-      parsed.completion = { attemptId, deadlineAt, ...(readyAt ? { readyAt } : {}), ...(turn === undefined ? {} : { turn: turn as NonNullable<ForgeWorker["completion"]>["turn"] }), ...(report ? { report } : {}), ...(reportError ? { reportError } : {}) };
+      parsed.completion = { attemptId, deadlineAt, ...(readyAt ? { readyAt } : {}), ...(turn === undefined ? {} : { turn: turn as NonNullable<ForgeWorker["completion"]>["turn"] }), ...(report ? { report } : {}), ...(reportError ? { reportError } : {}), ...(continuationRequired ? { continuationRequired } : {}) };
       if (completion.reviewScope !== undefined) {
         const scope = parseReviewScope(completion.reviewScope);
         if (worker.kind !== "review" || worker.attemptId !== undefined && scope.current.headSha !== worker.headSha ||
@@ -484,6 +529,13 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
           throw new Error("Saved review scope must match the review attempt and report.");
         parsed.completion.reviewScope = scope;
       }
+    }
+    if (worker.retainedWorkspace !== undefined) {
+      const retained = object(worker.retainedWorkspace);
+      const worktreePath = nonblankText(retained.worktreePath, "retained checkout path", 4096);
+      if (worktreePath.includes("\0") || worker.worktreePath !== undefined && worker.worktreePath !== worktreePath)
+        throw new Error("Retained checkout must match the worker checkout.");
+      parsed.retainedWorkspace = { worktreePath, retainedPaths: retainedPaths(retained.retainedPaths) };
     }
     if (worker.mergeConflict !== undefined) {
       const conflict = object(worker.mergeConflict);

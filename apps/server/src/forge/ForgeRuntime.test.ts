@@ -25,6 +25,7 @@ import { ForgeWorkerReports } from "./ForgeWorkflowStore.js";
 import {
   ForgeRuntime,
   ForgeBranchConflictError,
+  ForgeHandoffError,
   assertForgeOrigin,
   type ForgeRuntimeDependencies,
   type ForgeWorkspace,
@@ -44,8 +45,7 @@ const expectedRepository = {
 };
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  return (
-    await execute("git", args, {
+  const { stdout } = await execute("git", args, {
       cwd,
       env: {
         ...process.env,
@@ -53,8 +53,8 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
         GIT_CONFIG_GLOBAL: "/dev/null",
       },
       timeout: 10_000,
-    })
-  ).stdout.trim();
+    });
+  return args.includes("-z") ? stdout : stdout.trim();
 }
 
 function dependencies({ trustRepository = true } = {}): ForgeRuntimeDependencies {
@@ -880,7 +880,7 @@ describe("ForgeRuntime remote checkouts", () => {
       "Issue resolved\n",
     );
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
-      "Commit all worker changes",
+      "explicit publication handoff",
     );
     await git(workspace.worktreePath, "add", "change.txt");
     await git(workspace.worktreePath, "commit", "-m", "FIX: resolve issue");
@@ -902,7 +902,7 @@ describe("ForgeRuntime remote checkouts", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("uses reviewer access for the exact detached head and removes generated review files", async () => {
+  it("uses reviewer access for the exact detached head and retains generated review files", async () => {
     const deps = dependencies();
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare("review-1", true);
@@ -925,11 +925,10 @@ describe("ForgeRuntime remote checkouts", () => {
     await expect(runtime.publishBranch(workspace)).rejects.toThrow(
       "Only an owned issue branch",
     );
-    await runtime.cleanup(workspace);
-    await expect(fs.stat(workspace.worktreePath)).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    const nextReview = await prepare("review-1", true);
+    expect(await runtime.cleanup(workspace)).toEqual({ worktreePath: workspace.worktreePath, retainedPaths: ["generated-review.txt"] });
+    expect(await fs.readFile(path.join(workspace.worktreePath, "generated-review.txt"), "utf8")).toBe("notes");
+    await expect(prepare("review-1", true)).rejects.toThrow("contains retained files");
+    const nextReview = await prepare("review-2", true);
     await runtime.cleanup(nextReview);
   });
 
@@ -1134,10 +1133,7 @@ describe("ForgeRuntime remote checkouts", () => {
     );
     await expect(
       runtime.verifyPublishedWorkspace(workspace, headSha),
-    ).rejects.toThrow("Commit all worker changes");
-    await expect(
-      runtime.cleanup({ ...workspace, expectedHeadSha: headSha }),
-    ).rejects.toThrow("Commit all worker changes");
+    ).rejects.toThrow("explicit publication handoff");
     await git(workspace.worktreePath, "add", "later.txt");
     await git(
       workspace.worktreePath,
@@ -1210,6 +1206,242 @@ describe("ForgeRuntime remote checkouts", () => {
     expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(
       headSha,
     );
+  });
+});
+
+describe("ForgeRuntime publication handoff", () => {
+  const ready = (headSha: string, retainedPaths: string[]) => ({
+    headSha, status: "ready" as const, retainedPaths, details: "These working files are intentionally excluded from publication.",
+  });
+
+  it("publishes and reviews the intended commit while preserving staged edits, deletions, binary notes and symlinks through cleanup and restart", async () => {
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "deleted.txt"), "Committed content\n");
+    await git(workspace.worktreePath, "add", "deleted.txt");
+    await git(workspace.worktreePath, "commit", "-m", "FIX: complete implementation");
+    const intended = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Intentionally staged\n");
+    await git(workspace.worktreePath, "add", "README.md");
+    const edits = Buffer.from([0, 255, 254, 10, 42]);
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), edits);
+    await fs.rm(path.join(workspace.worktreePath, "deleted.txt"));
+    await fs.mkdir(path.join(workspace.worktreePath, "debug_tooling"));
+    const notes = "debug_tooling/notes\nwith spaces.bin";
+    await fs.writeFile(path.join(workspace.worktreePath, notes), edits);
+    await fs.symlink("/outside/retained-target", path.join(workspace.worktreePath, "diagnostic-link"));
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\nignored.bin\n");
+    await fs.writeFile(path.join(workspace.worktreePath, "ignored.bin"), edits);
+    const retainedPaths = ["README.md", notes, "deleted.txt", "diagnostic-link"].sort();
+    const index = await git(workspace.worktreePath, "ls-files", "--stage", "-z");
+    const handoff = ready(intended, retainedPaths);
+
+    expect(await runtime.preparePublication(workspace, "completed-attempt", handoff)).toEqual({ headSha: intended, retainedPaths });
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.preparePublication(workspace, "completed-attempt", handoff)).toEqual({ headSha: intended, retainedPaths });
+    expect(await runtime.publishBranch(workspace)).toBe(intended);
+    await runtime.verifyPublishedWorkspace(workspace, intended);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(intended);
+    expect(await git(origin, "show", `${intended}:README.md`)).toBe("Initial content");
+    const review = await runtime.prepareWorkspace({ id: "exact-review", expectedRepository, baseBranch: "main", headSha: intended, baseSha: headSha, review: true });
+    expect(await git(review.worktreePath, "rev-parse", "HEAD")).toBe(intended);
+    expect(await fs.readFile(path.join(review.worktreePath, "README.md"), "utf8")).toBe("Initial content\n");
+
+    const retained = { worktreePath: workspace.worktreePath, retainedPaths: [...retainedPaths, "ignored.bin"].sort() };
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual(retained);
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual(retained);
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace: undefined, tabIds: [] });
+    await expect(prepare(workspace.id)).rejects.toThrow("contains retained files");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"))).toEqual(edits);
+    expect(await fs.readFile(path.join(workspace.worktreePath, notes))).toEqual(edits);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "ignored.bin"))).toEqual(edits);
+    expect(await fs.readlink(path.join(workspace.worktreePath, "diagnostic-link"))).toBe("/outside/retained-target");
+    await expect(fs.lstat(path.join(workspace.worktreePath, "deleted.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(workspace.worktreePath, "ls-files", "--stage", "-z")).toBe(index);
+  });
+
+  it.each(["undeclared", "wrong paths", "wrong head", "unfinished"])("requires an actionable new handoff for %s implementation", async condition => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "unfinished.txt"), "Do not lose this work\n");
+    const handoff = condition === "undeclared" ? undefined : {
+      ...ready(condition === "wrong head" ? "a".repeat(40) : headSha, condition === "wrong paths" ? [] : ["unfinished.txt"]),
+      status: condition === "unfinished" ? "needs_work" as const : "ready" as const,
+    };
+    await expect(runtime.preparePublication(workspace, "attempt", handoff)).rejects.toBeInstanceOf(ForgeHandoffError);
+    expect(vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "push")).toHaveLength(0);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Do not lose this work\n");
+  });
+
+  it.each(["bytes", "index", "mode", "head", "extra path"])("does not re-pin a recorded attempt after its %s change", async changed => {
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "First staged state\n");
+    await git(workspace.worktreePath, "add", "README.md");
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Retained working state\n");
+    const handoff = ready(headSha, ["README.md"]);
+    await runtime.preparePublication(workspace, "attempt", handoff);
+    if (changed === "bytes") await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Changed after handoff\n");
+    if (changed === "index") await git(workspace.worktreePath, "add", "README.md");
+    if (changed === "mode") await fs.chmod(path.join(workspace.worktreePath, "README.md"), 0o755);
+    if (changed === "head") await git(workspace.worktreePath, "commit", "-m", "FIX: later implementation");
+    if (changed === "extra path") await fs.writeFile(path.join(workspace.worktreePath, "later.txt"), "Later notes\n");
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.preparePublication(workspace, "attempt", handoff)).rejects.toBeInstanceOf(ForgeHandoffError);
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow();
+    await expect(git(origin, "rev-parse", workspace.branch)).rejects.toThrow();
+  });
+
+  it("accepts a new completed attempt while refusing to replay its superseded handoff", async () => {
+    const workspace = await prepare();
+    await runtime.preparePublication(workspace, "first", undefined);
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retained notes\n");
+    await runtime.preparePublication(workspace, "second", ready(headSha, ["notes.txt"]));
+    await expect(runtime.preparePublication(workspace, "first", ready(headSha, ["notes.txt"]))).rejects.toThrow("superseded");
+    expect(await runtime.publishBranch(workspace)).toBe(headSha);
+  });
+
+  it.each([false, true])("reconciles a lost publication response without repeating the push after restart (Git ownership interrupted: %s)", async interrupted => {
+    const deps = dependencies();
+    const runGit = deps.git!;
+    let pushes = 0;
+    deps.git = async (cwd, args, signal, environment) => {
+      const result = await runGit(cwd, args, signal, environment);
+      if (args[0] === "push" && ++pushes === 1) throw new Error("The push response was lost");
+      return result;
+    };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Keep me\n");
+    const handoff = ready(headSha, ["notes.txt"]);
+    await runtime.preparePublication(workspace, "attempt", handoff);
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("response was lost");
+    if (interrupted) {
+      const manifestPath = path.join(root, "data/forge-workers/workspaces", `${workspace.id}.json`);
+      const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+      await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, gitPending: true }));
+    }
+    runtime = new ForgeRuntime(deps);
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
+    await runtime.preparePublication(workspace, "attempt", handoff);
+    expect(await runtime.publishBranch(workspace)).toBe(headSha);
+    expect(pushes).toBe(1);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Keep me\n");
+  });
+
+  it("preserves unresolved Git ownership when an interrupted push cannot be confirmed remotely", async () => {
+    const deps = dependencies();
+    const runGit = deps.git!;
+    let pushes = 0;
+    deps.git = async (cwd, args, signal, environment) => {
+      if (args[0] === "push") {
+        pushes++;
+        throw new Error("Publication interrupted before remote confirmation");
+      }
+      return runGit(cwd, args, signal, environment);
+    };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retain uncertain work\n");
+    await runtime.preparePublication(workspace, "attempt", ready(headSha, ["notes.txt"]));
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("Publication interrupted");
+    const manifestPath = path.join(root, "data/forge-workers/workspaces", `${workspace.id}.json`);
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, gitPending: true }));
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.recover(workspace.id)).rejects.toThrow("publication remains uncertain");
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("publication remains uncertain");
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Git operation is unresolved");
+    expect(JSON.parse(await fs.readFile(manifestPath, "utf8")).gitPending).toBe(true);
+    expect(pushes).toBe(1);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Retain uncertain work\n");
+  });
+
+  it.each([false, true])("allows a fresh continuation only before publication intent exists (push attempted: %s)", async pushed => {
+    const deps = dependencies();
+    const runGit = deps.git!;
+    let pushes = 0;
+    deps.git = async (cwd, args, signal, environment) => {
+      const result = await runGit(cwd, args, signal, environment);
+      if (args[0] === "push") {
+        pushes++;
+        throw new Error("The push response was lost");
+      }
+      return result;
+    };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Recorded notes\n");
+    await runtime.preparePublication(workspace, "attempt", ready(headSha, ["notes.txt"]));
+    if (pushed) await expect(runtime.publishBranch(workspace)).rejects.toThrow("response was lost");
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "New notes\n");
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.publishBranch(workspace)).rejects.toMatchObject({ name: "ForgeHandoffError", publicationNotStarted: !pushed });
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow(pushed ? "restore the recorded retained files" : "Continue with message");
+    expect(pushes).toBe(pushed ? 1 : 0);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("New notes\n");
+  });
+
+  it("retains ignored directories and new unreported files when retiring a completed checkout", async () => {
+    const workspace = await prepare();
+    await runtime.preparePublication(workspace, "attempt", ready(headSha, []));
+    await runtime.publishBranch(workspace);
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\ndiagnostics/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, "diagnostics"));
+    await fs.writeFile(path.join(workspace.worktreePath, "diagnostics/result.bin"), Buffer.from([0, 255]));
+    await fs.writeFile(path.join(workspace.worktreePath, "later.txt"), "New notes\n");
+    await expect(runtime.verifyPublishedWorkspace(workspace, headSha)).rejects.toThrow("changed after");
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).toEqual({
+      worktreePath: workspace.worktreePath, retainedPaths: ["diagnostics", "later.txt"],
+    });
+    expect(await fs.readFile(path.join(workspace.worktreePath, "diagnostics/result.bin"))).toEqual(Buffer.from([0, 255]));
+  });
+
+  it("preserves retained checkout ownership and prevents branch mutation even after an accepted handoff", async () => {
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retained work\n");
+    await runtime.preparePublication(workspace, "attempt", ready(headSha, ["notes.txt"]));
+    await runtime.publishBranch(workspace);
+    await expect(runtime.updateIssueBranch(workspace, headSha, "main")).rejects.toThrow("retained checkout");
+    await expect(runtime.syncPublishedBranch(workspace, headSha, headSha)).rejects.toThrow("retained checkout");
+    await fs.rename(workspace.worktreePath, `${workspace.worktreePath}-original`);
+    await fs.mkdir(workspace.worktreePath);
+    await fs.writeFile(path.join(workspace.worktreePath, "foreign.txt"), "Foreign work\n");
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("ownership changed");
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("ownership changed");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "foreign.txt"), "utf8")).toBe("Foreign work\n");
+    expect(await fs.readFile(path.join(`${workspace.worktreePath}-original`, "notes.txt"), "utf8")).toBe("Retained work\n");
+  });
+
+  it("preserves a clean checkout with an unfinished Git operation and rejects malformed retained ownership", async () => {
+    const workspace = await prepare();
+    await fs.writeFile(path.join(workspace.worktreePath, ".git/MERGE_HEAD"), headSha);
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Git operation is already in progress");
+    expect(await fs.readFile(path.join(workspace.worktreePath, ".git/MERGE_HEAD"), "utf8")).toBe(headSha);
+    await fs.rm(path.join(workspace.worktreePath, ".git/MERGE_HEAD"));
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Keep notes\n");
+    await runtime.preparePublication(workspace, "attempt", ready(headSha, ["notes.txt"]));
+    const manifestPath = path.join(root, "data/forge-workers/workspaces", `${workspace.id}.json`);
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    manifest.publicationHandoffs.attempt.fingerprint = "invalid";
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("ownership record is missing or invalid");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Keep notes\n");
+  });
+
+  it.each(["MERGE_HEAD", "rebase-merge", "index.lock"])("requires worker continuation for a ready report with unfinished %s state", async state => {
+    const workspace = await prepare();
+    const pendingPath = path.join(workspace.worktreePath, ".git", state);
+    if (state === "rebase-merge") await fs.mkdir(pendingPath);
+    else await fs.writeFile(pendingPath, state === "MERGE_HEAD" ? headSha : "Lock ownership");
+    await expect(runtime.preparePublication(workspace, "attempt", ready(headSha, []))).rejects.toBeInstanceOf(ForgeHandoffError);
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow("Git operation is already in progress");
+    expect(await fs.lstat(pendingPath)).toBeDefined();
+    expect(await git(origin, "branch", "--list", workspace.branch)).toBe("");
   });
 });
 
@@ -1447,6 +1679,21 @@ describe("ForgeRuntime owned branch updates", () => {
     const rebasedHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
     return { workspace, publishedHead, targetHead, rebasedHead };
   }
+
+  it("completes and publishes an exact rebased handoff with intentionally retained files", async () => {
+    const { workspace, publishedHead, targetHead, rebasedHead } = await rebasedIssue();
+    const bytes = Buffer.from([0, 255, 11]);
+    await fs.writeFile(path.join(workspace.worktreePath, "notes.bin"), bytes);
+    await runtime.preparePublication(workspace, "rebase-attempt", {
+      headSha: rebasedHead, status: "ready", retainedPaths: ["notes.bin"], details: "Retain rebase diagnostics.",
+    });
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead })).toBe(rebasedHead);
+    expect(await runtime.publishBranch(workspace, undefined, rebasedHead, publishedHead)).toBe(rebasedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(rebasedHead);
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: rebasedHead })).toEqual({ worktreePath: workspace.worktreePath, retainedPaths: ["notes.bin"] });
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.bin"))).toEqual(bytes);
+  });
 
   it("lets a coding worker resolve a content conflict and publishes only its completed result with an exact lease", async () => {
     const deps = dependencies();
@@ -1970,7 +2217,7 @@ describe("ForgeRuntime owned branch updates", () => {
     const { workspace, publishedHead } = await publishedIssue();
     await fs.writeFile(path.join(workspace.worktreePath, "unpublished.txt"), "Keep this work\n");
     vi.mocked(deps.git).mockClear();
-    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/Commit all worker changes/i);
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/retained checkout/i);
     await fs.rm(path.join(workspace.worktreePath, "unpublished.txt"));
     await fs.writeFile(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"), `${headSha}\n`);
     await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/in progress|pending|unfinished/i);
@@ -2522,7 +2769,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("GIT_")));
 fs.appendFileSync(${JSON.stringify(records)}, JSON.stringify({ args, env }) + "\\n");
-const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => item === "fetch" || item === "push") ? ${JSON.stringify(origin)} : arg);
+const mapped = args.map((arg) => arg === "https://github.com/cloudx/test.git" && args.some((item) => ["fetch", "push", "ls-remote"].includes(item)) ? ${JSON.stringify(origin)} : arg);
 if (args.includes("push") && ${JSON.stringify(pushError)} !== undefined &&
     (${JSON.stringify(acceptedPushAuthorization)} === undefined || process.env.GIT_CONFIG_VALUE_1 !== ${JSON.stringify(acceptedPushAuthorization)})) {
   fs.writeSync(2, ${JSON.stringify(pushError)});

@@ -311,13 +311,14 @@ function reviewStartedAt({ worker, archivedDraft }: ReviewRound): string {
 }
 
 function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
-  const currentWorkers = workers.filter(worker => worker.status !== "completed" || (worker.kind === "review" && worker.draft?.status === "post_failed"));
+  const currentWorkers = workers.filter(worker => worker.status !== "completed" || worker.retainedWorkspace || (worker.kind === "review" && worker.draft?.status === "post_failed"));
   if (!currentWorkers.length) return null;
   return <span className="forge-item-workers">
     {currentWorkers.map(worker => {
       const postFailed = worker.status === "completed" && worker.draft?.status === "post_failed";
       return <span key={worker.id} className="forge-item-worker">
         <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
+        {worker.retainedWorkspace ? <span className="forge-muted">Retained working files</span> : null}
         {worker.autoReview?.enabled ? <span className="forge-muted">Auto review · {worker.autoReview.phase}</span> : null}
         {worker.error ? <span className={worker.status === "awaiting_publication" ? "forge-muted" : "forge-item-worker-error"} title={worker.error}>{worker.error}</span> : null}
       </span>;
@@ -331,6 +332,7 @@ function AutoReviewToggle({ enabled, disabled, onChange }: { enabled: boolean; d
 
 function autoReviewProgress(worker: ForgeWorker) {
   if (!worker.autoReview?.enabled) return undefined;
+  if (worker.completion?.continuationRequired) return "Auto review is waiting for implementation. Continue with message to finish the work.";
   const action = worker.pendingPublication ? "Retry publication" : "Resume";
   if (["paused", "stopped"].includes(worker.status)) return `Auto review is enabled. ${action} to continue the loop.`;
   if (["failed", "cleanup_failed"].includes(worker.status)) return `Auto review is waiting for attention. ${action} after resolving the error.`;
@@ -372,12 +374,17 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
     candidate.repository.provider === worker.repository.provider && candidate.repository.apiUrl === worker.repository.apiUrl && candidate.repository.projectPath === worker.repository.projectPath);
   const reviewRunning = reviews.some(review => ["starting", "running"].includes(review.status));
   const canPause = ["starting", "running", "awaiting_publication", "awaiting_merge"].includes(worker.status) || (worker.status === "awaiting_review" && automaticReview);
-  const canResume = !reviewRunning && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
+  const canResume = !reviewRunning && !worker.completion?.continuationRequired && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
   const pendingPublication = worker.pendingPublication;
+  const reportedHandoff = worker.completion?.report?.kind === "issue" && worker.completion.report.handoff?.status === "ready"
+    ? worker.completion.report.handoff : undefined;
+  const handoff = pendingPublication?.handoff ?? reportedHandoff;
+  const retainedFiles = worker.retainedWorkspace ?? (!["starting", "running"].includes(worker.status) && worker.worktreePath && handoff?.retainedPaths.length
+    ? { worktreePath: worker.worktreePath, retainedPaths: handoff.retainedPaths } : undefined);
   const uncertainReply = worker.kind === "issue" && ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) && pendingPublication?.headSha && pendingPublication.replyingToDiscussionId
     ? pendingPublication.report.discussionReplies.find(reply => reply.discussionId === pendingPublication.replyingToDiscussionId)
     : undefined;
-  const canSync = worker.kind === "issue" && !!worker.changeNumber && !!worker.headSha && !worker.pendingPublication && !worker.mergeAttempted &&
+  const canSync = worker.kind === "issue" && !!worker.changeNumber && !!worker.headSha && !worker.pendingPublication && !worker.mergeAttempted && !worker.completion?.continuationRequired &&
     ["paused", "failed", "stopped", "awaiting_review", "awaiting_merge"].includes(worker.status) && !reviewRunning &&
     !reviews.some(review => review.draft && ["posting", "post_failed"].includes(review.draft.status));
   const conflict = worker.kind === "issue" && worker.mergeConflict?.headSha === worker.headSha ? worker.mergeConflict : undefined;
@@ -393,6 +400,13 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
     <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
     {!archivedDraft && worker.error && worker.status !== "awaiting_publication" ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
+    {!archivedDraft && worker.completion?.continuationRequired ? <p role="status" className="forge-notice">{worker.completion.continuationRequired} Use Continue with message to finish the implementation and submit a new handoff.</p> : null}
+    {!archivedDraft && retainedFiles ? <section aria-label="Retained working files">
+      <p>{worker.retainedWorkspace ? "Forge kept the checkout and its uncommitted files at" : "Working files remain at"} <code>{retainedFiles.worktreePath}</code>.</p>
+      {worker.retainedWorkspace ? <p>Copy the files you need from this checkout. Its Git index remains intact, including staged edits; Forge keeps this checkout available for recovery.</p>
+        : <p>Copy any files you need from this checkout; staged edits are held in its Git index.</p>}
+      <details><summary>Retained paths ({retainedFiles.retainedPaths.length})</summary><ul>{retainedFiles.retainedPaths.map(path => <li key={path}><code>{path}</code></li>)}</ul></details>
+    </section> : null}
     {!archivedDraft && worker.providerRetryAt ? <p role="status">Worker will retry automatically at <time dateTime={worker.providerRetryAt}>{new Date(worker.providerRetryAt).toLocaleString()}</time>.</p> : null}
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
@@ -413,7 +427,7 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
     {!archivedDraft ? <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
       {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.pendingPublication ? "Retry publication" : "Resume"}</ControlButton> : null}
-      {worker.kind === "review" || worker.status !== "completed" ? <ControlButton size="compact" disabled={busy} aria-expanded={continuing} onClick={() => continuation.setMessage(worker.id, continuing ? undefined : "")}><MessageSquare size={14} /> Continue with message</ControlButton> : null}
+      {!worker.retainedWorkspace && (worker.kind === "review" || worker.status !== "completed") ? <ControlButton size="compact" disabled={busy} aria-expanded={continuing} onClick={() => continuation.setMessage(worker.id, continuing ? undefined : "")}><MessageSquare size={14} /> Continue with message</ControlButton> : null}
       {canSync ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.syncAndReview", { id: worker.id, ...placement }))}><RefreshCw size={14} /> Sync and re-review</ControlButton> : null}
       {canResolveConflicts ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.rebaseAndResolve", { id: worker.id, ...placement }))}><RefreshCw size={14} /> Rebase and resolve conflicts</ControlButton> : null}
       {canStop ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("stop")}><Square size={13} /> Stop</ControlButton> : null}

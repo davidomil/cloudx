@@ -13,7 +13,7 @@ import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError, F
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
-import { ForgeBranchConflictError } from "./ForgeRuntime.js";
+import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
 import type { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
@@ -103,7 +103,11 @@ function fixture() {
     finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
-    cleanup: vi.fn(async () => {}),
+    cleanup: vi.fn(async (): ReturnType<ForgeWorkflowDependencies["runtime"]["cleanup"]> => {}),
+    preparePublication: vi.fn(async (_workspace: unknown, _attemptId: string, handoff?: Parameters<ForgeWorkflowDependencies["runtime"]["preparePublication"]>[2]) => ({
+      headSha: handoff?.headSha ?? change.headSha,
+      retainedPaths: handoff?.retainedPaths ?? [],
+    })),
     verifyPublishedWorkspace: vi.fn(async () => {}),
     syncPublishedBranch: vi.fn(async (_workspace: unknown, _local: string, _remote: string, _signal?: AbortSignal) => {}),
     updateIssueBranch: vi.fn(async (_workspace: unknown, _head: string, _baseBranch: string, _signal?: AbortSignal) => "c".repeat(40)),
@@ -225,6 +229,151 @@ describe("Explicit directory ownership reconciliation", () => {
     f.runtime.reconcileOwnership.mockRejectedValueOnce(new Error("Nested source identity changed."));
     await expect(f.service.reconcileOwnership(worker.id, { fingerprint: "a".repeat(64), attestations: [] })).rejects.toThrow("Nested source identity changed.");
     expect(f.stored()[0].status).toBe("stopped");
+  });
+});
+
+describe("Issue publication handoff", () => {
+  it("pins the intended commit before publication and reuses it after restart", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const handoff = { headSha: f.change.headSha, status: "ready", retainedPaths: ["diagnostics.bin", "local.ts"], details: "Diagnostics and a separate experiment; committed tests passed." };
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Committed tests passed", handoff });
+    f.runtime.publishBranch.mockRejectedValueOnce(new Error("Publication interrupted"));
+
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", pendingPublication: { handoff: { headSha: handoff.headSha, retainedPaths: handoff.retainedPaths } } });
+    expect(f.runtime.preparePublication).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id }), worker.attemptId, handoff, expect.any(AbortSignal));
+    expect(f.runtime.finish).toHaveBeenCalledOnce();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(parseWorkers(f.stored())[0].pendingPublication?.handoff).toEqual({ headSha: handoff.headSha, retainedPaths: handoff.retainedPaths });
+
+    const resumed = await new ForgeWorkflowService(f.deps).resume(worker.id, placement);
+    expect(resumed).toMatchObject({ status: "awaiting_review", headSha: handoff.headSha });
+    expect(f.runtime.preparePublication).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: worker.id }), expect.any(AbortSignal), handoff.headSha);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+  });
+
+  it.each(["unfinished", "undeclared"])("offers continuation for %s work without retrying publication", async reason => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const report = { kind: "issue", title: "Fix", body: "Further work required", ...(reason === "unfinished" ? {
+      handoff: { headSha: f.change.headSha, status: "needs_work", retainedPaths: ["implementation.ts"], details: "Complete null-input handling and rerun the affected tests." },
+    } : {}) };
+    f.reports.read.mockResolvedValue(report);
+    if (reason === "undeclared") f.runtime.preparePublication.mockRejectedValueOnce(new ForgeHandoffError("implementation.ts was not declared as retained."));
+
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", worktreePath: worker.worktreePath, completion: { continuationRequired: expect.stringContaining("Continue with message") } });
+    expect(f.stored()[0].pendingPublication).toBeUndefined();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    const service = new ForgeWorkflowService(f.deps);
+    await expect(service.resume(worker.id, placement)).rejects.toThrow("Continue with message");
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(parseWorkers(f.stored())[0].completion?.continuationRequired).toContain("/repo/work");
+
+    const continued = await service.continueWorker(worker.id, "Finish the implementation and declare only unrelated retained files.", placement);
+    expect(continued).toMatchObject({ status: "running", worktreePath: worker.worktreePath });
+    expect(continued.attemptId).not.toBe(worker.attemptId);
+    expect(continued.completion?.continuationRequired).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({ manualContinuation: expect.objectContaining({ previousError: expect.stringContaining("Continue with message") }) }));
+  });
+
+  it.each([false, true])("keeps completed retained checkouts visible across restart without repeating cleanup after rebase: %s", async rebased => {
+    const f = fixture();
+    const save = f.deps.store.write;
+    f.deps.store.write = async workers => save(parseWorkers(workers));
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Tests passed" });
+    await f.service.poll();
+    if (rebased) await f.deps.store.write([{ ...f.stored()[0], rebaseRecovery: {
+      branch: worker.branch!, baseBranch: worker.baseBranch, expectedHeadSha: "b".repeat(40),
+      originalHeadSha: "b".repeat(40), targetHeadSha: "c".repeat(40), phase: "reviewing", headSha: f.change.headSha,
+    } }]);
+    f.change.merged = true;
+    f.issue.state = "closed";
+    const retained = { worktreePath: worker.worktreePath!, retainedPaths: ["diagnostics.bin", "local.ts"] };
+    f.runtime.cleanup.mockResolvedValue(retained);
+
+    await new ForgeWorkflowService(f.deps).resume(worker.id, placement);
+    expect(f.stored()[0]).toMatchObject({ id: worker.id, status: "completed", retainedWorkspace: retained, worktreePath: undefined, branch: undefined });
+    expect(parseWorkers(f.stored())[0].retainedWorkspace).toEqual(retained);
+    expect(f.stored()[0].rebaseRecovery).toBeUndefined();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect((await restarted.dashboard()).workers[0]).toMatchObject({ status: "completed", retainedWorkspace: retained });
+    expect(f.runtime.cleanup).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.deps.notify).toHaveBeenCalledWith("Forge files retained", expect.stringContaining(retained.worktreePath));
+  });
+
+  it("starts a new reviewer without reusing a completed checkout retained for recovery", async () => {
+    const f = fixture();
+    const prior = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Reviewed commit", comments: [] });
+    await f.service.poll();
+    const retained = { worktreePath: prior.worktreePath!, retainedPaths: ["review-notes.txt"] };
+    await f.deps.store.write([{ ...f.stored()[0], worktreePath: undefined, branch: undefined, retainedWorkspace: retained }]);
+    const service = new ForgeWorkflowService(f.deps);
+    await expect(service.continueWorker(prior.id, "Review again.", placement)).rejects.toThrow("retained for file recovery");
+    const next = await service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next.id).not.toBe(prior.id);
+    expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({ id: next.id, review: true }), expect.any(AbortSignal));
+    expect(f.runtime.refreshReviewWorkspace).not.toHaveBeenCalled();
+    expect((await service.dashboard()).workers.find(worker => worker.id === prior.id)?.retainedWorkspace).toEqual(retained);
+  });
+
+  it("does not create a change request if publication returns a different commit", async () => {
+    const f = fixture();
+    await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Tests passed" });
+    f.runtime.publishBranch.mockResolvedValue("d".repeat(40));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: expect.stringContaining("does not match the saved worker handoff") });
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+  });
+
+  it("preserves a valid report checkpoint when handoff preparation is interrupted", async () => {
+    const f = fixture();
+    const save = f.deps.store.write;
+    f.deps.store.write = async workers => save(parseWorkers(workers));
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Tests passed", handoff: {
+      headSha: f.change.headSha, status: "ready", retainedPaths: [], details: "Committed content verified",
+    } });
+    f.runtime.preparePublication.mockRejectedValueOnce(new Error("Manifest write interrupted"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", completion: { report: { handoff: { headSha: f.change.headSha } } } });
+    expect(f.stored()[0].pendingPublication).toBeUndefined();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    await new ForgeWorkflowService(f.deps).resume(worker.id, placement);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it.each([true, false])("allows a fresh handoff only when runtime proves publication never started: %s", async publicationNotStarted => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Tests passed" });
+    f.runtime.publishBranch.mockRejectedValueOnce(new ForgeHandoffError("Retained file content changed", publicationNotStarted));
+    await f.service.poll();
+    if (publicationNotStarted) {
+      expect(f.stored()[0].pendingPublication).toBeUndefined();
+      expect(f.stored()[0].completion?.continuationRequired).toContain("Continue with message");
+      await f.service.continueWorker(worker.id, "Inspect new edits and finish the handoff.", placement);
+      expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    } else {
+      expect(f.stored()[0].pendingPublication?.handoff).toBeDefined();
+      expect(f.stored()[0].completion?.continuationRequired).toBeUndefined();
+      await expect(f.service.continueWorker(worker.id, "Inspect new edits.", placement)).rejects.toThrow(/pending publication/);
+      expect(f.runtime.launch).toHaveBeenCalledOnce();
+    }
   });
 });
 
@@ -1988,6 +2137,7 @@ describe("Forge publication and feedback reconciliation", () => {
     await f.service.resume(worker.id, placement);
     const report = { kind: "issue", title: "Address review", body: "Added and tested null handling", discussionReplies: [{ discussionId: "thread-1", body: "Added the null-input regression and verified the fix." }], resolvedDiscussionIds: ["thread-1"] };
     f.reports.read.mockResolvedValue(report);
+    f.runtime.preparePublication.mockResolvedValue({ headSha: publishedHead, retainedPaths: [] });
     f.runtime.publishBranch.mockResolvedValue(publishedHead);
     await f.service.poll();
     expect(f.stored()[0]).toMatchObject({ status: "awaiting_publication", headSha: previousHead, pendingPublication: { headSha: publishedHead, previousHeadSha: previousHead, report, repliedDiscussionIds: [] } });
@@ -2129,6 +2279,7 @@ describe("Forge publication and feedback reconciliation", () => {
     await f.service.poll();
     await f.service.resume(worker.id, placement);
     const publishedHead = "b".repeat(40);
+    f.runtime.preparePublication.mockResolvedValue({ headSha: publishedHead, retainedPaths: [] });
     f.runtime.publishBranch.mockImplementation(async () => {
       f.provider.getChangeRequestStatus.mockRejectedValueOnce(new Error("Could not load publication status"));
       return publishedHead;
@@ -2878,6 +3029,7 @@ describe("Forge publication confirmation", () => {
     await f.service.resume(worker.id, placement);
     const report = { kind: "issue", title: "Address review", body: "Null handling tested", discussionReplies: [{ discussionId: "thread-1", body: "Added and verified the regression." }], resolvedDiscussionIds: ["thread-1"] };
     f.reports.read.mockResolvedValue(report);
+    f.runtime.preparePublication.mockResolvedValue({ headSha: publishedHead, retainedPaths: [] });
     f.runtime.publishBranch.mockResolvedValue(publishedHead);
     return { ...f, worker, previousHead, publishedHead, report, advance: (ms: number) => { now += ms; } };
   }
@@ -4111,7 +4263,7 @@ describe("Forge issue auto review", () => {
       phase: "resolving", expectedHeadSha: f.change.headSha, originalHeadSha: f.change.headSha,
       targetHeadSha: f.change.baseSha, branch: f.change.headBranch, baseBranch: "main",
     } });
-    const resolvedReport = () => f.codingReport({ rebase: { outcome: "resolved", validation: "passed", details: "Affected test passed" } });
+    const resolvedReport = () => f.codingReport({ handoff: { headSha: "c".repeat(40), status: "ready", retainedPaths: [], details: "Rebased commit tests passed" }, rebase: { outcome: "resolved", validation: "passed", details: "Affected test passed" } });
     const publishRebase = () => f.runtime.publishBranch.mockImplementation(async () => {
       f.change.headSha = "c".repeat(40);
       f.change.hasConflicts = false;
@@ -4246,6 +4398,7 @@ describe("Forge issue auto review", () => {
     expect(f.currentIssue()).toMatchObject({ status: "running", autoReview: { phase: "implementing" } });
     expect(f.currentIssue().rebaseRecovery).toBeUndefined();
     expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
+    f.runtime.preparePublication.mockResolvedValue({ headSha: "d".repeat(40), retainedPaths: [] });
     f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = "d".repeat(40); return f.change.headSha; });
     f.codingReport({ discussionReplies: [{ discussionId: "review-2-thread-0", body: "Added and ran the renamed-file regression" }], resolvedDiscussionIds: ["review-2-thread-0"] });
     await f.poll();

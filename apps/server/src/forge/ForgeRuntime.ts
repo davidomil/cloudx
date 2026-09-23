@@ -16,6 +16,9 @@ import {
   type ForgeCredentialRole,
   type ForgeWorkerHistory,
   type ForgeTurnCompletion,
+  type ForgeIssueHandoff,
+  type ForgePublicationHandoff,
+  type ForgeRetainedWorkspace,
   type WorkspaceTab,
   type DirectoryOwnershipPreview,
   type DirectoryOwnershipReconciliation,
@@ -109,6 +112,17 @@ interface OwnedReviewRefresh {
   baseBranch: string;
 }
 
+interface OwnedPublicationHandoff extends ForgePublicationHandoff {
+  fingerprint: string;
+}
+
+export class ForgeHandoffError extends Error {
+  constructor(reason: string, readonly publicationNotStarted = false) {
+    super(reason);
+    this.name = "ForgeHandoffError";
+  }
+}
+
 interface OwnedWorkspace extends ForgeWorkspace {
   repository: DirectoryIdentity;
   worktree: DirectoryIdentity;
@@ -131,6 +145,10 @@ interface OwnedWorkspace extends ForgeWorkspace {
   reviewBaseSha?: string;
   reviewRefresh?: OwnedReviewRefresh;
   reviewConversation?: ReviewConversationBinding;
+  publicationAttemptId?: string;
+  publicationHandoffs?: Record<string, OwnedPublicationHandoff>;
+  retainedWorkspace?: ForgeRetainedWorkspace;
+  branchPublication?: { headSha: string; confirmed: boolean };
 }
 
 interface OwnedTab {
@@ -195,8 +213,12 @@ export class ForgeRuntime {
       if (input.review && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(input.baseSha!))
         throw new Error("Invalid review base commit.");
       const existing = await this.manifest(input.id).read<OwnedWorkspace>();
-      if (existing && !(await this.readOwned(input.id)).cleaned)
-        throw new Error("This worker already owns a workspace.");
+      if (existing) {
+        const owned = await this.readOwned(input.id);
+        if (owned.retainedWorkspace)
+          throw new Error("This worker's checkout contains retained files. Recover them from the recorded path; create a new worker for another checkout.");
+        if (!owned.cleaned) throw new Error("This worker already owns a workspace.");
+      }
       const baseBranch = input.baseBranch.trim();
       if (
         !baseBranch ||
@@ -966,6 +988,8 @@ export class ForgeRuntime {
       const owned = stored ? await this.readOwned(id) : undefined;
       if (owned && !owned.cleaned && owned.gitPending && owned.issueRebase?.publication && !owned.issueRebase.publication.confirmed)
         await this.reconcilePendingRebasePush(owned);
+      if (owned && !owned.cleaned && owned.gitPending && owned.branchPublication && !owned.branchPublication.confirmed)
+        await this.reconcilePendingBranchPush(owned);
       if (owned && !owned.cleaned && owned.gitPending)
         throw new Error(
           "A worker Git operation was interrupted before process exit was recorded. Its checkout was preserved.",
@@ -1042,6 +1066,49 @@ export class ForgeRuntime {
     });
   }
 
+  preparePublication(
+    workspace: ForgeWorkspace,
+    attemptId: string,
+    handoff: ForgeIssueHandoff | undefined,
+    signal?: AbortSignal,
+  ): Promise<ForgePublicationHandoff> {
+    return this.serialize(workspace.id, "preparePublication", signal, async () => {
+      safeId(attemptId);
+      const owned = await this.matchOwned(workspace);
+      if (!owned.prepared || !owned.branchOwned || owned.cleaned)
+        throw new Error("Only an owned issue checkout can prepare publication.");
+      await this.assertQuiescent(owned);
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      const headSha = await this.requireBranchHead(owned, signal);
+      if (handoff?.status === "needs_work")
+        throw new ForgeHandoffError(`The worker reports unfinished implementation: ${handoff.details}`);
+      const files = await this.workingFiles(owned, signal);
+      const previous = owned.publicationHandoffs && Object.hasOwn(owned.publicationHandoffs, attemptId)
+        ? owned.publicationHandoffs[attemptId] : undefined;
+      if (previous && owned.publicationAttemptId !== attemptId)
+        throw new ForgeHandoffError("This completion report was superseded by a later worker attempt.");
+      if (handoff && (handoff.status !== "ready" || !isCommitSha(handoff.headSha) ||
+          handoff.headSha.toLowerCase() !== headSha || !isRetainedPaths(handoff.retainedPaths) ||
+          !samePaths(handoff.retainedPaths, files)))
+        throw new ForgeHandoffError("The completion handoff must name the exact current commit and every remaining changed or untracked path.");
+      if (!handoff && files.length)
+        throw new ForgeHandoffError("Remaining working files need an explicit publication handoff.");
+      const fingerprint = await this.workingFingerprint(owned, files, signal);
+      if (previous && (previous.headSha !== headSha || previous.fingerprint !== fingerprint || !samePaths(previous.retainedPaths, files)))
+        throw new ForgeHandoffError("The intended commit or retained working files changed after this completion handoff was recorded.");
+      await this.verifyHead(owned, headSha, signal);
+      if (!samePaths(files, await this.workingFiles(owned, signal)))
+        throw new ForgeHandoffError("Working files changed while recording the completion handoff.");
+      const recorded = previous ?? { headSha, retainedPaths: files, fingerprint };
+      owned.publicationHandoffs ??= {};
+      owned.publicationHandoffs[attemptId] = recorded;
+      owned.publicationAttemptId = attemptId;
+      await this.manifest(owned.id).write(owned);
+      return { headSha: recorded.headSha, retainedPaths: [...recorded.retainedPaths] };
+    });
+  }
+
   async publishBranch(
     workspace: ForgeWorkspace,
     signal?: AbortSignal,
@@ -1057,10 +1124,13 @@ export class ForgeRuntime {
         throw new Error("Only an owned issue branch can be published.");
       if (owned.issueRebase && !owned.issueRebase.publication?.confirmed)
         throw new Error("Publish the recorded rebase through its exact-head lease before publishing other work.");
+      if (owned.gitPending && owned.branchPublication && !owned.branchPublication.confirmed)
+        await this.reconcilePendingBranchPush(owned, signal);
       await this.assertQuiescent(owned);
       await this.assertCheckout(owned);
       const headSha = await this.requireBranchHead(owned, signal);
-      await this.verifyCleanHead(owned, expectedHeadSha ?? headSha, signal);
+      const intendedHeadSha = expectedHeadSha ?? this.publicationHandoff(owned)?.headSha ?? headSha;
+      await this.verifyPublicationHead(owned, intendedHeadSha, signal, owned.branchPublication?.headSha !== intendedHeadSha);
       if (expectedHeadSha && headSha !== expectedHeadSha)
         throw new Error("Worker head differs from the recorded branch update.");
       const access = await this.access(
@@ -1072,14 +1142,23 @@ export class ForgeRuntime {
         throw new Error(
           "Repository origin changed while the worker was running.",
         );
-      if (expectedHeadSha) await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      await this.verifyPublicationHead(owned, intendedHeadSha, signal, owned.branchPublication?.headSha !== intendedHeadSha);
+      if (owned.branchPublication?.headSha === headSha && await this.publishedBranchHeadOrMissing(owned, access, signal) === headSha) {
+        owned.branchPublication.confirmed = true;
+        await this.manifest(owned.id).write(owned);
+        return headSha;
+      }
+      owned.branchPublication = { headSha, confirmed: false };
+      await this.manifest(owned.id).write(owned);
       await this.runOwnedGit(
         owned,
         ["push", access.cloneUrl, `${headSha}:refs/heads/${owned.branch}`],
         signal,
         access.authorization,
       );
-      await this.verifyCleanHead(owned, headSha, signal);
+      await this.verifyPublicationHead(owned, headSha, signal);
+      owned.branchPublication.confirmed = true;
+      await this.manifest(owned.id).write(owned);
       return headSha;
     });
   }
@@ -1300,7 +1379,7 @@ export class ForgeRuntime {
       await this.assertCheckout(owned);
       await this.requireNoGitOperation(owned);
       const headSha = await this.requireBranchHead(owned, signal);
-      await this.verifyCleanHead(owned, headSha, signal);
+      await this.verifyPublicationHead(owned, headSha, signal);
       await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", rebase.targetHeadSha, headSha], signal);
       if (await this.isAncestor(owned, rebase.originalHeadSha, headSha, signal))
         throw new Error("The coding worker has not rebased the original issue commits onto the target. The retained branch still contains its original head.");
@@ -1361,11 +1440,33 @@ export class ForgeRuntime {
   }
 
   private async publishedBranchHead(owned: OwnedWorkspace, access: { cloneUrl: string; authorization: string }, signal?: AbortSignal): Promise<string> {
+    const headSha = await this.publishedBranchHeadOrMissing(owned, access, signal);
+    if (!headSha) throw new Error("The published issue branch is missing or its exact head cannot be confirmed.");
+    return headSha;
+  }
+
+  private async publishedBranchHeadOrMissing(owned: OwnedWorkspace, access: { cloneUrl: string; authorization: string }, signal?: AbortSignal): Promise<string | undefined> {
     const output = (await this.runGit(owned.worktreePath, ["ls-remote", "--refs", access.cloneUrl, `refs/heads/${owned.branch}`], signal,
       this.gitAuthorization(owned, access.authorization))).trim().split(/\s+/u);
+    if (output.length === 1 && !output[0]) return undefined;
     if (output.length !== 2 || !isCommitSha(output[0]) || output[1] !== `refs/heads/${owned.branch}`)
       throw new Error("The published issue branch is missing or its exact head cannot be confirmed.");
     return output[0];
+  }
+
+  private async reconcilePendingBranchPush(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
+    await this.assertQuiescent(owned);
+    const idle = { ...owned, gitPending: false };
+    await this.assertCheckout(idle);
+    const publication = owned.branchPublication;
+    if (!publication || publication.confirmed) throw new Error("The interrupted Git operation has no pending publication intent.");
+    await this.verifyPublicationHead(idle, publication.headSha, signal);
+    const access = await this.workerAccess(owned, signal);
+    if (await this.publishedBranchHeadOrMissing(owned, access, signal) !== publication.headSha)
+      throw new Error("The interrupted publication remains uncertain. Confirm the previous Git process has stopped and inspect the remote branch before resuming; local work was preserved.");
+    publication.confirmed = true;
+    owned.gitPending = false;
+    await this.manifest(owned.id).write(owned);
   }
 
   private async reconcilePendingRebasePush(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
@@ -1391,12 +1492,12 @@ export class ForgeRuntime {
     await this.assertQuiescent(owned);
     await this.assertCheckout(owned);
     await this.requireNoGitOperation(owned);
-    await this.verifyCleanHead(owned, expectedHeadSha, signal);
+    await this.verifyPublicationHead(owned, expectedHeadSha, signal);
     const access = await this.workerAccess(owned, signal);
     const remoteHead = await this.publishedBranchHead(owned, access, signal);
     const publication = rebase.publication;
     if (publication && remoteHead === expectedHeadSha) {
-      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      await this.verifyPublicationHead(owned, expectedHeadSha, signal);
       if (!publication.confirmed) owned.baseUpdate = undefined;
       publication.confirmed = true;
       await this.manifest(owned.id).write(owned);
@@ -1404,14 +1505,14 @@ export class ForgeRuntime {
     }
     if (remoteHead !== expectedRemoteHeadSha || publication?.confirmed)
       throw new Error("The published branch changed during rebase recovery. The exact-head lease was rejected; concurrent remote work was preserved.");
-    await this.verifyCleanHead(owned, expectedHeadSha, signal);
+    await this.verifyPublicationHead(owned, expectedHeadSha, signal);
     rebase.publication = { headSha: expectedHeadSha, expectedRemoteHeadSha, confirmed: false };
     await this.manifest(owned.id).write(owned);
     await this.runOwnedGit(owned, ["push", `--force-with-lease=refs/heads/${owned.branch}:${expectedRemoteHeadSha}`,
       access.cloneUrl, `${expectedHeadSha}:refs/heads/${owned.branch}`], signal, access.authorization);
     if (await this.publishedBranchHead(owned, access, signal) !== expectedHeadSha)
       throw new Error("The rewritten published head could not be confirmed. Its publication intent and local work were preserved.");
-    await this.verifyCleanHead(owned, expectedHeadSha, signal);
+    await this.verifyPublicationHead(owned, expectedHeadSha, signal);
     rebase.publication.confirmed = true;
     owned.baseUpdate = undefined;
     await this.manifest(owned.id).write(owned);
@@ -1451,11 +1552,11 @@ export class ForgeRuntime {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
       }
-      throw new Error("A Git operation is already in progress. Inspect the owned checkout before updating its branch.");
+      throw new ForgeHandoffError("A Git operation is already in progress. Inspect the owned checkout before updating its branch.");
     }
   }
 
-  cleanup(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<void> {
+  cleanup(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<ForgeRetainedWorkspace | void> {
     return this.serialize(workspace.id, "cleanup", signal, async () => {
       const owned = await this.matchOwned(workspace);
       if (owned.launchPending)
@@ -1465,13 +1566,13 @@ export class ForgeRuntime {
         if (!workspace.expectedHeadSha)
           throw new Error("Issue cleanup requires the published head commit.");
         if (await optionalIdentity(owned.worktreePath))
-          await this.verifyCleanHead(owned, workspace.expectedHeadSha, signal);
+          await this.verifyHead(owned, workspace.expectedHeadSha, signal);
         else if (owned.cleanupHeadSha !== workspace.expectedHeadSha)
           throw new Error(
             "Owned checkout disappeared before cleanup; ownership was preserved.",
           );
       }
-      await this.cleanupOwned(owned, signal, workspace.expectedHeadSha);
+      return this.cleanupOwned(owned, signal, workspace.expectedHeadSha);
     });
   }
 
@@ -1486,11 +1587,12 @@ export class ForgeRuntime {
         throw new Error(
           "The published issue workspace is no longer available.",
         );
-      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      await this.assertQuiescent(owned);
+      await this.verifyPublicationHead(owned, expectedHeadSha, signal);
     });
   }
 
-  private async verifyCleanHead(
+  private async verifyHead(
     owned: OwnedWorkspace,
     expectedHeadSha: string,
     signal?: AbortSignal,
@@ -1503,26 +1605,110 @@ export class ForgeRuntime {
       throw new Error(
         "Worker head differs from the published commit; local changes were preserved.",
       );
-    if (
-      (
-        await this.runGit(
-          owned.worktreePath,
-          ["status", "--porcelain=v1", "--untracked-files=all"],
-          signal,
-        )
-      ).trim()
-    )
-      throw new Error(
-        "Commit all worker changes before publishing, merging, or cleanup.",
-      );
+  }
+
+  private publicationHandoff(owned: OwnedWorkspace): OwnedPublicationHandoff | undefined {
+    return owned.publicationAttemptId ? owned.publicationHandoffs?.[owned.publicationAttemptId] : undefined;
+  }
+
+  private async verifyPublicationHead(owned: OwnedWorkspace, expectedHeadSha: string, signal?: AbortSignal, publicationNotStarted = false): Promise<void> {
+    await this.verifyHead(owned, expectedHeadSha, signal);
+    try {
+      await this.requireNoGitOperation(owned);
+      const files = await this.workingFiles(owned, signal);
+      const handoff = this.publicationHandoff(owned);
+      if (handoff?.headSha === expectedHeadSha) {
+        if (!samePaths(handoff.retainedPaths, files) || handoff.fingerprint !== await this.workingFingerprint(owned, files, signal))
+          throw new ForgeHandoffError("Retained working files changed after the publication handoff.");
+      } else if (files.length) {
+        throw new ForgeHandoffError("Remaining working files need an explicit publication handoff for this commit.");
+      }
+    } catch (error) {
+      if (!(error instanceof ForgeHandoffError)) throw error;
+      const recovery = publicationNotStarted
+        ? "Use Continue with message to finish implementation or declare the retained paths in a new completion report."
+        : `Preserve new edits elsewhere and restore the recorded retained files in ${owned.worktreePath} before Resume.`;
+      throw new ForgeHandoffError(`${error.message} Local files were preserved. ${recovery}`, publicationNotStarted);
+    }
+  }
+
+  private async verifyCleanHead(owned: OwnedWorkspace, expectedHeadSha: string, signal?: AbortSignal): Promise<void> {
+    await this.verifyHead(owned, expectedHeadSha, signal);
+    if ((await this.workingFiles(owned, signal)).length)
+      throw new ForgeHandoffError(`The retained checkout at ${owned.worktreePath} has working files that prevent changing its branch. Recover them manually before updating or synchronizing the branch.`);
+  }
+
+  private async workingFiles(owned: OwnedWorkspace, signal?: AbortSignal, includeIgnored = false): Promise<string[]> {
+    const status = await this.runGit(owned.worktreePath, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all",
+      ...(includeIgnored ? ["--ignored=matching"] : [])], signal);
+    const files = status.split("\0").filter(Boolean).map(entry => entry.slice(3).replace(/\/$/u, "")).sort();
+    if (!isRetainedPaths(files)) throw new Error("Git returned an invalid working file inventory. Local files were preserved.");
+    return files;
+  }
+
+  private async workingFingerprint(owned: OwnedWorkspace, files: string[], signal?: AbortSignal): Promise<string> {
+    const hash = createHash("sha256");
+    hash.update(await this.runGit(owned.worktreePath, ["diff-index", "--cached", "--raw", "-z", "--no-renames", "HEAD", "--"], signal));
+    for (const file of files) await this.hashWorkingPath(owned.worktreePath, file, hash, signal);
+    return hash.digest("hex");
+  }
+
+  private async hashWorkingPath(root: string, relative: string, hash: ReturnType<typeof createHash>, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    hash.update(JSON.stringify(relative));
+    const absolute = path.join(root, relative);
+    if (!await requireSafeDirectory(root, path.dirname(absolute), { create: false, label: "Retained file parent" })) {
+      hash.update("missing");
+      return;
+    }
+    let stat;
+    try { stat = await fs.lstat(absolute); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      hash.update("missing");
+      return;
+    }
+    hash.update(`${stat.mode}:`);
+    if (stat.isSymbolicLink()) {
+      hash.update(JSON.stringify(await fs.readlink(absolute)));
+    } else if (stat.isDirectory()) {
+      for (const child of (await fs.readdir(absolute)).sort())
+        await this.hashWorkingPath(root, `${relative}/${child}`, hash, signal);
+    } else if (stat.isFile()) {
+      hash.update(`${stat.size}:`);
+      const handle = await fs.open(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened = await handle.stat();
+        if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino)
+          throw new ForgeHandoffError("A retained file changed while its handoff was being recorded.");
+        const content = Buffer.alloc(64 * 1024);
+        for (;;) {
+          signal?.throwIfAborted();
+          const { bytesRead } = await handle.read(content, 0, content.length, null);
+          if (!bytesRead) break;
+          hash.update(content.subarray(0, bytesRead));
+        }
+        const current = await handle.stat();
+        if (current.size !== opened.size || current.mtimeMs !== opened.mtimeMs || current.ctimeMs !== opened.ctimeMs)
+          throw new ForgeHandoffError("A retained file changed while its handoff was being recorded.");
+      } finally { await handle.close(); }
+    } else {
+      throw new ForgeHandoffError(`Retained path ${JSON.stringify(relative)} is not a regular file, directory, or symbolic link.`);
+    }
   }
 
   private async cleanupOwned(
     owned: OwnedWorkspace,
     signal?: AbortSignal,
     expectedHeadSha?: string,
-  ): Promise<void> {
-    if (owned.cleaned) return;
+  ): Promise<ForgeRetainedWorkspace | void> {
+    if (owned.cleaned) {
+      if (owned.retainedWorkspace) {
+        await this.assertCheckout(owned);
+        return owned.retainedWorkspace;
+      }
+      return;
+    }
     if (owned.gitPending)
       throw new Error(
         "A worker Git operation is unresolved; its checkout was preserved.",
@@ -1532,6 +1718,7 @@ export class ForgeRuntime {
       await this.assertIdentity(owned.worktree);
       if (owned.gitDirectory) {
         await this.assertCheckout(owned);
+        await this.requireNoGitOperation(owned);
         const registered = await this.runGit(
           owned.worktreePath,
           ["worktree", "list", "--porcelain", "-z"],
@@ -1551,8 +1738,15 @@ export class ForgeRuntime {
           );
       }
       if (expectedHeadSha && owned.branchOwned)
-        await this.verifyCleanHead(owned, expectedHeadSha, signal);
+        await this.verifyHead(owned, expectedHeadSha, signal);
       owned.cleanupHeadSha = expectedHeadSha;
+      const retainedPaths = owned.prepared ? await this.workingFiles(owned, signal, true) : [];
+      if (retainedPaths.length) {
+        owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths };
+        owned.cleaned = true;
+        await this.manifest(owned.id).write(owned);
+        return owned.retainedWorkspace;
+      }
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
       await this.assertIdentity(owned.worktree);
@@ -1715,6 +1909,13 @@ export class ForgeRuntime {
         (value.role !== "reviewer" || !isReviewRefresh(value.reviewRefresh))) ||
       (value.reviewConversation !== undefined &&
         (value.role !== "reviewer" || !isReviewConversationBinding(value.reviewConversation))) ||
+      !isPublicationOwnership(value) ||
+      (value.branchPublication !== undefined &&
+        (value.role !== "worker" || !value.branchPublication || !isCommitSha(value.branchPublication.headSha) ||
+          typeof value.branchPublication.confirmed !== "boolean")) ||
+      (value.retainedWorkspace !== undefined &&
+        (!value.cleaned || !value.retainedWorkspace || value.retainedWorkspace.worktreePath !== value.worktreePath ||
+          !isRetainedPaths(value.retainedWorkspace.retainedPaths) || !value.retainedWorkspace.retainedPaths.length)) ||
       (value.branch !== "" && value.branch !== `cloudx/forge/${id}`)
     )
       throw new Error(
@@ -2073,6 +2274,29 @@ function safeId(id: string): string {
 
 function isCommitSha(value: unknown): value is string {
   return typeof value === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(value);
+}
+
+function isRetainedPaths(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= 10_000 && value.every(file => typeof file === "string" && Boolean(file) && file.length <= 4096 &&
+    !file.includes("\0") && !file.includes("\\") && !/^[a-z]:/iu.test(file) && !path.isAbsolute(file) &&
+    file.split("/").every(part => part && part !== "." && part !== "..")) &&
+    new Set(value).size === value.length;
+}
+
+function samePaths(left: string[], right: string[]): boolean {
+  const expected = [...right].sort();
+  return left.length === right.length && [...left].sort().every((file, index) => file === expected[index]);
+}
+
+function isPublicationOwnership(value: OwnedWorkspace): boolean {
+  if (value.publicationAttemptId === undefined && value.publicationHandoffs === undefined) return true;
+  if (value.role !== "worker" || typeof value.publicationAttemptId !== "string" ||
+      !value.publicationHandoffs || typeof value.publicationHandoffs !== "object" || Array.isArray(value.publicationHandoffs) ||
+      !Object.hasOwn(value.publicationHandoffs, value.publicationAttemptId)) return false;
+  return Object.entries(value.publicationHandoffs).every(([attemptId, handoff]) =>
+    /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(attemptId) && handoff && typeof handoff === "object" &&
+    isCommitSha(handoff.headSha) && isRetainedPaths(handoff.retainedPaths) &&
+    typeof handoff.fingerprint === "string" && /^[a-f0-9]{64}$/u.test(handoff.fingerprint));
 }
 
 function isOwnedBaseUpdate(value: unknown): value is OwnedBaseUpdate {

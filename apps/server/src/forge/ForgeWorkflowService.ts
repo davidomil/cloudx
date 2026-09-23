@@ -9,6 +9,9 @@ import type {
   ForgeCredentialRole,
   ForgeDashboard,
   ForgeIssueDetail,
+  ForgeIssueHandoff,
+  ForgePublicationHandoff,
+  ForgeRetainedWorkspace,
   ForgePlacement,
   ForgePublicationObservation,
   ForgeRepository,
@@ -22,7 +25,7 @@ import type {
 } from "@cloudx/shared";
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
-import { ForgeBranchConflictError } from "./ForgeRuntime.js";
+import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { reviewScopeInstructions } from "./ForgeReviewScope.js";
 import { validateReview } from "./providers/reviewValidation.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
@@ -105,7 +108,13 @@ interface Runtime {
     worktreePath: string;
     branch: string;
     expectedHeadSha?: string;
-  }): Promise<void>;
+  }): Promise<ForgeRetainedWorkspace | void>;
+  preparePublication(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    attemptId: string,
+    handoff: ForgeIssueHandoff | undefined,
+    signal?: AbortSignal,
+  ): Promise<ForgePublicationHandoff>;
   verifyPublishedWorkspace(
     workspace: {
       id: string;
@@ -357,7 +366,7 @@ export class ForgeWorkflowService {
         throw new Error("The published commit changed or is still processing. Inspect the request before resuming auto review.");
     }
     const reviewer = kind === "review" ? this.workers.find(worker =>
-      worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository)) : undefined;
+      worker.kind === "review" && worker.number === number && !worker.retainedWorkspace && sameRepository(worker.repository, repository)) : undefined;
     if (reviewer)
       return this.startReviewRound(reviewer, item as ForgeChangeRequest, autoPost, placement, controller, issueWorker);
     const now = new Date().toISOString();
@@ -581,7 +590,7 @@ export class ForgeWorkflowService {
       for (const member of members) this.operations.set(member.id, controller);
       try {
         for (const member of members) {
-          if (!member.attemptId || member.completion?.reportError) continue;
+          if (!member.attemptId || member.completion?.reportError || member.completion?.continuationRequired) continue;
           const report = await this.deps.reports.read(member.attemptId);
           controller.signal.throwIfAborted();
           if (report !== undefined && (!member.completion || member.completion.turn?.status === "completed" &&
@@ -666,6 +675,7 @@ export class ForgeWorkflowService {
   syncAndReview(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
+      if (worker.completion?.continuationRequired) throw new Error(worker.completion.continuationRequired);
       if (worker.kind !== "issue" || !worker.changeNumber || !worker.headSha ||
           !["paused", "stopped", "failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
         throw new Error("Only an idle published issue worker can sync and re-review.");
@@ -719,6 +729,7 @@ export class ForgeWorkflowService {
   rebaseAndResolve(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
+      if (worker.completion?.continuationRequired) throw new Error(worker.completion.continuationRequired);
       if (worker.kind !== "issue" || !worker.changeNumber || !worker.headSha ||
           !["paused", "stopped", "failed", "awaiting_review", "awaiting_merge"].includes(worker.status))
         throw new Error("Only an idle published issue worker can rebase and resolve conflicts.");
@@ -740,6 +751,7 @@ export class ForgeWorkflowService {
   }
   private async resumeWorker(id: string, placement: ForgePlacement, { refreshPublicationCredentials = false } = {}): Promise<ForgeWorker> {
     const worker = this.requireWorker(id);
+    if (worker.completion?.continuationRequired) throw new Error(worker.completion.continuationRequired);
     if (
       ![
         "paused",
@@ -1044,11 +1056,16 @@ export class ForgeWorkflowService {
     if (!completion?.readyAt || completion.turn?.status !== "completed" || !completion.report) return false;
     this.operations.get(worker.id)?.signal.throwIfAborted();
     const report = completion.report;
+    if (completion.continuationRequired) throw new Error(completion.continuationRequired);
+    await this.quiesce(worker, { closeTab: false, successful: true, retainReport: true });
     if (report.kind === "issue") {
       worker.pendingPublication ??= { report, repliedDiscussionIds: [] };
-      await this.persist();
+      await this.preparePublication(worker);
+      if (worker.attemptId) {
+        await this.deps.reports.remove(worker.attemptId);
+        worker.attemptId = undefined;
+      }
     }
-    await this.quiesce(worker, { closeTab: false, successful: true, retainReport: report.kind === "review" });
     this.operations.get(worker.id)?.signal.throwIfAborted();
     if (report.kind === "issue") await this.issueReady(worker);
     else {
@@ -1074,6 +1091,32 @@ export class ForgeWorkflowService {
       this.deps.notify("Review complete", `${worker.title}: ${worker.draft.comments.length} suggested comments.`);
     }
     return true;
+  }
+  private async preparePublication(worker: ForgeWorker): Promise<void> {
+    const publication = worker.pendingPublication!;
+    if (publication.baseUpdate || publication.handoff || publication.headSha) return;
+    const completion = worker.completion!;
+    try {
+      const declared = publication.report.handoff;
+      if (declared?.status === "needs_work")
+        throw new ForgeHandoffError(`Implementation needs work: ${declared.details}`);
+      publication.handoff = await this.deps.runtime.preparePublication(
+        workerWorkspace(worker), completion.attemptId, declared, this.operations.get(worker.id)?.signal,
+      );
+      await this.persist();
+    } catch (error) {
+      if (!publication.handoff) worker.pendingPublication = undefined;
+      if (error instanceof ForgeHandoffError) {
+        await this.requireHandoffContinuation(worker, error);
+      }
+      throw error;
+    }
+  }
+  private async requireHandoffContinuation(worker: ForgeWorker, error: Error): Promise<never> {
+    worker.pendingPublication = undefined;
+    worker.completion!.continuationRequired = `${message(error)} Files remain in ${worker.worktreePath}. Use Continue with message to finish the implementation or declare intentionally retained files in a fresh handoff.`;
+    await this.persist();
+    throw new Error(worker.completion!.continuationRequired);
   }
   private autoReviewParent(worker: ForgeWorker): ForgeWorker | undefined {
     return this.workers.find(parent => parent.id === worker.issueWorkerId &&
@@ -1590,6 +1633,7 @@ export class ForgeWorkflowService {
     if (!publication) throw new Error("Issue completion report is missing.");
     if (!publication.baseUpdate && (!worker.completion?.readyAt || worker.completion.turn?.status !== "completed"))
       throw new Error("Publication requires the saved successful native turn completion. Its work and report were preserved.");
+    await this.preparePublication(worker);
     const { report } = publication;
     const provider = this.providerFor(worker);
     const signal = this.operations.get(worker.id)?.signal;
@@ -1659,7 +1703,17 @@ export class ForgeWorkflowService {
         if (publication.headSha !== rebase.headSha)
           throw new Error("The published rebase does not match its saved completed commit.");
       } else {
-        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal);
+        let headSha: string;
+        try {
+          headSha = await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha);
+        } catch (error) {
+          if (error instanceof ForgeHandoffError && error.publicationNotStarted)
+            await this.requireHandoffContinuation(worker, error);
+          throw error;
+        }
+        if (headSha !== publication.handoff!.headSha)
+          throw new Error("The published commit does not match the saved worker handoff.");
+        publication.headSha = headSha;
       }
       publication.confirmationStartedAt = new Date(Date.now()).toISOString();
       await this.persist();
@@ -1969,6 +2023,8 @@ export class ForgeWorkflowService {
       worker.kind === "issue"
         ? "Resolve the issue in this checkout. Read all issue and change-request feedback below, implement the changes, and run the relevant tests. Commit your changes to the current branch. Do not push, open or merge a PR/MR, or post replies or resolve threads directly: CloudX performs those steps. Include a discussionReplies entry shaped as { discussionId, body } with the exact review discussion ID and a reply explaining the change and validation for each review thread you addressed. Use replies to ask for clarification on unresolved feedback too. Include resolvedDiscussionIds only for review discussion IDs whose feedback you actually addressed; leave unresolved questions open. CloudX posts your replies as the issue worker and then resolves the listed threads after verifying the published commit. When ready for human review, write the completion report."
         : "Review the exact checked-out commit using the supplied review scope and local Git checkout. Do not alter the checkout or publish anything. The comments array contains actionable findings only, with file path and new line for inline findings. Set event to approve when the implementation satisfies the issue and review feedback and no issues remain; an issue-free review must explicitly approve. Set event to request_changes when actionable findings remain. Use comment only when human clarification or a decision is required. Write the completion report when finished.";
+    if (worker.kind === "issue")
+      instructions += " Include handoff with headSha set to the full intended commit from git rev-parse HEAD, status ready only when all intended implementation is committed and validated, retainedPaths listing every deliberately uncommitted tracked or untracked file, and details explaining their retention and validation of the committed content. Inventory files with git status --porcelain=v1 -z --untracked-files=all --no-renames; list each path separately, including deletions and both paths of a rename. Ignored files do not need declaration and remain preserved at cleanup. Working files are supported: do not commit diagnostics or unrelated edits just to make the checkout clean. Validate the intended commit independently if retained edits affect tests. If implementation is unfinished, use status needs_work and explain the remaining action in details. Leave all files intact; CloudX publishes only the recorded commit and preserves leftover contents in this checkout.";
     if (worker.rebaseRecovery?.phase === "resolving") {
       const recovery = worker.rebaseRecovery;
       instructions += ` This is conflict recovery for owned branch ${JSON.stringify(recovery.branch)}, previously published at ${recovery.expectedHeadSha}, with original local head ${recovery.originalHeadSha}. Rebase onto the pinned fetched target ${recovery.targetHeadSha}. First inspect git status and any interrupted rebase; continue an existing matching rebase without restarting it. If no rebase is in progress, preserve and commit any intended unpublished work, then run git rebase --rebase-merges=rebase-cousins --no-autostash --no-update-refs ${recovery.targetHeadSha}. Resolve each conflict and continue. Preserve the intended issue fix, target changes, rename/delete decisions, and manual resolutions from earlier target-update merge commits; compare against the saved original head and reapply intended changes as needed. Do not reset, clean, abort, skip commits, or discard unpublished work to make rebase succeed. Run affected tests and record the actual commands and results. Only report rebase outcome resolved and validation passed when the rebase is finished on the owned branch and the affected tests pass. If blocked or validation fails, report outcome blocked with a concrete reason, the needed human action, and validation failed; leave the checkout intact for Resume. CloudX alone publishes using the saved exact remote-head lease and requires a fresh review of the rewritten commit.`;
@@ -1986,6 +2042,7 @@ export class ForgeWorkflowService {
             body: "Summary and actual validation performed",
             discussionReplies: [],
             resolvedDiscussionIds: [],
+            handoff: { headSha: "Full intended commit SHA", status: "ready", retainedPaths: [], details: "Why remaining files are retained and how the committed content was validated; or what work remains" },
             ...(worker.rebaseRecovery?.phase === "resolving" ? {
               rebase: { outcome: "resolved", validation: "passed", details: "Resolution, actual test commands and results; or the blocker and action needed" },
             } : {}),
@@ -2037,7 +2094,7 @@ export class ForgeWorkflowService {
     for (const worker of [...this.workers]) {
       if (this.disposed) return;
       const number = changeNumber(worker);
-      if (!number || worker.status === "cleanup_failed" || !this.workers.includes(worker)) continue;
+      if (!number || worker.retainedWorkspace && worker.status === "completed" || worker.status === "cleanup_failed" || !this.workers.includes(worker)) continue;
       if (this.workers.some(candidate => hasUnconfirmedPublication(candidate) && candidate.changeNumber === number &&
         sameRepository(candidate.repository, worker.repository))) continue;
       if (recovering.some(candidate => changeNumber(candidate) === number && sameRepository(candidate.repository, worker.repository))) continue;
@@ -2091,6 +2148,7 @@ export class ForgeWorkflowService {
     signal.throwIfAborted();
     for (const candidate of associated) {
       signal.throwIfAborted();
+      if (candidate.status === "completed" && candidate.retainedWorkspace) continue;
       if (candidate.status === "cleanup_failed" && candidate.id !== retryCleanupId) continue;
       if (issuesClosed) await this.retireMergedWorker(candidate, change);
       else if (candidate.status !== "cleanup_failed" &&
@@ -2133,7 +2191,16 @@ export class ForgeWorkflowService {
       await this.cleanup(worker, change.headSha);
       worker.status = "completed";
       worker.error = undefined;
+      worker.rebaseRecovery = undefined;
+      worker.mergeConflict = undefined;
+      if (worker.completion) worker.completion.continuationRequired = undefined;
       if (worker.kind === "issue") worker.headSha = change.headSha;
+      if (worker.retainedWorkspace) {
+        await this.persist();
+        this.operations.delete(worker.id);
+        this.deps.notify("Forge files retained", `${worker.title}: recover working files from ${worker.retainedWorkspace.worktreePath}. The checkout and Git index were kept intact.`);
+        return;
+      }
       const index = this.workers.indexOf(worker);
       this.workers.splice(index, 1);
       try {
@@ -2179,13 +2246,14 @@ export class ForgeWorkflowService {
       await this.quiesce(worker, { retainReport: true });
       if (worker.worktreePath) {
         if (!worker.repositoryPath) throw new Error("Worker checkout ownership is missing.");
-        await this.deps.runtime.cleanup({
+        const retained = await this.deps.runtime.cleanup({
           id: worker.id,
           repositoryPath: worker.repositoryPath,
           worktreePath: worker.worktreePath,
           branch: worker.branch ?? "",
           expectedHeadSha: worker.kind === "issue" ? expectedHeadSha : undefined,
         });
+        if (retained) worker.retainedWorkspace = retained;
       }
       await this.quiesce(worker);
       worker.worktreePath = undefined;
