@@ -42,6 +42,7 @@ export interface ForgeTurnCompletion {
 export interface ForgeWorkerCompletion {
   attemptId: string;
   deadlineAt: string;
+  reviewScope?: ForgeReviewScope;
   readyAt?: string;
   turn?: ForgeTurnCompletion;
   report?: ForgeIssueCompletionReport | (ForgeReviewSubmission & { kind: "review" });
@@ -119,10 +120,21 @@ export interface ForgeWorker {
   issueWorkerId?: string;
   draft?: ForgeReviewDraft;
   reviewHistory?: ForgeReviewDraft[];
+  reviewBaseline?: { reviewId: string; revision: ForgeReviewRevision };
   error?: string;
   providerRetryAt?: string;
   startedAt: string;
   updatedAt: string;
+}
+export interface ForgeReviewRevision {
+  headSha: string;
+  baseSha: string;
+  mergeBaseSha: string;
+}
+export interface ForgeReviewScope {
+  kind: "initial" | "incremental" | "rewritten" | "unchanged";
+  current: ForgeReviewRevision;
+  previous?: ForgeReviewRevision;
 }
 export interface ForgeReviewDraft {
   id: string;

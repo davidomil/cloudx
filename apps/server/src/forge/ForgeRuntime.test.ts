@@ -10,7 +10,7 @@ import { createRoot } from "react-dom/client";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeReviewRevision, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import * as filesystemEvidence from "../filesystemIdentity.js";
@@ -301,6 +301,242 @@ describe("ForgeRuntime diagnostics", () => {
     await first;
 
     expect(records.filter(record => record.event === "git.completed" && record.command === "fetch").map(record => record.workerId)).toEqual(["second-worker", "first-worker"]);
+  });
+});
+
+describe("ForgeRuntime completed review baselines", () => {
+  async function commit(filename: string, content: string): Promise<string> {
+    await fs.writeFile(path.join(repositoryPath, filename), content);
+    await git(repositoryPath, "add", filename);
+    await git(repositoryPath, "commit", "-m", `TEST: change ${filename}`);
+    return git(repositoryPath, "rev-parse", "HEAD");
+  }
+
+  async function prepareReview(baseSha = headSha) {
+    await git(repositoryPath, "switch", "-c", "feature", headSha);
+    const reviewedHead = await commit("feature.txt", "Reviewed implementation\n");
+    await git(repositoryPath, "push", "origin", "feature");
+    const workspace = { id: "review-baseline", ...await runtime.prepareWorkspace({
+      id: "review-baseline", expectedRepository, baseBranch: "main", review: true, headSha: reviewedHead, baseSha,
+    }) };
+    const scope = await runtime.prepareReviewScope(workspace);
+    return { workspace, revision: scope.current };
+  }
+
+  function reviewRef(revision: ForgeReviewRevision, name: "head" | "base" | "merge-base"): string {
+    return `refs/cloudx/reviews/${revision.headSha}/${revision.baseSha}/${name}`;
+  }
+
+  async function refresh(workspace: ForgeWorkspace, currentHead: string, baseSha = headSha): Promise<void> {
+    await git(repositoryPath, "push", "--force", "origin", "feature");
+    await runtime.refreshReviewWorkspace(workspace, { headSha: currentHead, baseSha, baseBranch: "main" });
+  }
+
+  it("derives the first pinned comparison and only retains its head and base context when completion is accepted", async () => {
+    const targetHead = await commit("target.txt", "Independent target change\n");
+    await git(repositoryPath, "push", "origin", "main");
+    const { workspace, revision } = await prepareReview(targetHead);
+
+    expect(await runtime.prepareReviewScope(workspace)).toEqual({ kind: "initial", current: revision });
+    expect(revision).toEqual({ headSha: await git(repositoryPath, "rev-parse", "HEAD"), baseSha: targetHead, mergeBaseSha: headSha });
+    expect(await git(workspace.worktreePath, "for-each-ref", "refs/cloudx/reviews/")).toBe("");
+
+    await runtime.retainReviewBaseline(workspace, revision);
+    await new ForgeRuntime(dependencies()).retainReviewBaseline(workspace, revision);
+
+    for (const [name, sha] of [["head", revision.headSha], ["base", targetHead], ["merge-base", headSha]] as const)
+      expect(await git(workspace.worktreePath, "rev-parse", reviewRef(revision, name))).toBe(sha);
+  });
+
+  it("compares README and code fixes to the most recent completed review across refresh and restart", async () => {
+    const { workspace, revision: first } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, first);
+    const readmeHead = await commit("README.md", "Corrected README\n");
+    await refresh(workspace, readmeHead);
+    const readmeReview = await new ForgeRuntime(dependencies()).prepareReviewScope(workspace, first);
+
+    expect(readmeReview).toEqual({ kind: "incremental", current: { headSha: readmeHead, baseSha: headSha, mergeBaseSha: headSha }, previous: first });
+    expect(await git(workspace.worktreePath, "diff", "--name-only", first.headSha, readmeHead, "--")).toBe("README.md");
+
+    await runtime.retainReviewBaseline(workspace, readmeReview.current);
+    const fixHead = await commit("feature.txt", "Fix the previously reviewed finding\n");
+    await refresh(workspace, fixHead);
+    const fixReview = await new ForgeRuntime(dependencies()).prepareReviewScope(workspace, readmeReview.current);
+
+    expect(fixReview).toMatchObject({ kind: "incremental", previous: { headSha: readmeHead }, current: { headSha: fixHead } });
+    expect(await git(workspace.worktreePath, "diff", "--name-only", readmeHead, fixHead, "--")).toBe("feature.txt");
+    expect(await git(workspace.worktreePath, "rev-parse", reviewRef(first, "head"))).toBe(first.headSha);
+  });
+
+  it("recognizes unchanged code even when an amended commit has a new SHA", async () => {
+    const { workspace, revision } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, revision);
+    expect(await runtime.prepareReviewScope(workspace, revision)).toEqual({ kind: "unchanged", current: revision, previous: revision });
+    await git(repositoryPath, "commit", "--amend", "-m", "TEST: rewrite only the message");
+    const rewrittenHead = await git(repositoryPath, "rev-parse", "HEAD");
+    expect(rewrittenHead).not.toBe(revision.headSha);
+    await refresh(workspace, rewrittenHead);
+
+    expect(await runtime.prepareReviewScope(workspace, revision)).toMatchObject({ kind: "unchanged", current: { headSha: rewrittenHead }, previous: revision });
+  });
+
+  it("distinguishes edited rewritten history from an ordinary follow-up", async () => {
+    const { workspace, revision } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, revision);
+    await fs.writeFile(path.join(repositoryPath, "feature.txt"), "Amended implementation\n");
+    await git(repositoryPath, "add", "feature.txt");
+    await git(repositoryPath, "commit", "--amend", "--no-edit");
+    const rewrittenHead = await git(repositoryPath, "rev-parse", "HEAD");
+    await refresh(workspace, rewrittenHead);
+
+    expect(await runtime.prepareReviewScope(workspace, revision)).toMatchObject({ kind: "rewritten", current: { headSha: rewrittenHead, mergeBaseSha: headSha } });
+  });
+
+  it("keeps an ordinary delta when only the target advances outside the effective comparison", async () => {
+    const { workspace, revision } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, revision);
+    const nextHead = await commit("README.md", "Documentation correction\n");
+    await git(repositoryPath, "switch", "main");
+    const targetHead = await commit("upstream.txt", "Unrelated upstream change\n");
+    await git(repositoryPath, "push", "origin", "main");
+    await refresh(workspace, nextHead, targetHead);
+
+    expect(await runtime.prepareReviewScope(workspace, revision)).toMatchObject({ kind: "incremental", current: { headSha: nextHead, baseSha: targetHead, mergeBaseSha: headSha } });
+  });
+
+  it("retains unreachable reviewed heads and bases through force-push, conflict resolution, restart and Git garbage collection", async () => {
+    const oldBase = await commit("old-target.txt", "Old target context\n");
+    await git(repositoryPath, "push", "origin", "main");
+    const { workspace } = await prepareReview(oldBase);
+    const reviewedHead = await commit("README.md", "Reviewed README edit\n");
+    await refresh(workspace, reviewedHead, oldBase);
+    const previous = (await runtime.prepareReviewScope(workspace)).current;
+    await runtime.retainReviewBaseline(workspace, previous);
+
+    await git(repositoryPath, "switch", "main");
+    await git(repositoryPath, "reset", "--hard", headSha);
+    const newBase = await commit("README.md", "Rewritten upstream README\n");
+    await git(repositoryPath, "push", "--force", "origin", "main");
+    await git(repositoryPath, "switch", "feature");
+    await expect(git(repositoryPath, "rebase", "main")).rejects.toThrow();
+    await fs.writeFile(path.join(repositoryPath, "README.md"), "Reviewed README edit with upstream conflict resolved\n");
+    await git(repositoryPath, "add", "README.md");
+    await git(repositoryPath, "-c", "core.editor=true", "rebase", "--continue");
+    const currentHead = await git(repositoryPath, "rev-parse", "HEAD");
+    await refresh(workspace, currentHead, newBase);
+    await git(workspace.worktreePath, "reflog", "expire", "--expire=now", "--all");
+    await git(workspace.worktreePath, "gc", "--prune=now");
+    runtime = new ForgeRuntime(dependencies());
+
+    expect(await runtime.prepareReviewScope(workspace, previous)).toEqual({ kind: "rewritten", previous, current: { headSha: currentHead, baseSha: newBase, mergeBaseSha: newBase } });
+    for (const sha of [reviewedHead, oldBase, headSha])
+      expect(await git(workspace.worktreePath, "cat-file", "-t", sha)).toBe("commit");
+    expect(await git(workspace.worktreePath, "diff", "--no-ext-diff", "--no-textconv", reviewedHead, currentHead, "--")).toContain("+Reviewed README edit with upstream conflict resolved");
+    expect(await git(workspace.worktreePath, "diff", "--no-ext-diff", "--no-textconv", newBase, currentHead, "--")).toContain("+Reviewed implementation");
+
+    await git(workspace.worktreePath, "update-ref", "-d", reviewRef(previous, "head"));
+    await git(workspace.worktreePath, "gc", "--prune=now");
+    await expect(git(workspace.worktreePath, "cat-file", "-e", reviewedHead)).rejects.toThrow();
+    await expect(runtime.prepareReviewScope(workspace, previous)).rejects.toThrow("Incremental comparison cannot be established");
+  });
+
+  it("does not call unchanged trees unchanged review scope when their effective merge base moved", async () => {
+    const { workspace, revision } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, revision);
+    await git(repositoryPath, "switch", "main");
+    await git(repositoryPath, "commit", "--allow-empty", "-m", "TEST: advance effective base without code changes");
+    const newBase = await git(repositoryPath, "rev-parse", "HEAD");
+    await git(repositoryPath, "push", "origin", "main");
+    await git(repositoryPath, "switch", "feature");
+    await git(repositoryPath, "rebase", "main");
+    const currentHead = await git(repositoryPath, "rev-parse", "HEAD");
+    await refresh(workspace, currentHead, newBase);
+
+    expect(await git(workspace.worktreePath, "diff", "--name-only", revision.headSha, currentHead, "--")).toBe("");
+    expect(await runtime.prepareReviewScope(workspace, revision)).toMatchObject({ kind: "rewritten", current: { mergeBaseSha: newBase } });
+  });
+
+  it("requires completion evidence even when the alleged prior commit is locally available", async () => {
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+    const { workspace, revision } = await prepareReview();
+    vi.mocked(deps.git).mockClear();
+    vi.mocked(deps.gitAccess).mockClear();
+
+    await expect(runtime.prepareReviewScope(workspace, revision)).rejects.toThrow("Incremental comparison cannot be established");
+    await expect(runtime.prepareReviewScope(workspace, { ...revision, headSha: "--all" })).rejects.toThrow("Incremental comparison cannot be established");
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => args[0] === "fetch")).toBe(false);
+  });
+
+  it.each(["head", "base", "merge-base"] as const)("rejects a changed retained %s reference without replacing it", async name => {
+    const { workspace, revision } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, revision);
+    const ref = reviewRef(revision, name);
+    const replacement = name === "head" ? headSha : revision.headSha;
+    await git(workspace.worktreePath, "update-ref", ref, replacement);
+
+    await expect(runtime.prepareReviewScope(workspace, revision)).rejects.toThrow("Incremental comparison cannot be established");
+    await expect(runtime.retainReviewBaseline(workspace, revision)).rejects.toThrow("retained review reference changed");
+    expect(await git(workspace.worktreePath, "rev-parse", ref)).toBe(replacement);
+  });
+
+  it("rejects a symbolic baseline ref even when it currently points to the expected commit", async () => {
+    const { workspace, revision } = await prepareReview();
+    await runtime.retainReviewBaseline(workspace, revision);
+    await git(workspace.worktreePath, "symbolic-ref", reviewRef(revision, "head"), "HEAD");
+
+    await expect(runtime.prepareReviewScope(workspace, revision)).rejects.toThrow("Incremental comparison cannot be established");
+    await expect(runtime.retainReviewBaseline(workspace, revision)).rejects.toThrow("retained review reference changed");
+  });
+
+  it("can complete partially retained references after interruption without treating them as completed evidence", async () => {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const { workspace, revision } = await prepareReview();
+    const runGit = deps.git!;
+    deps.git = async (cwd, args, signal, environment) => {
+      if (args[0] === "update-ref" && args.includes(reviewRef(revision, "base"))) throw new Error("Pinning interrupted.");
+      return runGit(cwd, args, signal, environment);
+    };
+    await expect(runtime.retainReviewBaseline(workspace, revision)).rejects.toThrow("Pinning interrupted.");
+    expect(await git(workspace.worktreePath, "rev-parse", reviewRef(revision, "head"))).toBe(revision.headSha);
+    await expect(runtime.prepareReviewScope(workspace, revision)).rejects.toThrow("Incremental comparison cannot be established");
+
+    runtime = new ForgeRuntime(dependencies());
+    await runtime.retainReviewBaseline(workspace, revision);
+
+    expect(await runtime.prepareReviewScope(workspace, revision)).toMatchObject({ kind: "unchanged" });
+  });
+
+  it.each(["head", "base", "merge-base"] as const)("does not retain a completion whose %s differs from the current pinned comparison", async name => {
+    const { workspace, revision } = await prepareReview();
+    const key = name === "merge-base" ? "mergeBaseSha" : `${name}Sha`;
+    const mismatched = { ...revision, [key]: "a".repeat(40) };
+
+    await expect(runtime.retainReviewBaseline(workspace, mismatched)).rejects.toThrow("no longer matches its pinned checkout comparison");
+    expect(await git(workspace.worktreePath, "for-each-ref", "refs/cloudx/reviews/")).toBe("");
+  });
+
+  it.each(["dirty", "head", "base", "branch", "pending-git"])("preserves a reviewer checkout with %s changes and refuses scope or retention", async change => {
+    const { workspace, revision } = await prepareReview();
+    if (change === "dirty") await fs.writeFile(path.join(workspace.worktreePath, "user.txt"), "Keep user edits\n");
+    if (change === "head") await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "USER: move head");
+    if (change === "base") await git(workspace.worktreePath, "update-ref", "refs/cloudx/review-base", revision.headSha);
+    if (change === "branch") await git(workspace.worktreePath, "switch", "-c", "user-branch");
+    if (change === "pending-git") await fs.writeFile(path.join(workspace.worktreePath, ".git", "index.lock"), "");
+
+    await expect(runtime.prepareReviewScope(workspace)).rejects.toThrow(/clean|comparison|detached|in progress/);
+    await expect(runtime.retainReviewBaseline(workspace, revision)).rejects.toThrow(/clean|comparison|detached|in progress/);
+    expect(await git(workspace.worktreePath, "for-each-ref", "refs/cloudx/reviews/")).toBe("");
+  });
+
+  it("requires a reviewer-owned workspace and the requested pinned head", async () => {
+    const issueWorkspace = await prepare();
+    await expect(runtime.prepareReviewScope(issueWorkspace)).rejects.toThrow("owned, fully prepared reviewer checkout");
+    const { workspace } = await prepareReview();
+    await expect(runtime.prepareReviewScope({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("outside its recorded comparison");
   });
 });
 

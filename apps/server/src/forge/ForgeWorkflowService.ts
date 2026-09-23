@@ -13,6 +13,8 @@ import type {
   ForgePublicationObservation,
   ForgeRepository,
   ForgeReviewDraft,
+  ForgeReviewRevision,
+  ForgeReviewScope,
   ForgeReviewSubmission,
   ForgeTurnCompletion,
   ForgeWorker,
@@ -21,6 +23,7 @@ import type {
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
+import { reviewScopeInstructions, reviewScopeSummary } from "./ForgeReviewScope.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
 
 export interface ForgeSettings {
@@ -67,6 +70,16 @@ interface Runtime {
   refreshReviewWorkspace(
     workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
     revision: { headSha: string; baseSha: string; baseBranch: string },
+    signal?: AbortSignal,
+  ): Promise<void>;
+  prepareReviewScope(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    baseline?: ForgeReviewRevision,
+    signal?: AbortSignal,
+  ): Promise<ForgeReviewScope>;
+  retainReviewBaseline(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    revision: ForgeReviewRevision,
     signal?: AbortSignal,
   ): Promise<void>;
   launch(
@@ -1033,11 +1046,24 @@ export class ForgeWorkflowService {
       worker.pendingPublication ??= { report, repliedDiscussionIds: [] };
       await this.persist();
     }
-    await this.quiesce(worker, { closeTab: false, successful: true });
+    await this.quiesce(worker, { closeTab: false, successful: true, retainReport: report.kind === "review" });
     this.operations.get(worker.id)?.signal.throwIfAborted();
     if (report.kind === "issue") await this.issueReady(worker);
     else {
-      worker.draft = { ...parseReview(report), id: completion.attemptId, startedAt: worker.startedAt, status: "draft" };
+      const scope = completion.reviewScope;
+      if (!scope || scope.current.headSha !== report.headSha)
+        throw new Error("Completed review comparison evidence is missing or does not match its report. The review baseline was preserved.");
+      const draft: ForgeReviewDraft = {
+        ...parseReview({ ...report, body: `${reviewScopeSummary(scope)}\n\n${report.body}` }),
+        id: completion.attemptId, startedAt: worker.startedAt, status: "draft",
+      };
+      await this.deps.runtime.retainReviewBaseline(workerWorkspace(worker), scope.current, this.operations.get(worker.id)?.signal);
+      this.operations.get(worker.id)?.signal.throwIfAborted();
+      await this.deps.reports.remove(completion.attemptId);
+      this.operations.get(worker.id)?.signal.throwIfAborted();
+      worker.attemptId = undefined;
+      worker.draft = draft;
+      worker.reviewBaseline = { reviewId: draft.id, revision: scope.current };
       worker.status = "completed";
       await this.persist();
       if (worker.autoPost && !this.autoReviewParent(worker)) await this.postDraft(worker);
@@ -1909,6 +1935,15 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(worker.id)?.signal;
     signal?.throwIfAborted();
     const settings = this.deps.settings();
+    let reviewScope: ForgeReviewScope | undefined;
+    if (worker.kind === "review") {
+      if (!worker.reviewBaseline && (worker.draft || worker.reviewHistory?.length))
+        throw new Error("Incremental comparison cannot be established: the previous review has no verified baseline evidence. Restore its completed comparison and retained Git objects before resuming.");
+      reviewScope = await this.deps.runtime.prepareReviewScope(workerWorkspace(worker), worker.reviewBaseline?.revision, signal);
+      const change = context.item as ForgeChangeRequest;
+      if (reviewScope.current.headSha !== change.headSha || reviewScope.current.baseSha !== change.baseSha)
+        throw new Error("The review comparison does not match the current pinned request.");
+    }
     if (worker.kind === "issue")
       worker.feedbackDigest = feedbackDigest(context);
     else if (context.issue)
@@ -1917,28 +1952,26 @@ export class ForgeWorkflowService {
     worker.completion = {
       attemptId: worker.attemptId,
       deadlineAt: new Date(Date.now() + settings.maxRunMinutes * 60_000).toISOString(),
+      ...(reviewScope ? { reviewScope } : {}),
     };
     worker.status = "starting";
     worker.error = undefined;
     await this.persist();
     const { reportPath, contextPath } = await this.deps.reports.prepare(
       worker.attemptId,
-      worker.rebaseRecovery?.phase === "resolving" ? { ...context, rebaseRecovery: worker.rebaseRecovery } : context,
+      reviewScope ? { ...context, reviewScope, previousReviews: [...(worker.reviewHistory ?? []), ...(worker.draft ? [worker.draft] : [])] } :
+        worker.rebaseRecovery?.phase === "resolving" ? { ...context, rebaseRecovery: worker.rebaseRecovery } : context,
     );
     signal?.throwIfAborted();
     let instructions =
       worker.kind === "issue"
         ? "Resolve the issue in this checkout. Read all issue and change-request feedback below, implement the changes, and run the relevant tests. Commit your changes to the current branch. Do not push, open or merge a PR/MR, or post replies or resolve threads directly: CloudX performs those steps. Include a discussionReplies entry shaped as { discussionId, body } with the exact review discussion ID and a reply explaining the change and validation for each review thread you addressed. Use replies to ask for clarification on unresolved feedback too. Include resolvedDiscussionIds only for review discussion IDs whose feedback you actually addressed; leave unresolved questions open. CloudX posts your replies as the issue worker and then resolves the listed threads after verifying the published commit. When ready for human review, write the completion report."
-        : "Review the exact checked-out commit against the pinned base commit using the local Git checkout. Do not alter the checkout or publish anything. The comments array contains actionable findings only, with file path and new line for inline findings. Set event to approve when the implementation satisfies the issue and review feedback and no issues remain; an issue-free review must explicitly approve. Set event to request_changes when actionable findings remain. Use comment only when human clarification or a decision is required. Write the completion report when finished.";
+        : "Review the exact checked-out commit using the supplied review scope and local Git checkout. Do not alter the checkout or publish anything. The comments array contains actionable findings only, with file path and new line for inline findings. Set event to approve when the implementation satisfies the issue and review feedback and no issues remain; an issue-free review must explicitly approve. Set event to request_changes when actionable findings remain. Use comment only when human clarification or a decision is required. Write the completion report when finished.";
     if (worker.rebaseRecovery?.phase === "resolving") {
       const recovery = worker.rebaseRecovery;
       instructions += ` This is conflict recovery for owned branch ${JSON.stringify(recovery.branch)}, previously published at ${recovery.expectedHeadSha}, with original local head ${recovery.originalHeadSha}. Rebase onto the pinned fetched target ${recovery.targetHeadSha}. First inspect git status and any interrupted rebase; continue an existing matching rebase without restarting it. If no rebase is in progress, preserve and commit any intended unpublished work, then run git rebase --rebase-merges=rebase-cousins --no-autostash --no-update-refs ${recovery.targetHeadSha}. Resolve each conflict and continue. Preserve the intended issue fix, target changes, rename/delete decisions, and manual resolutions from earlier target-update merge commits; compare against the saved original head and reapply intended changes as needed. Do not reset, clean, abort, skip commits, or discard unpublished work to make rebase succeed. Run affected tests and record the actual commands and results. Only report rebase outcome resolved and validation passed when the rebase is finished on the owned branch and the affected tests pass. If blocked or validation fails, report outcome blocked with a concrete reason, the needed human action, and validation failed; leave the checkout intact for Resume. CloudX alone publishes using the saved exact remote-head lease and requires a fresh review of the rewritten commit.`;
     }
-    if (worker.kind === "review") {
-      const change = context.item as ForgeChangeRequest;
-      instructions += " Continue this request's review in the same conversation. Read the current task and feedback again; earlier conclusions apply only where the current code still supports them. Reassess the complete pinned comparison and verify how previous findings were addressed.";
-      instructions += ` Both commits and their history are already fetched. Compare with git diff --no-ext-diff --no-textconv ${change.baseSha}...${change.headSha} --. Inspect every changed file; if command output is clipped, inspect smaller file ranges until the review is complete. Do not use the provider's downloadable diff, which may omit large changes.`;
-    }
+    if (reviewScope) instructions += ` ${reviewScopeInstructions(reviewScope)}`;
     if (worker.issueWorkerId)
       instructions += " This review belongs to an automatic issue loop. Set event to request_changes when actionable findings remain, with specific changes and validation needed. Set event to approve only when the implementation satisfies the issue and review feedback and no actionable findings remain. Use comment only when a human clarification or decision is required; it pauses the loop. CloudX publishes the review and chooses the next step. Do not approve merely to finish the loop.";
     if (context.manualContinuation)

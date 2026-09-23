@@ -12,7 +12,9 @@ import type {
   ForgeCredentialRole,
   ForgeIssueDetail,
   ForgeRepository,
+  ForgeReviewDraft,
   ForgeReviewPublication,
+  ForgeReviewScope,
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
@@ -758,7 +760,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const resolution = await fixture.completedAssistantTurn(resolving);
     expect(resolution.context.rebaseRecovery).toEqual(resolving.rebaseRecovery);
     expect(resolution.context.item.body).toBe(fixture.provider.issue.body);
-    expect(resolution.context.change?.comments).toEqual(expect.arrayContaining([expect.objectContaining({ body: "No actionable findings. The change is ready to merge." })]));
+    expect(resolution.context.change?.comments).toEqual(expect.arrayContaining([expect.objectContaining({ body: expect.stringContaining("No actionable findings. The change is ready to merge.") })]));
     expect(await fixture.reports.read(resolving.attemptId!)).toMatchObject({
       rebase: { outcome: "resolved", validation: "passed", details: expect.stringContaining("node --test rebase-resolution.test.mjs") },
     });
@@ -932,8 +934,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       { role: "assistant", content: expect.stringContaining("No actionable findings.") },
     ]));
     expect(secondReviewReceipt.localReview).toMatchObject({ baseSha: targetHead, mergeBaseSha: targetHead, headSha: updatedHead });
-    expect(secondReviewReceipt.localReview!.diff).toContain("diff --git a/solution.txt b/solution.txt");
-    expect(secondReviewReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
+    expect(secondReviewReceipt.context.reviewScope).toMatchObject({ kind: "rewritten", previous: { headSha: implementation.headSha }, current: { headSha: updatedHead } });
+    expect(secondReviewReceipt.localReview!.diff).not.toContain("diff --git a/solution.txt b/solution.txt");
+    expect(secondReviewReceipt.localReview!.diff).toContain("diff --git a/target.txt b/target.txt");
+    expect(secondReviewReceipt.args.at(-1)).toContain("Inspect their resolutions with git show --remerge-diff");
     expect((await fixture.worker(started.id)).pendingPublication).toBeUndefined();
     expect(merge).not.toHaveBeenCalled();
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(targetHead);
@@ -1349,11 +1353,13 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect((await fixture.store.read())[0]?.draft?.status).toBe("posted");
   }, 20_000);
 
-  it("reuses the manual reviewer and its saved conversation for new head and base commits until final closure", async () => {
+  it("reuses the retained reviewer for rewritten history and a README-only follow-up after restart", async () => {
     const fixture = await LifecycleFixture.create();
     const firstHead = await fixture.seedReview();
     const first = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
     const firstReceipt = await fixture.completedAssistantTurn(first);
+    expect(firstReceipt.context.reviewScope).toMatchObject({ kind: "initial", current: { headSha: firstHead } });
+    expect(firstReceipt.args.at(-1)).toContain(`git diff --no-ext-diff --no-textconv ${firstReceipt.context.item.baseSha}...${firstHead} --`);
     expect(firstReceipt.sessionPath).toBe(path.join(firstReceipt.codexHome, "sessions", "fixture", `rollout-${firstReceipt.sessionId}.jsonl`));
     expect(firstReceipt.previousMessages).toHaveLength(1);
     const checkout = await fs.stat(first.worktreePath!);
@@ -1391,8 +1397,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       expect.objectContaining({ body: "Describe the empty-input result." }),
     ]));
     expect(secondReceipt.localReview).toMatchObject({ baseSha: nextBase, mergeBaseSha: nextBase, headSha: nextHead });
+    expect(secondReceipt.context.reviewScope).toMatchObject({ kind: "rewritten", previous: { headSha: firstHead }, current: { headSha: nextHead, baseSha: nextBase } });
     expect(secondReceipt.localReview!.diff).toContain("+An empty input returns no value.");
-    expect(secondReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
+    expect(secondReceipt.localReview!.diff).toContain("diff --git a/target.txt b/target.txt");
+    expect(secondReceipt.args.at(-1)).toContain("Distinguish already-reviewed work and upstream changes");
     expect(await git(second.worktreePath!, "status", "--porcelain")).toBe("");
     await fixture.workflow.poll();
     expect(fixture.sessions.getTab(second.tabId!).status).toBe("completed");
@@ -1404,7 +1412,30 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.restartWorkflow();
     expect(await fixture.worker(first.id)).toMatchObject({ status: "completed", worktreePath: first.worktreePath, reviewHistory: [firstDraft], draft: completed.draft });
     expect((await fs.stat(first.worktreePath!)).ino).toBe(checkout.ino);
-    expect(fixture.factory.processes).toHaveLength(2);
+    const readmeHead = await fixture.advanceReview("# Return value\n\nAn empty input returns no value.\n", "README.md");
+    const third = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const thirdReceipt = await fixture.completedAssistantTurn(third);
+    expect(thirdReceipt.resumedSessionId).toBe(firstReceipt.sessionId);
+    expect(thirdReceipt.context.reviewScope).toEqual({
+      kind: "incremental",
+      previous: { headSha: nextHead, baseSha: nextBase, mergeBaseSha: nextBase },
+      current: { headSha: readmeHead, baseSha: nextBase, mergeBaseSha: nextBase },
+    });
+    expect(thirdReceipt.context.previousReviews).toEqual([firstDraft, completed.draft]);
+    expect(thirdReceipt.args.at(-1)).toContain(`git diff --no-ext-diff --no-textconv ${nextHead} ${readmeHead} --`);
+    expect(thirdReceipt.args.at(-1)).not.toContain(`${nextBase}...${readmeHead}`);
+    expect(thirdReceipt.args.at(-1)).not.toContain("Inspect every changed file");
+    expect(thirdReceipt.args.at(-1)).toContain("a documentation-only follow-up needs the documentation delta");
+    expect(thirdReceipt.localReview!.diff).toContain("diff --git a/README.md b/README.md");
+    expect(thirdReceipt.localReview!.diff).not.toContain("diff --git a/review.txt b/review.txt");
+    expect(thirdReceipt.localReview!.diff).not.toContain("diff --git a/target.txt b/target.txt");
+    expect(await git(third.worktreePath!, "diff", "--name-only", nextHead, readmeHead, "--")).toBe("README.md");
+    await fixture.workflow.poll();
+    expect(await fixture.worker(first.id)).toMatchObject({
+      status: "completed", reviewBaseline: { reviewId: third.attemptId, revision: { headSha: readmeHead } },
+      draft: { headSha: readmeHead, body: expect.stringContaining(`Review scope: incremental, ${nextHead} → ${readmeHead}`) },
+    });
+    expect(fixture.factory.processes).toHaveLength(3);
     expect(await fixture.sessionRequests("thread/start")).toEqual([expect.objectContaining({ cwd: first.worktreePath, ephemeral: false })]);
     expect(await fixture.sessionRequests("thread/inject_items")).toHaveLength(1);
 
@@ -1415,13 +1446,14 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.sessions.listTabs()).toEqual([]);
     await expectMissing(first.worktreePath!);
-    for (const receipt of [firstReceipt, secondReceipt]) {
+    for (const receipt of [firstReceipt, secondReceipt, thirdReceipt]) {
       expect(await processIsRunning(receipt.pid)).toBe(false);
       await fixture.expectFinishedAttempt(receipt);
     }
     const retainedConversation = await fs.readFile(firstReceipt.sessionPath!, "utf8");
     expect(retainedConversation).toContain(firstHead);
     expect(retainedConversation).toContain(nextHead);
+    expect(retainedConversation).toContain(readmeHead);
     expect(retainedConversation).toContain("The return value needs documentation.");
   }, 30_000);
 
@@ -1481,7 +1513,7 @@ interface AssistantReceipt {
   sessionPath?: string;
   previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   localReview?: { baseSha: string; mergeBaseSha: string; headSha: string; diff: string };
-  context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest; rebaseRecovery?: ForgeWorker["rebaseRecovery"] };
+  context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest; rebaseRecovery?: ForgeWorker["rebaseRecovery"]; reviewScope?: ForgeReviewScope; previousReviews?: ForgeReviewDraft[] };
 }
 
 class RecordingTerminalFactory extends NodePtyTerminalProcessFactory {
@@ -1792,13 +1824,13 @@ test("retains the target behavior and issue fix", () => {
     return headSha;
   }
 
-  async advanceReview(content: string): Promise<string> {
+  async advanceReview(content: string, file = "review.txt"): Promise<string> {
     await git(this.root, "clone", "--branch", "review-target", this.origin, this.repositoryPath);
     await git(this.repositoryPath, "config", "user.name", "Forge Fixture");
     await git(this.repositoryPath, "config", "user.email", "forge-fixture@example.invalid");
     await git(this.repositoryPath, "merge", "--no-edit", "origin/main");
-    await fs.writeFile(path.join(this.repositoryPath, "review.txt"), content);
-    await git(this.repositoryPath, "add", "review.txt");
+    await fs.writeFile(path.join(this.repositoryPath, file), content);
+    await git(this.repositoryPath, "add", "--", file);
     await git(this.repositoryPath, "commit", "-m", "TEST: address review feedback");
     await git(this.repositoryPath, "push", "origin", "review-target");
     const headSha = await git(this.repositoryPath, "rev-parse", "HEAD");
@@ -2125,9 +2157,11 @@ if (changed.length) { git("add", "--", ...changed); git("commit", "-m", "FIX: de
 const headSha = git("rev-parse", "HEAD");
 let localReview;
 if (isReview) {
-  const command = prompt.match(/git diff --no-ext-diff --no-textconv ([a-f0-9]{40,64})[.]{3}([a-f0-9]{40,64}) --/);
-  if (!command) throw new Error("The reviewer prompt must identify the complete local diff command.");
-  localReview = { baseSha: git("rev-parse", "refs/cloudx/review-base"), mergeBaseSha: git("merge-base", "--all", command[1], command[2]), headSha, diff: git("diff", "--no-ext-diff", "--no-textconv", command[1] + "..." + command[2], "--") };
+  const scope = context.reviewScope;
+  if (!scope || scope.current.headSha !== headSha) throw new Error("The reviewer context must identify its pinned comparison.");
+  const revisions = scope.previous ? [scope.previous.headSha, headSha] : [scope.current.baseSha + "..." + headSha];
+  if (!prompt.includes("git diff --no-ext-diff --no-textconv " + revisions.join(" ") + " --")) throw new Error("The reviewer prompt must identify the scoped local diff command.");
+  localReview = { baseSha: git("rev-parse", "refs/cloudx/review-base"), mergeBaseSha: git("merge-base", "--all", scope.current.baseSha, headSha), headSha, diff: git("diff", "--no-ext-diff", "--no-textconv", ...revisions, "--") };
 }
 const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
   ? process.env.FORGE_FIXTURE_APPROVE_FIRST === "true" || fs.existsSync("regression.txt")

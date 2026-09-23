@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
-import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
@@ -87,6 +87,12 @@ function fixture() {
       repositoryPath: "/repo/work",
     })),
     refreshReviewWorkspace: vi.fn(async (_workspace: unknown, _revision: unknown, _signal?: AbortSignal) => {}),
+    prepareReviewScope: vi.fn(async (_workspace: unknown, previous?: ForgeReviewRevision, _signal?: AbortSignal): Promise<ForgeReviewScope> => ({
+      kind: !previous ? "initial" : previous.headSha === change.headSha ? "unchanged" : previous.baseSha === change.baseSha ? "incremental" : "rewritten",
+      current: { headSha: change.headSha, baseSha: change.baseSha, mergeBaseSha: change.baseSha },
+      ...(previous ? { previous } : {}),
+    })),
+    retainReviewBaseline: vi.fn(async (_workspace: unknown, _revision: ForgeReviewRevision, _signal?: AbortSignal) => {}),
     launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
     readTurnCompletion: vi.fn(async (workerId: string, attemptId: string) => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: (await reports.read.getMockImplementation()?.(attemptId) ? "completed" : "running") as "running" | "completed" | "interrupted" | "failed", error: undefined as string | undefined })),
     finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
@@ -817,6 +823,207 @@ describe("Reusable review workers", () => {
   });
 });
 
+describe("Incremental review scope", () => {
+  async function reviewedRevision() {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const revision = { headSha: f.change.headSha, baseSha: f.change.baseSha, mergeBaseSha: f.change.baseSha };
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: revision.headSha, event: "request_changes", body: "Correct the documented example.", comments: [{ body: "The README example omits the required argument." }] });
+    await f.service.poll();
+    f.reports.read.mockResolvedValue(undefined);
+    return { ...f, worker, revision, draft: f.stored()[0].draft! };
+  }
+
+  it("records the full first review only after successful native completion and checkout retention", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const revision = { headSha: f.change.headSha, baseSha: f.change.baseSha, mergeBaseSha: f.change.baseSha };
+    expect(f.stored()[0].reviewBaseline).toBeUndefined();
+    expect(f.stored()[0].completion?.reviewScope).toEqual({ kind: "initial", current: revision });
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(worker.attemptId, expect.objectContaining({ reviewScope: { kind: "initial", current: revision } }));
+    expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain(`git diff --no-ext-diff --no-textconv ${revision.baseSha}...${revision.headSha} --`);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: revision.headSha, event: "approve", body: "Reviewed the complete proposed change.", comments: [] });
+    await f.service.poll();
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }), revision, expect.any(AbortSignal));
+    expect(f.runtime.finish.mock.invocationCallOrder[0]).toBeLessThan(f.runtime.retainReviewBaseline.mock.invocationCallOrder[0]);
+    expect(f.stored()[0].reviewBaseline).toEqual({ reviewId: worker.attemptId, revision });
+  });
+
+  it("reviews a README correction from A to B while carrying the unresolved finding and current-head result", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const scope = { kind: "incremental", previous: f.revision, current: { ...f.revision, headSha: f.change.headSha } };
+    expect(next.reviewBaseline).toEqual({ reviewId: f.worker.attemptId, revision: f.revision });
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(next.attemptId, expect.objectContaining({ reviewScope: scope, previousReviews: [f.draft] }));
+    const prompt = f.runtime.launch.mock.calls.at(-1)![0].prompt;
+    expect(prompt).toContain(`git diff --no-ext-diff --no-textconv ${f.revision.headSha} ${f.change.headSha} --`);
+    expect(prompt).not.toContain("Reassess the complete pinned comparison");
+    expect(prompt).not.toContain(`${f.change.baseSha}...${f.change.headSha}`);
+    expect(prompt).toMatch(/documentation|README/i);
+    expect(prompt).toMatch(/previous findings|earlier findings/i);
+    expect(prompt).toMatch(/relevant validation|targeted validation|affected behavior/i);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: `Compared ${f.revision.headSha} to ${f.change.headSha}: the README example now supplies the required argument.`, comments: [] });
+    await f.service.poll();
+    const completed = f.stored()[0];
+    expect(completed.draft).toMatchObject({ headSha: f.change.headSha, event: "approve" });
+    await f.service.submitReview(completed.id, completed.draft!.id);
+    expect(f.provider.postReview).toHaveBeenCalledWith(7, expect.objectContaining({ headSha: f.change.headSha }));
+  });
+
+  it("uses the most recent completed review across A to B to C and service restart", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const second = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    await f.service.poll();
+    const secondRevision = { ...f.revision, headSha: f.change.headSha };
+    await f.service.saveReview(second.id, second.attemptId!, { event: "approve", body: "Reviewed the corrected example.", comments: [] });
+    f.reports.read.mockResolvedValue(undefined);
+    f.change.headSha = "d".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const third = await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(third.reviewBaseline).toEqual({ reviewId: second.attemptId, revision: secondRevision });
+    expect(third.reviewHistory).toHaveLength(2);
+    expect(f.runtime.prepareReviewScope).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.worker.id }), secondRevision, expect.any(AbortSignal));
+    expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain(`git diff --no-ext-diff --no-textconv ${secondRevision.headSha} ${f.change.headSha} --`);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it.each(["pause", "stop", "failed", "interrupted"] as const)("keeps A as the baseline when B is %s before a restarted Resume", async outcome => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    if (outcome === "pause" || outcome === "stop") await f.service[outcome](next.id);
+    else {
+      f.runtime.readTurnCompletion.mockResolvedValueOnce({ workerId: next.id, attemptId: next.attemptId!, threadId: `thread-${next.id}`, turnId: `turn-${next.attemptId}`, status: outcome, error: undefined });
+      await f.service.poll();
+    }
+    expect(f.stored()[0].reviewBaseline).toEqual({ reviewId: f.worker.attemptId, revision: f.revision });
+    f.change.headSha = "d".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const resumed = await restarted.resume(next.id, placement);
+    expect(resumed.status).toBe("running");
+    expect(f.runtime.prepareReviewScope).toHaveBeenLastCalledWith(expect.objectContaining({ id: next.id }), f.revision, expect.any(AbortSignal));
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledTimes(1);
+  });
+
+  it("processes new feedback at the same commit without reusing the old result", async () => {
+    const f = await reviewedRevision();
+    f.change.comments = [{ id: "new-feedback", body: "The example deliberately uses defaults.", author: "maintainer" }];
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next.draft).toBeUndefined();
+    expect(next.attemptId).not.toBe(f.draft.id);
+    expect(next.completion?.reviewScope).toEqual({ kind: "unchanged", current: f.revision, previous: f.revision });
+    const prompt = f.runtime.launch.mock.calls.at(-1)![0].prompt;
+    expect(prompt).toMatch(/feedback/i);
+    expect(prompt).not.toContain("Reassess the complete pinned comparison");
+    expect(prompt).not.toContain(`${f.change.baseSha}...${f.change.headSha}`);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("supplies both revisions and base context for rewritten history without omitting merge resolutions", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    f.change.baseSha = "d".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next.completion?.reviewScope).toEqual({ kind: "rewritten", previous: f.revision, current: { headSha: f.change.headSha, baseSha: f.change.baseSha, mergeBaseSha: f.change.baseSha } });
+    const prompt = f.runtime.launch.mock.calls.at(-1)![0].prompt;
+    expect(prompt).toContain("git range-diff");
+    expect(prompt).toContain(f.revision.headSha);
+    expect(prompt).toContain(f.revision.baseSha);
+    expect(prompt).toContain(f.change.headSha);
+    expect(prompt).toContain(f.change.baseSha);
+    expect(prompt).toMatch(/merge.resolution|conflict.resolution/i);
+    expect(prompt).toMatch(/upstream/i);
+    expect(prompt).not.toContain("Reassess the complete pinned comparison");
+  });
+
+  it("reports missing completed-review evidence instead of inventing an incremental baseline", async () => {
+    const f = await reviewedRevision();
+    delete f.stored()[0].reviewBaseline;
+    f.change.headSha = "c".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const next = await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next).toMatchObject({ status: "failed", error: expect.stringMatching(/incremental comparison.*(?:unavailable|cannot)|baseline.*(?:missing|unavailable)/i) });
+    expect(next.reviewHistory).toEqual([f.draft]);
+    expect(next.reviewBaseline).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the previous baseline when the completed revision cannot be protected from Git collection", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.runtime.retainReviewBaseline.mockRejectedValueOnce(new Error("The reviewed commit could not be retained."));
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, completion: { report: { headSha: f.change.headSha } } });
+    expect(f.stored()[0].draft).toBeUndefined();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(next.id, placement);
+    expect(completed).toMatchObject({ status: "completed", reviewBaseline: { reviewId: next.attemptId, revision: { ...f.revision, headSha: f.change.headSha } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the verified baseline when its retained Git object is unavailable", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    f.runtime.prepareReviewScope.mockRejectedValueOnce(new Error("Incremental comparison cannot be established: the previous reviewed commit is unavailable."));
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, error: expect.stringContaining("Incremental comparison cannot be established") });
+    expect(next.reviewHistory).toEqual([f.draft]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not advance the baseline when Stop interrupts completed-report retirement", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const removing = deferred<void>();
+    const removed = deferred<void>();
+    f.reports.remove.mockImplementationOnce(async () => { removing.resolve(); await removed.promise; });
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    const polling = f.service.poll();
+    await removing.promise;
+    const stopping = f.service.stop(next.id);
+    removed.resolve();
+    await polling;
+    await stopping;
+    expect(f.stored()[0]).toMatchObject({ status: "stopped", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision } });
+    expect(f.stored()[0].draft).toBeUndefined();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("rejects a follow-up report for the previous head without advancing the baseline", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.revision.headSha, event: "approve", body: "An old decision does not approve the new commit.", comments: [] });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, error: expect.stringContaining("does not match the checked out commit") });
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledTimes(1);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("keeps the actually reviewed B as baseline when head C prevents its approval from posting", async () => {
+    const f = await reviewedRevision();
+    const reviewedHead = "c".repeat(40);
+    f.change.headSha = reviewedHead;
+    const next = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    f.change.headSha = "d".repeat(40);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: reviewedHead, event: "approve", body: "The correction is sound.", comments: [] });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: next.attemptId, revision: { ...f.revision, headSha: reviewedHead } }, draft: { headSha: reviewedHead } });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    f.reports.read.mockResolvedValue(undefined);
+    const current = await f.service.continueWorker(next.id, "Review the new current head before posting an approval.", placement);
+    expect(current.completion?.reviewScope).toMatchObject({ kind: "incremental", previous: { headSha: reviewedHead }, current: { headSha: f.change.headSha } });
+  });
+});
+
 describe("Issue merge attempts", () => {
   async function approvedManualIssue() {
     const f = fixture();
@@ -943,7 +1150,7 @@ describe("Issue merge attempts", () => {
 });
 
 describe("Forge issue and review workflows", () => {
-  it("prepares both pinned review commits and supplies a local comparison for every attempt", async () => {
+  it("keeps the full pinned comparison after Resume when no review has completed", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -4039,7 +4246,7 @@ describe("Forge issue auto review", () => {
         await service.poll();
 
         expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
-        expect(f.currentReview()).toMatchObject({ id: reviewer.id, status: "completed", draft: { status: "draft", body: "Fix reviewed" } });
+        expect(f.currentReview()).toMatchObject({ id: reviewer.id, status: "completed", draft: { status: "draft", body: expect.stringContaining("Fix reviewed") } });
         expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
         expect(f.runtime.launch.mock.calls.at(-1)![0]).toMatchObject({ id: f.issue.id });
         expect(f.provider.postReview).not.toHaveBeenCalled();
@@ -4350,7 +4557,7 @@ describe("Forge issue auto review", () => {
     f.advanceTime(1_000);
     await f.service.poll();
     const draft = f.currentReview().draft!;
-    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { id: reviewer.attemptId, status: "draft", body: "Ready" } });
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { id: reviewer.attemptId, status: "draft", body: expect.stringContaining("Ready") } });
     f.advanceTime(58_999);
     await f.service.poll();
     expect(f.provider[operation]).toHaveBeenCalledTimes(reads);

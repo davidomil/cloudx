@@ -167,10 +167,30 @@ checkout and Codex conversation. A finished review retains its completed
 terminal and final response. The next review opens a new terminal that
 resumes the same conversation.
 
-Reviewers fetch the selected request’s exact head and pinned base commit
-into their retained checkout and inspect the complete local Git
-comparison. Each round receives the latest task and feedback, reassesses
-the comparison, and checks whether previous findings were addressed.
+The first review inspects the complete comparison between the request’s
+pinned base and head. A valid report and successful native turn completion
+record that exact revision as the baseline. Git references retain its head,
+base and merge base in the owned checkout across refreshes and restarts.
+Starting, failing or interrupting another review does not advance it.
+
+Follow-up reviews receive the previous reviewed SHA, current pinned SHA,
+and earlier findings. They compare those two heads, verify the fixes and
+inspect surrounding code as needed. A README correction stays focused on
+the documentation delta; a small code fix needs the affected behavior and
+relevant validation. Required CI and merge checks still apply. Unchanged
+code with new feedback receives a fresh decision without another code audit.
+
+Rebased revisions retain both versions’ base context. Reviewers use the
+endpoint diff and patch-series comparison to separate upstream changes
+from new edits, explicitly inspect merge resolutions and dropped changes,
+and explain any wider review. Each summary records the compared SHAs and
+scope; findings and approval apply to the current pinned head.
+
+If completed-review evidence or its retained Git objects are unavailable,
+Forge stops with an explicit incremental-comparison error. It does not infer
+a baseline from conversation history or silently start another full review.
+Existing completed reviews without this evidence cannot start a follow-up
+until the evidence is restored; no baseline is synthesized during upgrade.
 
 Opening a request does not download a provider diff, so large requests
 remain accessible.
