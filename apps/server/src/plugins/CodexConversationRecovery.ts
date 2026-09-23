@@ -11,9 +11,14 @@ const RECEIPT = ".cloudx-conversation.json";
 const MAX_METADATA_BYTES = 65_536;
 const MAX_TRANSCRIPT_HEADER_BYTES = 1_048_576;
 
-export interface CodexConversationIdentity { sessionId: string; transcriptPath?: string; cwd: string }
+export interface CodexConversationIdentity {
+  sessionId: string;
+  transcriptPath?: string;
+  cwd: string;
+  selection?: { tabId: string; executionId: string };
+}
 
-/** Records the last observed conversation; native selection can change before the next hook runs. */
+/** Reads native selection receipts and legacy last-prompt receipts without confusing their authority. */
 export class CodexConversationRecovery {
   readonly receiptPath: string;
 
@@ -54,7 +59,22 @@ export class CodexConversationRecovery {
         value.transcriptPath != null && (typeof value.transcriptPath !== "string" || !path.isAbsolute(value.transcriptPath))) {
       throw new Error("Saved Codex conversation identity is invalid.");
     }
-    return { sessionId: value.sessionId, cwd: value.cwd, ...(typeof value.transcriptPath === "string" ? { transcriptPath: value.transcriptPath } : {}) };
+    const selected = value.version === 2 && value.authority === "selected";
+    if ((value.version !== undefined || value.authority !== undefined) && !selected ||
+        selected && (typeof value.tabId !== "string" || !value.tabId || !isCodexConversationId(value.executionId)))
+      throw new Error("Saved Codex conversation selection binding is invalid.");
+    return {
+      sessionId: value.sessionId, cwd: value.cwd,
+      ...(typeof value.transcriptPath === "string" ? { transcriptPath: value.transcriptPath } : {}),
+      ...(selected ? { selection: { tabId: value.tabId as string, executionId: value.executionId as string } } : {})
+    };
+  }
+
+  readForExecution(tabId: string, executionId: unknown): CodexConversationIdentity | undefined {
+    const identity = this.read();
+    if (identity?.selection && (identity.selection.tabId !== tabId || identity.selection.executionId !== executionId))
+      throw new Error("Saved Codex conversation belongs to a different tab or execution. Select a saved session.");
+    return identity;
   }
 
   observe(onIdentity: (identity: CodexConversationIdentity) => void | Promise<void>, onError: (error: unknown) => void): () => void {

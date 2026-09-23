@@ -4,6 +4,8 @@ import { constants, closeSync, fsyncSync, openSync, renameSync, writeFileSync } 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
+import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
+import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -122,9 +124,13 @@ export async function runWorkerBridge(launch) {
     verifyClient: ({ req }) => !connected && !req.headers.origin && req.headers.authorization === `Bearer ${token}`
   });
   await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
-  const turn = new CodexWorkerTurn(launch.binding,
+  const turn = launch.binding ? new CodexWorkerTurn(launch.binding,
     value => saveTurnReceipt(launch.binding.receiptPath, value),
-    value => saveTurnReceipt(`${launch.binding.receiptPath}.final.json`, value));
+    value => saveTurnReceipt(`${launch.binding.receiptPath}.final.json`, value)) : undefined;
+  const selection = launch.selection ? new CodexConversationSelection(launch.selection,
+    value => saveTurnReceipt(launch.selection.receiptPath, value)) : undefined;
+  const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
+  if (!turn && !selection) throw new Error("A native bridge execution binding is required.");
   let finishing = false;
   const fail = error => {
     console.error(`CloudX native worker bridge: ${error.message}`);
@@ -157,8 +163,10 @@ export async function runWorkerBridge(launch) {
           const message = JSON.parse(line);
           if (socket.readyState !== WebSocket.OPEN) throw new Error("Native worker emitted a message without its visible client.");
           if (socket.bufferedAmount > MAX_MESSAGE_BYTES) throw new Error("Native worker client cannot keep up with output.");
+          selection?.fromServer(message);
+          permissions?.fromServer(message);
+          turn?.fromServer(message);
           socket.send(line);
-          turn.fromServer(message);
         }
         if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
       } catch (error) { fail(error); }
@@ -167,7 +175,9 @@ export async function runWorkerBridge(launch) {
     socket.on("message", data => {
       try {
         const message = JSON.parse(data.toString());
-        turn.fromClient(message);
+        permissions?.fromClient(message);
+        selection?.fromClient(message);
+        turn?.fromClient(message);
         const line = `${JSON.stringify(message)}\n`;
         if (native.stdin.writableLength + Buffer.byteLength(line) > MAX_MESSAGE_BYTES) throw new Error("Native worker input exceeds the size limit.");
         native.stdin.write(line);

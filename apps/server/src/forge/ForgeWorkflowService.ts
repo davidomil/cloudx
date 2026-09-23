@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   CodexReasoningEffort,
+  DirectoryOwnershipPreview,
+  DirectoryOwnershipReconciliation,
   ForgeChangeRequest,
   ForgeChangeRequestStatus,
   ForgeCredentialRole,
@@ -33,6 +35,8 @@ export interface ForgeSettings {
   maxRunMinutes: number;
 }
 interface Runtime {
+  previewOwnership(id: string): Promise<DirectoryOwnershipPreview>;
+  reconcileOwnership(id: string, input: DirectoryOwnershipReconciliation): Promise<void>;
   isActive(tabId: string): boolean;
   workerHistory(id: string): Promise<ForgeWorkerHistory | undefined>;
   readTurnCompletion(workerId: string, attemptId: string): Promise<ForgeTurnCompletion | undefined>;
@@ -524,6 +528,28 @@ export class ForgeWorkflowService {
         return this.resumeAutoReview(issue, placement);
       return this.resumeWorker(issue.id, placement, { refreshPublicationCredentials: true });
     });
+  }
+  previewOwnership(id: string): Promise<DirectoryOwnershipPreview> {
+    return this.exclusive(async () => {
+      this.requireOwnershipReconciliation(id);
+      return this.deps.runtime.previewOwnership(id);
+    });
+  }
+  reconcileOwnership(id: string, input: DirectoryOwnershipReconciliation): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      const worker = this.requireOwnershipReconciliation(id);
+      await this.deps.runtime.reconcileOwnership(id, input);
+      // Ownership repair does not consume reports, alter publication, or resume work.
+      return structuredClone(worker);
+    });
+  }
+  private requireOwnershipReconciliation(id: string): ForgeWorker {
+    const worker = this.requireWorker(id);
+    if (this.disposed) throw new Error("Forge Workers is shutting down.");
+    if (this.controlGroup(id).some(member => !["failed", "paused", "stopped", "cleanup_failed", "completed", "awaiting_review", "awaiting_merge"].includes(member.status) ||
+        member.tabId && this.deps.runtime.isActive(member.tabId) || this.providerRecoveries.has(member.id)))
+      throw new Error("Stop the issue and its reviewer before reconciling directory ownership.");
+    return worker;
   }
   continueWorker(id: string, input: string, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {

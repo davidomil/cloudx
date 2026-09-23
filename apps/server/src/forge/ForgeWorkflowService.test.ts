@@ -66,6 +66,8 @@ function fixture() {
   };
   let stored: ForgeWorker[] = [];
   const runtime = {
+    previewOwnership: vi.fn(async (_id: string) => ({ fingerprint: "a".repeat(64), directories: [] })),
+    reconcileOwnership: vi.fn(async (_id: string, _input: unknown) => {}),
     isActive: vi.fn(() => true),
     workerHistory: vi.fn(async (_id: string): Promise<ForgeWorkerHistory | undefined> => undefined),
     recover: vi.fn(async (_id: string): ReturnType<ForgeWorkflowDependencies["runtime"]["recover"]> => ({
@@ -156,6 +158,64 @@ function deferred<T>() {
   const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
   return { promise, resolve, reject };
 }
+
+describe("Explicit directory ownership reconciliation", () => {
+  it("preserves report/publication and stopped workflow state without launching or publishing", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.stop(worker.id);
+    f.runtime.isActive.mockReturnValue(false);
+    f.stored()[0].pendingPublication = {
+      report: { kind: "issue", title: "Retain publication", body: "Retain report", discussionReplies: [{ discussionId: "discussion-1", body: "Already prepared reply" }], resolvedDiscussionIds: [] },
+      headSha: f.change.headSha, repliedDiscussionIds: [], replyingToDiscussionId: "discussion-1",
+    };
+    const restored = new ForgeWorkflowService(f.deps);
+    await restored.dashboard();
+    const before = f.stored();
+    f.runtime.launch.mockClear();
+    f.runtime.recover.mockClear();
+    f.reports.remove.mockClear();
+    const preview = await restored.previewOwnership(worker.id);
+    await restored.reconcileOwnership(worker.id, { fingerprint: preview.fingerprint, attestations: [{ device: "64521", filesystemId: "original", filesystemType: "ext4" }] });
+    expect(f.runtime.reconcileOwnership).toHaveBeenCalledTimes(1);
+    expect(f.stored()).toEqual(before);
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+    expect(f.runtime.recover).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+  });
+
+  it("reconciles a blocked reviewer while its inactive issue remains awaiting review", async () => {
+    const f = fixture();
+    const issue = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.stop(issue.id);
+    const parent = { ...f.stored()[0], tabId: undefined, status: "awaiting_review" as const,
+      autoReview: { enabled: false, phase: "reviewing" as const, reviewWorkerId: "blocked-review", placement } };
+    const reviewer = { ...parent, id: "blocked-review", kind: "review" as const, number: 7,
+      status: "cleanup_failed" as const, issueWorkerId: parent.id, autoReview: undefined };
+    await f.deps.store.write([parent, reviewer]);
+    f.runtime.isActive.mockReturnValue(false);
+    const restored = new ForgeWorkflowService(f.deps);
+    await restored.dashboard();
+    const before = structuredClone(f.stored());
+    const preview = await restored.previewOwnership(reviewer.id);
+    await restored.reconcileOwnership(reviewer.id, { fingerprint: preview.fingerprint, attestations: [] });
+    expect(f.runtime.reconcileOwnership).toHaveBeenCalledExactlyOnceWith(reviewer.id, { fingerprint: preview.fingerprint, attestations: [] });
+    expect(f.stored()).toEqual(before);
+  });
+
+  it("blocks reconciliation while a worker is running and preserves owner validation errors", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await expect(f.service.previewOwnership(worker.id)).rejects.toThrow("Stop the issue");
+    expect(f.runtime.previewOwnership).not.toHaveBeenCalled();
+    await f.service.stop(worker.id);
+    f.runtime.isActive.mockReturnValue(false);
+    f.runtime.reconcileOwnership.mockRejectedValueOnce(new Error("Nested source identity changed."));
+    await expect(f.service.reconcileOwnership(worker.id, { fingerprint: "a".repeat(64), attestations: [] })).rejects.toThrow("Nested source identity changed.");
+    expect(f.stored()[0].status).toBe("stopped");
+  });
+});
 
 describe("Retained worker terminal history", () => {
   it("loads the known worker after restart and reads history without launching work", async () => {

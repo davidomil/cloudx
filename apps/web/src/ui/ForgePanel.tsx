@@ -1,9 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
 import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH } from "@cloudx/shared";
-import type { ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
+import type { DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
 import { ForgeWorkerTerminalOverlay } from "./ForgeWorkerTerminalOverlay.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
@@ -396,6 +397,11 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && !conflict && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
+    {!archivedDraft && ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) ? <DirectoryOwnershipRecovery key={worker.id}
+      disabled={busy || controlling || reviewRunning}
+      preview={async () => (await request<{ preview: DirectoryOwnershipPreview }>("forge.worker.previewOwnership", { id: worker.id })).preview}
+      reconcile={async input => { await request("forge.worker.reconcileOwnership", { id: worker.id, ...input }); }}
+    /> : null}
     {!archivedDraft && uncertainReply ? <section aria-label="Uncertain discussion reply">
       <p className="forge-notice">Inspect the reply on the PR/MR. Omit it to continue publication without posting it again or resolving this thread. Then retry publication.</p>
       <p>Discussion: <code>{uncertainReply.discussionId}</code></p>

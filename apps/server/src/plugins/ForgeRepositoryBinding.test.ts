@@ -65,6 +65,8 @@ async function fixture(selectedRepository: ForgeRepository) {
     return remote;
   });
   const runtime = {
+    previewOwnership: vi.fn(async () => ({ fingerprint: "a".repeat(64), directories: [] })),
+    reconcileOwnership: vi.fn(async () => {}),
     readTurnCompletion: vi.fn(async (workerId: string, attemptId: string) => ({ workerId, attemptId, threadId: "thread", turnId: attemptId, status: "completed" as const })),
     finish: vi.fn(async () => {}),
     isActive: vi.fn(() => true),

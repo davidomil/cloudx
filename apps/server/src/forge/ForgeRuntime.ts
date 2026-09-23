@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -15,9 +15,14 @@ import {
   type ForgeWorkerHistory,
   type ForgeTurnCompletion,
   type WorkspaceTab,
+  type DirectoryOwnershipPreview,
+  type DirectoryOwnershipReconciliation,
 } from "@cloudx/shared";
 
-import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
+import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
+import { CodexStateSources, type ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
+import { assertDirectoryIdentity, readDirectoryIdentity, isDurableDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
+import { JsonStateFile, openOwnedDirectoryNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, stringifyJsonDocument, type OwnedDirectory } from "../jsonStateFile.js";
 import type { PathPolicy } from "../pathPolicy.js";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { SessionStore } from "../sessionStore.js";
@@ -67,12 +72,6 @@ export interface ForgeRuntimeDependencies {
     environment?: NodeJS.ProcessEnv,
   ) => Promise<string>;
   reviewConversations?: Pick<ForgeReviewConversation, "prepare">;
-}
-
-interface DirectoryIdentity {
-  path: string;
-  dev: string;
-  ino: string;
 }
 
 interface OwnedPublishedSync {
@@ -684,6 +683,183 @@ export class ForgeRuntime {
       owned.closed = true;
       await this.tabManifest(tabId).write(owned);
       this.ownedTabs.delete(tabId);
+    }
+  }
+
+  previewOwnership(id: string): Promise<DirectoryOwnershipPreview> {
+    return this.serialize(id, "previewOwnership", undefined, async () => (await this.ownershipReconciliation(id)).preview);
+  }
+
+  reconcileOwnership(id: string, input: DirectoryOwnershipReconciliation): Promise<void> {
+    return this.serialize(id, "reconcileOwnership", undefined, async () => {
+      const { reconciliation, preview, records, tabs, owned, missing } = await this.ownershipReconciliation(id);
+      reconciliation.validate(preview, input);
+      await this.assertReconciliationQuiescent(owned, tabs);
+      await reconciliation.assertCurrent();
+      for (const directory of missing)
+        if (await this.disposableDirectoryExists(directory))
+          throw new Error("A removed worker directory reappeared after inspection. Inspect ownership again before reconciling.");
+      if (await this.configHash(owned) !== owned.gitConfigHash)
+        throw new Error("Worker Git configuration changed after inspection; its checkout was preserved.");
+      const sourceDirectories = new Map<JsonStateFile, OwnedDirectory>();
+      try {
+        for (const record of records) {
+          const view = record.sourceDirectory;
+          if (view) sourceDirectories.set(record.file, await openOwnedDirectoryNoFollow(path.dirname(view.path), view.path, "Codex launch", view));
+        }
+        for (const record of records) {
+          const directory = sourceDirectories.get(record.file);
+          const binding = directory?.childPath(".cloudx-source.json");
+          const current = binding
+            ? await requireRegularFile(binding, "Codex source binding") && JSON.parse(await readTextFileNoFollow(binding, "Codex source binding"))
+            : await record.file.read();
+          if (JSON.stringify(current) !== JSON.stringify(record.saved))
+            throw new Error("Worker ownership records changed after inspection. Inspect them again before reconciling.");
+        }
+        for (const directory of sourceDirectories.values()) await directory.assertCurrent();
+        // Every path, record and process is validated before replacing any metadata.
+        for (const record of records) {
+          const directory = sourceDirectories.get(record.file);
+          if (directory) await this.writeReconciledSourceBinding(directory, record.next);
+          else await record.file.write(record.next);
+        }
+        for (const tab of tabs) if (this.ownedTabs.has(tab.tabId)) this.ownedTabs.set(tab.tabId, tab);
+      } finally {
+        await Promise.all([...sourceDirectories.values()].map(directory => directory.close()));
+      }
+    });
+  }
+
+  private async writeReconciledSourceBinding(directory: OwnedDirectory, binding: unknown): Promise<void> {
+    await directory.assertCurrent();
+    const staging = directory.childPath(`.cloudx-source.json.${randomUUID()}.tmp`);
+    const file = await fs.open(staging, "wx", 0o600);
+    let staged = true;
+    try {
+      try {
+        await file.writeFile(stringifyJsonDocument(binding, "Codex source binding"));
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await directory.assertCurrent();
+      await fs.rename(staging, directory.childPath(".cloudx-source.json"));
+      staged = false;
+      await directory.assertCurrent();
+    } finally {
+      if (staged) await fs.unlink(staging);
+    }
+  }
+
+  private async ownershipReconciliation(id: string) {
+    const owned = await this.readOwned(id);
+    if (owned.cleaned || !owned.prepared || owned.gitPending)
+      throw new Error("Only a prepared workspace without an unresolved Git operation can reconcile filesystem ownership.");
+    const reconciliation = new DirectoryOwnershipReconciler();
+    const missing = new Set<string>();
+    const disposable = async (expected: DirectoryIdentity): Promise<DirectoryIdentity> => {
+      if (await this.disposableDirectoryExists(expected.path)) return reconciliation.add(expected);
+      missing.add(expected.path);
+      return expected;
+    };
+    const records: Array<{ file: JsonStateFile; saved: unknown; next: unknown; sourceDirectory?: DirectoryIdentity }> = [];
+    const save = (file: JsonStateFile, value: unknown, sourceDirectory?: DirectoryIdentity) => {
+      records.push({ file, saved: structuredClone(value), next: value, sourceDirectory });
+    };
+    save(this.manifest(id), owned);
+    owned.repository = await reconciliation.add(owned.repository);
+    owned.worktree = await reconciliation.add(owned.worktree);
+    owned.gitDirectory = await reconciliation.add(owned.gitDirectory!);
+    if (await this.configHash(owned) !== owned.gitConfigHash)
+      throw new Error("Worker Git configuration or origin changed; its checkout was preserved.");
+    const tabs: OwnedTab[] = [];
+    const tabDirectory = path.join(this.dependencies.dataDir, "forge-workers", "tabs");
+    if (await requireSafeDirectory(this.dependencies.dataDir, tabDirectory, { create: false, label: "Forge tab ownership directory" })) {
+      for (const name of (await fs.readdir(tabDirectory)).sort()) {
+        if (!name.endsWith(".json")) continue;
+        const file = this.tabManifest(name.slice(0, -5));
+        const tab = await file.read<OwnedTab>();
+        if (!tab || tab.workerId !== id || tab.closed) continue;
+        if (tab.tabId !== name.slice(0, -5) || typeof tab.quiescent !== "boolean") throw new Error("Worker tab ownership record is invalid.");
+        save(file, tab);
+        for (const key of ["context", "launch"] as const) {
+          const expected = tab[key];
+          if (!expected) continue;
+          const parent = path.join(path.resolve(this.dependencies.dataDir), key === "context" ? "context" : "codex-launches");
+          if (!isIdentity(expected) || path.dirname(expected.path) !== parent || key === "launch" && path.basename(expected.path) !== tab.tabId)
+            throw new Error("Worker nested directory ownership record is invalid.");
+          tab[key] = await disposable(expected);
+        }
+        if (tab.execution) {
+          if (tab.execution.directory !== path.join(path.resolve(this.dependencies.dataDir), "forge-workers", "executions", tab.execution.executionId) ||
+            tab.execution.receiptDirectory.path !== tab.execution.directory)
+            throw new Error("Worker execution ownership record is invalid.");
+          tab.execution.receiptDirectory = await disposable(tab.execution.receiptDirectory);
+        }
+        tabs.push(tab);
+      }
+    }
+    const views = new Map(tabs.filter(tab => tab.launch && !missing.has(tab.launch.path)).map(tab => [tab.launch!.path, tab.launch!]));
+    if (owned.reviewConversation) {
+      const binding = owned.reviewConversation;
+      const source = await reconciliation.add({ ...binding.source, path: binding.source.home });
+      binding.source = { ...binding.source, dev: source.dev, ino: source.ino, durable: source.durable };
+      binding.sqliteHome = await reconciliation.add(binding.sqliteHome);
+      binding.originView = await reconciliation.add(binding.originView);
+      views.set(binding.originView.path, binding.originView);
+    }
+    for (const [view, identity] of views) {
+      if (path.dirname(view) !== path.join(path.resolve(this.dependencies.dataDir), "codex-launches")) throw new Error("Codex launch ownership record is invalid.");
+      const file = new JsonStateFile(this.dependencies.dataDir, path.relative(this.dependencies.dataDir, path.join(view, ".cloudx-source.json")), "Codex source binding", 0o600);
+      const binding = await file.read<ResolvedCodexStateSource & { version: number }>();
+      if (!binding) {
+        if (owned.reviewConversation) throw new Error("Reviewer source binding is missing; its existing thread was preserved.");
+        continue;
+      }
+      if (binding.version !== 1 || binding.sourceId !== "shared" || !isIdentity({ ...binding, path: binding.home })) throw new Error("Codex source binding is invalid.");
+      const sources = new CodexStateSources(this.dependencies.dataDir, { CODEX_HOME: binding.home });
+      try {
+        const selected = await sources.resolve();
+        if (selected.home !== binding.home) throw new Error("Codex source selection changed.");
+        await reconciliation.add({ ...binding, path: binding.home });
+        save(file, binding, identity);
+        Object.assign(binding, selected);
+      } finally { await sources.dispose(); }
+      if (owned.reviewConversation && (binding.home !== owned.reviewConversation.source.home || binding.ino !== owned.reviewConversation.source.ino))
+        throw new Error("Reviewer conversation source changed; its existing thread was preserved.");
+      for (const name of ["sessions", "archived_sessions"]) {
+        const link = path.join(view, name);
+        const stat = await fs.lstat(link).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+        if (stat && (!stat.isSymbolicLink() || await fs.realpath(link) !== path.join(binding.home, name)))
+          throw new Error("Codex session history link changed; its view was preserved.");
+      }
+    }
+    await this.assertReconciliationQuiescent(owned, tabs);
+    const snapshots = records.map(record => ({ path: record.file.filePath, saved: record.saved }));
+    return { owned, tabs, records, reconciliation, missing, preview: reconciliation.preview({ records: snapshots, missing: [...missing] }) };
+  }
+
+  private async disposableDirectoryExists(directory: string): Promise<boolean> {
+    if (!await requireSafeDirectory(this.dependencies.dataDir, path.dirname(directory), { create: false, label: "Worker disposable directory parent" })) return false;
+    try { await fs.lstat(directory); return true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  private async assertReconciliationQuiescent(owned: OwnedWorkspace, tabs: OwnedTab[]): Promise<void> {
+    const environment = await executionEnvironment();
+    if (owned.launchPending && (!owned.launchBootId || owned.launchBootId === environment.bootId))
+      throw new Error("Worker launch ownership is unresolved. Reboot the host before reconciling filesystem ownership.");
+    for (const tab of this.dependencies.sessions.listTabs())
+      if (tab.ownerPluginId === "forge" && tab.pluginMetadata?.["forge-workers"]?.workerId === owned.id && this.isActive(tab.id))
+        throw new Error("Stop the worker process before reconciling filesystem ownership.");
+    for (const tab of tabs) {
+      if (tab.quiescent) continue;
+      if (tab.execution) await this.executions.assertEnded(tab.execution);
+      else if (!tab.observedBootId || tab.observedBootId === environment.bootId)
+        throw new Error("Worker process ownership is unresolved. Reboot the host after its recorded execution before reconciling filesystem ownership.");
     }
   }
 
@@ -1734,10 +1910,7 @@ export class ForgeRuntime {
     );
     const current = await optionalIdentity(launchPath);
     if (!current) return;
-    if (current.dev !== expected.dev || current.ino !== expected.ino)
-      throw new Error(
-        "Worker launch ownership changed; the replacement was preserved.",
-      );
+    assertDirectoryIdentity(expected, current, "Worker launch");
     if (conversation) await retireReviewSessionView(this.dependencies.dataDir, tabId, expected, conversation);
     else await fs.rm(launchPath, { recursive: true });
   }
@@ -1755,14 +1928,7 @@ export class ForgeRuntime {
 
   private async assertIdentity(expected: DirectoryIdentity): Promise<void> {
     const current = await this.directory(expected.path);
-    if (
-      current.path !== expected.path ||
-      current.dev !== expected.dev ||
-      current.ino !== expected.ino
-    )
-      throw new Error(
-        "Worker directory ownership changed; the replacement was preserved.",
-      );
+    assertDirectoryIdentity(expected, current, "Worker directory");
   }
 
   private serialize<T>(id: string, name: string, signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
@@ -1889,19 +2055,13 @@ function isIdentity(value: unknown): value is DirectoryIdentity {
   return (
     typeof item.path === "string" &&
     typeof item.dev === "string" &&
-    typeof item.ino === "string"
+    typeof item.ino === "string" &&
+    (item.durable === undefined || isDurableDirectoryIdentity(item.durable))
   );
 }
 
 async function identity(directory: string): Promise<DirectoryIdentity> {
-  const stat = await fs.lstat(directory, { bigint: true });
-  if (!stat.isDirectory() || stat.isSymbolicLink())
-    throw new Error("Worker directory must be a real directory.");
-  return {
-    path: directory,
-    dev: stat.dev.toString(),
-    ino: stat.ino.toString(),
-  };
+  return readDirectoryIdentity(directory, "Worker directory");
 }
 
 async function optionalIdentity(

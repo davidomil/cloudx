@@ -4,11 +4,18 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
+import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation } from "@cloudx/shared";
+import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
+import { openOwnedDirectoryNoFollow, stringifyJsonDocument } from "../jsonStateFile.js";
+
+import { assertDirectoryIdentity, readDirectoryIdentity, sameDirectoryIdentity, isDurableDirectoryIdentity, type DurableDirectoryIdentity } from "../directoryIdentity.js";
+
 export interface ResolvedCodexStateSource {
   sourceId: string;
   home: string;
   dev: string;
   ino: string;
+  durable?: DurableDirectoryIdentity;
 }
 
 interface SourceDependencies {
@@ -159,8 +166,9 @@ export class CodexStateSources {
     signal?: AbortSignal,
   ): Promise<void> {
     const current = await this.resolve(signal);
-    if (!sameSource(source, current))
-      throw new Error("Codex source binding is stale: source changed.");
+    if (source.sourceId !== current.sourceId) throw new Error("Codex source binding is stale: source selection changed.");
+    if (!sameCodexSource(source, current))
+      assertDirectoryIdentity({ ...source, path: source.home }, { ...current, path: current.home }, "Codex source binding is stale: source");
   }
 
   replaceConfig(
@@ -200,7 +208,7 @@ export class CodexStateSources {
         } finally {
           await this.cleanup(() => file.close());
         }
-        if (!sameSource(source, await this.resolveChecked(check)))
+        if (!sameCodexSource(source, await this.resolveChecked(check)))
           throw new Error("Codex source changed.");
         if (await this.readText(target, 1_048_576, check, true) !== expected)
           throw new Error("Shared Codex settings changed. Reload before saving again.");
@@ -231,6 +239,67 @@ export class CodexStateSources {
     return this.work(signal, (check) => this.bindingChecked(tabId, check));
   }
 
+  previewOwnership(tabId: string): Promise<DirectoryOwnershipPreview> {
+    return this.work(undefined, async check => (await this.ownershipReconciliation(tabId, check)).preview);
+  }
+
+  reconcileOwnership(tabId: string, input: DirectoryOwnershipReconciliation): Promise<void> {
+    return this.work(undefined, async check => {
+      const { reconciliation, preview, selected, record, view } = await this.ownershipReconciliation(tabId, check);
+      reconciliation.validate(preview, input);
+      await reconciliation.assertCurrent();
+      const ownedView = await openOwnedDirectoryNoFollow(path.dirname(view.path), view.path, "Codex launch", view);
+      const binding = ownedView.childPath(BINDING);
+      const staging = ownedView.childPath(`.cloudx-binding-${randomUUID()}.tmp`);
+      let staged = false;
+      try {
+        if (JSON.stringify(await this.readBindingRecord(binding, check)) !== JSON.stringify(record))
+          throw new Error("Codex source binding changed after inspection. Inspect it again before reconciling.");
+        await ownedView.assertCurrent();
+        check();
+        const file = await this.dependencies.fs.open(staging, "wx", 0o600);
+        staged = true;
+        try {
+          check();
+          await file.writeFile(stringifyJsonDocument({ version: 1, ...selected }, "Codex source binding"));
+          check();
+          await file.sync();
+        } finally {
+          await this.cleanup(() => file.close());
+        }
+        await ownedView.assertCurrent();
+        check();
+        await this.dependencies.fs.rename(staging, binding);
+        staged = false;
+        await ownedView.assertCurrent();
+      } finally {
+        try {
+          if (staged) await this.cleanup(() => this.dependencies.fs.unlink(staging));
+        } finally {
+          await this.cleanup(() => ownedView.close());
+        }
+      }
+    });
+  }
+
+  private async ownershipReconciliation(tabId: string, check: () => void) {
+    const record = await this.bindingRecord(tabId, check);
+    if (!record) throw new Error("Codex launch source binding is missing.");
+    const selected = await this.resolveChecked(check);
+    if (record.sourceId !== selected.sourceId || record.home !== selected.home) throw new Error("Codex source selection changed; filesystem reconciliation cannot change the selected home.");
+    const reconciliation = new DirectoryOwnershipReconciler();
+    await reconciliation.add({ ...record, path: record.home });
+    const view = await readDirectoryIdentity(this.viewPath(tabId), "Codex launch");
+    for (const name of ["sessions", "archived_sessions"]) {
+      const link = path.join(view.path, name);
+      const stat = await this.optionalStat(link, check);
+      if (stat && (!stat.isSymbolicLink() || await this.dependencies.fs.realpath(link) !== path.join(selected.home, name)))
+        throw new Error("Codex session history link changed; its view was preserved.");
+    }
+    check();
+    return { reconciliation, selected, record, view, preview: reconciliation.preview({ record, view }) };
+  }
+
   async bind(
     tabId: string,
     source: ResolvedCodexStateSource,
@@ -239,11 +308,11 @@ export class CodexStateSources {
     return this.work(signal, async (check) => {
       const view = this.viewPath(tabId);
       const shared = await this.resolveChecked(check);
-      if (!sameSource(source, shared)) throw new Error("Codex launch requires the shared session store.");
+      if (!sameCodexSource(source, shared)) throw new Error("Codex launch requires the shared session store.");
       const existing = await this.bindingChecked(tabId, check);
       check();
       if (existing) {
-        if (!sameSource(existing, source))
+        if (!sameCodexSource(source, existing))
           throw new Error(
             "Codex source selection conflicts with existing binding.",
           );
@@ -292,6 +361,15 @@ export class CodexStateSources {
     tabId: string,
     check: () => void,
   ): Promise<ResolvedCodexStateSource | undefined> {
+    const record = await this.bindingRecord(tabId, check);
+    if (!record) return undefined;
+    const selected = await this.resolveChecked(check);
+    if (!sameCodexSource(record, selected))
+      assertDirectoryIdentity({ ...record, path: record.home }, { ...selected, path: selected.home }, "Codex source binding is stale: source");
+    return selected;
+  }
+
+  private async bindingRecord(tabId: string, check: () => void): Promise<ResolvedCodexStateSource | undefined> {
     const view = this.viewPath(tabId);
     if (!(await this.optionalStat(view, check))) {
       return undefined;
@@ -299,10 +377,14 @@ export class CodexStateSources {
     await this.directory(this.dataDir, check);
     await this.directory(path.dirname(view), check);
     await this.directory(view, check);
+    return this.readBindingRecord(path.join(view, BINDING), check);
+  }
+
+  private async readBindingRecord(binding: string, check: () => void): Promise<ResolvedCodexStateSource> {
     let value: unknown;
     try {
       value = JSON.parse(
-        (await this.readText(path.join(view, BINDING), 4096, check))!,
+        (await this.readText(binding, 4096, check))!,
       );
     } catch {
       check();
@@ -312,8 +394,8 @@ export class CodexStateSources {
       throw new Error("Invalid Codex source binding.");
     const record = value as Record<string, unknown>;
     if (
-      Object.keys(record).sort().join(",") !==
-        "dev,home,ino,sourceId,version" ||
+      Object.keys(record).some(key => !["dev", "home", "ino", "sourceId", "version", "durable"].includes(key)) ||
+      (record.durable !== undefined && !isDurableDirectoryIdentity(record.durable)) ||
       record.version !== 1 ||
       record.sourceId !== "shared" ||
       ![record.home, record.sourceId, record.dev, record.ino].every(
@@ -321,10 +403,7 @@ export class CodexStateSources {
       )
     )
       throw new Error("Invalid Codex source binding.");
-    const selected = await this.resolveChecked(check);
-    if (!sameSource(record as unknown as ResolvedCodexStateSource, selected))
-      throw new Error("Codex source binding is stale: source changed.");
-    return selected;
+    return record as unknown as ResolvedCodexStateSource;
   }
 
   private async resolveChecked(
@@ -377,12 +456,10 @@ export class CodexStateSources {
       !after.isDirectory()
     )
       throw new Error("Codex source directory changed.");
-    return {
-      sourceId: "shared",
-      home,
-      dev: String(after.dev),
-      ino: String(after.ino),
-    };
+    const identity = await readDirectoryIdentity(home, "Codex source");
+    check();
+    if (identity.dev !== String(after.dev) || identity.ino !== String(after.ino)) throw new Error("Codex source directory changed.");
+    return { sourceId: "shared", home, dev: identity.dev, ino: identity.ino, durable: identity.durable };
   }
 
   private async requireIdentity(
@@ -390,7 +467,7 @@ export class CodexStateSources {
     check: () => void,
   ): Promise<void> {
     const current = await this.directory(source.home, check);
-    if (!sameSource(source, current)) throw new Error("Codex source changed.");
+    if (!sameCodexSource(source, current)) throw new Error("Codex source changed.");
   }
 
   private async optionalStat(
@@ -485,11 +562,11 @@ export class CodexStateSources {
   }
 }
 
-function sameSource(
+export function sameCodexSource(
   left: ResolvedCodexStateSource,
   right: ResolvedCodexStateSource,
 ): boolean {
   return (
-    left.sourceId === right.sourceId && left.home === right.home && left.dev === right.dev && left.ino === right.ino
+    left.sourceId === right.sourceId && sameDirectoryIdentity({ ...left, path: left.home }, { ...right, path: right.home })
   );
 }

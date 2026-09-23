@@ -4,6 +4,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TabRecovery, WorkspaceTab } from "@cloudx/shared";
 
+import { previewTabOwnership, reconcileTabOwnership } from "../api.js";
+vi.mock("../api.js", () => ({ previewTabOwnership: vi.fn(), reconcileTabOwnership: vi.fn() }));
+
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 
 const tab: WorkspaceTab = {
@@ -31,6 +34,22 @@ afterEach(async () => {
 });
 
 describe("workspace recovery choices", () => {
+  it("repairs only the inspected tab's source after explicit filesystem verification without starting a conversation", async () => {
+    const preview = { fingerprint: "a".repeat(64), directories: [{ path: "/home/me/.codex", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ef53" }] };
+    vi.mocked(previewTabOwnership).mockResolvedValue(preview);
+    vi.mocked(reconcileTabOwnership).mockResolvedValue({ ...tab, pluginId: "codex-terminal" });
+    await show({ state: "missing", message: "Codex source device changed.", canResume: false }, "codex-terminal");
+    await click("Inspect directory ownership");
+    expect(previewTabOwnership).toHaveBeenCalledExactlyOnceWith(tab.id);
+    const apply = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === "Reconcile verified ownership")!;
+    expect(apply.disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+    await click("Reconcile verified ownership");
+    expect(reconcileTabOwnership).toHaveBeenCalledExactlyOnceWith(tab.id, { fingerprint: preview.fingerprint, attestations: [{ device: "64521", filesystemId: "original-root", filesystemType: "ef53" }] });
+    expect(recover).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Directory ownership reconciled. Resume when ready.");
+  });
+
   it("opens a replacement only after the user sees that the previous shell ended", async () => {
     await show({ state: "missing", message: "The previous shell process ended." });
     expect(container.textContent).toContain("The previous shell process ended.");
@@ -50,7 +69,7 @@ describe("workspace recovery choices", () => {
   it("offers the recorded exact conversation and explicit selection", async () => {
     await show({ state: "missing", message: "The previous process ended.", conversationId: "recorded-session", canResume: true }, "codex-terminal");
     expect(container.textContent).toContain("recorded-session");
-    expect(buttons()).toEqual(["Resume conversation", "Resume selected conversation"]);
+    expect(buttons()).toEqual(["Resume conversation", "Inspect directory ownership", "Resume selected conversation"]);
     await click("Resume conversation");
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "resume-conversation" });
   });
@@ -58,8 +77,8 @@ describe("workspace recovery choices", () => {
   it.each(["The exact conversation ID was not recorded.", "The saved conversation transcript is unavailable."])("explains '%s' and requires explicit selection", async message => {
     await show({ state: "missing", message, canResume: false }, "codex-terminal");
     expect(container.textContent).toContain(message);
-    expect(buttons()).toEqual(["Resume selected conversation"]);
-    expect(container.querySelector<HTMLButtonElement>("button")!.disabled).toBe(true);
+    expect(buttons()).toEqual(["Inspect directory ownership", "Resume selected conversation"]);
+    expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
     const input = container.querySelector<HTMLInputElement>("input")!;
     await act(async () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, " chosen-session ");

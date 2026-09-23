@@ -5,7 +5,7 @@ import {
   type JsonSchemaLike,
   type WorkspacePlugin,
 } from "@cloudx/plugin-api";
-import type { ForgePlacement, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
+import type { DirectoryOwnershipReconciliation, ForgePlacement, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH } from "@cloudx/shared";
 import {
   forgeConfigFields,
@@ -196,6 +196,23 @@ export class ForgePlugin implements WorkspacePlugin {
           worker: await this.service().workflow.continueWorker(String(input.id), String(input.message), place(input)),
         }),
       ),
+      hook("worker.previewOwnership", "Inspect directory ownership recovery", "read", { id }, ["id"], async input => ({
+        preview: await this.service().workflow.previewOwnership(String(input.id)),
+      })),
+      hook("worker.reconcileOwnership", "Reconcile verified directory ownership", "write", {
+        id,
+        fingerprint: { type: "string", pattern: "^[a-f0-9]{64}$" },
+        attestations: {
+          type: "array", minItems: 1, maxItems: 128,
+          items: {
+            type: "object", additionalProperties: false,
+            properties: Object.fromEntries(["device", "filesystemId", "filesystemType"].map(name => [name, { type: "string", minLength: 1, maxLength: 256, pattern: "^\\S+$" }])),
+            required: ["device", "filesystemId", "filesystemType"],
+          },
+        },
+      }, ["id", "fingerprint", "attestations"], async ({ id, ...input }) => ({
+        worker: await this.service().workflow.reconcileOwnership(String(id), input as unknown as DirectoryOwnershipReconciliation),
+      })),
       hook(
         "worker.omitDiscussionReply",
         "Omit an uncertain discussion reply",

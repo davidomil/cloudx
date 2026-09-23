@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ForgeExecutionRecovery } from "./ForgeExecution.js";
+
+vi.mock("../filesystemIdentity.js", () => ({ filesystemIdentity: async () => ({ filesystemType: "ef53", filesystemId: "f00d1234" }) }));
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
@@ -98,3 +100,20 @@ async function fixture() {
   await receipt("ready");
   return { recovery, execution, receipt };
 }
+
+it("validates completion and cleans its durable receipt directory after device reassignment", async () => {
+  const { recovery, execution, receipt } = await fixture();
+  execution.receiptDirectory.dev = "1";
+  await expect(recovery.assertEnded(execution)).rejects.toThrow("still alive");
+  await receipt("complete", { exitCode: 0 });
+  await expect(recovery.assertEnded(execution)).resolves.toBeUndefined();
+  await recovery.remove(execution);
+  await expect(fs.stat(execution.directory)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("rejects invalid durable ownership metadata even when a reboot ended the process", async () => {
+  const { recovery, execution } = await fixture();
+  execution.bootId = randomUUID();
+  execution.receiptDirectory.durable!.uid = "invalid";
+  await expect(recovery.assertEnded(execution)).rejects.toThrow("record is invalid");
+});
