@@ -889,7 +889,9 @@ export class InstallerRunner {
       inspect: true,
     });
     this.log(`$ ${formatCommand(command, args, options)}`);
+    this.logVerboseCommand(options);
     const result = this.spawnCaptured(command, args, options);
+    this.logVerboseProcessResult(result);
     if (!processSucceeded(result)) throw commandFailure(command, args, result);
     return result.stdout.trim();
   }

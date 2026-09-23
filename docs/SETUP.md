@@ -103,6 +103,11 @@ prints command working directories, allowlisted installer environment values,
 captured stdout/stderr from probes, service unit write paths, and health-check
 failure context.
 
+For managed updates, launcher diagnostics go to stderr and coordinator diagnostics
+go to the private `~/.local/state/cloudx/settings-update/<run-id>.log` file.
+`CLOUDX_INSTALL_VERBOSE=1` also enables these diagnostics. A resumed run retains
+its verbose setting; adding `--verbose` when resuming enables it for that run.
+
 Cloudx binds to `127.0.0.1` by default. For a tailnet-authenticated path, add the
 exact externally visible origin to the installed environment file, restart
 Cloudx, and proxy the loopback service with Tailscale Serve:

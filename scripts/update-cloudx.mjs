@@ -22,6 +22,7 @@ export function parseUpdateArguments(argv) {
     } else if (flag === '--confirm-interruption' || flag === '--migrate-terminals') options.confirmInterruption = true;
     else if (flag === '--status') options.status = true;
     else if (flag === '--non-interactive') options.nonInteractive = true;
+    else if (flag === '--verbose') options.verbose = true;
     else if (flag === '--update' || flag === '--yes') continue;
     else throw new Error(`Unsupported managed update option: ${flag}`);
   }
@@ -33,9 +34,11 @@ export function parseUpdateArguments(argv) {
 }
 
 export async function launchManagedUpdate(options = {}) {
+  options = { ...options, verbose: options.verbose === true || process.env.CLOUDX_INSTALL_VERBOSE === '1' };
   const repoRoot = fs.realpathSync(options.repoRoot ?? process.cwd());
   const home = options.home ?? os.homedir();
-  const commands = new InstallerRunner({ cwd: repoRoot, nonInteractive: true, log: () => {} });
+  const commands = new InstallerRunner({ cwd: repoRoot, nonInteractive: true, verbose: options.verbose,
+    log: options.verbose ? console.error : () => {} });
   let envPath = path.join(home, '.config/cloudx/cloudx.env');
   let dataDir, savedRecord;
   let selection = options;

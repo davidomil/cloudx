@@ -98,13 +98,13 @@ export class ManagedUpdate {
 }
 
 export class UpdateHost {
-  constructor({ repoRoot, home = os.homedir(), dataDir, service, port, host, runDir, commands, save = () => {}, prepareRelease = prepareManagedRelease, recovery }) {
+  constructor({ repoRoot, home = os.homedir(), dataDir, service, port, host, runDir, commands, verbose = false, save = () => {}, prepareRelease = prepareManagedRelease, recovery }) {
     this.home = home;
     this.runDir = runDir;
     this.save = save;
     this.prepareRelease = prepareRelease;
     this.paths = { repoRoot: fs.realpathSync(repoRoot), dataDir, envPath: path.join(home, '.config/cloudx/cloudx.env'), systemdDir: path.join(home, '.config/systemd/user') };
-    this.runner = commands ?? new InstallerRunner({ cwd: this.paths.repoRoot, nonInteractive: true });
+    this.runner = commands ?? new InstallerRunner({ cwd: this.paths.repoRoot, nonInteractive: true, verbose });
     this.target = recovery?.mutating ? recovery.serviceTarget : inspectUpdateTarget({ paths: this.paths, commands: this.runner, service, port, host });
     if (!this.target || !['standard', 'web'].includes(this.target.kind) || !Array.isArray(this.target.serviceNames)) throw new Error('Invalid saved update service target.');
     if (recovery?.mutating) {
@@ -939,7 +939,7 @@ export async function runManagedUpdate(recordPath) {
   const save = value => writeUpdateJson(recordPath, value);
   try {
     const host = new UpdateHost({ repoRoot: record.repoRoot, home: record.home, dataDir: record.dataDir,
-      service: record.service, port: record.port, host: record.host, runDir, save, recovery: record.transition });
+      service: record.service, port: record.port, host: record.host, runDir, save, recovery: record.transition, verbose: record.verbose === true });
     return await new ManagedUpdate({ record, save, host }).run();
   } catch (error) {
     console.error(error);

@@ -347,7 +347,7 @@ export class SettingsUpdater {
     };
   }
 
-  start(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId } = {}) {
+  start(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId, verbose = false } = {}) {
     updateCommit(targetCommit);
     if (restoreSnapshotRunId && !RUN_ID.test(restoreSnapshotRunId)) throw new Error("Invalid snapshot identifier.");
     let saved;
@@ -416,6 +416,7 @@ export class SettingsUpdater {
       record.confirmInterruption ||= confirmInterruption;
       if (restoreSnapshotRunId) record.restoreSnapshotRunId = restoreSnapshotRunId;
     }
+    record.verbose = record.verbose === true || verbose === true;
     this.stage(record);
     const environmentFile = this.launchEnvironment(record);
     fs.rmSync(path.join(this.stateDir, "confirmation.json"), { force: true });
