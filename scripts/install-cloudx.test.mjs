@@ -712,6 +712,7 @@ describe("install-cloudx helpers", () => {
     });
     expect(service).toContain("Type=notify\nNotifyAccess=all");
     expect(service).toContain("WorkingDirectory=/repo");
+    expect(service).toContain("ConditionPathExists=/repo/apps/server/dist/terminal/broker.js");
     expect(service).toContain("EnvironmentFile=/home/me/.config/cloudx/cloudx.env");
     expect(service).toContain("ExecStart=/usr/bin/node /repo/apps/server/dist/terminal/broker.js");
     expect(service).not.toMatch(/PartOf=|BindsTo=|KillMode=/);
@@ -754,7 +755,7 @@ describe("install-cloudx helpers", () => {
     });
   });
 
-  it("prints verbose cwd, safe env, stdout, and stderr for captured commands", () => {
+  it.each(["capture", "inspect"])("prints verbose cwd, safe env, stdout, and stderr for %s", (method) => {
     const logs = [];
     const runner = new InstallerRunner({
       cwd: "/tmp",
@@ -762,7 +763,7 @@ describe("install-cloudx helpers", () => {
       verbose: true,
     });
 
-    const output = runner.capture(
+    const output = runner[method](
       process.execPath,
       ["-e", "console.log('probe stdout'); console.error('probe stderr')"],
       {
@@ -784,7 +785,7 @@ describe("install-cloudx helpers", () => {
     expect(logText).toContain("[verbose] stderr:\n  probe stderr");
   });
 
-  it("prints captured stdout and stderr before throwing in verbose mode", () => {
+  it.each(["capture", "inspect"])("prints stdout and stderr before %s throws in verbose mode", (method) => {
     const logs = [];
     const runner = new InstallerRunner({
       cwd: "/tmp",
@@ -793,7 +794,7 @@ describe("install-cloudx helpers", () => {
     });
 
     expect(() =>
-      runner.capture(process.execPath, [
+      runner[method](process.execPath, [
         "-e",
         "console.log('before failure'); console.error('failure detail'); process.exit(7)",
       ]),
@@ -803,7 +804,7 @@ describe("install-cloudx helpers", () => {
     expect(logText).toContain("[verbose] stderr:\n  failure detail");
   });
 
-  it("keeps captured output quiet by default", () => {
+  it.each(["capture", "inspect"])("keeps %s output quiet by default", (method) => {
     const logs = [];
     const runner = new InstallerRunner({
       cwd: "/tmp",
@@ -811,7 +812,7 @@ describe("install-cloudx helpers", () => {
     });
 
     expect(
-      runner.capture(process.execPath, ["-e", "console.log('quiet stdout')"]),
+      runner[method](process.execPath, ["-e", "console.log('quiet stdout')"]),
     ).toBe("quiet stdout");
     expect(logs.join("\n")).not.toContain("[verbose]");
   });

@@ -103,6 +103,11 @@ prints command working directories, allowlisted installer environment values,
 captured stdout/stderr from probes, service unit write paths, and health-check
 failure context.
 
+For managed updates, launcher diagnostics go to stderr and coordinator diagnostics
+go to the private `~/.local/state/cloudx/settings-update/<run-id>.log` file.
+`CLOUDX_INSTALL_VERBOSE=1` also enables these diagnostics. A resumed run retains
+its verbose setting; adding `--verbose` when resuming enables it for that run.
+
 Cloudx binds to `127.0.0.1` by default. For a tailnet-authenticated path, add the
 exact externally visible origin to the installed environment file, restart
 Cloudx, and proxy the loopback service with Tailscale Serve:
@@ -414,9 +419,14 @@ from `origin/main`, installs Node dependencies, rebuilds Cloudx, and asks whethe
 to restart only that unit. The address and port must match the service's HTTPS
 listener. It preserves the unit definition and environment, including transient services, and
 leaves shared Codex, ASR, documentation, model, and certificate installations in
-place. Add `--no-start` to build without restarting or `--dry-run --yes` to inspect
-the plan. The standard update mode rejects units owned by another checkout even
-with `--no-start`.
+place. Add `--no-start` to prepare dependencies and build the selected target
+without stopping, starting or restarting installed services. The run reports
+`prepared`; activation and runtime verification are still pending. Use its
+printed retained CLI command with `--resume <update-id>` and omit `--no-start`
+to activate it. Failed or interrupted preparation retries retain `--no-start`
+until preparation completes.
+Use `--dry-run --yes` to inspect the plan. The standard update mode rejects units
+owned by another checkout even with `--no-start`.
 
 ## Uninstall
 

@@ -7,6 +7,7 @@ import { CommandOutputTail } from "../../containers/ci/diagnostics.mjs";
 
 export const attempts = 3;
 export const requiredCases = [
+  "delivers a 64 MiB burst with 1024 replay bytes, snapshots, subsequent input, and confirmed termination",
   "drains parsed output without resuming an exited producer during terminate",
   "drains parsed output without resuming an exited producer during stop broker",
   "resumes output parsed while the producer is alive before termination",
@@ -161,7 +162,7 @@ async function readTestReport(filename) {
       errors.push(`Required case did not pass exactly once: ${title}`);
   }
   const selected = cases.filter((test) =>
-    /durable terminal broker|terminal replay history|restores a full 32 MiB replay/u.test(
+    /native Forge-owned terminal output|durable terminal broker|terminal replay history|restores a full 32 MiB replay/u.test(
       test.name,
     ),
   );

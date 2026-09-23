@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -10,6 +11,7 @@ const SAFE_ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 const FORGE_STATE = `plugin-data/forge-${createHash("sha256").update("forge").digest("hex")}.json`;
 const WORKER_GUIDANCE = "Stop or recover the worker through CloudX first. Resolve missing ownership evidence explicitly; service restarts do not prove a worker ended. Local resources were preserved.";
+const LEGACY_RECOVERY = "Legacy workspace has no saved session identities. Its exact layout will be backed up, but in-memory tabs and terminal processes cannot be restored. Record working directories and exact Codex conversation IDs before confirming interruption. No commands or prompts will be replayed.";
 
 /** Run before stopping the web service; snapshotTerminalRecovery checks again after it stops. */
 export function assertTerminalMigrationSafe({ dataDir }) {
@@ -17,13 +19,21 @@ export function assertTerminalMigrationSafe({ dataDir }) {
   snapshot.readForgeState();
 }
 
+export function inspectTerminalRecovery({ dataDir, allowLegacyState = false }) {
+  const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
+  snapshot.readForgeState();
+  snapshot.readSessions();
+  return { legacySessionIdentitiesUnavailable: snapshot.legacySessions, warnings: snapshot.legacySessions ? [LEGACY_RECOVERY] : [] };
+}
+
 /** The caller must stop the web service before this runs, and stop the broker only after it returns. */
-export function snapshotTerminalRecovery({ dataDir, log = console.warn }) {
-  const snapshot = new RecoverySnapshot(dataDir);
+export function snapshotTerminalRecovery({ dataDir, log = console.warn, allowLegacyState = false }) {
+  const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
   snapshot.readForgeState();
   snapshot.readSessions();
   if (!snapshot.files.size) return undefined;
   const backup = snapshot.save();
+  if (snapshot.legacySessions) log(LEGACY_RECOVERY);
   log(`Verified terminal recovery snapshot: ${backup}. Broker replacement interrupts processes. Reopen shells explicitly and select an exact saved Codex conversation in each existing tab; no commands or prompts are replayed.`);
   return backup;
 }
@@ -34,10 +44,12 @@ class RecoverySnapshot {
   sources = [];
   bytes = 0;
   entries = 0;
+  legacySessions = false;
 
-  constructor(dataDir) {
+  constructor(dataDir, allowLegacyState = false) {
     this.dataDir = path.resolve(dataDir);
     this.present = safeDirectory(this.dataDir, true);
+    this.allowLegacyState = allowLegacyState;
   }
 
   capture(relative, optional = false, source = path.join(this.dataDir, relative), limit = STATE_LIMIT) {
@@ -118,8 +130,10 @@ class RecoverySnapshot {
     if (!this.present) return;
     const workspace = this.json("workspace.json", true);
     const saved = this.json("sessions.json", true);
-    if (workspace !== undefined && saved === undefined && (!validWorkspace(workspace) || workspace.windows.some(window => layoutTabIds(window.layout).length)))
-      throw new Error("Legacy workspace has no saved session identities. Preserve and close its terminals manually before broker replacement; layout alone cannot restore them.");
+    if (workspace !== undefined && saved === undefined && (!validWorkspace(workspace) || workspace.windows.some(window => layoutTabIds(window.layout).length))) {
+      if (!this.allowLegacyState) throw new Error(LEGACY_RECOVERY);
+      this.legacySessions = true;
+    }
     if (saved === undefined) return;
     if (!saved || saved.version !== 1 || !Array.isArray(saved.sessions) || saved.sessions.length > FILE_LIMIT ||
         saved.sessions.some(session => !session || !validSession(session)))
@@ -142,7 +156,8 @@ class RecoverySnapshot {
   readConversation({ tab, initialInput }) {
     const view = `codex-launches/${tab.id}`;
     const binding = this.json(`${view}/.cloudx-source.json`, true);
-    if (!isRecord(binding) || Object.keys(binding).sort().join(",") !== "dev,home,ino,sourceId,version" ||
+    if (!isRecord(binding) || Object.keys(binding).some(key => !["dev", "home", "ino", "sourceId", "version", "durable"].includes(key)) ||
+        binding.durable !== undefined && !validDurableIdentity(binding.durable) ||
         binding.version !== 1 || binding.sourceId !== "shared" ||
         ![binding.home, binding.sourceId, binding.dev, binding.ino].every(value => typeof value === "string") || !path.isAbsolute(binding.home))
       throw new Error(`Codex tab ${tab.id} has invalid source ownership.`);
@@ -187,6 +202,8 @@ class RecoverySnapshot {
         if (!readFile(source, TRANSCRIPT_LIMIT).equals(bytes)) throw new Error(`Recovery source changed during snapshot: ${source}`);
       for (const source of this.sources) assertSourceIdentity(source);
       fs.writeFileSync(path.join(backup, "manifest.json"), `${JSON.stringify({ version: 1, capturedAt: new Date().toISOString(), files, conversations: this.conversations,
+        legacySessionIdentitiesUnavailable: this.legacySessions,
+        warnings: this.legacySessions ? [LEGACY_RECOVERY] : [],
         recovery: "Keep existing tabs and layouts. Start shells explicitly. Select an exact saved Codex session in its existing tab; lastObservedSessionId is not proof of the current native selection. Never replay saved shell commands or AI prompts. Forge ownership records remain unchanged." }, null, 2)}\n`,
       { flag: "wx", mode: 0o600, flush: true });
       syncDirectories(backup);
@@ -278,9 +295,32 @@ function isRecord(value) {
 
 function assertSourceIdentity(binding) {
   safeDirectory(binding.home);
-  const home = fs.statSync(binding.home);
-  if (String(home.dev) !== binding.dev || String(home.ino) !== binding.ino)
-    throw new Error(`Codex source ownership changed: ${binding.home}`);
+  const fd = fs.openSync(binding.home, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try {
+    const home = fs.fstatSync(fd, { bigint: true });
+    let sameDevice = home.dev.toString() === binding.dev;
+    if (binding.durable) {
+      const { filesystemId, filesystemType, birthtimeNs, uid } = binding.durable;
+      // Match directoryIdentity.ts and filesystemIdentity.ts without depending on a built server.
+      const filesystem = execFileSync("/usr/bin/stat", ["--file-system", "--format=%t:%i", "--", "/proc/self/fd/3"], {
+        stdio: ["ignore", "pipe", "ignore", fd], env: { LC_ALL: "C" }, timeout: 3_000, maxBuffer: 256, encoding: "utf8",
+      });
+      if (filesystem !== `${filesystemType}:${filesystemId}\n` || home.birthtimeNs.toString() !== birthtimeNs || home.uid.toString() !== uid)
+        throw new Error(`Codex source ownership changed: ${binding.home}`);
+      sameDevice ||= ["ef53", "9123683e"].includes(filesystemType) && birthtimeNs !== "0";
+    }
+    const current = fs.lstatSync(binding.home, { bigint: true });
+    if (!home.isDirectory() || home.uid !== BigInt(process.getuid()) || home.ino.toString() !== binding.ino || !sameDevice ||
+        !current.isDirectory() || ["dev", "ino", "uid", "birthtimeNs"].some(key => home[key] !== current[key]) ||
+        fs.realpathSync(binding.home) !== path.resolve(binding.home))
+      throw new Error(`Codex source ownership changed: ${binding.home}`);
+  } finally { fs.closeSync(fd); }
+}
+
+function validDurableIdentity(value) {
+  return isRecord(value) && typeof value.filesystemId === "string" && /^[a-f0-9]{1,32}$/u.test(value.filesystemId) && !/^0+$/u.test(value.filesystemId) &&
+    typeof value.filesystemType === "string" && /^[a-f0-9]+$/u.test(value.filesystemType) &&
+    typeof value.birthtimeNs === "string" && /^\d+$/u.test(value.birthtimeNs) && typeof value.uid === "string" && /^\d+$/u.test(value.uid);
 }
 
 function safeDirectory(directory, optional = false) {

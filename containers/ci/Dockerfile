@@ -28,6 +28,7 @@ COPY packages/plugin-api/package.json packages/plugin-api/package.json
 COPY packages/shared/package.json packages/shared/package.json
 
 RUN npm ci --ignore-scripts \
+    && npm cache add smol-toml@1.7.0 \
     && npm cache verify
 
 COPY services/asr /opt/cloudx-services/asr

@@ -211,7 +211,11 @@ export function helpText() {
     "       node scripts/install-cloudx.mjs [options]",
     "",
     "Options:",
-    "  --update           Fast-forward to origin/main; requires no tracked changes. Unrelated untracked files are allowed.",
+    "  --update           Stage and manage a transition to origin/main or the selected commit.",
+    "  --resume <id>      Resume an interrupted managed update using its saved target and recovery data.",
+    "  --status           Show the current managed update phase and recovery action.",
+    "  --confirm-interruption  Confirm the terminal interruption disclosed by the update plan.",
+    "  --restore-snapshot <id>  Explicitly restore a compatible prior profile; preserve newer data.",
     "  --migrate-terminals  Back up recovery state and interrupt terminals for a standard-service update.",
     "  --checkout <path>  Run a staged updater against this absolute installed checkout path; requires --update.",
     "  --target-commit <sha>  Update to this exact commit from origin; requires --update.",
@@ -575,6 +579,7 @@ export function renderCloudxService({
   envPath,
   nodePath,
   npmPath,
+  runtimeLaunch,
 }) {
   return [
     "[Unit]",
@@ -587,7 +592,9 @@ export function renderCloudxService({
     `WorkingDirectory=${root}`,
     `EnvironmentFile=${envPath}`,
     `ExecStartPre=${nodePath} ${path.join(root, "scripts/create-local-cert.mjs")}`,
-    `ExecStart=${npmPath} run start -w @cloudx/server`,
+    runtimeLaunch
+      ? `ExecStart=${[nodePath, runtimeLaunch.script, path.join(root, 'apps/server/dist/index.js'), runtimeLaunch.buildFile, runtimeLaunch.receiptFile].map(systemdCommandArgument).join(' ')}`
+      : `ExecStart=${npmPath} run start -w @cloudx/server`,
     "Restart=on-failure",
     "RestartSec=5",
     "KillSignal=SIGINT",
@@ -602,6 +609,7 @@ export function renderTerminalService({ repoRoot: root, envPath, nodePath }) {
   return [
     "[Unit]",
     "Description=Cloudx persistent terminal sessions",
+    `ConditionPathExists=${path.join(root, "apps/server/dist/terminal/broker.js")}`,
     "",
     "[Service]",
     "Type=notify",
@@ -881,7 +889,9 @@ export class InstallerRunner {
       inspect: true,
     });
     this.log(`$ ${formatCommand(command, args, options)}`);
+    this.logVerboseCommand(options);
     const result = this.spawnCaptured(command, args, options);
+    this.logVerboseProcessResult(result);
     if (!processSucceeded(result)) throw commandFailure(command, args, result);
     return result.stdout.trim();
   }
@@ -1079,6 +1089,7 @@ export async function runInstaller(options = {}) {
     inspectUpdateCheckout(commands, root);
     prepareRuntimeUpdate({
       paths, commands, target: updateTarget, dryRun,
+      targetRuntime: { brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true },
       migrateTerminals: options.migrateTerminals && !env.CLOUDX_INSTALL_UPDATED_COMMIT,
     });
     const updatedCommit = updateCheckout(commands, {
@@ -2053,7 +2064,7 @@ function downloadModel(commands, paths) {
   ]);
 }
 
-function installSystemdServices(commands, runner, paths) {
+function installSystemdServices(commands, runner, paths, runtimeLaunch) {
   console.log(`Writing user units to ${paths.systemdDir}.`);
   commands.mkdir(paths.systemdDir);
   runner.writeFile(
@@ -2090,6 +2101,7 @@ function installSystemdServices(commands, runner, paths) {
       envPath: paths.envPath,
       nodePath: commands.which("node"),
       npmPath: commands.which("npm"),
+      runtimeLaunch,
     }),
   );
 }
@@ -2609,6 +2621,10 @@ function logVerboseBlock(log, label, value) {
 }
 
 async function main() {
+  if (process.argv.includes('--update') && !process.argv.some(flag => ['--dry-run', '--help', '-h'].includes(flag))) {
+    const { launchManagedUpdate, parseUpdateArguments } = await import('./update-cloudx.mjs');
+    return launchManagedUpdate(parseUpdateArguments(process.argv.slice(2)));
+  }
   const options = parseArgs();
   if (options.help) {
     console.log(helpText());
@@ -2634,4 +2650,51 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     );
     process.exitCode = 1;
   });
+}
+
+// Preparation has its own immutable release directory. It must not write the
+// installed configuration, data, service definitions or dependency directories.
+export function prepareManagedRelease({ releaseRoot, home, envConfig, standard = true, runner, progress = () => {} }) {
+  const paths = installerPaths({ repoRoot: releaseRoot, home, env: { ...process.env, ...envConfig } });
+  const commands = commandMap(runner ?? new InstallerRunner({ cwd: releaseRoot, nonInteractive: true }));
+  verifyNodeAndNpm(commands);
+  progress('dependencies', 'Installing the selected release’s locked npm dependencies in its private staging directory.');
+  commands.run('npm', ['ci']);
+  if (standard) {
+    progress('python', 'Preparing isolated ASR and documentation Python environments.');
+    paths.uvVenvDir = path.join(releaseRoot, '.update-tools/uv');
+    paths.uvPath = path.join(paths.uvVenvDir, 'bin/uv');
+    paths.uvPipPath = path.join(paths.uvVenvDir, 'bin/pip');
+    paths.pythonInstallDir = path.join(releaseRoot, '.update-tools/python');
+    setupUv(commands, paths);
+    setupAsr(commands, paths, (envConfig.CLOUDX_ASR_DEVICE ?? 'cpu') === 'cuda');
+    syncPythonService(commands, paths, paths.documentationIndexerDir, paths.documentationVenvDir,
+      (envConfig.CLOUDX_DOCUMENTATION_ASR_DEVICE ?? envConfig.CLOUDX_ASR_DEVICE ?? 'cpu') === 'cuda');
+  }
+  progress('build', 'Building the selected release before changing the installation.');
+  commands.run('npm', ['run', 'build']);
+  for (const relative of SERVER_RUNTIME_SCHEMA_FILES) {
+    const source = path.join(releaseRoot, 'apps/server/src', relative);
+    if (fs.existsSync(source)) {
+      const target = path.join(releaseRoot, 'apps/server/dist', relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(source, target);
+    }
+  }
+  return paths;
+}
+
+export function activateManagedServices({ repoRoot, releaseRoot, home, envConfig, runner, runtimeLaunch }) {
+  const paths = installerPaths({ repoRoot, home, env: { ...process.env, ...envConfig } });
+  paths.dataDir = envConfig.CLOUDX_DATA_DIR ?? paths.dataDir;
+  runner.writeFile(paths.envPath, updateEnvFileContent(fs.readFileSync(paths.envPath, 'utf8'), {
+    ...missingEnvVars(envConfig, defaultDocumentationEnvVars(paths)),
+    CLOUDX_INSTALL_ROOT: repoRoot,
+    CLOUDX_DATA_DIR: paths.dataDir,
+    ...(runtimeLaunch ? { CLOUDX_UPDATE_COORDINATOR_ROOT: path.resolve(path.dirname(runtimeLaunch.script), '..') } : {}),
+  }));
+  const prepared = installerPaths({ repoRoot: releaseRoot, home, env: envConfig });
+  // Python entry points keep their original absolute interpreter paths.
+  for (const key of ['pythonPath', 'uvicornPath', 'documentationPythonPath', 'documentationIndexerPath']) paths[key] = prepared[key];
+  installSystemdServices(commandMap(runner), runner, paths, runtimeLaunch);
 }

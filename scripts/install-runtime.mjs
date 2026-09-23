@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { assertTerminalMigrationSafe, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
+import { inspectTerminalRecovery, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
 
 const properties = "LoadState,ActiveState,MainPID,InvocationID,ControlGroup,KillMode,SendSIGKILL,WorkingDirectory";
 
@@ -38,47 +38,105 @@ export function assertPinnedTerminalRuntime({ dataDir, role, service, state, rea
       || role === "broker" && receipt.pid !== Number(state.MainPID)) {
       throw new Error("Runtime receipt does not identify the process in the current service invocation.");
     }
+    if (role === "broker" && receipt.attachmentExitBeforeReady !== true) {
+      throw new Error("The running broker lacks ordered attachment exit reporting. A confirmed terminal interruption is needed to distinguish exited shells from live sessions safely.");
+    }
   } catch (error) {
     throw new Error(`${service} cannot safely survive an in-place update: ${error.message} ` +
-      "The update cannot proceed. For standard services, run --update --migrate-terminals explicitly to back up recovery state and interrupt terminals. " +
-      "For custom services, follow docs/TERMINAL_UPGRADES.md and stop the affected services before updating.", { cause: error });
+      "The managed update requires confirmation to preserve recovery state and interrupt terminals.", { cause: error });
   }
 }
 
-export function prepareRuntimeUpdate({ paths, commands, target, migrateTerminals = false, dryRun = false, log = console.warn, readFile = fs.readFileSync }) {
+export function inspectRuntimeUpdate({ paths, commands, target, targetRuntime, readFile = fs.readFileSync }) {
   const webService = target.kind === "web" ? target.serviceNames[0] : "cloudx.service";
   const web = inspectTerminalService(commands, webService);
   const broker = inspectTerminalService(commands, "cloudx-terminal.service");
   const ownBroker = broker.LoadState === "not-found" || broker.WorkingDirectory === paths.repoRoot;
-  if (!ownBroker && target.kind === "standard") throw new Error("The terminal broker belongs to another checkout.");
-  if (!migrateTerminals) {
-    assertPinnedTerminalRuntime({ dataDir: paths.dataDir, role: "web", service: webService, state: web });
-    if (ownBroker) assertPinnedTerminalRuntime({ dataDir: paths.dataDir, role: "broker", service: "cloudx-terminal.service", state: broker });
-    return;
-  }
-  if (target.kind !== "standard") throw new Error("--migrate-terminals requires the standard CloudX services.");
-  for (const state of [web, broker]) {
-    if (state.LoadState !== "not-found" && (state.KillMode !== "control-group" || state.SendSIGKILL !== "yes")) {
-      throw new Error("Terminal migration requires KillMode=control-group and SendSIGKILL=yes for both CloudX services.");
+  const services = [{ service: webService, role: "web", state: web }];
+  if (ownBroker) services.push({ service: "cloudx-terminal.service", role: "broker", state: broker });
+  const plan = { requiresInterruption: false, reasons: [], blockers: [], services, stopServices: [], recovery: undefined };
+  if (web.LoadState !== "not-found" && web.WorkingDirectory !== paths.repoRoot)
+    plan.blockers.push({ service: webService, message: "The web service belongs to another checkout." });
+  if (!ownBroker && target.kind === "standard")
+    plan.blockers.push({ service: "cloudx-terminal.service", message: "The terminal broker belongs to another checkout." });
+  for (const { service, role, state } of services) {
+    try {
+      assertPinnedTerminalRuntime({ dataDir: paths.dataDir, role, service, state, readFile });
+      if (serviceIsRunning(state) && !supportsPinnedRuntime(targetRuntime))
+        throw new Error("The selected target has no compatible persistent terminal runtime contract.");
+    } catch (error) {
+      plan.reasons.push({ service, role, message: error.message });
     }
-    if (state.LoadState !== "not-found" && !["inactive", "failed"].includes(state.ActiveState)
-      && (!state.ControlGroup?.startsWith("/") || state.ControlGroup === "/" || state.ControlGroup.split("/").includes(".."))) {
-      throw new Error("Terminal migration requires the original service control group to verify cleanup.");
+  }
+  plan.requiresInterruption = plan.reasons.length > 0;
+  if (plan.requiresInterruption) {
+    plan.stopServices = services.filter(entry => entry.state.LoadState !== "not-found" &&
+      (entry.role === "web" || plan.reasons.some(reason => reason.service === entry.service))).map(entry => entry.service);
+    for (const entry of services.filter(entry => plan.stopServices.includes(entry.service))) {
+      try { assertMigrationService(entry); }
+      catch (error) { plan.blockers.push({ service: entry.service, message: error.message }); }
+    }
+    if (!plan.blockers.length) {
+      try { plan.recovery = inspectTerminalRecovery({ dataDir: paths.dataDir, allowLegacyState: true }); }
+      catch (error) { plan.blockers.push({ service: "recovery", message: error.message }); }
     }
   }
-  assertUpdaterOutsideServices([[webService, web], ["cloudx-terminal.service", broker]], readFile);
-  assertTerminalMigrationSafe({ dataDir: paths.dataDir });
-  log("Terminal migration will interrupt all terminal processes. Tabs and layouts remain saved; shells and exact saved Codex conversations must be recovered explicitly. No commands or prompts will be replayed.");
-  commands.run("systemctl", ["--user", "stop", webService]);
-  if (!dryRun) {
-    assertStoppedService(commands, webService, web.ControlGroup, readFile);
-    snapshotTerminalRecovery({ dataDir: paths.dataDir, log });
-  } else log("Dry run: would verify a private recovery snapshot after the web service stops and before stopping the broker.");
-  commands.run("systemctl", ["--user", "stop", "cloudx-terminal.service"]);
-  if (!dryRun) assertStoppedService(commands, "cloudx-terminal.service", broker.ControlGroup, readFile);
+  return plan;
 }
 
-function assertUpdaterOutsideServices(services, readFile) {
+export function prepareRuntimeUpdate(options) {
+  const { paths, commands, migrateTerminals = false, interruptionConfirmed = false, dryRun = false,
+    log = console.warn, readFile = fs.readFileSync } = options;
+  const plan = inspectRuntimeUpdate(options);
+  if (plan.blockers.length) {
+    throw Object.assign(new Error(plan.blockers.map(blocker => blocker.message).join("\n")), { code: "CLOUDX_TERMINAL_MIGRATION_BLOCKED", plan });
+  }
+  if (!plan.requiresInterruption) return { plan };
+  if (!interruptionConfirmed && !migrateTerminals) {
+    throw Object.assign(new Error(plan.reasons.map(reason => reason.message).join("\n") +
+      " Confirm terminal interruption in the update flow to continue."), { code: "CLOUDX_TERMINAL_CONFIRMATION_REQUIRED", plan });
+  }
+  assertUpdaterOutsideServices(plan.services.filter(entry => plan.stopServices.includes(entry.service)).map(({ service, state }) => [service, state]), readFile);
+  log("Terminal migration will interrupt terminal processes. Saved tabs and layouts remain recoverable; shells and exact saved Codex conversations must be recovered explicitly. No commands or prompts will be replayed.");
+  for (const warning of plan.recovery?.warnings ?? []) log(warning);
+  if (dryRun) {
+    log("Dry run: would stop the selected web service, verify a private recovery snapshot, and stop its terminal broker.");
+    return { plan };
+  }
+  const web = plan.services.find(entry => entry.role === "web");
+  stopRuntimeService(commands, web, readFile);
+  const recoverySnapshot = snapshotTerminalRecovery({ dataDir: paths.dataDir, log, allowLegacyState: true });
+  const broker = plan.services.find(entry => entry.role === "broker");
+  if (broker && plan.stopServices.includes(broker.service)) stopRuntimeService(commands, broker, readFile);
+  return { plan, recoverySnapshot };
+}
+
+function supportsPinnedRuntime(runtime) {
+  return runtime?.brokerProtocol === 1 && runtime.supervisorContract === "execution-json-v1" && runtime.persistentSessions === true;
+}
+
+function serviceIsRunning(state) {
+  return state.LoadState !== "not-found" && !(["inactive", "failed"].includes(state.ActiveState) && state.MainPID === "0");
+}
+
+function assertMigrationService({ service, state }) {
+  if (state.LoadState === "not-found") return;
+  if (state.LoadState !== "loaded" || !["active", "inactive", "failed"].includes(state.ActiveState))
+    throw new Error(`${service} is not stable; wait for its current service operation to finish before resuming the update.`);
+  if (!serviceIsRunning(state)) return;
+  if (!["control-group", "mixed"].includes(state.KillMode) || state.SendSIGKILL !== "yes")
+    throw new Error(`${service}: terminal migration requires KillMode=control-group or mixed and SendSIGKILL=yes. Update this service's termination policy before resuming.`);
+  if (!state.ControlGroup?.startsWith("/") || state.ControlGroup === "/" || state.ControlGroup.split("/").includes(".."))
+    throw new Error("Terminal migration requires the original service control group to verify cleanup.");
+}
+
+function stopRuntimeService(commands, { service, state }, readFile) {
+  if (state.LoadState === "not-found") return;
+  commands.run("systemctl", ["--user", "stop", service]);
+  assertStoppedService(commands, service, state.ControlGroup, readFile);
+}
+
+export function assertUpdaterOutsideServices(services, readFile = fs.readFileSync) {
   let callerGroup;
   try {
     const groups = readFile("/proc/self/cgroup", "utf8").trim().split("\n").filter(line => line.startsWith("0::"));
@@ -99,7 +157,10 @@ function assertUpdaterOutsideServices(services, readFile) {
 
 export function assertStoppedService(commands, service, previousControlGroup, readFile = fs.readFileSync) {
   const state = inspectTerminalService(commands, service);
-  if (state.LoadState === "not-found") return;
+  if (state.LoadState === "not-found") {
+    assertEmptyControlGroup(service, previousControlGroup, readFile);
+    return;
+  }
   if (!["inactive", "failed"].includes(state.ActiveState) || state.MainPID !== "0") {
     throw new Error(`${service} did not stop; terminal migration stopped before changing the checkout.`);
   }

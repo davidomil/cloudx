@@ -8,7 +8,8 @@ import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStor
 import { WorkspaceLayoutStore } from "../apps/server/src/workspace/WorkspaceLayoutStore.ts";
 import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
 import { CodexStateSources } from "../apps/server/src/plugins/CodexStateSources.ts";
-import { assertTerminalMigrationSafe, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
+import { assertTerminalMigrationSafe, inspectTerminalRecovery, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
+import { inspectRuntimeUpdate } from "./install-runtime.mjs";
 
 const roots = [];
 const conversationId = "12345678-1234-1234-1234-123456789abc";
@@ -47,7 +48,106 @@ function fixture() {
   return { dataDir, write, read, tab, owned, transcriptPath, log: vi.fn() };
 }
 
+async function currentCodexFixture() {
+  const f = fixture();
+  const saved = f.read("sessions.json");
+  await new SessionStateStore(f.dataDir).save(saved);
+  const bindingFile = "codex-launches/codex-1/.cloudx-source.json";
+  const { home } = f.read(bindingFile);
+  fs.rmSync(path.join(f.dataDir, "codex-launches/codex-1"), { recursive: true });
+  const sources = new CodexStateSources(f.dataDir, { CODEX_HOME: home });
+  try {
+    const binding = await sources.resolve();
+    await sources.bind(f.tab.id, binding);
+    expect(await sources.readBinding(f.tab.id)).toEqual(binding);
+  } finally { await sources.dispose(); }
+  f.write("codex-launches/codex-1/.cloudx-conversation.json", { sessionId: conversationId, cwd: f.tab.cwd, transcriptPath: f.transcriptPath });
+  expect((await new SessionStateStore(f.dataDir).read()).sessions).toEqual(saved.sessions);
+  const commands = { inspect: (_command, args) => Object.entries(args[2] === "cloudx-terminal.service" ? { LoadState: "not-found" } : {
+    LoadState: "loaded", ActiveState: "active", MainPID: "123", ControlGroup: "/user/cloudx.service", WorkingDirectory: f.dataDir,
+    KillMode: "control-group", SendSIGKILL: "yes",
+  }).map(([key, value]) => `${key}=${value}`).join("\n") };
+  return { ...f, bindingFile, plan: () => inspectRuntimeUpdate({ paths: { dataDir: f.dataDir, repoRoot: f.dataDir }, commands, target: { kind: "standard" } }) };
+}
+
 describe("controlled terminal replacement snapshots", () => {
+  it("plans and snapshots production-written Codex bindings and saved tabs without replaying inputs", async () => {
+    const f = await currentCodexFixture();
+    const binding = f.read(f.bindingFile);
+    expect(binding.durable).toEqual(expect.objectContaining({ filesystemId: expect.any(String), birthtimeNs: expect.any(String) }));
+    expect(f.plan()).toMatchObject({ requiresInterruption: true, blockers: [], recovery: { legacySessionIdentitiesUnavailable: false } });
+    const saved = fs.readFileSync(path.join(f.dataDir, "sessions.json"));
+    const backup = snapshotTerminalRecovery(f);
+    expect(JSON.parse(fs.readFileSync(path.join(backup, f.bindingFile), "utf8"))).toEqual(binding);
+    expect(fs.readFileSync(path.join(backup, "sessions.json"))).toEqual(saved);
+    expect(fs.readFileSync(path.join(f.dataDir, "sessions.json"))).toEqual(saved);
+    expect(JSON.parse(fs.readFileSync(path.join(backup, "manifest.json"), "utf8")).conversations)
+      .toEqual([{ tabId: f.tab.id, lastObservedSessionId: conversationId, transcriptPath: f.transcriptPath, snapshot: `transcripts/${f.tab.id}.jsonl` }]);
+  });
+
+  it.each(["filesystemId", "filesystemType", "birthtimeNs", "uid", "ino"])("rejects a changed production Codex %s during planning and snapshotting", async field => {
+    const f = await currentCodexFixture();
+    const binding = f.read(f.bindingFile);
+    const owner = field === "ino" ? binding : binding.durable;
+    owner[field] = owner[field] === "1" ? "2" : "1";
+    f.write(f.bindingFile, binding);
+    const sources = new CodexStateSources(f.dataDir, { CODEX_HOME: binding.home });
+    try { await expect(sources.readBinding(f.tab.id)).rejects.toThrow("ownership changed"); }
+    finally { await sources.dispose(); }
+    expect(f.plan().blockers).toEqual([{ service: "recovery", message: expect.stringContaining("source ownership changed") }]);
+    for (const operation of [inspectTerminalRecovery, snapshotTerminalRecovery])
+      expect(() => operation(f)).toThrow("source ownership changed");
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it.each([null, {}, { filesystemId: "0", filesystemType: "ef53", birthtimeNs: "1", uid: "1" }])("rejects malformed durable Codex ownership %#", async durable => {
+    const f = await currentCodexFixture();
+    f.write(f.bindingFile, { ...f.read(f.bindingFile), durable });
+    expect(() => snapshotTerminalRecovery(f)).toThrow("invalid source ownership");
+  });
+
+  it("matches the production ownership decision after device numbering changes", async () => {
+    const f = await currentCodexFixture();
+    const binding = f.read(f.bindingFile);
+    binding.dev = (BigInt(binding.dev) + 1n).toString();
+    f.write(f.bindingFile, binding);
+    const sources = new CodexStateSources(f.dataDir, { CODEX_HOME: binding.home });
+    const durableFilesystem = ["ef53", "9123683e"].includes(binding.durable.filesystemType) && binding.durable.birthtimeNs !== "0";
+    try {
+      if (durableFilesystem) {
+        await expect(sources.readBinding(f.tab.id)).resolves.toMatchObject({ home: binding.home, ino: binding.ino, durable: binding.durable });
+        expect(f.plan().blockers).toEqual([]);
+        expect(snapshotTerminalRecovery(f)).toBeTypeOf("string");
+      } else {
+        await expect(sources.readBinding(f.tab.id)).rejects.toThrow("device changed");
+        expect(() => snapshotTerminalRecovery(f)).toThrow("source ownership changed");
+      }
+    } finally { await sources.dispose(); }
+  });
+
+  it.each(["before planning", "during snapshot"])("rejects a source directory replaced %s with the same transcript bytes", async timing => {
+    const f = await currentCodexFixture();
+    const { home } = f.read(f.bindingFile);
+    const replace = () => {
+      fs.renameSync(home, `${home}.original`);
+      fs.cpSync(`${home}.original`, home, { recursive: true });
+    };
+    if (timing === "before planning") {
+      replace();
+      expect(f.plan().blockers).toEqual([{ service: "recovery", message: expect.stringContaining("source ownership changed") }]);
+    } else {
+      const write = fs.writeFileSync;
+      let replaced = false;
+      vi.spyOn(fs, "writeFileSync").mockImplementation((file, bytes, options) => {
+        if (!replaced && String(file).includes("terminal-recovery-")) { replaced = true; replace(); }
+        return write(file, bytes, options);
+      });
+    }
+    expect(() => snapshotTerminalRecovery(f)).toThrow("source ownership changed");
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+    expect(fs.readFileSync(f.transcriptPath)).toEqual(fs.readFileSync(f.transcriptPath.replace(home, `${home}.original`)));
+  });
+
   it("preserves exact tabs, layout, last observed Codex conversation, transcript, and Forge ownership privately", () => {
     const f = fixture();
     const originals = ["workspace.json", "sessions.json", forgeState, "forge-workers/workspaces/worker-1.json", "codex-launches/codex-1/.cloudx-source.json", "codex-launches/codex-1/.cloudx-conversation.json"];

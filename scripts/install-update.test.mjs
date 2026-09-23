@@ -71,7 +71,7 @@ function updateCli(fixture, ...args) {
   });
   return {
     ...result,
-    serviceCalls: fs.readFileSync(serviceLog, "utf8").trim().split("\n"),
+    serviceCalls: fs.existsSync(serviceLog) ? fs.readFileSync(serviceLog, "utf8").trim().split("\n") : [],
   };
 }
 function checkout({ includeInstaller = false } = {}) {
@@ -98,6 +98,10 @@ function checkout({ includeInstaller = false } = {}) {
         path.join(author, "scripts", file),
       );
   }
+  if (includeInstaller) fs.writeFileSync(path.join(author, "scripts/update-cloudx.mjs"), [
+    'export const parseUpdateArguments = args => ({ args });',
+    'export const launchManagedUpdate = options => { console.log("managed handoff"); console.log(JSON.stringify(options)); };',
+  ].join("\n"));
   git(author, "add", ".");
   git(author, "commit", "-m", "TEST: initial");
   git(author, "push", "origin", "main");
@@ -553,57 +557,37 @@ describe("documentation service readiness", () => {
 });
 
 describe("installer update entrypoints", () => {
-  it("reloads the production checkout check with unrelated untracked work", () => {
+  it("hands off updates while retaining unrelated untracked work and the installed revision", () => {
     const fixture = checkout({ includeInstaller: true });
-    publishFile(fixture, "scripts/install-cloudx.mjs", [
-      'import { updateCheckout } from "./install-update.mjs";',
-      'import { execFileSync } from "node:child_process";',
-      'const commands = { inspect: (command, args) => execFileSync(command, args, { encoding: "utf8" }).trim() };',
-      'updateCheckout(commands, { repoRoot: process.cwd(), updatedCommit: process.env.CLOUDX_INSTALL_UPDATED_COMMIT });',
-      'console.log("updated checkout accepted after reload");',
-    ].join("\n"));
     const file = "local diagnostics/nested/notes.txt";
     writeFile(fixture.root, file, "keep these notes\n");
-
+    const before = git(fixture.root, "rev-parse", "HEAD");
     const result = updateCli(fixture);
-
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("updated checkout accepted after reload");
-    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(fixture.latest);
-    expect(fs.readFileSync(path.join(fixture.root, file), "utf8"))
-      .toBe("keep these notes\n");
+    expect(result.stdout).toContain("managed handoff");
+    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(before);
+    expect(fs.readFileSync(path.join(fixture.root, file), "utf8")).toBe("keep these notes\n");
+    expect(result.serviceCalls).toEqual([]);
   });
 
   it.each([
     ["file replacing a file", "local notes.txt", "local notes.txt"],
     ["directory replacing a file", "local notes", "local notes/upstream.txt"],
     ["file replacing a directory", "local notes/nested/notes.txt", "local notes"],
-  ])("rejects an upstream %s before installing packages or changing services", (_name, localFile, upstreamFile) => {
-    const fixture = checkout({ includeInstaller: true });
+  ])("the checkout helper rejects an upstream %s while retaining local contents and index", (_name, localFile, upstreamFile) => {
+    const fixture = checkout();
     publishFile(fixture, upstreamFile, "upstream content\n");
     writeFile(fixture.root, localFile, "irreplaceable local notes\n");
     const beforeHead = git(fixture.root, "rev-parse", "HEAD");
     const beforeStatus = git(fixture.root, "status", "--porcelain");
     const beforeIndex = git(fixture.root, "ls-files", "--stage");
-
-    const result = updateCli(fixture);
-
-    expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/would be overwritten by merge|would lose untracked files/);
-    expect(result.stderr).toContain("local notes");
+    expect(() => updateCheckout(fixture.commands, { repoRoot: fixture.root }))
+      .toThrow(/would be overwritten by merge|would lose untracked files/);
     expect(git(fixture.root, "rev-parse", "HEAD")).toBe(beforeHead);
     expect(git(fixture.root, "status", "--porcelain")).toBe(beforeStatus);
     expect(git(fixture.root, "ls-files", "--stage")).toBe(beforeIndex);
-    expect(fs.readFileSync(path.join(fixture.root, localFile), "utf8"))
-      .toBe("irreplaceable local notes\n");
-    expect(fs.readFileSync(path.join(fixture.root, "version"), "utf8"))
-      .toBe("one\n");
-    expect(result.stdout).not.toMatch(/npm ci|apt-get|updated installer executed/);
-    expect(result.serviceCalls).toEqual([
-      expect.stringMatching(/^--user show preview\.service /),
-      expect.stringMatching(/^--user show preview\.service /),
-      expect.stringMatching(/^--user show cloudx-terminal\.service /),
-    ]);
+    expect(fs.readFileSync(path.join(fixture.root, localFile), "utf8")).toBe("irreplaceable local notes\n");
+    expect(fs.readFileSync(path.join(fixture.root, "version"), "utf8")).toBe("one\n");
   });
 
   it.each(["unrelated", "colliding"])("previews updates with %s untracked files without fetching or merging", (kind) => {
@@ -647,7 +631,7 @@ describe("installer update entrypoints", () => {
     ]) expect(() => parseArgs(args)).toThrow();
   });
 
-  it("runs a staged updater against the installed checkout before replacing its files", () => {
+  it("hands the explicit installed checkout from a staged entry to the managed updater", () => {
     const fixture = checkout({ includeInstaller: true });
     const staged = directory();
     fs.cpSync(path.join(fixture.root, "scripts"), path.join(staged, "scripts"), { recursive: true });
@@ -659,8 +643,9 @@ describe("installer update entrypoints", () => {
       cwd: staged, encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CLOUDX_TEST_CHECKOUT: fixture.root },
     });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("updated installer executed");
-    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(fixture.latest);
+    expect(result.stdout).toContain("managed handoff");
+    expect(JSON.parse(result.stdout.trim().split("\n").at(-1)).args).toContain(fixture.root);
+    expect(git(fixture.root, "rev-parse", "HEAD")).not.toBe(fixture.latest);
   });
 
   it("accepts a complete target commit only in update mode", () => {
@@ -682,7 +667,7 @@ describe("installer update entrypoints", () => {
     }
   });
 
-  it("reloads the selected release installer with the same target and commit handoff when main moves ahead", () => {
+  it("passes the selected release commit to the managed updater when main moves ahead", () => {
     const fixture = checkout({ includeInstaller: true });
     fs.writeFileSync(
       path.join(fixture.author, "scripts/install-cloudx.mjs"),
@@ -730,15 +715,13 @@ describe("installer update entrypoints", () => {
       },
     );
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("selected release installer executed");
-    expect(JSON.parse(result.stdout.trim().split("\n").at(-1))).toEqual({
-      args,
-      updatedCommit: targetCommit,
-    });
-    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(targetCommit);
+    expect(result.stdout).toContain("managed handoff");
+    expect(JSON.parse(result.stdout.trim().split("\n").at(-1))).toEqual({ args });
+    expect(git(fixture.root, "rev-parse", "HEAD")).not.toBe(targetCommit);
+    expect(fs.existsSync(path.join(fixture.root, ".git/FETCH_HEAD"))).toBe(false);
   });
 
-  it("reloads the installer from the fetched commit before running package updates", () => {
+  it("hands off before fetching code or running package updates", () => {
     const fixture = checkout({ includeInstaller: true });
     const bin = path.join(directory(), "bin");
     fs.mkdirSync(bin);
@@ -770,9 +753,10 @@ describe("installer update entrypoints", () => {
     );
     expect(result.stderr).not.toContain("Error");
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain("updated installer executed");
+    expect(result.stdout).toContain("managed handoff");
     expect(result.stdout).not.toContain("npm ci");
-    expect(git(fixture.root, "rev-parse", "HEAD")).toBe(fixture.latest);
+    expect(git(fixture.root, "rev-parse", "HEAD")).not.toBe(fixture.latest);
+    expect(fs.existsSync(path.join(fixture.root, ".git/FETCH_HEAD"))).toBe(false);
   });
 
   it("routes shell updates to the Node preflight before bootstrap packages", () => {
@@ -896,7 +880,7 @@ describe("the complete updater plan", () => {
     fs.writeFileSync(path.join(fixture.unitDir, service), "installed service");
     const inspect = fixture.runner.inspect.bind(fixture.runner);
     fixture.runner.inspect = (command, args) => command === "systemctl" && args[2] === service
-      ? ["LoadState=loaded", "NeedDaemonReload=no", "ActiveState=active", "MainPID=123", "ControlGroup=/cloudx-test.service",
+      ? ["LoadState=loaded", "NeedDaemonReload=no", "ActiveState=active", "MainPID=123", "ControlGroup=/cloudx-test.service", "KillMode=control-group", "SendSIGKILL=yes",
         `WorkingDirectory=${fixture.root}`, `FragmentPath=${path.join(fixture.unitDir, service)}`,
         `EnvironmentFiles=${fixture.envPath} (ignore_errors=no)`].join("\n") : inspect(command, args);
     const before = git(fixture.root, "rev-parse", "HEAD");

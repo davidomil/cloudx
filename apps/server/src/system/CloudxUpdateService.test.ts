@@ -35,6 +35,45 @@ describe("CloudxUpdateService", () => {
     expect(catalog.preview).not.toHaveBeenCalled();
   });
 
+  it("uses the installed checkout when managed build modules live in a separate release directory", async () => {
+    vi.stubEnv("CLOUDX_INSTALL_ROOT", dataDir);
+    try {
+      const { service, execute } = fixture();
+      await service.status();
+      expect(execute).toHaveBeenCalledWith(process.execPath, [path.join(dataDir, "scripts/settings-update.mjs"), "status", dataDir, String(process.pid)],
+        { cwd: dataDir, timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+      await service.preview();
+      expect(execute).toHaveBeenCalledWith("git", ["rev-parse", "HEAD"], expect.objectContaining({ cwd: dataDir }));
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("rejects a relative installed-checkout setting", () => {
+    vi.stubEnv("CLOUDX_INSTALL_ROOT", "relative/path");
+    try { expect(() => fixture()).toThrow("absolute checkout path"); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
+  it("keeps status and the next update on the independent coordinator after a downgrade", async () => {
+    const coordinator = path.join(dataDir, "retained-coordinator");
+    vi.stubEnv("CLOUDX_INSTALL_ROOT", dataDir);
+    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", coordinator);
+    try {
+      const { service, execute } = fixture();
+      await service.status();
+      await service.preview();
+      await service.start({ channel: "main", targetCommit: target });
+      const calls = execute.mock.calls.filter(([file]) => file === process.execPath);
+      expect(calls.every(([, args]) => args[0] === path.join(coordinator, "scripts/settings-update.mjs"))).toBe(true);
+      expect(calls.at(-1)?.[1]).toEqual([path.join(coordinator, "scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target]);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("rejects a relative coordinator setting", () => {
+    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", "relative/coordinator");
+    try { expect(() => fixture()).toThrow("absolute coordinator path"); }
+    finally { vi.unstubAllEnvs(); }
+  });
+
   it("defaults to main and persists the chosen release cycle across service restarts", async () => {
     const { service, execute, catalog } = fixture();
     expect((await service.preview()).channel).toBe("main");
@@ -53,7 +92,7 @@ describe("CloudxUpdateService", () => {
     ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
   });
 
-  it.each(["never checked", "changed target", "changed channel", "changed checkout", "ahead", "diverged", "unavailable"])("rejects an unsafe launch: %s", async scenario => {
+  it.each(["never checked", "changed target", "changed channel", "changed checkout", "unavailable"])("rejects an unsafe launch: %s", async scenario => {
     const { service, catalog, execute } = fixture();
     const preview = checked();
     if (["ahead", "diverged", "unavailable"].includes(scenario)) preview.state = scenario as CloudxUpdatePreview["state"];
@@ -71,6 +110,63 @@ describe("CloudxUpdateService", () => {
     await service.preview();
     await service.start({ channel: "main", targetCommit: installed });
     expect(execute.mock.calls.at(-1)![1].at(-1)).toBe(installed);
+  });
+
+  it.each(["ahead", "diverged"] as const)("allows a checked %s target through the managed compatibility plan", async state => {
+    const { service, catalog, execute } = fixture();
+    catalog.preview.mockResolvedValue({ ...checked(), state });
+    await service.preview();
+    await service.start(selection);
+    expect(execute.mock.calls.at(-1)![1].at(-1)).toBe(target);
+  });
+
+  it("passes explicit interruption consent with the checked target only", async () => {
+    const { service, execute } = fixture();
+    await service.preview();
+    await service.start({ ...selection, confirmInterruption: true });
+    expect(execute.mock.calls.at(-1)![1].slice(-2)).toEqual([target, "--confirm-interruption"]);
+  });
+
+  it.each(["failed", "prepared"])("resumes the persisted %s run without a remote or checkout lookup", async state => {
+    const { service, execute, catalog } = fixture();
+    const id = "11111111-1111-4111-8111-111111111111";
+    const status = { available: true, run: { id, state, startedAt: "2026-09-15T00:00:00Z", message: "Resume the saved update.", targetCommit: target, resumable: true } };
+    execute.mockResolvedValue({ stdout: JSON.stringify(status) });
+    await service.start({ ...selection, resumeRunId: id, confirmInterruption: true });
+    expect(execute.mock.calls.at(-1)![1].slice(-3)).toEqual([target, "--confirm-interruption", `--resume=${id}`]);
+    expect(execute.mock.calls.some(([file]) => file === "git")).toBe(false);
+    expect(catalog.preview).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["failed", "target"], ["failed", "identity"], ["failed", "not resumable"],
+    ["prepared", "target"], ["prepared", "identity"], ["prepared", "not resumable"],
+  ])("rejects a %s resume whose %s differs from the persisted run", async (state, scenario) => {
+    const { service, execute } = fixture();
+    const id = "11111111-1111-4111-8111-111111111111";
+    execute.mockResolvedValue({ stdout: JSON.stringify({ available: true, run: { id, state, startedAt: "2026-09-15T00:00:00Z", message: "Resume the saved update.", targetCommit: target, resumable: scenario !== "not resumable" } }) });
+    await expect(service.start({ ...selection, targetCommit: scenario === "target" ? installed : target,
+      resumeRunId: scenario === "identity" ? "22222222-2222-4222-8222-222222222222" : id })).rejects.toMatchObject({ statusCode: 409 });
+    expect(execute.mock.calls.some(([, args]) => args[1] === "start")).toBe(false);
+  });
+
+  it.each(["matching snapshot", "other snapshot", "other target", "no confirmation"])("binds data restoration to the latest recovery notice: %s", async scenario => {
+    const { service, execute } = fixture();
+    const id = "11111111-1111-4111-8111-111111111111";
+    const snapshotId = "22222222-2222-4222-8222-222222222222";
+    execute.mockResolvedValue({ stdout: JSON.stringify({ available: true,
+      run: { id, state: "failed", startedAt: "2026-09-15T00:00:00Z", message: "Data compatibility requires restoration.", targetCommit: target, resumable: true },
+      ...(scenario === "no confirmation" ? {} : { confirmation: { targetCommit: scenario === "other target" ? installed : target,
+        message: "Replace active data with the saved snapshot; preserve newer data separately.", restoreSnapshotRunId: snapshotId } }),
+    }) });
+    const request = { ...selection, resumeRunId: id, restoreSnapshotRunId: scenario === "other snapshot" ? id : snapshotId };
+    if (scenario === "matching snapshot") {
+      await service.start(request);
+      expect(execute.mock.calls.at(-1)![1].slice(-3)).toEqual([target, `--resume=${id}`, `--restore-snapshot=${snapshotId}`]);
+    } else {
+      await expect(service.start(request)).rejects.toMatchObject({ statusCode: 409 });
+      expect(execute.mock.calls.some(([, args]) => args[1] === "start")).toBe(false);
+    }
   });
 
   it("coalesces concurrent remote checks, while an explicit later check refreshes the target", async () => {

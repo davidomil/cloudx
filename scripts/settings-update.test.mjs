@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,7 +8,7 @@ import {
   parseArgs,
   ubuntuBootstrapPlan,
 } from "./install-cloudx.mjs";
-import { SERVICE_NAMES, inspectUpdateCheckout } from "./install-update.mjs";
+import { SERVICE_NAMES } from "./install-update.mjs";
 import {
   SettingsUpdater,
   UPDATE_TIMEOUT_MS,
@@ -46,7 +47,9 @@ function installation({ home, checkout = "checkout" } = {}) {
     dirty: false,
     sudo: true,
     launch: true,
-    installer: () => {},
+    runtime: { requiresInterruption: false, reasons: [], blockers: [], services: [], stopServices: [] },
+    staged: [],
+    coordinator(args) { completeCoordinator(args.at(-1), host.now); },
   };
   const options = {
     repoRoot,
@@ -54,6 +57,20 @@ function installation({ home, checkout = "checkout" } = {}) {
     dataDir,
     serverPid: 456,
     now: () => host.now,
+    runtimeInspector: () => host.runtime,
+    stageCoordinator: record => {
+      const coordinator = path.join(home, ".local/state/cloudx/settings-update", record.run.id, "fixture-coordinator");
+      const source = "export {};\n";
+      fs.mkdirSync(path.join(coordinator, "scripts"), { recursive: true });
+      const manifest = ["settings-update.mjs", "managed-update.mjs"].map(name => {
+        const relative = `scripts/${name}`;
+        fs.writeFileSync(path.join(coordinator, relative), source, { mode: 0o600 });
+        return { path: relative, type: "file", mode: 0o600, size: Buffer.byteLength(source), sha256: createHash("sha256").update(source).digest("hex") };
+      });
+      fs.writeFileSync(path.join(coordinator, "bundle.json"), JSON.stringify(manifest));
+      host.staged.push(coordinator);
+      return coordinator;
+    },
     readCgroup: (pid) =>
       pid === process.pid
         ? "0::/user.slice/cloudx-settings-update.service\n"
@@ -68,7 +85,7 @@ function installation({ home, checkout = "checkout" } = {}) {
               ? host.unit
               : {
                   Id: name,
-                  LoadState: "loaded",
+                  LoadState: fs.existsSync(path.join(systemdDir, name)) ? "loaded" : "not-found",
                   WorkingDirectory: repoRoot,
                   EnvironmentFiles: `${envPath} (ignore_errors=no)`,
                   FragmentPath: path.join(systemdDir, name),
@@ -107,7 +124,7 @@ function installation({ home, checkout = "checkout" } = {}) {
           return "";
         }
         if (command === process.execPath)
-          return host.installer(args, commandOptions);
+          return host.coordinator(args, commandOptions);
         throw new Error(`Unexpected command: ${command}`);
       },
     },
@@ -125,6 +142,46 @@ function installation({ home, checkout = "checkout" } = {}) {
 }
 
 describe("installed Settings updater", () => {
+  it("stages a no-start update without interruption consent and requires consent to activate its prepared run", () => {
+    const { updater, host, calls } = installation();
+    host.runtime.requiresInterruption = true;
+    const started = updater.start(TARGET_COMMIT, { noStart: true });
+    expect(started.run).toMatchObject({ state: "running", message: expect.stringContaining("without activating") });
+    expect(updater.read(started.run.id)).toMatchObject({ noStart: true, confirmInterruption: false });
+    host.coordinator = args => completeCoordinator(args.at(-1), host.now, { state: "prepared", phase: "prepared", resumable: true });
+    expect(updater.run(started.run.id).state).toBe("prepared");
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: started.run.id })).toMatchObject({ confirmation: { targetCommit: TARGET_COMMIT } });
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: started.run.id, confirmInterruption: true }).run.state).toBe("running");
+    expect(updater.read(started.run.id)).toMatchObject({ noStart: false, confirmInterruption: true });
+  });
+
+  it("rejects no-start resume before launching restoration of an interrupted installation", () => {
+    const { updater, host, calls } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    const saved = updater.read(started.run.id);
+    saved.transition = { mutating: true };
+    saved.run = { ...saved.run, state: "failed", resumable: true };
+    updater.save(saved);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    expect(() => updater.start(TARGET_COMMIT, { resumeRunId: saved.run.id, noStart: true })).toThrow("restoration is pending");
+    expect(calls).toEqual([]);
+    expect(updater.read(saved.run.id)).toEqual(saved);
+  });
+
+  it("retains no-start when resume itself discovers an interrupted preparation coordinator", () => {
+    const { updater, host } = installation();
+    const started = updater.start(TARGET_COMMIT, { noStart: true });
+    expect(updater.read(started.run.id).run.state).toBe("running");
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    host.now = new Date(host.now.getTime() + 60000);
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: started.run.id }).run.state).toBe("running");
+    expect(updater.read(started.run.id).noStart).toBe(true);
+  });
+
   it.each([undefined, "", "main", "a".repeat(39), "A".repeat(40), "--upload-pack=other"])(
     "rejects invalid target %j before inspecting or starting host services",
     (targetCommit) => {
@@ -148,11 +205,7 @@ describe("installed Settings updater", () => {
   it("recognizes the Node child of the standard npm service without requiring MainPID equality", () => {
     const fixture = installation();
     expect(fixture.updater.status()).toEqual({ available: true });
-    expect(
-      fixture.calls.some(
-        ([command, args]) => command === "sudo" && args.join(" ") === "-n true",
-      ),
-    ).toBe(true);
+    expect(fixture.calls.every(([command]) => command === "systemctl")).toBe(true);
     expect(fixture.calls.some(([command]) => command === "git")).toBe(false);
   });
 
@@ -178,10 +231,10 @@ describe("installed Settings updater", () => {
     expect(calls.every(([command]) => command === "systemctl")).toBe(true);
   });
 
-  it("rejects a missing terminal service and mismatched persisted data directory", () => {
+  it("allows a missing terminal unit while rejecting a mismatched persisted data directory", () => {
     const first = installation();
     fs.rmSync(path.join(first.systemdDir, "cloudx-terminal.service"));
-    expect(first.updater.status().available).toBe(false);
+    expect(first.updater.status().available).toBe(true);
     const second = installation();
     second.updater.dataDir = second.home;
     expect(second.updater.status().available).toBe(false);
@@ -203,31 +256,19 @@ describe("installed Settings updater", () => {
     });
   });
 
-  it("refuses password-requiring sudo before Git or a launch", () => {
+  it("does not require sudo for an already installed managed update", () => {
     const { updater, host, calls } = installation();
     host.sudo = false;
-    expect(updater.start(TARGET_COMMIT)).toMatchObject({
-      available: false,
-      unavailableReason: expect.stringContaining("non-interactive sudo"),
-    });
-    expect(
-      calls.some(([command]) => ["git", "systemd-run"].includes(command)),
-    ).toBe(false);
+    expect(updater.start(TARGET_COMMIT)).toMatchObject({ available: true, run: { state: "running" } });
+    expect(calls.some(([command]) => command === "sudo")).toBe(false);
   });
 
-  it("uses the shared tracked-change guard without fetching or merging in the request", () => {
+  it("hands local work to the coordinator without fetching or changing the checkout in the request", () => {
     const fixture = installation();
     fixture.host.dirty = true;
-    expect(() =>
-      inspectUpdateCheckout(fixture.options.commands, fixture.repoRoot),
-    ).toThrow("local changes");
-    expect(fixture.updater.start(TARGET_COMMIT)).toMatchObject({
-      available: false,
-      unavailableReason: expect.stringContaining("no tracked changes"),
-    });
-    expect(fixture.calls.some(([command]) => command === "systemd-run")).toBe(
-      false,
-    );
+    expect(fixture.updater.start(TARGET_COMMIT)).toMatchObject({ available: true, run: { state: "running" } });
+    expect(fixture.calls.some(([command]) => command === "git")).toBe(false);
+    expect(fixture.calls.some(([command]) => command === "systemd-run")).toBe(true);
   });
 
   it("launches an independent bounded service and reconnects to the same durable run", () => {
@@ -246,7 +287,8 @@ describe("installed Settings updater", () => {
         `--unit=${UPDATE_UNIT}`,
         `--property=RuntimeMaxSec=${UPDATE_TIMEOUT_MS / 1000}`,
         "--property=KillMode=control-group",
-        path.join(repoRoot, "scripts/settings-update.mjs"),
+        `--property=WorkingDirectory=${updater.read(first.run.id).coordinator}`,
+        path.join(updater.read(first.run.id).coordinator, "scripts/settings-update.mjs"),
         "run",
         first.run.id,
       ]),
@@ -283,7 +325,7 @@ describe("installed Settings updater", () => {
       const previous = installation();
       const started = previous.updater.start(TARGET_COMMIT);
       if (state === "failed")
-        previous.host.installer = () => {
+        previous.host.coordinator = () => {
           throw new Error("Installer failed");
         };
       const completed = previous.updater.run(started.run.id);
@@ -465,30 +507,19 @@ describe("installed Settings updater", () => {
   });
 
   it.each([true, false])(
-    "reports installer success=%s only after the bounded installer exits",
-    (succeeds) => {
-      const { updater, host, calls, repoRoot } = installation();
+    "reports coordinator success=%s from durable state after the bounded child exits",
+    succeeds => {
+      const { updater, host, calls } = installation();
       const started = updater.start(TARGET_COMMIT);
-      host.installer = (args, options) => {
+      const staged = updater.read(started.run.id).coordinator;
+      host.coordinator = (args, options) => {
         expect(updater.status().run.state).toBe("running");
-        expect(args).toEqual([
-          path.join(repoRoot, "scripts/install-cloudx.mjs"),
-          "--update",
-          "--target-commit",
-          TARGET_COMMIT,
-          "--yes",
-          "--non-interactive",
-          "--answers",
-          expect.any(String),
-        ]);
-        expect(JSON.parse(fs.readFileSync(args.at(-1), "utf8"))).toEqual({
-          runCodexLogin: false,
-          restartServices: true,
-        });
+        expect(args).toEqual([path.join(staged, "scripts/managed-update.mjs"), updater.recordPath(started.run.id)]);
+        expect(options.cwd).toBe(staged);
         expect(options.timeout).toBeLessThan(UPDATE_TIMEOUT_MS);
         expect(options.stdio[0]).toBe("ignore");
-        expect(options.env.CLOUDX_INSTALL_UPDATED_COMMIT).toBeUndefined();
-        if (!succeeds) throw new Error("secret installer details");
+        if (!succeeds) throw new Error("secret coordinator details");
+        completeCoordinator(args.at(-1), host.now);
         return "";
       };
       const completed = updater.run(started.run.id);
@@ -496,23 +527,233 @@ describe("installed Settings updater", () => {
       expect(completed.finishedAt).toBe(host.now.toISOString());
       expect(updater.status().run).toEqual(completed);
       expect(JSON.stringify(completed)).not.toContain("secret");
-      expect(
-        calls.filter(([command]) => command === process.execPath),
-      ).toHaveLength(1);
-      expect(
-        fs.existsSync(
-          path.join(updater.stateDir, `${started.run.id}.answers.json`),
-        ),
-      ).toBe(false);
+      expect(calls.filter(([command]) => command === process.execPath)).toHaveLength(1);
+      expect(fs.statSync(path.join(updater.stateDir, `${started.run.id}.log`)).mode & 0o777).toBe(0o600);
     },
   );
 
-  it("revalidates service ownership in the detached worker before invoking the installer", () => {
+  it("does not report success from a zero exit status without a durable verified result", () => {
+    const { updater, host } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    host.coordinator = () => "";
+    expect(updater.run(started.run.id)).toMatchObject({ state: "failed", resumable: true, message: expect.stringContaining("interrupted") });
+  });
+
+  it("retains the coordinator's actionable failure after a nonzero exit", () => {
+    const { updater, host } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    host.coordinator = args => {
+      completeCoordinator(args.at(-1), host.now, { state: "failed", phase: "restore", component: "documentation", resumable: true,
+        message: "The documentation schema migration failed. The previous installation was restored; repair the source archive and resume." });
+      throw new Error("private failure details");
+    };
+    expect(updater.run(started.run.id)).toMatchObject({ state: "failed", phase: "restore", component: "documentation", resumable: true,
+      message: expect.stringContaining("previous installation was restored") });
+  });
+
+  it("runs the detached coordinator after the initiating web process has stopped", () => {
     const { updater, host, calls } = installation();
     const started = updater.start(TARGET_COMMIT);
-    host.service = { DropInPaths: "/tmp/new-custom-unit.conf" };
-    expect(updater.run(started.run.id).state).toBe("failed");
-    expect(calls.some(([command]) => command === process.execPath)).toBe(false);
+    host.service = { ActiveState: "inactive", MainPID: "0" };
+    updater.readCgroup = pid => {
+      if (pid !== process.pid) throw new Error("The initiating web process is gone");
+      return "0::/user.slice/cloudx-settings-update.service\n";
+    };
+    expect(updater.run(started.run.id).state).toBe("succeeded");
+    expect(calls.filter(([command]) => command === process.execPath)).toHaveLength(1);
+  });
+
+  it("waits for explicit terminal interruption consent and exposes legacy recovery limits", () => {
+    const { updater, options, host, calls } = installation();
+    host.runtime = { ...host.runtime, requiresInterruption: true,
+      reasons: [{ service: "cloudx.service", message: "ENOENT: terminal-runtime/web.json" }],
+      recovery: { legacySessionIdentitiesUnavailable: true, warnings: ["Legacy in-memory tab identities cannot be restored."] } };
+    const proposed = updater.start(TARGET_COMMIT);
+    expect(proposed).toMatchObject({ available: true, confirmation: { targetCommit: TARGET_COMMIT,
+      message: expect.stringContaining("cannot be restored") } });
+    expect(proposed.run).toBeUndefined();
+    expect(host.staged).toEqual([]);
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+    const reconnected = new SettingsUpdater(options);
+    expect(reconnected.status().confirmation).toEqual(proposed.confirmation);
+    const accepted = reconnected.start(TARGET_COMMIT, { confirmInterruption: true });
+    expect(accepted.run.state).toBe("running");
+    expect(updater.read(accepted.run.id).confirmInterruption).toBe(true);
+    expect(reconnected.status().confirmation).toBeUndefined();
+    expect(calls.filter(([command]) => command === "systemd-run")).toHaveLength(1);
+  });
+
+  it("surfaces a migration blocker before staging or starting the update", () => {
+    const { updater, host, calls } = installation();
+    host.runtime = { ...host.runtime, requiresInterruption: true,
+      blockers: [{ service: "recovery", message: "Forge worker worker-1 has a pending launch. Stop or recover it through CloudX first." }] };
+    expect(updater.start(TARGET_COMMIT, { confirmInterruption: true })).toMatchObject({ available: false,
+      unavailableReason: expect.stringContaining("pending launch") });
+    expect(host.staged).toEqual([]);
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+  });
+
+  it("resumes the same durable UUID and selected commit with saved consent without resolving a remote or restaging", () => {
+    const { updater, options, host, calls } = installation();
+    host.runtime = { ...host.runtime, requiresInterruption: true };
+    const original = updater.start(TARGET_COMMIT, { confirmInterruption: true });
+    const saved = updater.read(original.run.id);
+    saved.transition = { phase: "snapshot", snapshotVerified: true, recoveryIdentity: "preserved-backup" };
+    updater.save(saved);
+    host.coordinator = () => { throw new Error("Killed coordinator"); };
+    expect(updater.run(original.run.id)).toMatchObject({ state: "failed", resumable: true });
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    host.now = new Date(host.now.getTime() + 60000);
+    calls.length = 0;
+    const reconnected = new SettingsUpdater({ ...options, serverPid: 789 });
+    const resumed = reconnected.start(TARGET_COMMIT, { resumeRunId: original.run.id });
+    expect(resumed).toMatchObject({ available: true, run: { id: original.run.id, targetCommit: TARGET_COMMIT,
+      state: "running", resumable: false, startedAt: host.now.toISOString() } });
+    expect(reconnected.read(original.run.id)).toMatchObject({ confirmInterruption: true, coordinator: saved.coordinator,
+      targetCommit: TARGET_COMMIT, serverPid: 789, transition: saved.transition });
+    expect(reconnected.read(original.run.id).run.finishedAt).toBeUndefined();
+    expect(host.staged).toEqual([saved.coordinator]);
+    expect(calls.some(([command]) => command === "git")).toBe(false);
+    expect(calls.filter(([command]) => command === "systemd-run")).toHaveLength(1);
+    expect(calls.find(([command]) => command === "systemd-run")[1].at(-1)).toBe(original.run.id);
+  });
+
+  it("rejects a changed target or nonresumable run before relaunch", () => {
+    const { updater, host, calls } = installation();
+    const original = updater.start(TARGET_COMMIT);
+    host.coordinator = () => "";
+    updater.run(original.run.id);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    expect(() => updater.start("c".repeat(40), { resumeRunId: original.run.id })).toThrow("cannot be resumed");
+    const saved = updater.read(original.run.id);
+    saved.run.resumable = false;
+    updater.save(saved);
+    expect(() => updater.start(TARGET_COMMIT, { resumeRunId: original.run.id })).toThrow("cannot be resumed");
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+  });
+
+  it("requests newly required interruption consent when resuming prepared work", () => {
+    const { updater, host, calls } = installation();
+    const original = updater.start(TARGET_COMMIT);
+    host.coordinator = () => "";
+    updater.run(original.run.id);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    host.runtime = { ...host.runtime, requiresInterruption: true };
+    calls.length = 0;
+    const proposed = updater.start(TARGET_COMMIT, { resumeRunId: original.run.id });
+    expect(proposed.confirmation).toMatchObject({ targetCommit: TARGET_COMMIT, message: expect.stringContaining("interrupt terminal processes") });
+    expect(updater.status().confirmation).toEqual(proposed.confirmation);
+    expect(updater.read(original.run.id).run.state).toBe("failed");
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: original.run.id, confirmInterruption: true }).run)
+      .toMatchObject({ id: original.run.id, state: "running" });
+  });
+
+  it("rejects a historical failed run after a later update becomes current", () => {
+    const { updater, host, calls } = installation();
+    const first = updater.start(TARGET_COMMIT);
+    host.coordinator = () => "";
+    updater.run(first.run.id);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    const later = updater.start(TARGET_COMMIT);
+    updater.run(later.run.id);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    expect(() => updater.start(TARGET_COMMIT, { resumeRunId: first.run.id })).toThrow("no longer the current run");
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+    expect(updater.status().run.id).toBe(later.run.id);
+  });
+
+  function interruptedMutation() {
+    const fixture = installation();
+    const started = fixture.updater.start(TARGET_COMMIT);
+    const record = fixture.updater.read(started.run.id);
+    record.run = { ...record.run, state: "failed", resumable: true };
+    record.transition = { mutating: true, completed: ["prepare", "quiesce"],
+      serviceTarget: { kind: "standard", serviceNames: SERVICE_NAMES }, environmentText: fs.readFileSync(fixture.envPath, "utf8") };
+    fixture.updater.save(record);
+    fixture.host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    fixture.calls.length = 0;
+    return { ...fixture, record };
+  }
+
+  it("recovers an interrupted mutation with stale unit definitions and missing live environment before inspecting new migrations", () => {
+    const { options, host, calls, envPath, record } = interruptedMutation();
+    host.service = { NeedDaemonReload: "yes", ActiveState: "inactive", MainPID: "0" };
+    fs.rmSync(envPath);
+    const updater = new SettingsUpdater({ ...options, cli: true,
+      runtimeInspector() { throw new Error("Restoration must precede a new runtime plan."); } });
+    expect(updater.status()).toMatchObject({ available: true, run: { id: record.run.id, resumable: true } });
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: record.run.id }).run).toMatchObject({ id: record.run.id, state: "running" });
+    const environmentFlag = calls.find(([command]) => command === "systemd-run")[1].find(arg => arg.startsWith("--property=EnvironmentFile="));
+    const recoveryEnvironment = environmentFlag.slice("--property=EnvironmentFile=".length);
+    expect(recoveryEnvironment).not.toBe(envPath);
+    expect(fs.readFileSync(recoveryEnvironment, "utf8")).toBe(record.transition.environmentText);
+    expect(fs.statSync(recoveryEnvironment).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(envPath)).toBe(false);
+  });
+
+  it.each(["other checkout", "other data", "other environment", "other coordinator", "other services"])("rejects mutation recovery with %s ownership", scenario => {
+    const { options, host, calls, home, updater, record } = interruptedMutation();
+    if (scenario === "other checkout") host.service = { WorkingDirectory: home };
+    if (scenario === "other environment") host.service = { EnvironmentFiles: `${home}/foreign.env (ignore_errors=no)` };
+    if (scenario === "other coordinator") record.coordinator = home;
+    if (scenario === "other services") record.transition.serviceTarget.serviceNames = ["foreign.service"];
+    updater.save(record);
+    const recovery = new SettingsUpdater({ ...options, cli: true, ...(scenario === "other data" ? { dataDir: home } : {}) });
+    expect(recovery.status().available).toBe(false);
+    if (scenario === "other data") expect(() => recovery.start(TARGET_COMMIT, { resumeRunId: record.run.id })).toThrow("another installation");
+    else expect(recovery.start(TARGET_COMMIT, { resumeRunId: record.run.id }).available).toBe(false);
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+  });
+
+  it("blocks a fresh update while another run still requires restoration", () => {
+    const { updater, calls } = interruptedMutation();
+    expect(updater.start(TARGET_COMMIT)).toMatchObject({ available: false, unavailableReason: expect.stringContaining("Resume the interrupted update") });
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+  });
+
+  it("discovers a custom service environment and reuses that saved identity for recovery", () => {
+    const fixture = installation();
+    const { host, options, home, calls } = fixture;
+    const customEnvironment = path.join(home, "custom.env");
+    fs.copyFileSync(fixture.envPath, customEnvironment);
+    fs.writeFileSync(path.join(fixture.systemdDir, "cloudx-custom.service"), "custom installed unit\n");
+    host.service = { EnvironmentFiles: `${customEnvironment} (ignore_errors=no)` };
+    const custom = new SettingsUpdater({ ...options, cli: true, service: "cloudx-custom.service", port: 3456 });
+    const started = custom.start(TARGET_COMMIT);
+    const record = custom.read(started.run.id);
+    expect(record.envPath).toBe(customEnvironment);
+    record.run = { ...record.run, state: "failed", resumable: true };
+    record.transition = { mutating: true, serviceTarget: { kind: "web", serviceNames: ["cloudx-custom.service"] },
+      environmentText: fs.readFileSync(customEnvironment, "utf8") };
+    custom.save(record);
+    fs.rmSync(customEnvironment);
+    host.service.NeedDaemonReload = "yes";
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    const recovered = new SettingsUpdater({ ...options, cli: true });
+    expect(recovered.status().available).toBe(true);
+    expect(recovered.start(TARGET_COMMIT, { resumeRunId: record.run.id }).run.state).toBe("running");
+    expect(recovered.serviceName).toBe("cloudx-custom.service");
+    expect(recovered.paths.envPath).toBe(customEnvironment);
+    expect(calls.some(([command, args]) => command === "systemctl" && args[2] === "cloudx.service")).toBe(false);
+  });
+
+  it("rejects an altered staged coordinator when resuming and preserves recovery state", () => {
+    const { updater, host, calls } = installation();
+    const original = updater.start(TARGET_COMMIT);
+    host.coordinator = () => "";
+    updater.run(original.run.id);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    const record = updater.read(original.run.id);
+    fs.writeFileSync(path.join(record.coordinator, "scripts/managed-update.mjs"), "modified");
+    const before = fs.readFileSync(updater.recordPath(original.run.id));
+    calls.length = 0;
+    expect(() => updater.start(TARGET_COMMIT, { resumeRunId: original.run.id })).toThrow("verification failed");
+    expect(fs.readFileSync(updater.recordPath(original.run.id))).toEqual(before);
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
   });
 
   it("rejects browser-shaped worker IDs and workers outside their managed cgroup", () => {
@@ -579,3 +820,9 @@ describe("unattended installer execution", () => {
     expect(processBelongsToService("0::/anything\n", "/")).toBe(false);
   });
 });
+
+function completeCoordinator(recordPath, now, outcome = {}) {
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  record.run = { ...record.run, state: "succeeded", phase: "complete", message: "The selected target runtime is running and verified.", finishedAt: now.toISOString(), ...outcome };
+  fs.writeFileSync(recordPath, JSON.stringify(record));
+}

@@ -2,9 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Fastify from "fastify";
 import type { CloudxUpdateStatus, CloudxUpdateRequest, CloudxUpdatePreview } from "@cloudx/shared";
 import { loadConfig } from "../config.js";
 import { buildServer, buildServices } from "../server.js";
+import { registerCloudxUpdateRoutes } from "./CloudxUpdateRoutes.js";
 
 describe("CloudX update HTTP boundary", () => {
   const running = { available: true, run: { id: "update-1", state: "running" as const, message: "Updating.", startedAt: "2026-09-15T00:00:00Z" } };
@@ -52,6 +54,39 @@ describe("CloudX update HTTP boundary", () => {
     expect(accepted.statusCode).toBe(202);
     expect(accepted.json()).toEqual(running);
     expect(start).toHaveBeenCalledExactlyOnceWith(selection);
+  });
+
+  it("provides startup identity when installed into a historical server without the runtime route", async () => {
+    const historical = Fastify();
+    registerCloudxUpdateRoutes(historical, { status, start, preview, selectChannel }, []);
+    try {
+      const response = await historical.inject({ url: "/api/runtime" });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.json()).toMatchObject({ verification: "unverified", build: null, pid: process.pid });
+    } finally { await historical.close(); }
+  });
+
+  it("passes explicit interruption consent and pinned resume identity through the trusted boundary", async () => {
+    const request = { ...selection, confirmInterruption: true, resumeRunId: "11111111-1111-4111-8111-111111111111", restoreSnapshotRunId: "22222222-2222-4222-8222-222222222222" };
+    const response = await app.inject({ method: "POST", url: "/api/system/update", headers, payload: request });
+    expect(response.statusCode).toBe(202);
+    expect(start).toHaveBeenCalledExactlyOnceWith(request);
+  });
+
+  it("returns a target-bound interruption notice without claiming the update started", async () => {
+    const confirmation = { available: true, confirmation: { targetCommit: selection.targetCommit, message: "Replacing terminals interrupts running work." } };
+    start.mockResolvedValueOnce(confirmation);
+    const response = await app.inject({ method: "POST", url: "/api/system/update", headers, payload: selection });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(confirmation);
+  });
+
+  it.each([{ confirmInterruption: "yes" }, { resumeRunId: "../run" }, { resumeRunId: "--command=bad" }, { restoreSnapshotRunId: "/arbitrary/data" }])("rejects unsafe recovery options before host work: %j", fields => {
+    return app.inject({ method: "POST", url: "/api/system/update", headers, payload: { ...selection, ...fields } }).then(response => {
+      expect(response.statusCode).toBe(400);
+      expect(start).not.toHaveBeenCalled();
+    });
   });
 
   it.each([

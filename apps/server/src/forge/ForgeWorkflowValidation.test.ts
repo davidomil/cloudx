@@ -773,6 +773,34 @@ describe("Saved review rounds", () => {
   });
 });
 
+describe("Historical single-review workers", () => {
+  const draft = { headSha, body: "Original finding.", event: "comment", comments: [], status: "posted",
+    publication: { commentIds: ["posted-original"] }, postedAt: worker.startedAt };
+  const reviewer = { ...worker, id: reviewWorkerId, kind: "review", status: "completed", draft };
+
+  it("uses the original worker identity and timestamp without changing publication or inventing comparison evidence", () => {
+    const parsed = parseWorkers([reviewer])[0];
+    expect(parsed).toEqual({ ...reviewer, draft: { id: reviewer.id, startedAt: reviewer.startedAt, ...draft } });
+    expect(parseWorkers([parsed])[0]).toEqual(parsed);
+    expect(reviewer.draft).toEqual(draft);
+    expect(parsed.reviewBaseline).toBeUndefined();
+  });
+
+  it.each([
+    { draft: { ...draft, id: reviewWorkerId } },
+    { draft: { ...draft, startedAt: worker.startedAt } },
+    { draft: { ...draft, id: null } },
+    { reviewHistory: [] },
+    { reviewBaseline: { reviewId: reviewWorkerId, revision: { headSha, baseSha: headSha, mergeBaseSha: headSha } } },
+    { completion: { attemptId: reviewWorkerId, deadlineAt: worker.startedAt } },
+    { id: "1".repeat(36) },
+    { startedAt: "2026-09-08" },
+    { draft: { ...draft, status: "draft" } },
+  ])("rejects partial identities, modern metadata and malformed historical evidence %#", changes => {
+    expect(() => parseWorkers([{ ...reviewer, ...changes }])).toThrow();
+  });
+});
+
 describe("Saved native worker completion", () => {
   const attemptId = "33333333-3333-4333-8333-333333333333";
   const turn = { workerId: worker.id, attemptId, threadId: "native-thread", turnId: "native-turn", status: "completed" };

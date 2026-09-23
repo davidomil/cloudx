@@ -37,11 +37,23 @@ must fetch this tag and its history before running the publisher tests. The
 tests validate exact commit, tree, parent, and changed-path identities and fail
 clearly when their history prerequisite is missing.
 
+Managed updater regressions also need full Git history. The pre-review-scope
+Forge fixture uses main commit `aec0d06e7f9087f9e912f6023cfbde5623f28178`;
+the initial native review-scope fixture uses
+`4083e1204ca86a84e3722248bb619a644326e34e`. These retain the tested Forge
+contracts without depending on discarded pre-rebase branch commits.
+Historical builds install their locked dependencies offline. After `npm ci`,
+run `npm cache add smol-toml@1.7.0` before these tests: CloudX 0.1.3 pins that
+version while the current lockfile pins 1.7.1. Both the TypeScript job and the
+isolated verifier image seed this extra dependency before offline execution.
+
 ## Terminal reliability stress
 
 The terminal stress job runs three fresh Node 22 V8 coverage processes
 with two CPUs, 7 GiB RAM and no swap. It repeats the broker and Unicode
-replay tests plus the full 32 MiB real-PTY recovery case. Every attempt
+replay tests, the full 32 MiB real-PTY recovery case, and the native
+Forge-owned 64 MiB burst with screen recovery, subsequent input and
+confirmed termination. Every attempt
 and case keeps its outcome and duration; any failure, missing required
 case or skipped selected case fails the job.
 
@@ -59,8 +71,8 @@ isolated verifier’s existing bounded log capture.
 
 Each stress command retains at most 64 KiB of stdout and stderr tails. A
 separate process measures replay append and snapshot throughput without
-a speed threshold. Correctness assertions and existing recovery
-deadlines remain unchanged; whole-repository coverage thresholds remain
+a speed threshold. Stress runs use the same correctness assertions and
+deadlines as ordinary coverage; whole-repository coverage thresholds remain
 in the ordinary coverage job.
 
 Run the same environment locally with the following commands. Use an
@@ -113,6 +125,11 @@ Machine-managed consumers can run the full plan-bound verifier described in
 `docs/AI_CHANGE_PROCESS.md`. Its fixed checks cover policy, formatting, lint,
 coverage, build, both Python services, and browser smoke. Focused checks do not
 produce an equivalent full-verification artifact.
+
+The isolated verifier allows 40 minutes for coverage, including historical
+release builds, on its two CPUs. Other verification commands retain their
+existing limits. Browser verification uses two workers regardless of the host
+CPU count, keeping execution within the container's CPU and process limits.
 
 The isolated verifier under `containers/ci/` separates candidate execution from
 trusted evidence. Changes to that boundary warrant its supervisor tests and

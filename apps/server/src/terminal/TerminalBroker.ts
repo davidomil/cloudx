@@ -103,11 +103,11 @@ export class TerminalBroker {
           owned.clients.set(socket, { output, dispose });
           output.replay(owned.output.snapshot());
           output.screen(screen);
-          output.send({ type: "ready" });
           socket.setTimeout(0);
           attached = true;
           for (const data of live) output.data(data);
           if (owned.exit) output.send({ type: "exit", event: owned.exit });
+          output.send({ type: "ready" });
         }).catch((error: unknown) => this.fail(output, error));
         return;
       }

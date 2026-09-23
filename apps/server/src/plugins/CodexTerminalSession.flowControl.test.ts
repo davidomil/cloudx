@@ -8,6 +8,7 @@ import { CodexTerminalPlugin, CodexTerminalSession } from "./CodexTerminalPlugin
 import { DurableTerminalProcessFactory } from "../terminal/DurableTerminalProcess.js";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import type { TerminalProducer } from "../terminal/TerminalProcess.js";
+import { retainTerminalDiagnostics } from "../terminal/testing/TerminalDiagnostics.js";
 
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
@@ -100,7 +101,8 @@ describe("directly owned terminal output", () => {
 });
 
 describe.skipIf(process.platform !== "linux")("native Forge-owned terminal output", () => {
-  it("delivers a 64 MiB burst with 1024 replay bytes, snapshots, subsequent input, and confirmed termination", async () => {
+  it("delivers a 64 MiB burst with 1024 replay bytes, snapshots, subsequent input, and confirmed termination", async context => {
+    const diagnostics = retainTerminalDiagnostics(context, "native-owned-output-burst");
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-owned-output-"));
     cleanups.push(() => fs.rm(directory, { recursive: true, force: true }));
     const shell = path.join(directory, "codex-fixture");
@@ -108,7 +110,8 @@ describe.skipIf(process.platform !== "linux")("native Forge-owned terminal outpu
     vi.stubEnv("SHELL", "/bin/sh");
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", shell);
     const native = new NodePtyTerminalProcessFactory();
-    const spawn = vi.spyOn(native, "spawn");
+    const spawnNative = native.spawn.bind(native);
+    const spawn = vi.spyOn(native, "spawn").mockImplementation(async (...args) => diagnostics.observe(await spawnNative(...args)));
     const factory = new DurableTerminalProcessFactory(path.join(directory, "absent-broker.sock"), native);
     const plugin = new CodexTerminalPlugin(factory, 1024);
     const closeTab = vi.fn();
@@ -126,26 +129,37 @@ describe.skipIf(process.platform !== "linux")("native Forge-owned terminal outpu
       printableBytes += data.length - data.replaceAll("@", "").length;
       output = (output + data).slice(-4096);
     });
-    session.write!("stty -echo; PS1=''; printf '\\nREADY_PID=%s\\n' \"$$\"\n");
-    await vi.waitFor(() => expect(output).toMatch(/READY_PID=\d+/u));
-    const pid = Number(/READY_PID=(\d+)/u.exec(output)![1]);
-    session.write!("python3 -c \"import os; [os.write(1, b'@' * 65536) for _ in range(1024)]\"; printf '\\nBURST_DONE=%s\\n' \"$$\"\n");
-    await vi.waitFor(() => expect(session.snapshot().recentOutput).toContain(`BURST_DONE=${pid}`), { timeout: 75_000 });
-    const restored = await session.attachTerminal!(() => {});
-    expect(printableBytes).toBe(64 * 1024 * 1024);
-    expect(restored.screen.data).toContain(`BURST_DONE=${pid}`);
-    expect(pause).toHaveBeenCalled();
-    expect(session.snapshot().status).toBe("running");
-    expect(Buffer.byteLength(session.snapshot().recentOutput!)).toBeLessThanOrEqual(1024);
-    await session.handleAction("enter_text", { text: "printf '\\nAFTER_BURST=%s\\n' \"$$\"", submit: true });
-    await vi.waitFor(() => expect(output).toContain(`AFTER_BURST=${pid}`));
-    expect((await session.attachTerminal!(() => {})).screen.data).toContain(`AFTER_BURST=${pid}`);
-    await expect(session.handleAction("stop", {})).resolves.toEqual({ stopped: true });
-    expect(() => process.kill(pid, 0)).toThrow();
-    expect(session.snapshot().status).toBe("stopped");
-    expect((await session.attachTerminal!(() => {})).screen.data).toContain(`AFTER_BURST=${pid}`);
-    expect(closeTab).not.toHaveBeenCalled();
-  }, 90_000);
+    try {
+      diagnostics.enterPhase("wait for shell readiness");
+      session.write!("stty -echo; PS1=''; printf '\\nREADY_PID=%s\\n' \"$$\"\n");
+      await vi.waitFor(() => expect(output).toMatch(/READY_PID=\d+/u));
+      const pid = Number(/READY_PID=(\d+)/u.exec(output)![1]);
+      diagnostics.enterPhase("receive 64 MiB and BURST_DONE");
+      session.write!("python3 -c \"import os; [os.write(1, b'@' * 65536) for _ in range(1024)]\"; printf '\\nBURST_DONE=%s\\n' \"$$\"\n");
+      // Match the broker burst budget while coverage workers share CPU time.
+      await vi.waitFor(() => expect(session.snapshot().recentOutput).toContain(`BURST_DONE=${pid}`), { timeout: 120_000 });
+      diagnostics.enterPhase("restore screen after burst");
+      const restored = await session.attachTerminal!(() => {});
+      expect(printableBytes).toBe(64 * 1024 * 1024);
+      expect(restored.screen.data).toContain(`BURST_DONE=${pid}`);
+      expect(pause).toHaveBeenCalled();
+      expect(session.snapshot().status).toBe("running");
+      expect(Buffer.byteLength(session.snapshot().recentOutput!)).toBeLessThanOrEqual(1024);
+      diagnostics.enterPhase("send input after burst");
+      await session.handleAction("enter_text", { text: "printf '\\nAFTER_BURST=%s\\n' \"$$\"", submit: true });
+      await vi.waitFor(() => expect(output).toContain(`AFTER_BURST=${pid}`));
+      expect((await session.attachTerminal!(() => {})).screen.data).toContain(`AFTER_BURST=${pid}`);
+      diagnostics.enterPhase("terminate shell and retain screen");
+      await expect(session.handleAction("stop", {})).resolves.toEqual({ stopped: true });
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(session.snapshot().status).toBe("stopped");
+      expect((await session.attachTerminal!(() => {})).screen.data).toContain(`AFTER_BURST=${pid}`);
+      expect(closeTab).not.toHaveBeenCalled();
+    } catch (error) {
+      diagnostics.fail(error);
+      throw error;
+    }
+  }, 135_000);
 });
 
 function fixture(initialOutput = "") {
