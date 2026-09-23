@@ -42,7 +42,29 @@ function commandResult(command, args, options = {}) {
   }
   if (command === 'git' && args.join(' ') === 'rev-parse --show-toplevel') return result(repoRoot);
   if (command === 'git' && args.join(' ') === 'rev-parse HEAD')
-    return result('fixture partial output', 'fixture preparation failure', 42);
+    return process.env.CLOUDX_TEST_UPDATE_FAILURE === 'git'
+      ? result('fixture partial output', 'fixture preparation failure', 42) : result('b'.repeat(40));
+  if (command === 'git') {
+    if (args[0] === 'write-tree') return result('c'.repeat(40));
+    if (args[0] === 'clone') {
+      fs.mkdirSync(args.at(-1), { recursive: true });
+      return result('');
+    }
+    if (args.join(' ') === 'remote get-url origin') return result(repoRoot);
+    if (args.join(' ') === `rev-parse ${'a'.repeat(40)}^{commit}`) return result('a'.repeat(40));
+    if (['remote', 'fetch', 'checkout', 'read-tree'].includes(args[0])) return result('');
+    if (args[0] === 'diff') {
+      const output = args.find(arg => arg.startsWith('--output='));
+      if (output) fs.writeFileSync(output.slice(9), '');
+      return result('');
+    }
+  }
+  const release = path.join(stateDir, JSON.parse(fs.readFileSync(path.join(stateDir, 'latest.json'), 'utf8')).id, 'release');
+  if (['node', 'npm', 'python3', path.join(release, '.update-tools/uv/bin/pip'), path.join(release, '.update-tools/uv/bin/uv')].includes(command)) {
+    if (options.cwd !== release) throw new Error(`Preparation command escaped staged release: ${options.cwd}`);
+    if (command === 'npm' && args.join(' ') === 'run build') return result('', 'fixture build failure', 42);
+    return result('');
+  }
   throw new Error(`Unexpected fixture host command: ${command} ${args.join(' ')}`);
 }
 

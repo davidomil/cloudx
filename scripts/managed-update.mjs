@@ -178,6 +178,7 @@ export class UpdateHost {
     transition.integration = prepareManagedIntegration(release, record.coordinator);
     this.prepareDirectBroker(record);
     this.prepareRelease({ releaseRoot: release, home: this.home, envConfig: this.envConfig, standard: this.target.kind === 'standard',
+      runner: new InstallerRunner({ cwd: release, nonInteractive: true, verbose: this.runner.verbose }),
       progress: (component, message) => { record.run.component = component; record.run.message = message; this.save(record); } });
     writeRuntimeBuild({ repoRoot: release, commit: record.targetCommit });
     const server = path.join(release, 'apps/server/dist/server.js');
