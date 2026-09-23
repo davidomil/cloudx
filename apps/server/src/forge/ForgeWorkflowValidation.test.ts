@@ -159,6 +159,86 @@ describe("Issue completion reports", () => {
   });
 });
 
+describe("Issue working-file handoffs", () => {
+  const handoff = { headSha, status: "ready" as const, retainedPaths: ["debug_tooling/notes.txt", "src/experiment.ts"], details: "Diagnostics and an unrelated experiment remain in the checkout." };
+
+  it.each(["ready", "needs_work"])("preserves a %s handoff and independent remaining files", status => {
+    const completed = { ...report, handoff: { ...handoff, status } };
+    expect(parseWorkerReport(completed)).toEqual(completed);
+  });
+
+  it("accepts exact SHA-256 commits, literal whitespace names, and an empty remaining-file list", () => {
+    for (const retainedPaths of [[], ["notes with spaces.txt", "line\nbreak.txt"], ["p".repeat(4096)], Array.from({ length: 10_000 }, (_, i) => `file-${i}`)]) {
+      const completed = { ...report, handoff: { ...handoff, headSha: "A".repeat(64), retainedPaths } };
+      expect(parseWorkerReport(completed)).toEqual(completed);
+    }
+  });
+
+  it.each([
+    null, {}, [],
+    { ...handoff, status: "done" }, { ...handoff, status: ["ready"] },
+    ...["a".repeat(39), "a".repeat(41), "a".repeat(63), "g".repeat(40), `${headSha}\n`].map(headSha => ({ ...handoff, headSha })),
+    { ...handoff, details: " " }, { ...handoff, details: "d".repeat(100_001) },
+    ...[null, {}, ["same", "same"], [1], [""], ["/absolute"], ["../parent"], ["a/../b"], ["a/./b"], ["a//b"], ["a/"], ["a\\b"], ["a\0b"], ["C:/outside"], ["p".repeat(4097)], Array.from({ length: 10_001 }, (_, i) => `file-${i}`)].map(retainedPaths => ({ ...handoff, retainedPaths })),
+  ])("rejects malformed or unsafe handoff evidence %#", handoff => {
+    expect(() => parseWorkerReport({ ...report, handoff })).toThrow();
+  });
+
+  it("rejects publication handoffs on review reports", () => {
+    expect(() => parseWorkerReport({ kind: "review", headSha, event: "comment", body: "Review", comments: [], handoff })).toThrow(/issue/);
+  });
+
+  it("persists the captured commit and paths before and after pushing the same commit", () => {
+    for (const head of [undefined, headSha]) {
+      const pendingPublication = { report: { ...report, handoff }, handoff: { headSha, retainedPaths: [...handoff.retainedPaths].reverse() }, ...(head ? { headSha: head } : {}), repliedDiscussionIds: [] };
+      expect(parseWorkers([{ ...worker, pendingPublication }])[0].pendingPublication).toEqual(pendingPublication);
+    }
+  });
+
+  it.each([
+    { handoff: undefined },
+    { handoff: { headSha: "b".repeat(40), retainedPaths: handoff.retainedPaths } },
+    { handoff: { headSha, retainedPaths: [handoff.retainedPaths[0]] } },
+    { handoff: { headSha, retainedPaths: ["other.txt", handoff.retainedPaths[0]] } },
+    { handoff: { headSha: "a".repeat(41), retainedPaths: handoff.retainedPaths } },
+    { headSha: "b".repeat(40) },
+    { report: { ...report, handoff: { ...handoff, status: "needs_work" } } },
+    { baseUpdate: { expectedHeadSha: headSha, baseBranch: "main" } },
+  ])("rejects publication that changes or omits the ready handoff %#", fields => {
+    const pendingPublication = { report: { ...report, handoff }, handoff: { headSha, retainedPaths: handoff.retainedPaths }, repliedDiscussionIds: [], ...fields };
+    expect(() => parseWorkers([{ ...worker, pendingPublication }])).toThrow(/handoff/);
+  });
+
+  it("retains a runtime-captured clean handoff for a report without explicit working files", () => {
+    const pendingPublication = { report, handoff: { headSha, retainedPaths: [] }, repliedDiscussionIds: [] };
+    expect(parseWorkers([{ ...worker, pendingPublication }])[0].pendingPublication).toEqual(pendingPublication);
+  });
+});
+
+describe("Saved retained checkouts", () => {
+  const retainedWorkspace = { worktreePath: "/owned/checkout", retainedPaths: ["notes.txt", "src/experiment.ts"] };
+
+  it.each(["completed", "cleanup_failed", "failed", "paused"])("preserves the recovery path and file names while %s", status => {
+    const saved = { ...worker, status, retainedWorkspace };
+    const parsed = parseWorkers([saved])[0];
+    expect(parsed).toEqual(saved);
+    expect(parsed.retainedWorkspace).not.toBe(retainedWorkspace);
+  });
+
+  it.each([
+    null, {}, { ...retainedWorkspace, worktreePath: " " }, { ...retainedWorkspace, worktreePath: "bad\0path" },
+    { ...retainedWorkspace, worktreePath: "p".repeat(4097) }, { ...retainedWorkspace, retainedPaths: ["../outside"] },
+    { ...retainedWorkspace, retainedPaths: ["same", "same"] },
+  ])("rejects malformed recovery information %#", retainedWorkspace => {
+    expect(() => parseWorkers([{ ...worker, retainedWorkspace }])).toThrow();
+  });
+
+  it("requires any still-owned checkout to match the retained location", () => {
+    expect(parseWorkers([{ ...worker, worktreePath: retainedWorkspace.worktreePath, retainedWorkspace }])[0].retainedWorkspace).toEqual(retainedWorkspace);
+    expect(() => parseWorkers([{ ...worker, worktreePath: "/another/checkout", retainedWorkspace }])).toThrow(/match/);
+  });
+});
+
 describe("Rebase completion reports", () => {
   const rebase = { outcome: "resolved", validation: "passed", details: "Resolved both edits and ran the affected tests." };
 
@@ -697,6 +777,23 @@ describe("Saved native worker completion", () => {
   const attemptId = "33333333-3333-4333-8333-333333333333";
   const turn = { workerId: worker.id, attemptId, threadId: "native-thread", turnId: "native-turn", status: "completed" };
   const completion = { attemptId, deadlineAt: "2026-09-21T07:00:00.000Z", turn, report };
+
+  it("preserves why a completed issue needs a new worker turn", () => {
+    const saved = { ...worker, completion: { ...completion, continuationRequired: "Commit the unfinished implementation and submit a ready handoff." } };
+    expect(parseWorkers([saved])[0]).toEqual(saved);
+  });
+
+  it.each([
+    { completion: { ...completion, continuationRequired: " " } },
+    { completion: { ...completion, continuationRequired: "x".repeat(100_001) } },
+    { completion: { ...completion, continuationRequired: "Finish", turn: undefined } },
+    { completion: { ...completion, continuationRequired: "Finish", turn: { ...turn, status: "interrupted" } } },
+    { completion: { ...completion, continuationRequired: "Finish", report: undefined } },
+    { completion: { ...completion, continuationRequired: "Finish" }, pendingPublication: { report, repliedDiscussionIds: [] } },
+    { kind: "review", completion: { ...completion, continuationRequired: "Finish", report: { kind: "review", headSha, event: "comment", body: "Review", comments: [] } } },
+  ])("rejects a continuation blocker without successful issue evidence or with publication underway %#", fields => {
+    expect(() => parseWorkers([{ ...worker, ...fields }])).toThrow(/continuation/);
+  });
 
   it.each(["running", "completed", "interrupted", "failed"])("preserves %s separately from the report across persistence", status => {
     const saved = { ...worker, attemptId, completion: { ...completion, turn: { ...turn, status } } };

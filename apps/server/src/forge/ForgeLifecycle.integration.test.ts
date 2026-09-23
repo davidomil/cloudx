@@ -11,6 +11,7 @@ import type {
   ForgeCreateChangeRequest,
   ForgeCredentialRole,
   ForgeIssueDetail,
+  ForgeIssueHandoff,
   ForgeRepository,
   ForgeReviewDraft,
   ForgeReviewPublication,
@@ -156,6 +157,188 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(manifest.quiescent).toBe(true);
     await expectMissing(receipt.reportPath, receipt.contextPath);
   }, 15_000);
+
+  it("publishes and reviews the declared commit while preserving working files and the index through merge and restart", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    const checkout = started.worktreePath!;
+    const diagnostics = Buffer.from([0, 255, 128, 10, 13, 0, 42]);
+    const ignored = Buffer.from([255, 0, 1, 2, 3]);
+    const tracked = Buffer.from("Retained working notes\n");
+    const staged = "Intentionally staged notes\n";
+    await fs.mkdir(path.join(checkout, "debug_tooling"));
+    await fs.writeFile(path.join(checkout, "debug_tooling", "diagnostics.bin"), diagnostics);
+    await fs.writeFile(path.join(checkout, "README.md"), staged);
+    await git(checkout, "add", "--", "README.md");
+    await fs.writeFile(path.join(checkout, "README.md"), tracked);
+    await fs.mkdir(path.join(checkout, ".git", "info"), { recursive: true });
+    await fs.appendFile(path.join(checkout, ".git", "info", "exclude"), "\nignored-diagnostics.bin\n");
+    await fs.writeFile(path.join(checkout, "ignored-diagnostics.bin"), ignored);
+    const status = await git(checkout, "status", "--porcelain=v1", "--untracked-files=all");
+    await declareHandoff(implementation, { headSha: implementation.headSha, status: "ready", retainedPaths: ["README.md", "debug_tooling/diagnostics.bin"], details: "The committed implementation is complete; preserve staged and working research notes and binary diagnostics." });
+
+    await fixture.workflow.poll();
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(implementation.headSha);
+    const reviewer = await fixture.runningWorker("review");
+    const reviewed = await fixture.completedAssistantTurn(reviewer);
+    expect(reviewed.localReview).toMatchObject({ headSha: implementation.headSha });
+    expect(reviewed.localReview!.diff).toContain("diff --git a/solution.txt b/solution.txt");
+    expect(reviewed.localReview!.diff).not.toContain("README.md");
+    expect(reviewed.localReview!.diff).not.toContain("diagnostics");
+    await fixture.workflow.poll();
+
+    expect(fixture.provider.submissions).toEqual([expect.objectContaining({ headSha: implementation.headSha, event: "approve" })]);
+    expect(fixture.provider.merges).toEqual([implementation.headSha]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(implementation.headSha);
+    expect(await git(fixture.origin, "show", `${implementation.headSha}:README.md`)).toBe("Fixture project");
+    const retained = await fixture.worker(started.id);
+    expect(retained).toMatchObject({ status: "completed", headSha: implementation.headSha, retainedWorkspace: { worktreePath: checkout, retainedPaths: expect.arrayContaining(["README.md", "debug_tooling/diagnostics.bin", "ignored-diagnostics.bin"]) } });
+    expect(retained.worktreePath).toBeUndefined();
+    expect(retained.error).toBeUndefined();
+    await expectMissing(reviewer.worktreePath!, implementation.reportPath, implementation.contextPath);
+    expect(fixture.sessions.listTabs()).toEqual([]);
+
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", retainedWorkspace: retained.retainedWorkspace });
+    expect((await fixture.worker(started.id)).worktreePath).toBeUndefined();
+    expect(await fs.readFile(path.join(checkout, "debug_tooling", "diagnostics.bin"))).toEqual(diagnostics);
+    expect(await fs.readFile(path.join(checkout, "ignored-diagnostics.bin"))).toEqual(ignored);
+    expect(await fs.readFile(path.join(checkout, "README.md"))).toEqual(tracked);
+    expect((await execute("git", ["show", ":README.md"], { cwd: checkout })).stdout).toBe(staged);
+    expect(await git(checkout, "status", "--porcelain=v1", "--untracked-files=all")).toBe(status);
+    expect(await git(checkout, "rev-parse", "HEAD")).toBe(implementation.headSha);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(fixture.factory.processes).toHaveLength(2);
+  }, 20_000);
+
+  it.each(["skip-worktree", "assume-unchanged", "ignored submodule"] as const)("retains %s contents omitted by status through merge, cleanup and restart", async hidden => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    const checkout = started.worktreePath!;
+    const submodule = path.join(checkout, "dependency");
+    if (hidden === "ignored submodule") {
+      await git(checkout, "init", "-b", "main", submodule);
+      await fs.writeFile(path.join(submodule, ".gitignore"), "diagnostics.bin\n");
+      await git(submodule, "add", ".gitignore");
+      await git(submodule, "-c", "user.name=Forge Fixture", "-c", "user.email=forge-fixture@example.invalid", "commit", "-m", "TEST: dependency");
+      await fs.writeFile(path.join(checkout, ".gitmodules"), '[submodule "dependency"]\n\tpath = dependency\n\turl = https://example.invalid/dependency.git\n');
+      await git(checkout, "add", "dependency", ".gitmodules");
+      await git(checkout, "commit", "-m", "TEST: committed dependency");
+    }
+    const intended = await git(checkout, "rev-parse", "HEAD");
+    await declareHandoff(implementation, { headSha: intended, status: "ready", retainedPaths: [], details: "The committed implementation is complete." });
+    await fixture.workflow.poll();
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(intended);
+
+    const retainedPath = hidden === "ignored submodule" ? "dependency" : "README.md";
+    const file = hidden === "ignored submodule" ? path.join(submodule, "diagnostics.bin") : path.join(checkout, retainedPath);
+    const bytes = Buffer.from([0, 255, 128, 13, 10, 0, 42]);
+    if (hidden !== "ignored submodule") await git(checkout, "update-index", `--${hidden}`, "--", retainedPath);
+    await fs.writeFile(file, bytes);
+    expect(await git(checkout, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")).toBe("");
+    const indexPath = path.join(checkout, ".git", "index");
+    const index = await fs.readFile(indexPath);
+    const submoduleIndex = hidden === "ignored submodule" ? await fs.readFile(path.join(submodule, ".git", "index")) : undefined;
+    const flags = await git(checkout, "ls-files", "-v", "--stage", "-z");
+    await fixture.workflowDependencies.runtime.verifyPublishedWorkspace({ id: started.id, repositoryPath: started.repositoryPath!, worktreePath: checkout, branch: started.branch! }, intended);
+
+    const reviewer = await fixture.runningWorker("review");
+    const reviewed = await fixture.completedAssistantTurn(reviewer);
+    expect(reviewed.localReview).toMatchObject({ headSha: intended });
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([intended]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(intended);
+    const retained = { worktreePath: checkout, retainedPaths: [retainedPath] };
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", headSha: intended, retainedWorkspace: retained });
+
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    const completed = await fixture.worker(started.id);
+    expect(completed).toMatchObject({ status: "completed", retainedWorkspace: retained });
+    expect(completed.worktreePath).toBeUndefined();
+    expect(completed.error).toBeUndefined();
+    expect(await fs.readFile(file)).toEqual(bytes);
+    expect(await fs.readFile(indexPath)).toEqual(index);
+    if (submoduleIndex) expect(await fs.readFile(path.join(submodule, ".git", "index"))).toEqual(submoduleIndex);
+    expect(await git(checkout, "ls-files", "-v", "--stage", "-z")).toBe(flags);
+    expect(await git(checkout, "rev-parse", "HEAD")).toBe(intended);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(fixture.factory.processes).toHaveLength(2);
+  }, 20_000);
+
+  it("resumes an interrupted dirty handoff after restart without repeating execution or publication", async () => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(started);
+    const diagnostics = Buffer.from([0, 255, 1, 2, 128]);
+    const diagnosticsPath = path.join(started.worktreePath!, "diagnostics.bin");
+    await fs.writeFile(diagnosticsPath, diagnostics);
+    await declareHandoff(receipt, { headSha: receipt.headSha, status: "ready", retainedPaths: ["diagnostics.bin"], details: "The implementation is complete; retain diagnostic bytes." });
+    const create = fixture.provider.createChangeRequest.bind(fixture.provider);
+    const creating = vi.spyOn(fixture.provider, "createChangeRequest").mockImplementation(async input => {
+      await create(input);
+      throw new Error("Connection interrupted after creating the change request.");
+    });
+    await fixture.workflow.poll();
+    const interrupted = await fixture.worker(started.id);
+    expect(interrupted).toMatchObject({ status: "failed", publicationState: "uncertain", pendingPublication: { headSha: receipt.headSha, handoff: { headSha: receipt.headSha, retainedPaths: ["diagnostics.bin"] } } });
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(receipt.headSha);
+
+    await fixture.restartWorkflow();
+    await fixture.workflow.resume(started.id, fixture.placement);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_review", headSha: receipt.headSha, changeNumber: 7 });
+    expect((await fixture.worker(started.id)).pendingPublication).toBeUndefined();
+    expect(await fs.readFile(diagnosticsPath)).toEqual(diagnostics);
+    expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(creating).toHaveBeenCalledOnce();
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect(fixture.gitPushes).toHaveLength(1);
+  }, 20_000);
+
+  it.each(["unfinished implementation", "undeclared working files"] as const)("continues %s in one new attempt while preserving prior work", async reason => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const first = await fixture.completedAssistantTurn(started);
+    const checkout = started.worktreePath!;
+    const solution = path.join(checkout, "solution.txt");
+    const notes = Buffer.from([0, 1, 255, 128]);
+    await fs.writeFile(solution, "Unfinished implementation\n");
+    await fs.writeFile(path.join(checkout, "research.bin"), notes);
+    if (reason === "unfinished implementation")
+      await declareHandoff(first, { headSha: first.headSha, status: "needs_work", retainedPaths: ["solution.txt", "research.bin"], details: "Finish the solution and validate it before publishing." });
+    await fixture.workflow.poll();
+    const blocked = await fixture.worker(started.id);
+    expect(blocked).toMatchObject({ status: "failed", completion: { continuationRequired: expect.stringContaining("Continue with message") } });
+    expect(blocked.pendingPublication).toBeUndefined();
+    expect(await fixture.reports.read(started.attemptId!)).toBeDefined();
+    expect(fixture.gitPushes).toEqual([]);
+    expect(fixture.provider.changes.size).toBe(0);
+
+    await fixture.restartWorkflow();
+    const message = "Finish the solution, commit only the implementation, and retain research.bin in the handoff.";
+    const continued = await fixture.workflow.continueWorker(started.id, message, fixture.placement);
+    expect(continued).toMatchObject({ id: started.id, status: "running", worktreePath: checkout });
+    expect(continued.attemptId).not.toBe(started.attemptId);
+    const second = await fixture.completedAssistantTurn(continued);
+    expect(second.context).toMatchObject({ manualContinuation: { message, previousError: expect.stringContaining("Continue with message") } });
+    expect(await fs.readFile(solution, "utf8")).toBe("Unfinished implementation\n");
+    expect(await fs.readFile(path.join(checkout, "research.bin"))).toEqual(notes);
+    await fs.writeFile(solution, "Completed implementation\n");
+    await git(checkout, "add", "--", "solution.txt");
+    await git(checkout, "commit", "-m", "FIX: complete the retained implementation");
+    const headSha = await git(checkout, "rev-parse", "HEAD");
+    await declareHandoff(second, { headSha, status: "ready", retainedPaths: ["research.bin"], details: "Implementation completed and committed; retain research bytes." });
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "awaiting_review", headSha });
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(headSha);
+    expect(await fs.readFile(path.join(checkout, "research.bin"))).toEqual(notes);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+  }, 20_000);
 
   it("retains a normally exited reviewer until Forge verifies termination and saves its draft", async () => {
     const fixture = await LifecycleFixture.create();
@@ -876,7 +1059,9 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
     await fixture.workflow.poll();
     expect(await fixture.worker(started.id)).toMatchObject({
-      status: "paused", error: expect.stringContaining("Commit all worker changes"), rebaseRecovery: { phase: "resolving" },
+      status: "failed", error: expect.stringContaining("Continue with message"),
+      completion: { continuationRequired: expect.stringContaining("explicit publication handoff") },
+      rebaseRecovery: { phase: "resolving" },
     });
     expect(fixture.gitPushes).toHaveLength(1);
     expect(fixture.provider.submissions).toHaveLength(1);
@@ -1269,15 +1454,13 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fs.readFile(path.join(fixture.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
   }, 20_000);
 
-  it("preserves local edits and a completed report when merged cleanup fails until an explicit resume", async () => {
+  it("retains unpublished files when an external merge retires a completed worker", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
     await fixture.completedAssistantTurn(started);
     await fixture.workflow.poll();
     const resumed = await fixture.workflow.resume(started.id, fixture.placement);
     const receipt = await fixture.completedAssistantTurn(resumed);
-    const report = await fs.readFile(receipt.reportPath, "utf8");
-    const context = await fs.readFile(receipt.contextPath, "utf8");
     const localEdit = path.join(resumed.worktreePath!, "unpublished.txt");
     await fs.writeFile(localEdit, "Keep this local edit\n");
     await fixture.provider.mergeExternally(7);
@@ -1285,21 +1468,23 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
 
     fixture.advanceCleanupInterval();
     await fixture.workflow.poll();
-    expect(await fixture.worker(started.id)).toMatchObject({ status: "cleanup_failed", error: expect.stringMatching(/commit.*changes|local changes/i), worktreePath: resumed.worktreePath, attemptId: resumed.attemptId });
+    const retired = await fixture.worker(started.id);
+    expect(retired).toMatchObject({ status: "completed", retainedWorkspace: { worktreePath: resumed.worktreePath, retainedPaths: ["unpublished.txt"] } });
+    expect(retired.worktreePath).toBeUndefined();
+    expect(retired.error).toBeUndefined();
     expect(await processIsRunning(receipt.pid)).toBe(false);
     expect(await fs.readFile(localEdit, "utf8")).toBe("Keep this local edit\n");
-    expect(await fs.readFile(receipt.reportPath, "utf8")).toBe(report);
-    expect(await fs.readFile(receipt.contextPath, "utf8")).toBe(context);
+    await expectMissing(receipt.reportPath, receipt.contextPath, receipt.codexHome, path.dirname(receipt.tabContextPath));
 
-    await fs.rm(localEdit);
+    await fixture.restartWorkflow();
     fixture.advanceCleanupInterval();
     await fixture.workflow.poll();
-    expect((await fixture.worker(started.id)).status).toBe("cleanup_failed");
-    expect(await fs.readFile(receipt.reportPath, "utf8")).toBe(report);
-    await fixture.workflow.resume(started.id, fixture.placement);
-    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
-    expect(await fixture.store.read()).toEqual([]);
-    await expectMissing(resumed.worktreePath!, receipt.reportPath, receipt.contextPath, receipt.codexHome, path.dirname(receipt.tabContextPath));
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", retainedWorkspace: retired.retainedWorkspace });
+    expect((await fixture.worker(started.id)).worktreePath).toBeUndefined();
+    expect(await fs.readFile(localEdit, "utf8")).toBe("Keep this local edit\n");
+    expect(await git(resumed.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
     expect(fixture.sessions.listTabs()).toEqual([]);
   }, 20_000);
 
@@ -1984,6 +2169,12 @@ class LocalForgeProvider implements ForgeProvider {
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   return (await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } })).stdout.trim();
+}
+
+async function declareHandoff(receipt: AssistantReceipt, handoff: ForgeIssueHandoff): Promise<void> {
+  const report = JSON.parse(await fs.readFile(receipt.reportPath, "utf8"));
+  await fs.writeFile(`${receipt.reportPath}.tmp`, JSON.stringify({ ...report, handoff }));
+  await fs.rename(`${receipt.reportPath}.tmp`, receipt.reportPath);
 }
 
 async function expectMissing(...files: string[]): Promise<void> {

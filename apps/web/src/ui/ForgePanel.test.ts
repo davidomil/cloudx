@@ -170,6 +170,87 @@ describe("ForgePanel", () => {
     expect(recovery.textContent).toContain("Directory ownership reconciled");
   });
 
+  it.each(["awaiting_publication", "awaiting_review"] as const)("shows retained file recovery while %s", async status => {
+    const handoff = { headSha: change.headSha, status: "ready" as const, retainedPaths: ["diagnostics.log", "src/experiment.ts"], details: "Diagnostics and an unrelated experiment are retained." };
+    const published: ForgeWorker = { ...publishingWorker, status, worktreePath: "/owned/forge/active-checkout",
+      ...(status === "awaiting_publication" ? { pendingPublication: { ...publishingWorker.pendingPublication!, handoff } } : {
+        pendingPublication: undefined,
+        completion: { attemptId: "attempt", deadlineAt: "2026-09-23T12:00:00.000Z", report: { ...publishingWorker.pendingPublication!.report, handoff } },
+      }),
+    };
+    const panel = await renderPanel(fixture({ workers: [published] }));
+    for (const section of ["Issues", "Pull requests", "Workers (1)"]) {
+      if (section === "Workers (1)") await act(async () => { Array.from(panel.querySelectorAll<HTMLButtonElement>(".forge-tabs button")).find(item => item.textContent?.startsWith(section))!.click(); });
+      else await click(panel, section);
+      const recovery = panel.querySelector('[aria-label="Retained working files"]')!;
+      expect(recovery.textContent).toContain("Working files remain at");
+      expect(recovery.querySelector("code")?.textContent).toBe(published.worktreePath);
+      expect(recovery.textContent).toContain("Copy any files you need from this checkout");
+      expect(recovery.textContent).not.toContain("Forge kept the checkout");
+      expect(Array.from(recovery.querySelectorAll("li"), entry => entry.textContent)).toEqual(handoff.retainedPaths);
+    }
+  });
+
+  it.each([
+    { status: "running" as const, ready: true, paths: ["notes.txt"] },
+    { status: "starting" as const, ready: true, paths: ["notes.txt"] },
+    { status: "failed" as const, ready: false, paths: ["unfinished.ts"] },
+    { status: "awaiting_review" as const, ready: true, paths: [] },
+  ])("does not present stale, unfinished, or empty file inventories %#", async ({ status, ready, paths }) => {
+    const panel = await renderPanel(fixture({ workers: [{ ...worker, status, worktreePath: "/owned/forge/active-checkout", completion: {
+      attemptId: "attempt", deadlineAt: "2026-09-23T12:00:00.000Z", report: { ...publishingWorker.pendingPublication!.report,
+        handoff: { headSha: change.headSha, status: ready ? "ready" : "needs_work", retainedPaths: paths, details: "Working files." },
+      },
+    } }] }));
+    expect(panel.querySelector('[aria-label="Retained working files"]')).toBeNull();
+  });
+
+  it.each(["completed", "cleanup_failed"] as const)("shows a %s retained checkout and recovery instructions in every view", async status => {
+    const retainedWorkspace = { worktreePath: "/owned/forge/worker-checkout", retainedPaths: ["debug_tooling/notes.txt", "src/experiment.ts"] };
+    const panel = await renderPanel(fixture({ workers: [{ ...worker, status, changeNumber: change.number, tabId: undefined, retainedWorkspace }] }));
+    for (const section of ["Issues", "Pull requests", "Workers (1)"]) {
+      await click(panel, section);
+      const recovery = panel.querySelector('[aria-label="Retained working files"]')!;
+      expect(recovery).not.toBeNull();
+      expect(recovery.querySelector("code")?.textContent).toBe(retainedWorkspace.worktreePath);
+      expect(recovery.textContent).toContain("Copy the files you need from this checkout.");
+      expect(recovery.textContent).toContain("Git index remains intact, including staged edits");
+      expect(recovery.textContent).toContain("Forge keeps this checkout available for recovery.");
+      expect(Array.from(recovery.querySelectorAll("li"), entry => entry.textContent)).toEqual(retainedWorkspace.retainedPaths);
+      expect(Array.from(panel.querySelectorAll("button"), entry => entry.textContent?.trim())).not.toContain("Continue with message");
+      if (section !== "Workers (1)") expect(panel.querySelector(".forge-item-worker")?.textContent).toContain("Retained working files");
+    }
+  });
+
+  it("keeps a completed review checkout for recovery without offering to reuse it", async () => {
+    const retainedWorkspace = { worktreePath: "/owned/forge/review-checkout", retainedPaths: ["review-notes.txt"] };
+    const panel = await renderPanel(fixture({ workers: [{ ...reviewWorker, retainedWorkspace }] }));
+    await click(panel, "Pull requests");
+    expect(panel.querySelector('[aria-label="Retained working files"]')?.textContent).toContain(retainedWorkspace.worktreePath);
+    const card = panel.querySelector('[aria-label="review worker #12"]')!;
+    expect(Array.from(card.querySelectorAll("button"), entry => entry.textContent?.trim())).not.toContain("Continue with message");
+    expect(button(panel, "Review").disabled).toBe(false);
+  });
+
+  it("offers a new implementation turn for an unfinished handoff without replaying Resume", async () => {
+    const reason = "The handoff reports unfinished implementation in src/deploy.ts.";
+    const testFixture = fixture({ workers: [{ ...worker, status: "failed", changeNumber: change.number, headSha: change.headSha, completion: {
+      attemptId: "attempt", deadlineAt: "2026-09-23T12:00:00.000Z", continuationRequired: reason,
+    }, autoReview: { enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-2" } } }] });
+    const panel = await renderPanel(testFixture);
+    const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+    expect(card.textContent).toContain(reason);
+    expect(card.textContent).toContain("Use Continue with message to finish the implementation and submit a new handoff.");
+    expect(card.textContent).toContain("Auto review is waiting for implementation.");
+    expect(Array.from(card.querySelectorAll("button"), entry => entry.textContent?.trim())).not.toContain("Resume");
+    expect(Array.from(card.querySelectorAll("button"), entry => entry.textContent?.trim())).not.toContain("Sync and re-review");
+    await click(card, "Continue with message");
+    await fill(card.querySelector("textarea")!, "Finish and validate the remaining deployment edits.");
+    await act(async () => { card.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    expect(testFixture.calls.filter(call => call.hook === "forge.worker.continue")).toEqual([{ hook: "forge.worker.continue", input: { id: worker.id, message: "Finish and validate the remaining deployment edits.", windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }]);
+    expect(testFixture.calls.some(call => call.hook === "forge.worker.resume")).toBe(false);
+  });
+
   it.each(["github", "gitlab"] as const)("previews the uncertain %s reply in issues, requests, and worker tabs", async provider => {
     const currentRepository = { ...repository, provider };
     const panel = await renderPanel(fixture({ repository: currentRepository, workers: [{ ...uncertainReplyWorker, repository: currentRepository }] }));

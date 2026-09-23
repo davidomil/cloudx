@@ -47,6 +47,7 @@ async function workers(
   options: {
     holdFirstContinuation?: boolean;
     historyScreen?: ForgeWorkerHistory["screen"];
+    issueWorker?: Partial<ForgeWorker>;
   } = {},
 ) {
   const repository = {
@@ -72,6 +73,7 @@ async function workers(
       title: "Repair deployment",
       status: "failed",
       error: "The dependency is unavailable.",
+      ...options.issueWorker,
     },
     {
       ...common,
@@ -148,6 +150,119 @@ async function workers(
       }),
   };
 }
+
+test("shows retained checkout files without offering another worker attempt", async ({
+  page,
+}, testInfo) => {
+  const retainedWorkspace = {
+    worktreePath:
+      "/home/developer/cloudx/.cloudx/forge-workers/checkouts/5691781c-745a-4876-a8a4-9b7d3ab128c5",
+    retainedPaths: [
+      "debug_tooling/issue114/publication-diagnostics.bin",
+      "apps/server/src/forge/unfinished-research-notes.md",
+    ],
+  };
+  const fixture = await workers(page, {
+    issueWorker: { status: "completed", error: undefined, retainedWorkspace },
+  });
+  const worker = page.getByRole("article", { name: "issue worker #7" });
+  const recovery = worker.getByRole("region", {
+    name: "Retained working files",
+  });
+  await expect(recovery).toContainText(retainedWorkspace.worktreePath);
+  await expect(recovery).toContainText(
+    "Its Git index remains intact, including staged edits",
+  );
+  await recovery.getByText("Retained paths (2)", { exact: true }).click();
+  await expect(recovery.getByRole("listitem")).toHaveText(
+    retainedWorkspace.retainedPaths,
+  );
+  for (const text of [
+    retainedWorkspace.worktreePath,
+    ...retainedWorkspace.retainedPaths,
+  ]) {
+    const entry = recovery.getByText(text, { exact: true });
+    await expect(entry).toBeInViewport({ ratio: 1 });
+    const bounds = (await entry.boundingBox())!;
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+    expect(bounds.x + bounds.width).toBeLessThanOrEqual(
+      page.viewportSize()!.width,
+    );
+  }
+  await expect(
+    worker.getByRole("button", { name: "Resume", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    worker.getByRole("button", { name: "Continue with message", exact: true }),
+  ).toHaveCount(0);
+  expect(fixture.continuations).toEqual([]);
+  const screenshot = testInfo.outputPath("retained-working-files.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("retained-working-files", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+});
+
+test("continues an unfinished handoff with the exact message to its issue worker", async ({
+  page,
+}, testInfo) => {
+  const reason =
+    "The handoff reports unfinished deployment edits. The checkout and its files were preserved.";
+  const fixture = await workers(page, {
+    issueWorker: {
+      error: reason,
+      completion: {
+        attemptId: "unfinished-attempt",
+        deadlineAt: "2026-09-23T12:00:00.000Z",
+        continuationRequired: reason,
+      },
+    },
+  });
+  const worker = page.getByRole("article", { name: "issue worker #7" });
+  await expect(worker.getByRole("status")).toContainText(reason);
+  await expect(worker.getByRole("status")).toContainText(
+    "Use Continue with message",
+  );
+  await expect(
+    worker.getByRole("button", { name: "Resume", exact: true }),
+  ).toHaveCount(0);
+  await worker
+    .getByRole("button", { name: "Continue with message", exact: true })
+    .click();
+  const form = worker.getByRole("form", {
+    name: "Continue worker with a message",
+  });
+  const message =
+    "Finish and validate the deployment changes.\nCommit the implementation and retain the diagnostic files in the new handoff.";
+  const input = form.getByRole("textbox", { name: "Message to worker" });
+  await input.fill(message);
+  const submit = form.getByRole("button", { name: "Send and continue" });
+  await expect(input).toBeInViewport({ ratio: 1 });
+  await expect(submit).toBeInViewport({ ratio: 1 });
+  const screenshot = testInfo.outputPath("unfinished-handoff-continuation.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("unfinished-handoff-continuation", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await submit.click();
+  await expect(form).toHaveCount(0);
+  expect(fixture.continuations).toEqual([
+    {
+      input: {
+        id: "issue-worker",
+        message,
+        windowId: "window-1",
+        paneId: "pane-2",
+      },
+      tabId: "forge-tab",
+    },
+  ]);
+  await expect(page.getByRole("tab", { name: /Issue #7/ })).toContainText(
+    "running",
+  );
+});
 
 for (const worker of [
   { kind: "issue", number: 7, status: "failed" },

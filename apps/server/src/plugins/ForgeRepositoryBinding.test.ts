@@ -78,6 +78,7 @@ async function fixture(selectedRepository: ForgeRepository) {
     retainReviewBaseline: vi.fn(async () => {}),
     launch: vi.fn(async () => "worker-tab"),
     pause: vi.fn(async () => {}), close: vi.fn(async () => {}), cleanup: vi.fn(async () => {}),
+    preparePublication: vi.fn(async () => ({ headSha, retainedPaths: [] })),
     verifyPublishedWorkspace: vi.fn(async () => {}), syncPublishedBranch: vi.fn(async () => {}), updateIssueBranch: vi.fn(async () => headSha), publishBranch: vi.fn(async () => headSha),
     prepareIssueRebase: vi.fn(async () => ({ targetHeadSha: headSha, originalHeadSha: headSha })),
     completeIssueRebase: vi.fn(async () => headSha),

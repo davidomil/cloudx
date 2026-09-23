@@ -23,11 +23,26 @@ export interface ForgeIssueCompletionReport {
   body: string;
   resolvedDiscussionIds: string[];
   discussionReplies: Array<{ discussionId: string; body: string }>;
+  handoff?: ForgeIssueHandoff;
   rebase?: {
     outcome: "resolved" | "blocked";
     validation: "passed" | "failed";
     details: string;
   };
+}
+export interface ForgeIssueHandoff {
+  headSha: string;
+  status: "ready" | "needs_work";
+  retainedPaths: string[];
+  details: string;
+}
+export interface ForgePublicationHandoff {
+  headSha: string;
+  retainedPaths: string[];
+}
+export interface ForgeRetainedWorkspace {
+  worktreePath: string;
+  retainedPaths: string[];
 }
 export interface ForgeWorkerHistory {
   tabId: string;
@@ -50,6 +65,7 @@ export interface ForgeWorkerCompletion {
   turn?: ForgeTurnCompletion;
   report?: ForgeIssueCompletionReport | (ForgeReviewSubmission & { kind: "review" });
   reportError?: string;
+  continuationRequired?: string;
 }
 export function isForgeTurnCompletion(value: unknown): value is ForgeTurnCompletion {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -83,6 +99,7 @@ export interface ForgeWorker {
   tabId?: string;
   attemptId?: string;
   completion?: ForgeWorkerCompletion;
+  retainedWorkspace?: ForgeRetainedWorkspace;
   publicationState?: "creating" | "uncertain" | "created";
   mergeConflict?: {
     headSha: string;
@@ -99,6 +116,7 @@ export interface ForgeWorker {
   };
   pendingPublication?: {
     report: ForgeIssueCompletionReport;
+    handoff?: ForgePublicationHandoff;
     baseUpdate?: {
       expectedHeadSha: string;
       baseBranch: string;
@@ -197,6 +215,8 @@ export function forgeWorkerContinuationBlocker(worker: ForgeWorker, workers: rea
 }
 
 function continuationStateBlocker(worker: ForgeWorker): string | undefined {
+  if (worker.retainedWorkspace)
+    return "This completed checkout is retained for file recovery. Start a new worker to do further work.";
   if (["starting", "running"].includes(worker.status))
     return "Pause this worker before continuing with a message.";
   if (!["paused", "stopped", "failed", "awaiting_review", "awaiting_merge"].includes(worker.status) &&
