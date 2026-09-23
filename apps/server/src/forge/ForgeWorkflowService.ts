@@ -2040,6 +2040,9 @@ export class ForgeWorkflowService {
           if (change.headSha !== publication.headSha || change.headBranch !== candidate.branch || change.baseBranch !== candidate.baseBranch)
             throw new Error("The merged request does not match the pushed publication. Inspect the retained checkout before resuming.");
           candidate.headSha = publication.headSha;
+          candidate.mergeConflict = undefined;
+          if (candidate.rebaseRecovery?.phase === "reviewing" && candidate.rebaseRecovery.headSha !== publication.headSha)
+            candidate.rebaseRecovery = undefined;
           publication.confirmed = true;
           publication.nextConfirmationAt = undefined;
         }

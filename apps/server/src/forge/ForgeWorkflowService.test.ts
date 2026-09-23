@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -11,7 +11,8 @@ import {
 } from "./ForgeWorkflowService.js";
 import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
-import { ForgeWorkerReports } from "./ForgeWorkflowStore.js";
+import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
@@ -3658,6 +3659,89 @@ describe("Forge issue auto review", () => {
     });
     return { ...f, oldReview, resolvedReport, publishRebase };
   }
+
+  describe("merged publication revision persistence", () => {
+    it.each([
+      { publication: "conflict recovery", endpoint: "status" },
+      { publication: "conflict recovery", endpoint: "change" },
+      { publication: "base update after recovery", endpoint: "status" },
+      { publication: "base update after recovery", endpoint: "change" },
+    ])("persists $publication observed by $endpoint through restart and issue closure", async ({ publication, endpoint }) => {
+      const f = await resolvingIssue();
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-merged-publication-"));
+      onTestFinished(() => fs.rm(directory, { recursive: true, force: true }));
+      const store = new ForgeWorkflowStore(new PluginDataStore(directory));
+      await store.write(f.stored());
+      const save = f.deps.store.write;
+      f.deps.store = {
+        read: () => store.read(),
+        write: async workers => { await store.write(workers); await save(workers); },
+      };
+
+      f.resolvedReport();
+      let publishedHead = "c".repeat(40);
+      if (publication === "base update after recovery") {
+        f.publishRebase();
+        await f.poll();
+        expect(f.currentIssue().rebaseRecovery).toMatchObject({ phase: "reviewing", headSha: publishedHead });
+        expect(f.currentIssue().mergeConflict).toBeUndefined();
+        publishedHead = "d".repeat(40);
+        f.change.requiresBaseUpdate = true;
+        f.runtime.updateIssueBranch.mockResolvedValue(publishedHead);
+        f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Resolution verified", comments: [] });
+      }
+      const previousHead = f.change.headSha;
+      const recovery = structuredClone(f.currentIssue().rebaseRecovery!);
+      f.runtime.publishBranch.mockResolvedValue(publishedHead);
+      await f.poll();
+      expect(f.currentIssue()).toMatchObject({ status: "awaiting_publication", headSha: previousHead,
+        pendingPublication: { headSha: publishedHead, previousHeadSha: previousHead } });
+      const report = f.currentIssue().pendingPublication!.report;
+      const launches = f.runtime.launch.mock.calls.length;
+      const pushes = f.runtime.publishBranch.mock.calls.length;
+      const reviews = f.provider.postReview.mock.calls.length;
+
+      await f.service.dispose();
+      let service = new ForgeWorkflowService(f.deps);
+      await service.poll();
+      expect(f.currentIssue().status).toBe("awaiting_publication");
+      f.change.headSha = publishedHead;
+      if (endpoint === "change") f.provider.getChangeRequestStatus.mockResolvedValueOnce({ ...f.change });
+      Object.assign(f.change, { merged: true, state: "merged" });
+      f.advanceTime(5_000);
+      await service.poll();
+      expect(f.currentIssue()).toMatchObject({ status: "paused", headSha: publishedHead,
+        error: expect.stringContaining("Waiting for linked issues"), pendingPublication: { confirmed: true, report } });
+      expect(f.currentIssue().mergeConflict).toBeUndefined();
+      expect(f.currentIssue().rebaseRecovery).toEqual(publication === "conflict recovery"
+        ? { ...recovery, phase: "publishing", headSha: publishedHead } : undefined);
+      expect(await store.read()).toEqual(f.stored());
+      expect(f.stored()).toHaveLength(2);
+      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+
+      await service.dispose();
+      service = new ForgeWorkflowService(f.deps);
+      await service.poll();
+      expect(f.currentIssue().status).toBe("paused");
+      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+      f.provider.getIssue.mockResolvedValue({ ...await f.provider.getIssue(), state: "closed" });
+      f.advanceTime(30_000);
+      await service.poll();
+      expect(await store.read()).toEqual([]);
+      expect(f.stored()).toEqual([]);
+      expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+      expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: f.issue.id, expectedHeadSha: publishedHead }));
+      expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: f.oldReview.id, expectedHeadSha: undefined }));
+      expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+      expect(f.runtime.publishBranch).toHaveBeenCalledTimes(pushes);
+      expect(f.provider.postReview).toHaveBeenCalledTimes(reviews);
+      expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+      expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
+      expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
+      expect(f.provider.merge).not.toHaveBeenCalled();
+      await service.dispose();
+    });
+  });
 
   it("prevents a new reviewer from running alongside conflict recovery", async () => {
     const f = await resolvingIssue();
