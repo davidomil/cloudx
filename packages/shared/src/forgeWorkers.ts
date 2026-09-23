@@ -3,6 +3,9 @@ import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication, Forge
 export const FORGE_PLUGIN_ID = "forge";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
+export const MAX_FORGE_REVIEW_REPORT_BODY_LENGTH = 100_000;
+// Drafts also contain Forge's scope summary, including up to four 64-character SHAs.
+export const MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH = MAX_FORGE_REVIEW_REPORT_BODY_LENGTH + 512;
 export type ForgeWorkerStatus =
   | "starting"
   | "running"

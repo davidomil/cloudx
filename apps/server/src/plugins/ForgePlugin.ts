@@ -6,7 +6,7 @@ import {
   type WorkspacePlugin,
 } from "@cloudx/plugin-api";
 import type { DirectoryOwnershipReconciliation, ForgePlacement, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
-import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH } from "@cloudx/shared";
+import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import {
   forgeConfigFields,
   type ForgeSettingsService,
@@ -261,7 +261,7 @@ export class ForgePlugin implements WorkspacePlugin {
         {
           id,
           draftId,
-          body: { type: "string", maxLength: 100_000 },
+          body: { type: "string", maxLength: MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH },
           event,
           comments: {
             type: "array",

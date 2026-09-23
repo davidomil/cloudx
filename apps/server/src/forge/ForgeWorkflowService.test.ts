@@ -19,6 +19,9 @@ import { GitLabProvider } from "./providers/GitLabProvider.js";
 import type { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
 import { validateReview } from "./providers/reviewValidation.js";
+import { ForgePlugin } from "../plugins/ForgePlugin.js";
+import { HookRegistry } from "../hooks/HookRegistry.js";
+import type { ForgeSettingsService } from "./ForgeSettingsService.js";
 
 function fixture() {
   const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
@@ -836,7 +839,7 @@ describe("Incremental review scope", () => {
     return { ...f, worker, revision, draft: f.stored()[0].draft! };
   }
 
-  async function reviewAtBodyLimit(kind: "initial" | "incremental") {
+  async function reviewAtBodyLimit(kind: "initial" | "incremental", autoPost = false) {
     const f = kind === "initial" ? fixture() : await reviewedRevision();
     if (kind === "incremental") f.change.headSha = "c".repeat(40);
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-review-body-"));
@@ -844,12 +847,103 @@ describe("Incremental review scope", () => {
     f.deps.store = new ForgeWorkflowStore(new PluginDataStore(root));
     await f.deps.store.write(f.stored());
     const service = new ForgeWorkflowService(f.deps);
-    const worker = await service.startReview(f.deps.settings().repository, 7, false, placement);
+    const worker = await service.startReview(f.deps.settings().repository, 7, autoPost, placement);
     const report = { kind: "review", headSha: f.change.headSha, event: "approve", body: "x".repeat(100_000), comments: [] };
     f.reports.read.mockResolvedValue(report);
     const body = `${reviewScopeSummary(worker.completion!.reviewScope!)}\n\n${report.body}`;
     return { ...f, service, worker, report, body };
   }
+
+  function realReviewAdapter(f: Awaited<ReturnType<typeof reviewAtBodyLimit>>, kind: "github" | "gitlab") {
+    const request = vi.fn(async (url: string, options?: { method?: string; body?: unknown }) => {
+      if (options?.method === "POST")
+        return { body: url.endsWith("/approve") ? { approved_by: [] } : { id: 71 } };
+      return { body: { iid: 7, head: { sha: f.change.headSha }, sha: f.change.headSha, state: kind === "github" ? "open" : "opened" } };
+    });
+    const http = {
+      repository: { ...f.deps.settings().repository, provider: kind }, request,
+    } as unknown as ForgeHttpClient;
+    const adapter = kind === "github" ? new GitHubProvider(http) : new GitLabProvider(http);
+    f.provider.postReview.mockImplementation((...args) => adapter.postReview(...args));
+    return request;
+  }
+
+  describe.each(["initial", "incremental"] as const)("%s provider submission limits", scopeKind => {
+    it.each(["github", "gitlab"] as const)("auto-posts exactly 65,000 characters including scope through %s", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind, true);
+      const request = realReviewAdapter(f, providerKind);
+      const prefix = `${reviewScopeSummary(f.worker.completion!.reviewScope!)}\n\n`;
+      const body = `${prefix}${"x".repeat(65_000 - prefix.length)}`;
+      f.reports.read.mockResolvedValue({ ...f.report, body: body.slice(prefix.length) });
+      await f.service.poll();
+      const [completed] = await f.deps.store.read();
+      expect(completed).toMatchObject({ status: "completed", draft: { status: "posted", body, headSha: f.change.headSha } });
+      expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, expect.objectContaining({ body, headSha: f.change.headSha }));
+      const summary = request.mock.calls.find(([url]) => url.endsWith(providerKind === "github" ? "/reviews" : "/notes"));
+      expect(summary?.[1]?.body).toMatchObject({ body });
+      if (providerKind === "github") expect(summary?.[1]?.body).toMatchObject({ commit_id: f.change.headSha });
+      else expect(request).toHaveBeenCalledWith(expect.stringContaining("/approve"), expect.objectContaining({ body: { sha: f.change.headSha } }));
+    });
+
+    it.each(["github", "gitlab"] as const)("keeps scope overflow editable across restart and Resume before posting to %s", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind, true);
+      const request = realReviewAdapter(f, providerKind);
+      f.reports.read.mockResolvedValue({ ...f.report, body: "x".repeat(65_000) });
+      await f.service.poll();
+      const [failed] = await f.deps.store.read();
+      expect(failed).toMatchObject({ status: "failed", error: expect.stringContaining("65,000"), draft: { status: "draft" } });
+      expect(failed.draft!.body.length).toBeGreaterThan(65_000);
+      expect(failed.reviewBaseline?.reviewId).toBe(f.worker.attemptId);
+      expect(f.provider.postReview).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+
+      const restarted = new ForgeWorkflowService(f.deps);
+      const resumed = await restarted.resume(failed.id, placement);
+      expect(resumed).toMatchObject({ status: "failed", error: expect.stringContaining("65,000"), draft: { status: "draft" } });
+      expect(request).not.toHaveBeenCalled();
+      const body = failed.draft!.body.slice(0, 65_000);
+      await restarted.saveReview(failed.id, failed.draft!.id, { ...failed.draft!, body });
+      const launches = f.runtime.launch.mock.calls.length;
+      const completed = await restarted.resume(failed.id, placement);
+      expect(completed).toMatchObject({ status: "completed", draft: { status: "posted", body } });
+      expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, expect.objectContaining({ body }));
+      expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+    });
+
+    it.each(["github", "gitlab"] as const)("allows editing after a manual submission one character over the %s limit", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind);
+      const request = realReviewAdapter(f, providerKind);
+      const prefix = `${reviewScopeSummary(f.worker.completion!.reviewScope!)}\n\n`;
+      f.reports.read.mockResolvedValue({ ...f.report, body: "x".repeat(65_001 - prefix.length) });
+      await f.service.poll();
+      const [completed] = await f.deps.store.read();
+      await expect(f.service.submitReview(completed.id, completed.draft!.id)).rejects.toThrow("65,000");
+      expect((await f.deps.store.read())[0].draft?.status).toBe("draft");
+      expect(f.provider.postReview).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+      const body = completed.draft!.body.slice(0, 65_000);
+      await f.service.saveReview(completed.id, completed.draft!.id, { ...completed.draft!, body });
+      await f.service.submitReview(completed.id, completed.draft!.id);
+      expect((await f.deps.store.read())[0].draft).toMatchObject({ status: "posted", body });
+    });
+
+    it.each(["github", "gitlab"] as const)("accepts a shorter continuation after local %s length rejection", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind, true);
+      const request = realReviewAdapter(f, providerKind);
+      f.reports.read.mockResolvedValue({ ...f.report, body: "x".repeat(65_000) });
+      await f.service.poll();
+      expect(request).not.toHaveBeenCalled();
+      const restarted = new ForgeWorkflowService(f.deps);
+      const continued = await restarted.continueWorker(f.worker.id, "Shorten the summary while preserving the findings.", placement);
+      expect(continued.status, continued.error).toBe("running");
+      expect(continued.attemptId).not.toBe(f.worker.attemptId);
+      f.reports.read.mockResolvedValue({ ...f.report, body: "Verified the requested changes." });
+      await restarted.poll();
+      const [completed] = await f.deps.store.read();
+      expect(completed).toMatchObject({ status: "completed", draft: { status: "posted", headSha: f.change.headSha } });
+      expect(f.provider.postReview).toHaveBeenCalledOnce();
+    });
+  });
 
   it.each(["initial", "incremental"] as const)("completes and reloads a maximum-length %s report with its scope intact", async kind => {
     const f = await reviewAtBodyLimit(kind);
@@ -864,7 +958,14 @@ describe("Incremental review scope", () => {
 
     const restarted = new ForgeWorkflowService(f.deps);
     await restarted.dashboard();
-    await restarted.saveReview(completed.id, completed.draft!.id, completed.draft!);
+    const hooks = new HookRegistry();
+    const plugin = new ForgePlugin(() => ({ workflow: restarted, settings: {} as ForgeSettingsService }));
+    plugin.hooks.forEach(hook => hooks.register(hook));
+    await hooks.call("forge.review.save", {
+      id: completed.id, draftId: completed.draft!.id,
+      body: completed.draft!.body, comments: completed.draft!.comments, event: "comment",
+    }, { caller: { kind: "ui" } });
+    expect((await f.deps.store.read())[0].draft).toMatchObject({ body: f.body, event: "comment" });
     f.reports.read.mockResolvedValue(undefined);
     f.change.headSha = "d".repeat(40);
     await restarted.startReview(f.deps.settings().repository, 7, false, placement);

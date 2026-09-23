@@ -24,6 +24,7 @@ import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeN
 import { parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError } from "./ForgeRuntime.js";
 import { reviewScopeInstructions } from "./ForgeReviewScope.js";
+import { validateReview } from "./providers/reviewValidation.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
 
 export interface ForgeSettings {
@@ -2201,6 +2202,8 @@ export class ForgeWorkflowService {
       throw new Error(
         "No unsubmitted review draft is available. A failed submission must be reconciled with the provider before another review.",
       );
+    const submission = reviewSubmission(draft);
+    validateReview(submission);
     this.requireConfirmedPublication(worker.repository, worker.changeNumber);
     const provider = this.providerFor(worker, "reviewer");
     const change = await provider.getChangeRequest(worker.changeNumber);
@@ -2226,7 +2229,7 @@ export class ForgeWorkflowService {
       signal.throwIfAborted();
     }
     try {
-      draft.publication = await provider.postReview(worker.changeNumber, reviewSubmission(draft));
+      draft.publication = await provider.postReview(worker.changeNumber, submission);
     } catch (error) {
       draft.status = "post_failed";
       await this.persist();

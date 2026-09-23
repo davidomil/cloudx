@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
-import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH } from "@cloudx/shared";
+import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import type { DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -476,7 +476,7 @@ function ReviewEditor({ worker, draft, archived, request, runAction, busy, canSu
   const [edit, setEdit] = useState<ReviewEdit>(() => ({ body: draft.body, event: draft.event, comments: draft.comments.map((comment) => ({ ...comment })) }));
   const [saved, setSaved] = useState(false);
   const locked = archived || busy || draft.status !== "draft";
-  const valid = edit.comments.every((comment) => comment.body.trim() && (!comment.path || (Number.isSafeInteger(comment.line) && Number(comment.line) > 0))) && (edit.event !== "request_changes" || !!edit.body.trim()) && (!!edit.body.trim() || edit.comments.length > 0);
+  const valid = edit.body.length <= MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH && edit.comments.every((comment) => comment.body.trim() && (!comment.path || (Number.isSafeInteger(comment.line) && Number(comment.line) > 0))) && (edit.event !== "request_changes" || !!edit.body.trim()) && (!!edit.body.trim() || edit.comments.length > 0);
   function updateEdit(next: ReviewEdit) { setEdit(next); setSaved(false); }
   function updateComment(index: number, change: Partial<ForgeReviewComment>) {
     updateEdit({ ...edit, comments: edit.comments.map((comment, position) => position === index ? { ...comment, ...change } : comment) });
@@ -492,7 +492,7 @@ function ReviewEditor({ worker, draft, archived, request, runAction, busy, canSu
     <summary><MessageSquare size={14} /> {draft.status === "posted" ? "Posted review" : "Suggested review"} · {edit.comments.length} {edit.comments.length === 1 ? "comment" : "comments"}</summary>
     <fieldset disabled={locked}>
       <label className="forge-field">Review outcome<select value={edit.event} onChange={(event) => updateEdit({ ...edit, event: event.target.value as ReviewEdit["event"] })}><option value="comment">Comment</option><option value="request_changes">Request changes</option><option value="approve">Approve</option></select></label>
-      <label className="forge-field">Review summary<textarea rows={3} maxLength={100_000} value={edit.body} onChange={(event) => updateEdit({ ...edit, body: event.target.value })} /></label>
+      <label className="forge-field">Review summary<textarea rows={3} maxLength={MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH} value={edit.body} onChange={(event) => updateEdit({ ...edit, body: event.target.value })} /></label>
       {edit.comments.map((comment, index) => <div className="forge-draft-comment" key={index}>
         <div className="forge-comment-location">
           <label>File<input maxLength={4096} aria-label={`Comment ${index + 1} file`} value={comment.path ?? ""} onChange={(event) => updateComment(index, event.target.value ? { path: event.target.value } : { path: undefined, oldPath: undefined, line: undefined, side: undefined })} placeholder="General comment" /></label>

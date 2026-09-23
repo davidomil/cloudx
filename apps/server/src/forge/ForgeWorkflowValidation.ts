@@ -1,4 +1,4 @@
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeIssueCompletionReport,
@@ -12,10 +12,6 @@ import type {
   ForgeWorker,
 } from "@cloudx/shared";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
-
-const MAX_REVIEW_REPORT_BODY_LENGTH = 100_000;
-// Drafts also contain Forge's scope summary, including up to four 64-character SHAs.
-const MAX_REVIEW_BODY_LENGTH = MAX_REVIEW_REPORT_BODY_LENGTH + 512;
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -170,7 +166,7 @@ export function parseReview(value: unknown): ForgeReviewSubmission {
         : {}),
     };
   });
-  const body = text(input.body, "review body", MAX_REVIEW_BODY_LENGTH);
+  const body = text(input.body, "review body", MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH);
   if (!body.trim() && !comments.length)
     throw new Error("A review must contain a summary or comments.");
   return {
@@ -194,7 +190,7 @@ export function parseWorkerReport(
   if (report.kind === "review") {
     if (report.rebase !== undefined)
       throw new Error("Only issue reports can report a rebase resolution.");
-    text(report.body, "review body", MAX_REVIEW_REPORT_BODY_LENGTH);
+    text(report.body, "review body", MAX_FORGE_REVIEW_REPORT_BODY_LENGTH);
     return { kind: "review", ...parseReview(report) };
   }
   if (report.kind !== "issue")
