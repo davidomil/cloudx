@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ForgeWorkflowService } from '../apps/server/src/forge/ForgeWorkflowService.ts';
 import { ForgeWorkflowStore, ForgeWorkerReports } from '../apps/server/src/forge/ForgeWorkflowStore.ts';
+import { ForgeRuntime } from '../apps/server/src/forge/ForgeRuntime.ts';
 import { PluginDataStore } from '../apps/server/src/plugins/PluginDataStore.ts';
 import { PathPolicy } from '../apps/server/src/pathPolicy.ts';
 import { ManagedUpdate, UpdateHost, validateSavedTransition } from './managed-update.mjs';
@@ -28,10 +29,11 @@ async function originalProfile() {
     headBranch: 'feature', title: `Original review ${number}`, state: 'open', merged: false, comments: [], linkedIssues: [] })),
     postReview: vi.fn(async () => ({ commentIds: ['published-original'], inlineReview: { id: 'inline-original', commentCount: 1 } })) };
   const reports = new ForgeWorkerReports(f.dataDir);
-  const runtime = new history.ForgeRuntime({ dataDir: f.dataDir, pathPolicy: new PathPolicy([f.host.home]),
+  const runtimeDeps = { dataDir: f.dataDir, pathPolicy: new PathPolicy([f.host.home]),
     isRepositoryTrusted: () => true, gitAccess: async () => ({ cloneUrl: origin, authorization: 'Basic fixture' }),
     git: async (cwd, args) => git(cwd, ...args.map(arg => arg === origin && args[0] === 'fetch' ? f.root : arg)),
-    sessions: { getTab: () => undefined, listTabs: () => [] }, workspaceCommands: {}, rulesSkills: {} });
+    sessions: { getTab: () => undefined, listTabs: () => [] }, workspaceCommands: {}, rulesSkills: {} };
+  const runtime = new history.ForgeRuntime(runtimeDeps);
   runtime.launch = vi.fn(async () => randomUUID());
   runtime.isActive = vi.fn(() => true);
   runtime.close = vi.fn(async () => {});
@@ -60,7 +62,10 @@ async function originalProfile() {
     expect(worker.completion).toBeUndefined();
   }
   const currentStore = new ForgeWorkflowStore(new PluginDataStore(f.dataDir));
-  const currentRuntime = { launch: vi.fn(), recover: vi.fn() };
+  const currentRuntime = new ForgeRuntime(runtimeDeps);
+  vi.spyOn(currentRuntime, 'launch').mockImplementation(async () => randomUUID());
+  vi.spyOn(currentRuntime, 'recover');
+  vi.spyOn(currentRuntime, 'close').mockResolvedValue();
   function restartCurrent() {
     const service = new ForgeWorkflowService({ store: currentStore, reports, runtime: currentRuntime,
       provider: () => provider, settings, notify: vi.fn() });
@@ -88,6 +93,61 @@ it('loads every original 0.1.3 review on upgrade and preserves posted receipts w
   expect(await f.currentStore.read()).toHaveLength(f.saved.length);
   expect(f.currentRuntime.launch).not.toHaveBeenCalled();
   expect(f.currentRuntime.recover).not.toHaveBeenCalled();
+  expect(f.provider.postReview).toHaveBeenCalledOnce();
+}, 15000);
+
+it.each(['draft', 'posted'])('starts a fresh full review after an original 0.1.3 %s review', async status => {
+  const f = await originalProfile();
+  f.host.planData(f.record);
+  expect(f.record.transition.dataCompatibility.compatible).toBe(true);
+  const before = (await f.current.dashboard()).workers;
+  const original = before.find(worker => worker.draft.status === status);
+  expect(original.worktreePath).toBeUndefined();
+  expect(original.reviewBaseline).toBeUndefined();
+  const ownershipPath = path.join(f.dataDir, 'forge-workers', 'workspaces', `${original.id}.json`);
+  const ownership = fs.readFileSync(ownershipPath);
+  expect(JSON.parse(ownership)).toMatchObject({ cleaned: true });
+  f.provider.getChangeRequest.mockImplementation(async number => ({ number, headSha: f.record.targetCommit,
+    baseSha: f.record.transition.sourceCommit, baseBranch: 'main', headBranch: 'feature', title: `Next review ${number}`,
+    state: 'open', merged: false, comments: [], linkedIssues: [] }));
+
+  const next = await f.current.startReview(original.repository, original.number, false, { windowId: 'window', paneId: 'pane' });
+  expect(next.status, next.error).toBe('running');
+  expect(next.id).not.toBe(original.id);
+  expect(next.reviewBaseline).toBeUndefined();
+  expect(next.completion.reviewScope).toEqual({ kind: 'initial', current: {
+    headSha: f.record.targetCommit, baseSha: f.record.transition.sourceCommit, mergeBaseSha: f.record.transition.sourceCommit,
+  } });
+  expect(git(next.worktreePath, 'diff', '--name-only', `${f.record.transition.sourceCommit}...${f.record.targetCommit}`)).toBe('version.txt');
+  const context = JSON.parse(fs.readFileSync(path.join(f.dataDir, 'forge-reports', `${next.attemptId}.context.json`), 'utf8'));
+  expect(context.previousReviews).toEqual([original.draft]);
+  expect(context.reviewScope).toEqual(next.completion.reviewScope);
+  expect(f.currentRuntime.launch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    id: next.id, worktreePath: next.worktreePath, prompt: expect.stringContaining('review the full pinned PR/MR comparison'),
+  }), expect.any(AbortSignal));
+  expect(f.currentRuntime.recover).not.toHaveBeenCalled();
+  expect(fs.readFileSync(ownershipPath)).toEqual(ownership);
+  const saved = await f.currentStore.read();
+  expect(saved).toHaveLength(before.length + 1);
+  for (const { updatedAt, ...worker } of before) expect(saved.find(candidate => candidate.id === worker.id)).toMatchObject(worker);
+  expect(f.provider.postReview).toHaveBeenCalledOnce();
+}, 15000);
+
+it.each(['posting', 'post_failed'])('requires reconciliation of an original 0.1.3 %s review before starting another', async status => {
+  const f = await originalProfile();
+  const original = f.saved.find(worker => worker.draft.status === 'draft');
+  original.draft.status = status;
+  write(f.forgeFile, JSON.stringify(f.saved));
+  const prepare = vi.spyOn(f.currentRuntime, 'prepareWorkspace');
+
+  await expect(f.current.startReview(original.repository, original.number, false, { windowId: 'window', paneId: 'pane' }))
+    .rejects.toThrow('The previous review submission must be reconciled');
+  expect(prepare).not.toHaveBeenCalled();
+  expect(f.currentRuntime.launch).not.toHaveBeenCalled();
+  expect(f.currentRuntime.recover).not.toHaveBeenCalled();
+  const saved = await f.currentStore.read();
+  expect(saved).toHaveLength(f.saved.length);
+  expect(saved.find(worker => worker.id === original.id)).toMatchObject({ status: 'completed', draft: { status: 'post_failed' } });
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 

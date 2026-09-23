@@ -365,10 +365,11 @@ export class ForgeWorkflowService {
       if ((item as ForgeChangeRequest).headSha !== issueWorker.headSha || !(item as ForgeChangeRequest).reviewReady)
         throw new Error("The published commit changed or is still processing. Inspect the request before resuming auto review.");
     }
-    const reviewer = kind === "review"
-      ? this.reviewWorkers(repository, number).filter(worker => !worker.retainedWorkspace).at(-1)
-      : undefined;
-    if (reviewer)
+    const reviewers = kind === "review" ? this.reviewWorkers(repository, number) : [];
+    if (reviewers.some(worker => worker.draft && ["posting", "post_failed"].includes(worker.draft.status)))
+      throw new Error("The previous review submission must be reconciled before starting another review.");
+    const reviewer = reviewers.filter(worker => !worker.retainedWorkspace).at(-1);
+    if (reviewer?.worktreePath)
       return this.startReviewRound(reviewer, item as ForgeChangeRequest, autoPost, placement, controller, issueWorker);
     const now = new Date().toISOString();
     const worker: ForgeWorker = {
@@ -443,8 +444,6 @@ export class ForgeWorkflowService {
     controller: AbortController,
     issueWorker?: ForgeWorker,
   ): Promise<ForgeWorker> {
-    if (worker.draft && ["posting", "post_failed"].includes(worker.draft.status))
-      throw new Error("The previous review submission must be reconciled before starting another review.");
     if (worker.draft && (worker.reviewHistory?.length ?? 0) >= MAX_FORGE_REVIEW_HISTORY)
       throw new Error("The review history limit has been reached. Inspect this worker before starting another review.");
     if (issueWorker && worker.issueWorkerId && worker.issueWorkerId !== issueWorker.id)
