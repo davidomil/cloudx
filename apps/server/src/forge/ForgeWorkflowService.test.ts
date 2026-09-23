@@ -284,6 +284,57 @@ describe("Issue publication handoff", () => {
     expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({ manualContinuation: expect.objectContaining({ previousError: expect.stringContaining("Continue with message") }) }));
   });
 
+  it("saves maximum-length unfinished details without blocking other workers or one continuation after restart", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-handoff-continuation-"));
+    const f = fixture();
+    const store = new ForgeWorkflowStore(new PluginDataStore(root));
+    const reports = new ForgeWorkerReports(root);
+    const deps = { ...f.deps, store, reports };
+    let service = new ForgeWorkflowService(deps);
+    try {
+      const worker = await service.startIssue(deps.settings().repository, 1, placement);
+      const details = "Complete remaining implementation. ".padEnd(100_000, "x");
+      const report = { kind: "issue", title: "Fix", body: "Further work required", handoff: {
+        headSha: f.change.headSha, status: "needs_work", retainedPaths: ["implementation.ts"], details,
+      } };
+      await fs.writeFile(path.join(root, "forge-reports", `${worker.attemptId}.json`), JSON.stringify(report));
+      f.runtime.readTurnCompletion.mockImplementation(async (workerId, attemptId) => ({
+        workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`,
+        status: attemptId === worker.attemptId ? "completed" : "running", error: undefined,
+      }));
+
+      await service.poll();
+      const failed = (await store.read())[0]!;
+      expect(failed).toMatchObject({ status: "failed", completion: { report: { handoff: { details } } } });
+      expect(failed.completion?.continuationRequired?.length).toBeLessThanOrEqual(100_000);
+      expect(failed.completion?.continuationRequired).toContain("Implementation needs work: Complete remaining implementation.");
+      expect(failed.completion?.continuationRequired).toContain(`Files remain in ${worker.worktreePath}. Use Continue with message`);
+      expect(failed.error).toBe(failed.completion?.continuationRequired);
+      expect(await reports.read(worker.attemptId!)).toEqual(report);
+
+      f.provider.getIssue.mockResolvedValueOnce({ ...f.issue, number: 2 });
+      const unrelated = await service.startIssue(deps.settings().repository, 2, placement);
+      expect(unrelated.status).toBe("running");
+      await expect(service.stop(unrelated.id)).resolves.toMatchObject({ status: "stopped" });
+      await service.dispose();
+      service = new ForgeWorkflowService(deps);
+      await expect(service.resume(worker.id, placement)).rejects.toThrow("Continue with message");
+      expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === worker.id)).toHaveLength(1);
+
+      const continued = await service.continueWorker(worker.id, "Finish the remaining implementation.", placement);
+      expect(continued).toMatchObject({ status: "running", worktreePath: worker.worktreePath });
+      expect(continued.attemptId).not.toBe(worker.attemptId);
+      await service.poll();
+      expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === worker.id)).toHaveLength(2);
+      expect((await store.read()).find(saved => saved.id === worker.id)).toMatchObject({ status: "running", attemptId: continued.attemptId });
+      expect((await store.read()).find(saved => saved.id === unrelated.id)).toMatchObject({ status: "stopped" });
+      expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    } finally {
+      try { await service.dispose(); }
+      finally { await fs.rm(root, { recursive: true, force: true }); }
+    }
+  });
+
   it.each([false, true])("keeps completed retained checkouts visible across restart without repeating cleanup after rebase: %s", async rebased => {
     const f = fixture();
     const save = f.deps.store.write;

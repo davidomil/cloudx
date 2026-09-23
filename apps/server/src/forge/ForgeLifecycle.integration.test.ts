@@ -213,6 +213,62 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.factory.processes).toHaveLength(2);
   }, 20_000);
 
+  it.each(["skip-worktree", "assume-unchanged", "ignored submodule"] as const)("retains %s contents omitted by status through merge, cleanup and restart", async hidden => {
+    const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const implementation = await fixture.completedAssistantTurn(started);
+    const checkout = started.worktreePath!;
+    const submodule = path.join(checkout, "dependency");
+    if (hidden === "ignored submodule") {
+      await git(checkout, "init", "-b", "main", submodule);
+      await fs.writeFile(path.join(submodule, ".gitignore"), "diagnostics.bin\n");
+      await git(submodule, "add", ".gitignore");
+      await git(submodule, "-c", "user.name=Forge Fixture", "-c", "user.email=forge-fixture@example.invalid", "commit", "-m", "TEST: dependency");
+      await fs.writeFile(path.join(checkout, ".gitmodules"), '[submodule "dependency"]\n\tpath = dependency\n\turl = https://example.invalid/dependency.git\n');
+      await git(checkout, "add", "dependency", ".gitmodules");
+      await git(checkout, "commit", "-m", "TEST: committed dependency");
+    }
+    const intended = await git(checkout, "rev-parse", "HEAD");
+    await declareHandoff(implementation, { headSha: intended, status: "ready", retainedPaths: [], details: "The committed implementation is complete." });
+    await fixture.workflow.poll();
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(intended);
+
+    const retainedPath = hidden === "ignored submodule" ? "dependency" : "README.md";
+    const file = hidden === "ignored submodule" ? path.join(submodule, "diagnostics.bin") : path.join(checkout, retainedPath);
+    const bytes = Buffer.from([0, 255, 128, 13, 10, 0, 42]);
+    if (hidden !== "ignored submodule") await git(checkout, "update-index", `--${hidden}`, "--", retainedPath);
+    await fs.writeFile(file, bytes);
+    expect(await git(checkout, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching")).toBe("");
+    const indexPath = path.join(checkout, ".git", "index");
+    const index = await fs.readFile(indexPath);
+    const submoduleIndex = hidden === "ignored submodule" ? await fs.readFile(path.join(submodule, ".git", "index")) : undefined;
+    const flags = await git(checkout, "ls-files", "-v", "--stage", "-z");
+    await fixture.workflowDependencies.runtime.verifyPublishedWorkspace({ id: started.id, repositoryPath: started.repositoryPath!, worktreePath: checkout, branch: started.branch! }, intended);
+
+    const reviewer = await fixture.runningWorker("review");
+    const reviewed = await fixture.completedAssistantTurn(reviewer);
+    expect(reviewed.localReview).toMatchObject({ headSha: intended });
+    await fixture.workflow.poll();
+    expect(fixture.provider.merges).toEqual([intended]);
+    expect(await git(fixture.origin, "rev-parse", "main")).toBe(intended);
+    const retained = { worktreePath: checkout, retainedPaths: [retainedPath] };
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", headSha: intended, retainedWorkspace: retained });
+
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    const completed = await fixture.worker(started.id);
+    expect(completed).toMatchObject({ status: "completed", retainedWorkspace: retained });
+    expect(completed.worktreePath).toBeUndefined();
+    expect(completed.error).toBeUndefined();
+    expect(await fs.readFile(file)).toEqual(bytes);
+    expect(await fs.readFile(indexPath)).toEqual(index);
+    if (submoduleIndex) expect(await fs.readFile(path.join(submodule, ".git", "index"))).toEqual(submoduleIndex);
+    expect(await git(checkout, "ls-files", "-v", "--stage", "-z")).toBe(flags);
+    expect(await git(checkout, "rev-parse", "HEAD")).toBe(intended);
+    expect(fixture.gitPushes).toHaveLength(1);
+    expect(fixture.factory.processes).toHaveLength(2);
+  }, 20_000);
+
   it("resumes an interrupted dirty handoff after restart without repeating execution or publication", async () => {
     const fixture = await LifecycleFixture.create();
     const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);

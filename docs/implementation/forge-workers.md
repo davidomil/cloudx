@@ -103,6 +103,11 @@ Checkouts with retained files remain available for recovery in the Workers
 view. Ownership changes or a local commit different from the published
 head block cleanup and preserve the resources.
 
+Cleanup also retains checkouts with `skip-worktree` or `assume-unchanged`
+index entries, or populated submodules, even when Git status reports them
+clean. The recovery location stays visible in Workers, with index flags
+and submodule contents preserved.
+
 ## Auto review
 
 Enable **Auto review** beside **Start work** to run the issue through

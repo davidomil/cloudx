@@ -13,12 +13,14 @@ import type {
 } from "@cloudx/shared";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
 
+export const MAX_FORGE_WORKFLOW_TEXT_LENGTH = 100_000;
+
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Expected a JSON object.");
   return value as Record<string, unknown>;
 }
-function text(value: unknown, name: string, max = 100_000): string {
+function text(value: unknown, name: string, max = MAX_FORGE_WORKFLOW_TEXT_LENGTH): string {
   if (typeof value !== "string" || value.length > max)
     throw new Error(`Invalid ${name}.`);
   return value;
@@ -514,7 +516,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       const report = completion.report === undefined ? undefined : parseWorkerReport(completion.report);
       const reportError = completion.reportError === undefined ? undefined : nonblankText(completion.reportError, "completion report error", 100_000);
       const readyAt = completion.readyAt === undefined ? undefined : isoTimestamp(completion.readyAt, "completion handoff timestamp");
-      const continuationRequired = completion.continuationRequired === undefined ? undefined : nonblankText(completion.continuationRequired, "required worker continuation", 100_000);
+      const continuationRequired = completion.continuationRequired === undefined ? undefined : nonblankText(completion.continuationRequired, "required worker continuation", MAX_FORGE_WORKFLOW_TEXT_LENGTH);
       if (continuationRequired && (worker.kind !== "issue" || !report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || worker.pendingPublication !== undefined))
         throw new Error("Required continuation needs a successful issue completion without pending publication.");
       if (report && reportError || readyAt && (!report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || Date.parse(readyAt) >= Date.parse(deadlineAt)))

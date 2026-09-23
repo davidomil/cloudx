@@ -1646,6 +1646,35 @@ export class ForgeRuntime {
     return files;
   }
 
+  private async filesRequiringRetention(owned: OwnedWorkspace, signal?: AbortSignal): Promise<string[]> {
+    const files = new Set(await this.workingFiles(owned, signal, true));
+    const index = await this.runGit(owned.worktreePath, ["ls-files", "--stage", "-v", "-z"], signal);
+    for (const entry of index.split("\0").filter(Boolean)) {
+      signal?.throwIfAborted();
+      const match = /^([A-Za-z]) (\d{6}) [a-f0-9]{40,64} [0-3]\t(.+)$/su.exec(entry);
+      if (!match || !isRetainedPaths([match[3]]))
+        throw new Error("Git returned an invalid index inventory. Local files were preserved.");
+      const flag = match[1]!;
+      const mode = match[2]!;
+      const file = match[3]!;
+      // Index flags and populated submodules carry local state that root status cannot inventory.
+      if (flag === "S" || flag === flag.toLowerCase()) files.add(file);
+      if (mode !== "160000") continue;
+      const absolute = path.join(owned.worktreePath, file);
+      if (!await requireSafeDirectory(owned.worktreePath, path.dirname(absolute), { create: false, label: "Retained submodule parent" })) continue;
+      let stat;
+      try { stat = await fs.lstat(absolute); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      if (!stat.isDirectory() || (await fs.readdir(absolute)).length) files.add(file);
+    }
+    const retainedPaths = [...files].sort();
+    if (!isRetainedPaths(retainedPaths)) throw new Error("Git returned an invalid retained file inventory. Local files were preserved.");
+    return retainedPaths;
+  }
+
   private async workingFingerprint(owned: OwnedWorkspace, files: string[], signal?: AbortSignal): Promise<string> {
     const hash = createHash("sha256");
     hash.update(await this.runGit(owned.worktreePath, ["diff-index", "--cached", "--raw", "-z", "--no-renames", "HEAD", "--"], signal));
@@ -1740,7 +1769,7 @@ export class ForgeRuntime {
       if (expectedHeadSha && owned.branchOwned)
         await this.verifyHead(owned, expectedHeadSha, signal);
       owned.cleanupHeadSha = expectedHeadSha;
-      const retainedPaths = owned.prepared ? await this.workingFiles(owned, signal, true) : [];
+      const retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal) : [];
       if (retainedPaths.length) {
         owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths };
         owned.cleaned = true;

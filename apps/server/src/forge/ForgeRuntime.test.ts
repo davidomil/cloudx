@@ -1214,6 +1214,66 @@ describe("ForgeRuntime publication handoff", () => {
     headSha, status: "ready" as const, retainedPaths, details: "These working files are intentionally excluded from publication.",
   });
 
+  it("retains clean files with both index flags without clearing their local state", async () => {
+    const workspace = await prepare();
+    const file = "local\tsettings\nwith spaces.txt";
+    await fs.writeFile(path.join(workspace.worktreePath, file), "Local settings\n");
+    await git(workspace.worktreePath, "add", "--", file);
+    await git(workspace.worktreePath, "commit", "-m", "TEST: local settings");
+    const intended = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await git(workspace.worktreePath, "update-index", "--assume-unchanged", "--", file);
+    await git(workspace.worktreePath, "update-index", "--skip-worktree", "--", file);
+    const index = await fs.readFile(path.join(workspace.worktreePath, ".git", "index"));
+    expect(await git(workspace.worktreePath, "ls-files", "-v", "--", file)).toMatch(/^s /u);
+
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual({ worktreePath: workspace.worktreePath, retainedPaths: [file] });
+    expect(await fs.readFile(path.join(workspace.worktreePath, file), "utf8")).toBe("Local settings\n");
+    expect(await fs.readFile(path.join(workspace.worktreePath, ".git", "index"))).toEqual(index);
+  });
+
+  it.each(["missing", "empty", "populated", "symlink"])("checks %s submodule contents before deleting a checkout", async contents => {
+    const workspace = await prepare();
+    const submodule = "vendor/dependency";
+    const directory = path.join(workspace.worktreePath, submodule);
+    await git(workspace.worktreePath, "update-index", "--add", "--cacheinfo", `160000,${headSha},${submodule}`);
+    await git(workspace.worktreePath, "commit", "-m", "TEST: dependency");
+    const intended = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    if (contents === "empty") await fs.mkdir(directory, { recursive: true });
+    if (contents === "populated") await git(workspace.worktreePath, "clone", "--branch", "main", origin, directory);
+    if (contents === "symlink") {
+      await fs.mkdir(path.dirname(directory));
+      await fs.symlink(repositoryPath, directory);
+    }
+    const externalIndex = await fs.readFile(path.join(repositoryPath, ".git", "index"));
+    const retained = await runtime.cleanup({ ...workspace, expectedHeadSha: intended });
+    if (contents === "empty") {
+      expect(retained).toBeUndefined();
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      expect(retained).toEqual({ worktreePath: workspace.worktreePath, retainedPaths: [submodule] });
+      runtime = new ForgeRuntime(dependencies());
+      expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual(retained);
+      if (contents === "populated") expect(await fs.readFile(path.join(directory, "README.md"), "utf8")).toBe("Initial content\n");
+      if (contents === "symlink") expect(await fs.readlink(directory)).toBe(repositoryPath);
+      if (contents === "missing") await expect(fs.lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    expect(await fs.readFile(path.join(repositoryPath, ".git", "index"))).toEqual(externalIndex);
+  });
+
+  it.each(["unreadable", "malformed", "unsafe path"])("preserves the checkout when its retention index inventory is %s", async failure => {
+    const workspace = await prepare();
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, env) => {
+      if (args[0] !== "ls-files") return run(cwd, args, signal, env);
+      if (failure === "unreadable") throw new Error("Cannot read index");
+      return failure === "malformed" ? "invalid\0" : `H 160000 ${headSha} 0\t../outside\0`;
+    };
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow(/index/iu);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Initial content\n");
+  });
+
   it("publishes and reviews the intended commit while preserving staged edits, deletions, binary notes and symlinks through cleanup and restart", async () => {
     const workspace = await prepare();
     await fs.writeFile(path.join(workspace.worktreePath, "deleted.txt"), "Committed content\n");

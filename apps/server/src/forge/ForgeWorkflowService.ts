@@ -24,7 +24,7 @@ import type {
   ForgeWorkerHistory,
 } from "@cloudx/shared";
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
-import { parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
+import { MAX_FORGE_WORKFLOW_TEXT_LENGTH, parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { reviewScopeInstructions } from "./ForgeReviewScope.js";
 import { validateReview } from "./providers/reviewValidation.js";
@@ -1114,7 +1114,11 @@ export class ForgeWorkflowService {
   }
   private async requireHandoffContinuation(worker: ForgeWorker, error: Error): Promise<never> {
     worker.pendingPublication = undefined;
-    worker.completion!.continuationRequired = `${message(error)} Files remain in ${worker.worktreePath}. Use Continue with message to finish the implementation or declare intentionally retained files in a fresh handoff.`;
+    const recovery = `Files remain in ${worker.worktreePath}. Use Continue with message to finish the implementation or declare intentionally retained files in a fresh handoff.`;
+    const reason = message(error);
+    const reasonLimit = MAX_FORGE_WORKFLOW_TEXT_LENGTH - recovery.length - 1;
+    const summary = reason.length <= reasonLimit ? reason : `${reason.slice(0, reasonLimit - 1)}…`;
+    worker.completion!.continuationRequired = `${summary} ${recovery}`;
     await this.persist();
     throw new Error(worker.completion!.continuationRequired);
   }
