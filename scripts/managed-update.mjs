@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { inspectDataCompatibility, inspectSnapshotCompatibility, inspectTargetRuntime } from './managed-update-data.mjs';
+import { inspectDataCompatibility, inspectSnapshotCompatibility, inspectTargetRuntime, normalizeHistoricalForgeReviewIdentity } from './managed-update-data.mjs';
 import { MANAGED_INTEGRATION_FILES, prepareManagedIntegration } from './managed-update-integration.mjs';
 import { writeRuntimeBuild } from './write-runtime-build.mjs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -806,7 +806,7 @@ function forgeRecords(root, restoringFiles = new Set()) {
         // Publication, retry and completion timestamps remain part of the comparison.
         if (!['paused', 'awaiting_review', 'stopped', 'completed', 'failed'].includes(worker?.status) ||
             typeof worker.updatedAt !== 'string' || !Number.isFinite(Date.parse(worker.updatedAt))) return worker;
-        const { updatedAt, ...ownership } = worker;
+        const { updatedAt, ...ownership } = normalizeHistoricalForgeReviewIdentity(worker);
         return ownership;
       }));
     }

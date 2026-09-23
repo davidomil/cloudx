@@ -84,9 +84,15 @@ export async function launchManagedUpdate(options = {}) {
     } finally { prompt.close(); }
   }
   console.log(JSON.stringify(status, null, 2));
-  if (status.run?.id) console.log(`Update ${status.run.id}: use --status for progress and --resume ${status.run.id} after resolving a failure. The coordinator continues if this terminal disconnects.`);
+  if (status.run?.id) {
+    const entry = path.join(updater.stateDir, status.run.id, 'coordinator/scripts/update-cloudx.mjs');
+    const command = [process.execPath, entry, '--checkout', repoRoot].map(shellQuote).join(' ');
+    console.log(`Update ${status.run.id}: the coordinator continues if this terminal disconnects. Retain these commands; they work after checkout replacement:\n${command} --status\n${command} --resume ${status.run.id}`);
+  }
   if (!status.available || status.confirmation) process.exitCode = 1;
   return status;
 }
+
+function shellQuote(value) { return `'${value.replaceAll("'", "'\\''")}'`; }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) launchManagedUpdate(parseUpdateArguments(process.argv.slice(2))).catch(error => { console.error(error.message); process.exitCode = 1; });

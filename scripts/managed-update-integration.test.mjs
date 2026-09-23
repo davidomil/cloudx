@@ -209,7 +209,7 @@ it("bundles the maintained integration and lifecycle probe with the coordinator 
     .toEqual(fs.readFileSync(path.join(coordinator, "scripts/managed-update-readiness-legacy.ts")));
 });
 
-it.each(["settings-update.mjs", "managed-update.mjs"])("loads staged %s through resume and the next handoff after checkout replacement", entrypoint => {
+it.each(["settings-update.mjs", "managed-update.mjs", "update-cloudx.mjs"])("loads staged %s through resume and the next handoff after checkout replacement", entrypoint => {
   const home = directory(), checkout = directory();
   const installed = { run: { id: "11111111-1111-4111-8111-111111111111" } };
   new SettingsUpdater({ repoRoot: checkout, home }).stage(installed);

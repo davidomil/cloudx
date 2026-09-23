@@ -930,6 +930,35 @@ describe("Reusable review workers", () => {
     expect(f.runtime.launch.mock.calls[1][0].prompt).toContain("Continue this request's review in the same conversation");
   });
 
+  it.each([false, true])("uses the latest separate reviewer and includes only this request's history (saved newest first: %s)", async newestFirst => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime("2026-09-09T01:00:00.000Z");
+    const f = await completedReview();
+    const older = structuredClone(f.stored()[0]);
+    older.updatedAt = "2026-09-10T01:00:00.000Z";
+    const startedAt = "2026-09-09T02:00:00.000Z";
+    const draft = { ...f.draft, id: randomUUID(), startedAt, headSha: "c".repeat(40), body: "Review B", comments: [{ body: "Finding B" }] };
+    const latest = { ...older, id: randomUUID(), startedAt: "2026-09-08T23:00:00.000-03:00", updatedAt: startedAt, draft, completion: undefined,
+      headSha: draft.headSha, reviewBaseline: { reviewId: draft.id, revision: { ...older.reviewBaseline!.revision, headSha: draft.headSha } } };
+    const unrelated = [
+      { ...latest, id: randomUUID(), number: 8, changeNumber: 8 },
+      { ...latest, id: randomUUID(), repository: { ...latest.repository, projectPath: "another/repository" } },
+    ];
+    const sameRequest = newestFirst ? [latest, older] : [older, latest];
+    await f.deps.store.write(parseWorkers([...sameRequest, ...unrelated]));
+    f.change.headSha = "d".repeat(40);
+    vi.setSystemTime("2026-09-11T01:00:00.000Z");
+    const restarted = new ForgeWorkflowService(f.deps);
+    const next = await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next).toMatchObject({ id: latest.id, status: "running", reviewBaseline: latest.reviewBaseline, reviewHistory: [draft] });
+    expect(f.runtime.prepareReviewScope).toHaveBeenLastCalledWith(expect.objectContaining({ id: latest.id }), latest.reviewBaseline.revision, expect.any(AbortSignal));
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(next.attemptId, expect.objectContaining({ previousReviews: [f.draft, draft] }));
+    expect(f.stored().map(worker => worker.id)).toEqual([...sameRequest, ...unrelated].map(worker => worker.id));
+    expect(f.stored().find(worker => worker.id === older.id)?.draft).toEqual(f.draft);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+  });
+
   it("rejects an older round's save and submit even when both reviews inspected the same commit", async () => {
     const f = await completedReview();
     const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);

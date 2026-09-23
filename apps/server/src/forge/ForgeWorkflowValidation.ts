@@ -144,6 +144,15 @@ function parseSavedReview(value: unknown): ForgeReviewDraft {
   return { id, startedAt, ...review, status, publication: parseReviewPublication(input.publication), postedAt: isoTimestamp(input.postedAt, "review publication timestamp") };
 }
 
+function parseHistoricalReviewDraft(worker: Record<string, unknown>): ForgeReviewDraft {
+  const draft = object(worker.draft);
+  // Before review rounds, each worker owned one draft identified by the worker.
+  if (draft.id === undefined && draft.startedAt === undefined &&
+      worker.reviewHistory === undefined && worker.reviewBaseline === undefined && worker.completion === undefined)
+    return parseSavedReview({ id: worker.id, startedAt: worker.startedAt, ...draft });
+  return parseSavedReview(draft);
+}
+
 export function parseReview(value: unknown): ForgeReviewSubmission {
   const input = object(value);
   const headSha = text(input.headSha, "review head", 64);
@@ -551,7 +560,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       parsed.providerRetryAt = isoTimestamp(worker.providerRetryAt, "provider retry deadline");
     if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined || worker.reviewBaseline !== undefined))
       throw new Error("Only review workers can have review drafts or history.");
-    if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
+    if (worker.draft !== undefined) parsed.draft = parseHistoricalReviewDraft(worker);
     if (worker.reviewHistory !== undefined) {
       if (!Array.isArray(worker.reviewHistory) || worker.reviewHistory.length > MAX_FORGE_REVIEW_HISTORY)
         throw new Error(`Review history must contain at most ${MAX_FORGE_REVIEW_HISTORY} drafts.`);

@@ -96,10 +96,18 @@ function inspectForgeReviews(release, dataDir, issues) {
   const workers = JSON.parse(saved);
   if (!Array.isArray(workers) || workers.some(worker => !worker || typeof worker !== "object" || Array.isArray(worker)))
     throw new Error("Saved Forge workers must be a valid worker list.");
-  const reviews = workers.filter(worker => worker.reviewBaseline !== undefined || worker.completion?.reviewScope !== undefined);
-  if (!reviews.length) return { forgePresent: true, forgeReviewEvidence: false };
   const source = name => readOptional(path.join(release, "apps/server/src/forge", `${name}.ts`)) ?? "";
   const service = source("ForgeWorkflowService"), validation = source("ForgeWorkflowValidation"), runtime = source("ForgeRuntime");
+  if (validation.includes('"saved review identity"')) for (const worker of workers) {
+    const normalized = normalizeHistoricalForgeReviewIdentity(worker);
+    if (normalized !== worker && !validation.includes("function parseHistoricalReviewDraft("))
+      issues.push("The selected target lacks the historical Forge draft reader required by the saved profile.");
+    const drafts = [normalized.draft, ...(Array.isArray(normalized.reviewHistory) ? normalized.reviewHistory : [])].filter(draft => draft !== undefined);
+    if (drafts.some(draft => !validReviewId(draft?.id) || !validTimestamp(draft?.startedAt)))
+      issues.push("Saved Forge review identities or start timestamps are invalid. Preserve the profile and recover the original review identity before updating.");
+  }
+  const reviews = workers.filter(worker => worker.reviewBaseline !== undefined || worker.completion?.reviewScope !== undefined);
+  if (!reviews.length) return { forgePresent: true, forgeReviewEvidence: false };
   const native = service.includes("worker.reviewBaseline = { reviewId: draft.id, revision: scope.current }") &&
     validation.includes("parsed.completion.reviewScope = scope") && validation.includes("parsed.reviewBaseline = { reviewId, revision }");
   const retained = service.includes("recordManagedReview(") && validation.includes("preserveManagedReviewEvidence(worker, parsed)") &&
@@ -119,6 +127,24 @@ function inspectForgeReviews(release, dataDir, issues) {
       issues.push("Saved Forge review scope does not match its revision or completion report. Preserve the profile and recover the recorded review evidence before updating.");
   }
   return { forgePresent: true, forgeReviewEvidence: true, targetForgeReviewEvidence: supported ? native ? "native" : "retained" : null };
+}
+
+export function normalizeHistoricalForgeReviewIdentity(worker) {
+  const draft = worker?.draft;
+  if (worker?.kind !== "review" || !draft || typeof draft !== "object" || Array.isArray(draft) ||
+      draft.id !== undefined || draft.startedAt !== undefined || worker.reviewHistory !== undefined ||
+      worker.reviewBaseline !== undefined || worker.completion !== undefined ||
+      !validReviewId(worker.id) || !validTimestamp(worker.startedAt)) return worker;
+  return { ...worker, draft: { id: worker.id, startedAt: worker.startedAt, ...draft } };
+}
+
+function validReviewId(value) {
+  return typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+}
+
+function validTimestamp(value) {
+  const timestamp = typeof value === "string" ? Date.parse(value) : NaN;
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
 }
 
 function validReviewRevision(value) {

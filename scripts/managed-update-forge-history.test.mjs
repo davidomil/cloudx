@@ -158,31 +158,45 @@ it.each(['2e69451b', 'a9613faf', '643ad8eb', '224a75ef'])('downgrades to %s, com
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 20000);
 
-it('preserves current reviews and edits a separate 0.1.3 review before upgrading from its retained baseline', async () => {
+it.each([false, true])('preserves same-request reviews across 0.1.3 and upgrades from the latest baseline (posted: %s)', async posted => {
   const f = await reviewRoundTrip({ commit: 'c664071e' });
   const downgraded = f.serviceFor(f.history);
   expect((await downgraded.service.dashboard()).workers[0]).toMatchObject({
     draft: f.initial.draft, reviewBaseline: f.initial.reviewBaseline,
   });
-  f.change.number = 8;
   f.change.headSha = f.record.targetCommit;
-  const second = await f.finishReview(downgraded, await downgraded.service.startReview(f.initial.repository, 8, false, f.placement));
+  const second = await f.finishReview(downgraded, await downgraded.service.startReview(f.initial.repository, 7, false, f.placement));
+  expect(second.id).not.toBe(f.initial.id);
   expect(second.reviewBaseline).toEqual({ reviewId: second.draft.id, revision: second.completion.reviewScope.current });
   expect(second.draft).toMatchObject({ id: second.completion.attemptId, startedAt: second.startedAt });
-  await downgraded.service.saveReview(second.id, { body: 'Edited historical review', comments: [], event: 'approve' });
+  const comments = [{ body: 'Historical finding retained for the next reviewer' }];
+  await downgraded.service.saveReview(second.id, { body: 'Edited historical review', comments, event: 'request_changes' });
+  if (posted) {
+    f.provider.postReview.mockResolvedValue({ commentIds: ['published-B'] });
+    await downgraded.service.submitReview(second.id);
+  }
   await downgraded.service.dispose();
   const persisted = await downgraded.store.read();
   expect(persisted[0]).toMatchObject({ draft: f.initial.draft, reviewBaseline: f.initial.reviewBaseline });
-  expect(persisted[1]).toMatchObject({ draft: { ...second.draft, body: 'Edited historical review' }, reviewBaseline: second.reviewBaseline });
+  expect(persisted[1]).toMatchObject({ draft: { ...second.draft, body: 'Edited historical review', comments,
+    event: 'request_changes', status: posted ? 'posted' : 'draft' }, reviewBaseline: second.reviewBaseline });
   const revision = second.reviewBaseline.revision;
   for (const [name, sha] of [['head', revision.headSha], ['base', revision.baseSha], ['merge-base', revision.mergeBaseSha]])
     expect(git(second.worktreePath, 'rev-parse', `refs/cloudx/reviews/${revision.headSha}/${revision.baseSha}/${name}`)).toBe(sha);
   const upgraded = f.serviceFor(f.currentClasses);
-  const next = await upgraded.service.startReview(f.initial.repository, 8, false, f.placement);
+  const next = await upgraded.service.startReview(f.initial.repository, 7, false, f.placement);
   expect(next.status, next.error).toBe('running');
+  expect(next.id).toBe(second.id);
+  expect(next.reviewBaseline).toEqual(second.reviewBaseline);
   expect(next.completion.reviewScope).toMatchObject({ kind: 'unchanged', current: revision, previous: revision });
   expect(next.reviewHistory).toEqual([persisted[1].draft]);
-  expect(f.provider.postReview).toHaveBeenCalledOnce();
+  const context = JSON.parse(fs.readFileSync(path.join(f.dataDir, 'forge-reports', `${next.attemptId}.context.json`), 'utf8'));
+  expect(context.previousReviews).toEqual([persisted[0].draft, persisted[1].draft]);
+  expect(await upgraded.store.read()).toEqual([
+    expect.objectContaining({ id: f.initial.id, draft: persisted[0].draft, reviewBaseline: f.initial.reviewBaseline }),
+    expect.objectContaining({ id: second.id, reviewHistory: [persisted[1].draft], reviewBaseline: second.reviewBaseline }),
+  ]);
+  expect(f.provider.postReview).toHaveBeenCalledTimes(posted ? 2 : 1);
 }, 20000);
 
 it.each(['retention', 'cleanup'])('preserves 0.1.3 review evidence when %s fails before a return upgrade', async failure => {

@@ -14,8 +14,10 @@ export function prepareManagedForgeIntegration(readTarget, readCoordinator) {
     validation.includes("parsed.completion.reviewScope = scope;") && validation.includes("parsed.reviewBaseline = { reviewId, revision };"),
     runtime.includes("  prepareReviewScope(\n") && runtime.includes("  retainReviewBaseline(\n")];
   const integrated = service.includes("captureManagedReviewScope(") && validation.includes("preserveManagedReviewEvidence(worker, parsed);");
-  if (native.every(Boolean)) return {};
-  if (integrated && native[2] && readTarget(FORGE_EVIDENCE_FILE).includes("export function preserveManagedReviewEvidence(")) return {};
+  if (native.every(Boolean) || integrated && native[2] && readTarget(FORGE_EVIDENCE_FILE).includes("export function preserveManagedReviewEvidence(")) {
+    const reader = retainHistoricalDraftReader(validation);
+    return reader === validation ? {} : { [FORGE_VALIDATION_FILE]: reader };
+  }
   if (native.some(Boolean) || integrated) throw new Error("Managed Forge review integration does not recognize the target evidence contract.");
 
   function replace(file, before, after) {
@@ -121,6 +123,7 @@ export function prepareManagedForgeIntegration(readTarget, readCoordinator) {
   else
     replace(FORGE_VALIDATION_FILE, '    return { kind: "review", ...parseReview(report) };',
       '    text(report.body, "review body", 100_000);\n    return { kind: "review", ...parseReview(report) };');
+  changes[FORGE_VALIDATION_FILE] = retainHistoricalDraftReader(changes[FORGE_VALIDATION_FILE]);
   return changes;
 }
 
@@ -195,7 +198,7 @@ function completedManagedDraft(worker: ForgeWorker): boolean {
   replace(FORGE_VALIDATION_FILE, "return { ...review, status };", "return { id, startedAt, ...review, status };");
   replace(FORGE_VALIDATION_FILE, "return { ...review, status, publication:", "return { id, startedAt, ...review, status, publication:");
   replace(FORGE_VALIDATION_FILE, "    if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);", `    if (worker.draft !== undefined)
-      parsed.draft = parseSavedReview({ id: worker.id, startedAt: worker.startedAt, ...object(worker.draft) });
+      parsed.draft = parseHistoricalReviewDraft(worker);
     if (worker.reviewHistory !== undefined) {
       if (!Array.isArray(worker.reviewHistory) || worker.reviewHistory.length > 1000) throw new Error("Invalid saved review history.");
       const reviewHistory = worker.reviewHistory.map(parseSavedReview);
@@ -205,4 +208,21 @@ function completedManagedDraft(worker: ForgeWorker): boolean {
     }
     if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined))
       throw new Error("Only review workers can have review drafts or history.");`);
+}
+
+function retainHistoricalDraftReader(validation) {
+  if (validation.includes("function parseHistoricalReviewDraft(")) return validation;
+  const assignment = ["parsed.draft = parseSavedReview(worker.draft);",
+    "parsed.draft = parseSavedReview({ id: worker.id, startedAt: worker.startedAt, ...object(worker.draft) });",
+    "parsed.draft = parseHistoricalReviewDraft(worker);"].find(candidate => validation.split(candidate).length === 2);
+  if (!assignment) throw new Error("Managed Forge review integration does not recognize the target draft reader.");
+  return validation.replace(assignment, "parsed.draft = parseHistoricalReviewDraft(worker);") + `
+function parseHistoricalReviewDraft(worker: Record<string, unknown>): ForgeReviewDraft {
+  const draft = object(worker.draft);
+  if (draft.id === undefined && draft.startedAt === undefined &&
+      worker.reviewHistory === undefined && worker.reviewBaseline === undefined && worker.completion === undefined)
+    return parseSavedReview({ id: worker.id, startedAt: worker.startedAt, ...draft });
+  return parseSavedReview(draft);
+}
+`;
 }

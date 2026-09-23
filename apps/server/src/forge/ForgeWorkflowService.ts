@@ -365,8 +365,9 @@ export class ForgeWorkflowService {
       if ((item as ForgeChangeRequest).headSha !== issueWorker.headSha || !(item as ForgeChangeRequest).reviewReady)
         throw new Error("The published commit changed or is still processing. Inspect the request before resuming auto review.");
     }
-    const reviewer = kind === "review" ? this.workers.find(worker =>
-      worker.kind === "review" && worker.number === number && !worker.retainedWorkspace && sameRepository(worker.repository, repository)) : undefined;
+    const reviewer = kind === "review"
+      ? this.reviewWorkers(repository, number).filter(worker => !worker.retainedWorkspace).at(-1)
+      : undefined;
     if (reviewer)
       return this.startReviewRound(reviewer, item as ForgeChangeRequest, autoPost, placement, controller, issueWorker);
     const now = new Date().toISOString();
@@ -424,6 +425,15 @@ export class ForgeWorkflowService {
       await this.fail(worker, error);
     }
     return structuredClone(worker);
+  }
+  private reviewWorkers(repository: ForgeRepository, number: number): ForgeWorker[] {
+    return this.workers.filter(worker => worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository))
+      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
+  }
+  private previousReviews(worker: ForgeWorker): ForgeReviewDraft[] {
+    return this.reviewWorkers(worker.repository, worker.number)
+      .flatMap(reviewer => [...(reviewer.reviewHistory ?? []), ...(reviewer.draft ? [reviewer.draft] : [])])
+      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
   }
   private async startReviewRound(
     worker: ForgeWorker,
@@ -2019,7 +2029,7 @@ export class ForgeWorkflowService {
     await this.persist();
     const { reportPath, contextPath } = await this.deps.reports.prepare(
       worker.attemptId,
-      reviewScope ? { ...context, reviewScope, previousReviews: [...(worker.reviewHistory ?? []), ...(worker.draft ? [worker.draft] : [])] } :
+      reviewScope ? { ...context, reviewScope, previousReviews: this.previousReviews(worker) } :
         worker.rebaseRecovery?.phase === "resolving" ? { ...context, rebaseRecovery: worker.rebaseRecovery } : context,
     );
     signal?.throwIfAborted();

@@ -275,7 +275,7 @@ function forgeFixture() {
   }
   const id = '11111111-1111-4111-8111-111111111111';
   const revision = { headSha: 'a'.repeat(40), baseSha: 'b'.repeat(40), mergeBaseSha: 'b'.repeat(40) };
-  const worker = { kind: 'review', draft: { id, headSha: revision.headSha }, reviewBaseline: { reviewId: id, revision },
+  const worker = { kind: 'review', draft: { id, startedAt: '2026-09-20T10:00:00.000Z', headSha: revision.headSha }, reviewBaseline: { reviewId: id, revision },
     completion: { reviewScope: { kind: 'initial', current: revision }, report: { kind: 'review', headSha: revision.headSha } } };
   const store = path.join(f.data, `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`);
   fs.mkdirSync(path.dirname(store));
@@ -295,6 +295,36 @@ it('checks Forge review evidence for both the active profile and a selected snap
   fs.writeFileSync(path.join(snapshot, path.relative(f.data, f.store)), JSON.stringify([f.worker]));
   expect(inspectSnapshotCompatibility(f.release, {}, f.data, [{ root: f.data, destination: snapshot }])).toMatchObject({ compatible: false });
   expect(fs.readFileSync(f.store)).toEqual(before);
+});
+
+it.each([
+  { id: '11111111-1111-4111-8111-111111111111' },
+  { startedAt: '2026-09-20T10:00:00.000Z' },
+  { id: null },
+  { startedAt: '2026-09-20' },
+])('rejects partial or malformed original Forge identities before activation %#', identity => {
+  const f = forgeFixture();
+  const worker = { kind: 'review', id: '11111111-1111-4111-8111-111111111111', startedAt: '2026-09-20T10:00:00.000Z',
+    draft: { ...identity, headSha: f.worker.draft.headSha, status: 'posted' } };
+  const content = JSON.stringify([worker]);
+  fs.writeFileSync(f.store, content);
+  expect(inspectDataCompatibility(f.release, {}, f.data)).toMatchObject({ compatible: false });
+  expect(fs.readFileSync(f.store, 'utf8')).toBe(content);
+});
+
+it('requires the retained reader before accepting an original draft for a target with review identities', () => {
+  const f = forgeFixture();
+  const worker = { kind: 'review', id: '11111111-1111-4111-8111-111111111111', startedAt: '2026-09-20T10:00:00.000Z',
+    draft: { headSha: f.worker.draft.headSha, status: 'posted' } };
+  const content = JSON.stringify([worker]);
+  fs.writeFileSync(f.store, content);
+  expect(inspectDataCompatibility(f.release, {}, f.data)).toMatchObject({ compatible: true });
+  const validation = path.join(f.release, 'apps/server/src/forge/ForgeWorkflowValidation.ts');
+  fs.writeFileSync(validation, fs.readFileSync(validation, 'utf8').replace('function parseHistoricalReviewDraft(', 'function unavailableHistoricalReader('));
+  const compatibility = inspectDataCompatibility(f.release, {}, f.data);
+  expect(compatibility.compatible).toBe(false);
+  expect(compatibility.issues).toContainEqual(expect.stringContaining('historical Forge draft reader'));
+  expect(fs.readFileSync(f.store, 'utf8')).toBe(content);
 });
 
 it.each([

@@ -122,13 +122,23 @@ The server permits a replacement run only before mutation or after
 restoration completes. A run with incomplete restoration must resume its
 original recovery first.
 
-The CLI provides the same saved run, including after a service shutdown
-or reboot:
+After a managed update is staged, use its retained CLI for status and
+resume. This entry stays outside the checkout, including when an older
+target has no updater script or the web service is down. The launch
+output prints the full commands. Find the update ID in Settings, the
+launch output, or ~/.local/state/cloudx/settings-update/latest.json.
 
 ``` bash
-node scripts/update-cloudx.mjs --checkout /path/to/cloudx --status
-node scripts/update-cloudx.mjs --checkout /path/to/cloudx --resume "<update-id>"
+CLOUDX_UPDATE_ID="<update-id>"
+CLOUDX_UPDATE_CLI="$HOME/.local/state/cloudx/settings-update/$CLOUDX_UPDATE_ID/coordinator/scripts/update-cloudx.mjs"
+node "$CLOUDX_UPDATE_CLI" --checkout /path/to/cloudx --status
+node "$CLOUDX_UPDATE_CLI" --checkout /path/to/cloudx --resume "$CLOUDX_UPDATE_ID"
 ```
+
+These commands load the saved installation, target and coordinator
+without downloading another launcher. Resume still checks service
+ownership and the retained bundle before starting the coordinator. Later
+update phases may require network access to prepare dependencies.
 
 Run records and private logs live under
 `~/.local/state/cloudx/settings-update`. Each update directory retains
@@ -173,6 +183,16 @@ startup and shutdown. A historical review records its pinned head, base
 and merge base, retains those Git objects, and saves the completed draft
 and baseline together. Returning to a newer version can continue from
 that completed comparison.
+
+Recognized original single-review drafts inherit their saved worker
+identity and start time when loading. Their publication receipts remain
+unchanged. Rollback recognizes this identity conversion while continuing
+to reject publication or ownership changes.
+
+When a historical version kept separate review workers for the same
+request, the next review uses the latest worker and its baseline. Its
+context includes earlier review bodies and findings from every retained
+worker for that repository and request.
 
 These integrations keep ordinary metadata persistence from blocking
 rollback. New reviews, publications and ownership changes still block
