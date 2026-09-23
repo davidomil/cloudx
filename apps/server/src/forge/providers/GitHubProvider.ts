@@ -40,6 +40,7 @@ import { validateCreateRequest, validateReview } from "./reviewValidation.js";
 import { assertGitHubScopedFilter, resolveListScope } from "./listScope.js";
 
 interface GitHubReadiness {
+  headSha: string;
   reviewDecision: string | null;
   mergeable: string;
   mergeStateStatus: string;
@@ -185,7 +186,10 @@ export class GitHubProvider implements ForgeProvider {
       if (status && (current.state !== status.state || current.headBranch !== status.headBranch || current.baseBranch !== status.baseBranch))
         throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
       if (status && current.headSha !== status.headSha)
-        throw new ForgeHeadChangedError([status.headSha, current.headSha]);
+        throw new ForgeHeadChangedError([status.headSha, current.headSha], [
+          { source: "github.graphql.status", headSha: status.headSha },
+          { source: "github.graphql.status", headSha: current.headSha },
+        ]);
       status = current;
       const connection = record(request.closingIssuesReferences);
       const nodes = list(connection.nodes);
@@ -573,10 +577,18 @@ export class GitHubProvider implements ForgeProvider {
       if (result.status === "rejected" && !(result.reason instanceof ForgeHeadChangedError)) throw result.reason;
     const [status, readiness] = results;
     const observedHeadShas = [expected.headSha];
-    if (status.status === "fulfilled") observedHeadShas.push(status.value.headSha);
+    const observations = [{ source: "github.rest.pull", headSha: expected.headSha }];
+    if (status.status === "fulfilled") {
+      observedHeadShas.push(status.value.headSha);
+      observations.push({ source: "github.graphql.status", headSha: status.value.headSha });
+    }
+    if (readiness.status === "fulfilled") observations.push({ source: "github.graphql.readiness", headSha: readiness.value.headSha });
     for (const result of results)
-      if (result.status === "rejected" && result.reason instanceof ForgeHeadChangedError) observedHeadShas.push(...result.reason.observedHeadShas);
-    if (new Set(observedHeadShas).size > 1) throw new ForgeHeadChangedError(observedHeadShas);
+      if (result.status === "rejected" && result.reason instanceof ForgeHeadChangedError) {
+        observedHeadShas.push(...result.reason.observedHeadShas);
+        observations.push(...result.reason.observations);
+      }
+    if (new Set(observedHeadShas).size > 1) throw new ForgeHeadChangedError(observedHeadShas, observations);
     if (status.status === "rejected") throw status.reason;
     if (readiness.status === "rejected") throw readiness.reason;
     return { status: status.value, readiness: readiness.value };
@@ -587,6 +599,7 @@ export class GitHubProvider implements ForgeProvider {
     expected: GitHubSnapshot,
   ): Promise<GitHubReadiness> {
     const [owner, name] = this.http.repository.projectPath.split("/");
+    const observations = [{ source: "github.rest.pull", headSha: expected.headSha }];
     let cursor: string | null = null;
     let unresolved = 0;
     const threadsByComment = new Map<
@@ -620,8 +633,9 @@ export class GitHubProvider implements ForgeProvider {
         throw new ForgeProviderError("The target branch changed while loading. Refresh before proceeding.", 409);
       if (string(request.headRefName) !== expected.headBranch || string(request.baseRefName) !== expected.baseBranch || string(request.state).toLowerCase() !== expected.state)
         throw new ForgeProviderError("The request changed while loading. Refresh before proceeding.", 409);
+      observations.push({ source: "github.graphql.readiness", headSha: observedHeadSha });
       if (observedHeadSha !== expected.headSha)
-        throw new ForgeHeadChangedError([expected.headSha, observedHeadSha]);
+        throw new ForgeHeadChangedError([expected.headSha, observedHeadSha], observations);
       const threads = record(request.reviewThreads);
       for (const value of list(threads.nodes)) {
         const thread = record(value);
@@ -637,6 +651,7 @@ export class GitHubProvider implements ForgeProvider {
       const pageInfo = record(threads.pageInfo);
       if (!boolean(pageInfo.hasNextPage))
         return {
+          headSha: observedHeadSha,
           unresolved,
           threads: threadsByComment,
           reviewDecision:
@@ -662,7 +677,10 @@ function githubHeadChecks(value: unknown, expectedHeadSha: string): GitHubHeadCh
   if (value === null) return "blocked";
   const commit = record(record(value).target);
   const headSha = githubHeadSha(commit.oid);
-  if (headSha !== expectedHeadSha) throw new ForgeHeadChangedError([expectedHeadSha, headSha]);
+  if (headSha !== expectedHeadSha) throw new ForgeHeadChangedError([expectedHeadSha, headSha], [
+    { source: "github.graphql.readiness", headSha: expectedHeadSha },
+    { source: "github.graphql.readiness.head-ref", headSha },
+  ]);
   if (commit.statusCheckRollup === null) return "absent";
   const state = string(record(commit.statusCheckRollup).state);
   if (!["SUCCESS", "PENDING", "EXPECTED", "FAILURE", "ERROR"].includes(state)) return invalid();

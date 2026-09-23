@@ -1,7 +1,8 @@
-import { isForgeTurnCompletion, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeIssueCompletionReport,
+  ForgePublicationObservation,
   ForgeReviewComment,
   ForgeReviewDraft,
   ForgeReviewPublication,
@@ -235,6 +236,38 @@ function parseRebaseRecovery(value: unknown, worker: ForgeWorker): NonNullable<F
   return { branch, baseBranch, expectedHeadSha, originalHeadSha, targetHeadSha, phase, ...(headSha ? { headSha } : {}) };
 }
 
+function publicationTimestamp(value: unknown): string {
+  const timestamp = text(value, "publication timestamp", 24);
+  if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(timestamp) ||
+    !Number.isFinite(Date.parse(timestamp)) || new Date(timestamp).toISOString() !== timestamp)
+    throw new Error("Invalid publication timestamp.");
+  return timestamp;
+}
+
+function parsePublicationObservations(value: unknown): ForgePublicationObservation[] {
+  if (!Array.isArray(value) || value.length > 8)
+    throw new Error("Invalid publication observation history.");
+  return value.map(raw => {
+    const input = object(raw);
+    const observedAt = publicationTimestamp(input.observedAt);
+    const source = input.source;
+    const reason = input.reason as ForgePublicationObservation["reason"];
+    if (source !== "status" && source !== "change" && source !== "confirmation" ||
+      !["snapshot", "mixed_heads", "waiting", "deferred", "confirmed", "exhausted", "provider_error", "rejected"].includes(reason) ||
+      !Array.isArray(input.heads) || input.heads.length > 16)
+      throw new Error("Invalid publication observation.");
+    const heads = input.heads.map(raw => {
+      const head = object(raw);
+      const source = text(head.source, "publication endpoint", 80);
+      const headSha = text(head.headSha, "observed publication head", 64);
+      if (!/^[a-zA-Z][a-zA-Z0-9_.-]*$/.test(source) || !/^[a-f0-9]{40,64}$/i.test(headSha))
+        throw new Error("Invalid publication endpoint or observed head.");
+      return { source, headSha };
+    });
+    return { observedAt, source, heads, reason };
+  });
+}
+
 function parsePendingPublication(
   value: unknown,
 ): NonNullable<ForgeWorker["pendingPublication"]> {
@@ -272,6 +305,12 @@ function parsePendingPublication(
       !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(confirmationStartedAt) ||
       !Number.isFinite(Date.parse(confirmationStartedAt))))
     throw new Error("Publication confirmation requires a pushed head and a valid timestamp.");
+  const nextConfirmationAt = input.nextConfirmationAt === undefined ? undefined : publicationTimestamp(input.nextConfirmationAt);
+  const confirmationObservations = input.confirmationObservations === undefined ? undefined : parsePublicationObservations(input.confirmationObservations);
+  if ((nextConfirmationAt || confirmationObservations) && !confirmationStartedAt ||
+    nextConfirmationAt && (Date.parse(nextConfirmationAt) < Date.parse(confirmationStartedAt!) ||
+      Date.parse(nextConfirmationAt) > Date.parse(confirmationStartedAt!) + FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS))
+    throw new Error("Publication observations and scheduling require a confirmation window.");
   if (input.confirmed !== undefined && (input.confirmed !== true || !headSha))
     throw new Error("Publication confirmation requires a published head.");
   const replyIds = new Set(report.discussionReplies.map(reply => reply.discussionId));
@@ -297,6 +336,8 @@ function parsePendingPublication(
     ...(headSha !== undefined ? { headSha } : {}),
     ...(previousHeadSha !== undefined ? { previousHeadSha } : {}),
     ...(confirmationStartedAt !== undefined ? { confirmationStartedAt } : {}),
+    ...(nextConfirmationAt !== undefined ? { nextConfirmationAt } : {}),
+    ...(confirmationObservations !== undefined ? { confirmationObservations } : {}),
     ...(input.confirmed === true ? { confirmed: true as const } : {}),
     repliedDiscussionIds: [...replied] as string[],
     ...(replyingTo !== undefined ? { replyingToDiscussionId: replyingTo as string } : {}),

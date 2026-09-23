@@ -138,8 +138,12 @@ export class GitLabProvider implements ForgeProvider {
       );
     const version = record(versions[0]);
     const versionHeadSha = gitlabHeadSha(version.head_commit_sha);
+    const observations = [
+      { source: "gitlab.rest.merge-request.initial", headSha },
+      { source: "gitlab.rest.versions", headSha: versionHeadSha },
+    ];
     if (versionHeadSha !== headSha)
-      throw new ForgeHeadChangedError([headSha, versionHeadSha]);
+      throw new ForgeHeadChangedError([headSha, versionHeadSha], observations);
     const patchIdSha = version.patch_id_sha === null ? undefined : gitlabHeadSha(version.patch_id_sha);
     const createdAt = Date.parse(string(version.created_at));
     if (!Number.isFinite(createdAt)) return invalid();
@@ -172,18 +176,20 @@ export class GitLabProvider implements ForgeProvider {
     const targetHeadSha = await this.readTargetHeadSha(initial.baseBranch);
     const current = record((await this.http.request(path)).body);
     const status = gitlabStatus(current, number);
+    observations.push({ source: "gitlab.rest.merge-request.current", headSha: status.headSha });
     if (status.headBranch !== initial.headBranch || status.baseBranch !== initial.baseBranch || status.state !== initial.state)
       throw new ForgeProviderError(
         "The request changed while loading. Refresh before proceeding.",
         409,
       );
     if (status.headSha !== headSha)
-      throw new ForgeHeadChangedError([headSha, status.headSha]);
+      throw new ForgeHeadChangedError([headSha, status.headSha], observations);
     const refs = record(current.diff_refs);
     const diffHeadSha = gitlabHeadSha(refs.head_sha);
     const baseSha = gitlabHeadSha(refs.base_sha);
+    observations.push({ source: "gitlab.rest.merge-request.diff-refs", headSha: diffHeadSha });
     if (diffHeadSha !== headSha)
-      throw new ForgeHeadChangedError([headSha, diffHeadSha]);
+      throw new ForgeHeadChangedError([headSha, diffHeadSha], observations);
     const mergeStatus = string(current.detailed_merge_status);
     if (await this.readTargetHeadSha(status.baseBranch) !== targetHeadSha)
       throw new ForgeProviderError("The target branch changed while loading. Refresh before proceeding.", 409);

@@ -318,7 +318,7 @@ function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
       return <span key={worker.id} className="forge-item-worker">
         <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
         {worker.autoReview?.enabled ? <span className="forge-muted">Auto review · {worker.autoReview.phase}</span> : null}
-        {worker.error ? <span className="forge-item-worker-error" title={worker.error}>{worker.error}</span> : null}
+        {worker.error ? <span className={worker.status === "awaiting_publication" ? "forge-muted" : "forge-item-worker-error"} title={worker.error}>{worker.error}</span> : null}
       </span>;
     })}
   </span>;
@@ -391,9 +391,9 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
   const card = <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
     <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
-    {!archivedDraft && worker.error ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
+    {!archivedDraft && worker.error && worker.status !== "awaiting_publication" ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
     {!archivedDraft && worker.providerRetryAt ? <p role="status">Worker will retry automatically at <time dateTime={worker.providerRetryAt}>{new Date(worker.providerRetryAt).toLocaleString()}</time>.</p> : null}
-    {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">The commit was pushed. Waiting for {worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.</p> : null}
+    {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && !conflict && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     {!archivedDraft && uncertainReply ? <section aria-label="Uncertain discussion reply">
@@ -415,6 +415,7 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
       {onViewWorker ? <ControlButton size="compact" onClick={() => onViewWorker(worker.id)}><Terminal size={14} /> View worker</ControlButton> : null}
       {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">Open PR/MR <ExternalLink size={12} /></a> : null}
     </div> : null}
+    {!archivedDraft && pendingPublication?.headSha ? <PublicationDiagnostics publication={pendingPublication} waiting={worker.status === "awaiting_publication"} /> : null}
     {!archivedDraft && continuing ? <form aria-label="Continue worker with a message" onSubmit={event => { event.preventDefault(); void continueWorker(); }}>
       <p className="forge-muted">Continue this {worker.kind === "issue" ? "issue" : "review"} worker with additional instructions.</p>
       {continuationBlocker ? <p role="status" className="forge-notice">{continuationBlocker}</p> : null}
@@ -438,6 +439,22 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
       {draft ? <span className="forge-muted"> · {draft.status === "posted" ? "Posted review" : "Suggested review"} · {comments} {comments === 1 ? "comment" : "comments"}</span> : null}
     </summary>
     {card}
+  </details>;
+}
+
+function PublicationDiagnostics({ publication, waiting }: { publication: NonNullable<ForgeWorker["pendingPublication"]>; waiting: boolean }) {
+  return <details className="forge-review" aria-label="Publication diagnostics">
+    <summary>Publication diagnostics</summary>
+    {publication.previousHeadSha ? <p>Previous head: <code>{publication.previousHeadSha}</code></p> : null}
+    <p>Pushed head: <code>{publication.headSha}</code></p>
+    {publication.confirmationStartedAt ? <p>Confirmation started: <time dateTime={publication.confirmationStartedAt}>{new Date(publication.confirmationStartedAt).toLocaleString()}</time></p> : null}
+    {waiting && publication.nextConfirmationAt ? <p>Next automatic check: <time dateTime={publication.nextConfirmationAt}>{new Date(publication.nextConfirmationAt).toLocaleString()}</time></p> : null}
+    {publication.confirmationObservations?.length ? <ol>
+      {publication.confirmationObservations.map((observation, index) => <li key={index}>
+        <time dateTime={observation.observedAt}>{new Date(observation.observedAt).toLocaleString()}</time> · {observation.source} · {observation.reason.replaceAll("_", " ")}
+        {observation.heads.length ? <ul>{observation.heads.map((head, headIndex) => <li key={headIndex}>{head.source}: <code>{head.headSha}</code></li>)}</ul> : null}
+      </li>)}
+    </ol> : <p>No provider observations recorded yet.</p>}
   </details>;
 }
 

@@ -340,6 +340,41 @@ describe("Saved issue publication checkpoints", () => {
     expect(parseWorkers([waiting])).toEqual([waiting]);
   });
 
+  const observation = {
+    observedAt: worker.startedAt, source: "change", reason: "mixed_heads",
+    heads: [{ source: "github.rest.pull", headSha }, { source: "github.graphql.readiness", headSha: "b".repeat(40) }],
+  };
+  const confirmation = {
+    ...waiting.pendingPublication,
+    nextConfirmationAt: "2026-09-08T00:03:00.000Z", confirmationObservations: [observation],
+  };
+
+  it("round-trips bounded endpoint observations and the next check without sharing references", () => {
+    const saved = { ...waiting, pendingPublication: confirmation };
+    const [parsed] = parseWorkers([saved]);
+    expect(parsed).toEqual(saved);
+    expect(parsed.pendingPublication!.confirmationObservations![0].heads).not.toBe(observation.heads);
+  });
+
+  it.each([
+    { nextConfirmationAt: "yesterday" }, { nextConfirmationAt: null }, { nextConfirmationAt: 123 },
+    { nextConfirmationAt: "2026-02-30T00:00:00.000Z" },
+    { nextConfirmationAt: "2026-09-07T00:00:00.000Z" },
+    { nextConfirmationAt: "2026-09-08T00:30:00.001Z" },
+    { confirmationStartedAt: undefined }, { headSha: undefined },
+    { confirmationObservations: null }, { confirmationObservations: {} },
+    { confirmationObservations: Array(9).fill(observation) },
+    ...[
+      null, { ...observation, observedAt: "yesterday" }, { ...observation, source: "unknown" },
+      { ...observation, reason: "arbitrary error body" }, { ...observation, heads: null },
+      { ...observation, heads: Array(17).fill(observation.heads[0]) },
+      { ...observation, heads: [{ source: "https://endpoint?token=secret", headSha }] },
+      { ...observation, heads: [{ source: "github.rest.pull", headSha: "invalid" }] },
+    ].map(invalid => ({ confirmationObservations: [invalid] })),
+  ])("rejects malformed confirmation scheduling and diagnostics %#", invalid => {
+    expect(() => parseWorkers([{ ...waiting, pendingPublication: { ...confirmation, ...invalid } }])).toThrow();
+  });
+
   it.each([
     { kind: "review" }, { changeNumber: undefined }, { repositoryPath: undefined },
     { worktreePath: undefined }, { branch: "" }, { pendingPublication: undefined },

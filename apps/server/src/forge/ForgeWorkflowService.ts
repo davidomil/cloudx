@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type {
   CodexReasoningEffort,
   ForgeChangeRequest,
@@ -8,6 +8,7 @@ import type {
   ForgeDashboard,
   ForgeIssueDetail,
   ForgePlacement,
+  ForgePublicationObservation,
   ForgeRepository,
   ForgeReviewDraft,
   ForgeReviewSubmission,
@@ -159,6 +160,7 @@ export interface ForgeWorkflowDependencies {
 
 const PROVIDER_RECOVERY_DELAYS = [5_000, 15_000, 30_000, 60_000];
 const PROVIDER_RECOVERY_WINDOW = 5 * 60_000;
+const PUBLICATION_INITIAL_WINDOW = 2 * 60_000;
 
 interface ProviderRecovery {
   firstFailureAt: number;
@@ -191,7 +193,6 @@ export class ForgeWorkflowService {
   private nextCompletionCheckAt = 0;
   private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
-  private readonly nextPublicationCheckAt = new Map<string, number>();
   private readonly nextAutoReviewCheckAt = new Map<string, number>();
   private readonly providerRecoveries = new Map<string, ProviderRecovery>();
   constructor(private readonly deps: ForgeWorkflowDependencies) {}
@@ -227,7 +228,7 @@ export class ForgeWorkflowService {
     await this.exclusive(async () => {
       for (const worker of this.workers.filter(
         (w) => w.status === "running" || w.status === "starting" ||
-          w.autoReview?.enabled && ["awaiting_publication", "awaiting_review", "awaiting_merge"].includes(w.status),
+          w.autoReview?.enabled && ["awaiting_review", "awaiting_merge"].includes(w.status),
       )) {
         await this.quiesce(worker, { retainReport: true });
         this.cancelProviderRecovery(worker);
@@ -775,8 +776,10 @@ export class ForgeWorkflowService {
           await this.deps.refreshPublicationCredentials(worker.repository, controller.signal);
           refreshingPublicationCredentials = false;
         }
-        if (worker.pendingPublication.confirmationStartedAt)
+        if (worker.pendingPublication.headSha) {
           worker.pendingPublication.confirmationStartedAt = new Date(Date.now()).toISOString();
+          worker.pendingPublication.nextConfirmationAt = undefined;
+        }
         await this.issueReady(worker);
         return structuredClone(worker);
       }
@@ -919,7 +922,7 @@ export class ForgeWorkflowService {
       await this.reconcileCompletedWorkers();
       for (const worker of this.workers.filter(w => w.status === "awaiting_publication")) {
         if (this.disposed) return;
-        if (Date.now() < (this.nextPublicationCheckAt.get(worker.id) ?? 0)) continue;
+        if (Date.now() < Date.parse(worker.pendingPublication?.nextConfirmationAt ?? "")) continue;
         try {
           await this.confirmPublication(worker);
         } catch (error) {
@@ -1637,6 +1640,18 @@ export class ForgeWorkflowService {
       throw new Error("The change request changed during the base update. The owned checkout was preserved for inspection.");
   }
   private async confirmPublication(worker: ForgeWorker): Promise<void> {
+    try {
+      await this.finishPublication(worker);
+    } catch (error) {
+      if (worker.pendingPublication?.headSha) {
+        worker.pendingPublication.nextConfirmationAt = undefined;
+        await this.recordPublicationObservation(worker, "confirmation", [], "rejected");
+        this.log(worker, "warn", "publication_confirmation_stopped", forgeErrorFields(error));
+      }
+      throw error;
+    }
+  }
+  private async finishPublication(worker: ForgeWorker): Promise<void> {
     const workspace = workerWorkspace(worker);
     const publication = worker.pendingPublication;
     if (!publication?.headSha || !worker.changeNumber)
@@ -1646,10 +1661,10 @@ export class ForgeWorkflowService {
       await this.persist();
     }
     const { headSha } = publication;
-    if (worker.status === "awaiting_publication") this.requirePublicationTime(worker);
+    if (worker.status === "awaiting_publication") await this.requirePublicationTime(worker);
     const provider = this.providerFor(worker);
     const signal = this.operations.get(worker.id)?.signal;
-    const status = await this.publicationSnapshot(worker, () => provider.getChangeRequestStatus(worker.changeNumber!));
+    const status = await this.publicationSnapshot(worker, "status", () => provider.getChangeRequestStatus(worker.changeNumber!));
     if (!status) return;
     if (await this.reconcileMergedChange(worker, { change: status, signal })) return;
     requirePublicationRequest(worker, status);
@@ -1657,7 +1672,7 @@ export class ForgeWorkflowService {
       await this.awaitPublication(worker, [status.headSha]);
       return;
     }
-    const change = await this.publicationSnapshot(worker, () => provider.getChangeRequest(worker.changeNumber!));
+    const change = await this.publicationSnapshot(worker, "change", () => provider.getChangeRequest(worker.changeNumber!));
     if (!change) return;
     if (change.merged) {
       await this.reconcileMergedChange(worker, { change, signal });
@@ -1670,7 +1685,7 @@ export class ForgeWorkflowService {
     }
     await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
     signal?.throwIfAborted();
-    if (worker.status === "awaiting_publication") this.requirePublicationTime(worker);
+    publication.nextConfirmationAt = undefined;
     worker.status = "starting";
     worker.headSha = headSha;
     this.observeMergeConflict(worker, change);
@@ -1678,7 +1693,7 @@ export class ForgeWorkflowService {
       worker.rebaseRecovery = undefined;
     publication.confirmed = true;
     worker.error = undefined;
-    await this.persist();
+    await this.recordPublicationObservation(worker, "confirmation", [], "confirmed");
     const currentIssue = await provider.getIssue(worker.number);
     signal?.throwIfAborted();
     const feedbackUnchanged =
@@ -1732,22 +1747,33 @@ export class ForgeWorkflowService {
       worker.autoReview?.enabled ? `${worker.title}: starting automatic review.` : `${worker.title}: ${worker.changeUrl}. Resume after review to address feedback or merge the approved commit.`,
     );
   }
-  private async publicationSnapshot<T>(worker: ForgeWorker, read: () => Promise<T>): Promise<T | undefined> {
+  private async publicationSnapshot<T extends ForgeChangeRequestStatus>(worker: ForgeWorker, source: "status" | "change", read: () => Promise<T>): Promise<T | undefined> {
     const signal = this.operations.get(worker.id)?.signal;
     try {
       const snapshot = await read();
       signal?.throwIfAborted();
+      const endpoint = source === "status"
+        ? worker.repository.provider === "github" ? "github.graphql.status" : "gitlab.rest.merge-request"
+        : `${worker.repository.provider}.snapshot`;
+      await this.recordPublicationObservation(worker, source, [{ source: endpoint, headSha: snapshot.headSha }], "snapshot");
       return snapshot;
     } catch (error) {
       signal?.throwIfAborted();
-      if (!(error instanceof ForgeHeadChangedError)) throw error;
+      if (!(error instanceof ForgeHeadChangedError)) {
+        await this.recordPublicationObservation(worker, source, [], "provider_error");
+        throw error;
+      }
+      await this.recordPublicationObservation(worker, source,
+        error.observations.length ? [...error.observations] : error.observedHeadShas.map(headSha => ({ source, headSha })), "mixed_heads");
       await this.awaitPublication(worker, error.observedHeadShas);
     }
   }
-  private requirePublicationTime(worker: ForgeWorker): void {
+  private async requirePublicationTime(worker: ForgeWorker): Promise<void> {
     const started = Date.parse(worker.pendingPublication?.confirmationStartedAt ?? "");
-    if (!Number.isFinite(started) || Date.now() - started >= 120_000)
-      throw new Error(`The commit was pushed, but its publication is not confirmed for change request #${worker.changeNumber}. Inspect the request and Resume to check again without rerunning the worker.`);
+    if (!Number.isFinite(started) || Date.now() - started >= FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS) {
+      await this.recordPublicationObservation(worker, "confirmation", [], "exhausted");
+      throw new Error(`The commit was pushed, but publication for change request #${worker.changeNumber} is still not confirmed after 30 minutes. Automatic confirmation stopped. Inspect the request and use Retry publication to check again without rerunning the worker.`);
+    }
   }
   private async awaitPublication(worker: ForgeWorker, observedHeads: readonly string[]): Promise<void> {
     const publication = worker.pendingPublication!;
@@ -1757,11 +1783,29 @@ export class ForgeWorkflowService {
       throw new Error(`Change request #${worker.changeNumber} reports an unexpected commit (${observedHeads.join(", ")}) after pushing ${publication.headSha}. Inspect the branch before resuming; the completed work is retained.`);
     if (publication.repliedDiscussionIds.length || publication.replyingToDiscussionId)
       throw new Error("The request head changed after a discussion reply was attempted. Inspect the request before resuming.");
-    this.requirePublicationTime(worker);
+    await this.requirePublicationTime(worker);
     worker.status = "awaiting_publication";
-    worker.error = undefined;
-    this.nextPublicationCheckAt.set(worker.id, Date.now() + 5_000);
+    const started = Date.parse(publication.confirmationStartedAt!);
+    const deferred = Date.now() - started >= PUBLICATION_INITIAL_WINDOW;
+    publication.nextConfirmationAt = new Date(Math.min(Date.now() + (deferred ? 60_000 : 5_000), started + FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS)).toISOString();
+    worker.error = deferred
+      ? `The commit was pushed, but provider snapshots are still catching up. Checking once per minute until ${new Date(started + FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS).toISOString()}; next check at ${publication.nextConfirmationAt}.`
+      : undefined;
+    await this.recordPublicationObservation(worker, "confirmation", [], deferred ? "deferred" : "waiting");
+  }
+  private async recordPublicationObservation(worker: ForgeWorker, source: ForgePublicationObservation["source"], heads: ForgePublicationObservation["heads"], reason: ForgePublicationObservation["reason"]): Promise<void> {
+    const publication = worker.pendingPublication!;
+    const observation = {
+      observedAt: new Date(Date.now()).toISOString(), source, reason,
+      heads: heads.filter(head => /^[a-f0-9]{40,64}$/i.test(head.headSha)).slice(-16),
+    };
+    publication.confirmationObservations = [...(publication.confirmationObservations ?? []), observation].slice(-8);
     await this.persist();
+    this.log(worker, "info", "publication_observed", {
+      previousHeadSha: publication.previousHeadSha, pushedHeadSha: publication.headSha,
+      confirmationStartedAt: publication.confirmationStartedAt, nextConfirmationAt: publication.nextConfirmationAt,
+      ...observation,
+    });
   }
   private async respondToReview(worker: ForgeWorker, change: ForgeChangeRequest, provider: ForgeProvider): Promise<void> {
     const publication = worker.pendingPublication!;
@@ -1932,7 +1976,7 @@ export class ForgeWorkflowService {
     for (const worker of [...this.workers]) {
       if (this.disposed) return;
       const number = changeNumber(worker);
-      if (!number || ["cleanup_failed", "awaiting_publication"].includes(worker.status) || !this.workers.includes(worker)) continue;
+      if (!number || worker.status === "cleanup_failed" || hasUnconfirmedPublication(worker) || !this.workers.includes(worker)) continue;
       if (recovering.some(candidate => changeNumber(candidate) === number && sameRepository(candidate.repository, worker.repository))) continue;
       const key = JSON.stringify([worker.repository.provider, worker.repository.apiUrl, worker.repository.projectPath, number]);
       if (checked.has(key)) continue;
@@ -2196,9 +2240,6 @@ export class ForgeWorkflowService {
       forgeLog(this.deps.logger, "info", "worker_retired", { workerId: id });
       this.loggedWorkerStates.delete(id);
     }
-    for (const id of this.nextPublicationCheckAt.keys())
-      if (!this.workers.some(worker => worker.id === id && worker.status === "awaiting_publication"))
-        this.nextPublicationCheckAt.delete(id);
     for (const id of this.nextAutoReviewCheckAt.keys())
       if (!this.workers.some(worker => worker.id === id && worker.autoReview?.enabled &&
         ["awaiting_review", "awaiting_merge"].includes(worker.status)))
@@ -2234,7 +2275,7 @@ export class ForgeWorkflowService {
               worker.error = message(error);
             }
           }
-          if (worker.status === "awaiting_publication" && !worker.autoReview?.enabled) {
+          if (worker.status === "awaiting_publication") {
             try {
               await this.recoverResources(worker);
               await this.quiesce(worker);
@@ -2244,7 +2285,7 @@ export class ForgeWorkflowService {
               worker.error = message(error);
             }
           } else if (["running", "starting", "cleanup_failed"].includes(worker.status) || worker.autoReview?.enabled &&
-            ["awaiting_publication", "awaiting_review", "awaiting_merge"].includes(worker.status)) {
+            ["awaiting_review", "awaiting_merge"].includes(worker.status)) {
             const cleanupFailed = worker.status === "cleanup_failed";
             try {
               const recovered = await this.recoverResources(worker);

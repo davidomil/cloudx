@@ -160,13 +160,22 @@ export function throwIfForgeRequestAborted(signal?: AbortSignal, operation?: "re
   }
 }
 
+export interface ForgeHeadObservation {
+  readonly source: string;
+  readonly headSha: string;
+}
+
 export class ForgeHeadChangedError extends ForgeProviderError {
   readonly observedHeadShas: readonly string[];
+  readonly observations: readonly ForgeHeadObservation[];
 
-  constructor(observedHeadShas: readonly string[]) {
+  constructor(observedHeadShas: readonly string[], observations: readonly ForgeHeadObservation[] = []) {
     super("The request changed while loading. Refresh before proceeding.", 409);
     this.name = "ForgeHeadChangedError";
     this.observedHeadShas = Object.freeze([...new Set(observedHeadShas)]);
+    this.observations = Object.freeze([...new Map(observations.map(({ source, headSha }) => [
+      `${source}:${headSha}`, Object.freeze({ source, headSha }),
+    ])).values()]);
   }
 }
 

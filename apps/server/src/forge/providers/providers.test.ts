@@ -818,11 +818,20 @@ describe("inconsistent provider head snapshots", () => {
 
   it("preserves observed head evidence independently of the caller's array", () => {
     const observed = [headSha, previousSha, headSha];
-    const error = new ForgeHeadChangedError(observed);
+    const observations = [{ source: "github.rest.pull", headSha }, { source: "github.graphql.status", headSha: previousSha }];
+    const error = new ForgeHeadChangedError(observed, observations);
     observed.push("c".repeat(40));
+    observations[0].headSha = "c".repeat(40);
+    observations.push({ source: "github.graphql.readiness", headSha });
     expect(error).toBeInstanceOf(ForgeProviderError);
     expect(error).toMatchObject({ statusCode: 409, observedHeadShas: [headSha, previousSha] });
+    expect(error.observations).toEqual([
+      { source: "github.rest.pull", headSha },
+      { source: "github.graphql.status", headSha: previousSha },
+    ]);
     expect(Object.isFrozen(error.observedHeadShas)).toBe(true);
+    expect(Object.isFrozen(error.observations)).toBe(true);
+    expect(error.observations.every(Object.isFrozen)).toBe(true);
   });
 
   it.each([
@@ -835,8 +844,38 @@ describe("inconsistent provider head snapshots", () => {
     const error = await provider.getChangeRequest(7).catch(error => error);
     expect(error).toBeInstanceOf(ForgeHeadChangedError);
     expect(new Set(error.observedHeadShas)).toEqual(new Set([headSha, ...Object.values(heads)]));
+    expect(error.observations).toEqual(expect.arrayContaining([
+      { source: "github.rest.pull", headSha },
+      { source: "github.graphql.status", headSha: heads.statusHead ?? headSha },
+      { source: "github.graphql.readiness", headSha: heads.readinessHead ?? headSha },
+    ]));
     expect(error.statusCode).toBe(409);
     expect(calls.filter(call => call.url.pathname === "/graphql")).toHaveLength(2);
+  });
+
+  it.each(["status", "readiness"])("retains both GitHub %s pages and the parallel snapshot head", async source => {
+    const parallelHead = "c".repeat(40);
+    const connection = source === "status" ? "closingIssuesReferences" : "reviewThreads";
+    const parallelSource = source === "status" ? "readiness" : "status";
+    const base = githubSnapshot(source === "status" ? { readinessHead: parallelHead } : { statusHead: parallelHead });
+    const { provider } = harness(github, async (url, options) => {
+      if (url.pathname !== "/graphql" || !JSON.parse(String(options.body)).query.includes(connection)) return base.fetcher(url, options);
+      const value = await (await base.fetcher(url, options)).json();
+      const { cursor } = JSON.parse(String(options.body)).variables;
+      Object.assign(value.data.repository.pullRequest, {
+        headRefOid: cursor ? previousSha : headSha,
+        [connection]: { nodes: [], pageInfo: { hasNextPage: !cursor, endCursor: "next" } },
+      });
+      return response(value);
+    });
+    const error = await provider.getChangeRequest(7).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeHeadChangedError);
+    expect(error.observations).toEqual(expect.arrayContaining([
+      { source: "github.rest.pull", headSha },
+      { source: `github.graphql.${source}`, headSha },
+      { source: `github.graphql.${source}`, headSha: previousSha },
+      { source: `github.graphql.${parallelSource}`, headSha: parallelHead },
+    ]));
   });
 
   it.each([{ statusBranch: "other" }, { statusBase: "release" }, { statusState: "CLOSED" }])("does not classify GitHub branch or state changes as head lag %j", async branch => {
@@ -897,6 +936,10 @@ describe("inconsistent provider head snapshots", () => {
     const error = await provider.getChangeRequest(7).catch(error => error);
     expect(error).toBeInstanceOf(ForgeHeadChangedError);
     expect(error).toMatchObject({ observedHeadShas: [headSha, previousSha], statusCode: 409 });
+    expect(error.observations).toEqual(expect.arrayContaining([
+      { source: "gitlab.rest.merge-request.initial", headSha },
+      { source: source === "version" ? "gitlab.rest.versions" : "gitlab.rest.merge-request.current", headSha: previousSha },
+    ]));
   });
 
   it.each(["initial", "version", "current"])("does not classify malformed GitLab %s heads as lag", async source => {
@@ -1056,7 +1099,14 @@ describe("GitHub review and exact-commit merge", () => {
 
   it("rejects check evidence for another head even when the branch is behind", async () => {
     const { provider } = hubFixture({ graphql: { mergeStateStatus: "BEHIND", headRef: { target: { oid: previousSha, statusCheckRollup: { state: "SUCCESS" } } } } });
-    await expect(provider.getChangeRequest(7)).rejects.toBeInstanceOf(ForgeHeadChangedError);
+    await expect(provider.getChangeRequest(7)).rejects.toMatchObject({
+      observations: expect.arrayContaining([
+        { source: "github.rest.pull", headSha },
+        { source: "github.graphql.status", headSha },
+        { source: "github.graphql.readiness", headSha },
+        { source: "github.graphql.readiness.head-ref", headSha: previousSha },
+      ]),
+    });
   });
 
   it.each([
@@ -1799,7 +1849,13 @@ describe("GitLab review and exact-commit merge", () => {
 
   it("refuses a GitLab comparison prepared for another head", async () => {
     await expect(labFixture({ request: { diff_refs: { ...labRequest.diff_refs, head_sha: previousSha } } }).provider.getChangeRequest(7))
-      .rejects.toMatchObject({ observedHeadShas: [headSha, previousSha] });
+      .rejects.toMatchObject({
+        observedHeadShas: [headSha, previousSha],
+        observations: expect.arrayContaining([
+          { source: "gitlab.rest.merge-request.current", headSha },
+          { source: "gitlab.rest.merge-request.diff-refs", headSha: previousSha },
+        ]),
+      });
   });
 
   it("refuses mismatched GitLab diff versions", async () => {

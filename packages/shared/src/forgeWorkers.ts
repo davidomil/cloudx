@@ -55,6 +55,15 @@ export function isForgeTurnCompletion(value: unknown): value is ForgeTurnComplet
     typeof turn.status === "string" && ["running", "completed", "interrupted", "failed"].includes(turn.status) &&
     (turn.error === undefined || typeof turn.error === "string" && turn.error.length <= 100_000);
 }
+export const FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS = 30 * 60_000;
+
+export interface ForgePublicationObservation {
+  observedAt: string;
+  source: "status" | "change" | "confirmation";
+  heads: { source: string; headSha: string }[];
+  reason: "snapshot" | "mixed_heads" | "waiting" | "deferred" | "confirmed" | "exhausted" | "provider_error" | "rejected";
+}
+
 export interface ForgeWorker {
   id: string;
   kind: "issue" | "review";
@@ -94,6 +103,8 @@ export interface ForgeWorker {
     headSha?: string;
     previousHeadSha?: string;
     confirmationStartedAt?: string;
+    nextConfirmationAt?: string;
+    confirmationObservations?: ForgePublicationObservation[];
     confirmed?: true;
     repliedDiscussionIds: string[];
     replyingToDiscussionId?: string;

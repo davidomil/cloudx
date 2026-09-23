@@ -1139,26 +1139,84 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(receipt.codexHome, receipt.tabContextPath);
   }, 20_000);
 
-  it("keeps the original confirmation deadline across restart and preserves the publication when it expires", async () => {
+  it("reconciles delayed publication across restart without another coding turn, push, or discussion reply", async () => {
     const fixture = await LifecycleFixture.create();
-    const { worker, receipt } = await fixture.startAwaitingPublication();
-    const checkpoint = worker.pendingPublication;
-    const confirmationStartedAt = checkpoint!.confirmationStartedAt;
-    fixture.advanceTime(90_000);
+    const createRequest = vi.spyOn(fixture.provider, "createChangeRequest");
+    const { worker, receipt, showCurrentHead } = await fixture.startAwaitingPublication();
+    const confirmationStartedAt = worker.pendingPublication!.confirmationStartedAt!;
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(confirmationStartedAt) + 120_001);
     await fixture.workflow.poll();
-    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_publication", pendingPublication: checkpoint });
+    const deferred = await fixture.worker(worker.id);
+    const checkpoint = deferred.pendingPublication!;
+    expect(deferred).toMatchObject({ status: "awaiting_publication", error: expect.stringContaining("once per minute"), pendingPublication: { confirmationStartedAt } });
+    expect(checkpoint.confirmationObservations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: "status", heads: [{ source: "github.graphql.status", headSha: checkpoint.headSha }] }),
+      expect.objectContaining({ source: "change", heads: [{ source: "github.snapshot", headSha: checkpoint.previousHeadSha }] }),
+      expect.objectContaining({ reason: "deferred" }),
+    ]));
+    expect(Date.parse(checkpoint.nextConfirmationAt!)).toBe(Date.now() + 60_000);
 
     await fixture.restartWorkflow();
-    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_publication", pendingPublication: { confirmationStartedAt } });
-    fixture.advanceTime(30_001);
-    await fixture.workflow.poll();
-
-    expect(await fixture.worker(worker.id)).toMatchObject({ status: "failed", error: expect.stringMatching(/confirm|publication/i), pendingPublication: checkpoint, worktreePath: worker.worktreePath });
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_publication", pendingPublication: checkpoint });
     expect((await fixture.store.read())[0]?.pendingPublication).toEqual(checkpoint);
-    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(checkpoint!.headSha);
-    expect(await git(fixture.origin, "rev-parse", worker.branch!)).toBe(checkpoint!.headSha);
+    const reads = vi.spyOn(fixture.provider, "getChangeRequestStatus");
+    showCurrentHead();
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(checkpoint.nextConfirmationAt!) - 1);
+    await fixture.workflow.poll();
+    expect(reads).not.toHaveBeenCalled();
     expect(fixture.provider.discussionReplies).toEqual([]);
     expect(fixture.provider.resolvedDiscussions).toEqual([]);
+
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    expect(reads).not.toHaveBeenCalled();
+    expect((await fixture.worker(worker.id)).pendingPublication).toEqual(checkpoint);
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(checkpoint.nextConfirmationAt!));
+    await fixture.workflow.poll();
+    await fixture.workflow.poll();
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+
+    const confirmed = await fixture.worker(worker.id);
+    expect(confirmed).toMatchObject({ status: "awaiting_review", headSha: checkpoint.headSha });
+    expect(confirmed.pendingPublication).toBeUndefined();
+    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(checkpoint.headSha);
+    expect(await git(fixture.origin, "rev-parse", worker.branch!)).toBe(checkpoint.headSha);
+    expect(fixture.provider.discussionReplies).toHaveLength(1);
+    expect(fixture.provider.discussionReplies[0]).toMatchObject({ discussionId: "empty-input", headSha: checkpoint.headSha });
+    expect(fixture.provider.resolvedDiscussions).toEqual(["empty-input"]);
+    expect(createRequest).toHaveBeenCalledOnce();
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(2);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    await expectMissing(receipt.codexHome, receipt.tabContextPath);
+  }, 20_000);
+
+  it("stops automatic publication confirmation after thirty minutes while preserving the completed work", async () => {
+    const fixture = await LifecycleFixture.create();
+    const { worker, receipt, showCurrentHead } = await fixture.startAwaitingPublication();
+    const { confirmationStartedAt, headSha, previousHeadSha, report } = worker.pendingPublication!;
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse(confirmationStartedAt!) + 30 * 60_000);
+    await fixture.workflow.poll();
+
+    const stopped = await fixture.worker(worker.id);
+    expect(stopped).toMatchObject({ status: "failed", error: expect.stringContaining("after 30 minutes"), worktreePath: worker.worktreePath,
+      pendingPublication: { confirmationStartedAt, headSha, previousHeadSha, report } });
+    expect(stopped.pendingPublication!.nextConfirmationAt).toBeUndefined();
+    expect(stopped.pendingPublication!.confirmationObservations).toEqual(expect.arrayContaining([expect.objectContaining({ reason: "exhausted" })]));
+    expect((await fixture.store.read())[0]?.pendingPublication).toEqual(stopped.pendingPublication);
+    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(headSha);
+    expect(await git(fixture.origin, "rev-parse", worker.branch!)).toBe(headSha);
+    const reads = vi.mocked(fixture.provider.getChangeRequest).mock.calls.length;
+    fixture.advanceTime(60_001);
+    await fixture.workflow.poll();
+    expect(fixture.provider.getChangeRequest).toHaveBeenCalledTimes(reads);
+    expect(fixture.provider.discussionReplies).toEqual([]);
+    expect(fixture.provider.resolvedDiscussions).toEqual([]);
+
+    showCurrentHead();
+    expect(await fixture.workflow.resume(worker.id, fixture.placement)).toMatchObject({ status: "awaiting_review", headSha });
+    expect(fixture.provider.discussionReplies).toHaveLength(1);
     expect(fixture.factory.processes).toHaveLength(2);
     expect(fixture.gitPushes).toHaveLength(2);
     expect(await processIsRunning(receipt.pid)).toBe(false);
