@@ -1231,7 +1231,7 @@ describe("ForgeRuntime publication handoff", () => {
     expect(await fs.readFile(path.join(workspace.worktreePath, ".git", "index"))).toEqual(index);
   });
 
-  it.each(["missing", "empty", "populated", "symlink"])("checks %s submodule contents before deleting a checkout", async contents => {
+  it.each(["missing", "empty", "populated"])("checks %s submodule contents before deleting a checkout", async contents => {
     const workspace = await prepare();
     const submodule = "vendor/dependency";
     const directory = path.join(workspace.worktreePath, submodule);
@@ -1240,10 +1240,6 @@ describe("ForgeRuntime publication handoff", () => {
     const intended = await git(workspace.worktreePath, "rev-parse", "HEAD");
     if (contents === "empty") await fs.mkdir(directory, { recursive: true });
     if (contents === "populated") await git(workspace.worktreePath, "clone", "--branch", "main", origin, directory);
-    if (contents === "symlink") {
-      await fs.mkdir(path.dirname(directory));
-      await fs.symlink(repositoryPath, directory);
-    }
     const externalIndex = await fs.readFile(path.join(repositoryPath, ".git", "index"));
     const retained = await runtime.cleanup({ ...workspace, expectedHeadSha: intended });
     if (contents === "empty") {
@@ -1254,10 +1250,58 @@ describe("ForgeRuntime publication handoff", () => {
       runtime = new ForgeRuntime(dependencies());
       expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual(retained);
       if (contents === "populated") expect(await fs.readFile(path.join(directory, "README.md"), "utf8")).toBe("Initial content\n");
-      if (contents === "symlink") expect(await fs.readlink(directory)).toBe(repositoryPath);
       if (contents === "missing") await expect(fs.lstat(directory)).rejects.toMatchObject({ code: "ENOENT" });
     }
     expect(await fs.readFile(path.join(repositoryPath, ".git", "index"))).toEqual(externalIndex);
+  });
+
+  it("preserves a symlink submodule through cleanup and restart even when Git refuses its status", async () => {
+    const workspace = await prepare();
+    const submodule = "vendor/dependency";
+    const directory = path.join(workspace.worktreePath, submodule);
+    await git(workspace.worktreePath, "update-index", "--add", "--cacheinfo", `160000,${headSha},${submodule}`);
+    await git(workspace.worktreePath, "commit", "-m", "TEST: dependency");
+    const intended = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await fs.mkdir(path.dirname(directory));
+    await fs.symlink(repositoryPath, directory);
+    const diagnostic = Buffer.from([0, 255, 13, 10, 128]);
+    await fs.writeFile(path.join(repositoryPath, "diagnostic.bin"), diagnostic);
+    const indexPath = path.join(workspace.worktreePath, ".git", "index");
+    const externalIndexPath = path.join(repositoryPath, ".git", "index");
+    const index = await fs.readFile(indexPath);
+    const externalIndex = await fs.readFile(externalIndexPath);
+    const cleanup = () => runtime.cleanup({ ...workspace, expectedHeadSha: intended });
+    const refusal = `expected submodule path '${submodule}' not to be a symbolic link`;
+    const retained = { worktreePath: workspace.worktreePath, retainedPaths: [submodule] };
+
+    async function expectContentsPreserved() {
+      expect((await fs.lstat(workspace.worktreePath)).isDirectory()).toBe(true);
+      expect(await fs.readlink(directory)).toBe(repositoryPath);
+      expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Initial content\n");
+      expect(await fs.readFile(path.join(repositoryPath, "README.md"), "utf8")).toBe("Initial content\n");
+      expect(await fs.readFile(path.join(directory, "diagnostic.bin"))).toEqual(diagnostic);
+      expect(await fs.readFile(indexPath)).toEqual(index);
+      expect(await fs.readFile(externalIndexPath)).toEqual(externalIndex);
+    }
+
+    const [outcome] = await Promise.allSettled([cleanup()]);
+    if (outcome.status === "rejected") {
+      expect(outcome.reason).toBeInstanceOf(Error);
+      expect(outcome.reason.message).toContain("Command failed: git status ");
+      expect(outcome.reason.message).toContain(refusal);
+    } else {
+      expect(outcome.value).toEqual(retained);
+    }
+    await expectContentsPreserved();
+
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.recover(workspace.id)).toEqual({
+      workspace: outcome.status === "rejected" ? workspace : undefined,
+      tabIds: [],
+    });
+    if (outcome.status === "rejected") await expect(cleanup()).rejects.toThrow(refusal);
+    else await expect(cleanup()).resolves.toEqual(retained);
+    await expectContentsPreserved();
   });
 
   it.each(["unreadable", "malformed", "unsafe path"])("preserves the checkout when its retention index inventory is %s", async failure => {
