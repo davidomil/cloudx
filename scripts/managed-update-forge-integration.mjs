@@ -149,6 +149,9 @@ function retainReviewContinuation(service) {
         `    const reviewer = kind === "review" ? this.workers.find(worker =>
       worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository)) : undefined;
     if (reviewer)`,
+        `    const reviewer = kind === "review" ? this.workers.find(worker =>
+      worker.kind === "review" && worker.number === number && !worker.retainedWorkspace && sameRepository(worker.repository, repository)) : undefined;
+    if (reviewer)`,
         `    const reviewer = kind === "review"
       ? this.reviewWorkers(repository, number).filter(worker => !worker.retainedWorkspace).at(-1)
       : undefined;

@@ -99,7 +99,8 @@ it('loads every original 0.1.3 review on upgrade and preserves posted receipts w
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
-const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', '2e69451b', '39d42ec9', '7604d8d'];
+const nativeTarget = '2f28a100cd765b8c209e85fdacb03b03a57ba0df';
+const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', '2e69451b', '39d42ec9', '7604d8d', nativeTarget];
 it.each(continuationTargets.flatMap(target => ['draft', 'posted'].map(status => ({ target, status }))))(
   'starts a fresh full review after an original 0.1.3 $status review on $target', async ({ target, status }) => {
   const f = await originalProfile(target);
@@ -140,6 +141,35 @@ it.each(continuationTargets.flatMap(target => ['draft', 'posted'].map(status => 
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
+it('excludes a native reviewer whose checkout is retained for file recovery', async () => {
+  const f = await originalProfile(nativeTarget);
+  const workers = await f.currentStore.read();
+  const original = workers.find(worker => worker.draft.status === 'posted');
+  const ownershipPath = path.join(f.dataDir, 'forge-workers', 'workspaces', `${original.id}.json`);
+  const ownership = fs.readFileSync(ownershipPath);
+  original.worktreePath = JSON.parse(ownership).worktreePath;
+  original.retainedWorkspace = { worktreePath: original.worktreePath, retainedPaths: ['review-notes.txt'] };
+  const retainedNotes = path.join(original.worktreePath, 'review-notes.txt');
+  write(retainedNotes, 'Uncommitted review notes');
+  await f.currentStore.write(workers);
+
+  const next = await f.current.startReview(original.repository, original.number, false, { windowId: 'window', paneId: 'pane' });
+  expect(next.status, next.error).toBe('running');
+  expect(next.id).not.toBe(original.id);
+  expect(next.worktreePath).not.toBe(original.worktreePath);
+  expect(next.completion.reviewScope).toEqual({ kind: 'initial', current: {
+    headSha: f.record.transition.sourceCommit, baseSha: f.record.transition.sourceCommit, mergeBaseSha: f.record.transition.sourceCommit,
+  } });
+  const context = JSON.parse(fs.readFileSync(path.join(f.dataDir, 'forge-reports', `${next.attemptId}.context.json`), 'utf8'));
+  expect(context.previousReviews).toEqual([original.draft]);
+  expect(f.currentRuntime.recover).not.toHaveBeenCalled();
+  expect(fs.readFileSync(ownershipPath)).toEqual(ownership);
+  expect(fs.readFileSync(retainedNotes, 'utf8')).toBe('Uncommitted review notes');
+  const { updatedAt, ...retainedReview } = original;
+  expect((await f.currentStore.read()).find(worker => worker.id === original.id)).toMatchObject(retainedReview);
+  expect(f.provider.postReview).toHaveBeenCalledOnce();
+}, 15000);
+
 it.each(continuationTargets.flatMap(target => ['posting', 'post_failed'].map(status => ({ target, status }))))(
   'requires reconciliation of an original 0.1.3 $status review on $target before starting another', async ({ target, status }) => {
   const f = await originalProfile(target);
@@ -164,6 +194,8 @@ it.each([
   { target: '2e69451b', missing: 'ownership' },
   { target: '7604d8d', missing: 'ownership' },
   { target: '7604d8d', missing: 'baseline' },
+  { target: nativeTarget, missing: 'ownership' },
+  { target: nativeTarget, missing: 'baseline' },
 ])('retains modern $missing protection on $target', async ({ target, missing }) => {
   const f = await originalProfile(target);
   const original = f.saved.find(worker => worker.draft.status === 'draft');

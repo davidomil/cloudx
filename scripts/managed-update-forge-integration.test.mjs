@@ -24,10 +24,13 @@ it.each(['2e69451b065e265db2a296e465ed306a33ab8f88', 'c664071e04091db6be78df09d8
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
 });
 
-it('adds continuation to a native target without replacing its comparison and ownership implementation', () => {
-  const target = file => historical(file, '7604d8d');
+it.each([
+  ['7604d8d', [FORGE_SERVICE_FILE]],
+  ['2f28a100cd765b8c209e85fdacb03b03a57ba0df', [FORGE_VALIDATION_FILE, FORGE_SERVICE_FILE]],
+])('adds continuation to native %s without replacing its comparison and ownership implementation', (commit, files) => {
+  const target = file => historical(file, commit);
   const migrated = prepareManagedForgeIntegration(target, maintained);
-  expect(Object.keys(migrated)).toEqual([FORGE_SERVICE_FILE]);
+  expect(Object.keys(migrated)).toEqual(files);
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
 });
 
@@ -39,6 +42,13 @@ it.each(['a9613faf', '2e69451b', 'c664071e'])('adds continuation to previously i
   const migrated = prepareManagedForgeIntegration(file => integrated[file] ?? target(file), maintained);
   expect(Object.keys(migrated)).toEqual([FORGE_SERVICE_FILE]);
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? integrated[file] ?? target(file), maintained)).toEqual({});
+});
+
+it('rejects an unrecognized native reviewer selection', () => {
+  expect(() => prepareManagedForgeIntegration(file => {
+    const source = historical(file, '2f28a100cd765b8c209e85fdacb03b03a57ba0df');
+    return file === FORGE_SERVICE_FILE ? source.replace('&& !worker.retainedWorkspace &&', '&& worker.status === "paused" &&') : source;
+  }, maintained)).toThrow('does not recognize the target reviewer selection');
 });
 
 it.each([
