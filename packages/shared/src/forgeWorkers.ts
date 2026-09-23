@@ -3,6 +3,9 @@ import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication, Forge
 export const FORGE_PLUGIN_ID = "forge";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
+export const MAX_FORGE_REVIEW_REPORT_BODY_LENGTH = 100_000;
+// Drafts also contain Forge's scope summary, including up to four 64-character SHAs.
+export const MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH = MAX_FORGE_REVIEW_REPORT_BODY_LENGTH + 512;
 export type ForgeWorkerStatus =
   | "starting"
   | "running"
@@ -42,6 +45,7 @@ export interface ForgeTurnCompletion {
 export interface ForgeWorkerCompletion {
   attemptId: string;
   deadlineAt: string;
+  reviewScope?: ForgeReviewScope;
   readyAt?: string;
   turn?: ForgeTurnCompletion;
   report?: ForgeIssueCompletionReport | (ForgeReviewSubmission & { kind: "review" });
@@ -119,10 +123,21 @@ export interface ForgeWorker {
   issueWorkerId?: string;
   draft?: ForgeReviewDraft;
   reviewHistory?: ForgeReviewDraft[];
+  reviewBaseline?: { reviewId: string; revision: ForgeReviewRevision };
   error?: string;
   providerRetryAt?: string;
   startedAt: string;
   updatedAt: string;
+}
+export interface ForgeReviewRevision {
+  headSha: string;
+  baseSha: string;
+  mergeBaseSha: string;
+}
+export interface ForgeReviewScope {
+  kind: "initial" | "incremental" | "rewritten" | "unchanged";
+  current: ForgeReviewRevision;
+  previous?: ForgeReviewRevision;
 }
 export interface ForgeReviewDraft {
   id: string;

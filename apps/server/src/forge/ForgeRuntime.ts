@@ -11,6 +11,8 @@ import {
   isForgeTurnCompletion,
   type CodexReasoningEffort,
   type ForgeRepository,
+  type ForgeReviewRevision,
+  type ForgeReviewScope,
   type ForgeCredentialRole,
   type ForgeWorkerHistory,
   type ForgeTurnCompletion,
@@ -386,6 +388,98 @@ export class ForgeRuntime {
     });
   }
 
+  prepareReviewScope(
+    workspace: ForgeWorkspace,
+    baseline?: ForgeReviewRevision,
+    signal?: AbortSignal,
+  ): Promise<ForgeReviewScope> {
+    return this.serialize(workspace.id, "prepareReviewScope", signal, async () => {
+      const { owned, current } = await this.requireCurrentReviewRevision(workspace, signal);
+      if (!baseline) return { kind: "initial", current };
+      try {
+        await this.requireRetainedReviewRevision(owned, baseline, signal);
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw new Error("Incremental comparison cannot be established: the completed review's retained Git evidence is missing or changed.", { cause: error });
+      }
+      let kind: ForgeReviewScope["kind"] = "rewritten";
+      if (baseline.mergeBaseSha === current.mergeBaseSha) {
+        const previousTree = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", `${baseline.headSha}^{tree}`], signal)).trim();
+        const currentTree = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", `${current.headSha}^{tree}`], signal)).trim();
+        if (previousTree === currentTree) kind = "unchanged";
+        else if (await this.isAncestor(owned, baseline.headSha, current.headSha, signal)) kind = "incremental";
+      }
+      return { kind, current, previous: baseline };
+    });
+  }
+
+  retainReviewBaseline(
+    workspace: ForgeWorkspace,
+    revision: ForgeReviewRevision,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.serialize(workspace.id, "retainReviewBaseline", signal, async () => {
+      const { owned, current } = await this.requireCurrentReviewRevision(workspace, signal);
+      if (revision.headSha !== current.headSha || revision.baseSha !== current.baseSha || revision.mergeBaseSha !== current.mergeBaseSha)
+        throw new Error("The completed review no longer matches its pinned checkout comparison.");
+      const refs = this.reviewRevisionRefs(revision);
+      const retained = await this.readReviewRefs(owned, revision, signal);
+      for (const [ref, commit] of refs) {
+        const existing = retained.get(ref);
+        if (existing && (existing.commit !== commit || existing.symbolic))
+          throw new Error("A retained review reference changed; the completed review baseline was preserved.");
+      }
+      for (const [ref, commit] of refs) {
+        if (!retained.has(ref))
+          await this.runOwnedGit(owned, ["update-ref", "--no-deref", ref, commit, "0".repeat(commit.length)], signal);
+      }
+      await this.requireRetainedReviewRevision(owned, revision, signal);
+      await this.requireCurrentReviewRevision(workspace, signal);
+    });
+  }
+
+  private async requireCurrentReviewRevision(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<{ owned: OwnedWorkspace; current: ForgeReviewRevision }> {
+    const owned = await this.matchOwned(workspace);
+    if (owned.role !== "reviewer" || owned.cleaned || !owned.prepared || owned.reviewRefresh)
+      throw new Error("Review comparison requires an owned, fully prepared reviewer checkout.");
+    await this.assertQuiescent(owned);
+    await this.requireNoGitOperation(owned);
+    const headSha = await this.requireCleanReviewHead(owned, signal);
+    const baseSha = await this.reviewBase(owned, signal);
+    if (headSha !== owned.baseCommit || baseSha !== owned.reviewBaseSha || (workspace.expectedHeadSha && headSha !== workspace.expectedHeadSha))
+      throw new Error("The reviewer checkout changed outside its recorded comparison. Local changes were preserved.");
+    const mergeBaseSha = await this.requireReviewMergeBase(owned, headSha, baseSha, signal);
+    return { owned, current: { headSha, baseSha, mergeBaseSha } };
+  }
+
+  private reviewRevisionRefs(revision: ForgeReviewRevision): [string, string][] {
+    if (![revision.headSha, revision.baseSha, revision.mergeBaseSha].every(isCommitSha))
+      throw new Error("A retained review requires exact head, base, and merge-base commits.");
+    const prefix = `refs/cloudx/reviews/${revision.headSha}/${revision.baseSha}`;
+    return [[`${prefix}/head`, revision.headSha], [`${prefix}/base`, revision.baseSha], [`${prefix}/merge-base`, revision.mergeBaseSha]];
+  }
+
+  private async readReviewRefs(owned: OwnedWorkspace, revision: ForgeReviewRevision, signal?: AbortSignal): Promise<Map<string, { commit: string; symbolic: boolean }>> {
+    const prefix = path.posix.dirname(this.reviewRevisionRefs(revision)[0]![0]);
+    const output = await this.runGit(owned.worktreePath, ["for-each-ref", "--format=%(refname) %(objectname) %(symref)", `${prefix}/`], signal);
+    return new Map(output.trim().split("\n").filter(Boolean).map(line => {
+      const [ref, commit, symbolic] = line.split(" ");
+      return [ref!, { commit: commit!, symbolic: Boolean(symbolic) }];
+    }));
+  }
+
+  private async requireRetainedReviewRevision(owned: OwnedWorkspace, revision: ForgeReviewRevision, signal?: AbortSignal): Promise<void> {
+    const refs = this.reviewRevisionRefs(revision);
+    const retained = await this.readReviewRefs(owned, revision, signal);
+    for (const [ref, commit] of refs) {
+      const existing = retained.get(ref);
+      if (!existing || existing.commit !== commit || existing.symbolic || (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", `${ref}^{commit}`], signal)).trim() !== commit)
+        throw new Error("The completed review's retained Git reference or commit is missing or changed.");
+    }
+    if (await this.requireReviewMergeBase(owned, revision.headSha, revision.baseSha, signal) !== revision.mergeBaseSha)
+      throw new Error("The completed review's retained merge base changed.");
+  }
+
   private async requireCleanReviewHead(owned: OwnedWorkspace, signal?: AbortSignal): Promise<string> {
     await this.assertCheckout(owned);
     const branch = (await this.runGit(owned.worktreePath, ["rev-parse", "--abbrev-ref", "HEAD"], signal)).trim();
@@ -421,7 +515,7 @@ export class ForgeRuntime {
     await this.requireReviewMergeBase(owned, headSha, baseSha, signal);
   }
 
-  private async requireReviewMergeBase(owned: OwnedWorkspace, headSha: string, baseSha: string, signal?: AbortSignal): Promise<void> {
+  private async requireReviewMergeBase(owned: OwnedWorkspace, headSha: string, baseSha: string, signal?: AbortSignal): Promise<string> {
     let mergeBases: string[];
     try {
       mergeBases = (await this.runGit(
@@ -435,6 +529,7 @@ export class ForgeRuntime {
     }
     if (mergeBases.length !== 1 || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/iu.test(mergeBases[0]!))
       throw new Error("The review commits do not have a unique merge base for comparison.");
+    return mergeBases[0]!;
   }
 
   async launch(

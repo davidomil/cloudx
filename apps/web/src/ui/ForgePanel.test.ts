@@ -4,6 +4,7 @@ import { act, createElement, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeDashboard, ForgeIssueDetail, ForgeRepository, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import { MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import { ForgePanel } from "./ForgePanel.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -1166,6 +1167,31 @@ describe("ForgePanel", () => {
     expect(publication.map((call) => call.hook)).toEqual(["forge.review.save", "forge.review.save", "forge.review.submit"]);
     expect(publication[1].input).toEqual({ id: "review-1", draftId: reviewWorker.draft!.id, event: "request_changes", body: "Use a bounded timeout.", comments: [{ path: "deploy.ts", line: 11, side: "LEFT", body: "Cancel after 30 seconds." }] });
     expect(publication[2].input).toEqual({ id: "review-1", draftId: reviewWorker.draft!.id });
+  });
+
+  it("edits and saves a summary at the draft body limit and blocks longer edits", async () => {
+    const body = "x".repeat(MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH);
+    const testFixture = fixture({ workers: [{ ...reviewWorker, draft: { ...reviewWorker.draft!, body } }] });
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Pull requests");
+    const editor = panel.querySelector(".forge-review")!;
+    const summary = editor.querySelector<HTMLTextAreaElement>("textarea")!;
+    expect(summary.maxLength).toBe(MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH);
+    expect(summary.value).toBe(body);
+
+    const edited = `${body.slice(0, -1)}y`;
+    await fill(summary, edited);
+    expect(button(editor, "Save draft").disabled).toBe(false);
+    await click(editor, "Save draft");
+    expect(testFixture.calls.filter(call => call.hook === "forge.review.save")).toEqual([
+      expect.objectContaining({ input: { id: reviewWorker.id, draftId: reviewWorker.draft!.id, body: edited, event: reviewWorker.draft!.event, comments: reviewWorker.draft!.comments } })
+    ]);
+
+    await fill(summary, `${edited}z`);
+    expect(button(editor, "Save draft").disabled).toBe(true);
+    expect(button(editor, "Submit review").disabled).toBe(true);
+    await click(editor, "Save draft");
+    expect(testFixture.calls.filter(call => call.hook === "forge.review.save")).toHaveLength(1);
   });
 
   it("keeps edits during worker polling and cleans up the polling timer on unmount", async () => {

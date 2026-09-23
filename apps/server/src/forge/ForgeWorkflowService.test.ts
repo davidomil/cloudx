@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
-import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
+import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
@@ -17,6 +17,11 @@ import { ForgeBranchConflictError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
 import type { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
+import { reviewScopeSummary } from "./ForgeReviewScope.js";
+import { validateReview } from "./providers/reviewValidation.js";
+import { ForgePlugin } from "../plugins/ForgePlugin.js";
+import { HookRegistry } from "../hooks/HookRegistry.js";
+import type { ForgeSettingsService } from "./ForgeSettingsService.js";
 
 function fixture() {
   const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
@@ -87,6 +92,12 @@ function fixture() {
       repositoryPath: "/repo/work",
     })),
     refreshReviewWorkspace: vi.fn(async (_workspace: unknown, _revision: unknown, _signal?: AbortSignal) => {}),
+    prepareReviewScope: vi.fn(async (_workspace: unknown, previous?: ForgeReviewRevision, _signal?: AbortSignal): Promise<ForgeReviewScope> => ({
+      kind: !previous ? "initial" : previous.headSha === change.headSha ? "unchanged" : previous.baseSha === change.baseSha ? "incremental" : "rewritten",
+      current: { headSha: change.headSha, baseSha: change.baseSha, mergeBaseSha: change.baseSha },
+      ...(previous ? { previous } : {}),
+    })),
+    retainReviewBaseline: vi.fn(async (_workspace: unknown, _revision: ForgeReviewRevision, _signal?: AbortSignal) => {}),
     launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
     readTurnCompletion: vi.fn(async (workerId: string, attemptId: string) => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: (await reports.read.getMockImplementation()?.(attemptId) ? "completed" : "running") as "running" | "completed" | "interrupted" | "failed", error: undefined as string | undefined })),
     finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
@@ -817,6 +828,395 @@ describe("Reusable review workers", () => {
   });
 });
 
+describe("Incremental review scope", () => {
+  async function reviewedRevision() {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const revision = { headSha: f.change.headSha, baseSha: f.change.baseSha, mergeBaseSha: f.change.baseSha };
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: revision.headSha, event: "request_changes", body: "Correct the documented example.", comments: [{ body: "The README example omits the required argument." }] });
+    await f.service.poll();
+    f.reports.read.mockResolvedValue(undefined);
+    return { ...f, worker, revision, draft: f.stored()[0].draft! };
+  }
+
+  async function reviewAtBodyLimit(kind: "initial" | "incremental", autoPost = false) {
+    const f = kind === "initial" ? fixture() : await reviewedRevision();
+    if (kind === "incremental") f.change.headSha = "c".repeat(40);
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-review-body-"));
+    onTestFinished(() => fs.rm(root, { recursive: true, force: true }));
+    f.deps.store = new ForgeWorkflowStore(new PluginDataStore(root));
+    await f.deps.store.write(f.stored());
+    const service = new ForgeWorkflowService(f.deps);
+    const worker = await service.startReview(f.deps.settings().repository, 7, autoPost, placement);
+    const report = { kind: "review", headSha: f.change.headSha, event: "approve", body: "x".repeat(100_000), comments: [] };
+    f.reports.read.mockResolvedValue(report);
+    const body = `${reviewScopeSummary(worker.completion!.reviewScope!)}\n\n${report.body}`;
+    return { ...f, service, worker, report, body };
+  }
+
+  function realReviewAdapter(f: Awaited<ReturnType<typeof reviewAtBodyLimit>>, kind: "github" | "gitlab") {
+    const request = vi.fn(async (url: string, options?: { method?: string; body?: unknown }) => {
+      if (options?.method === "POST")
+        return { body: url.endsWith("/approve") ? { approved_by: [] } : { id: 71 } };
+      return { body: { iid: 7, head: { sha: f.change.headSha }, sha: f.change.headSha, state: kind === "github" ? "open" : "opened" } };
+    });
+    const http = {
+      repository: { ...f.deps.settings().repository, provider: kind }, request,
+    } as unknown as ForgeHttpClient;
+    const adapter = kind === "github" ? new GitHubProvider(http) : new GitLabProvider(http);
+    f.provider.postReview.mockImplementation((...args) => adapter.postReview(...args));
+    return request;
+  }
+
+  describe.each(["initial", "incremental"] as const)("%s provider submission limits", scopeKind => {
+    it.each(["github", "gitlab"] as const)("auto-posts exactly 65,000 characters including scope through %s", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind, true);
+      const request = realReviewAdapter(f, providerKind);
+      const prefix = `${reviewScopeSummary(f.worker.completion!.reviewScope!)}\n\n`;
+      const body = `${prefix}${"x".repeat(65_000 - prefix.length)}`;
+      f.reports.read.mockResolvedValue({ ...f.report, body: body.slice(prefix.length) });
+      await f.service.poll();
+      const [completed] = await f.deps.store.read();
+      expect(completed).toMatchObject({ status: "completed", draft: { status: "posted", body, headSha: f.change.headSha } });
+      expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, expect.objectContaining({ body, headSha: f.change.headSha }));
+      const summary = request.mock.calls.find(([url]) => url.endsWith(providerKind === "github" ? "/reviews" : "/notes"));
+      expect(summary?.[1]?.body).toMatchObject({ body });
+      if (providerKind === "github") expect(summary?.[1]?.body).toMatchObject({ commit_id: f.change.headSha });
+      else expect(request).toHaveBeenCalledWith(expect.stringContaining("/approve"), expect.objectContaining({ body: { sha: f.change.headSha } }));
+    });
+
+    it.each(["github", "gitlab"] as const)("keeps scope overflow editable across restart and Resume before posting to %s", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind, true);
+      const request = realReviewAdapter(f, providerKind);
+      f.reports.read.mockResolvedValue({ ...f.report, body: "x".repeat(65_000) });
+      await f.service.poll();
+      const [failed] = await f.deps.store.read();
+      expect(failed).toMatchObject({ status: "failed", error: expect.stringContaining("65,000"), draft: { status: "draft" } });
+      expect(failed.draft!.body.length).toBeGreaterThan(65_000);
+      expect(failed.reviewBaseline?.reviewId).toBe(f.worker.attemptId);
+      expect(f.provider.postReview).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+
+      const restarted = new ForgeWorkflowService(f.deps);
+      const resumed = await restarted.resume(failed.id, placement);
+      expect(resumed).toMatchObject({ status: "failed", error: expect.stringContaining("65,000"), draft: { status: "draft" } });
+      expect(request).not.toHaveBeenCalled();
+      const body = failed.draft!.body.slice(0, 65_000);
+      await restarted.saveReview(failed.id, failed.draft!.id, { ...failed.draft!, body });
+      const launches = f.runtime.launch.mock.calls.length;
+      const completed = await restarted.resume(failed.id, placement);
+      expect(completed).toMatchObject({ status: "completed", draft: { status: "posted", body } });
+      expect(f.provider.postReview).toHaveBeenCalledExactlyOnceWith(7, expect.objectContaining({ body }));
+      expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+    });
+
+    it.each(["github", "gitlab"] as const)("allows editing after a manual submission one character over the %s limit", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind);
+      const request = realReviewAdapter(f, providerKind);
+      const prefix = `${reviewScopeSummary(f.worker.completion!.reviewScope!)}\n\n`;
+      f.reports.read.mockResolvedValue({ ...f.report, body: "x".repeat(65_001 - prefix.length) });
+      await f.service.poll();
+      const [completed] = await f.deps.store.read();
+      await expect(f.service.submitReview(completed.id, completed.draft!.id)).rejects.toThrow("65,000");
+      expect((await f.deps.store.read())[0].draft?.status).toBe("draft");
+      expect(f.provider.postReview).not.toHaveBeenCalled();
+      expect(request).not.toHaveBeenCalled();
+      const body = completed.draft!.body.slice(0, 65_000);
+      await f.service.saveReview(completed.id, completed.draft!.id, { ...completed.draft!, body });
+      await f.service.submitReview(completed.id, completed.draft!.id);
+      expect((await f.deps.store.read())[0].draft).toMatchObject({ status: "posted", body });
+    });
+
+    it.each(["github", "gitlab"] as const)("accepts a shorter continuation after local %s length rejection", async providerKind => {
+      const f = await reviewAtBodyLimit(scopeKind, true);
+      const request = realReviewAdapter(f, providerKind);
+      f.reports.read.mockResolvedValue({ ...f.report, body: "x".repeat(65_000) });
+      await f.service.poll();
+      expect(request).not.toHaveBeenCalled();
+      const restarted = new ForgeWorkflowService(f.deps);
+      const continued = await restarted.continueWorker(f.worker.id, "Shorten the summary while preserving the findings.", placement);
+      expect(continued.status, continued.error).toBe("running");
+      expect(continued.attemptId).not.toBe(f.worker.attemptId);
+      f.reports.read.mockResolvedValue({ ...f.report, body: "Verified the requested changes." });
+      await restarted.poll();
+      const [completed] = await f.deps.store.read();
+      expect(completed).toMatchObject({ status: "completed", draft: { status: "posted", headSha: f.change.headSha } });
+      expect(f.provider.postReview).toHaveBeenCalledOnce();
+    });
+  });
+
+  it.each(["initial", "incremental"] as const)("completes and reloads a maximum-length %s report with its scope intact", async kind => {
+    const f = await reviewAtBodyLimit(kind);
+    await f.service.poll();
+    const [completed] = await f.deps.store.read();
+    expect(completed.status, completed.error).toBe("completed");
+    expect(completed.draft?.body).toBe(f.body);
+    expect(completed.draft?.headSha).toBe(f.change.headSha);
+    expect(completed.completion?.report).toEqual(f.report);
+    expect(completed.reviewBaseline?.reviewId).toBe(f.worker.attemptId);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.dashboard();
+    const hooks = new HookRegistry();
+    const plugin = new ForgePlugin(() => ({ workflow: restarted, settings: {} as ForgeSettingsService }));
+    plugin.hooks.forEach(hook => hooks.register(hook));
+    await hooks.call("forge.review.save", {
+      id: completed.id, draftId: completed.draft!.id,
+      body: completed.draft!.body, comments: completed.draft!.comments, event: "comment",
+    }, { caller: { kind: "ui" } });
+    expect((await f.deps.store.read())[0].draft).toMatchObject({ body: f.body, event: "comment" });
+    f.reports.read.mockResolvedValue(undefined);
+    f.change.headSha = "d".repeat(40);
+    await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    const [next] = await f.deps.store.read();
+    expect(next.reviewHistory?.at(-1)?.body).toBe(f.body);
+    expect(next.completion?.reviewScope?.previous?.headSha).toBe(f.report.headSha);
+  });
+
+  it.each(["initial", "incremental"] as const)("resumes a cached maximum-length %s completion after restart and its deadline", async kind => {
+    const f = await reviewAtBodyLimit(kind);
+    const baseline = f.worker.reviewBaseline;
+    f.runtime.retainReviewBaseline.mockRejectedValueOnce(new Error("Could not retain the completed revision."));
+    await f.service.poll();
+    const [failed] = await f.deps.store.read();
+    expect(failed).toMatchObject({ status: "failed", error: "Could not retain the completed revision." });
+    expect(failed.completion?.readyAt).toEqual(expect.any(String));
+    expect(failed.completion?.report).toEqual(f.report);
+    expect(failed.reviewBaseline).toEqual(baseline);
+    expect(failed.draft).toBeUndefined();
+
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse(failed.completion!.deadlineAt) + 1);
+    onTestFinished(() => now.mockRestore());
+    f.reports.read.mockResolvedValue(undefined);
+    const launches = f.runtime.launch.mock.calls.length;
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(f.worker.id, placement);
+    expect(completed.status, completed.error).toBe("completed");
+    expect(completed.draft?.body).toBe(f.body);
+    expect(completed.draft?.headSha).toBe(f.report.headSha);
+    expect(completed.reviewBaseline?.reviewId).toBe(f.worker.attemptId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+
+    const body = `${reviewScopeSummary(completed.completion!.reviewScope!)}\n\nVerified the fix and relevant tests.`;
+    await restarted.saveReview(completed.id, completed.draft!.id, { ...completed.draft!, body });
+    f.provider.postReview.mockImplementation(async (_number, review) => { validateReview(review); return { commentIds: [] }; });
+    await restarted.submitReview(completed.id, completed.draft!.id);
+    expect(f.provider.postReview).toHaveBeenCalledWith(7, expect.objectContaining({ body, headSha: f.report.headSha }));
+    expect((await f.deps.store.read())[0].draft?.status).toBe("posted");
+  });
+
+  it.each(["initial", "incremental"] as const)("rejects an oversized %s report before checkpointing and accepts a corrected continuation", async kind => {
+    const f = await reviewAtBodyLimit(kind);
+    f.reports.read.mockResolvedValue({ ...f.report, body: `${f.report.body}x` });
+    await f.service.poll();
+    const [failed] = await f.deps.store.read();
+    expect(failed).toMatchObject({ status: "failed", completion: { reportError: expect.stringContaining("Invalid review body.") } });
+    expect(failed.completion?.readyAt).toBeUndefined();
+    expect(failed.completion?.report).toBeUndefined();
+    expect(failed.reviewBaseline).toEqual(f.worker.reviewBaseline);
+
+    const restarted = new ForgeWorkflowService(f.deps);
+    const continued = await restarted.continueWorker(f.worker.id, "Shorten the review summary.", placement);
+    expect(continued.status).toBe("running");
+    expect(continued.attemptId).not.toBe(f.worker.attemptId);
+    f.reports.read.mockResolvedValue(f.report);
+    await restarted.poll();
+    const [completed] = await f.deps.store.read();
+    expect(completed.status, completed.error).toBe("completed");
+    expect(completed.draft?.body).toBe(f.body);
+  });
+
+  it("records the full first review only after successful native completion and checkout retention", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const revision = { headSha: f.change.headSha, baseSha: f.change.baseSha, mergeBaseSha: f.change.baseSha };
+    expect(f.stored()[0].reviewBaseline).toBeUndefined();
+    expect(f.stored()[0].completion?.reviewScope).toEqual({ kind: "initial", current: revision });
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(worker.attemptId, expect.objectContaining({ reviewScope: { kind: "initial", current: revision } }));
+    expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain(`git diff --no-ext-diff --no-textconv ${revision.baseSha}...${revision.headSha} --`);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: revision.headSha, event: "approve", body: "Reviewed the complete proposed change.", comments: [] });
+    await f.service.poll();
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }), revision, expect.any(AbortSignal));
+    expect(f.runtime.finish.mock.invocationCallOrder[0]).toBeLessThan(f.runtime.retainReviewBaseline.mock.invocationCallOrder[0]);
+    expect(f.stored()[0].reviewBaseline).toEqual({ reviewId: worker.attemptId, revision });
+  });
+
+  it("reviews a README correction from A to B while carrying the unresolved finding and current-head result", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const scope = { kind: "incremental", previous: f.revision, current: { ...f.revision, headSha: f.change.headSha } };
+    expect(next.reviewBaseline).toEqual({ reviewId: f.worker.attemptId, revision: f.revision });
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(next.attemptId, expect.objectContaining({ reviewScope: scope, previousReviews: [f.draft] }));
+    const prompt = f.runtime.launch.mock.calls.at(-1)![0].prompt;
+    expect(prompt).toContain(`git diff --no-ext-diff --no-textconv ${f.revision.headSha} ${f.change.headSha} --`);
+    expect(prompt).not.toContain("Reassess the complete pinned comparison");
+    expect(prompt).not.toContain(`${f.change.baseSha}...${f.change.headSha}`);
+    expect(prompt).toMatch(/documentation|README/i);
+    expect(prompt).toMatch(/previous findings|earlier findings/i);
+    expect(prompt).toMatch(/relevant validation|targeted validation|affected behavior/i);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: `Compared ${f.revision.headSha} to ${f.change.headSha}: the README example now supplies the required argument.`, comments: [] });
+    await f.service.poll();
+    const completed = f.stored()[0];
+    expect(completed.draft).toMatchObject({ headSha: f.change.headSha, event: "approve" });
+    await f.service.submitReview(completed.id, completed.draft!.id);
+    expect(f.provider.postReview).toHaveBeenCalledWith(7, expect.objectContaining({ headSha: f.change.headSha }));
+  });
+
+  it("uses the most recent completed review across A to B to C and service restart", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const second = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    await f.service.poll();
+    const secondRevision = { ...f.revision, headSha: f.change.headSha };
+    await f.service.saveReview(second.id, second.attemptId!, { event: "approve", body: "Reviewed the corrected example.", comments: [] });
+    f.reports.read.mockResolvedValue(undefined);
+    f.change.headSha = "d".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const third = await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(third.reviewBaseline).toEqual({ reviewId: second.attemptId, revision: secondRevision });
+    expect(third.reviewHistory).toHaveLength(2);
+    expect(f.runtime.prepareReviewScope).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.worker.id }), secondRevision, expect.any(AbortSignal));
+    expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain(`git diff --no-ext-diff --no-textconv ${secondRevision.headSha} ${f.change.headSha} --`);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it.each(["pause", "stop", "failed", "interrupted"] as const)("keeps A as the baseline when B is %s before a restarted Resume", async outcome => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    if (outcome === "pause" || outcome === "stop") await f.service[outcome](next.id);
+    else {
+      f.runtime.readTurnCompletion.mockResolvedValueOnce({ workerId: next.id, attemptId: next.attemptId!, threadId: `thread-${next.id}`, turnId: `turn-${next.attemptId}`, status: outcome, error: undefined });
+      await f.service.poll();
+    }
+    expect(f.stored()[0].reviewBaseline).toEqual({ reviewId: f.worker.attemptId, revision: f.revision });
+    f.change.headSha = "d".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const resumed = await restarted.resume(next.id, placement);
+    expect(resumed.status).toBe("running");
+    expect(f.runtime.prepareReviewScope).toHaveBeenLastCalledWith(expect.objectContaining({ id: next.id }), f.revision, expect.any(AbortSignal));
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledTimes(1);
+  });
+
+  it("processes new feedback at the same commit without reusing the old result", async () => {
+    const f = await reviewedRevision();
+    f.change.comments = [{ id: "new-feedback", body: "The example deliberately uses defaults.", author: "maintainer" }];
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next.draft).toBeUndefined();
+    expect(next.attemptId).not.toBe(f.draft.id);
+    expect(next.completion?.reviewScope).toEqual({ kind: "unchanged", current: f.revision, previous: f.revision });
+    const prompt = f.runtime.launch.mock.calls.at(-1)![0].prompt;
+    expect(prompt).toMatch(/feedback/i);
+    expect(prompt).not.toContain("Reassess the complete pinned comparison");
+    expect(prompt).not.toContain(`${f.change.baseSha}...${f.change.headSha}`);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("supplies both revisions and base context for rewritten history without omitting merge resolutions", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    f.change.baseSha = "d".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next.completion?.reviewScope).toEqual({ kind: "rewritten", previous: f.revision, current: { headSha: f.change.headSha, baseSha: f.change.baseSha, mergeBaseSha: f.change.baseSha } });
+    const prompt = f.runtime.launch.mock.calls.at(-1)![0].prompt;
+    expect(prompt).toContain("git range-diff");
+    expect(prompt).toContain(f.revision.headSha);
+    expect(prompt).toContain(f.revision.baseSha);
+    expect(prompt).toContain(f.change.headSha);
+    expect(prompt).toContain(f.change.baseSha);
+    expect(prompt).toMatch(/merge.resolution|conflict.resolution/i);
+    expect(prompt).toMatch(/upstream/i);
+    expect(prompt).not.toContain("Reassess the complete pinned comparison");
+  });
+
+  it("reports missing completed-review evidence instead of inventing an incremental baseline", async () => {
+    const f = await reviewedRevision();
+    delete f.stored()[0].reviewBaseline;
+    f.change.headSha = "c".repeat(40);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const next = await restarted.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next).toMatchObject({ status: "failed", error: expect.stringMatching(/incremental comparison.*(?:unavailable|cannot)|baseline.*(?:missing|unavailable)/i) });
+    expect(next.reviewHistory).toEqual([f.draft]);
+    expect(next.reviewBaseline).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains the previous baseline when the completed revision cannot be protected from Git collection", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    f.runtime.retainReviewBaseline.mockRejectedValueOnce(new Error("The reviewed commit could not be retained."));
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, completion: { report: { headSha: f.change.headSha } } });
+    expect(f.stored()[0].draft).toBeUndefined();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    const restarted = new ForgeWorkflowService(f.deps);
+    const completed = await restarted.resume(next.id, placement);
+    expect(completed).toMatchObject({ status: "completed", reviewBaseline: { reviewId: next.attemptId, revision: { ...f.revision, headSha: f.change.headSha } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the verified baseline when its retained Git object is unavailable", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    f.runtime.prepareReviewScope.mockRejectedValueOnce(new Error("Incremental comparison cannot be established: the previous reviewed commit is unavailable."));
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(next).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, error: expect.stringContaining("Incremental comparison cannot be established") });
+    expect(next.reviewHistory).toEqual([f.draft]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not advance the baseline when Stop interrupts completed-report retirement", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    const next = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const removing = deferred<void>();
+    const removed = deferred<void>();
+    f.reports.remove.mockImplementationOnce(async () => { removing.resolve(); await removed.promise; });
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "The correction is sound.", comments: [] });
+    const polling = f.service.poll();
+    await removing.promise;
+    const stopping = f.service.stop(next.id);
+    removed.resolve();
+    await polling;
+    await stopping;
+    expect(f.stored()[0]).toMatchObject({ status: "stopped", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision } });
+    expect(f.stored()[0].draft).toBeUndefined();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("rejects a follow-up report for the previous head without advancing the baseline", async () => {
+    const f = await reviewedRevision();
+    f.change.headSha = "c".repeat(40);
+    await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.revision.headSha, event: "approve", body: "An old decision does not approve the new commit.", comments: [] });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: f.worker.attemptId, revision: f.revision }, error: expect.stringContaining("does not match the checked out commit") });
+    expect(f.runtime.retainReviewBaseline).toHaveBeenCalledTimes(1);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it("keeps the actually reviewed B as baseline when head C prevents its approval from posting", async () => {
+    const f = await reviewedRevision();
+    const reviewedHead = "c".repeat(40);
+    f.change.headSha = reviewedHead;
+    const next = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
+    f.change.headSha = "d".repeat(40);
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: reviewedHead, event: "approve", body: "The correction is sound.", comments: [] });
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", reviewBaseline: { reviewId: next.attemptId, revision: { ...f.revision, headSha: reviewedHead } }, draft: { headSha: reviewedHead } });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    f.reports.read.mockResolvedValue(undefined);
+    const current = await f.service.continueWorker(next.id, "Review the new current head before posting an approval.", placement);
+    expect(current.completion?.reviewScope).toMatchObject({ kind: "incremental", previous: { headSha: reviewedHead }, current: { headSha: f.change.headSha } });
+  });
+});
+
 describe("Issue merge attempts", () => {
   async function approvedManualIssue() {
     const f = fixture();
@@ -943,7 +1343,7 @@ describe("Issue merge attempts", () => {
 });
 
 describe("Forge issue and review workflows", () => {
-  it("prepares both pinned review commits and supplies a local comparison for every attempt", async () => {
+  it("keeps the full pinned comparison after Resume when no review has completed", async () => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     expect(f.runtime.prepareWorkspace).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -4039,7 +4439,7 @@ describe("Forge issue auto review", () => {
         await service.poll();
 
         expect(f.currentIssue()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" } });
-        expect(f.currentReview()).toMatchObject({ id: reviewer.id, status: "completed", draft: { status: "draft", body: "Fix reviewed" } });
+        expect(f.currentReview()).toMatchObject({ id: reviewer.id, status: "completed", draft: { status: "draft", body: expect.stringContaining("Fix reviewed") } });
         expect(f.runtime.prepareIssueRebase).toHaveBeenCalledOnce();
         expect(f.runtime.launch.mock.calls.at(-1)![0]).toMatchObject({ id: f.issue.id });
         expect(f.provider.postReview).not.toHaveBeenCalled();
@@ -4350,7 +4750,7 @@ describe("Forge issue auto review", () => {
     f.advanceTime(1_000);
     await f.service.poll();
     const draft = f.currentReview().draft!;
-    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { id: reviewer.attemptId, status: "draft", body: "Ready" } });
+    expect(f.currentReview()).toMatchObject({ status: "completed", draft: { id: reviewer.attemptId, status: "draft", body: expect.stringContaining("Ready") } });
     f.advanceTime(58_999);
     await f.service.poll();
     expect(f.provider[operation]).toHaveBeenCalledTimes(reads);

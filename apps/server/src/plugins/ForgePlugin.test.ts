@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
+import { MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import type { ForgeCredential } from "../forge/providers/ForgeCredentials.js";
 import { ForgePlugin } from "./ForgePlugin.js";
 import { HookRegistry } from "../hooks/HookRegistry.js";
@@ -209,6 +210,17 @@ describe("Forge plugin boundary", () => {
     await hooks.call("forge.review.submit", { id: "worker", draftId }, { caller: { kind: "ui" } });
     expect(workflow.saveReview).toHaveBeenCalledExactlyOnceWith("worker", draftId, edit);
     expect(workflow.submitReview).toHaveBeenCalledExactlyOnceWith("worker", draftId);
+  });
+
+  it.each(["ui", "http"] as const)("saves the full draft body limit through %s and rejects longer edits before dispatch", async kind => {
+    const { hooks, workflow } = await fixture();
+    const draftId = "33333333-3333-4333-8333-333333333333";
+    const edit = { body: "x".repeat(MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH), event: "comment", comments: [] };
+    await hooks.call("forge.review.save", { id: "worker", draftId, ...edit }, { caller: { kind } });
+    expect(workflow.saveReview).toHaveBeenCalledExactlyOnceWith("worker", draftId, edit);
+
+    await expect(hooks.call("forge.review.save", { id: "worker", draftId, ...edit, body: `${edit.body}x` }, { caller: { kind } })).rejects.toThrow(/invalid input.*body/);
+    expect(workflow.saveReview).toHaveBeenCalledTimes(1);
   });
 
   it.each([undefined, null, 7, "", " ", "review", "33333333-3333-4333-8333-33333333333", "33333333-3333-4333-8333-333333333333\n"])("rejects a missing or invalid draft identity before either mutation: %j", async draftId => {

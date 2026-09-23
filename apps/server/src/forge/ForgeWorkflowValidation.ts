@@ -1,4 +1,4 @@
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeIssueCompletionReport,
@@ -6,9 +6,12 @@ import type {
   ForgeReviewComment,
   ForgeReviewDraft,
   ForgeReviewPublication,
+  ForgeReviewRevision,
+  ForgeReviewScope,
   ForgeReviewSubmission,
   ForgeWorker,
 } from "@cloudx/shared";
+import { reviewScopeSummary } from "./ForgeReviewScope.js";
 
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -37,6 +40,26 @@ function isoTimestamp(value: unknown, name: string): string {
   if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== result)
     throw new Error(`Invalid ${name}.`);
   return result;
+}
+function parseReviewRevision(value: unknown): ForgeReviewRevision {
+  const input = object(value);
+  return {
+    headSha: commitSha(input.headSha, "review revision head"),
+    baseSha: commitSha(input.baseSha, "review revision base"),
+    mergeBaseSha: commitSha(input.mergeBaseSha, "review revision merge base"),
+  };
+}
+function parseReviewScope(value: unknown): ForgeReviewScope {
+  const input = object(value);
+  const kind = input.kind;
+  if (kind !== "initial" && kind !== "incremental" && kind !== "rewritten" && kind !== "unchanged")
+    throw new Error("Invalid review comparison scope.");
+  const current = parseReviewRevision(input.current);
+  const previous = input.previous === undefined ? undefined : parseReviewRevision(input.previous);
+  if ((kind === "initial") !== (previous === undefined) ||
+      (kind === "incremental" || kind === "unchanged") && previous?.mergeBaseSha !== current.mergeBaseSha)
+    throw new Error("Review comparison scope requires matching revision evidence.");
+  return { kind, current, ...(previous ? { previous } : {}) };
 }
 function workerLink(value: unknown, ownerId: string): string {
   const id = text(value, "linked worker identity", 36);
@@ -143,7 +166,7 @@ export function parseReview(value: unknown): ForgeReviewSubmission {
         : {}),
     };
   });
-  const body = text(input.body, "review body");
+  const body = text(input.body, "review body", MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH);
   if (!body.trim() && !comments.length)
     throw new Error("A review must contain a summary or comments.");
   return {
@@ -152,6 +175,11 @@ export function parseReview(value: unknown): ForgeReviewSubmission {
     body,
     comments,
   };
+}
+export function parseScopedReview(report: ForgeReviewSubmission, scope: ForgeReviewScope | undefined): ForgeReviewSubmission {
+  if (!scope || scope.current.headSha !== report.headSha)
+    throw new Error("Completed review comparison evidence is missing or does not match its report. The review baseline was preserved.");
+  return parseReview({ ...report, body: `${reviewScopeSummary(scope)}\n\n${report.body}` });
 }
 export function parseWorkerReport(
   value: unknown,
@@ -162,6 +190,7 @@ export function parseWorkerReport(
   if (report.kind === "review") {
     if (report.rebase !== undefined)
       throw new Error("Only issue reports can report a rebase resolution.");
+    text(report.body, "review body", MAX_FORGE_REVIEW_REPORT_BODY_LENGTH);
     return { kind: "review", ...parseReview(report) };
   }
   if (report.kind !== "issue")
@@ -448,6 +477,13 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       if (report && (report.kind !== worker.kind || worker.attemptId !== undefined && report.kind === "review" && report.headSha !== worker.headSha))
         throw new Error("Saved completion report must match the worker revision.");
       parsed.completion = { attemptId, deadlineAt, ...(readyAt ? { readyAt } : {}), ...(turn === undefined ? {} : { turn: turn as NonNullable<ForgeWorker["completion"]>["turn"] }), ...(report ? { report } : {}), ...(reportError ? { reportError } : {}) };
+      if (completion.reviewScope !== undefined) {
+        const scope = parseReviewScope(completion.reviewScope);
+        if (worker.kind !== "review" || worker.attemptId !== undefined && scope.current.headSha !== worker.headSha ||
+            report?.kind === "review" && scope.current.headSha !== report.headSha)
+          throw new Error("Saved review scope must match the review attempt and report.");
+        parsed.completion.reviewScope = scope;
+      }
     }
     if (worker.mergeConflict !== undefined) {
       const conflict = object(worker.mergeConflict);
@@ -459,7 +495,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     }
     if (worker.providerRetryAt !== undefined)
       parsed.providerRetryAt = isoTimestamp(worker.providerRetryAt, "provider retry deadline");
-    if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined))
+    if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined || worker.reviewBaseline !== undefined))
       throw new Error("Only review workers can have review drafts or history.");
     if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
     if (worker.reviewHistory !== undefined) {
@@ -469,6 +505,15 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       const reviewIds = [...parsed.reviewHistory, ...(parsed.draft ? [parsed.draft] : [])].map(draft => draft.id.toLowerCase());
       if (new Set(reviewIds).size !== reviewIds.length)
         throw new Error("Duplicate saved review identity.");
+    }
+    if (worker.reviewBaseline !== undefined) {
+      const baseline = object(worker.reviewBaseline);
+      const revision = parseReviewRevision(baseline.revision);
+      const reviewId = nonblankText(baseline.reviewId, "completed review identity", 36);
+      const latest = parsed.draft ?? parsed.reviewHistory?.at(-1);
+      if (!latest || latest.id !== reviewId || latest.headSha !== revision.headSha)
+        throw new Error("The review baseline must identify the most recent completed review.");
+      parsed.reviewBaseline = { reviewId, revision };
     }
     if (worker.autoReview !== undefined) {
       if (worker.kind !== "issue") throw new Error("Only issue workers can have an automatic review loop.");

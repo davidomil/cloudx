@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { ForgeIssueCompletionReport, ForgeWorker } from "@cloudx/shared";
-import { parseWorkerReport, parseWorkers } from "./ForgeWorkflowValidation.js";
+import type { ForgeIssueCompletionReport, ForgeReviewScope, ForgeWorker } from "@cloudx/shared";
+import { parseReview, parseScopedReview, parseWorkerReport, parseWorkers } from "./ForgeWorkflowValidation.js";
+import { reviewScopeSummary } from "./ForgeReviewScope.js";
 
 const report: ForgeIssueCompletionReport = {
   kind: "issue",
@@ -30,6 +31,95 @@ const reviewWorkerId = "22222222-2222-4222-8222-222222222222";
 const autoReview: NonNullable<ForgeWorker["autoReview"]> = {
   enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-1" }
 };
+
+describe("Review body limits", () => {
+  const review = { kind: "review" as const, headSha, event: "approve" as const, comments: [], body: "x".repeat(100_000) };
+
+  it.each([99_999, 100_000])("accepts a %i-character worker report", length => {
+    const input = { ...review, body: "x".repeat(length) };
+    expect(parseWorkerReport(input)).toEqual(input);
+  });
+
+  it("reserves scope space for drafts without increasing worker report limits", () => {
+    expect(() => parseWorkerReport({ ...review, body: `${review.body}x` })).toThrow("Invalid review body.");
+    const draft = { ...review, body: "x".repeat(100_512) };
+    expect(parseReview(draft).body.length).toBe(100_512);
+    expect(() => parseReview({ ...draft, body: `${draft.body}x` })).toThrow("Invalid review body.");
+    expect(() => parseWorkerReport({ ...report, body: "x".repeat(100_001) })).toThrow("Invalid change body.");
+  });
+
+  it.each(["initial", "incremental", "rewritten", "unchanged"] as const)("fits a maximum-length %s report and 64-character revision evidence in a draft", kind => {
+    const previous = { headSha: "b".repeat(64), baseSha: "c".repeat(64), mergeBaseSha: "d".repeat(64) };
+    const current = { ...previous, headSha: "a".repeat(64) };
+    const scope: ForgeReviewScope = { kind, current, ...(kind === "initial" ? {} : { previous }) };
+    const report = parseWorkerReport({ ...review, headSha: current.headSha });
+    if (report.kind !== "review") throw new Error("Expected a review report.");
+    const draft = parseScopedReview(report, scope);
+    expect(draft.body).toBe(`${reviewScopeSummary(scope)}\n\n${review.body}`);
+    expect(draft.body.length).toBeLessThanOrEqual(100_512);
+    expect(draft.headSha).toBe(current.headSha);
+  });
+
+  it("rejects missing or mismatched comparison evidence before building a draft", () => {
+    expect(() => parseScopedReview(review, undefined)).toThrow(/comparison evidence/);
+    expect(() => parseScopedReview(review, { kind: "initial", current: { headSha: "b".repeat(40), baseSha: headSha, mergeBaseSha: headSha } })).toThrow(/comparison evidence/);
+  });
+});
+
+describe("Saved review comparison evidence", () => {
+  const revision = { headSha, baseSha: "b".repeat(40), mergeBaseSha: "c".repeat(40) };
+  const draft = { id: reviewWorkerId, startedAt: worker.startedAt, headSha, body: "Reviewed.", comments: [], event: "approve", status: "draft" };
+  const reviewed = { ...worker, kind: "review", headSha, draft, reviewBaseline: { reviewId: draft.id, revision } };
+
+  it("retains the last completed revision independently of the active attempt and editable report", () => {
+    const saved = { ...reviewed, headSha: "d".repeat(40), draft: undefined, reviewHistory: [draft] };
+    expect(parseWorkers([saved])[0]).toEqual(saved);
+    expect(parseWorkers([saved])[0].reviewBaseline).not.toBe(saved.reviewBaseline);
+  });
+
+  it.each([
+    null, {}, { reviewId: draft.id },
+    { reviewId: worker.id, revision },
+    { reviewId: draft.id, revision: { ...revision, headSha: "d".repeat(40) } },
+    { reviewId: draft.id, revision: { ...revision, baseSha: "b".repeat(41) } },
+    { reviewId: draft.id, revision: { ...revision, mergeBaseSha: undefined } },
+  ])("rejects missing or mismatched completed baseline evidence %#", reviewBaseline => {
+    expect(() => parseWorkers([{ ...reviewed, reviewBaseline }])).toThrow();
+  });
+
+  it("rejects a baseline without its completed review or attached to an issue", () => {
+    expect(() => parseWorkers([{ ...reviewed, draft: undefined }])).toThrow(/most recent completed/);
+    expect(() => parseWorkers([{ ...reviewed, kind: "issue" }])).toThrow(/Only review/);
+    const newer = { ...draft, id: worker.id, headSha: "d".repeat(40) };
+    expect(() => parseWorkers([{ ...reviewed, draft: newer, reviewHistory: [draft] }])).toThrow(/most recent completed/);
+  });
+
+  const completion = { attemptId: reviewWorkerId, deadlineAt: "2026-09-08T01:00:00.000Z", reviewScope: { kind: "initial", current: revision } };
+  it.each(["initial", "incremental", "rewritten", "unchanged"])("round-trips %s attempt scope without promoting it to a baseline", kind => {
+    const reviewScope = { kind, current: revision, ...(kind === "initial" ? {} : { previous: revision }) };
+    const saved = { ...worker, kind: "review", headSha, attemptId: reviewWorkerId, completion: { ...completion, reviewScope } };
+    const [parsed] = parseWorkers([saved]);
+    expect(parsed.completion).toEqual(saved.completion);
+    expect(parsed.reviewBaseline).toBeUndefined();
+  });
+
+  it.each([
+    null, {}, { kind: "unknown", current: revision },
+    { kind: "initial", current: revision, previous: revision },
+    { kind: "incremental", current: revision },
+    { kind: "unchanged", current: revision, previous: { ...revision, mergeBaseSha: "d".repeat(40) } },
+    { kind: "initial", current: { ...revision, headSha: "d".repeat(40) } },
+    { kind: "rewritten", current: revision, previous: { ...revision, baseSha: "bad" } },
+  ])("rejects malformed or inconsistent attempt scope %#", reviewScope => {
+    expect(() => parseWorkers([{ ...worker, kind: "review", headSha, attemptId: reviewWorkerId, completion: { ...completion, reviewScope } }])).toThrow();
+  });
+
+  it("requires scope to belong to a review and match its saved report even after retirement", () => {
+    expect(() => parseWorkers([{ ...worker, completion }])).toThrow(/review attempt/);
+    const report = { kind: "review", headSha: "d".repeat(40), event: "approve", comments: [], body: "Done." };
+    expect(() => parseWorkers([{ ...reviewed, completion: { ...completion, report } }])).toThrow(/review attempt/);
+  });
+});
 
 describe("Issue completion reports", () => {
   it("keeps discussion replies separate from requested resolutions", () => {
