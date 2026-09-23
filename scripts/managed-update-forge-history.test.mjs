@@ -37,7 +37,7 @@ function completedReview() {
   };
 }
 
-it.each(['2e69451b', 'c664071e'].flatMap(commit => [false, true].map(resume => [commit, resume])))('restores after %s Forge persistence and failed readiness (fresh Resume: %s)', async (commit, resume) => {
+it.each(['aec0d06e', 'c664071e'].flatMap(commit => [false, true].map(resume => [commit, resume])))('restores after %s Forge persistence and failed readiness (fresh Resume: %s)', async (commit, resume) => {
   const history = historicalForge(commit);
   const f = updateFixture({ activate: false, originalWeb: 'active' });
   const currentStore = new ForgeWorkflowStore(new PluginDataStore(f.dataDir));
@@ -134,7 +134,7 @@ async function reviewRoundTrip({ commit, ...options } = {}) {
   return { ...f, history, change, provider, reports, serviceFor, currentClasses, placement, finishReview, initial };
 }
 
-it.each(['2e69451b', 'a9613faf', '643ad8eb', '224a75ef'])('downgrades to %s, completes a review, then upgrades and continues from the new verified baseline', async commit => {
+it.each(['aec0d06e', 'a9613faf', '643ad8eb', '224a75ef'])('downgrades to %s, completes a review, then upgrades and continues from the new verified baseline', async commit => {
   const f = await reviewRoundTrip({ commit });
   expect(inspectDataCompatibility(f.history.root, {}, f.dataDir).compatible).toBe(true);
   const downgraded = f.serviceFor(f.history);
@@ -235,7 +235,7 @@ it.each(['retention', 'cleanup'])('preserves 0.1.3 review evidence when %s fails
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 20000);
 
-it.each(['2e69451b', '224a75ef'])('keeps the previous review and baseline when %s retention fails before completion', async commit => {
+it.each(['aec0d06e', '224a75ef'])('keeps the previous review and baseline when %s retention fails before completion', async commit => {
   const f = await reviewRoundTrip({ commit });
   const downgraded = f.serviceFor(f.history);
   f.change.headSha = f.record.targetCommit;
@@ -318,7 +318,7 @@ it('preserves the completed pre-native review before cleanup fails, then loads i
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 20000);
 
-it.each(['2e69451b', '224a75ef', 'c664071e'])('keeps report and saved-draft body limits compatible across %s', commit => {
+it.each(['aec0d06e', '224a75ef', 'c664071e'])('keeps report and saved-draft body limits compatible across %s', commit => {
   const history = historicalForge(commit);
   const validation = history.load('apps/server/src/forge/ForgeWorkflowValidation.ts');
   const saved = completedReview();

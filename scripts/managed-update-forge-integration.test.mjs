@@ -9,14 +9,14 @@ import { cleanupHistoricalForge, historicalForge } from './helpers/managed-updat
 
 const sources = new Map();
 const maintained = file => fs.readFileSync(file, 'utf8');
-function historical(file, commit = '2e69451b065e265db2a296e465ed306a33ab8f88') {
+function historical(file, commit = 'aec0d06e7f9087f9e912f6023cfbde5623f28178') {
   const key = `${commit}:${file}`;
   if (!sources.has(key)) sources.set(key, execFileSync('git', ['show', key], { encoding: 'utf8' }));
   return sources.get(key);
 }
 afterEach(cleanupHistoricalForge);
 
-it.each(['2e69451b065e265db2a296e465ed306a33ab8f88', 'c664071e04091db6be78df09d8c91a1975e9313c'])('preserves the native reader/writer contract and accepts integrated %s', commit => {
+it.each(['aec0d06e7f9087f9e912f6023cfbde5623f28178', 'c664071e04091db6be78df09d8c91a1975e9313c'])('preserves the native reader/writer contract and accepts integrated %s', commit => {
   const target = file => historical(file, commit);
   expect(prepareManagedForgeIntegration(maintained, maintained)).toEqual({});
   const migrated = prepareManagedForgeIntegration(target, maintained);
@@ -34,7 +34,7 @@ it.each([
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
 });
 
-it.each(['a9613faf', '2e69451b', 'c664071e'])('adds continuation to previously integrated %s targets', async commit => {
+it.each(['a9613faf', 'aec0d06e', 'c664071e'])('adds continuation to previously integrated %s targets', async commit => {
   const source = historical('scripts/managed-update-forge-integration.mjs', '540da2c');
   const previous = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
   const target = file => historical(file, commit);

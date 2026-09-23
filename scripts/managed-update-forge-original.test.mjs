@@ -100,7 +100,7 @@ it('loads every original 0.1.3 review on upgrade and preserves posted receipts w
 }, 15000);
 
 const nativeTarget = '2f28a100cd765b8c209e85fdacb03b03a57ba0df';
-const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', '2e69451b', '39d42ec9', '7604d8d', nativeTarget];
+const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e120', '7604d8d', nativeTarget];
 it.each(continuationTargets.flatMap(target => ['draft', 'posted'].map(status => ({ target, status }))))(
   'starts a fresh full review after an original 0.1.3 $status review on $target', async ({ target, status }) => {
   const f = await originalProfile(target);
@@ -191,7 +191,7 @@ it.each(continuationTargets.flatMap(target => ['posting', 'post_failed'].map(sta
 
 it.each([
   { target: 'a9613faf', missing: 'ownership' },
-  { target: '2e69451b', missing: 'ownership' },
+  { target: 'aec0d06e', missing: 'ownership' },
   { target: '7604d8d', missing: 'ownership' },
   { target: '7604d8d', missing: 'baseline' },
   { target: nativeTarget, missing: 'ownership' },
@@ -225,7 +225,7 @@ it.each([
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
-it.each(['c664071e', '224a75ef', 'a9613faf', '2e69451b', '39d42ec97528b24a15caa5bfa777dec103992fe3'])('retains original draft identity when the selected target is %s', async commit => {
+it.each(['c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e1204ca86a84e3722248bb619a644326e34e'])('retains original draft identity when the selected target is %s', async commit => {
   const f = await originalProfile();
   const target = historicalForge(commit);
   const record = { ...f.record, transition: { ...f.record.transition, release: target.root } };

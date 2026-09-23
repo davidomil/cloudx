@@ -37,6 +37,16 @@ must fetch this tag and its history before running the publisher tests. The
 tests validate exact commit, tree, parent, and changed-path identities and fail
 clearly when their history prerequisite is missing.
 
+Managed updater regressions also need full Git history. The pre-review-scope
+Forge fixture uses main commit `aec0d06e7f9087f9e912f6023cfbde5623f28178`;
+the initial native review-scope fixture uses
+`4083e1204ca86a84e3722248bb619a644326e34e`. These retain the tested Forge
+contracts without depending on discarded pre-rebase branch commits.
+Historical builds install their locked dependencies offline. After `npm ci`,
+run `npm cache add smol-toml@1.7.0` before these tests: CloudX 0.1.3 pins that
+version while the current lockfile pins 1.7.1. Both the TypeScript job and the
+isolated verifier image seed this extra dependency before offline execution.
+
 ## Terminal reliability stress
 
 The terminal stress job runs three fresh Node 22 V8 coverage processes

@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { prepareManagedIntegration } from '../managed-update-integration.mjs';
 
-export const FORGE_BEFORE_REVIEW_SCOPE = '2e69451b065e265db2a296e465ed306a33ab8f88';
+export const FORGE_BEFORE_REVIEW_SCOPE = 'aec0d06e7f9087f9e912f6023cfbde5623f28178';
 const require = createRequire(import.meta.url);
 const roots = [];
 
