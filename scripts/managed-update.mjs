@@ -368,7 +368,7 @@ export class UpdateHost {
           throw publicFailure('forge', 'Forge ownership or publication records changed since the selected snapshot. Snapshot application stopped to prevent repeating published work.');
         t.snapshotApplication[index] = 'copying';
         this.save(record);
-        clearProfile(snapshot.root);
+        clearProfile(snapshot.root, snapshot.manifest);
         restoreSnapshot(snapshot.destination, snapshot.root, snapshot.manifest);
         verifySnapshot(snapshot.root, snapshot.manifest);
         t.snapshotApplication[index] = 'applied';
@@ -658,7 +658,7 @@ export class UpdateHost {
             verifySnapshot(snapshot.root, manifest);
             continue;
           }
-          clearProfile(snapshot.root);
+          clearProfile(snapshot.root, snapshot.manifest);
           restoreSnapshot(snapshot.destination, snapshot.root, snapshot.manifest);
           verifySnapshot(snapshot.root, snapshot.manifest);
           t.profileRestoration[index] = 'restored';
@@ -818,12 +818,22 @@ function forgeRecords(root, restoringFiles = new Set()) {
   return records;
 }
 
-function clearProfile(root) {
-  const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
-  try {
-    for (const name of fs.readdirSync(`/proc/self/fd/${fd}`)) if (!runtimeData(name)) fs.rmSync(`/proc/self/fd/${fd}/${name}`, { recursive: true, force: true });
-    fs.fsyncSync(fd);
-  } finally { fs.closeSync(fd); }
+function clearProfile(root, manifest) {
+  const directories = new Set(manifest.filter(entry => entry.type === 'directory').map(entry => entry.path));
+  function clear(directory, relative) {
+    const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+    try {
+      for (const name of fs.readdirSync(`/proc/self/fd/${fd}`)) {
+        const child = path.join(relative, name), file = `/proc/self/fd/${fd}/${name}`;
+        if (runtimeData(child)) continue;
+        // Forge and Codex ownership records retain directory inode and creation time.
+        if (directories.has(child) && fs.lstatSync(file).isDirectory()) clear(file, child);
+        else fs.rmSync(file, { recursive: true, force: true });
+      }
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+  }
+  clear(root, '');
 }
 
 function readJson(file) { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : undefined; }

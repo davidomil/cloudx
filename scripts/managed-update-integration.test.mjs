@@ -4,13 +4,14 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, expect, it } from "vitest";
+import ts from "typescript";
 import { MANAGED_INTEGRATION_FILES, MANAGED_INTEGRATION_SOURCE_FILES, prepareManagedIntegration } from "./managed-update-integration.mjs";
 import { SettingsUpdater } from "./settings-update.mjs";
 import { verifySnapshot } from "./managed-update-store.mjs";
 import { UpdateHost } from "./managed-update.mjs";
 import { verifyHistoricalTerminals } from "./managed-update-readiness.mjs";
 import { MISSING_SETTINGS_FILES } from "./managed-update-settings-integration.mjs";
-import { SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES } from "./managed-update-session-integration.mjs";
+import { CODEX_SOURCES, CODEX_IDENTITY_FILES, SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES } from "./managed-update-session-integration.mjs";
 import { inspectDataCompatibility } from "./managed-update-data.mjs";
 
 const coordinator = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
@@ -25,6 +26,32 @@ it("retains managed Settings and independent terminal readiness in a historical 
     ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES].includes(file)), independentReadiness: true });
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
+});
+
+it.each(["legacy", "current", "unknown"])("integrates a broker-era target with a %s Codex source reader", kind => {
+  const release = fixture("CLOUDX_UPDATE_COORDINATOR_ROOT", "/api/ready/terminals");
+  const destination = path.join(release, CODEX_SOURCES);
+  const source = kind === "current" ? fs.readFileSync(CODEX_SOURCES, "utf8") :
+    git(coordinator, ["show", `a9613fafdc0ed1765fcf72ea7d9f61de08c3914a:${CODEX_SOURCES}`]);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.writeFileSync(destination, kind === "unknown" ? source.replace('"dev,home,ino,sourceId,version"', '"unknown"') : source);
+  git(release, ["add", "."]);
+  git(release, ["commit", "-m", "TEST: target Codex ownership reader"]);
+  if (kind === "unknown") {
+    expect(() => prepareManagedIntegration(release, coordinator)).toThrow("does not recognize the target source ownership contract");
+    expect(git(release, ["status", "--porcelain"])).toBe("");
+  } else {
+    const integration = prepareManagedIntegration(release, coordinator);
+    expect(integration.files).toEqual(kind === "legacy" ? [CODEX_SOURCES, ...CODEX_IDENTITY_FILES] : []);
+    expect(integration.sessionRecovery).toBeUndefined();
+    if (kind === "legacy") {
+      expect(fs.readFileSync(destination, "utf8")).toContain("sameDirectoryIdentity(");
+      for (const file of CODEX_IDENTITY_FILES) expect(fs.readFileSync(path.join(release, file))).toEqual(fs.readFileSync(file));
+    } else {
+      expect(fs.readFileSync(destination, "utf8")).toBe(source);
+      expect(git(release, ["status", "--porcelain"])).toBe("");
+    }
+  }
 });
 
 it("selects the supervised readiness probe before execution bindings were supported", () => {
@@ -213,6 +240,50 @@ it.each(["settings-update.mjs", "managed-update.mjs"])("loads staged %s through 
     expect(execFileSync(process.execPath, ["--input-type=module", "--eval",
       "await import(process.argv[1]); console.log('loaded');", pathToFileURL(path.join(record.coordinator, "scripts", entrypoint)).href],
     { cwd: checkout, encoding: "utf8", timeout: 10_000 }).trim()).toBe("loaded");
+  }
+});
+
+it("retains working historical persistence through coordinator reuse and the next handoff after checkout replacement", () => {
+  const home = directory(), checkout = directory();
+  const staged = { run: { id: "11111111-1111-4111-8111-111111111111" } };
+  new SettingsUpdater({ repoRoot: checkout, home }).stage(staged);
+  fs.writeFileSync(path.join(checkout, "replaced-checkout"), "Historical checkout without maintained persistence helpers");
+  for (const id of [staged.run.id, "22222222-2222-4222-8222-222222222222"]) {
+    const release = preBrokerFixture();
+    execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      import { SettingsUpdater } from './scripts/settings-update.mjs';
+      const [repoRoot, home, saved, release, id] = process.argv.slice(1);
+      const previous = JSON.parse(saved);
+      const record = id === previous.run.id ? previous : { run: { id } };
+      new SettingsUpdater({ repoRoot, home }).stage(record);
+      const { prepareManagedIntegration } = await import(record.coordinator + '/scripts/managed-update-integration.mjs');
+      prepareManagedIntegration(release);
+    `, checkout, home, JSON.stringify(staged), release, id], { cwd: staged.coordinator, encoding: "utf8", timeout: 10_000 });
+
+    // Compile the retained source, then let a fresh Node process resolve its
+    // dependencies without access to modules in the original checkout.
+    const source = path.join(release, "apps/server/src");
+    fs.writeFileSync(path.join(source, "pathBoundary.ts"), git(coordinator,
+      ["show", "224a75ef7b3efced05b2c6b3b136250d9a532dc3:apps/server/src/pathBoundary.ts"]));
+    for (const name of fs.readdirSync(source).filter(name => name.endsWith(".ts"))) {
+      fs.writeFileSync(path.join(source, name.replace(/\.ts$/, ".js")), ts.transpileModule(fs.readFileSync(path.join(source, name), "utf8"), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+      }).outputText);
+    }
+    fs.writeFileSync(path.join(release, "package.json"), JSON.stringify({ type: "module" }));
+    expect(execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      import assert from 'node:assert/strict';
+      import { JsonStateFile, openOwnedDirectoryNoFollow } from './apps/server/src/jsonStateFile.js';
+      const state = new JsonStateFile(process.cwd(), 'saved.json', 'Saved state');
+      await state.write({ preserved: true });
+      assert.deepEqual(await state.read(), { preserved: true });
+      const owned = await openOwnedDirectoryNoFollow(process.cwd(), process.cwd() + '/owned', 'Owned directory');
+      assert.ok(owned.identity.durable.filesystemId);
+      await owned.assertCurrent();
+      await owned.remove();
+      await owned.close();
+      console.log('persisted');
+    `], { cwd: release, encoding: "utf8", timeout: 10_000 }).trim()).toBe("persisted");
   }
 });
 

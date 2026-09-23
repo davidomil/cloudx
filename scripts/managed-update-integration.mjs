@@ -3,7 +3,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { MISSING_SETTINGS_FILES, prepareMissingSettingsIntegration } from "./managed-update-settings-integration.mjs";
-import { SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES, prepareSessionIntegration } from "./managed-update-session-integration.mjs";
+import { CODEX_SOURCES, CODEX_IDENTITY_FILES, SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES,
+  prepareCodexSourceIntegration, prepareSessionIntegration } from "./managed-update-session-integration.mjs";
 
 const SETTINGS_FILES = [
   "apps/server/src/system/CloudxUpdateService.ts",
@@ -57,6 +58,15 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
   if (sessionRecovery) {
     Object.assign(migrated, prepareSessionIntegration(relative => migrated[relative] ?? fs.readFileSync(integrationPath(release, relative), "utf8")));
     files.push(...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES);
+  }
+  const codex = integrationPath(release, CODEX_SOURCES);
+  if (!sessionRecovery && fs.existsSync(codex)) {
+    const source = fs.readFileSync(codex, "utf8");
+    const integrated = prepareCodexSourceIntegration(source);
+    if (integrated !== source) {
+      migrated[CODEX_SOURCES] = integrated;
+      files.push(CODEX_SOURCES, ...CODEX_IDENTITY_FILES);
+    }
   }
   const uniqueFiles = [...new Set(files)];
   const changes = uniqueFiles.map(relative => {

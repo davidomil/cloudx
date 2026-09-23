@@ -6,9 +6,11 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import ts from "typescript";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CodexStateSources as CurrentCodexStateSources } from "../apps/server/src/plugins/CodexStateSources.ts";
 
 import { MISSING_SETTINGS_FILES, prepareMissingSettingsIntegration } from "./managed-update-settings-integration.mjs";
-import { SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES, prepareSessionIntegration } from "./managed-update-session-integration.mjs";
+import { CODEX_SOURCES, SESSION_INTEGRATION_FILES, SESSION_PERSISTENCE_FILES,
+  prepareCodexSourceIntegration, prepareSessionIntegration } from "./managed-update-session-integration.mjs";
 import { inspectTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
 
 const historicalCommit = "224a75ef7b3efced05b2c6b3b136250d9a532dc3";
@@ -26,18 +28,18 @@ const modules = new Map();
 
 // Execute the migration's historical production classes, including their real
 // validators and filesystem persistence, without requiring a historical build.
-function load(file) {
-  if (modules.has(file)) return modules.get(file).exports;
-  const source = migrated[file] ?? settings[file] ?? copied[file] ?? (file === "packages/shared/src/cloudxUpdate.ts" ? fs.readFileSync(file, "utf8") : historical(file));
+function load(file, overrides = {}, cache = modules) {
+  if (cache.has(file)) return cache.get(file).exports;
+  const source = overrides[file] ?? migrated[file] ?? settings[file] ?? copied[file] ?? (file === "packages/shared/src/cloudxUpdate.ts" ? fs.readFileSync(file, "utf8") : historical(file));
   const compiled = ts.transpileModule(source, { fileName: file, reportDiagnostics: true,
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, esModuleInterop: true } });
   expect(compiled.diagnostics).toEqual([]);
   const module = { exports: {} };
-  modules.set(file, module);
+  cache.set(file, module);
   const dependency = name => {
     if (name.startsWith("node:")) return require(name);
-    if (name.startsWith("@cloudx/")) return load(`packages/${name.slice(8)}/src/index.ts`);
-    if (name.startsWith(".")) return load(path.posix.normalize(path.posix.join(path.posix.dirname(file), name)).replace(/\.js$/, ".ts"));
+    if (name.startsWith("@cloudx/")) return load(`packages/${name.slice(8)}/src/index.ts`, overrides, cache);
+    if (name.startsWith(".")) return load(path.posix.normalize(path.posix.join(path.posix.dirname(file), name)).replace(/\.js$/, ".ts"), overrides, cache);
     return require(name);
   };
   const javascript = compiled.outputText.replaceAll("import.meta.url", JSON.stringify(pathToFileURL(path.resolve(file)).href));
@@ -105,10 +107,15 @@ async function preservedCodexConversation() {
   const fixture = await savedWorkspace();
   const codexHome = path.join(fixture.root, "codex-home");
   fs.mkdirSync(path.join(codexHome, "sessions"), { recursive: true });
-  fixture.sources = new CodexStateSources(fixture.root, { CODEX_HOME: codexHome });
-  const binding = await fixture.sources.resolve();
   const tab = fixture.saved.sessions[1].tab;
-  const view = await fixture.sources.bind(tab.id, binding);
+  const currentSources = new CurrentCodexStateSources(fixture.root, { CODEX_HOME: codexHome });
+  let view;
+  try {
+    const binding = await currentSources.resolve();
+    view = await currentSources.bind(tab.id, binding);
+    expect((await currentSources.readBinding(tab.id)).durable).toEqual(binding.durable);
+  } finally { await currentSources.dispose(); }
+  fixture.sources = new CodexStateSources(fixture.root, { CODEX_HOME: codexHome });
   const transcript = path.join(codexHome, "sessions", `rollout-${conversationId}.jsonl`);
   fs.writeFileSync(transcript, `${JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: tab.cwd } })}\n`);
   const receipt = path.join(view, ".cloudx-conversation.json");
@@ -125,6 +132,43 @@ describe("saved-tab recovery in the managed pre-broker target", () => {
     expect(Object.keys(migrated)).toEqual(SESSION_INTEGRATION_FILES);
     expect(MISSING_SETTINGS_FILES).toContain("apps/server/src/server.ts");
     expect(() => prepareSessionIntegration(file => migrated[file])).toThrow("does not recognize");
+  });
+
+  it("preserves native durable source ownership and rejects an unknown historical reader", () => {
+    const current = fs.readFileSync(CODEX_SOURCES, "utf8");
+    expect(prepareCodexSourceIntegration(current)).toBe(current);
+    expect(prepareCodexSourceIntegration(migrated[CODEX_SOURCES])).toBe(migrated[CODEX_SOURCES]);
+    expect(() => prepareCodexSourceIntegration(historical(CODEX_SOURCES).replace('"dev,home,ino,sourceId,version"', '"unknown"')))
+      .toThrow("does not recognize the target source ownership contract");
+  });
+
+  it.each([
+    "a9613fafdc0ed1765fcf72ea7d9f61de08c3914a", "26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb1c0ebe12cf4e112d72265fbe53814b65",
+    "ad72433b2d6283811fad6bfe288748f2c24b0c5e", historicalCommit,
+  ])("recovers current production ownership through the actual %s source reader without replay", async commit => {
+    const fixture = await preservedCodexConversation();
+    const original = execFileSync("git", ["show", `${commit}:${CODEX_SOURCES}`], { encoding: "utf8" });
+    const { CodexStateSources: HistoricalSources } = load(CODEX_SOURCES, { [CODEX_SOURCES]: prepareCodexSourceIntegration(original) }, new Map());
+    const file = path.join(fixture.view, ".cloudx-source.json");
+    const binding = JSON.parse(fs.readFileSync(file, "utf8"));
+    const sources = new HistoricalSources(fixture.root, { CODEX_HOME: binding.home });
+    const plugin = new CodexTerminalPlugin(fixture.factory, undefined, fixture.root, sources);
+    const createSession = vi.spyOn(plugin, "createSession").mockResolvedValue({});
+    try {
+      expect(await sources.readBinding(fixture.input.tab.id)).toMatchObject({ durable: binding.durable });
+      expect(await plugin.describeRecovery(fixture.input)).toMatchObject({ conversationId, canResume: true });
+      await plugin.recoverSession(fixture.input);
+      expect(createSession).toHaveBeenCalledExactlyOnceWith({ ...fixture.input,
+        initialInput: { model: "saved-model", resume: { mode: "session", sessionId: conversationId } }, prepareCodexSession: undefined,
+      });
+      expect(fixture.input.prepareCodexSession).not.toHaveBeenCalled();
+      createSession.mockClear();
+      binding.durable.birthtimeNs = (BigInt(binding.durable.birthtimeNs) + 1n).toString();
+      fs.writeFileSync(file, JSON.stringify(binding));
+      expect(await plugin.describeRecovery(fixture.input)).toMatchObject({ canResume: false });
+      await expect(plugin.recoverSession(fixture.input)).rejects.toThrow("stale");
+      expect(createSession).not.toHaveBeenCalled();
+    } finally { await sources.dispose(); }
   });
 
   it("restores tab identities, inputs and split layout without starting terminal sessions", async () => {
@@ -270,6 +314,45 @@ describe("saved-tab recovery in the managed pre-broker target", () => {
     expect((await fixture.savedSessions.read()).sessions[1].initialInput).toEqual(fixture.input.initialInput);
   });
 
+  it("retains five-field historical binding recovery of the exact conversation", async () => {
+    const fixture = await preservedCodexConversation();
+    const file = path.join(fixture.view, ".cloudx-source.json");
+    const binding = JSON.parse(fs.readFileSync(file, "utf8"));
+    delete binding.durable;
+    fs.writeFileSync(file, JSON.stringify(binding));
+    expect(await fixture.plugin.describeRecovery(fixture.input)).toMatchObject({ conversationId, canResume: true });
+    await fixture.plugin.recoverSession(fixture.input);
+    expect(fixture.createSession).toHaveBeenCalledExactlyOnceWith({ ...fixture.input,
+      initialInput: { model: "saved-model", resume: { mode: "session", sessionId: conversationId } }, prepareCodexSession: undefined,
+    });
+    expect(fixture.input.prepareCodexSession).not.toHaveBeenCalled();
+  });
+
+  it("matches current ownership validation when device numbering changes before historical recovery", async () => {
+    const fixture = await preservedCodexConversation();
+    const file = path.join(fixture.view, ".cloudx-source.json");
+    const binding = JSON.parse(fs.readFileSync(file, "utf8"));
+    binding.dev = (BigInt(binding.dev) + 1n).toString();
+    fs.writeFileSync(file, JSON.stringify(binding));
+    const sources = new CurrentCodexStateSources(fixture.root, { CODEX_HOME: binding.home });
+    let current;
+    try { current = await sources.readBinding(fixture.input.tab.id).catch(() => undefined); }
+    finally { await sources.dispose(); }
+    const description = await fixture.plugin.describeRecovery(fixture.input);
+    expect(description.canResume).toBe(current !== undefined);
+    if (current) {
+      expect(description.conversationId).toBe(conversationId);
+      await fixture.plugin.recoverSession(fixture.input);
+      expect(fixture.createSession).toHaveBeenCalledExactlyOnceWith({ ...fixture.input,
+        initialInput: { model: "saved-model", resume: { mode: "session", sessionId: conversationId } }, prepareCodexSession: undefined,
+      });
+    } else {
+      expect(description.conversationId).toBeUndefined();
+      await expect(fixture.plugin.recoverSession(fixture.input)).rejects.toThrow("stale");
+      expect(fixture.createSession).not.toHaveBeenCalled();
+    }
+  });
+
   it("exposes the validated preserved conversation in the restored workspace without launching it", async () => {
     const fixture = await preservedCodexConversation();
     fixture.plugins[1] = fixture.plugin;
@@ -411,6 +494,21 @@ describe("saved-tab recovery in the managed pre-broker target", () => {
     ["stale source binding", fixture => {
       const file = path.join(fixture.view, ".cloudx-source.json");
       fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), ino: "0" }));
+    }, "stale"],
+    ...["filesystemId", "filesystemType", "birthtimeNs", "uid"].map(field => [`changed source ${field}`, fixture => {
+      const file = path.join(fixture.view, ".cloudx-source.json");
+      const binding = JSON.parse(fs.readFileSync(file, "utf8"));
+      binding.durable[field] = binding.durable[field] === "1" ? "2" : "1";
+      fs.writeFileSync(file, JSON.stringify(binding));
+    }, "stale"]),
+    ["invalid durable source binding", fixture => {
+      const file = path.join(fixture.view, ".cloudx-source.json");
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, "utf8")), durable: {} }));
+    }, "Invalid Codex source binding"],
+    ["replaced source directory", fixture => {
+      const home = path.dirname(path.dirname(fixture.transcript));
+      fs.renameSync(home, `${home}.original`);
+      fs.cpSync(`${home}.original`, home, { recursive: true });
     }, "stale"],
   ])("rejects %s before launch without changing saved session inputs", async (_reason, corrupt, message) => {
     const fixture = await preservedCodexConversation();

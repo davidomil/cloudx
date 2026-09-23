@@ -4,7 +4,10 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ForgeWorkflowService } from '../apps/server/src/forge/ForgeWorkflowService.ts';
 import { ForgeWorkflowStore, ForgeWorkerReports } from '../apps/server/src/forge/ForgeWorkflowStore.ts';
+import { ForgeRuntime } from '../apps/server/src/forge/ForgeRuntime.ts';
 import { PluginDataStore } from '../apps/server/src/plugins/PluginDataStore.ts';
+import { PathPolicy } from '../apps/server/src/pathPolicy.ts';
+import { readDirectoryIdentity } from '../apps/server/src/directoryIdentity.ts';
 import { ManagedUpdate, UpdateHost, validateSavedTransition } from './managed-update.mjs';
 import { cleanupUpdates, FORGE_STATE, git, runPreparedUpdate, updateFixture, write } from './helpers/managed-update-rollback-fixture.mjs';
 
@@ -44,7 +47,112 @@ async function forgeUpdate({ status = 'completed', published = status === 'compl
   return { ...f, store, original, worker, provider, deps, forge };
 }
 
+async function pausedWorkspace() {
+  const f = updateFixture({ activate: false, originalWeb: 'active' });
+  const id = randomUUID(), tabs = new Map(), contexts = new Map();
+  const repository = { provider: 'github', apiUrl: 'https://api.github.com', projectPath: 'fixture/cloudx' };
+  const origin = 'https://github.com/fixture/cloudx.git';
+  const deps = {
+    dataDir: f.dataDir, pathPolicy: new PathPolicy([f.host.home]),
+    isRepositoryTrusted: () => true,
+    gitAccess: async () => ({ cloneUrl: origin, authorization: 'Basic fixture-secret' }),
+    git: async (cwd, args) => git(cwd, ...args.map(argument => argument === origin && args[0] === 'fetch' ? f.root : argument)),
+    sessions: {
+      getTab: tabId => tabs.get(tabId), listTabs: () => [...tabs.values()],
+      getContextDirectory: tabId => contexts.get(tabId),
+      getSession: () => ({ attachTerminal: async () => ({ screen: { data: 'Paused worker output', cols: 80, rows: 24 }, dispose() {} }) }),
+      executePluginAction: vi.fn(async tabId => { tabs.get(tabId).status = 'stopped'; return {}; }),
+      discardPreparedTab: vi.fn(async tabId => { tabs.delete(tabId); }),
+    },
+    workspaceCommands: { createTab: vi.fn(async (request, options) => {
+      await options.authorizeProjectTrust();
+      const tab = { ...request, id: randomUUID(), ownerPluginId: 'forge' };
+      const context = path.join(f.dataDir, 'context', tab.id);
+      tab.contextPath = path.join(context, 'context.md');
+      write(tab.contextPath, 'Preserve the worker context');
+      write(path.join(f.dataDir, 'codex-launches', tab.id, 'config.toml'), 'Preserve the worker launch');
+      contexts.set(tab.id, await readDirectoryIdentity(context));
+      tabs.set(tab.id, tab);
+      return { tab };
+    }) },
+    rulesSkills: { list: async () => ({ templates: [{ id: 'worker' }] }) },
+  };
+  const runtime = new ForgeRuntime(deps);
+  const workspace = { id, ...await runtime.prepareWorkspace({ id, expectedRepository: repository, baseBranch: 'main' }) };
+  const request = { id, worktreePath: workspace.worktreePath, attemptId: 'first-attempt', templateId: 'worker',
+    model: 'gpt-6-astra', reasoningEffort: 'xhigh', prompt: 'Resolve the issue.', windowId: 'window', paneId: 'pane' };
+  const tabId = await runtime.launch(request);
+  await runtime.pause(tabId);
+  write(f.forgeFile, JSON.stringify([{ id, status: 'paused', worktreePath: workspace.worktreePath, tabId, attemptId: request.attemptId }]));
+  write(path.join(workspace.worktreePath, 'local-work.txt'), 'Uncommitted worker work');
+  const owned = JSON.parse(fs.readFileSync(path.join(f.dataDir, 'forge-workers/workspaces', `${id}.json`), 'utf8'));
+  const tab = JSON.parse(fs.readFileSync(path.join(f.dataDir, 'forge-workers/tabs', `${tabId}.json`), 'utf8'));
+  const identities = [owned.worktree, owned.gitDirectory, tab.context, tab.launch];
+  return { ...f, deps, workspace, request, identities };
+}
+
 describe('Forge rollback ownership', () => {
+  it.each(['rollback', 'snapshot application', 'interrupted rollback'])('preserves a real paused worker workspace, context and launch through %s', async operation => {
+    const f = await pausedWorkspace();
+    if (operation === 'snapshot application') {
+      f.host.snapshot(f.record);
+      f.record.transition.restoreData = f.record.transition.snapshots;
+      f.commands.afterStart = service => {
+        if (service !== 'cloudx.service') return;
+        for (const identity of f.identities) {
+          const stat = fs.statSync(identity.path, { bigint: true });
+          expect(stat.ino.toString()).toBe(identity.ino);
+          expect(stat.birthtimeNs.toString()).toBe(identity.durable.birthtimeNs);
+        }
+      };
+    }
+    const fsync = fs.fsyncSync;
+    const failure = operation === 'interrupted rollback' && vi.spyOn(fs, 'fsyncSync').mockImplementation(fd => {
+      fsync(fd);
+      if (fs.realpathSync(`/proc/self/fd/${fd}`) === f.dataDir && !fs.existsSync(f.forgeFile))
+        throw Object.assign(new Error('Disk full after clearing profile files'), { code: 'ENOSPC' });
+    });
+    const result = await runPreparedUpdate(f);
+    expect(result).toMatchObject({ state: 'failed', phase: 'verify', component: 'verify', resumable: true });
+    if (failure) {
+      expect(f.record.transition.profileRestoration).toEqual(['copying']);
+      failure.mockRestore();
+      f.record = JSON.parse(fs.readFileSync(f.recordPath, 'utf8'));
+      validateSavedTransition(f.record, f.host.runDir);
+      const host = Object.assign(Object.create(UpdateHost.prototype), f.host, {
+        quiesce() { throw new Error('Target retry deferred by test'); },
+      });
+      const resumed = await new ManagedUpdate({ record: f.record, save: f.save, host }).run();
+      expect(resumed).toMatchObject({ state: 'failed', phase: 'quiesce' });
+    }
+    expect(f.record.transition).toMatchObject({ restored: true, mutating: false });
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.record.transition.sourceCommit);
+    for (const identity of f.identities) expect(await readDirectoryIdentity(identity.path)).toEqual(identity);
+    expect(fs.readFileSync(path.join(f.workspace.worktreePath, 'local-work.txt'), 'utf8')).toBe('Uncommitted worker work');
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    const resumed = new ForgeRuntime(f.deps);
+    await expect(resumed.previewOwnership(f.workspace.id)).resolves.toMatchObject({ directories: [] });
+    const tabId = await resumed.launch({ ...f.request, attemptId: 'second-attempt' });
+    expect(f.deps.sessions.getTab(tabId)).toMatchObject({ cwd: f.workspace.worktreePath, pluginMetadata: { 'forge-workers': { workerId: f.workspace.id } } });
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledTimes(2);
+  }, 15000);
+
+  it('does not rebind a replaced worker directory during rollback', async () => {
+    const f = await pausedWorkspace();
+    const original = path.join(f.host.home, 'original-worker');
+    f.commands.afterStart = service => {
+      if (service !== 'cloudx.service' || fs.existsSync(original)) return;
+      fs.renameSync(f.workspace.worktreePath, original);
+      fs.cpSync(original, f.workspace.worktreePath, { recursive: true });
+    };
+    await runPreparedUpdate(f);
+    expect(f.record.transition.restored).toBe(true);
+    const resumed = new ForgeRuntime(f.deps);
+    await expect(resumed.previewOwnership(f.workspace.id)).rejects.toThrow('ownership changed');
+    await expect(resumed.launch({ ...f.request, attemptId: 'second-attempt' })).rejects.toThrow('ownership changed');
+    expect(f.deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+  }, 15000);
+
   it.each([false, true])('restores a profile without prior Forge state after empty-store initialization (fresh coordinator: %s)', async freshCoordinator => {
     const f = await forgeUpdate();
     fs.unlinkSync(f.forgeFile);

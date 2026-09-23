@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -155,7 +156,8 @@ class RecoverySnapshot {
   readConversation({ tab, initialInput }) {
     const view = `codex-launches/${tab.id}`;
     const binding = this.json(`${view}/.cloudx-source.json`, true);
-    if (!isRecord(binding) || Object.keys(binding).sort().join(",") !== "dev,home,ino,sourceId,version" ||
+    if (!isRecord(binding) || Object.keys(binding).some(key => !["dev", "home", "ino", "sourceId", "version", "durable"].includes(key)) ||
+        binding.durable !== undefined && !validDurableIdentity(binding.durable) ||
         binding.version !== 1 || binding.sourceId !== "shared" ||
         ![binding.home, binding.sourceId, binding.dev, binding.ino].every(value => typeof value === "string") || !path.isAbsolute(binding.home))
       throw new Error(`Codex tab ${tab.id} has invalid source ownership.`);
@@ -293,9 +295,32 @@ function isRecord(value) {
 
 function assertSourceIdentity(binding) {
   safeDirectory(binding.home);
-  const home = fs.statSync(binding.home);
-  if (String(home.dev) !== binding.dev || String(home.ino) !== binding.ino)
-    throw new Error(`Codex source ownership changed: ${binding.home}`);
+  const fd = fs.openSync(binding.home, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try {
+    const home = fs.fstatSync(fd, { bigint: true });
+    let sameDevice = home.dev.toString() === binding.dev;
+    if (binding.durable) {
+      const { filesystemId, filesystemType, birthtimeNs, uid } = binding.durable;
+      // Match directoryIdentity.ts and filesystemIdentity.ts without depending on a built server.
+      const filesystem = execFileSync("/usr/bin/stat", ["--file-system", "--format=%t:%i", "--", "/proc/self/fd/3"], {
+        stdio: ["ignore", "pipe", "ignore", fd], env: { LC_ALL: "C" }, timeout: 3_000, maxBuffer: 256, encoding: "utf8",
+      });
+      if (filesystem !== `${filesystemType}:${filesystemId}\n` || home.birthtimeNs.toString() !== birthtimeNs || home.uid.toString() !== uid)
+        throw new Error(`Codex source ownership changed: ${binding.home}`);
+      sameDevice ||= ["ef53", "9123683e"].includes(filesystemType) && birthtimeNs !== "0";
+    }
+    const current = fs.lstatSync(binding.home, { bigint: true });
+    if (!home.isDirectory() || home.uid !== BigInt(process.getuid()) || home.ino.toString() !== binding.ino || !sameDevice ||
+        !current.isDirectory() || ["dev", "ino", "uid", "birthtimeNs"].some(key => home[key] !== current[key]) ||
+        fs.realpathSync(binding.home) !== path.resolve(binding.home))
+      throw new Error(`Codex source ownership changed: ${binding.home}`);
+  } finally { fs.closeSync(fd); }
+}
+
+function validDurableIdentity(value) {
+  return isRecord(value) && typeof value.filesystemId === "string" && /^[a-f0-9]{1,32}$/u.test(value.filesystemId) && !/^0+$/u.test(value.filesystemId) &&
+    typeof value.filesystemType === "string" && /^[a-f0-9]+$/u.test(value.filesystemType) &&
+    typeof value.birthtimeNs === "string" && /^\d+$/u.test(value.birthtimeNs) && typeof value.uid === "string" && /^\d+$/u.test(value.uid);
 }
 
 function safeDirectory(directory, optional = false) {

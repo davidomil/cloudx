@@ -137,7 +137,7 @@ describe('durable application of a confirmed downgrade snapshot', () => {
       fs.fsyncSync = fd => {
         sync(fd);
         if (boundary === 'after clearing' && fs.realpathSync('/proc/self/fd/' + fd) === record.dataDir &&
-            !fs.existsSync(path.join(record.dataDir, 'plugin-data'))) process.kill(process.pid, 'SIGKILL');
+            !fs.existsSync(${JSON.stringify(f.forgeFile)})) process.kill(process.pid, 'SIGKILL');
       };
       fs.copyFileSync = (source, target, mode) => {
         copy(source, target, mode);

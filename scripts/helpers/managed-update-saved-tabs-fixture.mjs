@@ -1,11 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { InstallerRunner, prepareManagedRelease } from "../install-cloudx.mjs";
 import { ManagedUpdate, UpdateHost } from "../managed-update.mjs";
 import { writeUpdateJson } from "../managed-update-store.mjs";
 
-export function seedSavedTabProfile({ root, home, dataDir, webUrl }) {
+export async function seedSavedTabProfile({ root, home, dataDir, repoRoot, webUrl }) {
+  const { SessionStateStore } = await import(pathToFileURL(path.join(repoRoot, "apps/server/dist/workspace/SessionStateStore.js")));
+  const { CodexStateSources } = await import(pathToFileURL(path.join(repoRoot, "apps/server/dist/plugins/CodexStateSources.js")));
   const cwd = path.join(root, "project");
   fs.mkdirSync(cwd);
   const timestamp = "2026-09-22T00:00:00.000Z";
@@ -27,7 +30,7 @@ export function seedSavedTabProfile({ root, home, dataDir, webUrl }) {
         { type: "pane", pane: { id: "saved-right", tabIds: ["saved-codex"], activeTabId: "saved-codex" } },
       ],
     } } }] };
-  writeUpdateJson(path.join(dataDir, "sessions.json"), { version: 1, activeTabId: "saved-shell", sessions });
+  await new SessionStateStore(dataDir).save({ version: 1, activeTabId: "saved-shell", sessions });
   writeUpdateJson(path.join(dataDir, "workspace.json"), workspace);
   fs.mkdirSync(path.join(dataDir, "context"));
   for (const { tab } of sessions) fs.writeFileSync(tab.contextPath, `Saved context for ${tab.id}.\n`, { mode: 0o600 });
@@ -35,10 +38,10 @@ export function seedSavedTabProfile({ root, home, dataDir, webUrl }) {
   const transcriptPath = path.join(codexHome, "sessions/2026/rollout-" + conversationId + ".jsonl");
   fs.mkdirSync(path.dirname(transcriptPath), { recursive: true });
   fs.writeFileSync(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd } })}\n{"type":"event_msg","payload":{"message":"Retain this exact conversation history."}}\n`, { mode: 0o600 });
-  const identity = fs.statSync(codexHome);
-  const launch = path.join(dataDir, "codex-launches/saved-codex");
-  fs.mkdirSync(launch, { recursive: true });
-  writeUpdateJson(path.join(launch, ".cloudx-source.json"), { version: 1, sourceId: "shared", home: codexHome, dev: String(identity.dev), ino: String(identity.ino) });
+  const sources = new CodexStateSources(dataDir, { CODEX_HOME: codexHome });
+  let launch;
+  try { launch = await sources.bind("saved-codex", await sources.resolve()); }
+  finally { await sources.dispose(); }
   writeUpdateJson(path.join(launch, ".cloudx-conversation.json"), { sessionId: conversationId, cwd, transcriptPath });
   const evidence = [transcriptPath,
     path.join(launch, ".cloudx-source.json"), path.join(launch, ".cloudx-conversation.json")]

@@ -4,10 +4,13 @@ const SHARED = "packages/shared/src/index.ts";
 const PANEL = "apps/web/src/ui/TerminalPanel.tsx";
 const API = "apps/web/src/api.ts";
 const CODEX = "apps/server/src/plugins/CodexTerminalPlugin.ts";
+export const CODEX_SOURCES = "apps/server/src/plugins/CodexStateSources.ts";
+export const CODEX_IDENTITY_FILES = ["apps/server/src/directoryIdentity.ts", "apps/server/src/filesystemIdentity.ts"];
 const PLUGINS = "packages/plugin-api/src/index.ts";
 
-export const SESSION_INTEGRATION_FILES = [STORE, SERVER, SHARED, PANEL, API, CODEX, PLUGINS];
+export const SESSION_INTEGRATION_FILES = [STORE, SERVER, SHARED, PANEL, API, CODEX, PLUGINS, CODEX_SOURCES];
 export const SESSION_PERSISTENCE_FILES = ["apps/server/src/workspace/SessionStateStore.ts", "apps/server/src/jsonStateFile.ts",
+  ...CODEX_IDENTITY_FILES,
   "apps/server/src/plugins/CodexConversationRecovery.ts", "apps/server/helpers/codex-conversation-hook.mjs"];
 
 // Give the recognized in-memory release one session authority, using the same
@@ -21,6 +24,8 @@ export function prepareSessionIntegration(readSource) {
   }
   function before(file, anchor, addition) { replace(file, anchor, addition + anchor); }
   function after(file, anchor, addition) { replace(file, anchor, anchor + addition); }
+
+  changes[CODEX_SOURCES] = prepareCodexSourceIntegration(changes[CODEX_SOURCES]);
 
   after(STORE, 'import type { ConfigValue } from "@cloudx/shared";\n', 'import type { RecoverTabRequest, TabRecovery } from "@cloudx/shared";\nimport type { SessionStateStore } from "./workspace/SessionStateStore.js";\n');
   before(STORE, '  constructor(\n', `  private readonly initialInputs = new Map<string, Record<string, unknown> | undefined>();
@@ -330,4 +335,30 @@ function SavedTerminalRecovery({ tab }: { tab: WorkspaceTab }) {
 
 function LiveTerminalPanel({ tab, active, uiScale }: { tab: WorkspaceTab; active: boolean; uiScale: number }) {`);
   return changes;
+}
+
+// Historical targets share this ownership reader even when they already persist sessions.
+export function prepareCodexSourceIntegration(source) {
+  if (source.includes("!isDurableDirectoryIdentity(record.durable)") && source.includes("sameDirectoryIdentity(") &&
+      source.includes('readDirectoryIdentity(home, "Codex source")')) return source;
+  function replace(before, after) {
+    if (source.split(before).length !== 2)
+      throw new Error("Managed Codex recovery does not recognize the target source ownership contract.");
+    source = source.replace(before, after);
+  }
+  function after(anchor, addition) { replace(anchor, anchor + addition); }
+  after('import path from "node:path";\n',
+    'import { readDirectoryIdentity, sameDirectoryIdentity, isDurableDirectoryIdentity, type DurableDirectoryIdentity } from "../directoryIdentity.js";\n');
+  after('  ino: string;\n', '  durable?: DurableDirectoryIdentity;\n');
+  replace('      Object.keys(record).sort().join(",") !==\n        "dev,home,ino,sourceId,version" ||\n',
+    '      Object.keys(record).some(key => !["dev", "home", "ino", "sourceId", "version", "durable"].includes(key)) ||\n' +
+    '      (record.durable !== undefined && !isDurableDirectoryIdentity(record.durable)) ||\n');
+  replace('    return {\n      sourceId: "shared",\n      home,\n      dev: String(after.dev),\n      ino: String(after.ino),\n    };\n',
+    '    const identity = await readDirectoryIdentity(home, "Codex source");\n' +
+    '    check();\n' +
+    '    if (identity.dev !== String(after.dev) || identity.ino !== String(after.ino)) throw new Error("Codex source directory changed.");\n' +
+    '    return { sourceId: "shared", home, dev: identity.dev, ino: identity.ino, durable: identity.durable };\n');
+  replace('    left.sourceId === right.sourceId && left.home === right.home && left.dev === right.dev && left.ino === right.ino\n',
+    '    left.sourceId === right.sourceId && sameDirectoryIdentity({ ...left, path: left.home }, { ...right, path: right.home })\n');
+  return source;
 }

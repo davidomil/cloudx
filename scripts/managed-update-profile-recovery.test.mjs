@@ -72,6 +72,38 @@ async function resumeRestoration(f, refreshedAt) {
 }
 
 describe('durable restoration of an interrupted profile copy', () => {
+  it('retains snapshot directories while replacing nested files and links without following redirects', () => {
+    const f = updateFixture({ activate: false });
+    const directory = path.join(f.dataDir, 'documentation');
+    const outside = path.join(f.host.home, 'unrelated');
+    write(path.join(outside, 'keep.txt'), 'Unrelated data');
+    write(path.join(directory, 'nested/original.txt'), 'Original nested data');
+    write(path.join(directory, 'file.txt'), 'Original file');
+    fs.symlinkSync(outside, path.join(directory, 'link'));
+    f.host.snapshot(f.record);
+    const identity = fs.statSync(directory, { bigint: true });
+    f.host.activate(f.record);
+    f.host.start(f.record);
+    fs.rmSync(path.join(directory, 'nested'), { recursive: true });
+    fs.symlinkSync(outside, path.join(directory, 'nested'));
+    fs.rmSync(path.join(directory, 'file.txt'));
+    write(path.join(directory, 'file.txt/target.txt'), 'Target directory');
+    fs.unlinkSync(path.join(directory, 'link'));
+    write(path.join(directory, 'link/target.txt'), 'Target link replacement');
+    write(path.join(directory, 'target-only/extra.txt'), 'New target data');
+
+    f.host.restore(f.record);
+
+    const restored = fs.statSync(directory, { bigint: true });
+    expect([restored.ino, restored.birthtimeNs]).toEqual([identity.ino, identity.birthtimeNs]);
+    expect(fs.readFileSync(path.join(directory, 'nested/original.txt'), 'utf8')).toBe('Original nested data');
+    expect(fs.readFileSync(path.join(directory, 'file.txt'), 'utf8')).toBe('Original file');
+    expect(fs.readlinkSync(path.join(directory, 'link'))).toBe(outside);
+    expect(fs.existsSync(path.join(directory, 'target-only'))).toBe(false);
+    expect(fs.readdirSync(outside)).toEqual(['keep.txt']);
+    expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('Unrelated data');
+  });
+
   it.each(['after clearing', 'during copying'])('restores the complete profile and services with a fresh coordinator after ENOSPC %s', async boundary => {
     const f = activatedUpdate();
     const failure = injectCopyFailure(f, boundary);
@@ -113,7 +145,7 @@ describe('durable restoration of an interrupted profile copy', () => {
       fs.fsyncSync = fd => {
         sync(fd);
         if (boundary === 'after clearing' && fs.realpathSync('/proc/self/fd/' + fd) === record.dataDir &&
-            !fs.existsSync(path.join(record.dataDir, 'plugin-data'))) process.kill(process.pid, 'SIGKILL');
+            !fs.existsSync(${JSON.stringify(f.forgeFile)})) process.kill(process.pid, 'SIGKILL');
       };
       fs.copyFileSync = (source, target, mode) => {
         copy(source, target, mode);

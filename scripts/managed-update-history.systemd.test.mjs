@@ -77,6 +77,7 @@ it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and i
       expect(JSON.parse(fixture.curl("/api/ready/terminals"))).toMatchObject({ status: "ready" });
       expect(fs.readFileSync(path.join(fixture.dataDir, "user-data.txt"), "utf8")).toBe("Preserve the active profile across the historical transition.\n");
       await fixture.expectSavedTabs();
+      await fixture.recoverAfterNextUpdate();
     }
     expect(fixture.calls.filter(call => call.command === "systemctl" && call.args.some(arg => ["start", "stop", "restart", "kill"].includes(arg)))
       .every(call => [fixture.webUnit, fixture.brokerUnit].includes(call.args.at(-1)))).toBe(true);
@@ -116,7 +117,7 @@ class HistoricalInstallation {
     fs.mkdirSync(imagegen, { recursive: true });
     fs.writeFileSync(path.join(imagegen, "SKILL.md"), "---\nname: imagegen\ndescription: Isolated fixture.\n---\nSynthetic fixture data.\n");
     fs.writeFileSync(path.join(this.dataDir, "user-data.txt"), "Preserve the active profile across the historical transition.\n");
-    if (savedTabs) this.savedTabs = seedSavedTabProfile({ root: this.root, home: this.home, dataDir: this.dataDir,
+    if (savedTabs) this.savedTabs = await seedSavedTabProfile({ root: this.root, home: this.home, dataDir: this.dataDir, repoRoot: this.repoRoot,
       webUrl: `http://127.0.0.1:${dependencyPort}/saved-dashboard?token=fixture-token` });
     // ASR/documentation HTTP dependencies and the Codex executable are fixtures;
     // CloudX services, recovery validation and supervised PTYs are production paths.
@@ -224,6 +225,30 @@ http.createServer((request, response) => {
   terminalLaunches() {
     return fs.existsSync(this.savedTabs.terminalLaunches)
       ? fs.readFileSync(this.savedTabs.terminalLaunches, "utf8").trim().split("\n").map(line => JSON.parse(line)) : [];
+  }
+
+  async recoverAfterNextUpdate() {
+    const expected = this.savedTabs;
+    const response = JSON.parse(this.curl("/api/tabs/saved-codex/recover", ["--fail", "-X", "POST", "-H", "Content-Type: application/json",
+      "-H", `Origin: https://127.0.0.1:${this.port}`, "--data", JSON.stringify({ action: "resume-conversation", sessionId: expected.conversationId })]));
+    expect(response.id).toBe("saved-codex");
+    expected.recoveryLaunches++;
+    await expect.poll(() => this.terminalLaunches().length).toBe(expected.recoveryLaunches);
+    const launch = this.terminalLaunches().at(-1);
+    expect(launch.args.slice(-2)).toEqual(["resume", expected.conversationId]);
+    expect(launch.args.join(" ")).not.toContain("NEVER_REPLAY");
+    expect(() => process.kill(launch.pid, 0)).not.toThrow();
+    expect(fs.existsSync(expected.terminalInput)).toBe(false);
+    for (const { file, bytes } of expected.evidence) {
+      // The broker-era plugin resets the previous execution's receipt at launch;
+      // this synthetic Codex process does not emit a new native receipt.
+      if (path.basename(file) === ".cloudx-conversation.json") expect(fs.existsSync(file)).toBe(false);
+      else expect(fs.readFileSync(file)).toEqual(bytes);
+    }
+    const saved = JSON.parse(fs.readFileSync(path.join(this.dataDir, "sessions.json"), "utf8"))
+      .sessions.find(({ tab }) => tab.id === "saved-codex");
+    expect(saved.initialInput.resume).toEqual({ mode: "session", sessionId: expected.conversationId });
+    expect(saved.initialInput.prompt).toBeUndefined();
   }
 
   async recoverPreservedConversationInBrowser() {
