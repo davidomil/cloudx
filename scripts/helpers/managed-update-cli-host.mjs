@@ -20,6 +20,7 @@ fs.readFileSync = (file, ...options) => readFileSync(
     ? path.join(home, 'update-cgroup') : file, ...options);
 
 function commandResult(command, args, options = {}) {
+  fs.appendFileSync(path.join(home, 'commands.jsonl'), JSON.stringify({ command, args, cwd: options.cwd }) + '\n');
   if (command === 'systemctl' && args[0] === '--user' && args[1] === 'show') {
     const name = args[2];
     const unit = name === 'cloudx-settings-update.service'
@@ -28,6 +29,10 @@ function commandResult(command, args, options = {}) {
         Id: name, LoadState: 'loaded', ActiveState: 'inactive', MainPID: '0', ControlGroup: '',
         WorkingDirectory: repoRoot, EnvironmentFiles: `${home}/.config/cloudx/cloudx.env (ignore_errors=no)`,
         FragmentPath: `${home}/.config/systemd/user/${name}`, NeedDaemonReload: 'no', DropInPaths: '',
+        ...(process.env.CLOUDX_TEST_UPDATE_ACTIVE === name ? {
+          ActiveState: 'active', MainPID: '123', ControlGroup: `/user.slice/${name}`,
+          InvocationID: 'd'.repeat(32), KillMode: 'control-group', SendSIGKILL: 'yes',
+        } : {}),
       };
     const fields = args.find(arg => arg.startsWith('--property=')).slice(11).split(',');
     return result(fields.map(key => `${key}=${unit[key] ?? ''}`).join('\n'));
@@ -43,14 +48,18 @@ function commandResult(command, args, options = {}) {
     return result('', worker.stderr);
   }
   if (command === process.execPath && args[0]?.startsWith(`${stateDir}${path.sep}`)) {
-    return spawnSync(command, args, { ...options, timeout: 10000 });
+    const output = spawnSync(command, args, { ...options, timeout: 10000 });
+    fs.appendFileSync(path.join(home, 'commands.jsonl'), JSON.stringify({ command, args, status: output.status }) + '\n');
+    return output;
   }
   if (command === 'git' && args.join(' ') === 'rev-parse --show-toplevel') return result(repoRoot);
   if (command === 'git' && args.join(' ') === 'rev-parse HEAD')
     return process.env.CLOUDX_TEST_UPDATE_FAILURE === 'git'
-      ? result('fixture partial output', 'fixture preparation failure', 42) : result('b'.repeat(40));
+      ? result('fixture partial output', 'fixture preparation failure', 42)
+      : result((options.cwd === repoRoot ? 'b' : 'a').repeat(40));
   if (command === 'git') {
     if (args[0] === 'write-tree') return result('c'.repeat(40));
+    if (args[0] === 'status') return result('');
     if (args[0] === 'clone') {
       fs.mkdirSync(args.at(-1), { recursive: true });
       return result('');
@@ -67,7 +76,15 @@ function commandResult(command, args, options = {}) {
   const release = path.join(stateDir, JSON.parse(fs.readFileSync(path.join(stateDir, 'latest.json'), 'utf8')).id, 'release');
   if (['node', 'npm', 'python3', path.join(release, '.update-tools/uv/bin/pip'), path.join(release, '.update-tools/uv/bin/uv')].includes(command)) {
     if (options.cwd !== release) throw new Error(`Preparation command escaped staged release: ${options.cwd}`);
-    if (command === 'npm' && args.join(' ') === 'run build') return result('', 'fixture build failure', 42);
+    if (command === 'npm' && args.join(' ') === 'run build') {
+      if (process.env.CLOUDX_TEST_UPDATE_FAILURE === 'build') return result('', 'fixture build failure', 42);
+      const server = path.join(release, 'apps/server/dist');
+      fs.mkdirSync(server, { recursive: true });
+      fs.writeFileSync(path.join(server, 'index.js'), '// fixture server entry\n');
+      fs.writeFileSync(path.join(server, 'server.js'), '// fixture /api/ready/terminals\n');
+      fs.writeFileSync(path.join(release, 'package-lock.json'), '{}');
+      return result('fixture build complete');
+    }
     return result('');
   }
   throw new Error(`Unexpected fixture host command: ${command} ${args.join(' ')}`);

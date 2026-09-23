@@ -1,6 +1,6 @@
 export interface CloudxUpdateRun {
   id: string;
-  state: "running" | "succeeded" | "failed";
+  state: "running" | "prepared" | "succeeded" | "failed";
   message: string;
   startedAt: string;
   finishedAt?: string;
@@ -135,13 +135,13 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
   if (value.run !== undefined) {
     const run = value.run;
     if (!record(run) || !text(run.id, 128) || !text(run.message)
-      || typeof run.state !== "string" || !["running", "succeeded", "failed"].includes(run.state)
+      || typeof run.state !== "string" || !["running", "prepared", "succeeded", "failed"].includes(run.state)
       || !timestamp(run.startedAt)
       || (run.finishedAt !== undefined && !timestamp(run.finishedAt))
       || (run.targetCommit !== undefined && !commit(run.targetCommit))
       || ["phase", "component", "cause", "recoveryAction"].some(key => run[key] !== undefined && !text(run[key]))
       || (run.resumable !== undefined && typeof run.resumable !== "boolean")
-      || (run.resumable === true && (run.state !== "failed" || !runId(run.id) || !commit(run.targetCommit)))) {
+      || (run.resumable === true && (!["failed", "prepared"].includes(run.state) || !runId(run.id) || !commit(run.targetCommit)))) {
       throw new Error("Invalid CloudX update run.");
     }
     result.run = {

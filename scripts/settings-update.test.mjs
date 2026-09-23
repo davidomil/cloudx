@@ -142,6 +142,46 @@ function installation({ home, checkout = "checkout" } = {}) {
 }
 
 describe("installed Settings updater", () => {
+  it("stages a no-start update without interruption consent and requires consent to activate its prepared run", () => {
+    const { updater, host, calls } = installation();
+    host.runtime.requiresInterruption = true;
+    const started = updater.start(TARGET_COMMIT, { noStart: true });
+    expect(started.run).toMatchObject({ state: "running", message: expect.stringContaining("without activating") });
+    expect(updater.read(started.run.id)).toMatchObject({ noStart: true, confirmInterruption: false });
+    host.coordinator = args => completeCoordinator(args.at(-1), host.now, { state: "prepared", phase: "prepared", resumable: true });
+    expect(updater.run(started.run.id).state).toBe("prepared");
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: started.run.id })).toMatchObject({ confirmation: { targetCommit: TARGET_COMMIT } });
+    expect(calls.some(([command]) => command === "systemd-run")).toBe(false);
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: started.run.id, confirmInterruption: true }).run.state).toBe("running");
+    expect(updater.read(started.run.id)).toMatchObject({ noStart: false, confirmInterruption: true });
+  });
+
+  it("rejects no-start resume before launching restoration of an interrupted installation", () => {
+    const { updater, host, calls } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    const saved = updater.read(started.run.id);
+    saved.transition = { mutating: true };
+    saved.run = { ...saved.run, state: "failed", resumable: true };
+    updater.save(saved);
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    calls.length = 0;
+    expect(() => updater.start(TARGET_COMMIT, { resumeRunId: saved.run.id, noStart: true })).toThrow("restoration is pending");
+    expect(calls).toEqual([]);
+    expect(updater.read(saved.run.id)).toEqual(saved);
+  });
+
+  it("retains no-start when resume itself discovers an interrupted preparation coordinator", () => {
+    const { updater, host } = installation();
+    const started = updater.start(TARGET_COMMIT, { noStart: true });
+    expect(updater.read(started.run.id).run.state).toBe("running");
+    host.unit = { LoadState: "not-found", ActiveState: "inactive" };
+    host.now = new Date(host.now.getTime() + 60000);
+    expect(updater.start(TARGET_COMMIT, { resumeRunId: started.run.id }).run.state).toBe("running");
+    expect(updater.read(started.run.id).noStart).toBe(true);
+  });
+
   it.each([undefined, "", "main", "a".repeat(39), "A".repeat(40), "--upload-pack=other"])(
     "rejects invalid target %j before inspecting or starting host services",
     (targetCommit) => {

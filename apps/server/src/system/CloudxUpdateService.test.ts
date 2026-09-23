@@ -127,21 +127,24 @@ describe("CloudxUpdateService", () => {
     expect(execute.mock.calls.at(-1)![1].slice(-2)).toEqual([target, "--confirm-interruption"]);
   });
 
-  it("resumes the persisted run after restart without a remote or checkout lookup", async () => {
+  it.each(["failed", "prepared"])("resumes the persisted %s run without a remote or checkout lookup", async state => {
     const { service, execute, catalog } = fixture();
     const id = "11111111-1111-4111-8111-111111111111";
-    const failed = { available: true, run: { id, state: "failed", startedAt: "2026-09-15T00:00:00Z", message: "Download failed.", targetCommit: target, resumable: true } };
-    execute.mockResolvedValue({ stdout: JSON.stringify(failed) });
+    const status = { available: true, run: { id, state, startedAt: "2026-09-15T00:00:00Z", message: "Resume the saved update.", targetCommit: target, resumable: true } };
+    execute.mockResolvedValue({ stdout: JSON.stringify(status) });
     await service.start({ ...selection, resumeRunId: id, confirmInterruption: true });
     expect(execute.mock.calls.at(-1)![1].slice(-3)).toEqual([target, "--confirm-interruption", `--resume=${id}`]);
     expect(execute.mock.calls.some(([file]) => file === "git")).toBe(false);
     expect(catalog.preview).not.toHaveBeenCalled();
   });
 
-  it.each(["target", "identity", "not resumable"])("rejects a resume whose %s differs from the persisted run", async scenario => {
+  it.each([
+    ["failed", "target"], ["failed", "identity"], ["failed", "not resumable"],
+    ["prepared", "target"], ["prepared", "identity"], ["prepared", "not resumable"],
+  ])("rejects a %s resume whose %s differs from the persisted run", async (state, scenario) => {
     const { service, execute } = fixture();
     const id = "11111111-1111-4111-8111-111111111111";
-    execute.mockResolvedValue({ stdout: JSON.stringify({ available: true, run: { id, state: "failed", startedAt: "2026-09-15T00:00:00Z", message: "Download failed.", targetCommit: target, resumable: scenario !== "not resumable" } }) });
+    execute.mockResolvedValue({ stdout: JSON.stringify({ available: true, run: { id, state, startedAt: "2026-09-15T00:00:00Z", message: "Resume the saved update.", targetCommit: target, resumable: scenario !== "not resumable" } }) });
     await expect(service.start({ ...selection, targetCommit: scenario === "target" ? installed : target,
       resumeRunId: scenario === "identity" ? "22222222-2222-4222-8222-222222222222" : id })).rejects.toMatchObject({ statusCode: 409 });
     expect(execute.mock.calls.some(([, args]) => args[1] === "start")).toBe(false);

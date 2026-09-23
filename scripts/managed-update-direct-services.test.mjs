@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { UpdateHost, validateSavedTransition } from './managed-update.mjs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ManagedUpdate, UpdateHost, validateSavedTransition } from './managed-update.mjs';
 import { BROKER, cleanupUpdates, git, updateFixture, write } from './helpers/managed-update-rollback-fixture.mjs';
 
 afterEach(cleanupUpdates);
@@ -68,6 +68,57 @@ describe('service transitions to targets without persistent terminal brokers', (
     expect(f.states[BROKER].ActiveState).toBe(originalBroker);
     expect(git(f.root, 'rev-parse', 'HEAD')).toBe(record.transition.sourceCommit);
     expect(fs.statSync(f.brokerFile).mode & 0o777).toBe(0o640);
+  });
+
+  it.each(['active', 'inactive'])('restores the custom broker state at activation after it was %s during preparation', async originalBroker => {
+    const f = directWebUpdate({ originalBroker });
+    f.host.prepareDirectBroker(f.record);
+    Object.assign(f.record.transition, { mutating: false, localPatch: f.host.localChanges(),
+      environmentText: fs.readFileSync(f.host.paths.envPath, 'utf8') });
+    vi.spyOn(f.host, 'planData').mockImplementation(() => {});
+    f.record.noStart = true;
+    const execute = () => new ManagedUpdate({ record: f.record, host: f.host, save: f.save }).run();
+    expect(await execute()).toMatchObject({ state: 'prepared' });
+    const activationState = originalBroker === 'active' ? 'inactive' : 'active';
+    Object.assign(f.states[BROKER], { ActiveState: activationState, MainPID: activationState === 'active' ? '100' : '0',
+      InvocationID: activationState === 'active' ? 'b'.repeat(32) : '', ControlGroup: activationState === 'active' ? '/cloudx-fixture/broker' : '' });
+    f.record.noStart = false;
+    f.record.confirmInterruption = true;
+    expect(await execute()).toMatchObject({ state: 'failed', phase: 'verify' });
+    expect(f.record.transition.directBroker.state).toContain(`ActiveState=${activationState}`);
+    expect(f.states[BROKER].ActiveState).toBe(activationState);
+    expect(fs.readFileSync(f.brokerFile, 'utf8')).toBe(f.brokerUnit);
+    expect(f.events.some(event => event.action === 'start' && event.service === BROKER)).toBe(activationState === 'active');
+  });
+
+  it('prepares again before activating when an owned broker appears during the preparation pause', async () => {
+    const f = directWebUpdate({ originalBroker: 'missing' });
+    f.host.prepareDirectBroker(f.record);
+    Object.assign(f.record.transition, { mutating: false, localPatch: f.host.localChanges(),
+      environmentText: fs.readFileSync(f.host.paths.envPath, 'utf8') });
+    vi.spyOn(f.host, 'planData').mockImplementation(() => {});
+    f.record.noStart = true;
+    const execute = () => new ManagedUpdate({ record: f.record, host: f.host, save: f.save }).run();
+    expect(await execute()).toMatchObject({ state: 'prepared' });
+    expect(f.record.transition.directBroker).toBeUndefined();
+
+    f.states[BROKER].LoadState = 'loaded';
+    f.record.noStart = false;
+    expect(await execute()).toMatchObject({ state: 'failed', phase: 'quiesce', component: 'services', resumable: true });
+    expect(f.record.transition.completed).toEqual([]);
+    expect(f.record.transition.mutating).toBe(false);
+    expect(f.events).toEqual([]);
+    expect(fs.readFileSync(f.brokerFile, 'utf8')).toBe(f.brokerUnit);
+
+    const prepare = vi.spyOn(f.host, 'prepare').mockImplementation(record => f.host.prepareDirectBroker(record));
+    const checkGuard = vi.fn(() => expect(fs.readFileSync(f.brokerFile, 'utf8'))
+      .toContain(`ConditionPathExists=${f.root}/apps/server/dist/terminal/broker.js`));
+    f.commands.afterStart = checkGuard;
+    expect(await execute()).toMatchObject({ state: 'failed', phase: 'verify' });
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(checkGuard).toHaveBeenCalledOnce();
+    expect(f.record.transition.directBroker.file).toBe(f.brokerFile);
+    expect(fs.readFileSync(f.brokerFile, 'utf8')).toBe(f.brokerUnit);
   });
 
   it('journals and restores the owned backing file when systemd reports a runtime unit link', () => {

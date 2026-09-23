@@ -23,6 +23,7 @@ export function parseUpdateArguments(argv) {
     else if (flag === '--status') options.status = true;
     else if (flag === '--non-interactive') options.nonInteractive = true;
     else if (flag === '--verbose') options.verbose = true;
+    else if (flag === '--no-start') options.noStart = true;
     else if (flag === '--update' || flag === '--yes') continue;
     else throw new Error(`Unsupported managed update option: ${flag}`);
   }

@@ -77,7 +77,7 @@ export class CloudxUpdateService {
         throw conflict("The recovery snapshot selection changed. Check update status and review the current data restoration notice.");
       }
       if (request.resumeRunId) {
-        if (status.run?.state !== "failed" || !status.run.resumable || status.run.id !== request.resumeRunId
+        if ((status.run?.state !== "failed" && status.run?.state !== "prepared") || !status.run.resumable || status.run.id !== request.resumeRunId
           || status.run.targetCommit !== request.targetCommit) {
           throw conflict("This update cannot be resumed. Check update status for the current recovery action.");
         }

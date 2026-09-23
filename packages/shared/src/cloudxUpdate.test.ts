@@ -18,6 +18,20 @@ describe("CloudX update status", () => {
     expect(parseCloudxUpdateStatus(status)).toEqual(status);
   });
 
+  it("keeps a prepared build distinct from runtime success and available for activation", () => {
+    const status = { available: true, run: { ...run, id: "11111111-1111-4111-8111-111111111111",
+      state: "prepared", targetCommit: "b".repeat(40), phase: "prepared", resumable: true,
+      message: "The selected build is prepared but has not been activated.", finishedAt: "2026-09-15T00:03:00.000Z" } };
+    expect(parseCloudxUpdateStatus(status)).toEqual(status);
+  });
+
+  it.each([
+    { id: "not-a-run" }, { targetCommit: undefined }, { targetCommit: "main" }, { state: "succeeded" },
+  ])("rejects an unsafe prepared activation identity: %j", fields => {
+    expect(() => parseCloudxUpdateStatus({ available: true, run: { ...run, state: "prepared",
+      id: "11111111-1111-4111-8111-111111111111", targetCommit: "b".repeat(40), resumable: true, ...fields } })).toThrow();
+  });
+
   it("projects target-bound confirmation and recovery diagnostics without private paths", () => {
     const status = {
       available: true,

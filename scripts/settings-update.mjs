@@ -244,7 +244,8 @@ export class SettingsUpdater {
       typeof record.repoRoot !== "string" ||
       !path.isAbsolute(record.repoRoot) ||
       run?.id !== id ||
-      !["running", "succeeded", "failed"].includes(run.state) ||
+      !["running", "prepared", "succeeded", "failed"].includes(run.state) ||
+      (record.noStart !== undefined && typeof record.noStart !== "boolean") ||
       typeof run.message !== "string" ||
       !Number.isFinite(Date.parse(run.startedAt)) ||
       (run.finishedAt !== undefined &&
@@ -347,8 +348,9 @@ export class SettingsUpdater {
     };
   }
 
-  start(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId, verbose = false } = {}) {
+  start(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId, verbose = false, noStart } = {}) {
     updateCommit(targetCommit);
+    if (noStart !== undefined && typeof noStart !== "boolean") throw new Error("Invalid no-start option.");
     if (restoreSnapshotRunId && !RUN_ID.test(restoreSnapshotRunId)) throw new Error("Invalid snapshot identifier.");
     let saved;
     if (resumeRunId) {
@@ -356,6 +358,8 @@ export class SettingsUpdater {
       this.selectSavedInstallation(saved);
       if (saved.targetCommit !== targetCommit) throw new Error("The selected update cannot be resumed.");
     }
+    noStart ??= saved?.run.state !== "prepared" && saved?.noStart === true;
+    if (noStart && saved?.transition?.mutating) throw new Error("Cannot use --no-start while installation restoration is pending. Resume without --no-start to restore the saved installation.");
     const previousRunId = this.pointer("latest")?.id;
     const status = this.status();
     if (!status.available || status.run?.state === "running") return status;
@@ -371,13 +375,13 @@ export class SettingsUpdater {
       };
     if (resumeRunId) {
       saved = this.read(resumeRunId);
-      if (saved.run.state !== "failed" || !saved.run.resumable) throw new Error("The selected update cannot be resumed.");
+      if (!["failed", "prepared"].includes(saved.run.state) || !saved.run.resumable) throw new Error("The selected update cannot be resumed.");
     }
     if (!saved?.transition?.mutating) {
       const runtimePlan = this.runtimeInspector({ paths: { ...this.paths, dataDir: this.dataDir }, commands: this.commands,
         target: { kind: this.serviceName ? "web" : "standard", serviceNames: this.serviceName ? [this.serviceName] : SERVICE_NAMES }, targetRuntime: CURRENT_TERMINAL_CONTRACT });
       if (runtimePlan.blockers.length) return { ...status, available: false, unavailableReason: runtimePlan.blockers.map(item => item.message).join(" ") };
-      if (runtimePlan.requiresInterruption && !confirmInterruption && !saved?.confirmInterruption) {
+      if (!noStart && runtimePlan.requiresInterruption && !confirmInterruption && !saved?.confirmInterruption) {
         const restoration = status.confirmation?.targetCommit === targetCommit && status.confirmation.restoreSnapshotRunId ? status.confirmation : undefined;
         const confirmation = restoration ? { ...restoration, requiresInterruption: true } : {
           targetCommit, message: "This update must interrupt terminal processes. Saved tabs, layouts and exact saved conversations will be preserved for explicit recovery. Commands and prompts will not be replayed. " + (runtimePlan.recovery?.warnings ?? []).join(" "),
@@ -398,12 +402,12 @@ export class SettingsUpdater {
         targetCommit,
         state: "running",
         message:
-          "Updating CloudX. This page will reconnect after the services restart.",
+          noStart ? "Preparing CloudX without activating it or restarting services." : "Updating CloudX. This page will reconnect after the services restart.",
         startedAt: this.now().toISOString(),
       },
     };
     if (resumeRunId) {
-      if (record.targetCommit !== targetCommit || record.run.state !== "failed" || !record.run.resumable) throw new Error("The selected update cannot be resumed.");
+      if (record.targetCommit !== targetCommit || !["failed", "prepared"].includes(record.run.state) || !record.run.resumable) throw new Error("The selected update cannot be resumed.");
       record.run.state = "running";
       record.run.resumable = false;
       record.run.startedAt = this.now().toISOString();
@@ -416,6 +420,7 @@ export class SettingsUpdater {
       record.confirmInterruption ||= confirmInterruption;
       if (restoreSnapshotRunId) record.restoreSnapshotRunId = restoreSnapshotRunId;
     }
+    record.noStart = noStart;
     record.verbose = record.verbose === true || verbose === true;
     this.stage(record);
     const environmentFile = this.launchEnvironment(record);
@@ -526,7 +531,7 @@ function main() {
       cli: record.cli, service: record.service, port: record.port, host: record.host });
     if (record.envPath) updater.paths.envPath = record.envPath;
     const run = updater.run(dataDir);
-    if (run.state !== "succeeded") process.exitCode = 1;
+    if (!["succeeded", "prepared"].includes(run.state)) process.exitCode = 1;
     return;
   }
   if (!["status", "start"].includes(action) || !dataDir || !/^\d+$/.test(serverPid ?? "") ||

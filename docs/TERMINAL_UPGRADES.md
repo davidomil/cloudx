@@ -31,6 +31,26 @@ needed, `--host`. Its EnvironmentFile must explicitly identify the data
 directory. Settings initiates updates for the standard installed service
 set.
 
+## Preparation without activation
+
+Add `--no-start` to prepare dependencies and build the selected target
+without stopping, starting or restarting installed services. The run
+reports `prepared`, not runtime success; the installed checkout, runtime
+and profile remain in use.
+
+After preparation completes, use the printed retained CLI command with
+`--resume <update-id>` and omit `--no-start` to activate that target.
+For standard installed services, Settings offers **Activate prepared update**
+for the same run.
+Activation rechecks the build, local work, configuration and live
+service state, then requests any required interruption or
+data-restoration consent.
+
+A failed or interrupted preparation retains `--no-start` when resumed.
+Repeating `--resume <update-id> --no-start` keeps a prepared run
+inactive. If an earlier activation still needs restoration, `--no-start`
+is rejected; resume without it to restore the installation.
+
 ## What the coordinator changes
 
 Before downtime, the updater prepares the selected commit and its

@@ -248,6 +248,47 @@ describe("CloudX updates", () => {
     expect(reload).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])("activates a prepared build only on request and reloads after runtime success, interruption consent: %s", async requiresInterruption => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const targetCommit = "c".repeat(40);
+    const prepared: CloudxUpdateStatus = { available: true, run: { id, state: "prepared", targetCommit, resumable: true,
+      startedAt: "2026-09-15T04:00:00.000Z", message: "The selected build is prepared but has not been activated." } };
+    let current = run("running", id);
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const request = JSON.parse(init.body as string);
+        current = requiresInterruption && !request.confirmInterruption
+          ? { ...prepared, confirmation: { targetCommit, message: "Activation must interrupt terminal sessions." } }
+          : run("running", id);
+      }
+      return reply(current);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const container = await mount(undefined, async () => { throw new Error("GitHub unavailable."); });
+    current = prepared;
+    await poll();
+    expect(container.textContent).toContain("prepared but has not been activated");
+    expect(container.textContent).toContain("Prepared target: cccccccccccc");
+    expect(button("Activate prepared update").disabled).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    await click("Activate prepared update");
+    if (requiresInterruption) {
+      expect(button("Confirm interruption and continue").disabled).toBe(true);
+      expect(reload).not.toHaveBeenCalled();
+      await act(async () => (container.querySelector('input[type="checkbox"]') as HTMLInputElement).click());
+      await click("Confirm interruption and continue");
+    }
+    expect(reload).not.toHaveBeenCalled();
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([, init]) => JSON.parse(init!.body as string))).toEqual([
+      { channel: "main", targetCommit, resumeRunId: id },
+      ...(requiresInterruption ? [{ channel: "main", targetCommit, resumeRunId: id, confirmInterruption: true }] : []),
+    ]);
+    current = run("succeeded", id);
+    await poll();
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])("requires exact snapshot consent before resuming data restoration, terminal interruption: %s", async requiresInterruption => {
     const id = "11111111-1111-4111-8111-111111111111";
     const snapshotId = "22222222-2222-4222-8222-222222222222";

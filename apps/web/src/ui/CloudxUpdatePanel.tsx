@@ -165,7 +165,7 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
   }
 
   async function resume(consent: CloudxUpdateConsent = {}) {
-    if (!status?.available || status.run?.state !== "failed" || !status.run.resumable || !status.run.targetCommit || checking) return;
+    if (!status?.available || (status.run?.state !== "failed" && status.run?.state !== "prepared") || !status.run.resumable || !status.run.targetCommit || checking) return;
     await launch({ channel, targetCommit: status.run.targetCommit, resumeRunId: status.run.id, ...consent });
   }
 
@@ -227,8 +227,9 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
 export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }) {
   const { status, preview, channel, previewLoading, starting, checking, notice, error } = update;
   const running = status?.run?.state === "running";
+  const prepared = status?.run?.state === "prepared";
   const canUpdate = preview?.target && preview.state !== "unavailable";
-  const canResume = status?.run?.state === "failed" && status.run.resumable === true;
+  const canResume = (status?.run?.state === "failed" || prepared) && status?.run?.resumable === true;
   const selectedTargetDiffers = preview?.target?.commit !== status?.run?.targetCommit;
   const confirmingResume = canResume && status?.confirmation?.targetCommit === status.run?.targetCommit;
   const confirmation = confirmingResume || status?.confirmation?.targetCommit === preview?.target?.commit ? status?.confirmation : undefined;
@@ -252,14 +253,14 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
     {status?.run?.component ? <p>Affected component: {status.run.component}</p> : null}
     {status?.run?.cause ? <p>Cause: {status.run.cause}</p> : null}
     {status?.run?.recoveryAction ? <p>Recovery: {status.run.recoveryAction}</p> : null}
-    {canResume ? <p>Resume target: <code>{status.run?.targetCommit?.slice(0, 12)}</code>. Resume continues this saved update.</p> : null}
+    {canResume ? <p>{prepared ? "Prepared target" : "Resume target"}: <code>{status?.run?.targetCommit?.slice(0, 12)}</code>. {prepared ? "Activation restarts CloudX and verifies the prepared build." : "Resume continues this saved update."}</p> : null}
     {notice ? <p role="status">{notice}</p> : null}
     {error ? <p role="alert">{error}</p> : null}
     {confirmation ? <UpdateConfirmation key={`${confirmation.targetCommit}:${confirmation.message}:${confirmation.restoreSnapshotRunId}:${confirmation.requiresInterruption}`} confirmation={confirmation}
       disabled={confirmingResume ? !status?.available || starting || checking : startDisabled}
       continueUpdate={consent => confirmingResume ? update.resume(consent) : update.start(consent)} /> : null}
     {canResume && !confirmation ? <ControlButton tone="primary" onClick={() => void update.resume()} disabled={!status?.available || starting || checking}>
-      {starting ? "Resuming update…" : "Resume update"}
+      {prepared ? starting ? "Activating update…" : "Activate prepared update" : starting ? "Resuming update…" : "Resume update"}
     </ControlButton> : null}
     {!confirmation || confirmingResume && selectedTargetDiffers ? <ControlButton tone="primary" onClick={() => void update.start()} disabled={startDisabled}>
       {starting ? "Starting update…" : running ? "Updating CloudX…" : canResume ? "Start selected target" : "Update CloudX and dependencies"}

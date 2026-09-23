@@ -61,6 +61,66 @@ function fixture() {
 }
 
 describe('managed update host with real Git and recovery files', () => {
+  it('keeps a prepared target inactive and verifies it after a later explicit activation', async () => {
+    const f = fixture();
+    f.record.noStart = true;
+    const execute = record => new ManagedUpdate({ record, save: f.save, host: f.host }).run();
+    expect(await execute(f.record)).toMatchObject({ state: 'prepared' });
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.old);
+    expect(fs.lstatSync(path.join(f.root, 'apps/server/dist')).isSymbolicLink()).toBe(false);
+    expect(f.calls.filter(([command, args]) => command === 'systemctl' && args[1] !== 'show')).toEqual([]);
+    const resumed = JSON.parse(fs.readFileSync(f.recordPath));
+    resumed.noStart = false;
+    vi.spyOn(f.host, 'start').mockImplementation(() => {});
+    const verify = vi.spyOn(f.host, 'verify').mockImplementation(record => {
+      expect(record.run.state).toBe('running');
+      expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.target);
+      expect(fs.readFileSync(path.join(f.root, 'apps/server/dist/index.js'), 'utf8')).toContain('new');
+    });
+    expect(await execute(resumed)).toMatchObject({ state: 'succeeded' });
+    expect(verify).toHaveBeenCalledOnce();
+    expect(f.build).toHaveBeenCalledOnce();
+  });
+
+  it.each(['local work', 'configuration', 'built artifact'])('rejects changed %s before activating a prepared target', async change => {
+    const f = fixture();
+    f.record.noStart = true;
+    const execute = record => new ManagedUpdate({ record, save: f.save, host: f.host }).run();
+    await execute(f.record);
+    const resumed = JSON.parse(fs.readFileSync(f.recordPath));
+    resumed.noStart = false;
+    if (change === 'local work') write(f.root, 'local.txt', 'new operator edit');
+    if (change === 'configuration') fs.appendFileSync(f.envPath, 'CLOUDX_PORT=4443\n');
+    if (change === 'built artifact') write(resumed.transition.release, 'apps/server/dist/index.js', 'unverified changed bytes');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await execute(resumed)).toMatchObject({ state: 'failed', phase: 'quiesce', resumable: true });
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.old);
+    expect(f.calls.filter(([command, args]) => command === 'systemctl' && args[1] !== 'show')).toEqual([]);
+    expect(fs.readFileSync(path.join(f.root, 'apps/server/dist/index.js'), 'utf8')).toContain('running-older-than-checkout');
+  });
+
+  it('captures service state at activation instead of restoring the state from preparation', async () => {
+    const f = fixture();
+    f.record.noStart = true;
+    await new ManagedUpdate({ record: f.record, save: f.save, host: f.host }).run();
+    const oldInspect = f.commands.inspect;
+    const oldRun = f.commands.run;
+    let active = true;
+    f.commands.inspect = (command, args, options) => {
+      const result = oldInspect(command, args, options);
+      return active && command === 'systemctl' && args[2] === 'cloudx-asr.service'
+        ? result.replace('ActiveState=inactive', 'ActiveState=active').replace('MainPID=0', 'MainPID=456') : result;
+    };
+    f.commands.run = (command, args, options) => {
+      if (command === 'systemctl' && args[1] === 'stop' && args.includes('cloudx-asr.service')) active = false;
+      oldRun(command, args, options);
+    };
+    f.record.noStart = false;
+    f.host.quiesce(f.record);
+    expect(f.record.transition.serviceStates['cloudx-asr.service']).toContain('ActiveState=active');
+    expect(f.record.transition.serviceStates['cloudx-asr.service']).toContain('MainPID=456');
+  });
+
   it.each(['local staged work', 'local work with trailing whitespace  \n', '\0binary\x01work'])('prepares without changing checkout, local work, running build or saved configuration (%j)', localWork => {
     const f = fixture();
     write(f.root, 'local.txt', localWork); git(f.root, 'add', 'local.txt');

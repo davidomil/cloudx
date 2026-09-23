@@ -29,6 +29,43 @@ function transition() {
 }
 
 describe('durable managed transition', () => {
+  it('retains a prepared release until an explicit activation resumes and verifies the target', async () => {
+    const f = transition();
+    f.record.noStart = true;
+    expect(await f.execute(f.record)).toMatchObject({ state: 'prepared', resumable: true, phase: 'prepared' });
+    expect(f.actions).toEqual(['prepare']);
+    expect(fs.readFileSync(f.data, 'utf8')).toContain('"schema":1');
+    const prepared = JSON.parse(fs.readFileSync(f.journal));
+    expect(await f.execute(prepared)).toMatchObject({ state: 'prepared' });
+    expect(f.actions).toEqual(['prepare']);
+
+    prepared.noStart = false;
+    f.host.verify.mockImplementation(record => {
+      f.actions.push('verify');
+      expect(record.run.state).toBe('running');
+    });
+    expect(await f.execute(prepared)).toMatchObject({ state: 'succeeded', phase: 'complete', resumable: false });
+    expect(f.actions).toEqual(['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify']);
+  });
+
+  it.each(['before:prepare', 'after:prepare'])('resumes preparation-only work after interruption at %s without entering service phases', async checkpoint => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const f = transition();
+    f.record.noStart = true;
+    expect(await f.execute(f.record, phase => { if (phase === checkpoint) throw new Error('Interrupted'); }))
+      .toMatchObject({ state: 'failed', resumable: true });
+    expect(await f.execute(JSON.parse(fs.readFileSync(f.journal)))).toMatchObject({ state: 'prepared', resumable: true });
+    expect(f.actions).toEqual(['prepare']);
+  });
+
+  it('rejects preparation-only execution when restoration would have to change services', async () => {
+    const f = transition();
+    f.record.noStart = true;
+    f.record.transition = { completed: ['prepare'], mutating: true };
+    await expect(f.execute(f.record)).rejects.toThrow('restoration is pending');
+    expect(f.actions).toEqual([]);
+  });
+
   it('reports success only after target startup and runtime verification', async () => {
     const fixture = transition();
     const result = await fixture.execute(fixture.record);
@@ -103,6 +140,11 @@ function savedTransition({ service, externalDocumentation } = {}) {
 }
 
 describe('saved transition boundaries', () => {
+  it.each(['true', 1, null, {}])('rejects an invalid saved no-start setting: %j', noStart => {
+    const { record, runDir } = savedTransition();
+    record.noStart = noStart;
+    expect(() => validateSavedTransition(record, runDir)).toThrow('no-start');
+  });
   it('accepts direct readiness only when the independent integration owns it', () => {
     const { record, runDir } = savedTransition();
     record.transition.integration = { version: 1, files: [], independentReadiness: true, terminalMode: 'direct' };

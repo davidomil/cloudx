@@ -36,6 +36,7 @@ export class ManagedUpdate {
     record.transition ??= { completed: [] };
     const transition = record.transition;
     if (record.run.state === 'succeeded') return record.run;
+    if (record.noStart && transition.mutating) throw new Error('Cannot prepare without service changes while installation restoration is pending.');
     // A lost process after quiescing is restored before any new transition.
     // Never repeat startup migrations on top of a partially migrated profile.
 
@@ -47,7 +48,7 @@ export class ManagedUpdate {
         await this.restore();
         transition.completed = transition.completed.filter(phase => phase === 'prepare');
       }
-      for (const phase of PHASES) {
+      for (const phase of record.noStart ? ['prepare'] : PHASES) {
         if (transition.completed.includes(phase)) continue;
 
         record.run.phase = phase;
@@ -59,6 +60,14 @@ export class ManagedUpdate {
         transition.completed.push(phase);
         this.persist();
         this.checkpoint(`after:${phase}`);
+      }
+      if (record.noStart) {
+        record.run = { ...record.run, state: 'prepared', phase: 'prepared', component: 'build', resumable: true,
+          message: 'The selected CloudX build is prepared but not activated. Installed services are unchanged; target runtime readiness has not been verified.',
+          recoveryAction: `To activate the prepared target, resume update ${record.run.id} without --no-start. Required interruption or data restoration consent will be requested before activation.`,
+          finishedAt: new Date().toISOString() };
+        this.persist();
+        return record.run;
       }
       transition.mutating = false;
       record.run = { ...record.run, state: 'succeeded', phase: 'complete', resumable: false,
@@ -168,7 +177,7 @@ export class UpdateHost {
     transition.targetRuntime = inspectTargetRuntime(release);
     transition.runtimePlan = inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: transition.targetRuntime });
     if (transition.runtimePlan.blockers.length) throw publicFailure('terminals', transition.runtimePlan.blockers.map(blocker => blocker.message ?? blocker).join(' '));
-    if (transition.runtimePlan.requiresInterruption && !record.confirmInterruption) this.requireInterruption(record, transition.runtimePlan);
+    if (!record.noStart && transition.runtimePlan.requiresInterruption && !record.confirmInterruption) this.requireInterruption(record, transition.runtimePlan);
     transition.release = release;
     transition.environment = this.envConfig;
     transition.environmentText = fs.readFileSync(this.paths.envPath, 'utf8');
@@ -232,7 +241,11 @@ export class UpdateHost {
   }
 
   assertDirectBrokerUnchanged(transition) {
-    if (!transition.directBroker) return;
+    if (!transition.directBroker) {
+      if (this.target.kind === 'web' && transition.integration?.terminalMode === 'direct' && this.inspectOwnedBrokerConfiguration())
+        throw Object.assign(publicFailure('services', 'A terminal broker was installed after preparation. Resume to prepare against its current configuration.'), { reprepare: true });
+      return;
+    }
     const { file, sha256 } = transition.directBroker;
     this.inspectOwnedBrokerConfiguration(file);
     if (hashFile(file) !== sha256)
@@ -301,6 +314,8 @@ export class UpdateHost {
     assertTerminalMigrationSafe({ dataDir: this.paths.dataDir });
     const currentPlan = inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: t.targetRuntime });
     if (currentPlan.requiresInterruption && !record.confirmInterruption) this.requireInterruption(record, currentPlan);
+    t.serviceStates = Object.fromEntries(this.target.serviceNames.map(service => [service, this.runner.inspect('systemctl', ['--user', 'show', service, '--property=ActiveState,MainPID,InvocationID'])]));
+    if (t.directBroker) t.directBroker.state = this.inspectOwnedBrokerConfiguration(t.directBroker.file).state;
     t.restored = false;
     t.mutating = true;
     this.save(record);
@@ -847,6 +862,7 @@ export function validateSavedTransition(record, runDir) {
   const object = value => value && typeof value === 'object' && !Array.isArray(value);
   if (![record.repoRoot, record.dataDir, record.home, runDir, record.envPath ?? path.join(record.home ?? '', '.config/cloudx/cloudx.env')].every(canonicalPath))
     throw new Error('Invalid saved installation path.');
+  if (record.noStart !== undefined && typeof record.noStart !== 'boolean') throw new Error('Invalid saved no-start option.');
   const t = record.transition;
   if (!t) return;
   if (t.integration !== undefined && (!object(t.integration) || t.integration.version !== 1 ||
@@ -965,5 +981,5 @@ export async function runManagedUpdate(recordPath) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  runManagedUpdate(process.argv[2]).then(run => { if (run.state !== 'succeeded') process.exitCode = 1; }).catch(error => { console.error(error); process.exitCode = 1; });
+  runManagedUpdate(process.argv[2]).then(run => { if (!['succeeded', 'prepared'].includes(run.state)) process.exitCode = 1; }).catch(error => { console.error(error); process.exitCode = 1; });
 }
