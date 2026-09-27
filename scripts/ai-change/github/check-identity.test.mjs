@@ -403,6 +403,7 @@ describe("exact test-merge reconciliation with real Git commits", () => {
 
   it("refuses authorization after target movement and never schedules repeated stale processing", async () => {
     const f = gitFixture();
+    f.api.post = vi.fn();
     const { artifact } = await createCiIdentityArtifact(f.input);
     f.git("checkout", "main");
     const nextBase = f.commit("later-target");
@@ -424,7 +425,7 @@ describe("exact test-merge reconciliation with real Git commits", () => {
         ),
       ).rejects.toBeInstanceOf(SupersededMergeIdentityError);
     }
-    expect(Object.keys(f.api)).toEqual(["repository", "get"]);
+    expect(f.api.post).not.toHaveBeenCalled();
   });
 
   it("classifies a later PR head and regenerated test merge as superseded", async () => {

@@ -744,10 +744,33 @@ async function main() {
   } catch (error) {
     evidence = failedEvidence("prepare or execute verifier", error);
   }
+  evidence = await completeVerificationEvidence({ root, lane, evidence });
+  evidence.preparation_ms = preparedMs;
+  evidence.total_duration_ms = Math.round(performance.now() - started);
+  evidence.lane = lane;
+  evidence.candidate_sha = candidateSha;
+  await publishAttestation(attestation, evidence);
+  if (evidence.verdict !== "passed") process.exitCode = 1;
+}
+
+export async function completeVerificationEvidence({
+  root,
+  lane,
+  evidence,
+  settleCandidates = terminateCandidateProcesses,
+}) {
   try {
-    await terminateCandidateProcesses();
+    await settleCandidates();
   } catch (error) {
-    evidence = failedEvidence("terminate candidate processes", error);
+    return {
+      ...failedEvidence("terminate candidate processes", error),
+      unavailable_reports: [
+        {
+          name: "candidate-reports",
+          reason: "candidate-processes-not-quiescent",
+        },
+      ],
+    };
   }
   if (root) {
     try {
@@ -781,12 +804,7 @@ async function main() {
       evidence.report_error = String(error.message);
     }
   }
-  evidence.preparation_ms = preparedMs;
-  evidence.total_duration_ms = Math.round(performance.now() - started);
-  evidence.lane = lane;
-  evidence.candidate_sha = candidateSha;
-  await publishAttestation(attestation, evidence);
-  if (evidence.verdict !== "passed") process.exitCode = 1;
+  return evidence;
 }
 
 async function liveProcessesOwnedBy(uid, procRoot) {
