@@ -1,8 +1,31 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { OwnedTestFixture } from "./owned-test-fixture.mjs";
+
+const receiptNotifications = vi.hoisted(() => ({
+  omitFilename: false,
+  count: 0,
+}));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    watch(...args) {
+      const watcher = actual.watch(...args);
+      const emit = watcher.emit;
+      watcher.emit = function (event, ...details) {
+        if (event === "change" && receiptNotifications.omitFilename) {
+          receiptNotifications.count++;
+          details[1] = null;
+        }
+        return emit.call(this, event, ...details);
+      };
+      return watcher;
+    },
+  };
+});
 
 const diagnostics = await fs.mkdtemp(
   path.join(os.tmpdir(), "cloudx-fixture-proof-"),
@@ -17,11 +40,49 @@ async function createFixture(name, options = {}) {
   return fixture;
 }
 afterEach(async ({ task }) => {
+  receiptNotifications.omitFilename = false;
+  receiptNotifications.count = 0;
   for (const fixture of fixtures.splice(0)) {
     if (!fixture.closing) await fixture.close(task.result?.state);
   }
   await fs.rm(diagnostics, { recursive: true, force: true });
 });
+
+it.skipIf(process.platform !== "linux")(
+  "reconciles filename-less notifications before removing descendants, receipts and the fixture",
+  async () => {
+    receiptNotifications.omitFilename = true;
+    const fixture = await createFixture("filename-less receipts");
+    const { stdout } = await fixture.run("detached writer", process.execPath, [
+      "-e",
+      `
+        const child = require('node:child_process').spawn(process.execPath,
+          ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+        console.log(child.pid);
+        child.unref();
+      `,
+    ]);
+    expect(receiptNotifications.count).toBeGreaterThan(0);
+    await expect(fs.access(`/proc/${stdout.trim()}`)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await fixture.close("pass");
+    expect(fixture.phases).toHaveLength(2);
+    for (const phase of fixture.phases) {
+      expect(phase).toMatchObject({
+        state: "passed",
+        childrenReaped: true,
+        completion: { exitCode: 0 },
+      });
+      await expect(fs.access(phase.receiptDirectory)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    }
+    await expect(fs.access(fixture.root)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  },
+);
 
 it.skipIf(process.platform !== "linux")(
   "joins a pending writer before removing a large tree and records cleanup independently of a failed body",

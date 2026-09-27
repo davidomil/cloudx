@@ -225,9 +225,7 @@ export class OwnedTestFixture {
             stop(cleanupFailure());
           }
         };
-        watcher.on("change", (_event, filename) => {
-          if (filename === "complete.json") acknowledge();
-        });
+        watcher.on("change", acknowledge);
         watcher.on("error", () => stop(cleanupFailure()));
         acknowledge();
         signal?.addEventListener("abort", abort, { once: true });

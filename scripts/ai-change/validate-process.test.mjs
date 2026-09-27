@@ -307,6 +307,9 @@ jobs:
     "stale artifact",
     "diagnostics",
     "superseded gate",
+    "pending gate",
+    "pending state",
+    "pending failure",
     "aggregate",
   ])("rejects missing merge reconciliation protection: %s", (scenario) => {
     const workflow = parseDocument(
@@ -327,6 +330,11 @@ jobs:
       );
     if (scenario === "superseded gate")
       delete workflow.jobs["superseded-identity"];
+    if (scenario === "pending gate") delete workflow.jobs["pending-identity"];
+    if (scenario === "pending state")
+      workflow.jobs["pending-identity"].if = "always()";
+    if (scenario === "pending failure")
+      workflow.jobs["pending-identity"].steps = [{ run: "exit 0" }];
     if (scenario === "aggregate") workflow.jobs.aggregate.steps = [];
     const issues = [];
     validateWorkflow(process.cwd(), "ci.yml", workflow, issues);

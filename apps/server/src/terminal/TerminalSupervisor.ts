@@ -1,4 +1,4 @@
-import { readFileSync, watch } from "node:fs";
+import { readFileSync, watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { IPty } from "node-pty";
@@ -16,6 +16,8 @@ export class TerminalSupervisor {
   private exited = false;
   private acknowledged: Promise<SupervisorExit> | undefined;
   private termination: Promise<void> | undefined;
+  private watcher: FSWatcher | undefined;
+  private observationError: Error | undefined;
 
   constructor(
     private readonly process: Pick<IPty, "pid" | "onExit" | "kill">,
@@ -24,27 +26,40 @@ export class TerminalSupervisor {
   ) {
     this.started = processStarted(process.pid);
     this.completion = new Promise((resolve) => {
-      const watcher = this.execution ? undefined : watch(directory, (_event, filename) => {
-        if (filename === "complete.json") this.acknowledgeCompletion();
-      });
       process.onExit(() => {
         this.exited = true;
-        watcher?.close();
-        void this.confirmExit().then(resolve, (error: Error) => resolve({ event: { exitCode: 125 }, error }));
+        this.watcher?.close();
+        void this.confirmExit().then(result => {
+          resolve(this.observationError ? { event: { exitCode: 125 }, error: new Error(
+            result.error ? "Terminal receipt observation failed and descendant ownership is unconfirmed." : "Terminal receipt observation failed; descendant cleanup was confirmed.",
+            { cause: result.error ? new AggregateError([this.observationError, result.error]) : this.observationError }
+          ) } : result);
+        }, (error: Error) => resolve({ event: { exitCode: 125 }, error }));
       });
-      // The helper may have completed before the watcher was installed.
-      if (watcher) void this.readReceipt("complete").then(receipt => {
-        if (receipt && !this.exited) this.acknowledgeCompletion();
-      }, () => this.acknowledgeCompletion());
     });
+    if (!this.execution) {
+      try {
+        this.watcher = watch(directory, () => { void this.reconcileCompletion(); });
+        this.watcher.on("error", error => this.failObservation(error));
+        // The helper may have completed before the watcher was installed.
+        void this.reconcileCompletion();
+      } catch (error) {
+        this.failObservation(error);
+      }
+    }
   }
 
   async ready(): Promise<void> {
     const deadline = Date.now() + 5_000;
     while (!this.exited) {
+      if (this.observationError) {
+        await this.terminate();
+        throw this.observationError;
+      }
       const receipt = await this.readReceipt("ready");
       if (receipt) {
         if (!this.ownsReceipt(receipt)) throw new Error("Terminal supervisor returned an invalid ownership receipt.");
+        if (this.observationError) continue;
         return;
       }
       if (Date.now() >= deadline) throw new Error(`Terminal supervisor did not start before the deadline. ${startupRequirement}`);
@@ -53,6 +68,31 @@ export class TerminalSupervisor {
     const result = await this.completion;
     if (!result.error) return;
     throw new Error(`Terminal supervisor failed to start. ${result.error.message} ${startupRequirement}`, { cause: result.error });
+  }
+
+  private failObservation(cause: unknown): void {
+    if (this.observationError || this.exited) return;
+    this.observationError = new Error("Terminal supervisor could not observe ownership receipts.", { cause });
+    this.watcher?.close();
+    // A broken observer cannot release the helper's acknowledgement wait. During
+    // bounded shutdown, reconcile receipts directly instead of accepting an exit.
+    const deadline = Date.now() + 5_000;
+    const reconcile = async () => {
+      while (!this.exited && !this.acknowledged && Date.now() < deadline) {
+        await this.reconcileCompletion();
+        await delay(10);
+      }
+    };
+    void Promise.all([this.terminate(), reconcile()]).catch(() => undefined);
+  }
+
+  private async reconcileCompletion(): Promise<void> {
+    if (this.exited || this.acknowledged) return;
+    try {
+      if (await this.readReceipt("complete")) this.acknowledgeCompletion();
+    } catch {
+      this.acknowledgeCompletion();
+    }
   }
 
   kill(): void {

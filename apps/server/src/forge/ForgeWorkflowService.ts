@@ -1495,6 +1495,10 @@ export class ForgeWorkflowService {
       await this.pauseForSupersededMergeIdentity(worker, change);
       return;
     }
+    if (change.checks?.reason === "pending_merge_identity") {
+      await this.pauseAutoReview(worker, `GitHub is still computing the test merge identity. Inspect ${change.checks.url}, wait for confirmed merge metadata and run CI for that identity, then Resume the issue loop. Do not change application code.`);
+      return;
+    }
     const issue = await this.observeProvider(worker, "getIssue", () => provider.getIssue(worker.number));
     signal?.throwIfAborted();
     if (issue.number !== worker.number || issue.state !== "open")

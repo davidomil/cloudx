@@ -92,22 +92,30 @@ created anew for each execution.
 
 ## Merge identity
 
-The workflow reconciles the exact checked-out test merge against the
-expected repository, main target ref, current pull-request head, ordered
-merge parents and tree. A stale event base can be diagnostic when the
-current target and tested first parent agree. Later target or head
-movement produces a superseded result, not application repair work.
-Forge pauses without retrying the unchanged identity; merge
-authorization revalidates the current identity.
+The workflow validates the exact checked-out test merge against the
+expected repository, live main ref, current pull-request head, ordered
+merge parents and tree. GitHub API version 2026-03-10 removed
+`merge_commit_sha` from pull-request payloads. After confirmed
+mergeability, the canonical resolver reads `refs/pull/<number>/merge`
+through the Git ref endpoint and revalidates its commit against the live
+target. CI artifact production and downstream merge authorization use
+this same resolver. A stale event base is diagnostic only when the
+current target and tested first parent agree. Moved target or head refs
+produce superseded before pending merge metadata is inspected. If refs
+still match and mergeability is `null`, the result is pending. Neither
+state produces an authorization artifact; Forge pauses before
+implementation or review can restart. See the [GitHub breaking-change
+notice](https://docs.github.com/en/rest/about-the-rest-api/breaking-changes?apiVersion=2026-03-10).
 
 ## GitHub App permissions
 
 Forge worker and reviewer Apps require Checks: read to identify the
-Superseded merge identity check. Existing installations must approve
-this additional read permission. Registration retains an installation
-missing the permission for Continue. A superseded result pauses Forge
-before review feedback can restart implementation; refresh the test
-merge for a new identity before resuming.
+Superseded merge identity and Pending merge identity checks. Existing
+installations must approve this additional read permission. Registration
+retains an installation missing the permission for Continue. A
+superseded result pauses Forge before review feedback can restart
+implementation; refresh the test merge for a new identity before
+resuming.
 
 ## Performance evidence still required
 
@@ -118,3 +126,57 @@ successful runs by exact commit, sample size, runner resources,
 cold/warm cache status, workflow elapsed time, slowest job and summed
 runner time. Retain the uploaded attestations and timing reports; do not
 infer linear speedup from shard count.
+
+## Provider observations before review fixes
+
+GitHub acceptance remains pending. The three successful baseline
+workflows are
+[36336277366](https://github.com/davidomil/cloudx/actions/runs/36336277366)
+(46m42s elapsed, 46m32s slowest job, 90m10s summed job time),
+[36335167752](https://github.com/davidomil/cloudx/actions/runs/36335167752)
+(48m10s, 47m40s, 96m02s), and
+[36334734155](https://github.com/davidomil/cloudx/actions/runs/36334734155)
+(46m33s, 46m26s, 90m33s). The isolated verifier is the slowest job in
+each. These are three observations across different commits. Times come
+from Actions run/job API timestamps; summed time includes every
+non-skipped job.
+
+Baseline main run 36336277366 tested
+7d809426c56e7fe49a68f8678951ac01ba20fdf5, whose parent is
+d8e620cf3c009cbb64fe925de24ae6d9daf0996c. PR run 36335167752 tested
+merge 0ccad34bf96b7af1bae1b2c9cbdf5ed746a3504f with base
+d8e620cf3c009cbb64fe925de24ae6d9daf0996c and head
+b5330f72b79be95b55ef135b42ea0a5f1f0832c4. PR run 36334734155 tested
+merge b21c69e46a7c03f48d91048e1b6fa3627a7de52b with the same base and
+head b310866910190daa98aedc72799f9e13ff4ab369. The Git commit API
+confirms these parents.
+
+[PR \#154 run
+36353377140](https://github.com/davidomil/cloudx/actions/runs/36353377140)
+tested merge 95bd66b60ff9eef151e928fbb98e8817604a9b8f with base
+630b42dced9c45951b6fb994b66ce3d69de67dde and head
+71dff8513afc8ec3343a5ddfe92b036238c8b670. It finished in 14m37s; browser
+shard 1 was slowest at 11m25s, and summed job time was 98m07s. Every
+workload job passed, but Trusted merge identity and CI aggregate failed.
+The identity log reports an invalid or missing test-merge SHA. A
+subsequent public request with the production API version reproduced the
+removed merge_commit_sha field despite mergeable:true; the corrected
+production resolver accepted the exact merge ref in a read-only probe.
+This failed workflow is excluded from successful performance acceptance.
+There are no successful post-change acceptance samples yet.
+
+These jobs use ubuntu-24.04 runners; the isolated workloads are bounded
+to two CPUs and 7 GiB. Actual host CPU/RAM were not recorded in the
+recovered job API metadata. Available baseline log excerpts end during
+image construction, so baseline cold/warm state remains unclassified. In
+run 36353377140 the browser shard 1 image build showed no cached steps
+and coverage-merge reused 18 cached steps within that workflow. This
+does not provide independent successful cold and warm workflow samples.
+
+Before approval, merge or closing \#147, record representative
+successful post-fix GitHub runs, classify cold/warm cache state, record
+actual runner CPU/RAM, and compare exact base/head/merge identities,
+sample size, workflow elapsed, slowest job and summed job time with the
+baseline. Preserve the test/skip inventory and merged thresholds. The
+implementation handoff to CloudX for publication and review does not
+satisfy this acceptance gate.

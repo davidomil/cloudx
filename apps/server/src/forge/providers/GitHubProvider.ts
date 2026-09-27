@@ -128,8 +128,8 @@ export class GitHubProvider implements ForgeProvider {
       readiness.unresolved === 0 &&
       (readiness.headChecks === "passed" || readiness.headChecks === "absent") &&
       await this.canMergeThroughUpdateRestriction(status.baseBranch, readiness.headChecks);
-    const supersededMergeIdentity = readiness.headChecks === "failed" &&
-      await this.hasSupersededMergeIdentity(headSha);
+    const identityFailure = readiness.headChecks === "failed"
+      ? await this.mergeIdentityFailureReason(headSha) : undefined;
     return {
       ...issue,
       ...status,
@@ -143,7 +143,7 @@ export class GitHubProvider implements ForgeProvider {
       checks: {
         state: readiness.headChecks === "absent" || readiness.headChecks === "blocked" ? "unknown" : readiness.headChecks,
         url: `${issue.url}/checks`,
-        ...(supersededMergeIdentity ? { reason: "superseded_merge_identity" as const } : {}),
+        ...(identityFailure ? { reason: identityFailure } : {}),
       },
       approved,
       unresolvedDiscussions: readiness.unresolved,
@@ -161,18 +161,23 @@ export class GitHubProvider implements ForgeProvider {
     return this.readStatus(number);
   }
 
-  private async hasSupersededMergeIdentity(headSha: string): Promise<boolean> {
-    const name = "Superseded merge identity";
-    const response = await this.http.request(`${this.path}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`);
-    if (hasNextPage(response.headers))
-      throw new ForgeProviderError("The merge identity check results are incomplete. Inspect CI before proceeding.", 409);
-    return list(record(response.body).check_runs).some(value => {
-      const check = record(value);
-      const app = record(check.app);
-      return check.name === name && check.head_sha === headSha &&
-        check.status === "completed" && check.conclusion === "failure" &&
-        app.slug === "github-actions" && record(app.owner).login === "github";
-    });
+  private async mergeIdentityFailureReason(headSha: string) {
+    for (const [name, reason] of [
+      ["Superseded merge identity", "superseded_merge_identity"],
+      ["Pending merge identity", "pending_merge_identity"],
+    ] as const) {
+      const response = await this.http.request(`${this.path}/commits/${headSha}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`);
+      if (hasNextPage(response.headers))
+        throw new ForgeProviderError("The merge identity check results are incomplete. Inspect CI before proceeding.", 409);
+      if (list(record(response.body).check_runs).some(value => {
+        const check = record(value);
+        const app = record(check.app);
+        return check.name === name && check.head_sha === headSha &&
+          check.status === "completed" && check.conclusion === "failure" &&
+          app.slug === "github-actions" && record(app.owner).login === "github";
+      })) return reason;
+    }
+    return undefined;
   }
 
   private async readStatus(number: number, expected?: GitHubSnapshot): Promise<ForgeChangeRequestStatus> {

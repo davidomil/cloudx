@@ -1081,6 +1081,12 @@ describe("conflict target revision snapshots", () => {
 describe("GitHub review and exact-commit merge", () => {
   it.each([
     ["trusted current failure", {}, "superseded_merge_identity"],
+    ["trusted pending identity failure", { name: "Pending merge identity" }, "pending_merge_identity"],
+    ["pending identity on a different head", { name: "Pending merge identity", head_sha: previousSha }, undefined],
+    ["pending identity from another app", { name: "Pending merge identity", app: { slug: "other-app", owner: { login: "github" } } }, undefined],
+    ["pending identity from another owner", { name: "Pending merge identity", app: { slug: "github-actions", owner: { login: "untrusted" } } }, undefined],
+    ["successful pending identity check", { name: "Pending merge identity", conclusion: "success" }, undefined],
+    ["unfinished pending identity check", { name: "Pending merge identity", status: "in_progress" }, undefined],
     ["different head", { head_sha: previousSha }, undefined],
     ["pending check", { status: "in_progress" }, undefined],
     ["successful check", { conclusion: "success" }, undefined],
@@ -1096,10 +1102,11 @@ describe("GitHub review and exact-commit merge", () => {
     expect(change.checks?.state).toBe("failed");
     expect(change.checks?.reason).toBe(reason);
     const checks = calls.filter(call => call.url.pathname.endsWith("/check-runs"));
-    expect(checks).toHaveLength(1);
+    expect(checks).toHaveLength(reason === "superseded_merge_identity" ? 1 : 2);
     expect(checks[0].url.pathname).toBe(`/repos/owner/repo/commits/${headSha}/check-runs`);
     expect(checks[0].url.searchParams.get("check_name")).toBe("Superseded merge identity");
     expect(checks[0].url.searchParams.get("filter")).toBe("latest");
+    if (checks.length === 2) expect(checks[1].url.searchParams.get("check_name")).toBe("Pending merge identity");
   });
 
   it("rejects incomplete merge identity check evidence", async () => {

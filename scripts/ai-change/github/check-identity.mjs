@@ -179,32 +179,39 @@ export async function mergeIdentityForPullRequest(
   policySha256,
 ) {
   validatePullRequestTarget(api.repository, pullRequest);
+  const pullRequestNumber = positiveInteger(
+    pullRequest?.number,
+    "pull request",
+  );
+  if (pullRequest?.mergeable !== true) {
+    throw new Error("Pull request test merge is not currently mergeable.");
+  }
+  const mergeRef = await api.get(
+    repoRoute(api.repository, `/git/ref/pull/${pullRequestNumber}/merge`),
+  );
+  if (
+    mergeRef?.ref !== `refs/pull/${pullRequestNumber}/merge` ||
+    mergeRef?.object?.type !== "commit"
+  ) {
+    throw new Error(
+      "Merge identity requires the exact pull request test merge commit ref.",
+    );
+  }
   const identity = validateMergeIdentity(
     {
-      pullRequest: positiveInteger(pullRequest?.number, "pull request"),
+      pullRequest: pullRequestNumber,
       baseSha: pullRequest?.base?.sha,
       headSha: pullRequest?.head?.sha,
-      testMergeSha: pullRequest?.merge_commit_sha,
+      testMergeSha: mergeRef.object.sha,
       testMergeTreeSha: "0".repeat(40),
       policySha256,
     },
     { allowPlaceholderTree: true },
   );
-  if (pullRequest?.mergeable !== true) {
-    throw new Error("Pull request test merge is not currently mergeable.");
-  }
   const commit = await api.get(
     repoRoute(api.repository, `/git/commits/${identity.testMergeSha}`),
   );
-  const target = await api.get(
-    repoRoute(api.repository, "/git/ref/heads/main"),
-  );
-  if (target?.ref !== "refs/heads/main" || target?.object?.type !== "commit") {
-    throw new Error(
-      "Merge identity requires the exact main branch commit ref.",
-    );
-  }
-  const targetSha = gitSha(target.object.sha, "current target SHA");
+  const targetSha = await currentTargetSha(api);
   const parents = Array.isArray(commit?.parents)
     ? commit.parents.map((parent) => parent?.sha)
     : [];
@@ -233,6 +240,18 @@ export async function mergeIdentityForPullRequest(
   });
 }
 
+async function currentTargetSha(api) {
+  const target = await api.get(
+    repoRoute(api.repository, "/git/ref/heads/main"),
+  );
+  if (target?.ref !== "refs/heads/main" || target?.object?.type !== "commit") {
+    throw new Error(
+      "Merge identity requires the exact main branch commit ref.",
+    );
+  }
+  return gitSha(target.object.sha, "current target SHA");
+}
+
 function validatePullRequestTarget(repository, pullRequest) {
   if (pullRequest?.base?.repo?.full_name !== validateRepository(repository)) {
     throw new Error(
@@ -257,6 +276,18 @@ export class SupersededMergeIdentityError extends Error {
     this.name = "SupersededMergeIdentityError";
     this.code = "SUPERSEDED_MERGE_IDENTITY";
     this.reason = reason;
+    this.observed = observed;
+  }
+}
+
+export class PendingMergeIdentityError extends Error {
+  constructor(observed) {
+    super(
+      "GitHub is still computing the pull request test merge. Wait for merge metadata to become available, then run CI for the confirmed identity; do not change application code.",
+    );
+    this.name = "PendingMergeIdentityError";
+    this.code = "PENDING_MERGE_IDENTITY";
+    this.reason = "mergeability_pending";
     this.observed = observed;
   }
 }
@@ -322,6 +353,22 @@ export async function createCiIdentityArtifact({
       currentHeadSha,
     });
   }
+  const currentBaseSha = await currentTargetSha(api);
+  if (currentBaseSha !== tested.baseSha) {
+    throw new SupersededMergeIdentityError("target_moved", {
+      testedBaseSha: tested.baseSha,
+      currentBaseSha,
+      headSha,
+      testMergeSha,
+    });
+  }
+  if (pullRequest.mergeable === null) {
+    throw new PendingMergeIdentityError({
+      tested,
+      currentBaseSha,
+      currentHeadSha,
+    });
+  }
   const current = await mergeIdentityForPullRequest(
     api,
     pullRequest,
@@ -369,7 +416,10 @@ export async function recordCiIdentity({
   try {
     result = await createCiIdentityArtifact(input);
   } catch (error) {
-    if (!(error instanceof SupersededMergeIdentityError)) {
+    if (
+      !(error instanceof SupersededMergeIdentityError) &&
+      !(error instanceof PendingMergeIdentityError)
+    ) {
       await writeExclusive(reconciliationFile, {
         state: "rejected",
         code: "INVALID_MERGE_IDENTITY",
@@ -378,7 +428,10 @@ export async function recordCiIdentity({
     }
     result = {
       reconciliation: {
-        state: "superseded",
+        state:
+          error instanceof SupersededMergeIdentityError
+            ? "superseded"
+            : "pending",
         code: error.code,
         reason: error.reason,
         observed: error.observed,

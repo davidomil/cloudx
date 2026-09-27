@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createGitHubApi } from "./api.mjs";
 
 import {
   buildCheckExternalId,
@@ -124,10 +125,13 @@ describe("canonical v2 merge identity", () => {
         repo: { full_name: "owner/repo" },
       },
       head: { sha: identity.headSha },
-      merge_commit_sha: identity.testMergeSha,
       mergeable: true,
     };
     api.get
+      .mockResolvedValueOnce({
+        ref: "refs/pull/42/merge",
+        object: { type: "commit", sha: identity.testMergeSha },
+      })
       .mockResolvedValueOnce({
         sha: identity.testMergeSha,
         tree: { sha: identity.testMergeTreeSha },
@@ -146,6 +150,10 @@ describe("canonical v2 merge identity", () => {
     );
 
     api.get
+      .mockResolvedValueOnce({
+        ref: "refs/pull/42/merge",
+        object: { type: "commit", sha: identity.testMergeSha },
+      })
       .mockResolvedValueOnce({
         sha: identity.testMergeSha,
         tree: { sha: identity.testMergeTreeSha },
@@ -303,6 +311,7 @@ function gitFixture() {
   git("checkout", "--detach", base);
   git("merge", "--no-ff", "feature", "-m", "test merge");
   const merge = git("rev-parse", "HEAD");
+  git("update-ref", "refs/pull/42/merge", merge);
   const pullRequest = {
     number: 42,
     state: "open",
@@ -310,7 +319,6 @@ function gitFixture() {
     mergeable: true,
     base: { ref: "main", sha: base, repo: { full_name: "owner/repo" } },
     head: { sha: head, repo: { full_name: "contributor/fork" } },
-    merge_commit_sha: merge,
   };
   const api = {
     repository: "owner/repo",
@@ -321,6 +329,14 @@ function gitFixture() {
         return {
           ref: "refs/heads/main",
           object: { type: "commit", sha: git("rev-parse", "main") },
+        };
+      if (route === "/repos/owner/repo/git/ref/pull/42/merge")
+        return {
+          ref: "refs/pull/42/merge",
+          object: {
+            type: "commit",
+            sha: git("rev-parse", "refs/pull/42/merge"),
+          },
         };
       if (route.startsWith("/repos/owner/repo/git/commits/")) {
         const [sha, tree, ...parents] = git(
@@ -358,6 +374,32 @@ function gitFixture() {
 }
 
 describe("exact test-merge reconciliation with real Git commits", () => {
+  it("records the exact merge through the pinned 2026 API without the removed PR merge SHA field", async () => {
+    const f = gitFixture();
+    expect(f.pullRequest).not.toHaveProperty("merge_commit_sha");
+    const fetchImpl = vi.fn(async (url, options) => {
+      expect(options.method).toBe("GET");
+      expect(options.headers["x-github-api-version"]).toBe("2026-03-10");
+      return Response.json(await f.api.get(new URL(url).pathname));
+    });
+    const api = createGitHubApi({
+      token: "test-token",
+      repository: f.api.repository,
+      fetchImpl,
+    });
+
+    const result = await createCiIdentityArtifact({ ...f.input, api });
+
+    expect(result.artifact).toMatchObject({
+      base_sha: f.base,
+      head_sha: f.head,
+      test_merge_sha: f.merge,
+    });
+    expect(
+      fetchImpl.mock.calls.map(([url]) => new URL(url).pathname),
+    ).toContain("/repos/owner/repo/git/ref/pull/42/merge");
+  });
+
   it.each([false, true])(
     "binds artifact and downstream authorization to the tested parents (stale event: %s)",
     async (staleEvent) => {
@@ -434,7 +476,7 @@ describe("exact test-merge reconciliation with real Git commits", () => {
     f.pullRequest.head.sha = f.commit("later-feature");
     f.git("checkout", "--detach", f.base);
     f.git("merge", "--no-ff", "feature", "-m", "new test merge");
-    f.pullRequest.merge_commit_sha = f.git("rev-parse", "HEAD");
+    f.git("update-ref", "refs/pull/42/merge", f.git("rev-parse", "HEAD"));
     f.git("checkout", "--detach", f.merge);
     await expect(createCiIdentityArtifact(f.input)).rejects.toMatchObject({
       code: "SUPERSEDED_MERGE_IDENTITY",
@@ -459,10 +501,152 @@ describe("exact test-merge reconciliation with real Git commits", () => {
     });
   });
 
+  it.each(["previous", "missing"])(
+    "records moved main as superseded while the merge is pending with a %s SHA",
+    async (mergeSha) => {
+      const f = gitFixture();
+      f.api.post = vi.fn();
+      f.git("checkout", "main");
+      const currentBaseSha = f.commit("pending-target");
+      f.git("checkout", "--detach", f.merge);
+      f.pullRequest.mergeable = null;
+      f.pullRequest.merge_commit_sha = mergeSha === "previous" ? f.merge : null;
+
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const artifactFile = path.join(
+          f.input.source,
+          `identity-${attempt}.json`,
+        );
+        const reconciliationFile = path.join(
+          f.input.source,
+          `reconciliation-${attempt}.json`,
+        );
+        const githubOutput = path.join(
+          f.input.source,
+          `github-output-${attempt}`,
+        );
+        const result = await recordCiIdentity({
+          ...f.input,
+          workflowRunAttempt: attempt,
+          artifactFile,
+          reconciliationFile,
+          githubOutput,
+        });
+
+        expect(result.reconciliation).toMatchObject({
+          state: "superseded",
+          code: "SUPERSEDED_MERGE_IDENTITY",
+          reason: "target_moved",
+          observed: {
+            testedBaseSha: f.base,
+            currentBaseSha,
+            headSha: f.head,
+            testMergeSha: f.merge,
+          },
+        });
+        expect(JSON.parse(fs.readFileSync(reconciliationFile, "utf8"))).toEqual(
+          result.reconciliation,
+        );
+        expect(fs.readFileSync(githubOutput, "utf8")).toBe(
+          "identity-state=superseded\n",
+        );
+        expect(fs.existsSync(artifactFile)).toBe(false);
+      }
+      expect(
+        f.api.get.mock.calls.some(([route]) => route.includes("/git/commits/")),
+      ).toBe(false);
+      expect(f.api.post).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["previous", "missing"])(
+    "records pending without authorization for a %s SHA until merge metadata is complete",
+    async (mergeSha) => {
+      const f = gitFixture();
+      f.pullRequest.mergeable = null;
+      f.pullRequest.merge_commit_sha = mergeSha === "previous" ? f.merge : null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const artifactFile = path.join(
+          f.input.source,
+          `identity-${attempt}.json`,
+        );
+        const reconciliationFile = path.join(
+          f.input.source,
+          `reconciliation-${attempt}.json`,
+        );
+        const githubOutput = path.join(
+          f.input.source,
+          `github-output-${attempt}`,
+        );
+        const result = await recordCiIdentity({
+          ...f.input,
+          workflowRunAttempt: attempt,
+          artifactFile,
+          reconciliationFile,
+          githubOutput,
+        });
+        expect(result.reconciliation).toMatchObject({
+          state: "pending",
+          code: "PENDING_MERGE_IDENTITY",
+          reason: "mergeability_pending",
+          observed: { currentBaseSha: f.base, currentHeadSha: f.head },
+        });
+        expect(JSON.parse(fs.readFileSync(reconciliationFile, "utf8"))).toEqual(
+          result.reconciliation,
+        );
+        expect(fs.existsSync(artifactFile)).toBe(false);
+        expect(fs.readFileSync(githubOutput, "utf8")).toBe(
+          "identity-state=pending\n",
+        );
+      }
+      expect(f.api.get).not.toHaveBeenCalledWith(
+        "/repos/owner/repo/git/ref/pull/42/merge",
+      );
+      f.pullRequest.mergeable = true;
+      delete f.pullRequest.merge_commit_sha;
+      const current = await createCiIdentityArtifact(f.input);
+      expect(current.reconciliation.state).toBe("current");
+      expect(current.artifact).toMatchObject({
+        base_sha: f.base,
+        head_sha: f.head,
+        test_merge_sha: f.merge,
+      });
+    },
+  );
+
+  it.each([false, undefined])(
+    "requires confirmed mergeability rather than inferring pending from mergeable=%s",
+    async (mergeable) => {
+      const f = gitFixture();
+      f.pullRequest.mergeable = mergeable;
+      f.pullRequest.merge_commit_sha = null;
+      const artifactFile = path.join(f.input.source, "identity.json");
+      const reconciliationFile = path.join(
+        f.input.source,
+        "reconciliation.json",
+      );
+      const githubOutput = path.join(f.input.source, "github-output");
+      await expect(
+        recordCiIdentity({
+          ...f.input,
+          artifactFile,
+          reconciliationFile,
+          githubOutput,
+        }),
+      ).rejects.toThrow(/not currently mergeable/);
+      expect(JSON.parse(fs.readFileSync(reconciliationFile, "utf8"))).toEqual({
+        state: "rejected",
+        code: "INVALID_MERGE_IDENTITY",
+      });
+      expect(fs.existsSync(artifactFile)).toBe(false);
+      expect(fs.existsSync(githubOutput)).toBe(false);
+    },
+  );
+
   it("rejects an old artifact after the same parents receive a new merge commit", async () => {
     const f = gitFixture();
     const { artifact } = await createCiIdentityArtifact(f.input);
-    f.pullRequest.merge_commit_sha = f.git(
+    const regeneratedMerge = f.git(
       "commit-tree",
       f.git("rev-parse", "HEAD^{tree}"),
       "-p",
@@ -472,6 +656,7 @@ describe("exact test-merge reconciliation with real Git commits", () => {
       "-m",
       "regenerated merge",
     );
+    f.git("update-ref", "refs/pull/42/merge", regeneratedMerge);
     const current = await mergeIdentityForPullRequest(
       f.api,
       f.pullRequest,
@@ -543,6 +728,9 @@ describe("exact test-merge reconciliation with real Git commits", () => {
     "wrong event target",
     "wrong target reference",
     "noncommit target",
+    "wrong merge reference",
+    "noncommit merge reference",
+    "missing merge reference SHA",
     "wrong API commit",
     "substituted head",
     "substituted merge",
@@ -561,6 +749,9 @@ describe("exact test-merge reconciliation with real Git commits", () => {
       [
         "wrong target reference",
         "noncommit target",
+        "wrong merge reference",
+        "noncommit merge reference",
+        "missing merge reference SHA",
         "wrong API commit",
       ].includes(scenario)
     ) {
@@ -572,6 +763,14 @@ describe("exact test-merge reconciliation with real Git commits", () => {
             return { ...result, ref: "refs/heads/release" };
           if (scenario === "noncommit target")
             return { ...result, object: { ...result.object, type: "tag" } };
+        }
+        if (route.endsWith("/git/ref/pull/42/merge")) {
+          if (scenario === "wrong merge reference")
+            return { ...result, ref: "refs/pull/43/merge" };
+          if (scenario === "noncommit merge reference")
+            return { ...result, object: { ...result.object, type: "tag" } };
+          if (scenario === "missing merge reference SHA")
+            return { ...result, object: { type: "commit" } };
         }
         if (scenario === "wrong API commit" && route.includes("/git/commits/"))
           return { ...result, sha: f.base };
@@ -593,7 +792,7 @@ describe("exact test-merge reconciliation with real Git commits", () => {
         scenario,
       );
       f.input.event.testMergeSha = invalidMerge;
-      f.pullRequest.merge_commit_sha = invalidMerge;
+      f.git("update-ref", "refs/pull/42/merge", invalidMerge);
       f.git("checkout", "--detach", invalidMerge);
     }
     if (scenario === "wrong tree") {

@@ -457,3 +457,14 @@ jobs:
       - run: |-
           echo "This test merge is superseded. Test the newly reconciled base/head identity; rerunning this unchanged merge cannot authorize it."
           exit 1
+  pending-identity:
+    name: Pending merge identity
+    needs:
+      - identity
+    if: needs.identity.outputs.identity-state == 'pending'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |-
+          echo "GitHub is still computing this test merge. Wait for confirmed merge metadata and run CI for that identity; do not change application code."
+          exit 1

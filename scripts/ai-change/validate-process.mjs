@@ -1954,6 +1954,7 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     );
   }
   const supersededIdentity = jobs["superseded-identity"];
+  const pendingIdentity = jobs["pending-identity"];
   if (
     !identitySteps.some(
       (step) =>
@@ -1968,11 +1969,17 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     supersededIdentity.if !==
       "needs.identity.outputs.identity-state == 'superseded'" ||
     !jobCommands(supersededIdentity).includes("exit 1") ||
+    !isRecord(pendingIdentity) ||
+    pendingIdentity.name !== "Pending merge identity" ||
+    !normalizedNeeds(pendingIdentity).includes("identity") ||
+    pendingIdentity.if !==
+      "needs.identity.outputs.identity-state == 'pending'" ||
+    !jobCommands(pendingIdentity).includes("exit 1") ||
     !isRecord(jobs.aggregate) ||
     !jobCommands(jobs.aggregate).includes('"$IDENTITY_STATE" = current')
   ) {
     issues.push(
-      `Workflow '${workflowName}' must retain merge reconciliation diagnostics and reject superseded merge identities without publishing a passing aggregate.`,
+      `Workflow '${workflowName}' must retain merge reconciliation diagnostics and reject superseded merge identities and pending merge identities without publishing a passing aggregate.`,
     );
   }
   return issues;
