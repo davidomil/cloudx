@@ -39,9 +39,9 @@ it.each(['aec0d06e7f9087f9e912f6023cfbde5623f28178', 'c664071e04091db6be78df09d8
 });
 
 it.each([
-  [FORGE_WITH_HISTORICAL_DRAFTS, [FORGE_SERVICE_FILE]],
-  ['2f28a100cd765b8c209e85fdacb03b03a57ba0df', [FORGE_VALIDATION_FILE, FORGE_SERVICE_FILE]],
-])('adds continuation to native %s without replacing its comparison and ownership implementation', (commit, files) => {
+  ['reviewer with historical draft support', FORGE_WITH_HISTORICAL_DRAFTS, [FORGE_SERVICE_FILE]],
+  ['reviewer with retained workspaces', '2f28a100cd765b8c209e85fdacb03b03a57ba0df', [FORGE_VALIDATION_FILE, FORGE_SERVICE_FILE]],
+])('adds continuation to native %s without replacing its comparison and ownership implementation', (_name, commit, files) => {
   const history = historicalForge(commit, { integrate: false });
   const target = file => fs.readFileSync(path.join(history.root, file), 'utf8');
   const migrated = prepareManagedForgeIntegration(target, maintained);
