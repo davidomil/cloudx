@@ -29,6 +29,12 @@ let baseUrl: string;
 let server: ChildProcess;
 let serverLogs = "";
 const mainUpdatePreview: CloudxUpdatePreview = {
+  runtime: {
+    verification: "verified",
+    commit: "a".repeat(40),
+    builtAt: "2026-09-15T00:00:00Z",
+    sourceDirty: false,
+  },
   channel: "main",
   currentCommit: "a".repeat(40),
   checkedAt: "2026-09-15T04:00:00.000Z",
@@ -1494,6 +1500,116 @@ async function expectCodexSettingsFits(page: Page) {
   }
 }
 
+test("Updates separates current source from the running build and offers repair", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const targetCommit = mainUpdatePreview.target!.commit;
+  let preview: CloudxUpdatePreview = {
+    ...mainUpdatePreview,
+    state: "current",
+    currentCommit: targetCommit,
+    changelog: [],
+  };
+  let status: CloudxUpdateStatus = { available: true };
+  const starts: unknown[] = [];
+  await page.route("**/api/system/update/preview", (route) =>
+    route.fulfill({ json: preview }),
+  );
+  await page.route("**/api/system/update", async (route) => {
+    if (route.request().method() === "POST") {
+      starts.push(route.request().postDataJSON());
+      status = {
+        available: true,
+        run: {
+          id: "browser-repair",
+          state: "running",
+          targetCommit,
+          startedAt: "2026-09-15T04:00:00Z",
+          message: "Rebuilding and activating CloudX.",
+        },
+      };
+    }
+    await route.fulfill({ json: status });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openSettings(page, isMobile);
+  await settings
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("Updates");
+  const updates = settings.getByRole("region", { name: "CloudX updates" });
+  await expect(updates).toContainText("The checkout is up to date with main.");
+  await expect(updates).toContainText("Checkout commit: bbbbbbbbbbbb");
+  await expect(updates).toContainText("Running server commit: aaaaaaaaaaaa");
+  await expect(updates).toContainText(
+    "The running server differs from the checkout.",
+  );
+  await expect(updates).not.toContainText("CloudX is up to date");
+  const check = updates.getByRole("button", {
+    name: "Check update status",
+    exact: true,
+  });
+  for (const reason of [
+    "A complete runtime build receipt is unavailable.",
+    "The runtime build receipt is invalid.",
+  ]) {
+    preview = { ...preview, runtime: { verification: "unverified", reason } };
+    await check.click();
+    await expect(updates).toContainText(
+      "Running server commit: unknown. Build verification: unverified.",
+    );
+    await expect(updates).toContainText(reason);
+    await expect(
+      updates.getByRole("button", {
+        name: "Rebuild and activate CloudX",
+        exact: true,
+      }),
+    ).toBeEnabled();
+  }
+  preview = {
+    ...preview,
+    runtime: {
+      verification: "verified",
+      commit: targetCommit,
+      builtAt: "2026-09-15T00:00:00Z",
+      sourceDirty: false,
+    },
+  };
+  await check.click();
+  await expect(updates).toContainText(
+    "The verified running server matches the selected target.",
+  );
+  await expect(updates).toContainText(
+    "it does not verify this browser’s loaded frontend",
+  );
+  await expect(
+    updates.getByRole("button", {
+      name: "Update CloudX and dependencies",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  preview = { ...preview, runtime: mainUpdatePreview.runtime };
+  await check.click();
+  const repair = updates.getByRole("button", {
+    name: "Rebuild and activate CloudX",
+    exact: true,
+  });
+  await repair.scrollIntoViewIfNeeded();
+  await expect(repair).toBeInViewport({ ratio: 1 });
+  await repair.click({ trial: true });
+  expect(
+    await updates.evaluate(
+      (panel) => panel.scrollWidth <= panel.clientWidth + 1,
+    ),
+  ).toBe(true);
+  await expectSettingsFits(page, isMobile);
+  await captureSample(page, testInfo, "settings-runtime-repair");
+  await repair.focus();
+  await repair.press("Enter");
+  await expect(updates).toContainText("Rebuilding and activating CloudX.");
+  expect(starts).toEqual([{ channel: "main", targetCommit }]);
+});
+
 test("Updates selects persisted release channels and shows availability and merged pull requests", async ({
   page,
   isMobile,
@@ -1581,6 +1697,13 @@ test("Updates selects persisted release channels and shows availability and merg
   preview = {
     ...preview,
     state: "current",
+    currentCommit: preview.target!.commit,
+    runtime: {
+      verification: "verified",
+      commit: preview.target!.commit,
+      builtAt: "2026-09-15T00:00:00Z",
+      sourceDirty: false,
+    },
     changelog: [],
     changelogComplete: true,
     message: undefined,
@@ -1591,10 +1714,9 @@ test("Updates selects persisted release channels and shows availability and merg
   });
   await check.click();
   await expect(
-    settings.getByText(
-      "CloudX is on the latest release. You can still update dependencies.",
-      { exact: true },
-    ),
+    settings.getByText("The checkout matches the latest release.", {
+      exact: true,
+    }),
   ).toBeVisible();
   await expect(
     settings.getByRole("button", {

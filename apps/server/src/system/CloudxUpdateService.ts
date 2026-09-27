@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { parseCloudxUpdateChannel, parseCloudxUpdatePreview, parseCloudxUpdateRequest, parseCloudxUpdateStatus,
   type CloudxUpdateChannel, type CloudxUpdatePreview, type CloudxUpdateRequest, type CloudxUpdateStatus } from "@cloudx/shared";
 import { CloudxUpdateCatalog } from "./CloudxUpdateCatalog.js";
+import { runtimeBuild, type RuntimeBuild } from "./RuntimeBuild.js";
 
 const executeFile = promisify(execFile);
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
@@ -24,7 +25,8 @@ export class CloudxUpdateService {
   private readonly checking = new Map<string, Promise<CloudxUpdatePreview>>();
 
   constructor(private readonly dataDir: string, private readonly execute: UpdateCommand = executeFile,
-    private readonly catalog: Pick<CloudxUpdateCatalog, "preview"> = new CloudxUpdateCatalog()) {
+    private readonly catalog: Pick<CloudxUpdateCatalog, "preview"> = new CloudxUpdateCatalog(),
+    private readonly runtime: Pick<RuntimeBuild, "identity"> = runtimeBuild) {
     if (!path.isAbsolute(this.repoRoot)) throw new Error("CLOUDX_INSTALL_ROOT must be an absolute checkout path.");
     if (!path.isAbsolute(this.coordinatorRoot)) throw new Error("CLOUDX_UPDATE_COORDINATOR_ROOT must be an absolute coordinator path.");
   }
@@ -41,7 +43,11 @@ export class CloudxUpdateService {
     if (active) return active;
     this.previews.delete(channel);
     const checking = this.catalog.preview(channel, currentCommit).then(value => {
-      const preview = parseCloudxUpdatePreview(value);
+      const identity = this.runtime.identity;
+      const runtime = identity.verification === "verified"
+        ? { verification: identity.verification, commit: identity.build.commit, builtAt: identity.build.builtAt, sourceDirty: identity.build.sourceDirty }
+        : { verification: identity.verification, reason: identity.reason };
+      const preview = parseCloudxUpdatePreview({ ...value, runtime });
       this.previews.set(channel, preview);
       return preview;
     }).finally(() => this.checking.delete(key));
