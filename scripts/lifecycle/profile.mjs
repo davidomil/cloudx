@@ -236,24 +236,7 @@ export async function seedProfile({
   });
   const requestsBeforePrompt = conversationCount(provider);
   await enterText(api, codex.id, PROMPT);
-  await until(
-    async () => {
-      const receipt = await readJsonOptional(receiptPath);
-      const bytes =
-        receipt?.transcriptPath && (await readOptional(receipt.transcriptPath));
-      return (
-        bytes &&
-        transcriptEvents(bytes).some(
-          (event) =>
-            event.type === "event_msg" &&
-            event.payload?.type === "task_complete" &&
-            event.payload.last_agent_message === ANSWER,
-        )
-      );
-    },
-    "The installed Codex never saved the synthetic completed turn.",
-    45_000,
-  );
+  await waitForSavedTurn(receiptPath);
   assert.equal(
     conversationCount(provider),
     requestsBeforePrompt + 1,
@@ -329,6 +312,27 @@ export async function seedProfile({
     unrelatedFiles,
     allowedStatusPaths: unrelatedFiles.map((value) => value.relativePath),
   };
+}
+
+export async function waitForSavedTurn(receiptPath) {
+  await until(
+    async () => {
+      const receipt = await readJsonOptional(receiptPath);
+      const bytes =
+        receipt?.transcriptPath && (await readOptional(receipt.transcriptPath));
+      return (
+        bytes &&
+        transcriptEvents(bytes).some(
+          (event) =>
+            event.type === "event_msg" &&
+            event.payload?.type === "task_complete" &&
+            event.payload.last_agent_message === ANSWER,
+        )
+      );
+    },
+    "The installed Codex never saved the synthetic completed turn.",
+    45_000,
+  );
 }
 
 /** First prove preservation, then use explicit recovery only when Settings disclosed an interruption. */
@@ -626,8 +630,8 @@ async function readJsonOptional(file) {
 function transcriptEvents(bytes) {
   return bytes
     .toString()
-    .trimEnd()
     .split("\n")
+    .slice(0, -1)
     .map((line) => JSON.parse(line));
 }
 function conversationCount(provider) {

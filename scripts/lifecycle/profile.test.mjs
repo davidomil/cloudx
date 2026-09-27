@@ -1,11 +1,16 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { startProfileProvider, verifySavedConversation } from "./profile.mjs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  startProfileProvider,
+  verifySavedConversation,
+  waitForSavedTurn,
+} from "./profile.mjs";
 
 const cleanups = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
@@ -17,7 +22,64 @@ async function temporaryHome() {
   return home;
 }
 
+async function savedTurnFixture(transcript) {
+  const home = await temporaryHome();
+  const transcriptPath = path.join(home, "conversation.jsonl");
+  const receiptPath = path.join(home, "receipt.json");
+  await fs.writeFile(transcriptPath, transcript);
+  await fs.writeFile(receiptPath, JSON.stringify({ transcriptPath }));
+  return { transcriptPath, receiptPath };
+}
+
+const completedTurn = JSON.stringify({
+  type: "event_msg",
+  payload: {
+    type: "task_complete",
+    last_agent_message: "The synthetic lifecycle conversation is saved.",
+  },
+});
+
 describe("installed lifecycle conversation evidence", () => {
+  it("waits through an empty transcript and partial records until the completed turn has a newline", async () => {
+    const header = '{"type":"session_meta","payload":{"id":"original-id"}}\n';
+    const snapshots = [
+      "",
+      header.slice(0, 12),
+      header,
+      header + completedTurn.slice(0, 30),
+      header + completedTurn,
+      header + completedTurn + '\n{"type":',
+    ];
+    const { transcriptPath, receiptPath } = await savedTurnFixture(
+      snapshots[0],
+    );
+    const observed = [];
+    const readFile = fs.readFile;
+    vi.spyOn(fs, "readFile").mockImplementation(async (file, ...options) => {
+      const bytes = await readFile(file, ...options);
+      if (file === transcriptPath) {
+        observed.push(bytes.toString());
+        expect(observed.length).toBeLessThanOrEqual(snapshots.length);
+        // Advance the writer only after this poll has captured its bytes.
+        if (observed.length < snapshots.length)
+          await fs.writeFile(transcriptPath, snapshots[observed.length]);
+      }
+      return bytes;
+    });
+
+    await expect(waitForSavedTurn(receiptPath)).resolves.toBeUndefined();
+    expect(observed).toEqual(snapshots);
+  });
+
+  it.each([
+    ["before completion", `{broken}\n${completedTurn}\n`],
+    ["after completion", `${completedTurn}\n{broken}\n`],
+    ["a blank completed record", `${completedTurn}\n\n`],
+  ])("rejects malformed completed records: %s", async (_label, transcript) => {
+    const { receiptPath } = await savedTurnFixture(transcript);
+    await expect(waitForSavedTurn(receiptPath)).rejects.toThrow(SyntaxError);
+  });
+
   it("provides completed synthetic native Responses turns without precreating conversation evidence", async () => {
     const home = await temporaryHome();
     const provider = await startProfileProvider({
