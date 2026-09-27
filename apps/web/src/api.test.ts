@@ -50,7 +50,8 @@ describe("api client", () => {
   });
 
   it("reads and validates a channel preview without using a cached response", async () => {
-    const preview = { channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "unavailable", changelog: [], changelogComplete: false };
+    const preview = { channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "unavailable", changelog: [], changelogComplete: false,
+      runtime: { verification: "unverified", reason: "A complete runtime build receipt is unavailable." } };
     const fetch = vi.fn().mockResolvedValueOnce(jsonResponse(preview)).mockResolvedValueOnce(jsonResponse({ channel: "nightly" }));
     vi.stubGlobal("fetch", fetch);
     const signal = new AbortController().signal;
@@ -61,6 +62,7 @@ describe("api client", () => {
 
   it("saves the selected channel and starts only the displayed commit", async () => {
     const preview = {
+      runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: false },
       channel: "releases", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "available", changelog: [], changelogComplete: true,
       target: { commit: "b".repeat(40), name: "v0.2.0", url: "https://github.com/davidomil/cloudx/releases/tag/v0.2.0" }
     };
