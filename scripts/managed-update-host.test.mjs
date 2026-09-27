@@ -16,6 +16,7 @@ function fixture() {
   const root = path.join(home, 'checkout'), origin = path.join(home, 'origin');
   fs.mkdirSync(origin); git(origin, 'init', '-b', 'main'); git(origin, 'config', 'user.email', 'test@local'); git(origin, 'config', 'user.name', 'Test');
   const source = { 'package.json': '{"name":"fixture","type":"module"}', 'package-lock.json': '{"lockfileVersion":3}', 'version.txt': 'old', 'local.txt': 'original',
+    '.gitignore': fs.readFileSync(new URL('../.gitignore', import.meta.url), 'utf8'),
     'apps/server/src/workspace/SessionStateStore.ts': 'if (value.version !== 1) throw new Error();',
     'services/documentation-indexer/src/cloudx_documentation_indexer/catalog_schema.py': 'SCHEMA_VERSION = 2\n' };
   for (const [name, value] of Object.entries(source)) write(origin, name, value);
@@ -61,6 +62,44 @@ function fixture() {
 }
 
 describe('managed update host with real Git and recovery files', () => {
+  it.each(['clean checkout', 'unrelated local work'])('keeps Git status unchanged after artifact activation: %s', checkout => {
+    const f = fixture();
+    const artifacts = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/dist', 'apps/server/dist', 'apps/web/dist',
+      'services/asr/.venv', 'services/documentation-indexer/.venv'];
+    const build = f.build.getMockImplementation();
+    f.build.mockImplementation(options => {
+      build(options);
+      for (const relative of artifacts) write(options.releaseRoot, `${relative}/generated.txt`, 'prepared artifact');
+    });
+    const localFiles = checkout === 'unrelated local work' ? {
+      'notes.txt': 'unrelated untracked work\n',
+      'apps/server/operator-notes.txt': 'notes next to generated output\n',
+    } : {};
+    const localLinks = checkout === 'unrelated local work' ? ['extras/dist', 'extras/node_modules', 'services/custom/.venv'] : [];
+    const external = path.join(f.home, 'external');
+    write(external, 'keep.txt', 'external work stays unchanged');
+    for (const [relative, content] of Object.entries(localFiles)) write(f.root, relative, content);
+    for (const relative of localLinks) {
+      fs.mkdirSync(path.dirname(path.join(f.root, relative)), { recursive: true });
+      fs.symlinkSync(external, path.join(f.root, relative));
+    }
+    const expectedStatus = [...Object.keys(localFiles), ...localLinks].sort().map(relative => `?? ${relative}\0`).join('');
+    expect(git(f.root, 'status', '--porcelain=v1', '-z', '--untracked-files=all')).toBe(expectedStatus);
+
+    f.host.prepare(f.record); f.host.quiesce(f.record); f.host.snapshot(f.record); f.host.activate(f.record);
+
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.target);
+    expect(f.record.transition.artifacts).toEqual(artifacts);
+    for (const relative of artifacts) {
+      expect(fs.readlinkSync(path.join(f.root, relative))).toBe(path.join(f.record.transition.release, relative));
+      expect(fs.readFileSync(path.join(f.root, relative, 'generated.txt'), 'utf8')).toBe('prepared artifact');
+    }
+    expect(git(f.root, 'status', '--porcelain=v1', '-z', '--untracked-files=all')).toBe(expectedStatus);
+    for (const [relative, content] of Object.entries(localFiles)) expect(fs.readFileSync(path.join(f.root, relative), 'utf8')).toBe(content);
+    for (const relative of localLinks) expect(fs.readlinkSync(path.join(f.root, relative))).toBe(external);
+    expect(fs.readFileSync(path.join(external, 'keep.txt'), 'utf8')).toBe('external work stays unchanged');
+  });
+
   it('keeps a prepared target inactive and verifies it after a later explicit activation', async () => {
     const f = fixture();
     f.record.noStart = true;

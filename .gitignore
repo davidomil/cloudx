@@ -40,5 +40,14 @@ REVIEW_TRACKING.md
 
 *.egg-info/
 
+# Managed updater artifact symlinks need exact paths without directory-only trailing slashes.
+/node_modules
+/packages/shared/dist
+/packages/plugin-api/dist
+/apps/server/dist
+/apps/web/dist
+/services/asr/.venv
+/services/documentation-indexer/.venv
+
 # Previous generated runtimes retained by the managed updater until recovery is no longer needed.
 *.cloudx-previous-*
