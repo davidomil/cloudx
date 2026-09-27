@@ -64,6 +64,32 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  codex-native:
+    name: Codex native recovery (${{ matrix.codex }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        codex: ["0.156.1", "0.157.1"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck -- --pretty false
+      - name: Install the exact supported native CLI
+        run: npm install --global --prefix "$RUNNER_TEMP/codex" --ignore-scripts --no-audit --no-fund '@openai/codex@${{ matrix.codex }}'
+      - name: Require production launch, permissions and conversation recovery
+        env:
+          CLOUDX_NATIVE_CODEX_VERSION: ${{ matrix.codex }}
+        run: CLOUDX_NATIVE_CODEX="$RUNNER_TEMP/codex/bin/codex" npm run test:codex-recovery
+
   terminal-stress:
     name: Terminal stress (Node 22, 2 CPUs, 7 GiB)
     runs-on: ubuntu-24.04
@@ -293,6 +319,7 @@ jobs:
       [
         policy,
         typescript,
+        codex-native,
         terminal-stress,
         python-services,
         browser,
@@ -306,6 +333,7 @@ jobs:
         env:
           POLICY_RESULT: ${{ needs.policy.result }}
           TYPESCRIPT_RESULT: ${{ needs.typescript.result }}
+          CODEX_NATIVE_RESULT: ${{ needs.codex-native.result }}
           TERMINAL_STRESS_RESULT: ${{ needs.terminal-stress.result }}
           PYTHON_RESULT: ${{ needs.python-services.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}

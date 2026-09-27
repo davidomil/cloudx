@@ -25,7 +25,7 @@ export class CodexWorkerTurn {
   }
 
   fromClient(message) {
-    if (message.method === "thread/start" && message.params?.threadSource === "system" && message.params?.ephemeral === true) {
+    if (message.method === "thread/start" && ["system", "thread_title"].includes(message.params?.threadSource) && message.params?.ephemeral === true) {
       if (message.id == null) throw new Error("Native auxiliary thread/start is missing its request identity.");
       if (this.auxiliaryThreadRequests.size + this.auxiliaryThreads.size >= MAX_AUXILIARY_THREADS)
         throw new Error("Native auxiliary thread tracking exceeded its limit.");
@@ -163,10 +163,10 @@ export async function runWorkerBridge(launch) {
           const message = JSON.parse(line);
           if (socket.readyState !== WebSocket.OPEN) throw new Error("Native worker emitted a message without its visible client.");
           if (socket.bufferedAmount > MAX_MESSAGE_BYTES) throw new Error("Native worker client cannot keep up with output.");
-          selection?.fromServer(message);
           permissions?.fromServer(message);
+          selection?.fromServer(message);
           turn?.fromServer(message);
-          socket.send(line);
+          socket.send(JSON.stringify(message));
         }
         if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
       } catch (error) { fail(error); }

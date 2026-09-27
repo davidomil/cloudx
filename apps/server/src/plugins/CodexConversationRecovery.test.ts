@@ -55,6 +55,73 @@ describe("Codex conversation identity", () => {
     expect(save).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId: firstId, authority: "selected" }));
   });
 
+  it("refreshes the selected conversation's transcript path after native history editing", () => {
+    const binding = { tabId: "tab", executionId: secondId, receiptPath: recovery.receiptPath };
+    const selection = new CodexConversationSelection(binding, (value: unknown) => saveTurnReceipt(binding.receiptPath, value));
+    const thread = { id: firstId, cwd: home, path: path.join(home, "before-edit.jsonl") };
+    selection.fromClient({ id: 1, method: "thread/start", params: {} });
+    selection.fromServer({ id: 1, result: { thread } });
+    selection.fromClient({ id: 2, method: "thread/revert", params: { threadId: firstId, beforeTurnId: "first-turn" } });
+    const transcriptPath = path.join(home, "after-edit.jsonl");
+    selection.fromServer({ id: 2, result: { thread: { ...thread, path: transcriptPath } } });
+
+    expect(recovery.readForExecution("tab", secondId)).toEqual({
+      sessionId: firstId, cwd: home, transcriptPath, selection: { tabId: "tab", executionId: secondId }
+    });
+  });
+
+  it("keeps the selected receipt when a history edit fails or replies without correlation", () => {
+    const save = vi.fn();
+    const selection = new CodexConversationSelection({ tabId: "tab", executionId: firstId, receiptPath: recovery.receiptPath }, save);
+    const thread = { id: firstId, cwd: home, path: path.join(home, "edited.jsonl") };
+    selection.fromClient({ id: 1, method: "thread/start", params: {} });
+    selection.fromServer({ id: 1, result: { thread } });
+    save.mockClear();
+    selection.fromClient({ id: 2, method: "thread/revert", params: { threadId: firstId, beforeTurnId: "first-turn" } });
+    selection.fromServer({ id: "2", result: { thread } });
+    selection.fromServer({ method: "thread/reverted", params: { threadId: firstId } });
+    selection.fromServer({ id: 2, error: { message: "History edit failed." } });
+    selection.fromServer({ id: 2, result: { thread } });
+
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("does not select a background or superseded thread from its history-edit response", () => {
+    const save = vi.fn();
+    const selection = new CodexConversationSelection({ tabId: "tab", executionId: firstId, receiptPath: recovery.receiptPath }, save);
+    const initial = { id: firstId, cwd: home };
+    const next = { id: secondId, cwd: home };
+    selection.fromClient({ id: 1, method: "thread/start", params: {} });
+    selection.fromServer({ id: 1, result: { thread: initial } });
+    save.mockClear();
+    selection.fromClient({ id: 2, method: "thread/revert", params: { threadId: secondId, beforeTurnId: "first-turn" } });
+    selection.fromServer({ id: 2, result: { thread: next } });
+    expect(save).not.toHaveBeenCalled();
+    selection.fromClient({ id: 3, method: "thread/revert", params: { threadId: firstId, beforeTurnId: "first-turn" } });
+    selection.fromClient({ id: 4, method: "thread/start", params: {} });
+    selection.fromServer({ id: 4, result: { thread: next } });
+    save.mockClear();
+    selection.fromServer({ id: 3, result: { thread: initial } });
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { id: secondId, cwd: "/tmp" },
+    { id: firstId, cwd: "relative" },
+    { id: firstId, cwd: "/tmp", path: "relative" },
+    { id: firstId, cwd: "/tmp", ephemeral: true }
+  ])("rejects a history edit that returns a different or invalid identity %j", thread => {
+    const save = vi.fn();
+    const selection = new CodexConversationSelection({ tabId: "tab", executionId: firstId, receiptPath: recovery.receiptPath }, save);
+    selection.fromClient({ id: 1, method: "thread/start", params: {} });
+    selection.fromServer({ id: 1, result: { thread: { id: firstId, cwd: home } } });
+    save.mockClear();
+    selection.fromClient({ id: 2, method: "thread/revert", params: { threadId: firstId, beforeTurnId: "first-turn" } });
+
+    expect(() => selection.fromServer({ id: 2, result: { thread } })).toThrow("invalid thread identity");
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it.each([{ id: "last", cwd: "/tmp" }, { id: firstId, cwd: "relative" }, { id: firstId, cwd: "/tmp", path: "relative" }, { id: firstId, cwd: "/tmp", ephemeral: true }])("rejects malformed native selections without replacing the saved identity", thread => {
     const save = vi.fn();
     const selection = new CodexConversationSelection({ tabId: "tab", executionId: firstId, receiptPath: recovery.receiptPath }, save);

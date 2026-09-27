@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireCodexInstallationLock,
   readCodexVersion,
@@ -10,7 +11,29 @@ import {
   updateCodexInstallation,
 } from "./codex-updater.mjs";
 
+vi.mock("node:child_process", async importOriginal => ({ ...await importOriginal() }));
+
 const scratch = [];
+beforeEach(() => {
+  const spawn = childProcess.spawn;
+  vi.spyOn(childProcess, "spawn").mockImplementation((command, args, options) => {
+    const verifier = args?.findIndex(argument => String(argument).endsWith("/codex-runtime-verification.mjs")) ?? -1;
+    if (verifier < 0) return spawn(command, args, options);
+    const source = `
+      const fs = require('node:fs');
+      fs.appendFileSync(process.env.TEST_RUNTIME_LOG, process.argv[1] + '\\n');
+      if (process.env.TEST_MODE === 'runtime') {
+        console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
+      }
+      if (process.env.TEST_MODE === 'runtime-timeout') {
+        const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+        fs.writeFileSync(process.env.TEST_CHILD, String(child.pid));
+        setInterval(() => {}, 1000);
+      }
+    `;
+    return spawn(command, [...args.slice(0, verifier), "-e", source, "--", ...args.slice(verifier + 1)], options);
+  });
+});
 afterEach(() => {
   vi.restoreAllMocks();
   for (const dir of scratch.splice(0))
@@ -111,6 +134,7 @@ else if (['timeout', 'cancel', 'escaped-child', 'escaped-silent', 'lost-owner', 
       TEST_WRITES: path.join(root, "writes"),
       TEST_OWNER: path.join(root, "owner"),
       TEST_VERSION_LOG: path.join(root, "versions"),
+      TEST_RUNTIME_LOG: path.join(root, "runtime-checks"),
     },
   };
 }
@@ -149,6 +173,7 @@ describe("shared Codex update", () => {
       previousVersion: "1.0.0",
     });
     expect(stages).toEqual(["checking", "updating", "verifying"]);
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
     expect(commands(fixture)).toEqual([
       ["view", "@openai/codex@latest", "version", "--json"],
       ["i", "-g", "--prefix", fixture.prefix, "@openai/codex@latest"],
@@ -158,13 +183,34 @@ describe("shared Codex update", () => {
     ).toBe(false);
   });
 
-  it("reports an already current executable without reinstalling", async () => {
+  it("verifies an already current executable without reinstalling", async () => {
     const fixture = installation({ version: "1.1.0" });
     await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({
       outcome: "current",
       installedVersion: "1.1.0",
     });
     expect(commands(fixture)).toHaveLength(1);
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
+  });
+
+  it.each(["1.0.0", "1.1.0"])("rejects a version-valid candidate when CloudX runtime verification fails (installed %s)", async version => {
+    const fixture = installation({ mode: "runtime", version });
+    const output = [];
+    const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
+    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: null, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(error.message).not.toContain("SECRET-TOKEN");
+    expect(output.join("")).toContain("SECRET-TOKEN: selected conversation was not saved");
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
+    expect(fs.readFileSync(fixture.env.TEST_VERSION_LOG, "utf8").trim().split("\n")).toHaveLength(version === "1.1.0" ? 1 : 2);
+    expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
+  });
+
+  it("reaps runtime-verifier descendants on timeout without claiming the unverified CLI is usable", async () => {
+    const fixture = installation({ mode: "runtime-timeout" });
+    await expect(updateCodexInstallation({ ...fixture, timeoutMs: 800 })).rejects.toMatchObject({ code: "timeout", usableVersion: null });
+    const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+    expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+    expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
   });
 
   it.each(["failure", "network", "permission", "registry"])(

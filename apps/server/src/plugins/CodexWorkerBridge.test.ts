@@ -19,7 +19,7 @@ const binding = { workerId: "worker", attemptId: "attempt", receiptPath: "/unuse
 const start = { id: 4, method: "turn/start", params: { threadId: "thread" } };
 const response = { id: 4, result: { turn: { id: "turn", status: "inProgress" } } };
 const complete = (status = "completed", threadId = "thread", turnId = "turn") => ({ method: "turn/completed", params: { threadId, turn: { id: turnId, status } } });
-const titleThreadStart = { id: "temporary-structured-thread", method: "thread/start", params: { threadSource: "system", ephemeral: true } };
+const titleThreadStart = { id: "temporary-structured-thread", method: "thread/start", params: { threadSource: "thread_title", ephemeral: true } };
 const titleThreadResponse = { id: titleThreadStart.id, result: { thread: { id: "title-thread" } } };
 const titleTurnStart = { id: "temporary-structured-turn", method: "turn/start", params: { threadId: "title-thread", outputSchema: { type: "object", properties: { title: { type: "string" } } } } };
 
@@ -42,17 +42,60 @@ it.each(["thread/resume", "thread/fork"])("keeps native saved permission selecti
   expect(rejoin.params).toEqual({ threadId: "loaded" });
 });
 
-it("keeps auxiliary thread permissions native and rejects unresolved new-thread roots", () => {
+it("keeps auxiliary thread permissions native and rejects malformed explicit roots", () => {
   const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
   const auxiliary = structuredClone(titleThreadStart);
   permissions.fromClient(auxiliary);
   expect(auxiliary).toEqual(titleThreadStart);
-  expect(() => permissions.fromClient({ method: "thread/start", params: {} })).toThrow("resolved workspace roots");
   expect(() => permissions.fromClient({ method: "thread/start", params: { runtimeWorkspaceRoots: ["relative"] } })).toThrow("workspace roots are invalid");
   expect(() => new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["relative"] })).toThrow("Invalid Codex launch permissions");
   const initial = { id: 1, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"] } };
   permissions.fromClient(initial);
   expect(initial.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
+});
+
+it.each(["thread/start", "thread/resume", "thread/fork"].flatMap(method =>
+  [true, false].flatMap(yoloMode => [undefined, null].map(roots => ({ method, yoloMode, roots })))
+))("extends server-resolved roots for $method (YOLO $yoloMode, roots $roots)", ({ method, yoloMode, roots }) => {
+  const permissions = new CodexRemotePermissions({ yoloMode, additionalWritableRoots: ["/cloudx-skills"] });
+  const request = { id: 1, method, params: { threadId: "saved", ...(roots === null ? { runtimeWorkspaceRoots: null } : {}), permissions: ":workspace" } };
+  permissions.fromClient(request);
+  expect(request.params.runtimeWorkspaceRoots).toBe(roots);
+  const response = { id: 1, result: { thread: { id: "selected" }, runtimeWorkspaceRoots: ["/saved-cwd", "/saved-extra"], sandbox: { type: "workspaceWrite", writableRoots: ["/saved-extra"] }, activePermissionProfile: { id: ":workspace" }, approvalPolicy: "on-request" } };
+  const policy = structuredClone(response.result);
+  permissions.fromServer(response);
+  expect(response.result).toEqual({ ...policy, runtimeWorkspaceRoots: ["/saved-cwd", "/saved-extra", "/cloudx-skills"] });
+  // The native client adopts the response roots and submits them with its turn.
+  const turn = { id: 2, method: "turn/start", params: { threadId: "selected", runtimeWorkspaceRoots: response.result.runtimeWorkspaceRoots, permissions: ":workspace" } };
+  permissions.fromClient(turn);
+  expect(turn.params).toEqual({ threadId: "selected", runtimeWorkspaceRoots: ["/saved-cwd", "/saved-extra", "/cloudx-skills"], permissions: ":workspace" });
+});
+
+it("finishes resolving pending roots even after a saved-thread selection replaces launch policy", () => {
+  const permissions = new CodexRemotePermissions({ yoloMode: true, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient({ id: 1, method: "thread/resume", params: { threadId: "saved" } });
+  permissions.fromClient({ id: 2, method: "thread/start", params: {} });
+  permissions.fromServer({ id: 1, result: { thread: { id: "saved" }, runtimeWorkspaceRoots: ["/saved"] } });
+  const response = { id: 2, result: { thread: { id: "new" }, runtimeWorkspaceRoots: ["/new", "/cloudx-skills"] } };
+  permissions.fromServer(response);
+  expect(response.result.runtimeWorkspaceRoots).toEqual(["/new", "/cloudx-skills"]);
+});
+
+it.each([undefined, null, "invalid", ["relative"]])("rejects malformed server-resolved roots %j", roots => {
+  const permissions = new CodexRemotePermissions({ yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient({ id: 1, method: "thread/start", params: {} });
+  expect(() => permissions.fromServer({ id: 1, result: { thread: { id: "new" }, runtimeWorkspaceRoots: roots } })).toThrow("workspace roots are invalid");
+});
+
+it("ignores failed, unrelated and auxiliary root responses", () => {
+  const permissions = new CodexRemotePermissions({ yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient({ id: 1, method: "thread/start", params: {} });
+  permissions.fromServer({ id: 1, error: { message: "Cannot start" } });
+  const response = { id: 1, result: {} };
+  permissions.fromServer(response);
+  permissions.fromClient(titleThreadStart);
+  permissions.fromServer(titleThreadResponse);
+  expect(response).toEqual({ id: 1, result: {} });
 });
 
 it.each(["thread/resume", "thread/fork"])("preserves native permissions on new threads after initial %s", method => {
@@ -87,9 +130,41 @@ function launchedPermissions() {
   return permissions;
 }
 
+it("persists the launch profile on the first turn after preserving server-resolved roots", () => {
+  const permissions = launchedPermissions();
+  const turn = { id: 2, method: "turn/start", params: { threadId: "selected", sandboxPolicy: null, permissions: null, runtimeWorkspaceRoots: ["/project", "/configured", "/cloudx-skills"] } };
+  permissions.fromClient(turn);
+  expect(turn.params).toEqual({ threadId: "selected", sandboxPolicy: null, permissions: ":danger-full-access", runtimeWorkspaceRoots: ["/project", "/configured", "/cloudx-skills"] });
+});
+
+it.each(["thread/start", "thread/resume", "thread/fork"])("retains native profile identity in the first turn after %s", method => {
+  const permissions = launchedPermissions();
+  permissions.fromClient({ id: 2, method: "thread/settings/update", params: { threadId: "selected", permissions: ":workspace" } });
+  permissions.fromServer({ method: "thread/settings/updated", params: { threadId: "selected", threadSettings: { activePermissionProfile: { id: ":workspace" }, sandboxPolicy: { type: "workspaceWrite" } } } });
+  permissions.fromServer({ id: 2, result: {} });
+  permissions.fromClient({ id: 3, method, params: { threadId: "selected", sandbox: method === "thread/start" ? "workspace-write" : null } });
+  const reply = { id: 3, result: { thread: { id: "next" }, runtimeWorkspaceRoots: ["/saved-extra"], sandbox: { type: "workspaceWrite" }, activePermissionProfile: method === "thread/start" ? null : { id: ":workspace" } } };
+  permissions.fromServer(reply);
+  const turn = { id: 4, method: "turn/start", params: { threadId: "next", sandboxPolicy: null, permissions: null, runtimeWorkspaceRoots: reply.result.runtimeWorkspaceRoots } };
+  permissions.fromClient(turn);
+  expect(turn.params).toEqual({ threadId: "next", sandboxPolicy: null, permissions: ":workspace", runtimeWorkspaceRoots: ["/saved-extra", "/cloudx-skills"] });
+});
+
+it.each([
+  { threadId: "auxiliary", sandboxPolicy: null, permissions: null },
+  { threadId: "selected", sandboxPolicy: { type: "readOnly" }, permissions: null },
+  { threadId: "selected", sandboxPolicy: { type: "dangerFullAccess" }, permissions: null },
+  { threadId: "selected", sandboxPolicy: null, permissions: "custom-profile" }
+])("preserves auxiliary and explicit native turn permissions %j", params => {
+  const permissions = launchedPermissions();
+  const turn = { id: 2, method: "turn/start", params: structuredClone(params) };
+  permissions.fromClient(turn);
+  expect(turn.params).toEqual(params);
+});
+
 it.each([
   { approvalPolicy: "on-request" },
-  { sandboxPolicy: { type: "workspace-write", writableRoots: ["/project"] } },
+  { sandboxPolicy: { type: "workspaceWrite", writableRoots: ["/project"] } },
   { permissions: ":workspace" },
   { permissions: "custom-profile" },
   { approvalsReviewer: "user" }
@@ -165,7 +240,7 @@ it.each(["thread/resume", "thread/fork"])("retains saved native permissions on s
   expect(afterFailure.params).toMatchObject({ approvalPolicy: "never", sandbox: "danger-full-access" });
   permissions.fromServer({ id: 3, error: { message: "New conversation unavailable." } });
   permissions.fromClient({ id: 4, method, params: { threadId: "resumed" } });
-  permissions.fromServer({ id: 4, result: { thread: { id: "resumed" } } });
+  permissions.fromServer({ id: 4, result: { thread: { id: "resumed" }, runtimeWorkspaceRoots: ["/saved"] } });
   const next = { id: 5, method: "thread/start", params: { runtimeWorkspaceRoots: ["/project"], approvalPolicy: "on-request", sandbox: "read-only" } };
   permissions.fromClient(next);
   expect(next.params).toMatchObject({ approvalPolicy: "on-request", sandbox: "read-only" });
@@ -174,7 +249,7 @@ it.each(["thread/resume", "thread/fork"])("retains saved native permissions on s
   expect(restricted.params).toMatchObject({ approvalPolicy: "on-request", sandbox: "workspace-write" });
 });
 
-it("makes each selected conversation durable before its native TUI receives the reply", async () => {
+it("delivers resolved roots and a durable selection before the native TUI receives the reply", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-selection-bridge-"));
   directories.push(directory);
   const command = path.join(directory, "codex.mjs");
@@ -192,8 +267,9 @@ if (process.argv.includes('app-server')) {
   readline.createInterface({ input: process.stdin }).on('line', line => {
     const request = JSON.parse(line);
     if (!['thread/start', 'thread/resume'].includes(request.method)) throw new Error('Unexpected request');
+    if (request.params.runtimeWorkspaceRoots != null) throw new Error('Client roots must remain server-owned');
     const thread = { id: request.id === 1 ? ${JSON.stringify(firstId)} : ${JSON.stringify(secondId)}, cwd: process.cwd() };
-    process.stdout.write(JSON.stringify({ id: request.id, result: { thread } }) + '\\n');
+    process.stdout.write(JSON.stringify({ id: request.id, result: { thread, runtimeWorkspaceRoots: [process.cwd(), '/saved-extra'] } }) + '\\n');
   });
 } else {
   const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
@@ -201,6 +277,8 @@ if (process.argv.includes('app-server')) {
   socket.on('open', () => socket.send(JSON.stringify({ id: 1, method: 'thread/start', params: {} })));
   socket.on('message', data => {
     const reply = JSON.parse(data.toString());
+    if (JSON.stringify(reply.result.runtimeWorkspaceRoots) !== JSON.stringify([process.cwd(), '/saved-extra', '/cloudx-skills']))
+      throw new Error('Native TUI did not receive augmented server roots');
     const receipt = JSON.parse(fs.readFileSync(${JSON.stringify(receiptPath)}, 'utf8'));
     if (receipt.sessionId !== reply.result.thread.id || receipt.executionId !== ${JSON.stringify(firstId)} || receipt.tabId !== 'visible-tab')
       throw new Error('TUI received selection before its bound receipt was durable');
@@ -211,14 +289,16 @@ if (process.argv.includes('app-server')) {
 }
 `, { mode: 0o755 });
   const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
-    selection, command, serverArgs: ["app-server"], tuiArgs: []
+    selection, command, serverArgs: ["app-server"], tuiArgs: [], permissions: { yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] }
   })], { cwd: directory, env: process.env, cols: 100, rows: 30 });
   try {
     await expect.poll(async () => fs.readFile(observedPath, "utf8").then(JSON.parse, () => undefined)).toEqual([firstId, secondId]);
   } finally { await terminal.terminate(); }
 }, 10_000);
 
-it.each(["before worker start", "before worker reply", "during worker turn", "after worker completion"])("keeps title generation separate %s", timing => {
+it.each(["before worker start", "before worker reply", "during worker turn", "after worker completion"].flatMap(timing =>
+  ["system", "thread_title"].map(threadSource => ({ timing, threadSource }))
+))("keeps $threadSource title generation separate $timing", ({ timing, threadSource }) => {
   const saved: unknown[] = [];
   const finals: unknown[] = [];
   const owner = new CodexWorkerTurn({ ...binding, expectedThreadId: "thread" }, (value: unknown) => saved.push(value), (value: unknown) => finals.push(value));
@@ -226,7 +306,7 @@ it.each(["before worker start", "before worker reply", "during worker turn", "af
   if (["during worker turn", "after worker completion"].includes(timing)) owner.fromServer(response);
   if (timing === "after worker completion") owner.fromServer(complete());
   const workerEvidence = [...saved];
-  owner.fromClient(titleThreadStart);
+  owner.fromClient({ ...titleThreadStart, params: { ...titleThreadStart.params, threadSource } });
   owner.fromServer(titleThreadResponse);
   owner.fromClient(titleTurnStart);
   owner.fromServer({ id: titleTurnStart.id, result: { turn: { id: "title-turn", status: "inProgress" } } });
@@ -273,6 +353,7 @@ it.each([
   { name: "malformed creation", request: titleThreadStart, reply: { id: titleThreadStart.id, result: { thread: { id: "" } } } },
   { name: "persistent system thread", request: { ...titleThreadStart, params: { threadSource: "system", ephemeral: false } }, reply: titleThreadResponse },
   { name: "ephemeral user thread", request: { ...titleThreadStart, params: { threadSource: "cli", ephemeral: true } }, reply: titleThreadResponse },
+  { name: "unrecognized feature thread", request: { ...titleThreadStart, params: { threadSource: "another_feature", ephemeral: true } }, reply: titleThreadResponse },
   { name: "missing system source", request: { ...titleThreadStart, params: { ephemeral: true } }, reply: titleThreadResponse },
   { name: "missing ephemeral flag", request: { ...titleThreadStart, params: { threadSource: "system" } }, reply: titleThreadResponse },
   { name: "non-boolean ephemeral flag", request: { ...titleThreadStart, params: { threadSource: "system", ephemeral: "true" } }, reply: titleThreadResponse }

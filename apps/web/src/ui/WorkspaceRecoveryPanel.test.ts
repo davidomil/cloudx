@@ -74,6 +74,17 @@ describe("workspace recovery choices", () => {
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "resume-conversation" });
   });
 
+  it("keeps startup failure guidance without asking for an uncreated conversation", async () => {
+    const message = "Codex exited before a selected conversation was confirmed. Check Codex settings, then open a new tab.";
+    await show({ state: "missing", message, canResume: false, startupFailed: true }, "codex-terminal");
+
+    expect(container.textContent).toContain("Codex startup failed");
+    expect(container.textContent).toContain(message);
+    expect(buttons()).toEqual([]);
+    expect(container.querySelector("input")).toBeNull();
+    expect(recover).not.toHaveBeenCalled();
+  });
+
   it.each(["The exact conversation ID was not recorded.", "The saved conversation transcript is unavailable."])("explains '%s' and requires explicit selection", async message => {
     await show({ state: "missing", message, canResume: false }, "codex-terminal");
     expect(container.textContent).toContain(message);

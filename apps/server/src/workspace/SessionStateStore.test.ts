@@ -50,7 +50,8 @@ it.each([
     { state: "missing", message: 1 },
     { state: "unknown", message: "Offline" },
     { state: "missing", message: "Offline", conversationId: 42 },
-    { state: "missing", message: "Offline", canResume: "yes" }
+    { state: "missing", message: "Offline", canResume: "yes" },
+    { state: "missing", message: "Offline", startupFailed: "yes" }
   ].map(recovery => ({ ...saved(), sessions: [{ ...saved().sessions[0], tab: { ...saved().sessions[0]!.tab, recovery } }] }))
 ])("rejects invalid recovery state without replacing it", async value => {
   const { directory, store } = await fixture();

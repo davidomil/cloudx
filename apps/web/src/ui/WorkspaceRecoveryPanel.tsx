@@ -34,7 +34,7 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
   }
 
   return <section className="workspace-recovery-panel" aria-label={`Recovery for ${tab.title}`} aria-busy={busy}>
-    <h2><AlertTriangle size={20} />{recovery.state === "retired" ? "Codex settings moved" : "Terminal recovery"}</h2>
+    <h2><AlertTriangle size={20} />{recovery.state === "retired" ? "Codex settings moved" : recovery.startupFailed ? "Codex startup failed" : "Terminal recovery"}</h2>
     <p>{recovery.message}</p>
     {recovery.state !== "retired" ? <p className="workspace-recovery-directory">Directory: <code>{tab.cwd}</code></p> : null}
     {error ? <p role="alert">{error}</p> : null}
@@ -46,7 +46,7 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
       <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "reconnect" }))}>Check connection</ControlButton> : null}
     {recovery.state === "missing" && tab.pluginId === "standard-terminal" && onRecover ?
       <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "new-shell" }))}>Open new shell</ControlButton> : null}
-    {recovery.state === "missing" && tab.pluginId === "codex-terminal" && onRecover ? <>
+    {recovery.state === "missing" && !recovery.startupFailed && tab.pluginId === "codex-terminal" && onRecover ? <>
       {recovery.canResume && recovery.conversationId ? <>
         <p>Conversation: <code>{recovery.conversationId}</code></p>
         <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "resume-conversation" }))}>Resume conversation</ControlButton>

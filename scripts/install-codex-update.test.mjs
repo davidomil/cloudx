@@ -71,7 +71,7 @@ describe("Codex-only update options", () => {
 });
 
 describe("updating only Codex", () => {
-  it("plans only the latest Codex package and version checks without a Git checkout or services", async () => {
+  it("plans the latest Codex package and CloudX runtime verification without changing a Git checkout or services", async () => {
     const { options, runner, prefix, envPath } = fixture();
     const result = await runInstaller(options);
     expect(result.assistantBin).toBe(path.join(prefix, "bin/codex"));
@@ -82,6 +82,7 @@ describe("updating only Codex", () => {
       ["npm", "-v"],
       ["npm", "i", "-g", "--prefix", prefix, "@openai/codex@latest"],
       [path.join(prefix, "bin/codex"), "--version"],
+      [process.execPath, path.join(process.cwd(), "scripts/codex-runtime-verification.mjs"), path.join(prefix, "bin/codex")],
     ]);
     expect(runner.commands[2].env).toEqual({
       NPM_CONFIG_PREFIX: prefix,
@@ -183,7 +184,7 @@ describe("updating only Codex", () => {
 });
 
 describe("Codex-only CLI entrypoints", () => {
-  it.each(["success", "npm failure", "Codex failure"])(
+  it.each(["runtime verification failure", "npm failure", "Codex failure"])(
     "runs the installer with isolated stand-in executables: %s",
     (outcome) => {
       const { root, home, envPath, prefix } = fixture();
@@ -253,11 +254,10 @@ console.log('codex-cli ' + JSON.parse(fs.readFileSync(${JSON.stringify(manifestP
           },
         },
       );
-      expect(result.status).toBe(outcome === "success" ? 0 : 1);
-      expect(result.stdout.includes("Codex CLI update complete")).toBe(
-        outcome === "success",
-      );
-      expect(fs.readFileSync(commandLog, "utf8").trim().split("\n")).toEqual([
+      expect(result.status).toBe(1);
+      expect(result.stdout).not.toContain("Codex CLI update complete");
+      if (outcome === "runtime verification failure") expect(result.stderr).toContain("failed CloudX tab launch");
+      expect(fs.readFileSync(commandLog, "utf8").trim().split("\n").filter(line => line.startsWith("npm ") || line === "codex --version")).toEqual([
         "codex --version",
         "npm view @openai/codex@latest version --json",
         `npm i -g --prefix ${prefix} @openai/codex@latest`,

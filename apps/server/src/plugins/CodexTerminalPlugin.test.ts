@@ -57,8 +57,8 @@ class FakeTerminalProcess implements TerminalProcess {
     }
   }
 
-  exit(exitCode: number, reason?: "broker-shutdown"): void {
-    this.exitListener?.({ exitCode, ...(reason ? { reason } : {}) });
+  exit(exitCode: number, reason?: "broker-shutdown", signal?: number): void {
+    this.exitListener?.({ exitCode, ...(reason ? { reason } : {}), ...(signal ? { signal } : {}) });
   }
 }
 
@@ -158,12 +158,13 @@ describe("CodexTerminalPlugin", () => {
   });
 
   it.each([
-    [17, "failed", "Terminal exited with code 17."],
-    [0, "completed", "Terminal exited cleanly."]
-  ] as const)("retains exit code %s and its detail before status observers subscribe", async (exitCode, status, statusMessage) => {
+    [17, undefined, "failed", "Terminal exited with code 17."],
+    [0, 9, "failed", "Terminal exited from signal 9."],
+    [0, undefined, "completed", "Terminal exited cleanly."]
+  ] as const)("retains exit code %s (signal %s) and its detail before status observers subscribe", async (exitCode, signal, status, statusMessage) => {
     const process = new FakeTerminalProcess();
     const session = new CodexTerminalSession(tab, process);
-    process.exit(exitCode);
+    process.exit(exitCode, undefined, signal);
 
     expect(session.snapshot()).toMatchObject({ status, statusMessage });
     const observer = vi.fn();
@@ -204,6 +205,32 @@ describe("CodexTerminalPlugin", () => {
     });
   });
 
+  it.each([
+    ["createSession", 0, 1, undefined],
+    ["createSession", CODEX_CLOSE_ON_EXIT_GRACE_MS + 1, 1, undefined],
+    ["restoreSession", CODEX_CLOSE_ON_EXIT_GRACE_MS + 1, 17, undefined],
+    ["createSession", CODEX_CLOSE_ON_EXIT_GRACE_MS + 1, 0, 9]
+  ] as const)("retains failed %s output after %s ms (code %s, signal %s)", async (method, elapsedMs, exitCode, signal) => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const attached = new FakeTerminalProcess();
+      Object.assign(factory, { attach: async () => attached });
+      const closeTab = vi.fn();
+      const session = await plugin[method]({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
+      const process = method === "createSession" ? factory.process! : attached;
+      process.emitData("CloudX native worker bridge: startup failed.\r\n");
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + elapsedMs);
+      process.exit(exitCode, undefined, signal);
+
+      expect(closeTab).not.toHaveBeenCalled();
+      expect(session.snapshot()).toMatchObject({
+        status: "failed",
+        statusMessage: signal ? `Codex exited from signal ${signal}.` : `Codex exited with code ${exitCode}.`,
+        recentOutput: "CloudX native worker bridge: startup failed.\r\n"
+      });
+      session.stop?.();
+    });
+  });
+
   it.each(["createSession", "restoreSession"] as const)("preserves a public Codex panel on broker shutdown after %s and the startup grace period", async method => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       const terminal = new FakeTerminalProcess();
@@ -235,7 +262,7 @@ describe("CodexTerminalPlugin", () => {
       expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
       expect(factory.spawns).toBe(1);
       expect(factory.bridgeLaunch().tuiArgs).not.toContain("--yolo");
-      expect(factory.bridgeLaunch().serverArgs).toContain('sandbox_mode="danger-full-access"');
+      expect(factory.bridgeLaunch().serverArgs).not.toContain('sandbox_mode="danger-full-access"');
       authorizeProjectTrust.mockRejectedValueOnce(new Error("Repository consent was revoked."));
       await expect(session.applyRuntimeContext!({})).rejects.toThrow("Repository consent was revoked.");
       session.stop?.();
@@ -294,7 +321,8 @@ describe("CodexTerminalPlugin", () => {
       await fs.writeFile(path.join(home, "config.toml"), original);
       const session = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() } });
       expect(factory.bridgeLaunch().tuiArgs).not.toContain("--yolo");
-      expect(factory.bridgeLaunch().serverArgs.includes('sandbox_mode="danger-full-access"')).toBe(yoloMode);
+      expect(factory.bridgeLaunch().serverArgs).not.toContain('sandbox_mode="danger-full-access"');
+      expect(factory.bridgeLaunch().serverArgs).not.toContain('approval_policy="never"');
       expect(factory.bridgeLaunch().tuiArgs).not.toContain("--add-dir");
       expect(factory.bridgeLaunch().permissions).toEqual({ yoloMode, additionalWritableRoots: [path.join(root, "data", "rules-skills")] });
       const config = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
@@ -1448,7 +1476,7 @@ describe("CodexTerminalSession", () => {
     ]);
   });
 
-  it("closes Codex tabs when the Codex process exits", () => {
+  it("closes Codex tabs when the Codex process exits cleanly", () => {
     const process = new FakeTerminalProcess();
     const closed: string[] = [];
     new CodexTerminalSession(
@@ -1461,9 +1489,9 @@ describe("CodexTerminalSession", () => {
       { closeOnExit: true }
     );
 
-    process.exit(1);
+    process.exit(0);
 
-    expect(closed).toEqual(["Codex exited with code 1."]);
+    expect(closed).toEqual(["Codex exited cleanly."]);
   });
 
   it("keeps immediately failed Codex tabs open long enough to show the failure", () => {
@@ -1802,6 +1830,22 @@ describe("Codex conversation recovery after process loss", () => {
     await expect(plugin.describeRecovery(input)).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("exact conversation ID was not saved") });
     await expect(plugin.recoverSession(input)).rejects.toThrow("Select a saved session");
     expect(factory.spawns).toBe(0);
+  });
+
+  it("identifies startup without a selected receipt without offering a nonexistent conversation", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const session = await plugin.createSession({ tab, cwd: root, controls });
+      factory.process!.exit(1);
+      const recovery = await plugin.describeRecovery({ tab, cwd: root, controls, initialInput: session.restoreInput?.() });
+
+      expect(recovery).toEqual({
+        message: "Codex exited before a selected conversation was confirmed. Review the terminal output and Settings → Codex, then open a new Codex tab.",
+        canResume: false, startupFailed: true
+      });
+      expect(factory.spawns).toBe(1);
+      session.stop?.();
+    });
   });
 
   it("validates the user's exact choice before binding a legacy tab with no saved source", async () => {

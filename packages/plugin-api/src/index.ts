@@ -14,6 +14,7 @@ import {
   type PluginId,
   type PluginPanelKind,
   type TabIndicatorUpdate,
+  type TabRecovery,
   type TriggerDescriptor,
   type TriggerEvent,
   type TriggerId,
@@ -257,7 +258,7 @@ export interface WorkspacePlugin {
   recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   previewOwnership?(input: CreatePluginSessionInput): Promise<DirectoryOwnershipPreview>;
   reconcileOwnership?(input: CreatePluginSessionInput, request: DirectoryOwnershipReconciliation): Promise<void>;
-  describeRecovery?(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume?: boolean }> | { message: string; conversationId?: string; canResume?: boolean };
+  describeRecovery?(input: CreatePluginSessionInput): Promise<Omit<TabRecovery, "state">> | Omit<TabRecovery, "state">;
   retirementMessage?: string;
   descriptor(): PluginDescriptor;
 }

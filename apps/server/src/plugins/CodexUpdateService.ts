@@ -75,8 +75,12 @@ export class CodexUpdateService {
           this.state = parseCodexUpdateStatus(saved.update);
           this.verificationBlocked = saved.verificationBlocked === true;
           if (["checking", "updating", "verifying"].includes(this.state.phase)) {
+            const interruptedVerification = this.state.phase === "verifying";
+            this.verificationBlocked ||= interruptedVerification;
             this.save({ ...this.state, phase: "failed", outcome: null, installedVersion: null,
-              message: "The previous Codex update was interrupted. Check the installed version before starting another update.",
+              message: interruptedVerification
+                ? "The previous Codex runtime verification was interrupted. Run the Codex update again to verify tab launch, conversation selection, and permissions before launching new tabs."
+                : "The previous Codex update was interrupted. Check the installed version before starting another update.",
               finishedAt: new Date().toISOString() });
           }
         }
@@ -136,9 +140,9 @@ export class CodexUpdateService {
         finishedAt: new Date().toISOString() });
     } catch (error) {
       const known = error instanceof CodexUpdateError;
-      if (known && error.code === "cleanup-incomplete") this.verificationBlocked = true;
+      if (known && (error.code === "cleanup-incomplete" || (this.state.phase === "verifying" && error.usableVersion === null))) this.verificationBlocked = true;
       const failed: CodexUpdateStatus = { ...this.state, phase: "failed", outcome: null,
-        installedVersion: known ? error.usableVersion : null,
+        installedVersion: known && !this.verificationBlocked ? error.usableVersion : null,
         message: this.verificationBlocked && known ? error.message
           : signal.aborted ? "Codex update stopped or exceeded its time limit. Check the installed version and private update log before trying again."
           : known ? error.message : "Codex update could not complete. Check permissions and the private codex-update/update.log file before trying again.",
@@ -176,6 +180,6 @@ function progressMessage(phase: "checking" | "updating" | "verifying"): string {
   return {
     checking: "Checking the Codex installation and latest npm release…",
     updating: "Installing the latest Codex release…",
-    verifying: "Verifying the updated Codex executable…",
+    verifying: "Verifying Codex tab launch, conversation selection, and permissions…",
   }[phase];
 }
