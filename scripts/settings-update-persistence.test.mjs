@@ -20,6 +20,7 @@ describe("Settings update workspace durability", () => {
   const reload = vi.fn();
   const start = vi.fn();
   const preview = {
+    runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: false },
     channel: "main",
     currentCommit: "a".repeat(40),
     checkedAt: "2026-09-15T00:00:00Z",

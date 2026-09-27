@@ -21,9 +21,14 @@ export interface CloudxUpdateStatus {
 
 export type CloudxUpdateChannel = "releases" | "main";
 
+export type CloudxRunningBuild =
+  | { verification: "verified"; commit: string; builtAt: string; sourceDirty: boolean }
+  | { verification: "unverified"; reason: string };
+
 export interface CloudxUpdatePreview {
   channel: CloudxUpdateChannel;
   currentCommit: string;
+  runtime: CloudxRunningBuild;
   checkedAt: string;
   state: "available" | "current" | "ahead" | "diverged" | "unavailable";
   target?: { commit: string; name: string; url: string };
@@ -76,6 +81,7 @@ export function parseCloudxUpdatePreview(value: unknown): CloudxUpdatePreview {
   const result: CloudxUpdatePreview = {
     channel: parseCloudxUpdateChannel(value.channel),
     currentCommit: value.currentCommit,
+    runtime: parseRunningBuild(value.runtime),
     checkedAt: value.checkedAt,
     state: value.state as CloudxUpdatePreview["state"],
     changelogComplete: value.changelogComplete,
@@ -98,6 +104,18 @@ export function parseCloudxUpdatePreview(value: unknown): CloudxUpdatePreview {
   if (value.compareUrl !== undefined) result.compareUrl = value.compareUrl as string;
   if (value.message !== undefined) result.message = value.message as string;
   return result;
+}
+
+function parseRunningBuild(value: unknown): CloudxRunningBuild {
+  if (record(value)) {
+    if (value.verification === "verified" && commit(value.commit) && timestamp(value.builtAt) && typeof value.sourceDirty === "boolean") {
+      return { verification: "verified", commit: value.commit, builtAt: value.builtAt, sourceDirty: value.sourceDirty };
+    }
+    if (value.verification === "unverified" && text(value.reason) && value.commit === undefined) {
+      return { verification: "unverified", reason: value.reason };
+    }
+  }
+  throw new Error("Invalid CloudX running build evidence.");
 }
 
 function commit(value: unknown): value is string {

@@ -18,6 +18,7 @@ const SETTINGS_FILES = [
   // Historical builds typecheck these fixtures with the maintained contracts.
   "apps/server/src/system/CloudxUpdateService.test.ts",
   "apps/server/src/system/CloudxUpdateRoutes.test.ts",
+  "apps/web/src/ui/CloudxUpdatePanel.test.ts",
   "apps/web/src/ui/SettingsDialog.navigation.test.ts",
   "apps/web/src/cloudxUpdateApi.ts",
 ];

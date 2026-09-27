@@ -228,6 +228,8 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
   const { status, preview, channel, previewLoading, starting, checking, notice, error } = update;
   const running = status?.run?.state === "running";
   const prepared = status?.run?.state === "prepared";
+  const needsRepair = preview?.state === "current" && (preview.runtime.verification === "unverified"
+    || preview.runtime.commit !== preview.currentCommit || preview.runtime.sourceDirty);
   const canUpdate = preview?.target && preview.state !== "unavailable";
   const canResume = (status?.run?.state === "failed" || prepared) && status?.run?.resumable === true;
   const selectedTargetDiffers = preview?.target?.commit !== status?.run?.targetCommit;
@@ -263,7 +265,7 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
       {prepared ? starting ? "Activating update…" : "Activate prepared update" : starting ? "Resuming update…" : "Resume update"}
     </ControlButton> : null}
     {!confirmation || confirmingResume && selectedTargetDiffers ? <ControlButton tone="primary" onClick={() => void update.start()} disabled={startDisabled}>
-      {starting ? "Starting update…" : running ? "Updating CloudX…" : canResume ? "Start selected target" : "Update CloudX and dependencies"}
+      {starting ? "Starting update…" : running ? "Updating CloudX…" : canResume ? "Start selected target" : needsRepair ? "Rebuild and activate CloudX" : "Update CloudX and dependencies"}
     </ControlButton> : null}
     <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading}>Check update status</ControlButton>
     <small>The update starts immediately and continues if you close Settings.</small>
@@ -293,7 +295,7 @@ function UpdateConfirmation({ confirmation, disabled, continueUpdate }: {
 function UpdatePreview({ preview }: { preview: CloudxUpdatePreview }) {
   const state = {
     available: preview.channel === "releases" ? "A new release is available." : "New changes are available on main.",
-    current: preview.channel === "releases" ? "CloudX is on the latest release. You can still update dependencies." : "CloudX is up to date with main. You can still update dependencies.",
+    current: preview.channel === "releases" ? "The checkout matches the latest release." : "The checkout is up to date with main.",
     ahead: "The selected target is older than this checkout. Updating will downgrade CloudX.",
     diverged: "The selected target is on a different history. Updating will switch to that target.",
     unavailable: "Update availability could not be determined."
@@ -301,6 +303,7 @@ function UpdatePreview({ preview }: { preview: CloudxUpdatePreview }) {
   return <>
     <p role="status">{state}</p>
     <p>Checkout commit: <code>{preview.currentCommit.slice(0, 12)}</code></p>
+    <RunningBuild preview={preview} />
     {preview.target ? <p>Target: <a href={preview.target.url} target="_blank" rel="noreferrer">{preview.target.name}</a> (<code>{preview.target.commit.slice(0, 12)}</code>)</p> : null}
     <small>Checked <time dateTime={preview.checkedAt}>{new Date(preview.checkedAt).toLocaleString()}</time></small>
     {preview.message ? <p>{preview.message}</p> : null}
@@ -310,6 +313,25 @@ function UpdatePreview({ preview }: { preview: CloudxUpdatePreview }) {
     </> : preview.state === "available" && preview.changelogComplete ? <p>No merged pull requests were found in these changes.</p> : null}
     {!preview.changelogComplete && !preview.message ? <p>The changelog is incomplete; some changes may be missing.</p> : null}
     {preview.compareUrl ? <p><a href={preview.compareUrl} target="_blank" rel="noreferrer">View all changes on GitHub</a></p> : null}
+  </>;
+}
+
+function RunningBuild({ preview }: { preview: CloudxUpdatePreview }) {
+  const runtime = preview.runtime;
+  if (runtime.verification === "unverified") return <>
+    <p role="status">Running server commit: unknown. Build verification: unverified.</p>
+    <p>{runtime.reason}</p>
+    <p>Rebuild and activate CloudX to establish a verified running build.</p>
+  </>;
+  const matchesCheckout = runtime.commit === preview.currentCommit;
+  return <>
+    <p>Running server commit: <code>{runtime.commit.slice(0, 12)}</code>. Build verification: verified at startup.</p>
+    <p role="status">{!matchesCheckout ? "The running server differs from the checkout. Rebuild and activate CloudX to run the selected target."
+      : runtime.sourceDirty ? "The running server was built with local source changes; it is not a verified copy of the selected commit."
+      : runtime.commit === preview.target?.commit ? "The verified running server matches the selected target."
+      : "The verified running server matches the checkout."}</p>
+    {runtime.sourceDirty && !matchesCheckout ? <p>The running build includes local source changes.</p> : null}
+    <small>Server build created {new Date(runtime.builtAt).toLocaleString()}. Verification covers server files at startup; it does not verify this browser’s loaded frontend.</small>
   </>;
 }
 

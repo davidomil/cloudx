@@ -64,6 +64,7 @@ describe("CloudX update status", () => {
 
 describe("CloudX update selection and preview", () => {
   const preview = {
+    runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: false },
     channel: "releases", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T00:00:00Z", state: "available",
     target: { commit: "b".repeat(40), name: "v1.0", url: "https://github.com/davidomil/cloudx/releases/tag/v1.0" },
     changelog: [{ number: 82, title: "Select an update release cycle", url: "https://github.com/davidomil/cloudx/pull/82" }],
@@ -71,7 +72,21 @@ describe("CloudX update selection and preview", () => {
   };
 
   it("projects the release comparison without exposing provider data", () => {
-    expect(parseCloudxUpdatePreview({ ...preview, private: "omitted", target: { ...preview.target, private: "omitted" } })).toEqual(preview);
+    expect(parseCloudxUpdatePreview({ ...preview, private: "omitted", runtime: { ...preview.runtime, pid: 123 }, target: { ...preview.target, private: "omitted" } })).toEqual(preview);
+  });
+
+  it("keeps unknown build evidence explicit and does not infer a running commit", () => {
+    const runtime = { verification: "unverified", reason: "The runtime build receipt is invalid." };
+    expect(parseCloudxUpdatePreview({ ...preview, runtime }).runtime).toEqual(runtime);
+  });
+
+  it.each([
+    undefined, null, {}, { ...preview.runtime, verification: "current" },
+    { ...preview.runtime, commit: "main" }, { ...preview.runtime, builtAt: "invalid" },
+    { ...preview.runtime, sourceDirty: "false" }, { verification: "unverified", reason: "" },
+    { verification: "unverified", reason: "Missing receipt", commit: preview.currentCommit },
+  ])("rejects missing or malformed running build evidence: %j", runtime => {
+    expect(() => parseCloudxUpdatePreview({ ...preview, runtime })).toThrow("Invalid CloudX running build evidence");
   });
 
   it.each(["available", "current", "ahead", "diverged", "unavailable"])("accepts the %s comparison state", state => {
