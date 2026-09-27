@@ -793,3 +793,194 @@ test("omits the displayed uncertain reply before explicitly retrying publication
     },
   ]);
 });
+
+test("saves a batch across reload, edits members and associates every issue with one worker", async ({
+  page,
+}, testInfo) => {
+  const repository = {
+    provider: "github" as const,
+    apiUrl: "https://api.github.com",
+    projectPath: "cloudx/example",
+  };
+  const issues = [7, 9, 11].map((number) => ({
+    number,
+    title: `Repair CI ${number}`,
+    body: `Reproduce CI failure ${number}.`,
+    url: `https://github.com/cloudx/example/issues/${number}`,
+    state: "open" as const,
+    author: "ari",
+    labels: [],
+    updatedAt: "2026-09-27",
+    comments: [],
+  }));
+  let worker: ForgeWorker | undefined;
+  const starts: Record<string, unknown>[] = [];
+  await page.route("**/fixture-hooks/**", async (route) => {
+    const hook = new URL(route.request().url()).pathname.split("/").pop();
+    const { input } = route.request().postDataJSON();
+    switch (hook) {
+      case "forge.dashboard":
+        return route.fulfill({
+          json: {
+            configured: true,
+            repository,
+            workers: worker ? [worker] : [],
+          },
+        });
+      case "forge.issues.list":
+        return route.fulfill({
+          json:
+            input.page === 2
+              ? { items: issues.slice(1) }
+              : { items: [issues[0]], nextPage: 2 },
+        });
+      case "forge.issue.get":
+        return route.fulfill({
+          json: {
+            issue: issues.find((issue) => issue.number === input.number),
+          },
+        });
+      case "forge.batch.save": {
+        worker = {
+          id: "ci-batch",
+          kind: "issue",
+          number: input.numbers[0],
+          title: input.name,
+          repository,
+          repositoryPath: "/fixture/repository",
+          baseBranch: "main",
+          templateId: "worker-template",
+          status: "draft",
+          autoPost: false,
+          startedAt: "2026-09-27",
+          updatedAt: "2026-09-27",
+          batch: {
+            issues: issues.filter((issue) =>
+              input.numbers.includes(issue.number),
+            ),
+          },
+        };
+        return route.fulfill({ json: { worker } });
+      }
+      case "forge.batch.start": {
+        starts.push(input);
+        worker = {
+          ...worker!,
+          status: "running",
+          changeNumber: 42,
+          changeUrl: "https://github.com/cloudx/example/pull/42",
+          batch: {
+            ...worker!.batch!,
+            results: [
+              {
+                number: 7,
+                status: "completed",
+                changes: "CI repaired",
+                validation: "CI reproduction passes",
+              },
+              {
+                number: 9,
+                status: "blocked",
+                changes: "CI analyzed",
+                validation: "CI still fails",
+                blocker: "Runner unavailable",
+              },
+              {
+                number: 11,
+                status: "unfinished",
+                changes: "Waiting for the runner repair",
+                validation: "Dependent CI check has not run",
+                blocker: "Depends on issue #9",
+              },
+            ],
+          },
+        };
+        return route.fulfill({ json: { worker } });
+      }
+      default:
+        throw new Error(`Unexpected hook ${hook}`);
+    }
+  });
+  await page.goto(baseUrl);
+  await page
+    .getByRole("checkbox", { name: "Select issue #7 for batch" })
+    .check();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await page
+    .getByRole("checkbox", { name: "Select issue #9 for batch" })
+    .check();
+  const create = page.getByRole("form", { name: "Create issue batch" });
+  await expect(create.getByRole("link")).toHaveText([
+    "#7 Repair CI 7",
+    "#9 Repair CI 9",
+  ]);
+  await create.getByRole("textbox", { name: "Batch name" }).fill("Reliable CI");
+  await create.getByRole("button", { name: "Save batch", exact: true }).click();
+  await expect(page.getByRole("tab", { name: /Batch · #7, #9/ })).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Workers (1)", exact: true }).click();
+  const edit = page.getByRole("form", { name: "Edit issue batch" });
+  await expect(edit.getByRole("textbox", { name: "Batch name" })).toHaveValue(
+    "Reliable CI",
+  );
+  await edit
+    .getByRole("textbox", { name: "Batch name" })
+    .fill("Reliable builds");
+  await edit.getByRole("textbox", { name: "Issue numbers" }).fill("7, 9, 11");
+  await expect(
+    page.getByRole("button", { name: "Start batch" }),
+  ).toBeDisabled();
+  await edit.getByRole("button", { name: "Save batch changes" }).click();
+  await expect(
+    page.getByRole("region", { name: "Batch issues" }).getByRole("link"),
+  ).toHaveText(["#7 Repair CI 7", "#9 Repair CI 9", "#11 Repair CI 11"]);
+  await page
+    .getByRole("checkbox", { name: "Auto review", exact: true })
+    .check();
+  const start = page.getByRole("button", { name: "Start batch", exact: true });
+  await start.scrollIntoViewIfNeeded();
+  await expect(start).toBeInViewport({ ratio: 1 });
+  const screenshot = testInfo.outputPath("batch-draft.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("batch-draft", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await start.click();
+  await expect(
+    page.getByRole("article", { name: "Batch worker Reliable builds" }),
+  ).toBeVisible();
+  await expect(edit).toHaveCount(0);
+  expect(starts).toEqual([
+    {
+      id: "ci-batch",
+      autoReview: true,
+      windowId: "window-1",
+      paneId: "pane-2",
+    },
+  ]);
+  await page.getByRole("button", { name: "Issues", exact: true }).click();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  for (const number of [9, 11]) {
+    await page
+      .getByRole("button", {
+        name: new RegExp(`^#${number} Repair CI ${number}`),
+      })
+      .click();
+    const card = page.getByRole("article", {
+      name: "Batch worker Reliable builds",
+    });
+    await expect(
+      card.getByRole("link", { name: "Open PR/MR" }),
+    ).toHaveAttribute("href", "https://github.com/cloudx/example/pull/42");
+    await expect(card).toContainText("Issue open · Last report: completed");
+    await expect(card).toContainText("CI reproduction passes");
+    await expect(card).toContainText("Runner unavailable");
+    await expect(
+      page.getByRole("button", { name: "Start work", exact: true }),
+    ).toBeDisabled();
+    await expect(
+      page.getByRole("checkbox", { name: `Select issue #${number} for batch` }),
+    ).toBeDisabled();
+  }
+});

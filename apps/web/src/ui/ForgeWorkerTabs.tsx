@@ -14,7 +14,7 @@ export function ForgeWorkerTabs({ workers, selectedWorkerId, onSelectWorker, chi
   return <div className="forge-workers" aria-label="Workers">
     <div className="forge-worker-tabs" role="tablist" aria-label="Worker tabs" onKeyDown={moveWorkerTabFocus}>
       {workers.map(worker => <button key={worker.id} type="button" role="tab" id={`${id}-tab-${worker.id}`} aria-controls={`${id}-panel-${worker.id}`} aria-selected={selected.id === worker.id} tabIndex={selected.id === worker.id ? 0 : -1} className="forge-worker-tab" title={worker.title} onClick={() => onSelectWorker(worker.id)}>
-        <strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number}</strong>
+        <strong>{worker.batch ? `Batch · ${worker.batch.issues.map(issue => `#${issue.number}`).join(", ")}` : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`}</strong>
         <span>{worker.title}</span>
         <small>{worker.status.replaceAll("_", " ")}</small>
       </button>)}

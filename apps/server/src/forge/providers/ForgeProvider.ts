@@ -34,6 +34,10 @@ export interface ForgeProvider {
   createChangeRequest(
     input: ForgeCreateChangeRequest,
   ): Promise<ForgeChangeRequestSummary>;
+  updateChangeRequest(
+    number: number,
+    input: { title: string; body: string },
+  ): Promise<void>;
   postReview(number: number, input: ForgeReviewSubmission): Promise<ForgeReviewPublication>;
   replyToDiscussion(
     number: number,

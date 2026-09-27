@@ -144,6 +144,100 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("selects issues across pages, reloads the saved draft, edits membership and starts one batch", async () => {
+    const issues = [issue, { ...issue, number: 9, title: "Fix cache" }, { ...issue, number: 11, title: "Fix retries" }];
+    let saved: ForgeWorker | undefined;
+    const starting = deferred<unknown>();
+    const testFixture = fixture({}, (hook, input) => {
+      if (hook === "forge.issues.list") return { items: [issues[input.page === 2 ? 1 : 0]], ...(input.page === 2 ? {} : { nextPage: 2 }) };
+      if (hook === "forge.issue.get") return { issue: issues.find(issue => issue.number === input.number) };
+      if (hook === "forge.dashboard") return { ...testFixture.dashboard, workers: saved ? [saved] : [] };
+      if (hook === "forge.batch.save") {
+        saved = { ...worker, id: "batch", title: String(input.name), status: "draft", batch: { issues: issues.filter(issue => (input.numbers as number[]).includes(issue.number)).map(issue => ({ ...issue, state: "open" })) } };
+        return { worker: saved };
+      }
+      if (hook === "forge.batch.start") return starting.promise;
+    });
+    let panel = await renderPanel(testFixture);
+    await act(async () => panel.querySelector<HTMLInputElement>('[aria-label="Select issue #7 for batch"]')!.click());
+    await click(panel, "Next");
+    await act(async () => panel.querySelector<HTMLInputElement>('[aria-label="Select issue #9 for batch"]')!.click());
+    expect(panel.querySelector('[aria-label="Create issue batch"]')?.textContent).toContain("#7 Fix deployment");
+    await fill(panel.querySelector<HTMLInputElement>('[aria-label="Create issue batch"] input')!, "Reliable CI");
+    await click(panel, "Save batch");
+    expect(saved?.batch?.issues.map(issue => issue.number)).toEqual([7, 9]);
+    expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Batch · #7, #9");
+    await act(async () => roots.pop()!.unmount());
+    panel.remove();
+    panel = await renderPanel(testFixture);
+    expect(button(panel, "Start work").disabled).toBe(false);
+    await click(panel, "Workers (1)");
+    expect(panel.querySelector('[aria-label="Batch issues"]')?.textContent).toContain("#9 Fix cache");
+    const editor = panel.querySelector('[aria-label="Edit issue batch"]')!;
+    const inputs = editor.querySelectorAll<HTMLInputElement>("input");
+    await fill(inputs[0], "Reliable builds");
+    await fill(inputs[1], "7, 9, 11");
+    expect(button(panel, "Start batch").disabled).toBe(true);
+    await click(panel, "Save batch changes");
+    await toggleAutoReview(panel);
+    await click(panel, "Start batch");
+    expect(button(panel, "Start batch").disabled).toBe(true);
+    await click(panel, "Start batch");
+    expect(testFixture.calls.filter(call => call.hook === "forge.batch.start")).toEqual([
+      { hook: "forge.batch.start", input: { id: "batch", autoReview: true, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+    await act(async () => {
+      saved = { ...saved!, status: "running" };
+      starting.resolve({ worker: saved });
+    });
+    expect(panel.querySelector('[aria-label="Batch worker Reliable builds"]')).not.toBeNull();
+    expect(panel.querySelector('[aria-label="Edit issue batch"]')).toBeNull();
+    expect(saved?.batch?.issues.map(issue => issue.number)).toEqual([7, 9, 11]);
+  });
+
+  it("associates every member with the same worker, review and request while showing individual results", async () => {
+    const second = { ...issue, number: 9, title: "Fix cache", url: "https://github.com/cloudx/example/issues/9" };
+    const batch: ForgeWorker = { ...worker, title: "Reliable builds", changeNumber: change.number, changeUrl: change.url, batch: {
+      issues: [issue, second].map(issue => ({ ...issue, state: "open" })), results: [
+        { number: 7, status: "completed", changes: "Deployment repaired", validation: "Deployment reproduction passes" },
+        { number: 9, status: "blocked", changes: "Cache analyzed", validation: "Cache reproduction fails", blocker: "Missing cache credentials" },
+      ],
+    } };
+    const testFixture = fixture({ workers: [batch, { ...reviewWorker, issueWorkerId: batch.id }] }, (hook, input) => {
+      if (hook === "forge.issues.list") return { items: [issue, second] };
+      if (hook === "forge.issue.get") return { issue: input.number === 9 ? second : issue };
+    });
+    const panel = await renderPanel(testFixture);
+    await act(async () => panel.querySelectorAll<HTMLButtonElement>(".forge-item")[1].click());
+    const card = panel.querySelector('[aria-label="Batch worker Reliable builds"]')!;
+    expect(card.textContent).toContain("Deployment reproduction passes");
+    expect(card.textContent).toContain("Missing cache credentials");
+    expect(card.textContent).toContain("Issue open · Last report: completed");
+    expect(card.querySelector('a[href="https://github.com/cloudx/example/issues/9"]')).not.toBeNull();
+    expect(card.querySelector(`a[href="${change.url}"]`)).not.toBeNull();
+    expect(panel.querySelector('[aria-label="review worker #12"]')).not.toBeNull();
+    expect(button(panel, "Start work").disabled).toBe(true);
+    expect(panel.querySelector<HTMLInputElement>('[aria-label="Select issue #9 for batch"]')?.disabled).toBe(true);
+    await click(panel, "Pull requests");
+    expect(panel.querySelectorAll('[aria-label="Batch worker Reliable builds"]')).toHaveLength(1);
+    expect(testFixture.calls.some(call => call.hook === "forge.issue.start")).toBe(false);
+  });
+
+  it("keeps invalid or unsaved draft membership from starting and deletes only the selected draft", async () => {
+    const batch: ForgeWorker = { ...worker, title: "Reliable builds", status: "draft", batch: { issues: [{ ...issue, state: "open" }] } };
+    const testFixture = fixture({ workers: [batch] }, hook => hook === "forge.batch.delete" ? {} : undefined);
+    const panel = await renderPanel(testFixture);
+    await click(panel, "Workers (1)");
+    const membership = panel.querySelectorAll<HTMLInputElement>('[aria-label="Edit issue batch"] input')[1];
+    for (const invalid of ["", "7, 7", "0", "1.5", "invalid"]) {
+      await fill(membership, invalid);
+      expect(button(panel, "Save batch changes").disabled).toBe(true);
+      expect(button(panel, "Start batch").disabled).toBe(true);
+    }
+    await click(panel, "Delete batch");
+    expect(testFixture.calls.filter(call => call.hook === "forge.batch.delete")).toEqual([{ hook: "forge.batch.delete", input: { id: batch.id }, tabId: tab.id }]);
+  });
+
   it("previews original/current directory ownership and requires a verified mapping before repair", async () => {
     const preview = { fingerprint: "a".repeat(64), directories: [
       { path: "/repo", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ext4" },

@@ -3,10 +3,12 @@ import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication, Forge
 export const FORGE_PLUGIN_ID = "forge";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
+export const MAX_FORGE_BATCH_ISSUES = 50;
 export const MAX_FORGE_REVIEW_REPORT_BODY_LENGTH = 100_000;
 // Drafts also contain Forge's scope summary, including up to four 64-character SHAs.
 export const MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH = MAX_FORGE_REVIEW_REPORT_BODY_LENGTH + 512;
 export type ForgeWorkerStatus =
+  | "draft"
   | "starting"
   | "running"
   | "paused"
@@ -23,12 +25,24 @@ export interface ForgeIssueCompletionReport {
   body: string;
   resolvedDiscussionIds: string[];
   discussionReplies: Array<{ discussionId: string; body: string }>;
+  issueResults?: ForgeBatchIssueResult[];
   handoff?: ForgeIssueHandoff;
   rebase?: {
     outcome: "resolved" | "blocked";
     validation: "passed" | "failed";
     details: string;
   };
+}
+export interface ForgeBatchIssueResult {
+  number: number;
+  status: "completed" | "blocked" | "unfinished";
+  changes: string;
+  validation: string;
+  blocker?: string;
+}
+export interface ForgeIssueBatch {
+  issues: Array<{ number: number; title: string; url: string; state: "open" | "closed" }>;
+  results?: ForgeBatchIssueResult[];
 }
 export interface ForgeIssueHandoff {
   headSha: string;
@@ -89,6 +103,7 @@ export interface ForgeWorker {
   kind: "issue" | "review";
   number: number;
   title: string;
+  batch?: ForgeIssueBatch;
   repository: ForgeRepository;
   repositoryPath?: string;
   baseBranch: string;
@@ -189,6 +204,10 @@ export interface ForgePlacement {
 export function hasUnconfirmedPublication(worker: ForgeWorker): boolean {
   return worker.kind === "issue" && Boolean(worker.pendingPublication?.headSha) &&
     worker.pendingPublication!.confirmed !== true;
+}
+
+export function forgeWorkerIssueNumbers(worker: ForgeWorker): number[] {
+  return worker.kind === "issue" ? worker.batch?.issues.map(issue => issue.number) ?? [worker.number] : [];
 }
 
 export function forgeWorkerContinuationBlocker(worker: ForgeWorker, workers: readonly ForgeWorker[]): string | undefined {

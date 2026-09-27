@@ -26,6 +26,9 @@ async function fixture() {
     previewOwnership: vi.fn(async () => ({ fingerprint: "a".repeat(64), directories: [] })),
     reconcileOwnership: vi.fn(async () => ({ id: "worker" })),
     startIssue: vi.fn(async () => ({ id: "worker" })),
+    saveBatch: vi.fn(async () => ({ id: "batch" })),
+    startBatch: vi.fn(async () => ({ id: "batch" })),
+    deleteBatch: vi.fn(async () => {}),
     setAutoReview: vi.fn(async () => ({ id: "worker" })),
     syncAndReview: vi.fn(async () => ({ id: "worker" })),
     rebaseAndResolve: vi.fn(async () => ({ id: "worker" })),
@@ -61,6 +64,33 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections, logger };
 }
 describe("Forge plugin boundary", () => {
+  it("saves bounded batch membership and starts the saved worker once per request", async () => {
+    const { hooks, workflow } = await fixture();
+    const input = { repository, name: "CI reliability", numbers: [7, 9] };
+    const context = { caller: { kind: "ui" as const } };
+    await hooks.call("forge.batch.save", input, context);
+    expect(workflow.saveBatch).toHaveBeenCalledExactlyOnceWith(repository, input.name, input.numbers, undefined);
+    await hooks.call("forge.batch.save", { ...input, id: "batch" }, context);
+    expect(workflow.saveBatch).toHaveBeenLastCalledWith(repository, input.name, input.numbers, "batch");
+    await hooks.call("forge.batch.start", { id: "batch", windowId: "window", paneId: "pane", autoReview: true }, context);
+    expect(workflow.startBatch).toHaveBeenCalledExactlyOnceWith("batch", { windowId: "window", paneId: "pane" }, true);
+    await hooks.call("forge.batch.delete", { id: "batch" }, context);
+    expect(workflow.deleteBatch).toHaveBeenCalledExactlyOnceWith("batch");
+  });
+
+  it("rejects invalid batches before calling the workflow", async () => {
+    const { hooks, workflow } = await fixture();
+    const input = { repository, name: "CI reliability", numbers: [7, 9] };
+    for (const invalid of [
+      { ...input, numbers: [] }, { ...input, numbers: [7, 7] }, { ...input, numbers: [0] },
+      { ...input, numbers: [1.5] }, { ...input, numbers: ["7"] }, { ...input, numbers: Array.from({ length: 51 }, (_, index) => index + 1) },
+      { ...input, name: " " }, { ...input, name: "x".repeat(201) }, { ...input, extra: true },
+    ]) await expect(hooks.call("forge.batch.save", invalid, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    await expect(hooks.call("forge.batch.start", { id: "batch" }, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    expect(workflow.saveBatch).not.toHaveBeenCalled();
+    expect(workflow.startBatch).not.toHaveBeenCalled();
+  });
+
   it("requires a complete ownership preview and explicit attestation at the hook boundary", async () => {
     const { hooks, workflow } = await fixture();
     const input = { id: "worker", fingerprint: "a".repeat(64), attestations: [{ device: "64521", filesystemId: "original-ext4", filesystemType: "ext4" }] };

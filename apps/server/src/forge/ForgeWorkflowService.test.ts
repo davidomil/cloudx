@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
-import type { ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
+import type { ForgeIssueCompletionReport, ForgeIssueDetail, ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
@@ -24,7 +24,7 @@ import { HookRegistry } from "../hooks/HookRegistry.js";
 import type { ForgeSettingsService } from "./ForgeSettingsService.js";
 
 function fixture() {
-  const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] };
+  const issue = { number: 1, title: "Fix issue", body: "Task", state: "open", comments: [] as ForgeIssueDetail["comments"] };
   const change: ForgeChangeRequest = {
     number: 7,
     title: "Fix issue",
@@ -55,10 +55,11 @@ function fixture() {
     findChangeRequestByBranch: vi.fn(
       async () => undefined as typeof change | undefined,
     ),
-    getIssue: vi.fn(async () => ({ ...issue })),
+    getIssue: vi.fn(async (_number?: number) => ({ ...issue })),
     getChangeRequestStatus: vi.fn(async () => ({ ...change })),
     getChangeRequest: vi.fn(async () => ({ ...change })),
     createChangeRequest: vi.fn(async () => change),
+    updateChangeRequest: vi.fn(async (_number: number, _input: {title: string; body: string}) => {}),
     postReview: vi.fn(async (_number: number, _review: ForgeReviewSubmission): Promise<ForgeReviewPublication> => ({ commentIds: [] })),
     replyToDiscussion: vi.fn(async (_number: number, _discussionId: string, _body: string, _headSha: string) => {}),
     resolveDiscussion: vi.fn(async (_number: number, _id: string, _headSha: string) => {}),
@@ -116,7 +117,7 @@ function fixture() {
     publishBranch: vi.fn(async () => change.headSha),
   };
   const reports = {
-    prepare: vi.fn(async (id: string) => ({
+    prepare: vi.fn(async (id: string, _context?: unknown) => ({
       reportPath: `/reports/${id}.json`,
       contextPath: `/reports/${id}.context.json`,
     })),
@@ -173,6 +174,433 @@ function deferred<T>() {
   const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; });
   return { promise, resolve, reject };
 }
+
+function batchFixture() {
+  const f = fixture();
+  const issues = [1, 2, 3].map(number => ({
+    ...f.issue, number, title: `Issue ${number}`, body: `Requirements and acceptance ${number}`,
+    url: `https://github.com/a/b/issues/${number}`, labels: [], author: "author", updatedAt: "",
+    comments: [{ id: `comment-${number}`, body: `Discussion ${number}`, author: "author", createdAt: "" }],
+  }));
+  f.provider.getIssue.mockImplementation(async number => {
+    const issue = issues.find(issue => issue.number === number);
+    if (!issue) throw new Error("Not found");
+    return structuredClone(issue);
+  });
+  const report = {
+    kind: "issue", title: "Combined reliability fixes", body: "Combined changes and validation",
+    discussionReplies: [], resolvedDiscussionIds: [],
+    issueResults: [1, 2].map(number => ({ number, status: "completed" as "completed" | "blocked" | "unfinished", changes: `Fixed ${number}`, validation: `test-${number} passes` })),
+    handoff: { headSha: f.change.headSha, status: "ready", retainedPaths: [], details: "The intended commit passed both issue tests." },
+  } satisfies ForgeIssueCompletionReport;
+  return { ...f, issues, report };
+}
+
+describe("Named issue batches", () => {
+  it("persists editable membership across restart and starts exactly one workspace and turn", async () => {
+    const f = batchFixture();
+    const repository = f.deps.settings().repository;
+    const draft = await f.service.saveBatch(repository, "Reliability", [1, 2]);
+    expect(draft).toMatchObject({ title: "Reliability", status: "draft", batch: { issues: [{ number: 1 }, { number: 2 }] } });
+    expect(f.runtime.prepareWorkspace).not.toHaveBeenCalled();
+    expect(parseWorkers(f.stored())).toHaveLength(1);
+    const restored = new ForgeWorkflowService(f.deps);
+    await restored.saveBatch(repository, "Combined CI reliability", [2, 3], draft.id);
+    const [first, second] = await Promise.all([restored.startBatch(draft.id, placement, true), restored.startBatch(draft.id, placement, true)]);
+    expect(first.id).toBe(second.id);
+    expect(first).toMatchObject({ title: "Combined CI reliability", status: "running", number: 2, autoReview: { enabled: true } });
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    const context = f.reports.prepare.mock.calls.at(-1)?.[1];
+    expect(context).toMatchObject({ batch: { name: "Combined CI reliability" }, issues: [f.issues[1], f.issues[2]] });
+    expect(f.runtime.launch.mock.calls[0]?.[0].prompt).toContain("issueResults");
+    await expect(restored.saveBatch(repository, "Changed", [1], draft.id)).rejects.toThrow("Only an unstarted batch");
+    await expect(restored.deleteBatch(draft.id)).rejects.toThrow("Only an unstarted batch");
+  });
+
+  it.each([
+    [[], "requires"], [[1, 1], "duplicate"], [[0], "valid issue"], [[99], "#99 is unavailable"],
+  ])("rejects invalid membership %j before persisting a draft", async (numbers, reason) => {
+    const f = batchFixture();
+    await expect(f.service.saveBatch(f.deps.settings().repository, "Batch", numbers as number[])).rejects.toThrow(reason as string);
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+  });
+
+  it("rejects closed members at save and start without reserving any member", async () => {
+    const f = batchFixture();
+    const repository = f.deps.settings().repository;
+    f.issues[1]!.state = "closed";
+    await expect(f.service.saveBatch(repository, "Batch", [1, 2])).rejects.toThrow("#2 is closed");
+    f.issues[1]!.state = "open";
+    const draft = await f.service.saveBatch(repository, "Batch", [1, 2]);
+    f.issues[1]!.state = "closed";
+    await expect(f.service.startBatch(draft.id, placement)).rejects.toThrow("#2 is closed");
+    expect((await f.service.startIssue(repository, 1, placement)).status).toBe("running");
+    expect(f.stored().find(worker => worker.id === draft.id)?.status).toBe("draft");
+  });
+
+  it("rejects changed repository and target branch settings at start", async () => {
+    const f = batchFixture();
+    const settings = f.deps.settings();
+    const draft = await f.service.saveBatch(settings.repository, "Batch", [1, 2]);
+    f.deps.settings = () => ({ ...settings, baseBranch: "release" });
+    await expect(f.service.startBatch(draft.id, placement)).rejects.toThrow("repository or target branch changed");
+    f.deps.settings = () => ({ ...settings, repository: { ...settings.repository, projectPath: "other/repository" } });
+    await expect(f.service.startBatch(draft.id, placement)).rejects.toThrow("repository or target branch changed");
+    expect(f.runtime.prepareWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("reserves overlapping batches atomically and prevents standalone ownership of every member", async () => {
+    const f = batchFixture();
+    const repository = f.deps.settings().repository;
+    const a = await f.service.saveBatch(repository, "First", [1, 2]);
+    const b = await f.service.saveBatch(repository, "Second", [2, 3]);
+    const starts = await Promise.allSettled([f.service.startBatch(a.id, placement), f.service.startBatch(b.id, placement)]);
+    expect(starts.map(result => result.status)).toEqual(["fulfilled", "rejected"]);
+    await expect(f.service.startIssue(repository, 2, placement)).rejects.toThrow("Issue #2 already belongs");
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.stored().find(worker => worker.id === b.id)?.status).toBe("draft");
+    expect((await f.service.startIssue(repository, 3, placement)).status).toBe("running");
+  });
+
+  it("rejects a batch overlapping an existing standalone worker", async () => {
+    const f = batchFixture();
+    const repository = f.deps.settings().repository;
+    await f.service.startIssue(repository, 2, placement);
+    const draft = await f.service.saveBatch(repository, "Batch", [1, 2]);
+    await expect(f.service.startBatch(draft.id, placement)).rejects.toThrow("Issue #2 already belongs");
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains one failed owner after workspace preparation fails and repeated Start cannot relaunch it", async () => {
+    const f = batchFixture();
+    const repository = f.deps.settings().repository;
+    const draft = await f.service.saveBatch(repository, "Batch", [1, 2]);
+    f.runtime.prepareWorkspace.mockRejectedValueOnce(new Error("Disk full"));
+    const failed = await f.service.startBatch(draft.id, placement);
+    expect(failed).toMatchObject({ status: "failed", error: "Disk full", batch: draft.batch });
+    expect((await f.service.startBatch(draft.id, placement)).id).toBe(draft.id);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+    await expect(f.service.startIssue(repository, 2, placement)).rejects.toThrow("already belongs");
+    expect(f.stored()).toHaveLength(1);
+  });
+
+  it("deletes only an unstarted group", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    await f.service.deleteBatch(draft.id);
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it.each(["omitted", "blocked", "unfinished"])("keeps %s issue outcomes unpublished and allows a corrective continuation", async outcome => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    if (outcome === "omitted") f.report.issueResults.pop();
+    else f.report.issueResults[1] = { ...f.report.issueResults[1]!, status: outcome, blocker: "Waiting for requirement clarification" } as typeof f.report.issueResults[number];
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    const saved = f.stored()[0]!;
+    expect(saved.status).toBe("failed");
+    expect(saved.pendingPublication).toBeUndefined();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(saved.completion?.reportError ?? saved.completion?.continuationRequired).toMatch(/every member|incomplete/);
+    expect(parseWorkers(f.stored())).toHaveLength(1);
+    await f.service.continueWorker(worker.id, "The missing requirement is clarified; finish both issues.", placement);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]], manualContinuation: { message: expect.stringContaining("clarified") } });
+  });
+
+  it("publishes one combined request then updates that request with both members' validation", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review", changeNumber: 7, batch: { results: f.report.issueResults } });
+    const created = f.provider.createChangeRequest.mock.calls[0] as unknown as [{body: string}];
+    expect(created[0].body).toContain("Closes #1");
+    expect(created[0].body).toContain("Closes #2");
+    expect(created[0].body).toContain("https://github.com/a/b/issues/2");
+    expect(created[0].body).toContain("test-2 passes");
+    f.reports.read.mockResolvedValue(undefined);
+    await f.service.resume(worker.id, placement);
+    f.report.issueResults[1]!.validation = "test-2 and regression-2 pass";
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.provider.updateChangeRequest.mock.calls.at(-1)).toEqual([7, expect.objectContaining({ body: expect.stringContaining("test-2 and regression-2 pass") })]);
+    expect(parseWorkers(f.stored())).toHaveLength(1);
+  });
+
+  it("reconciles uncertain creation by branch without creating a second request", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    f.provider.createChangeRequest.mockRejectedValueOnce(new Error("Response lost"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", publicationState: "uncertain" });
+    f.provider.findChangeRequestByBranch.mockResolvedValue(f.change);
+    await f.service.resume(worker.id, placement);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(1);
+    expect(f.stored()[0]).toMatchObject({ changeNumber: 7, status: "awaiting_review" });
+  });
+
+  it.each([
+    { request: "closed", change: { state: "closed" }, error: "closed without merging" },
+    { request: "retargeted", change: { baseBranch: "release" }, error: "branches or identity" },
+    { request: "different source branch", change: { headBranch: "another-worker" }, error: "branches or identity" },
+    { request: "different identity", change: { number: 8 }, error: "branches or identity" },
+    { request: "unchanged", change: {}, error: undefined },
+  ])("revalidates an $request request before retrying its batch description after restart", async ({ change, error }) => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    f.reports.read.mockResolvedValue(undefined);
+    await f.service.resume(worker.id, placement);
+    f.report.issueResults[1]!.validation = "test-2 and regression-2 pass";
+    f.reports.read.mockResolvedValue(f.report);
+    f.provider.updateChangeRequest.mockRejectedValueOnce(new Error("Description update failed"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: "Description update failed", pendingPublication: {
+      headSha: f.change.headSha, report: f.report,
+    } });
+    const pendingPublication = structuredClone(f.stored()[0]!.pendingPublication);
+    Object.assign(f.change, change, { title: "Manually edited title", body: "Manually edited body" });
+    f.provider.updateChangeRequest.mockClear().mockImplementation(async (_number, input) => {
+      Object.assign(f.change, input);
+    });
+    const restored = new ForgeWorkflowService(f.deps);
+
+    const resumed = await restored.resume(worker.id, placement);
+
+    if (error) {
+      expect(resumed).toMatchObject({ status: "failed", error: expect.stringContaining(error), pendingPublication: {
+        headSha: pendingPublication!.headSha, report: pendingPublication!.report,
+      } });
+      expect(f.provider.updateChangeRequest).not.toHaveBeenCalled();
+      expect(f.change).toMatchObject({ title: "Manually edited title", body: "Manually edited body" });
+    } else {
+      expect(resumed).toMatchObject({ id: worker.id, changeNumber: 7, status: "awaiting_review" });
+      expect(resumed.pendingPublication).toBeUndefined();
+      expect(f.provider.updateChangeRequest).toHaveBeenCalledExactlyOnceWith(7, {
+        title: f.report.title, body: expect.stringContaining("test-2 and regression-2 pass"),
+      });
+      expect(f.change.body).toContain("Closes #1");
+      expect(f.change.body).toContain("Closes #2");
+    }
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(parseWorkers(f.stored())).toHaveLength(1);
+  });
+
+  it("preserves the group and checkout through stop, restart and resume", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    await f.service.stop(worker.id);
+    const restored = new ForgeWorkflowService(f.deps);
+    const resumed = await restored.resume(worker.id, placement);
+    expect(resumed).toMatchObject({ id: worker.id, branch: worker.branch, batch: worker.batch, status: "running" });
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]] });
+  });
+
+  it("restores drafts when create, edit, delete or start cannot be persisted", async () => {
+    const f = batchFixture();
+    const repository = f.deps.settings().repository;
+    await f.service.dashboard();
+    const write = vi.spyOn(f.deps.store, "write");
+    write.mockRejectedValueOnce(new Error("State disk full"));
+    await expect(f.service.saveBatch(repository, "Unsaved", [1, 2])).rejects.toThrow("State disk full");
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    const draft = await f.service.saveBatch(repository, "Original", [1, 2]);
+    write.mockRejectedValueOnce(new Error("State disk full"));
+    await expect(f.service.saveBatch(repository, "Unsaved edit", [2, 3], draft.id)).rejects.toThrow("State disk full");
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ title: "Original", batch: draft.batch });
+    write.mockRejectedValueOnce(new Error("State disk full"));
+    await expect(f.service.deleteBatch(draft.id)).rejects.toThrow("State disk full");
+    expect((await f.service.dashboard()).workers[0]?.id).toBe(draft.id);
+    write.mockRejectedValueOnce(new Error("State disk full"));
+    await expect(f.service.startBatch(draft.id, placement, true)).rejects.toThrow("State disk full");
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "draft", batch: draft.batch });
+    expect(f.runtime.prepareWorkspace).not.toHaveBeenCalled();
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+    expect((await f.service.startBatch(draft.id, placement, true)).status).toBe("running");
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains an oversized combined request for correction before pushing any commit", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    await f.service.startBatch(draft.id, placement);
+    f.report.issueResults.forEach(result => {
+      result.changes = "c".repeat(20_000);
+      result.validation = "v".repeat(20_000);
+    });
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", completion: { continuationRequired: expect.stringContaining("65,000") } });
+    expect(f.stored()[0]?.pendingPublication).toBeUndefined();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it("rejects GitLab quick actions before publication and does not copy provider titles into closing references", async () => {
+    const f = batchFixture();
+    const settings = f.deps.settings();
+    f.deps.settings = () => ({ ...settings, repository: { provider: "gitlab", apiUrl: "https://gitlab.com/api/v4", projectPath: "a/b" } });
+    f.issues[1]!.title = "Closes #999";
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.report.issueResults[1]!.changes = "Fix failure\n/close #999";
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", completion: { continuationRequired: expect.stringContaining("quick actions") } });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    f.reports.read.mockResolvedValue(undefined);
+    await f.service.continueWorker(worker.id, "Remove the quick action and describe the fix in prose.", placement);
+    f.report.issueResults[1]!.changes = "Fixed issue 2";
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    const created = f.provider.createChangeRequest.mock.calls[0] as unknown as [{body: string}];
+    expect(created[0].body).not.toContain("#999");
+    expect(created[0].body).toContain("Closes #1");
+    expect(created[0].body).toContain("Closes #2");
+  });
+
+  it("invalidates approval when a non-first member receives new requirements", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    onTestFinished(() => { vi.useRealTimers(); });
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    await f.service.startBatch(draft.id, placement, true);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    const originalReview = f.stored().find(worker => worker.kind === "review")!;
+    f.issues[1]!.comments.push({ id: "new-requirement", body: "Also validate cancelled jobs", author: "human", createdAt: "" });
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "All requirements satisfied", comments: [] });
+    vi.setSystemTime(Date.now() + 30_001);
+    await f.service.poll();
+    const review = f.stored().find(worker => worker.kind === "review")!;
+    expect(review).toMatchObject({ id: originalReview.id, status: "running", reviewHistory: [expect.objectContaining({ event: "approve" })] });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]], reviewScope: { kind: "unchanged" } });
+  });
+
+  it("keeps every member in the same paused conflict recovery and resumed session", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    await f.service.rebaseAndResolve(worker.id, placement);
+    const resolving = f.stored()[0]!;
+    expect(resolving).toMatchObject({ id: worker.id, branch: worker.branch, rebaseRecovery: { phase: "resolving" }, batch: worker.batch });
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]], rebaseRecovery: resolving.rebaseRecovery });
+    await f.service.pause(worker.id);
+    const restarted = new ForgeWorkflowService(f.deps);
+    const resumed = await restarted.resume(worker.id, placement);
+    expect(resumed).toMatchObject({ id: worker.id, rebaseRecovery: resolving.rebaseRecovery, batch: resolving.batch });
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.launch.mock.calls.map(([input]) => input.id)).toEqual([worker.id, worker.id, worker.id]);
+  });
+
+  it("gives automatic and manual reviews all member requirements and completed results", async () => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    await f.service.startBatch(draft.id, placement, true);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    const reviewer = f.stored().find(worker => worker.kind === "review")!;
+    expect(reviewer).toBeDefined();
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]], batch: { results: f.report.issueResults }, reviewScope: { kind: "initial" } });
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0].prompt).toContain("Review every member issue");
+    await f.service.stop(reviewer.id);
+    await f.service.setAutoReview(draft.id, false, placement);
+    await f.deps.store.write(f.stored().filter(worker => worker.kind === "issue"));
+    const restored = new ForgeWorkflowService(f.deps);
+    await restored.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]], batch: { name: "Batch" } });
+  });
+
+  it.each(["github", "gitlab"] as const)("polls an externally merged %s batch on a non-default branch into closure waiting", async provider => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    onTestFinished(() => { vi.useRealTimers(); });
+    const f = batchFixture();
+    const settings = f.deps.settings();
+    f.deps.settings = () => ({ ...settings, baseBranch: "release", repository: {
+      ...settings.repository, provider, apiUrl: provider === "github" ? "https://api.github.com" : "https://gitlab.com/api/v4",
+    } });
+    f.change.baseBranch = "release";
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Release reliability", [1, 2]);
+    await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review", baseBranch: "release" });
+    expect(f.stored()[0]?.autoReview).toBeUndefined();
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.issues[0]!.state = "closed";
+    vi.setSystemTime(Date.now() + 30_001);
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({
+      status: "paused", error: "Change request merged. Waiting for actual closure of #2 before cleanup.",
+      batch: { issues: [{ number: 1, state: "closed" }, { number: 2, state: "open" }] },
+    });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    f.issues[1]!.state = "closed";
+    vi.setSystemTime(Date.now() + 30_001);
+    await f.service.poll();
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("waits for actual closure of every member after merge and records non-first member state", async () => {
+    vi.useFakeTimers();
+    onTestFinished(() => { vi.useRealTimers(); });
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    f.change.merged = true;
+    f.change.state = "merged";
+    f.issues[0]!.state = "closed";
+    await f.service.resume(worker.id, placement);
+    expect(f.stored()[0]).toMatchObject({ status: "paused", batch: { issues: [{ number: 1, state: "closed" }, { number: 2, state: "open" }] } });
+    expect(f.stored()[0]!.error).toContain("#2");
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    f.issues[1]!.state = "closed";
+    vi.advanceTimersByTime(30_001);
+    await f.service.poll();
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
+    expect(f.stored()).toEqual([]);
+  });
+});
 
 describe("Explicit directory ownership reconciliation", () => {
   it("preserves report/publication and stopped workflow state without launching or publishing", async () => {

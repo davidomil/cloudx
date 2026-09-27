@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_BATCH_ISSUES, forgeWorkerIssueNumbers } from "@cloudx/shared";
 import type {
   CodexReasoningEffort,
   DirectoryOwnershipPreview,
@@ -10,6 +10,8 @@ import type {
   ForgeDashboard,
   ForgeIssueDetail,
   ForgeIssueHandoff,
+  ForgeIssueBatch,
+  ForgeIssueCompletionReport,
   ForgePublicationHandoff,
   ForgeRetainedWorkspace,
   ForgePlacement,
@@ -27,7 +29,7 @@ import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeN
 import { MAX_FORGE_WORKFLOW_TEXT_LENGTH, parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { reviewScopeInstructions } from "./ForgeReviewScope.js";
-import { validateReview } from "./providers/reviewValidation.js";
+import { rejectQuickActions, validateRequestText, validateReview } from "./providers/reviewValidation.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
 
 export interface ForgeSettings {
@@ -95,6 +97,7 @@ interface Runtime {
       model: string;
       reasoningEffort: CodexReasoningEffort;
       prompt: string;
+      preserveConversation?: true;
       windowId: string;
       paneId: string;
     },
@@ -210,6 +213,15 @@ interface ManualContinuation {
   previousError?: string;
 }
 
+interface WorkerContext {
+  item: unknown;
+  change?: ForgeChangeRequest;
+  issue?: ForgeIssueDetail;
+  issues?: ForgeIssueDetail[];
+  batch?: ForgeIssueBatch & { name: string };
+  manualContinuation?: ManualContinuation;
+}
+
 export class ForgeWorkflowService {
   private workers: ForgeWorker[] = [];
   private readonly loggedWorkerStates = new Map<string, string>();
@@ -294,6 +306,126 @@ export class ForgeWorkflowService {
   startIssue(repository: ForgeRepository, number: number, placement: ForgePlacement, autoReview = false): Promise<ForgeWorker> {
     return this.exclusive(() => this.createWorker(repository, "issue", number, false, placement, autoReview));
   }
+  saveBatch(repository: ForgeRepository, name: string, numbers: number[], id?: string): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      if (this.disposed) throw new Error("Forge Workers is shutting down.");
+      const settings = this.deps.settings();
+      if (!sameRepository(repository, settings.repository))
+        throw new Error("The configured repository changed. Refresh Forge before saving this batch.");
+      if (typeof name !== "string" || !name.trim() || name.trim().length > 200)
+        throw new Error("A batch name must contain 1 to 200 characters.");
+      if (!Array.isArray(numbers) || !numbers.length || numbers.length > MAX_FORGE_BATCH_ISSUES ||
+          numbers.some(number => !Number.isSafeInteger(number) || number <= 0))
+        throw new Error(`A batch requires 1 to ${MAX_FORGE_BATCH_ISSUES} valid issue numbers.`);
+      if (new Set(numbers).size !== numbers.length) throw new Error("A batch cannot contain duplicate issues.");
+      const existing = id ? this.requireWorker(id) : undefined;
+      if (existing && (!existing.batch || existing.status !== "draft"))
+        throw new Error("Only an unstarted batch can change its name or membership.");
+      if (existing && (!sameRepository(existing.repository, repository) || existing.baseBranch !== settings.baseBranch))
+        throw new Error("The configured repository or target branch changed. Delete this draft and create a new batch.");
+      const issues = await this.readBatchIssues(repository, numbers);
+      const now = new Date().toISOString();
+      const worker: ForgeWorker = existing ? structuredClone(existing) : {
+        id: randomUUID(), kind: "issue", number: numbers[0]!, title: name.trim(), repository: settings.repository,
+        baseBranch: settings.baseBranch, templateId: settings.workerTemplateId, status: "draft", autoPost: false,
+        startedAt: now, updatedAt: now,
+      };
+      worker.title = name.trim();
+      worker.number = numbers[0]!;
+      worker.batch = { issues: issues.map(({ number, title, url }) => ({ number, title, url, state: "open" as const })) };
+      const index = existing ? this.workers.indexOf(existing) : this.workers.length;
+      this.workers.splice(index, existing ? 1 : 0, worker);
+      try {
+        await this.persist();
+      } catch (error) {
+        this.workers.splice(index, 1, ...(existing ? [existing] : []));
+        throw error;
+      }
+      return structuredClone(worker);
+    });
+  }
+  deleteBatch(id: string): Promise<void> {
+    return this.exclusive(async () => {
+      const worker = this.requireWorker(id);
+      if (!worker.batch || worker.status !== "draft") throw new Error("Only an unstarted batch can be deleted.");
+      const index = this.workers.indexOf(worker);
+      this.workers.splice(index, 1);
+      try {
+        await this.persist();
+      } catch (error) {
+        this.workers.splice(index, 0, worker);
+        throw error;
+      }
+    });
+  }
+  startBatch(id: string, placement: ForgePlacement, autoReview = false): Promise<ForgeWorker> {
+    return this.exclusive(async () => {
+      if (this.disposed) throw new Error("Forge Workers is shutting down.");
+      const worker = this.requireWorker(id);
+      if (!worker.batch) throw new Error("This worker is not an issue batch.");
+      if (worker.status !== "draft") return structuredClone(worker);
+      const settings = this.deps.settings();
+      if (!sameRepository(worker.repository, settings.repository) || worker.baseBranch !== settings.baseBranch)
+        throw new Error("The configured repository or target branch changed. Delete this draft and create a new batch.");
+      this.requireUnownedIssues(worker.repository, forgeWorkerIssueNumbers(worker));
+      const issues = await this.readBatchIssues(worker.repository, forgeWorkerIssueNumbers(worker));
+      if (this.disposed) throw new Error("Forge Workers is shutting down.");
+      const draft = structuredClone(worker);
+      const controller = new AbortController();
+      this.operations.set(worker.id, controller);
+      worker.status = "starting";
+      worker.startedAt = new Date().toISOString();
+      worker.templateId = settings.workerTemplateId;
+      if (autoReview) worker.autoReview = { enabled: true, phase: "implementing", placement };
+      try {
+        await this.persist();
+      } catch (error) {
+        this.workers[this.workers.indexOf(worker)] = draft;
+        this.operations.delete(worker.id);
+        throw error;
+      }
+      try {
+        Object.assign(worker, await this.deps.runtime.prepareWorkspace({
+          id: worker.id, baseBranch: worker.baseBranch, review: false, expectedRepository: worker.repository,
+        }, controller.signal));
+        await this.persist();
+        await this.launch(worker, placement, { item: issues[0] });
+      } catch (error) {
+        await this.fail(worker, error);
+      }
+      return structuredClone(worker);
+    });
+  }
+  private requireUnownedIssues(repository: ForgeRepository, numbers: number[]): void {
+    for (const number of numbers) {
+      const owner = this.workers.find(worker => sameRepository(worker.repository, repository) &&
+        !["completed", "draft"].includes(worker.status) && forgeWorkerIssueNumbers(worker).includes(number));
+      if (owner) throw new Error(`Issue #${number} already belongs to worker ${owner.title}. Resume or inspect that worker.`);
+    }
+  }
+  private async readBatchIssues(repository: ForgeRepository, numbers: number[], provider = this.deps.provider(repository, "worker")): Promise<ForgeIssueDetail[]> {
+    const issues: ForgeIssueDetail[] = [];
+    for (const number of numbers) {
+      let issue: ForgeIssueDetail;
+      try {
+        issue = await provider.getIssue(number);
+      } catch (error) {
+        if (error instanceof ForgeProviderUnavailableError) throw error;
+        throw new Error(`Issue #${number} is unavailable: ${message(error)}`);
+      }
+      if (issue.number !== number) throw new Error(`Issue #${number} is unavailable in the configured repository.`);
+      if (issue.state !== "open") throw new Error(`Issue #${number} is closed and cannot start or continue batch work.`);
+      issues.push(issue);
+    }
+    return issues;
+  }
+  private batchIssues(worker: ForgeWorker): Promise<ForgeIssueDetail[] | undefined> {
+    return worker.batch ? this.readBatchIssues(worker.repository, forgeWorkerIssueNumbers(worker), this.providerFor(worker)) : Promise.resolve(undefined);
+  }
+  private issueOwner(worker: ForgeWorker): ForgeWorker | undefined {
+    return worker.kind === "issue" ? worker : this.workers.find(candidate => candidate.kind === "issue" &&
+      sameRepository(candidate.repository, worker.repository) && candidate.changeNumber === worker.number);
+  }
   startReview(
     repository: ForgeRepository,
     number: number,
@@ -307,7 +439,7 @@ export class ForgeWorkflowService {
       this.operations.get(id)?.abort(new Error("Automatic review disabled by user."));
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
-      if (worker.kind !== "issue" || worker.status === "completed")
+      if (worker.kind !== "issue" || ["completed", "draft"].includes(worker.status))
         throw new Error("Auto review requires an existing issue worker.");
       worker.autoReview ??= { enabled, phase: worker.changeNumber && !worker.pendingPublication ? "reviewing" : "implementing", placement };
       worker.autoReview.enabled = enabled;
@@ -334,10 +466,11 @@ export class ForgeWorkflowService {
     if (!controller) throw new Error("The issue loop is no longer active.");
     controller.signal.throwIfAborted();
     if (kind === "review") this.requireConfirmedPublication(settings.repository, number);
+    else this.requireUnownedIssues(repository, [number]);
     if (
       this.workers.some(
         (w) =>
-          w.kind === kind &&
+          kind === "review" && w.kind === kind &&
           w.number === number &&
           sameRepository(w.repository, settings.repository) &&
           !["completed"].includes(w.status),
@@ -1026,6 +1159,7 @@ export class ForgeWorkflowService {
           if (report.kind === "review" && report.headSha !== worker.headSha)
             throw new Error("Review report does not match the checked out commit.");
           if (report.kind === "review") parseScopedReview(report, completion.reviewScope);
+          if (worker.batch && report.kind === "issue") worker.batch.results = batchResults(worker, report);
           completion.report = report;
           this.log(worker, "info", "worker_report_received");
         }
@@ -1068,6 +1202,7 @@ export class ForgeWorkflowService {
     if (completion.continuationRequired) throw new Error(completion.continuationRequired);
     await this.quiesce(worker, { closeTab: false, successful: true, retainReport: true });
     if (report.kind === "issue") {
+      if (worker.batch) await this.validateBatchPublication(worker, report);
       worker.pendingPublication ??= { report, repliedDiscussionIds: [] };
       await this.preparePublication(worker);
       if (worker.attemptId) {
@@ -1100,6 +1235,20 @@ export class ForgeWorkflowService {
       this.deps.notify("Review complete", `${worker.title}: ${worker.draft.comments.length} suggested comments.`);
     }
     return true;
+  }
+  private async validateBatchPublication(worker: ForgeWorker, report: ForgeIssueCompletionReport): Promise<void> {
+    try {
+      const results = batchResults(worker, report);
+      worker.batch!.results = results;
+      const unfinished = results.filter(result => result.status !== "completed");
+      if (unfinished.length)
+        throw new Error(`Batch remains incomplete: ${unfinished.map(result => `#${result.number}: ${result.blocker}`).join("; ")}`);
+      const body = issueRequestBody(worker, report);
+      validateRequestText({ title: report.title, body });
+      if (worker.repository.provider === "gitlab") rejectQuickActions(body);
+    } catch (error) {
+      await this.requireHandoffContinuation(worker, new Error(`The combined batch request needs correction: ${message(error)}`));
+    }
   }
   private async preparePublication(worker: ForgeWorker): Promise<void> {
     const publication = worker.pendingPublication!;
@@ -1330,7 +1479,7 @@ export class ForgeWorkflowService {
     this.providerRecoveries.delete(worker.id);
     this.nextAutoReviewCheckAt.delete(worker.id);
   }
-  private async autoReviewContext(worker: ForgeWorker): Promise<{ issue: ForgeIssueDetail; change: ForgeChangeRequest } | undefined> {
+  private async autoReviewContext(worker: ForgeWorker): Promise<{ issue: ForgeIssueDetail; issues?: ForgeIssueDetail[]; change: ForgeChangeRequest } | undefined> {
     if (!worker.changeNumber || !worker.headSha) throw new Error("Auto review requires confirmed published work.");
     this.requireConfirmedPublication(worker.repository, worker.changeNumber);
     const provider = this.providerFor(worker);
@@ -1346,7 +1495,7 @@ export class ForgeWorkflowService {
     signal?.throwIfAborted();
     if (issue.number !== worker.number || issue.state !== "open")
       throw new Error("Auto review requires the original issue to remain open.");
-    return { issue, change };
+    return { issue, issues: await this.batchIssues(worker), change };
   }
   private async observeProvider<T>(worker: Pick<ForgeWorker, "number" | "changeNumber">, operation: "getChangeRequest" | "getIssue", read: () => Promise<T>): Promise<T> {
     try {
@@ -1412,7 +1561,7 @@ export class ForgeWorkflowService {
     if (draft.headSha !== worker.headSha)
       throw new Error("The review does not match the issue worker's published commit.");
     if (draft.status === "draft") {
-      if (review.feedbackDigest !== feedbackDigest({ item: context.issue, change: context.change })) {
+      if (review.feedbackDigest !== feedbackDigest({ item: context.issue, issues: context.issues, change: context.change })) {
         await this.startAutoReview(worker);
         return;
       }
@@ -1437,7 +1586,7 @@ export class ForgeWorkflowService {
     loop.waitingSince = undefined;
     worker.error = undefined;
     if (draft.event === "comment") {
-      if (review.feedbackDigest !== feedbackDigest({ item: context.issue, change: withoutReviewFeedback(context.change, draft) })) {
+      if (review.feedbackDigest !== feedbackDigest({ item: context.issue, issues: context.issues, change: withoutReviewFeedback(context.change, draft) })) {
         await this.startAutoReview(worker);
         return;
       }
@@ -1450,7 +1599,7 @@ export class ForgeWorkflowService {
       await this.resumeWorker(worker.id, loop.placement);
       return;
     }
-    if (review.feedbackDigest !== feedbackDigest({ item: context.issue, change: withoutReviewFeedback(context.change, draft) })) {
+    if (review.feedbackDigest !== feedbackDigest({ item: context.issue, issues: context.issues, change: withoutReviewFeedback(context.change, draft) })) {
       await this.startAutoReview(worker);
       return;
     }
@@ -1486,7 +1635,7 @@ export class ForgeWorkflowService {
       await this.updateBranchForMerge(worker);
       return;
     }
-    if (review.feedbackDigest !== feedbackDigest({ item: latest.issue, change: withoutReviewFeedback(latest.change, draft) })) {
+    if (review.feedbackDigest !== feedbackDigest({ item: latest.issue, issues: latest.issues, change: withoutReviewFeedback(latest.change, draft) })) {
       await this.startAutoReview(worker);
       return;
     }
@@ -1557,6 +1706,7 @@ export class ForgeWorkflowService {
         kind: "issue",
         title: worker.title,
         body: `Update the worker branch from ${worker.baseBranch} before a fresh review.`,
+        ...(worker.batch ? { issueResults: worker.batch.results } : {}),
         discussionReplies: [],
         resolvedDiscussionIds: [],
       },
@@ -1646,8 +1796,9 @@ export class ForgeWorkflowService {
     if (!publication) throw new Error("Issue completion report is missing.");
     if (!publication.baseUpdate && (!worker.completion?.readyAt || worker.completion.turn?.status !== "completed"))
       throw new Error("Publication requires the saved successful native turn completion. Its work and report were preserved.");
-    await this.preparePublication(worker);
     const { report } = publication;
+    if (worker.batch && !publication.baseUpdate) await this.validateBatchPublication(worker, report);
+    await this.preparePublication(worker);
     const provider = this.providerFor(worker);
     const signal = this.operations.get(worker.id)?.signal;
     if (worker.rebaseRecovery?.phase === "resolving" && !await this.acceptRebaseReport(worker)) return;
@@ -1731,6 +1882,7 @@ export class ForgeWorkflowService {
       publication.confirmationStartedAt = new Date(Date.now()).toISOString();
       await this.persist();
     }
+    const updateExistingRequest = Boolean(worker.changeNumber);
     if (!worker.changeNumber) {
       worker.publicationState = "creating";
       await this.persist();
@@ -1738,7 +1890,7 @@ export class ForgeWorkflowService {
       try {
         change = await provider.createChangeRequest({
           title: report.title,
-          body: `${report.body}\n\nCloses #${worker.number}`,
+          body: issueRequestBody(worker, report),
           headBranch: workspace.branch,
           baseBranch: worker.baseBranch,
         });
@@ -1751,6 +1903,13 @@ export class ForgeWorkflowService {
       worker.changeUrl = change.url;
       worker.publicationState = "created";
       await this.persist();
+    }
+    if (worker.batch && !publication.baseUpdate && updateExistingRequest) {
+      const current = await provider.getChangeRequestStatus(worker.changeNumber!);
+      signal?.throwIfAborted();
+      if (await this.reconcileMergedChange(worker, { change: current, signal })) return;
+      requirePublicationRequest(worker, current);
+      await provider.updateChangeRequest(worker.changeNumber!, { title: report.title, body: issueRequestBody(worker, report) });
     }
     await this.confirmPublication(worker);
   }
@@ -1818,7 +1977,7 @@ export class ForgeWorkflowService {
     const currentIssue = await provider.getIssue(worker.number);
     signal?.throwIfAborted();
     const feedbackUnchanged =
-      worker.feedbackDigest === feedbackDigest({ item: currentIssue, change });
+      worker.feedbackDigest === feedbackDigest({ item: currentIssue, issues: await this.batchIssues(worker), change });
     await this.respondToReview(worker, change, provider);
     if (
       worker.rebaseRecovery?.phase !== "publishing" && !worker.autoReview?.enabled && feedbackUnchanged &&
@@ -1835,6 +1994,7 @@ export class ForgeWorkflowService {
         worker.feedbackDigest ===
           feedbackDigest({
             item: await provider.getIssue(worker.number),
+            issues: await this.batchIssues(worker),
             change: latest,
           })
       ) {
@@ -1998,12 +2158,19 @@ export class ForgeWorkflowService {
   private async launch(
     worker: ForgeWorker,
     placement: ForgePlacement,
-    context: { item: unknown; change?: ForgeChangeRequest; issue?: ForgeIssueDetail; manualContinuation?: ManualContinuation },
+    context: WorkerContext,
   ): Promise<void> {
     if (!worker.worktreePath) throw new Error("Worker checkout is missing.");
     const signal = this.operations.get(worker.id)?.signal;
     signal?.throwIfAborted();
     const settings = this.deps.settings();
+    const owner = this.issueOwner(worker);
+    if (owner?.batch) {
+      const issues = (await this.batchIssues(owner))!;
+      owner.batch.issues = issues.map(({ number, title, url }) => ({ number, title, url, state: "open" as const }));
+      context = { ...context, issues, batch: { name: owner.title, ...owner.batch },
+        ...(worker.kind === "issue" ? { item: issues[0] } : { issue: issues[0] }) };
+    }
     let reviewScope: ForgeReviewScope | undefined;
     if (worker.kind === "review") {
       if (!worker.reviewBaseline && (worker.draft || worker.reviewHistory?.length))
@@ -2016,7 +2183,7 @@ export class ForgeWorkflowService {
     if (worker.kind === "issue")
       worker.feedbackDigest = feedbackDigest(context);
     else if (context.issue)
-      worker.feedbackDigest = feedbackDigest({ item: context.issue, change: context.item as ForgeChangeRequest });
+      worker.feedbackDigest = feedbackDigest({ item: context.issue, issues: context.issues, change: context.item as ForgeChangeRequest });
     worker.attemptId = randomUUID();
     worker.completion = {
       attemptId: worker.attemptId,
@@ -2038,6 +2205,10 @@ export class ForgeWorkflowService {
         : "Review the exact checked-out commit using the supplied review scope and local Git checkout. Do not alter the checkout or publish anything. The comments array contains actionable findings only, with file path and new line for inline findings. Set event to approve when the implementation satisfies the issue and review feedback and no issues remain; an issue-free review must explicitly approve. Set event to request_changes when actionable findings remain. Use comment only when human clarification or a decision is required. Write the completion report when finished.";
     if (worker.kind === "issue")
       instructions += " Include handoff with headSha set to the full intended commit from git rev-parse HEAD, status ready only when all intended implementation is committed and validated, retainedPaths listing every deliberately uncommitted tracked or untracked file, and details explaining their retention and validation of the committed content. Inventory files with git status --porcelain=v1 -z --untracked-files=all --no-renames; list each path separately, including deletions and both paths of a rename. Ignored files do not need declaration and remain preserved at cleanup. Working files are supported: do not commit diagnostics or unrelated edits just to make the checkout clean. Validate the intended commit independently if retained edits affect tests. If implementation is unfinished, use status needs_work and explain the remaining action in details. Leave all files intact; CloudX publishes only the recorded commit and preserves leftover contents in this checkout.";
+    if (owner?.batch)
+      instructions += worker.kind === "issue"
+        ? " This is one named batch. Read every issue in the context, plan their combined requirements, dependencies and overlapping changes, and preserve all member identities. Include exactly one issueResults entry per member with number, status (completed, blocked or unfinished), changes and actual validation. For blocked or unfinished issues include a concrete blocker and required action, and mark handoff needs_work. A blocked or unfinished member keeps the whole batch incomplete."
+        : " Review every member issue in the supplied batch context and its reported changes and validation. Initial review must cover all requirements; follow-up review must assess the supplied incremental scope while retaining the requirements of every member. Approval requires the complete batch to be satisfied.";
     if (worker.rebaseRecovery?.phase === "resolving") {
       const recovery = worker.rebaseRecovery;
       instructions += ` This is conflict recovery for owned branch ${JSON.stringify(recovery.branch)}, previously published at ${recovery.expectedHeadSha}, with original local head ${recovery.originalHeadSha}. Rebase onto the pinned fetched target ${recovery.targetHeadSha}. First inspect git status and any interrupted rebase; continue an existing matching rebase without restarting it. If no rebase is in progress, preserve and commit any intended unpublished work, then run git rebase --rebase-merges=rebase-cousins --no-autostash --no-update-refs ${recovery.targetHeadSha}. Resolve each conflict and continue. Preserve the intended issue fix, target changes, rename/delete decisions, and manual resolutions from earlier target-update merge commits; compare against the saved original head and reapply intended changes as needed. Do not reset, clean, abort, skip commits, or discard unpublished work to make rebase succeed. Run affected tests and record the actual commands and results. Only report rebase outcome resolved and validation passed when the rebase is finished on the owned branch and the affected tests pass. If blocked or validation fails, report outcome blocked with a concrete reason, the needed human action, and validation failed; leave the checkout intact for Resume. CloudX alone publishes using the saved exact remote-head lease and requires a fresh review of the rewritten commit.`;
@@ -2055,6 +2226,7 @@ export class ForgeWorkflowService {
             body: "Summary and actual validation performed",
             discussionReplies: [],
             resolvedDiscussionIds: [],
+            ...(worker.batch ? { issueResults: worker.batch.issues.map(issue => ({ number: issue.number, status: "completed", changes: "Changes for this issue", validation: "Actual commands and outcomes; or missing validation" })) } : {}),
             handoff: { headSha: "Full intended commit SHA", status: "ready", retainedPaths: [], details: "Why remaining files are retained and how the committed content was validated; or what work remains" },
             ...(worker.rebaseRecovery?.phase === "resolving" ? {
               rebase: { outcome: "resolved", validation: "passed", details: "Resolution, actual test commands and results; or the blocker and action needed" },
@@ -2090,6 +2262,7 @@ export class ForgeWorkflowService {
         model: worker.kind === "issue" ? settings.workerModel : settings.reviewModel,
         reasoningEffort: worker.kind === "issue" ? settings.workerReasoningEffort : settings.reviewReasoningEffort,
         prompt,
+        ...(worker.batch ? { preserveConversation: true as const } : {}),
         ...placement,
       },
       signal,
@@ -2153,12 +2326,18 @@ export class ForgeWorkflowService {
       sameRepository(candidate.repository, worker.repository) && changeNumber(candidate) === number,
     );
     let issuesClosed = change.linkedIssues.every(issue => issue.state === "closed");
-    for (const issueNumber of new Set(associated.filter(candidate => candidate.kind === "issue").map(candidate => candidate.number))) {
+    for (const issueNumber of new Set(associated.flatMap(candidate => forgeWorkerIssueNumbers(candidate)))) {
       const issue = await this.observeProvider({ number: issueNumber, changeNumber: number }, "getIssue", () => provider.getIssue(issueNumber));
       if (issue.number !== issueNumber) throw new Error("Completion status does not match this issue.");
+      if (issue.state !== "open" && issue.state !== "closed") throw new Error(`Issue #${issueNumber} returned an invalid issue state.`);
       if (issue.state !== "closed") issuesClosed = false;
+      for (const candidate of associated) {
+        const member = candidate.batch?.issues.find(member => member.number === issueNumber);
+        if (member) member.state = issue.state;
+      }
     }
     signal.throwIfAborted();
+    if (associated.some(candidate => candidate.batch)) await this.persist();
     for (const candidate of associated) {
       signal.throwIfAborted();
       if (candidate.status === "completed" && candidate.retainedWorkspace) continue;
@@ -2166,7 +2345,7 @@ export class ForgeWorkflowService {
       if (issuesClosed) await this.retireMergedWorker(candidate, change);
       else if (candidate.status !== "cleanup_failed" &&
           (["starting", "running", "awaiting_publication", "awaiting_merge"].includes(candidate.status) ||
-            candidate.autoReview?.enabled && candidate.status === "awaiting_review" || candidate.id === retryCleanupId)) {
+            (candidate.autoReview?.enabled || candidate.batch) && candidate.status === "awaiting_review" || candidate.id === retryCleanupId)) {
         const publication = candidate.pendingPublication;
         if (publication?.headSha) {
           if (change.headSha !== publication.headSha || change.headBranch !== candidate.branch || change.baseBranch !== candidate.baseBranch)
@@ -2178,7 +2357,9 @@ export class ForgeWorkflowService {
           publication.confirmed = true;
           publication.nextConfirmationAt = undefined;
         }
-        await this.waitForIssueClosure(candidate, "Change request merged. Waiting for linked issues to close before cleanup.");
+        await this.waitForIssueClosure(candidate, candidate.batch
+          ? `Change request merged. Waiting for actual closure of ${candidate.batch.issues.filter(issue => issue.state === "open").map(issue => `#${issue.number}`).join(", ") || "linked issues"} before cleanup.`
+          : "Change request merged. Waiting for linked issues to close before cleanup.");
         if (publication?.confirmed) await this.recordPublicationObservation(candidate, "confirmation", [], "confirmed");
       }
     }
@@ -2298,7 +2479,7 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(parent?.id ?? worker.id)?.signal;
     if (parent) {
       const issue = await this.providerFor(parent).getIssue(parent.number);
-      if (!change.reviewReady || worker.feedbackDigest !== feedbackDigest({ item: issue, change }))
+      if (!change.reviewReady || worker.feedbackDigest !== feedbackDigest({ item: issue, issues: await this.batchIssues(parent), change }))
         throw new Error("The review input changed or is still processing. Run a fresh review before posting.");
     }
     signal?.throwIfAborted();
@@ -2467,6 +2648,22 @@ export class ForgeWorkflowService {
     return run;
   }
 }
+function batchResults(worker: ForgeWorker, report: ForgeIssueCompletionReport) {
+  const numbers = forgeWorkerIssueNumbers(worker);
+  const results = report.issueResults;
+  if (!results || results.length !== numbers.length || new Set(results.map(result => result.number)).size !== numbers.length ||
+      results.some(result => !numbers.includes(result.number)))
+    throw new Error("A batch completion report must include exactly one issueResults entry for every member issue.");
+  return results;
+}
+function issueRequestBody(worker: ForgeWorker, report: ForgeIssueCompletionReport): string {
+  if (!worker.batch) return `${report.body}\n\nCloses #${worker.number}`;
+  const results = batchResults(worker, report);
+  return [report.body, ...worker.batch.issues.map(issue => {
+    const result = results.find(result => result.number === issue.number)!;
+    return `### [Issue #${issue.number}](${issue.url})\n\n${result.changes}\n\nValidation: ${result.validation}\n\nCloses #${issue.number}`;
+  })].join("\n\n");
+}
 function reviewSubmission(draft: ForgeReviewDraft): ForgeReviewSubmission {
   return {
     headSha: draft.headSha,
@@ -2526,6 +2723,7 @@ function withoutReviewFeedback(change: ForgeChangeRequest, draft: ForgeReviewDra
 function feedbackDigest(context: {
   item: unknown;
   change?: ForgeChangeRequest;
+  issues?: ForgeIssueDetail[];
 }): string {
   const item = context.item as {
     body: string;
@@ -2556,6 +2754,7 @@ function feedbackDigest(context: {
       JSON.stringify({
         body: item.body,
         comments: comments(item.comments),
+        issues: context.issues?.map(issue => ({ number: issue.number, title: issue.title, body: issue.body, comments: comments(issue.comments) })),
         change: context.change
           ? {
               body: context.change.body,

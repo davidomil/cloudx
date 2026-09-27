@@ -1,6 +1,8 @@
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
+  ForgeBatchIssueResult,
+  ForgeIssueBatch,
   ForgeIssueCompletionReport,
   ForgePublicationObservation,
   ForgeReviewComment,
@@ -224,6 +226,8 @@ export function parseWorkerReport(
   | ({ kind: "review" } & ForgeReviewSubmission) {
   const report = object(value);
   if (report.kind === "review") {
+    if (report.issueResults !== undefined)
+      throw new Error("Only issue reports can include batch issue results.");
     if (report.handoff !== undefined)
       throw new Error("Only issue reports can include a publication handoff.");
     if (report.rebase !== undefined)
@@ -265,9 +269,71 @@ export function parseWorkerReport(
     body,
     resolvedDiscussionIds: [...new Set(ids)] as string[],
     discussionReplies,
+    ...(report.issueResults !== undefined ? { issueResults: parseBatchIssueResults(report.issueResults) } : {}),
     ...(report.handoff !== undefined ? { handoff: parseIssueHandoff(report.handoff) } : {}),
     ...(report.rebase !== undefined ? { rebase: parseRebaseReport(report.rebase) } : {}),
   };
+}
+
+function batchIssueNumber(value: unknown): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1)
+    throw new Error("Batch issues need positive issue numbers.");
+  return Number(value);
+}
+
+function batchEntries(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_FORGE_BATCH_ISSUES)
+    throw new Error(`A batch must contain 1–${MAX_FORGE_BATCH_ISSUES} issues.`);
+  const entries = value.map(object);
+  const numbers = entries.map(entry => batchIssueNumber(entry.number));
+  if (new Set(numbers).size !== numbers.length)
+    throw new Error("Batch issue numbers must be unique.");
+  return entries;
+}
+
+function parseBatchIssueResults(value: unknown): ForgeBatchIssueResult[] {
+  return batchEntries(value).map(result => {
+    const status = result.status;
+    if (status !== "completed" && status !== "blocked" && status !== "unfinished")
+      throw new Error("Invalid batch issue result status.");
+    const blocker = result.blocker === undefined ? undefined : nonblankText(result.blocker, "batch issue blocker", 20_000);
+    if (status === "completed" && blocker)
+      throw new Error("A completed batch issue cannot have a blocker.");
+    if (status !== "completed" && !blocker)
+      throw new Error("Incomplete batch issues must explain their blocker or remaining work.");
+    return {
+      number: batchIssueNumber(result.number),
+      status,
+      changes: nonblankText(result.changes, "batch issue changes", 20_000),
+      validation: nonblankText(result.validation, "batch issue validation", 20_000),
+      ...(blocker ? { blocker } : {}),
+    };
+  });
+}
+
+function parseBatch(value: unknown): ForgeIssueBatch {
+  const input = object(value);
+  const issues = batchEntries(input.issues).map(issue => {
+    if (issue.state !== "open" && issue.state !== "closed")
+      throw new Error("Invalid batch issue state.");
+    const url = nonblankText(issue.url, "batch issue URL", 4096);
+    if (!["http:", "https:"].includes(new URL(url).protocol))
+      throw new Error("Batch issue links must use HTTP or HTTPS.");
+    return {
+      number: batchIssueNumber(issue.number),
+      title: nonblankText(issue.title, "batch issue title", 4096),
+      url,
+      state: issue.state,
+    } as ForgeIssueBatch["issues"][number];
+  });
+  const results = input.results === undefined ? undefined : parseBatchIssueResults(input.results);
+  if (results) requireBatchCoverage(issues, results);
+  return { issues, ...(results ? { results } : {}) };
+}
+
+function requireBatchCoverage(issues: ForgeIssueBatch["issues"], results: ForgeBatchIssueResult[]): void {
+  if (issues.length !== results.length || issues.some(issue => !results.some(result => result.number === issue.number)))
+    throw new Error("Batch results must cover every member exactly once.");
 }
 
 function parseRebaseReport(value: unknown): NonNullable<ForgeIssueCompletionReport["rebase"]> {
@@ -450,6 +516,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     if (
       !["issue", "review"].includes(String(worker.kind)) ||
       ![
+        "draft",
         "starting",
         "running",
         "paused",
@@ -512,6 +579,19 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.batch !== undefined) {
+      if (worker.kind !== "issue") throw new Error("Only issue workers can own a batch.");
+      parsed.batch = parseBatch(worker.batch);
+      nonblankText(worker.title, "batch name", 200);
+      if (parsed.batch.issues[0].number !== worker.number)
+        throw new Error("Batch primary issue must match its first member.");
+    }
+    if (worker.status === "draft" && (!parsed.batch || [
+      "repositoryPath", "worktreePath", "branch", "tabId", "attemptId", "completion", "retainedWorkspace",
+      "publicationState", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
+      "mergeConflict", "rebaseRecovery", "issueWorkerId", "providerRetryAt",
+    ].some(key => worker[key] !== undefined) || parsed.batch.results !== undefined))
+      throw new Error("A draft batch cannot own execution or publication state.");
     if (worker.completion !== undefined) {
       const completion = object(worker.completion);
       const attemptId = nonblankText(completion.attemptId, "completion attempt", 36);
@@ -590,6 +670,13 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       if (worker.kind !== "issue")
         throw new Error("Only issue workers can have pending publication.");
       parsed.pendingPublication = parsePendingPublication(worker.pendingPublication);
+      if (parsed.batch) {
+        const results = parsed.pendingPublication.report.issueResults;
+        if (!results) throw new Error("Batch publication requires every member's results.");
+        requireBatchCoverage(parsed.batch.issues, results);
+        if (results.some(result => result.status !== "completed"))
+          throw new Error("Incomplete batch issues cannot be published.");
+      }
       const update = parsed.pendingPublication.baseUpdate;
       if (update && (!parsed.changeNumber || update.baseBranch !== parsed.baseBranch ||
         parsed.headSha !== update.expectedHeadSha && parsed.headSha !== update.headSha))

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
-import { forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
+import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import type { DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -140,13 +140,13 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </nav>
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
         {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
-      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} /> : null}
+      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
   </section></WorkerContinuations.Provider>;
 }
 
-function ForgeItems({ kind, repository, request, revision, workers, placement, runAction, busy, onViewWorker }: {
+function ForgeItems({ kind, repository, request, revision, workers, placement, runAction, busy, onViewWorker, onBatchSaved }: {
   kind: "issues" | "changes";
   repository: ForgeRepository;
   request: Request;
@@ -156,6 +156,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
   runAction: RunAction;
   busy: boolean;
   onViewWorker?: (workerId: string) => void;
+  onBatchSaved: (workerId: string) => void;
 }) {
   const provider = repository.provider;
   const defaultFilter = provider === "github" ? "is:open" : "state=opened";
@@ -170,6 +171,8 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
   const [detailError, setDetailError] = useState<string>();
   const [reviewBody, setReviewBody] = useState("");
   const [autoReviewDrafts, setAutoReviewDrafts] = useState<Record<number, boolean>>({});
+  const [batchMembers, setBatchMembers] = useState<ForgeIssue[]>([]);
+  const [batchName, setBatchName] = useState("");
   const singular = kind === "issues" ? "issue" : provider === "gitlab" ? "merge request" : "pull request";
   const selectedNumber = selected?.number;
 
@@ -202,7 +205,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
   useEffect(() => { setReviewBody(""); }, [selectedNumber]);
   const selectedWorkers = workersForItem(workers, kind, selectedNumber);
   const reviews = selectedWorkers.filter(worker => worker.kind === "review").flatMap(reviewRounds).sort((a, b) => Date.parse(reviewStartedAt(b)) - Date.parse(reviewStartedAt(a)));
-  const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed");
+  const activeWorker = selectedWorkers.find((worker) => worker.kind === (kind === "issues" ? "issue" : "review") && worker.status !== "completed" && worker.status !== "draft");
   const unconfirmedPublication = selectedWorkers.some(hasUnconfirmedPublication);
   const currentDetail = detail?.number === selectedNumber ? detail : undefined;
   const changeDetail = kind === "changes" && currentDetail && isChangeRequest(currentDetail) ? currentDetail : undefined;
@@ -214,6 +217,12 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
     setSelected(undefined);
     setQuery({ filter: scope ? filterText.trim() : defaultFilter, page: 1, ...(scope ? { scope } : {}) });
   };
+  async function saveBatch() {
+    await runAction(async () => {
+      const { worker } = await request<{ worker: ForgeWorker }>("forge.batch.save", { repository, name: batchName.trim(), numbers: batchMembers.map(member => member.number) });
+      onBatchSaved(worker.id);
+    });
+  }
 
   return <div className="forge-items">
     <form className="forge-filter" onSubmit={(event) => { event.preventDefault(); setSelected(undefined); setQuery({ ...query, filter: filterText.trim(), page: 1 }); }}>
@@ -227,6 +236,14 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
       <ControlButton type="submit" size="compact">Apply filter</ControlButton>
       <small>{provider === "github" ? "GitHub search qualifiers" : "GitLab URL query parameters"}</small>
     </form>
+    {kind === "issues" && batchMembers.length ? <form className="forge-batch-selection" aria-label="Create issue batch" onSubmit={event => { event.preventDefault(); void saveBatch(); }}>
+      <label className="forge-field">Batch name<input required maxLength={200} value={batchName} disabled={busy} onChange={event => setBatchName(event.target.value)} /></label>
+      <ul>{batchMembers.map(member => <li key={member.number}>
+        <a href={member.url} target="_blank" rel="noreferrer">#{member.number} {member.title}</a>
+        <ControlButton size="compact" disabled={busy} aria-label={`Remove issue #${member.number} from selection`} onClick={() => setBatchMembers(members => members.filter(candidate => candidate.number !== member.number))}>Remove</ControlButton>
+      </li>)}</ul>
+      <div className="forge-actions"><ControlButton type="submit" size="compact" disabled={busy || !batchName.trim()}>Save batch</ControlButton><span className="forge-muted">{batchMembers.length}/{MAX_FORGE_BATCH_ISSUES} issues · Save a draft, then start one worker for the group.</span></div>
+    </form> : null}
     <div className="forge-browser">
       <div className="forge-list" aria-label={`${kind === "issues" ? "Issue" : "Change request"} list`} aria-busy={listBusy}>
         {listError ? <p className="forge-notice" role="alert">{listError}</p> : null}
@@ -235,12 +252,16 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
           const itemWorkers = workersForItem(workers, kind, entry.number);
           const drafts = itemWorkers.filter((worker) => worker.kind === "review" && worker.draft && worker.draft.status !== "posted");
           const comments = drafts.reduce((count, worker) => count + (worker.draft?.comments.length ?? 0), 0);
-          return <button type="button" key={entry.number} className={`forge-item${selectedNumber === entry.number ? " selected" : ""}`} onClick={() => setSelected(entry)} aria-pressed={selectedNumber === entry.number}>
+          const checked = batchMembers.some(member => member.number === entry.number);
+          const owned = itemWorkers.some(worker => worker.kind === "issue" && worker.status !== "draft" && worker.status !== "completed");
+          return <div key={entry.number} className="forge-item-row">
+            {kind === "issues" ? <input type="checkbox" className="forge-batch-select" aria-label={`Select issue #${entry.number} for batch`} checked={checked} disabled={busy || (!checked && (entry.state !== "open" || owned || batchMembers.length >= MAX_FORGE_BATCH_ISSUES))} onChange={event => setBatchMembers(members => event.target.checked ? [...members, entry] : members.filter(member => member.number !== entry.number))} /> : null}
+            <button type="button" className={`forge-item${selectedNumber === entry.number ? " selected" : ""}`} onClick={() => setSelected(entry)} aria-pressed={selectedNumber === entry.number}>
             <span className="forge-item-title">#{entry.number} {entry.title}</span>
             <span className="forge-muted">{entry.state} · {entry.author}{entry.labels.length ? ` · ${entry.labels.join(", ")}` : ""}</span>
             <ItemWorkerStats workers={itemWorkers} />
             {kind === "changes" && drafts.length ? <span className="forge-badge"><MessageSquare size={13} /> {comments} suggested {comments === 1 ? "comment" : "comments"} · {drafts.length} review {drafts.length === 1 ? "draft" : "drafts"}</span> : null}
-          </button>;
+          </button></div>;
         })}
         {page && !page.items.length ? <p className="forge-empty">No {kind === "issues" ? "issues" : "requests"} match this filter.</p> : null}
         <div className="forge-pagination">
@@ -295,7 +316,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
 function workersForItem(workers: ForgeWorker[], kind: "issues" | "changes", number?: number) {
   if (number === undefined) return [];
   if (kind === "changes") return workers.filter(worker => (worker.kind === "issue" ? worker.changeNumber : worker.number) === number);
-  const issueWorkers = workers.filter(worker => worker.kind === "issue" && worker.number === number);
+  const issueWorkers = workers.filter(worker => worker.kind === "issue" && forgeWorkerIssueNumbers(worker).includes(number));
   const issueWorkerIds = new Set(issueWorkers.map(worker => worker.id));
   return workers.filter(worker => issueWorkerIds.has(worker.id) || (worker.kind === "review" && !!worker.issueWorkerId && issueWorkerIds.has(worker.issueWorkerId)));
 }
@@ -317,7 +338,7 @@ function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
     {currentWorkers.map(worker => {
       const postFailed = worker.status === "completed" && worker.draft?.status === "post_failed";
       return <span key={worker.id} className="forge-item-worker">
-        <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
+        <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.batch ? "Batch" : worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
         {worker.retainedWorkspace ? <span className="forge-muted">Retained working files</span> : null}
         {worker.autoReview?.enabled ? <span className="forge-muted">Auto review · {worker.autoReview.phase}</span> : null}
         {worker.error ? <span className={worker.status === "awaiting_publication" ? "forge-muted" : "forge-item-worker-error"} title={worker.error}>{worker.error}</span> : null}
@@ -339,7 +360,7 @@ function autoReviewProgress(worker: ForgeWorker) {
   return `Auto review · ${{ implementing: "Implementing changes", reviewing: "Reviewing changes", merging: "Waiting to merge" }[worker.autoReview.phase]}`;
 }
 
-function WorkerCard({ worker, workers, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: {
+type WorkerCardProps = {
   worker: ForgeWorker;
   workers: ForgeWorker[];
   archivedDraft?: ForgeReviewDraft;
@@ -351,7 +372,59 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
   canSubmitReview?: boolean;
   showAutoReview?: boolean;
   collapsible?: boolean;
-}) {
+};
+
+function WorkerCard(props: WorkerCardProps) {
+  const { worker } = props;
+  return worker.batch && worker.status === "draft"
+    ? <BatchDraftCard key={`${worker.id}:${worker.title}:${worker.batch.issues.map(issue => issue.number).join(",")}`} {...props} />
+    : <ActiveWorkerCard {...props} />;
+}
+
+function BatchDraftCard({ worker, request, runAction, placement, busy }: WorkerCardProps) {
+  const members = worker.batch!.issues;
+  const savedNumbers = members.map(issue => issue.number).join(", ");
+  const [name, setName] = useState(worker.title);
+  const [membership, setMembership] = useState(savedNumbers);
+  const [autoReview, setAutoReview] = useState(false);
+  const numbers = membership.trim().split(/[\s,]+/).map(Number);
+  const valid = !!name.trim() && numbers.length <= MAX_FORGE_BATCH_ISSUES && new Set(numbers).size === numbers.length && numbers.every(number => Number.isSafeInteger(number) && number > 0);
+  const edited = name !== worker.title || membership !== savedNumbers;
+  return <article className="forge-worker" aria-label={`Batch draft ${worker.title}`}>
+    <div className="forge-worker-heading"><strong>Batch · {worker.title}</strong><span className="forge-status">Draft</span></div>
+    <p className="forge-muted">{worker.repository.projectPath} · Target: {worker.baseBranch}</p>
+    <BatchIssues worker={worker} />
+    <form aria-label="Edit issue batch" onSubmit={event => { event.preventDefault(); void runAction(() => request("forge.batch.save", { id: worker.id, repository: worker.repository, name: name.trim(), numbers })); }}>
+      <label className="forge-field">Batch name<input required maxLength={200} disabled={busy} value={name} onChange={event => setName(event.target.value)} /></label>
+      <label className="forge-field">Issue numbers<input required maxLength={850} disabled={busy} value={membership} onChange={event => setMembership(event.target.value)} aria-describedby={`batch-members-${worker.id}`} /></label>
+      <p id={`batch-members-${worker.id}`} className="forge-muted">Enter up to 50 unique issue numbers, separated by commas. Save membership changes before starting.</p>
+      <div className="forge-actions">
+        <ControlButton type="submit" size="compact" disabled={busy || !edited || !valid}>Save batch changes</ControlButton>
+        <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.batch.delete", { id: worker.id }))}><Trash2 size={14} /> Delete batch</ControlButton>
+      </div>
+    </form>
+    <div className="forge-actions">
+      <ControlButton tone="primary" size="compact" disabled={busy || edited || !valid} onClick={() => void runAction(() => request("forge.batch.start", { id: worker.id, autoReview, ...placement }))}><Play size={14} /> Start batch</ControlButton>
+      <AutoReviewToggle enabled={autoReview} disabled={busy} onChange={setAutoReview} />
+    </div>
+  </article>;
+}
+
+function BatchIssues({ worker }: { worker: ForgeWorker }) {
+  if (!worker.batch) return null;
+  return <section className="forge-batch-members" aria-label="Batch issues">
+    <ul>{worker.batch.issues.map(issue => {
+      const result = worker.batch!.results?.find(result => result.number === issue.number);
+      return <li key={issue.number}>
+        <a href={issue.url} target="_blank" rel="noreferrer">#{issue.number} {issue.title}</a>
+        <span className="forge-muted"> · Issue {issue.state} · {result ? `Last report: ${result.status}` : worker.status === "draft" ? "Not started" : "Work pending"}</span>
+        {result ? <><p><strong>Changes:</strong> {result.changes}</p><p><strong>Validation:</strong> {result.validation}</p>{result.blocker ? <p className="forge-notice"><strong>Blocker:</strong> {result.blocker}</p> : null}</> : null}
+      </li>;
+    })}</ul>
+  </section>;
+}
+
+function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: WorkerCardProps) {
   const [controlling, setControlling] = useState(false);
   const continuation = useContext(WorkerContinuations)!;
   const continuing = continuation.messages[worker.id] !== undefined;
@@ -396,9 +469,10 @@ function WorkerCard({ worker, workers, archivedDraft, request, placement, runAct
   const canStop = ["starting", "running", "awaiting_publication", "awaiting_merge", "paused", "awaiting_review", "failed"].includes(worker.status);
   const progress = worker.providerRetryAt ? undefined : autoReviewProgress(worker);
   const draft = archivedDraft ?? worker.draft;
-  const card = <article className="forge-worker" aria-label={`${worker.kind} worker #${worker.number}`}>
-    <div className="forge-worker-heading"><strong>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
+  const card = <article className="forge-worker" aria-label={worker.batch ? `Batch worker ${worker.title}` : `${worker.kind} worker #${worker.number}`}>
+    <div className="forge-worker-heading"><strong>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
+    <BatchIssues worker={worker} />
     {!archivedDraft && worker.error && worker.status !== "awaiting_publication" ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
     {!archivedDraft && worker.completion?.continuationRequired ? <p role="status" className="forge-notice">{worker.completion.continuationRequired} Use Continue with message to finish the implementation and submit a new handoff.</p> : null}
     {!archivedDraft && retainedFiles ? <section aria-label="Retained working files">

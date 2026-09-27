@@ -21,7 +21,7 @@ export interface ReviewConversationBinding {
 
 interface ConversationTransport extends AppServerTransport { finish(): Promise<void>; terminate(): Promise<void> }
 
-/** Creates one durable reviewer thread and verifies that exact thread on later launches. */
+/** Creates one durable worker thread and verifies that exact thread on later launches. */
 export class ForgeReviewConversation {
   constructor(
     private readonly dataDir: string,
@@ -31,6 +31,7 @@ export class ForgeReviewConversation {
   async prepare(
     launch: PreparedCodexLaunch,
     options: {
+      purpose: "review" | "batch";
       binding?: ReviewConversationBinding;
       model: string;
       reasoningEffort: CodexReasoningEffort;
@@ -51,15 +52,15 @@ export class ForgeReviewConversation {
       signal?.throwIfAborted();
       const source = await sources.readBinding(launch.tabId, signal);
       if (!source || launch.env.CODEX_HOME !== sources.viewPath(launch.tabId))
-        throw new Error("Reviewer conversation requires the prepared Codex source overlay.");
+        throw new Error("Worker conversation requires the prepared Codex source overlay.");
       const sqlitePath = launch.env.CODEX_SQLITE_HOME?.trim();
-      if (!sqlitePath || !path.isAbsolute(sqlitePath)) throw new Error("Reviewer conversation requires an absolute Codex SQLite home.");
+      if (!sqlitePath || !path.isAbsolute(sqlitePath)) throw new Error("Worker conversation requires an absolute Codex SQLite home.");
       const sqliteHome = await directory(sqlitePath);
       const view = await directory(launch.env.CODEX_HOME);
       let binding = options.binding;
       if (binding && (!sameSource(binding.source, source) || !sameDirectory(binding.sqliteHome, sqliteHome)))
-        throw new Error("The reviewer conversation source changed. Its existing context was preserved.");
-      if (binding?.creating) throw new Error("Reviewer conversation initialization is unresolved. Its pending context was preserved.");
+        throw new Error("The worker conversation source changed. Its existing context was preserved.");
+      if (binding?.creating) throw new Error("Worker conversation initialization is unresolved. Its pending context was preserved.");
       if (binding) {
         const origin = await openReviewSessionView(sources, binding.originView, binding.source);
         await origin.close();
@@ -89,23 +90,25 @@ export class ForgeReviewConversation {
           threadId,
           items: [{
             type: "message", role: "user",
-            content: [{ type: "input_text", text: `This conversation belongs to one Forge review worker in ${JSON.stringify(launch.cwd)}. Retain prior review findings as context, and assess each requested revision from the current owned checkout. Wait for the review request before starting work.` }],
+            content: [{ type: "input_text", text: options.purpose === "batch"
+              ? `This conversation belongs to one Forge issue batch in ${JSON.stringify(launch.cwd)}. Retain the combined requirements, member identities, implementation decisions and validation history across pauses, review feedback and rebases. Continue from the current owned checkout and preserve its working files. Wait for the batch request before starting work.`
+              : `This conversation belongs to one Forge review worker in ${JSON.stringify(launch.cwd)}. Retain prior review findings as context, and assess each requested revision from the current owned checkout. Wait for the review request before starting work.` }],
           }],
         });
         if (!isRecord(initialized) || Object.keys(initialized).length !== 0)
-          throw new Error("Codex did not confirm the reviewer context was initialized.");
+          throw new Error("Codex did not confirm the worker context was initialized.");
         binding = { ...binding, creating: false };
         await options.save(binding);
         const unsubscribed = await client.request("thread/unsubscribe", { threadId });
         if (!isRecord(unsubscribed) || unsubscribed.status !== "unsubscribed")
-          throw new Error("Codex did not confirm the new reviewer thread was saved and unloaded.");
+          throw new Error("Codex did not confirm the new worker thread was saved and unloaded.");
       }
       const threadId = binding.threadId!;
       const resumed = await client.request("thread/resume", { threadId, excludeTurns: true });
       this.requireThreadIdentity(resumed, launch.cwd, threadId);
       const unsubscribed = await client.request("thread/unsubscribe", { threadId });
       if (!isRecord(unsubscribed) || unsubscribed.status !== "unsubscribed")
-        throw new Error("Codex did not confirm the reviewer conversation was unloaded.");
+        throw new Error("Codex did not confirm the worker conversation was unloaded.");
       await transport.finish();
       creatingThread = false;
       await sources.assertCurrent(source, signal);
@@ -121,7 +124,7 @@ export class ForgeReviewConversation {
       try { await transport?.terminate(); } catch (error) { errors.push(error); }
       try { await sources.dispose(); } catch (error) { errors.push(error); }
       if (errors.length === 1 && errors[0] instanceof AppServerOwnershipError) throw errors[0];
-      if (errors.length) throw new AppServerOwnershipError("Reviewer conversation cleanup is incomplete. Local resources were preserved.", { cause: new AggregateError(errors) });
+      if (errors.length) throw new AppServerOwnershipError("Worker conversation cleanup is incomplete. Local resources were preserved.", { cause: new AggregateError(errors) });
     }
   }
 
@@ -129,7 +132,7 @@ export class ForgeReviewConversation {
     const thread = isRecord(result) && isRecord(result.thread) ? result.thread : undefined;
     if (!thread || !isThreadId(thread.id) || expectedId !== undefined && thread.id !== expectedId ||
       thread.cwd !== cwd || thread.ephemeral !== false)
-      throw new Error("Codex returned a reviewer conversation that does not match its owned checkout.");
+      throw new Error("Codex returned a worker conversation that does not match its owned checkout.");
     return thread as Record<string, unknown> & { id: string };
   }
 }
@@ -139,11 +142,11 @@ export async function retireReviewSessionView(dataDir: string, tabId: string, ex
   const { source, originView } = binding;
   const sources = new CodexStateSources(dataDir, { CODEX_HOME: source.home });
   try {
-    if (sources.viewPath(tabId) !== expected.path) throw new Error("Reviewer session view ownership does not match.");
+    if (sources.viewPath(tabId) !== expected.path) throw new Error("Worker session view ownership does not match.");
     const isOrigin = expected.path === originView.path;
     if (isOrigin) {
       const current = await directory(expected.path);
-      if (!sameDirectory(expected, current) || !sameDirectory(originView, current)) throw new Error("Reviewer conversation origin view ownership changed.");
+      if (!sameDirectory(expected, current) || !sameDirectory(originView, current)) throw new Error("Worker conversation origin view ownership changed.");
     }
     const view = await openReviewSessionView(sources, expected, source);
     try {
@@ -159,16 +162,16 @@ export async function retireReviewSessionView(dataDir: string, tabId: string, ex
 
 async function openReviewSessionView(sources: CodexStateSources, expected: OwnedDirectoryIdentity, source: ResolvedCodexStateSource) {
   const tabId = path.basename(expected.path);
-  if (sources.viewPath(tabId) !== expected.path) throw new Error("Reviewer session view ownership does not match.");
+  if (sources.viewPath(tabId) !== expected.path) throw new Error("Worker session view ownership does not match.");
   const bound = await sources.readBinding(tabId);
-  if (!bound || !sameSource(source, bound)) throw new Error("Reviewer session source changed; its view was preserved.");
+  if (!bound || !sameSource(source, bound)) throw new Error("Worker session source changed; its view was preserved.");
   await sources.assertCurrent(source);
-  const view = await openOwnedDirectoryNoFollow(path.dirname(expected.path), expected.path, "Reviewer session view", expected);
+  const view = await openOwnedDirectoryNoFollow(path.dirname(expected.path), expected.path, "Worker session view", expected);
   try {
     for (const name of ["sessions", "archived_sessions"]) {
       const link = view.childPath(name);
       if (!(await fs.lstat(link)).isSymbolicLink() || await fs.realpath(link) !== path.join(source.home, name))
-        throw new Error("Reviewer session history link changed; its view was preserved.");
+        throw new Error("Worker session history link changed; its view was preserved.");
     }
     return view;
   } catch (error) {
