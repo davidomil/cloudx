@@ -912,7 +912,7 @@ export class CodexTerminalSession implements PluginSession {
           else reject(new Error(`Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`} during completion.`));
         });
         // Leave through the native TUI before releasing its supervised process tree.
-        this.terminalProcess.write("\u0015/quit");
+        this.terminalProcess.write("\u0015\u001b[200~/quit\u001b[201~");
         this.submit();
       });
     }
@@ -1006,7 +1006,7 @@ export class CodexTerminalSession implements PluginSession {
       const text = requireString(input.text, "text");
       const submit = typeof input.submit === "boolean" ? input.submit : false;
       const textToWrite = submit ? stripTrailingLineTerminators(text) : text;
-      this.write(textToWrite);
+      this.write(submit && this.options.voiceKind === "codex-terminal" ? `\u001b[200~${normalizeTerminalPasteText(textToWrite)}\u001b[201~` : textToWrite);
       if (submit) {
         this.markBusy("Input submitted.");
         this.submit();

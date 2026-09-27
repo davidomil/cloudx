@@ -30,3 +30,43 @@ it("cancels native verification and reaps the launched candidate", async () => {
 it("requires an explicitly selected absolute CLI path", async () => {
   await expect(verifyCodexRuntime({ assistantBin: "codex" })).rejects.toThrow("absolute executable path");
 });
+
+it("retains private bounded phase evidence after a rejected launch without inheriting credentials", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-verification-diagnostics-"));
+  const output: string[] = [];
+  try {
+    await expect(verifyCodexRuntime({
+      assistantBin: "/bin/false",
+      env: { PATH: process.env.PATH, CLOUDX_CODEX_VERIFICATION_DIAGNOSTICS_DIR: directory, OPENAI_API_KEY: "must-not-be-retained" },
+      onOutput: text => output.push(text)
+    })).rejects.toThrow("did not save a selected conversation");
+    const files = await fs.readdir(directory);
+    expect(files).toHaveLength(1);
+    const file = path.join(directory, files[0]!);
+    const content = await fs.readFile(file, "utf8");
+    const diagnostic = JSON.parse(content);
+    expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+    expect(Buffer.byteLength(content)).toBeLessThan(16_384);
+    expect(content).not.toContain("must-not-be-retained");
+    expect(diagnostic).toMatchObject({
+      version: 1, phase: "launch", elapsedMs: expect.any(Number),
+      phases: [{ phase: "launch", elapsedMs: expect.any(Number) }],
+      providerRequests: { count: 0, purposes: [] }, transcriptEvents: [],
+      process: { exited: true }, error: { name: "Error" }, evidenceErrors: []
+    });
+    expect(output).toContain(`Private native verification diagnostics: ${file}\n`);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+}, 10_000);
+
+it("refuses to put private launch evidence in a public directory", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-public-verification-diagnostics-"));
+  const output: string[] = [];
+  try {
+    await fs.chmod(directory, 0o755);
+    await expect(verifyCodexRuntime({
+      assistantBin: "/bin/false", env: { PATH: process.env.PATH, CLOUDX_CODEX_VERIFICATION_DIAGNOSTICS_DIR: directory }, onOutput: text => output.push(text)
+    })).rejects.toThrow("did not save a selected conversation");
+    expect(await fs.readdir(directory)).toEqual([]);
+    expect(output).toContain("Private native verification diagnostics could not be saved.\n");
+  } finally { await fs.rm(directory, { recursive: true, force: true }); }
+}, 10_000);

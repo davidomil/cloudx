@@ -4527,6 +4527,40 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
+  it.each(["superseded_merge_identity", "pending_merge_identity"] as const)("keeps repeated %s results paused without coding, rebasing, or rerunning CI", async reason => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "failed", reason, url: `${f.change.url}/checks` };
+    f.change.requiresBaseUpdate = true;
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(reason === "superseded_merge_identity"
+      ? /superseded merge identity.*new identity.*Do not rerun the unchanged event/
+      : /GitHub is still computing.*confirmed merge metadata.*Do not change application code/) });
+    await f.poll();
+    await f.service.resume(f.issue.id, placement);
+    expect(f.currentIssue().status).toBe("paused");
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.checks = { state: "passed", url: `${f.change.url}/checks` };
+    f.change.requiresBaseUpdate = false;
+    f.change.mergeable = true;
+    await f.service.resume(f.issue.id, placement);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+  });
+
+  it.each(["superseded_merge_identity", "pending_merge_identity"] as const)("pauses %s before review feedback can start an application fix", async reason => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.checks = { state: "failed", reason, url: `${f.change.url}/checks` };
+    f.report({ kind: "review", headSha: f.change.headSha, event: "request_changes", body: "Inspect CI", comments: [{ body: "CI failed" }] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringContaining(reason === "superseded_merge_identity" ? "superseded merge identity" : "GitHub is still computing") });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+  });
+
   it("describes pending CI while preserving the completed approval", async () => {
     const f = await approvedIssue();
     f.change.checks = { state: "pending", url: "https://github.com/a/b/pull/7/checks" };

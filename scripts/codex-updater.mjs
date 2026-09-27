@@ -260,35 +260,24 @@ function runCommand(
     const directory = fs.mkdtempSync(
       path.join(os.tmpdir(), "cloudx-codex-command-"),
     );
-    const child = spawn(
-      "python3",
-      [
-        "-I",
-        "-S",
-        helper,
-        directory,
-        String(process.pid),
-        "null",
-        command,
-        ...args,
-      ],
-      {
-        env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      },
-    );
     let stdout = "";
     let stderr = "";
     let failure;
     let cleanupTimer;
     let stopping = false;
     let settled = false;
+    let completion;
+    let completionError;
+    let acknowledged = false;
+    let watcher;
+    let child;
+    let timer;
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(cleanupTimer);
+      if (error?.code !== "cleanup-incomplete") watcher?.close();
       signal?.removeEventListener("abort", cancel);
       if (error?.code !== "cleanup-incomplete") {
         try {
@@ -304,6 +293,10 @@ function runCommand(
       if (stopping || settled) return;
       stopping = true;
       failure ??= error;
+      if (!child) {
+        settle(supervisionUnavailable());
+        return;
+      }
       // Keep the subreaper alive to adopt and reap detached descendants.
       child.kill("SIGTERM");
       cleanupTimer = setTimeout(() => {
@@ -320,7 +313,61 @@ function runCommand(
           "The Codex update was cancelled before completion. Check the installed version before trying again.",
         ),
       );
-    const timer = setTimeout(
+    const acknowledgeCompletion = () => {
+      if (acknowledged || !fs.existsSync(path.join(directory, "complete.json")))
+        return;
+      acknowledged = true;
+      try {
+        completion = completedCommand(directory, child.pid);
+      } catch (error) {
+        completionError = error;
+      }
+      try {
+        const temporary = path.join(directory, "acknowledged.tmp");
+        fs.writeFileSync(temporary, JSON.stringify({ pid: child.pid }), {
+          mode: 0o600,
+        });
+        fs.renameSync(temporary, path.join(directory, "acknowledged.json"));
+      } catch {
+        stop(incompleteCleanupError());
+      }
+    };
+    try {
+      watcher = fs.watch(directory, acknowledgeCompletion);
+      watcher.on("error", () => stop(incompleteCleanupError()));
+      watcher.unref();
+    } catch {
+      settle(new CodexUpdateError(
+        "supervision-unavailable",
+        "Cannot observe Codex subprocess completion. Check filesystem watch limits and temporary directory access before updating.",
+      ));
+      return;
+    }
+    try {
+      child = spawn(
+        "python3",
+        [
+          "-I",
+          "-S",
+          helper,
+          directory,
+          String(process.pid),
+          "null",
+          command,
+          ...args,
+        ],
+        {
+          env,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+    } catch {
+      settle(supervisionUnavailable());
+      return;
+    }
+    acknowledgeCompletion();
+    timer = setTimeout(
       () =>
         stop(
           new CodexUpdateError(
@@ -364,6 +411,7 @@ function runCommand(
       failure ??= supervisionUnavailable();
     });
     child.on("close", (code, signal) => {
+      watcher?.close();
       if (settled) return;
       if (!child.pid) {
         settle(failure ?? supervisionUnavailable());
@@ -379,7 +427,10 @@ function runCommand(
       }
       let result;
       try {
-        result = completedCommand(directory, child.pid);
+        if (completionError) throw completionError;
+        if (!completion || fs.existsSync(directory))
+          throw incompleteCleanupError();
+        result = completion;
       } catch (error) {
         settle(error);
         return;

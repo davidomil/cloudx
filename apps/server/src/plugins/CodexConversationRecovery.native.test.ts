@@ -13,6 +13,7 @@ import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
+import { completedVerificationTurn } from "./CodexVerificationTranscript.js";
 import type { PluginSession } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcess, NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import { SessionStateStore } from "../workspace/SessionStateStore.js";
@@ -174,12 +175,14 @@ it.skipIf(!codexBinary).each([
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
   };
   const completeTurn = async (text: string) => {
-    const previous = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload.turn_id;
-    submit(text);
-    await expect.poll(async () => {
-      const completed = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload;
-      return completed?.turn_id !== previous ? completed : output;
-    }, { timeout: 10_000 }).toMatchObject({ type: "task_complete", last_agent_message: "The conversation is saved." });
+    await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    const firstNewEvent = (await readTranscript()).length;
+    const threadId = recovery.read()!.sessionId;
+    await terminal!.handleAction("enter_text", { text, submit: true });
+    await expect.poll(async () => completedVerificationTurn(
+      await readTranscript(), firstNewEvent, threadId, "The conversation is saved."
+    ), { timeout: 10_000 }).toMatchObject({ threadId, turnId: expect.any(String) });
+    await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
     return readTranscript();
   };
   try {
@@ -351,7 +354,8 @@ it.skipIf(!codexBinary).each([false, true])("verifies the updater's production t
     await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
     expect(evidence).toEqual([
       "Selected conversation saved before any model prompt.\n",
-      "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
+      "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n",
+      "Resumed Forge turn matched the selected thread, native completion and final shutdown.\n"
     ]);
   } finally {
     writeSpy?.mockRestore();

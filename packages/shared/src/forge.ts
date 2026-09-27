@@ -82,6 +82,7 @@ export interface ForgeChangeRequest extends ForgeChangeRequestSummary, ForgeChan
   checks?: {
     state: "passed" | "pending" | "failed" | "unknown";
     url: string;
+    reason?: "superseded_merge_identity" | "pending_merge_identity";
   };
   approved: boolean;
   unresolvedDiscussions: number;

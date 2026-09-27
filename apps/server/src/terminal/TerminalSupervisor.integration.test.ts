@@ -42,7 +42,8 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
     expect(result.stderr).toBe("");
     expect(await fs.readdir(directory)).toEqual(["error.json"]);
     expect(JSON.parse(await fs.readFile(path.join(directory, "error.json"), "utf8")))
-      .toEqual({ pid: result.pid, message: expect.stringContaining(message) });
+      .toEqual({ pid: result.pid, message: expect.stringContaining(message),
+        diagnostics: { phase: "error", errorType: "RuntimeError", errno: null, elapsedMs: expect.any(Number) } });
   });
 
   it.each(["alive", "exited"] as const)("stops a detached orphan when the command is %s, preserving an unrelated process", async (mode) => {
@@ -143,6 +144,83 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
       await stopChild(host);
       await stopRecordedProcesses(directory);
       if (supervisor) await stopProcess(supervisor);
+    }
+  });
+
+  it.each(["receipt-acknowledged", "parent-exited"])("keeps the receipt owner alive after command completion until %s", async (release) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-completion-race-"));
+    directories.push(directory);
+    const receipts = path.join(directory, "receipts");
+    const diagnostics = path.join(directory, "diagnostics");
+    const secret = "supervisor-private-command-and-environment";
+    await fs.mkdir(receipts, { mode: 0o700 });
+    const helper = fileURLToPath(new URL("../../helpers/terminal-supervisor.py", import.meta.url));
+    const host = spawn(process.execPath, ["-e", `
+      require('node:child_process').spawn('python3', ['-I', '-S', ${JSON.stringify(helper)}, ${JSON.stringify(receipts)}, String(process.pid), 'null', '/bin/echo', ${JSON.stringify(secret)}], {
+        stdio: 'ignore', env: { ...process.env, PRIVATE_TOKEN: ${JSON.stringify(secret)}, CLOUDX_TERMINAL_DIAGNOSTICS_DIR: ${JSON.stringify(diagnostics)} }
+      });
+      setInterval(() => {}, 1000);
+    `], { stdio: "ignore" });
+    let supervisor: ProcessIdentity | undefined;
+    try {
+      await waitUntil(async () => fs.access(path.join(receipts, "complete.json")).then(() => true, () => false));
+      const complete = JSON.parse(await fs.readFile(path.join(receipts, "complete.json"), "utf8"));
+      supervisor = await readProcess(complete.pid);
+      expect(supervisor).toMatchObject({ parent: host.pid });
+      expect(await isRunning(supervisor!)).toBe(true);
+      if (release === "parent-exited") await stopChild(host);
+      else {
+        await fs.writeFile(path.join(receipts, "acknowledged.tmp"), JSON.stringify({ pid: supervisor!.pid }));
+        await fs.rename(path.join(receipts, "acknowledged.tmp"), path.join(receipts, "acknowledged.json"));
+      }
+      await waitUntil(async () => !await isRunning(supervisor!));
+      await expect(fs.access(receipts)).rejects.toMatchObject({ code: "ENOENT" });
+      const retained = await fs.readdir(diagnostics);
+      expect(retained).toHaveLength(1);
+      const file = path.join(diagnostics, retained[0]!, "lifecycle.json");
+      const text = await fs.readFile(file, "utf8");
+      const evidence = JSON.parse(text);
+      expect(evidence).toMatchObject({ pid: supervisor!.pid, started: supervisor!.started, processGroup: expect.any(Number) });
+      expect(evidence.events.map((event: { phase: string }) => event.phase)).toEqual([
+        "ready", "command-launched", "children-reaped", "awaiting-receipt-acknowledgement", release, "removing-ephemeral-receipts", "ephemeral-receipts-removed"
+      ]);
+      expect(text).not.toContain(secret);
+      expect((await fs.stat(path.dirname(file))).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+    } finally {
+      await stopChild(host);
+      if (supervisor) await stopProcess(supervisor);
+    }
+  });
+
+  it("retains private failure evidence when completion acknowledgement identifies the wrong owner", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-acknowledgement-error-"));
+    directories.push(directory);
+    const receipts = path.join(directory, "receipts");
+    const diagnostics = path.join(directory, "diagnostics");
+    await fs.mkdir(receipts, { mode: 0o700 });
+    const helper = fileURLToPath(new URL("../../helpers/terminal-supervisor.py", import.meta.url));
+    const child = spawn("python3", ["-I", "-S", helper, receipts, String(process.pid), "null", "/bin/true"], {
+      stdio: "ignore", env: { ...process.env, CLOUDX_TERMINAL_DIAGNOSTICS_DIR: diagnostics }
+    });
+    const exited = new Promise<number | null>(resolve => child.once("exit", resolve));
+    try {
+      await waitUntil(async () => fs.access(path.join(receipts, "complete.json")).then(() => true, () => false));
+      await fs.writeFile(path.join(receipts, "acknowledged.tmp"), JSON.stringify({ pid: process.pid }));
+      await fs.rename(path.join(receipts, "acknowledged.tmp"), path.join(receipts, "acknowledged.json"));
+
+      expect(await exited).toBe(125);
+      expect(JSON.parse(await fs.readFile(path.join(receipts, "error.json"), "utf8"))).toEqual({
+        pid: child.pid, message: "Terminal completion acknowledgement does not match its owner",
+        diagnostics: { phase: "error", errorType: "RuntimeError", errno: null, elapsedMs: expect.any(Number) }
+      });
+      const retained = await fs.readdir(diagnostics);
+      expect(retained).toHaveLength(1);
+      const evidence = JSON.parse(await fs.readFile(path.join(diagnostics, retained[0]!, "lifecycle.json"), "utf8"));
+      expect(evidence.events.at(-1)).toMatchObject({ phase: "error", errorType: "RuntimeError", errno: null });
+      expect(evidence.events).not.toContainEqual(expect.objectContaining({ phase: "ephemeral-receipts-removed" }));
+    } finally {
+      await stopChild(child);
     }
   });
 

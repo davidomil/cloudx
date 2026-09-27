@@ -136,6 +136,13 @@ export async function runWorkerBridge(launch) {
     console.error(`CloudX native worker bridge: ${error.message}`);
     process.exit(1);
   };
+  const awaitVisibleExit = () => {
+    if (finishing) return;
+    if (turn && turn.turn?.status !== "completed")
+      throw new Error("Native visible client disconnected before its owned turn completed.");
+    finishing = true;
+    setTimeout(() => fail(new Error("Native visible client disconnected without exiting.")), 5_000);
+  };
   server.on("error", fail);
   server.on("connection", socket => {
     if (connected) { socket.close(); return; }
@@ -161,7 +168,12 @@ export async function runWorkerBridge(launch) {
           if (!line.trim()) continue;
           if (Buffer.byteLength(line) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
           const message = JSON.parse(line);
-          if (socket.readyState !== WebSocket.OPEN) throw new Error("Native worker emitted a message without its visible client.");
+          if (socket.readyState !== WebSocket.OPEN) {
+            // Closing the socket precedes TUI process exit. A completed turn may
+            // still have auxiliary title notifications queued in the backend.
+            awaitVisibleExit();
+            continue;
+          }
           if (socket.bufferedAmount > MAX_MESSAGE_BYTES) throw new Error("Native worker client cannot keep up with output.");
           permissions?.fromServer(message);
           selection?.fromServer(message);
@@ -172,6 +184,10 @@ export async function runWorkerBridge(launch) {
       } catch (error) { fail(error); }
     });
     socket.on("error", fail);
+    socket.on("close", () => {
+      try { awaitVisibleExit(); }
+      catch (error) { fail(error); }
+    });
     socket.on("message", data => {
       try {
         const message = JSON.parse(data.toString());

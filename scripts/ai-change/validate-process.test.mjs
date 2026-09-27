@@ -300,6 +300,51 @@ jobs:
     );
   });
 
+  it.each([
+    "token",
+    "target",
+    "output",
+    "stale artifact",
+    "diagnostics",
+    "superseded gate",
+    "pending gate",
+    "pending state",
+    "pending failure",
+    "aggregate",
+  ])("rejects missing merge reconciliation protection: %s", (scenario) => {
+    const workflow = parseDocument(
+      fs.readFileSync(".github/workflows/ci.yml", "utf8"),
+    ).toJS();
+    const identity = workflow.jobs.identity;
+    const record = identity.steps.find((step) => step.id === "record");
+    if (scenario === "token") delete record.env.GH_TOKEN;
+    if (scenario === "target") delete record.env.PULL_REQUEST_BASE_REF;
+    if (scenario === "output") delete identity.outputs;
+    if (scenario === "stale artifact")
+      delete identity.steps.find(
+        (step) => step.with?.name === "cloudx-ci-identity-v2",
+      ).if;
+    if (scenario === "diagnostics")
+      identity.steps = identity.steps.filter(
+        (step) => step.with?.path !== "ci-identity/reconciliation.json",
+      );
+    if (scenario === "superseded gate")
+      delete workflow.jobs["superseded-identity"];
+    if (scenario === "pending gate") delete workflow.jobs["pending-identity"];
+    if (scenario === "pending state")
+      workflow.jobs["pending-identity"].if = "always()";
+    if (scenario === "pending failure")
+      workflow.jobs["pending-identity"].steps = [{ run: "exit 0" }];
+    if (scenario === "aggregate") workflow.jobs.aggregate.steps = [];
+    const issues = [];
+    validateWorkflow(process.cwd(), "ci.yml", workflow, issues);
+    expect(issues).toContainEqual(
+      expect.stringMatching(
+        /test-merge identity artifact|reject superseded merge identities/,
+      ),
+    );
+  });
+
   it("fails closed when policy references a skill that is not synchronized", () => {
     const issues = [];
     validatePolicyReferences(

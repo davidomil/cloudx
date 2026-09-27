@@ -240,7 +240,7 @@ setInterval(() => {
 `;
       const originalKill = process.kill;
       const originalRead = fs.promises.readFile;
-      const originalNow = Date.now;
+      const originalNow = performance.now.bind(performance);
       let outcome;
       let processGroup;
       let kill;
@@ -262,7 +262,7 @@ setInterval(() => {
         processGroup = await recordedProcessGroup(pidFile);
         const descendantStat = `/proc/${fs.readFileSync(pidFile, "utf8")}/stat`;
         clock = vi
-          .spyOn(Date, "now")
+          .spyOn(performance, "now")
           .mockImplementation(() => originalNow() + clockOffset);
         kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
           if (
@@ -292,11 +292,23 @@ setInterval(() => {
           });
         fs.writeFileSync(exitFile, "");
 
-        expect(await outcome).toEqual(
+        const result = await outcome;
+        expect(result).toEqual(
           terminated
             ? { stdout: "", stderr: "", exitCode: 1 }
             : new Error("Gate B command runner failed."),
         );
+        if (!terminated) {
+          expect(result.cause).toMatchObject({
+            pid: processGroup,
+            processGroup,
+            started: expect.stringMatching(/^\d+$/u),
+          });
+          expect(result.cause.events).toContainEqual(
+            expect.objectContaining({ phase: "kill-deadline" }),
+          );
+          expect(JSON.stringify(result.cause)).not.toContain(secret);
+        }
         expect(snapshotDelivered).toBe(true);
         expect(await processGroupHasRunningMember(processGroup)).toBe(
           !terminated,
@@ -309,6 +321,94 @@ setInterval(() => {
         await outcome;
         if (processGroup) await terminateProcessGroup(processGroup);
         fs.rmSync(directory, { force: true, recursive: true });
+      }
+    },
+  );
+
+  it("stops inherited-pipe descendants on leader exit before the command deadline", async () => {
+    const directory = fs.mkdtempSync(
+      path.join(os.tmpdir(), "cloudx-gate-b-inherited-pipes-"),
+    );
+    const pidFile = path.join(directory, "descendant.pid");
+    const descendant = `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);`;
+    const leader = `const fs = require('node:fs'); require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: ['ignore', 'inherit', 'inherit'] }); setInterval(() => { if (fs.existsSync(${JSON.stringify(pidFile)})) process.exit(0); }, 5);`;
+    let processGroup;
+    try {
+      const run = gateBPublisher.runGateBCommandForDirectTest(
+        process.execPath,
+        ["-e", leader],
+        { timeoutMs: 30_000 },
+      );
+      processGroup = await recordedProcessGroup(pidFile);
+      expect(await run).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+      expect(await processGroupHasRunningMember(processGroup)).toBe(false);
+    } finally {
+      if (processGroup) await terminateProcessGroup(processGroup);
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["spawn", "output"])(
+    "retains bounded private lifecycle metadata without secrets after %s failure",
+    async (failure) => {
+      const directory = fs.mkdtempSync(
+        path.join(os.tmpdir(), "cloudx-gate-b-diagnostics-"),
+      );
+      const secret = "private-runner-token-should-not-be-recorded";
+      vi.stubEnv("CLOUDX_GATE_B_DIAGNOSTICS_DIR", directory);
+      try {
+        const command =
+          failure === "spawn" ? path.join(directory, secret) : process.execPath;
+        const args =
+          failure === "spawn"
+            ? [secret]
+            : [
+                "-e",
+                `process.stdout.write(${JSON.stringify(secret)}); process.stdout.write(Buffer.alloc(2 * 1024 * 1024));`,
+              ];
+        const result = await gateBPublisher.runGateBCommandForDirectTest(
+          command,
+          args,
+          { env: { GH_TOKEN: secret } },
+        );
+        expect(result).toEqual({ stdout: "", stderr: "", exitCode: 1 });
+        const files = fs.readdirSync(directory);
+        expect(files).toHaveLength(1);
+        const privateDirectory = path.join(directory, files[0]);
+        const file = path.join(privateDirectory, "lifecycle.json");
+        const text = fs.readFileSync(file, "utf8");
+        const diagnostic = JSON.parse(text);
+        expect(fs.statSync(privateDirectory).mode & 0o777).toBe(0o700);
+        expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+        expect(diagnostic.events).toContainEqual(
+          expect.objectContaining(
+            failure === "spawn"
+              ? { phase: "spawn-error", code: "ENOENT" }
+              : { phase: "stdout-limit" },
+          ),
+        );
+        if (failure === "output") {
+          expect(diagnostic).toMatchObject({
+            pid: expect.any(Number),
+            processGroup: diagnostic.pid,
+            started: expect.stringMatching(/^\d+$/u),
+          });
+          expect(diagnostic.events).toContainEqual(
+            expect.objectContaining({ phase: "exit" }),
+          );
+          expect(diagnostic.events.at(-1).phase).toBe("exhausted");
+        }
+        expect(diagnostic.events).toContainEqual(
+          expect.objectContaining({ phase: "close" }),
+        );
+        expect(diagnostic.events.length).toBeLessThanOrEqual(64);
+        expect(diagnostic.events.every((event) => event.elapsedMs >= 0)).toBe(
+          true,
+        );
+        expect(text).not.toContain(secret);
+      } finally {
+        vi.unstubAllEnvs();
+        fs.rmSync(directory, { recursive: true, force: true });
       }
     },
   );

@@ -1583,10 +1583,10 @@ async function defaultCommandRunner(command, args, options = {}) {
       "Gate B command runner timeout must be a positive integer.",
     );
   }
-  if (process.platform !== "linux") {
-    throw new Error("Gate B command runner failed.");
-  }
+  if (process.platform !== "linux")
+    throw new Error("Gate B command runner requires Linux.");
 
+  const diagnostics = new GateBCommandDiagnostics();
   let child;
   try {
     child = spawn(command, args, {
@@ -1595,68 +1595,84 @@ async function defaultCommandRunner(command, args, options = {}) {
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-  } catch {
+  } catch (error) {
+    diagnostics.record("spawn-error", { code: safeCommandErrorCode(error) });
+    diagnostics.retain();
     return failedCommandResult(encoding);
   }
-
+  diagnostics.identity(child.pid);
   const firstEvent = deferredGateBCommandEvent();
   const closed = deferredGateBCommandClose();
   let runnerFailed = false;
-  const requestStop = () => {
+  const requestStop = (phase, error) => {
+    diagnostics.record(phase, { code: safeCommandErrorCode(error) });
     if (runnerFailed) return;
     runnerFailed = true;
     firstEvent.resolve({ kind: "stop" });
   };
-  const stdout = boundedGateBCommandOutput(requestStop);
-  const stderr = boundedGateBCommandOutput(requestStop);
+  const stdout = boundedGateBCommandOutput(() => requestStop("stdout-limit"));
+  const stderr = boundedGateBCommandOutput(() => requestStop("stderr-limit"));
   child.stdout?.on("data", stdout.write);
   child.stderr?.on("data", stderr.write);
-  child.stdout?.once("error", requestStop);
-  child.stderr?.once("error", requestStop);
-  child.once("error", requestStop);
+  child.stdout?.once("error", (error) => requestStop("stdout-error", error));
+  child.stderr?.once("error", (error) => requestStop("stderr-error", error));
+  child.once("error", (error) => requestStop("spawn-error", error));
+  child.once("exit", (code, signal) => {
+    diagnostics.record("exit", { code, signal });
+    firstEvent.resolve({ kind: "exit" });
+  });
   child.once("close", (code, signal) => {
     const outcome = { code, signal };
+    diagnostics.record("close", outcome);
     closed.resolve(outcome);
     firstEvent.resolve({ kind: "close", outcome });
   });
 
   const processGroup = child.pid;
-  if (
-    !Number.isSafeInteger(processGroup) ||
-    processGroup < 2 ||
-    !child.stdout ||
-    !child.stderr
-  ) {
-    requestStop();
+  let timeout;
+  try {
+    if (
+      !Number.isSafeInteger(processGroup) ||
+      processGroup < 2 ||
+      !child.stdout ||
+      !child.stderr
+    ) {
+      requestStop("invalid-spawn");
+      if (
+        !(await settleGateBCommandClose(
+          closed.promise,
+          commandCloseSettlementMs,
+        ))
+      ) {
+        diagnostics.record("close-deadline");
+        throw new Error("Gate B command runner failed.");
+      }
+      return failedCommandResult(encoding);
+    }
+    timeout = setTimeout(() => requestStop("command-deadline"), timeoutMs);
+    timeout.unref();
+    const first = await firstEvent.promise;
+    if (first.kind !== "stop") {
+      // Exit does not imply close: descendants can retain the inherited pipes.
+      await settleGateBCommandClose(closed.promise, commandExitDrainMs);
+      if (await gateBProcessGroupHasRunningMember(processGroup, diagnostics)) {
+        requestStop("descendants-after-exit");
+        await terminateGateBProcessGroup(processGroup, diagnostics);
+      }
+    } else await terminateGateBProcessGroup(processGroup, diagnostics);
     const outcome = await settleGateBCommandClose(
       closed.promise,
       commandCloseSettlementMs,
     );
-    if (!outcome) throw new Error("Gate B command runner failed.");
-    return failedCommandResult(encoding);
-  }
-
-  const timeout = setTimeout(requestStop, timeoutMs);
-  timeout.unref();
-  try {
-    const first = await firstEvent.promise;
-    let outcome = first.kind === "close" ? first.outcome : undefined;
-    if (first.kind === "close") {
-      await gateBCommandDelay(commandExitDrainMs);
-      if (await gateBProcessGroupHasRunningMember(processGroup)) {
-        requestStop();
-        await terminateGateBProcessGroup(processGroup);
-      }
-    } else {
-      await terminateGateBProcessGroup(processGroup);
-    }
-    outcome ??= await settleGateBCommandClose(
-      closed.promise,
-      commandCloseSettlementMs,
-    );
-    if (!outcome || (await gateBProcessGroupHasRunningMember(processGroup))) {
+    if (!outcome) {
+      diagnostics.record("close-deadline");
       throw new Error("Gate B command runner failed.");
     }
+    if (await gateBProcessGroupHasRunningMember(processGroup, diagnostics)) {
+      diagnostics.record("group-not-exhausted");
+      throw new Error("Gate B command runner failed.");
+    }
+    diagnostics.record("exhausted");
     if (runnerFailed) return failedCommandResult(encoding);
     return {
       stdout: commandOutputValue(stdout.value(), encoding),
@@ -1668,11 +1684,76 @@ async function defaultCommandRunner(command, args, options = {}) {
             ? 128
             : 1,
     };
-  } catch {
-    throw new Error("Gate B command runner failed.");
+  } catch (error) {
+    runnerFailed = true;
+    diagnostics.record("runner-error", { code: safeCommandErrorCode(error) });
+    // The public message stays credential-free; the cause contains only selected metadata.
+    throw new Error("Gate B command runner failed.", {
+      cause: diagnostics.snapshot(),
+    });
   } finally {
     clearTimeout(timeout);
+    if (runnerFailed) diagnostics.retain();
   }
+}
+
+class GateBCommandDiagnostics {
+  started = performance.now();
+  events = [];
+  process = {};
+  identity(pid) {
+    if (!Number.isSafeInteger(pid)) return;
+    this.process = { pid, processGroup: pid };
+    try {
+      const fields = fs
+        .readFileSync(`/proc/${pid}/stat`, "utf8")
+        .split(") ")
+        .at(-1)
+        .split(" ");
+      this.process.started = fields[19];
+    } catch (error) {
+      this.record("identity-unavailable", {
+        code: safeCommandErrorCode(error),
+      });
+    }
+    this.record("spawn");
+  }
+  record(phase, data = {}) {
+    this.events.push({
+      phase,
+      elapsedMs: Math.round(performance.now() - this.started),
+      ...data,
+    });
+    if (this.events.length > 64) this.events.splice(1, 1);
+  }
+  snapshot() {
+    return { ...this.process, events: [...this.events] };
+  }
+  retain() {
+    const parent = process.env.CLOUDX_GATE_B_DIAGNOSTICS_DIR ?? os.tmpdir();
+    try {
+      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+      const directory = fs.mkdtempSync(
+        path.join(parent, "cloudx-gate-b-failure-"),
+      );
+      fs.writeFileSync(
+        path.join(directory, "lifecycle.json"),
+        JSON.stringify(this.snapshot()),
+        { mode: 0o600, flag: "wx" },
+      );
+    } catch (error) {
+      this.record("diagnostic-write-error", {
+        code: safeCommandErrorCode(error),
+      });
+    }
+  }
+}
+
+function safeCommandErrorCode(error) {
+  return typeof error?.code === "string" &&
+    /^E[A-Z0-9_]{1,30}$/u.test(error.code)
+    ? error.code
+    : undefined;
 }
 
 function boundedGateBCommandOutput(stop) {
@@ -1706,15 +1787,29 @@ function failedCommandResult(encoding) {
   return { stdout: empty, stderr: empty, exitCode: 1 };
 }
 
-async function terminateGateBProcessGroup(processGroup) {
-  if (!(await gateBProcessGroupHasRunningMember(processGroup))) return;
-  signalGateBProcessGroup(processGroup, "SIGTERM");
-  if (await waitForGateBProcessGroup(processGroup, commandTerminationGraceMs))
+async function terminateGateBProcessGroup(processGroup, diagnostics) {
+  if (!(await gateBProcessGroupHasRunningMember(processGroup, diagnostics)))
     return;
+  diagnostics.record("terminate");
+  signalGateBProcessGroup(processGroup, "SIGTERM");
+  if (
+    await waitForGateBProcessGroup(
+      processGroup,
+      commandTerminationGraceMs,
+      diagnostics,
+    )
+  )
+    return;
+  diagnostics.record("kill");
   signalGateBProcessGroup(processGroup, "SIGKILL");
   if (
-    !(await waitForGateBProcessGroup(processGroup, commandKillSettlementMs))
+    !(await waitForGateBProcessGroup(
+      processGroup,
+      commandKillSettlementMs,
+      diagnostics,
+    ))
   ) {
+    diagnostics.record("kill-deadline");
     throw new Error("Gate B command runner failed.");
   }
 }
@@ -1723,38 +1818,64 @@ function signalGateBProcessGroup(processGroup, signal) {
   try {
     process.kill(-processGroup, signal);
   } catch (error) {
-    if (error?.code !== "ESRCH")
-      throw new Error("Gate B command runner failed.");
+    if (error?.code !== "ESRCH") throw error;
   }
 }
 
-async function waitForGateBProcessGroup(processGroup, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (await gateBProcessGroupHasRunningMember(processGroup)) {
-    if (Date.now() >= deadline) {
+async function waitForGateBProcessGroup(processGroup, timeoutMs, diagnostics) {
+  const deadline = performance.now() + timeoutMs;
+  while (await gateBProcessGroupHasRunningMember(processGroup, diagnostics)) {
+    if (performance.now() >= deadline) {
       // An asynchronous /proc read may have captured the state before exit.
-      return !(await gateBProcessGroupHasRunningMember(processGroup));
+      return !(await gateBProcessGroupHasRunningMember(
+        processGroup,
+        diagnostics,
+      ));
     }
     await gateBCommandDelay(commandPollMs);
   }
   return true;
 }
 
-async function gateBProcessGroupHasRunningMember(processGroup) {
-  const entries = await fs.promises.readdir("/proc", { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !/^\d+$/u.test(entry.name)) continue;
-    const stat = await fs.promises
-      .readFile(`/proc/${entry.name}/stat`, "utf8")
-      .catch(() => undefined);
-    if (!stat) continue;
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    if (
-      Number(fields[2]) === processGroup &&
-      fields[0] !== "Z" &&
-      fields[0] !== "X"
-    )
+async function gateBProcessGroupHasRunningMember(processGroup, diagnostics) {
+  try {
+    process.kill(-processGroup, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+  const entries = (
+    await fs.promises.readdir("/proc", { withFileTypes: true })
+  ).filter((entry) => entry.isDirectory() && /^\d+$/u.test(entry.name));
+  for (let offset = 0; offset < entries.length; offset += 32) {
+    const members = await Promise.all(
+      entries.slice(offset, offset + 32).map(async (entry) => {
+        let stat;
+        try {
+          stat = await fs.promises.readFile(`/proc/${entry.name}/stat`, "utf8");
+        } catch (error) {
+          if (["ENOENT", "ESRCH"].includes(error?.code)) return undefined;
+          throw error;
+        }
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        if (
+          Number(fields[2]) !== processGroup ||
+          ["Z", "X"].includes(fields[0])
+        )
+          return undefined;
+        return {
+          pid: Number(entry.name),
+          started: fields[19],
+          state: fields[0],
+          processGroup,
+        };
+      }),
+    );
+    const outstanding = members.filter(Boolean);
+    if (outstanding.length) {
+      diagnostics?.record("outstanding", { members: outstanding });
       return true;
+    }
   }
   return false;
 }

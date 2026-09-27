@@ -51,3 +51,6 @@ REVIEW_TRACKING.md
 
 # Previous generated runtimes retained by the managed updater until recovery is no longer needed.
 *.cloudx-previous-*
+
+.vitest-reports/
+blob-report/

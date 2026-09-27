@@ -1491,6 +1491,14 @@ export class ForgeWorkflowService {
     requirePublicationRequest(worker, change);
     if (change.headSha !== worker.headSha)
       throw new Error("The request head changed outside this issue loop. Inspect the published work before resuming.");
+    if (change.checks?.reason === "superseded_merge_identity") {
+      await this.pauseForSupersededMergeIdentity(worker, change);
+      return;
+    }
+    if (change.checks?.reason === "pending_merge_identity") {
+      await this.pauseAutoReview(worker, `GitHub is still computing the test merge identity. Inspect ${change.checks.url}, wait for confirmed merge metadata and run CI for that identity, then Resume the issue loop. Do not change application code.`);
+      return;
+    }
     const issue = await this.observeProvider(worker, "getIssue", () => provider.getIssue(worker.number));
     signal?.throwIfAborted();
     if (issue.number !== worker.number || issue.state !== "open")
@@ -1674,6 +1682,9 @@ export class ForgeWorkflowService {
       change.checks?.state === "failed" ? `CI checks failed. Inspect ${change.checks.url}, resolve the failure, then Resume the issue loop.` :
       `Waiting for the provider's merge requirements. Inspect ${worker.changeUrl ?? change.url}.`;
     await this.persist();
+  }
+  private async pauseForSupersededMergeIdentity(worker: ForgeWorker, change: ForgeChangeRequest): Promise<void> {
+    await this.pauseAutoReview(worker, `CI tested a superseded merge identity. Inspect ${change.checks!.url}, refresh the pull request test merge and run CI for its new identity, then Resume the issue loop. Do not rerun the unchanged event or change application code.`);
   }
   private async mergePublishedIssue(worker: ForgeWorker, provider: ForgeProvider): Promise<void> {
     if (worker.mergeAttempted)

@@ -39,7 +39,7 @@ RUN UV_PROJECT_ENVIRONMENT=/opt/cloudx-asr \
     && UV_PROJECT_ENVIRONMENT=/opt/cloudx-documentation \
       uv sync --project /opt/cloudx-services/documentation-indexer --locked --extra dev --no-editable
 
-COPY containers/ci/run.mjs containers/ci/diagnostics.mjs containers/ci/attestation.test.mjs containers/ci/diagnostics.test.mjs /opt/cloudx-ci/
+COPY containers/ci/run.mjs containers/ci/lanes.mjs containers/ci/reports.mjs containers/ci/diagnostics.mjs containers/ci/attestation.test.mjs containers/ci/diagnostics.test.mjs /opt/cloudx-ci/
 
 RUN groupadd --gid 10001 cloudx-ci-candidate \
     && useradd --no-create-home --uid 10001 --gid 10001 \

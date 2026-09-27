@@ -296,6 +296,56 @@ if (process.argv.includes('app-server')) {
   } finally { await terminal.terminate(); }
 }, 10_000);
 
+it.each([
+  { completion: "completed", exitCode: 0, expectedCode: 0, waitForExit: true },
+  { completion: "completed", exitCode: 7, expectedCode: 7, waitForExit: true },
+  { completion: "running", exitCode: 0, expectedCode: 1, waitForExit: true },
+  { completion: "completed", exitCode: 0, expectedCode: 1, waitForExit: false }
+])("keeps the visible exit authoritative after socket close: $completion, exit $exitCode, exits $waitForExit", async ({ completion, exitCode, expectedCode, waitForExit }) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-close-order-"));
+  directories.push(directory);
+  const command = path.join(directory, "codex.mjs");
+  const receiptPath = path.join(directory, "turn.json");
+  const closedPath = path.join(directory, "visible-closed");
+  const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+import WebSocket from ${JSON.stringify(ws)};
+if (process.argv.includes('app-server')) {
+  const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+  readline.createInterface({ input: process.stdin }).on('line', () => {
+    send(${JSON.stringify(response)});
+    ${completion === "completed" ? `send(${JSON.stringify(complete())});` : ""}
+    // The backend remains active after the client closes its socket, before TUI exit.
+    setInterval(() => {
+      if (fs.existsSync(${JSON.stringify(closedPath)}))
+        send({ method: 'thread/name/updated', params: { threadId: 'thread', threadName: 'Late title' } });
+    }, 10);
+  });
+} else {
+  const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
+  socket.on('open', () => socket.send(JSON.stringify(${JSON.stringify(start)})));
+  socket.on('message', data => {
+    const message = JSON.parse(data.toString());
+    if (${completion === "completed" ? "message.method === 'turn/completed'" : "message.id === 4"}) socket.close();
+  });
+  socket.on('close', () => {
+    fs.writeFileSync(${JSON.stringify(closedPath)}, 'closed');
+    ${waitForExit ? `setTimeout(() => process.exit(${exitCode}), 200);` : "setInterval(() => {}, 1000);"}
+  });
+}
+`, { mode: 0o755 });
+  const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
+    binding: { ...binding, receiptPath }, command, serverArgs: ["app-server"], tuiArgs: []
+  })], { cwd: directory, env: process.env, cols: 100, rows: 30 });
+  try {
+    const exit = await new Promise<TerminalExit>(resolve => terminal.onExit(resolve));
+    expect(exit.exitCode).toBe(expectedCode);
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8")).status).toBe(completion);
+  } finally { await terminal.terminate(); }
+}, 10_000);
+
 it.each(["before worker start", "before worker reply", "during worker turn", "after worker completion"].flatMap(timing =>
   ["system", "thread_title"].map(threadSource => ({ timing, threadSource }))
 ))("keeps $threadSource title generation separate $timing", ({ timing, threadSource }) => {
@@ -500,7 +550,7 @@ it.each(["signalled exit", "cancellation before exit", "cancellation during clea
   const session = new CodexTerminalSession(tab, terminal, undefined, { closeOnExit: false, nativeTurn });
   const finish = Promise.resolve(session.handleAction("finish", { threadId: "thread", turnId: "turn" }));
   const rejection = expect(finish).rejects.toThrow(scenario === "signalled exit" ? "signal 15" : "cancelled");
-  await vi.waitFor(() => expect(terminal.write).toHaveBeenCalledWith("\u0015/quit"));
+  await vi.waitFor(() => expect(terminal.write).toHaveBeenCalledWith("\u0015\u001b[200~/quit\u001b[201~"));
   if (scenario === "signalled exit") exit({ exitCode: 0, signal: 15 });
   else {
     if (scenario === "cancellation during cleanup") {

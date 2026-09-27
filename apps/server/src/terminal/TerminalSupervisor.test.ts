@@ -80,6 +80,8 @@ describe("TerminalSupervisor ownership receipts", () => {
   it("accepts completed ownership when the command exits before startup is observed", async () => {
     const fixture = await supervisorFixture();
     await fixture.receipt("complete", { pid: process.pid, exitCode: 23 });
+    await fixture.acknowledged();
+    await fs.rm(fixture.directory, { recursive: true });
     fixture.exit();
 
     await expect(fixture.supervisor.ready()).resolves.toBeUndefined();
@@ -117,6 +119,29 @@ describe("TerminalSupervisor ownership receipts", () => {
     expect(await fixture.supervisor.completion).toMatchObject({ event: { exitCode: 125 }, error: expect.any(Error) });
   });
 
+  it("rejects successful completion when the helper leaves its acknowledged directory behind", async () => {
+    const fixture = await supervisorFixture();
+    await fixture.receipt("complete", { pid: process.pid, exitCode: 0 });
+    await fixture.acknowledged();
+    fixture.exit();
+
+    await expect(fixture.supervisor.terminate()).rejects.toMatchObject({
+      message: "Terminal supervisor exited before removing its ephemeral receipt directory.",
+      cause: expect.objectContaining({ pid: process.pid, phase: "receipt-cleanup" })
+    });
+    await expect(fs.access(fixture.directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("acknowledges rejected evidence for cleanup without accepting the command", async () => {
+    const fixture = await supervisorFixture();
+    await fixture.receipt("complete", { pid: process.pid, exitCode: -1 });
+    await fixture.acknowledged();
+    await fs.rm(fixture.directory, { recursive: true });
+    fixture.exit();
+
+    await expect(fixture.supervisor.terminate()).rejects.toThrow("without confirming its descendants stopped");
+  });
+
   it("refuses startup evidence from a different process", async () => {
     const fixture = await supervisorFixture();
     await fixture.receipt("ready", { pid: 2_147_483_647 });
@@ -144,6 +169,8 @@ describe("TerminalSupervisor ownership receipts", () => {
     await vi.advanceTimersByTimeAsync(5_000);
     await stopped;
     await fixture.receipt("complete", { pid: process.pid, exitCode: 0 });
+    await fixture.acknowledged();
+    await fs.rm(fixture.directory, { recursive: true });
     fixture.exit();
 
     await expect(fixture.supervisor.terminate()).resolves.toBeUndefined();
@@ -163,6 +190,8 @@ describe("TerminalSupervisor ownership receipts", () => {
     expect(fixture.supervisor.terminate()).toBe(second);
     expect(fixture.native.kill).toHaveBeenCalledTimes(2);
     await fixture.receipt("complete", { pid: process.pid, exitCode: 0 });
+    await fixture.acknowledged();
+    await fs.rm(fixture.directory, { recursive: true });
     fixture.exit();
     await expect(second).resolves.toBeUndefined();
   });
@@ -186,6 +215,22 @@ async function supervisorFixture(durable = false) {
   const supervisor = new TerminalSupervisor(native as unknown as IPty, directory, durable ? execution : undefined);
   return {
     directory, native, supervisor, identity, exit: () => exit(),
-    receipt: (name: string, value: unknown) => fs.writeFile(path.join(directory, `${name}.json`), JSON.stringify(value))
+    receipt: async (name: string, value: unknown) => {
+      await fs.writeFile(path.join(directory, `${name}.tmp`), JSON.stringify(value));
+      await fs.rename(path.join(directory, `${name}.tmp`), path.join(directory, `${name}.json`));
+    },
+    acknowledged: async () => {
+      // Await real filesystem I/O even in tests controlling the shutdown clock.
+      for (let checks = 0; checks < 1_000; checks += 1) {
+        const receipt = await fs.readFile(path.join(directory, "acknowledged.json"), "utf8").catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+        if (receipt) {
+          expect(JSON.parse(receipt)).toEqual({ pid: native.pid });
+          return;
+        }
+      }
+      throw new Error("Terminal completion was not acknowledged");
+    }
   };
 }

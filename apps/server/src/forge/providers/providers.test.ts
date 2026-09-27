@@ -162,6 +162,7 @@ function hubFixture(
     rules?: unknown[];
     classicRule?: unknown;
     rulesets?: Record<number, Record<string, unknown>>;
+    checks?: unknown[];
     intercept?: Handler;
   } = {},
 ) {
@@ -174,6 +175,7 @@ function hubFixture(
       return response(overrides.rules ?? []);
     if (path.startsWith("/repos/owner/repo/rulesets/"))
       return response(overrides.rulesets?.[Number(path.split("/").at(-1))] ?? {});
+    if (path.endsWith("/check-runs")) return response({ check_runs: overrides.checks ?? [] });
     if (options.method === "PUT" && path.endsWith("/merge"))
       return response({ merged: true, sha: "c".repeat(40) });
     if (path === "/graphql")
@@ -1077,6 +1079,44 @@ describe("conflict target revision snapshots", () => {
 });
 
 describe("GitHub review and exact-commit merge", () => {
+  it.each([
+    ["trusted current failure", {}, "superseded_merge_identity"],
+    ["trusted pending identity failure", { name: "Pending merge identity" }, "pending_merge_identity"],
+    ["pending identity on a different head", { name: "Pending merge identity", head_sha: previousSha }, undefined],
+    ["pending identity from another app", { name: "Pending merge identity", app: { slug: "other-app", owner: { login: "github" } } }, undefined],
+    ["pending identity from another owner", { name: "Pending merge identity", app: { slug: "github-actions", owner: { login: "untrusted" } } }, undefined],
+    ["successful pending identity check", { name: "Pending merge identity", conclusion: "success" }, undefined],
+    ["unfinished pending identity check", { name: "Pending merge identity", status: "in_progress" }, undefined],
+    ["different head", { head_sha: previousSha }, undefined],
+    ["pending check", { status: "in_progress" }, undefined],
+    ["successful check", { conclusion: "success" }, undefined],
+    ["another name", { name: "Application checks" }, undefined],
+    ["another app", { app: { slug: "other-app", owner: { login: "github" } } }, undefined],
+    ["another owner", { app: { slug: "github-actions", owner: { login: "untrusted" } } }, undefined],
+  ])("classifies merge identity recovery only for a %s", async (_name, changes, reason) => {
+    const { provider, calls } = hubFixture({
+      graphql: { mergeStateStatus: "BLOCKED", headRef: { target: { oid: headSha, statusCheckRollup: { state: "FAILURE" } } } },
+      checks: [{ name: "Superseded merge identity", head_sha: headSha, status: "completed", conclusion: "failure", app: { slug: "github-actions", owner: { login: "github" } }, ...changes }],
+    });
+    const change = await provider.getChangeRequest(7);
+    expect(change.checks?.state).toBe("failed");
+    expect(change.checks?.reason).toBe(reason);
+    const checks = calls.filter(call => call.url.pathname.endsWith("/check-runs"));
+    expect(checks).toHaveLength(reason === "superseded_merge_identity" ? 1 : 2);
+    expect(checks[0].url.pathname).toBe(`/repos/owner/repo/commits/${headSha}/check-runs`);
+    expect(checks[0].url.searchParams.get("check_name")).toBe("Superseded merge identity");
+    expect(checks[0].url.searchParams.get("filter")).toBe("latest");
+    if (checks.length === 2) expect(checks[1].url.searchParams.get("check_name")).toBe("Pending merge identity");
+  });
+
+  it("rejects incomplete merge identity check evidence", async () => {
+    const base = hubFixture({ graphql: { headRef: { target: { oid: headSha, statusCheckRollup: { state: "FAILURE" } } } } });
+    const { provider } = harness(github, (url, options) => url.pathname.endsWith("/check-runs")
+      ? new Response(JSON.stringify({ check_runs: [] }), { headers: { link: '<https://api.github.com/next>; rel="next"' } })
+      : base.fetcher(url, options));
+    await expect(provider.getChangeRequest(7)).rejects.toThrow("merge identity check results are incomplete");
+  });
+
   it.each([
     ["SUCCESS", "passed"], ["PENDING", "pending"], ["EXPECTED", "pending"],
     ["FAILURE", "failed"], ["ERROR", "failed"],

@@ -116,6 +116,14 @@ else if (['timeout', 'cancel', 'escaped-child', 'escaped-silent', 'lost-owner', 
   const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
   manifest.version = mode === 'wrong-version' ? '1.0.1' : '1.1.0';
   fs.writeFileSync(file, JSON.stringify(manifest));
+  if (mode === 'escaped-success') {
+    const descendant = spawn(process.execPath, ['-e', 'const fs = require("node:fs"); fs.appendFileSync(process.env.TEST_WRITES, "x"); setInterval(() => fs.appendFileSync(process.env.TEST_WRITES, "x"), 10)'], {detached: true, stdio: 'ignore'});
+    fs.writeFileSync(process.env.TEST_CHILD, String(descendant.pid));
+    descendant.unref();
+    const written = setInterval(() => {
+      if (fs.existsSync(process.env.TEST_WRITES)) clearInterval(written);
+    }, 10);
+  }
 }
 `,
     { mode: 0o755 },
@@ -159,6 +167,115 @@ function replaceSupervisorInterpreter(fixture, source) {
 }
 
 describe("shared Codex update", () => {
+  it("acknowledges version completion before the supervisor exits and removes its receipts", async () => {
+    const fixture = installation();
+    const diagnostics = path.join(fixture.root, "diagnostics");
+    fixture.env.CLOUDX_TERMINAL_DIAGNOSTICS_DIR = diagnostics;
+
+    await expect(readCodexVersion(fixture.assistantBin, fixture)).resolves.toBe("1.0.0");
+
+    const launch = childProcess.spawn.mock.calls.find(([, args]) => args[2]?.endsWith("terminal-supervisor.py"));
+    expect(launch).toBeDefined();
+    expect(fs.existsSync(launch[1][3])).toBe(false);
+    const retained = fs.readdirSync(diagnostics);
+    expect(retained).toHaveLength(1);
+    const evidence = JSON.parse(fs.readFileSync(path.join(diagnostics, retained[0], "lifecycle.json"), "utf8"));
+    expect(evidence.events).toContainEqual(expect.objectContaining({ phase: "receipt-acknowledged" }));
+    expect(evidence.events.at(-1).phase).toBe("ephemeral-receipts-removed");
+    expect(fs.existsSync(`/proc/${evidence.pid}`)).toBe(false);
+  });
+
+  it("does not launch npm installation when its receipt watcher cannot be created", async () => {
+    const fixture = installation({ mode: "escaped-silent" });
+    const watch = fs.watch;
+    const directories = [];
+    vi.spyOn(fs, "watch").mockImplementation((directory, listener) => {
+      directories.push(directory);
+      if (directories.length === 3)
+        throw Object.assign(new Error("ENOSPC private watcher path"), { code: "ENOSPC" });
+      return watch(directory, listener);
+    });
+
+    try {
+      await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+        code: "supervision-unavailable",
+        usableVersion: "1.0.0",
+        message: expect.stringContaining("filesystem watch limits"),
+      });
+      expect(commands(fixture)).toEqual([["view", "@openai/codex@latest", "version", "--json"]]);
+      expect(fs.existsSync(fixture.env.TEST_CHILD)).toBe(false);
+      expect(fs.existsSync(fixture.env.TEST_WRITES)).toBe(false);
+      expect(directories).toHaveLength(4);
+      for (const directory of directories) expect(fs.existsSync(directory)).toBe(false);
+      const release = acquireCodexInstallationLock(fixture.prefix);
+      release();
+    } finally {
+      await finishFixtureSupervisors();
+    }
+  });
+
+  it("stops an installation writer and retains its lock when receipt observation fails", async () => {
+    const fixture = installation({ mode: "escaped-silent" });
+    const watch = fs.watch;
+    const watchers = [];
+    vi.spyOn(fs, "watch").mockImplementation((directory, listener) => {
+      const watcher = watch(directory, listener);
+      watchers.push({ directory, watcher });
+      return watcher;
+    });
+    const result = updateCodexInstallation(fixture).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(0));
+      expect(watchers).toHaveLength(3);
+      const installationWatcher = watchers[2];
+      installationWatcher.watcher.close();
+      installationWatcher.watcher.emit("error", new Error("private observation failure"));
+
+      expect(await result).toMatchObject({
+        code: "cleanup-incomplete",
+        message: expect.not.stringContaining("private observation failure"),
+      });
+      const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+      expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+      const bytes = fs.statSync(fixture.env.TEST_WRITES).size;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(fs.statSync(fixture.env.TEST_WRITES).size).toBe(bytes);
+      expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(/Another CloudX installer/);
+      expect(fs.existsSync(path.join(installationWatcher.directory, "complete.json"))).toBe(true);
+    } finally {
+      await finishFixtureSupervisors();
+      await result;
+      for (const { directory } of watchers) expect(fs.existsSync(directory)).toBe(false);
+    }
+  });
+
+  it("completes updates and reaps detached writers when receipt notifications omit filenames", async () => {
+    const fixture = installation({ mode: "escaped-success" });
+    const watch = fs.watch;
+    const directories = [];
+    vi.spyOn(fs, "watch").mockImplementation((directory, listener) => {
+      directories.push(directory);
+      return watch(directory, event => listener(event, null));
+    });
+
+    try {
+      await expect(updateCodexInstallation({ ...fixture, timeoutMs: 3_000 })).resolves.toMatchObject({
+        outcome: "updated",
+        installedVersion: "1.1.0",
+      });
+      const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+      expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(0);
+      expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+      for (const directory of directories) expect(fs.existsSync(directory)).toBe(false);
+      const release = acquireCodexInstallationLock(fixture.prefix);
+      release();
+      fs.rmSync(fixture.root, { recursive: true });
+      expect(fs.existsSync(fixture.root)).toBe(false);
+    } finally {
+      await finishFixtureSupervisors();
+    }
+  });
+
   it("updates the selected npm prefix and verifies the resulting executable", async () => {
     const fixture = installation();
     const stages = [];
@@ -676,5 +793,19 @@ function stopEscapedFixture(fixture) {
     process.kill(-pid, "SIGKILL");
   } catch (error) {
     if (error.code !== "ESRCH") throw error;
+  }
+}
+
+async function finishFixtureSupervisors() {
+  for (const [index, [, args]] of childProcess.spawn.mock.calls.entries()) {
+    if (!args[2]?.endsWith("terminal-supervisor.py")) continue;
+    const child = childProcess.spawn.mock.results[index].value;
+    if (!child?.pid || !fs.existsSync(`/proc/${child.pid}`)) continue;
+    const directory = args[3];
+    child.kill("SIGTERM");
+    await vi.waitFor(() => expect(fs.existsSync(path.join(directory, "complete.json"))).toBe(true));
+    fs.writeFileSync(path.join(directory, "acknowledged.json"), JSON.stringify({ pid: child.pid }));
+    await vi.waitFor(() => expect(fs.existsSync(`/proc/${child.pid}`)).toBe(false));
+    expect(fs.existsSync(directory)).toBe(false);
   }
 }

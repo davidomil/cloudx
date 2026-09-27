@@ -1813,9 +1813,9 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
       );
     }
   }
-  const verifier = jobs["isolated-verifier"];
+  const verifier = jobs["isolated-lanes"];
   if (!isRecord(verifier)) {
-    issues.push(`Workflow '${workflowName}' must define isolated-verifier.`);
+    issues.push(`Workflow '${workflowName}' must define isolated-lanes.`);
     return issues;
   }
   const steps = Array.isArray(verifier.steps)
@@ -1839,8 +1839,12 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
   if (
     !controller ||
     !source ||
-    !commands.includes(
-      "--file controller/containers/ci/Dockerfile controller",
+    !steps.some(
+      (step) =>
+        step.uses?.startsWith("docker/build-push-action@") &&
+        step.with?.context === "controller" &&
+        step.with?.file === "controller/containers/ci/Dockerfile" &&
+        step.with?.load === true,
     ) ||
     !commands.includes("/source:/source:ro") ||
     !commands.includes("results.json:/results/results.json:rw") ||
@@ -1872,6 +1876,34 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
       `Workflow '${workflowName}' isolated verifier must use a reaping init and the exact bounded no-network runtime with no-exec temporary storage and an executable candidate workspace.`,
     );
   }
+  const requiredLanes = [
+    "coverage-1",
+    "coverage-2",
+    "coverage-3",
+    "coverage-4",
+    "static",
+    "asr",
+    "documentation",
+    "browser-1",
+    "browser-2",
+  ];
+  if (
+    JSON.stringify(verifier.strategy?.matrix?.lane) !==
+      JSON.stringify(requiredLanes) ||
+    verifier.strategy?.["fail-fast"] !== false ||
+    !commands.includes('"${{ matrix.lane }}" "${{ github.sha }}"') ||
+    !normalizedNeeds(jobs["coverage-merge"] ?? {}).includes("isolated-lanes") ||
+    !jobCommands(jobs["coverage-merge"] ?? {}).includes("aggregate.mjs") ||
+    !jobCommands(jobs["coverage-merge"] ?? {}).includes("coverage-merge") ||
+    !normalizedNeeds(jobs["isolated-verifier"] ?? {}).includes(
+      "coverage-merge",
+    ) ||
+    !jobCommands(jobs["isolated-verifier"] ?? {}).includes("aggregate.mjs")
+  ) {
+    issues.push(
+      `Workflow '${workflowName}' must require every isolated lane and merged coverage evidence.`,
+    );
+  }
   const identity = jobs.identity;
   const identityCommands = isRecord(identity) ? jobCommands(identity) : "";
   const identitySteps =
@@ -1883,6 +1915,7 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
       typeof step.uses === "string" &&
       step.uses.startsWith("actions/checkout@"),
   );
+  const recordIdentity = identitySteps.find((step) => step.id === "record");
   if (
     !isRecord(identity) ||
     !identityCheckouts.some(
@@ -1898,15 +1931,55 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
         step.with?.["fetch-depth"] === 2,
     ) ||
     !identityCommands.includes("check-identity.mjs create-ci-artifact") ||
+    identity.permissions?.["pull-requests"] !== "read" ||
+    identity.outputs?.["identity-state"] !==
+      "${{ steps.record.outputs.identity-state }}" ||
+    recordIdentity?.env?.GH_TOKEN !== "${{ github.token }}" ||
+    recordIdentity?.env?.PULL_REQUEST_BASE_REF !==
+      "${{ github.event.pull_request.base.ref }}" ||
+    recordIdentity?.env?.PULL_REQUEST_BASE_REPOSITORY !==
+      "${{ github.event.pull_request.base.repo.full_name }}" ||
+    recordIdentity?.env?.CI_RECONCILIATION_OUTPUT !==
+      "../ci-identity/reconciliation.json" ||
     !identitySteps.some(
       (step) =>
         typeof step.uses === "string" &&
         step.uses.startsWith("actions/upload-artifact@") &&
-        step.with?.name === "cloudx-ci-identity-v2",
+        step.with?.name === "cloudx-ci-identity-v2" &&
+        step.if === "steps.record.outputs.identity-state == 'current'",
     )
   ) {
     issues.push(
       `Workflow '${workflowName}' must emit one test-merge identity artifact for private-controller revalidation.`,
+    );
+  }
+  const supersededIdentity = jobs["superseded-identity"];
+  const pendingIdentity = jobs["pending-identity"];
+  if (
+    !identitySteps.some(
+      (step) =>
+        step.if === "always()" &&
+        typeof step.uses === "string" &&
+        step.uses.startsWith("actions/upload-artifact@") &&
+        step.with?.path === "ci-identity/reconciliation.json",
+    ) ||
+    !isRecord(supersededIdentity) ||
+    supersededIdentity.name !== "Superseded merge identity" ||
+    !normalizedNeeds(supersededIdentity).includes("identity") ||
+    supersededIdentity.if !==
+      "needs.identity.outputs.identity-state == 'superseded'" ||
+    !jobCommands(supersededIdentity).includes("exit 1") ||
+    !isRecord(pendingIdentity) ||
+    pendingIdentity.name !== "Pending merge identity" ||
+    !normalizedNeeds(pendingIdentity).includes("identity") ||
+    pendingIdentity.if !==
+      "needs.identity.outputs.identity-state == 'pending'" ||
+    !jobCommands(pendingIdentity).includes("exit 1") ||
+    !isRecord(jobs.aggregate) ||
+    !jobCommands(jobs.aggregate).includes('"$IDENTITY_STATE" = current')
+  ) {
+    issues.push(
+      `Workflow '${workflowName}' must retain merge reconciliation diagnostics and reject superseded merge identities and pending merge identities without publishing a passing aggregate.`,
     );
   }
   return issues;

@@ -1265,6 +1265,20 @@ describe("CodexTerminalSession", () => {
     }
   });
 
+  it("frames submitted Codex input as a paste so a busy reader cannot consume Enter as text", async () => {
+    vi.useFakeTimers();
+    try {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, voiceKind: "codex-terminal", submitDelayMs: 25 });
+
+      session.handleAction("enter_text", { text: "line one\r\nline two\n", submit: true });
+
+      expect(process.written).toBe("\u001b[200~line one\nline two\u001b[201~");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(process.written).toBe("\u001b[200~line one\nline two\u001b[201~\r");
+    } finally { vi.useRealTimers(); }
+  });
+
   it("waits for initial Codex terminal output to become quiet", async () => {
     vi.useFakeTimers();
     try {

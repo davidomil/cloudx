@@ -23,7 +23,7 @@ const installation = {
   id: 42,
   app_id: 123,
   suspended_at: null,
-  permissions: { contents: "write", issues: "write", pull_requests: "write", workflows: "write" },
+  permissions: { contents: "write", issues: "write", pull_requests: "write", checks: "read", workflows: "write" },
 };
 
 describe("GitHub application registration", () => {
@@ -49,6 +49,7 @@ describe("GitHub application registration", () => {
         contents: "write",
         issues: "write",
         pull_requests: "write",
+        checks: "read",
         workflows: "write",
       },
     });
@@ -56,6 +57,7 @@ describe("GitHub application registration", () => {
       contents: "read",
       issues: "read",
       pull_requests: "write",
+      checks: "read",
     });
     expect(worker.manifest.name).not.toBe(reviewer.manifest.name);
     expect(worker.manifest).not.toHaveProperty("hook_attributes");
@@ -202,6 +204,7 @@ describe("GitHub application registration", () => {
           contents: "read",
           issues: "read",
           pull_requests: "write",
+          checks: "read",
         },
       }),
     );
@@ -213,6 +216,14 @@ describe("GitHub application registration", () => {
         "reviewer",
       ),
     ).resolves.toEqual({ installationId: "42" });
+  });
+
+  it.each(["worker", "reviewer"] as const)("requires checks read access to classify superseded CI for the %s", async role => {
+    const { checks, ...permissions } = installation.permissions;
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ ...installation, permissions }));
+    await expect(new ForgeRegistrationClient(fetcher).githubInstallation(repository, app, "42", role))
+      .rejects.toThrow(`Grant the ${role} GitHub App checks: read permission`);
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("rejects invalid inputs and already canceled requests before fetching", async () => {

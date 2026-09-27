@@ -32,9 +32,11 @@ process](https://docs.github.com/en/apps/sharing-github-apps/registering-a-githu
 The GitHub issue worker requests **Contents**, **Issues**, **Pull
 requests** and **Workflows** write access. The reviewer requests
 **Contents** and **Issues** read access plus **Pull requests** write
-access. CloudX rejects a worker installation missing **Workflows:
-write** and keeps the registered app available for **Continue** after
-approval.
+access. Both Apps also request **Checks: read** to recognize superseded
+CI merge identities. Existing installations must approve this additional
+read permission. CloudX rejects missing required permissions, including
+worker **Workflows: write**, and keeps the registered app available for
+**Continue** after approval.
 
 For GitLab, use version 18.11 or later and a one-time personal access
 token with `api` scope and project Maintainer/Owner access. Click

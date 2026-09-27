@@ -12,6 +12,9 @@ import {
   CommandOutputTail,
 } from "./diagnostics.mjs";
 
+import { selectCommands, coverageLanes } from "./lanes.mjs";
+import { readReport, fixtureReports, lifecycleReports } from "./reports.mjs";
+
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);
 const commandTimeoutMs = 20 * 60 * 1_000;
@@ -25,70 +28,77 @@ export const candidateIdentity = Object.freeze({
   username: "cloudx-ci-candidate",
 });
 
-export function verificationCommands() {
-  return [
-    command(10 * 60 * 1_000, "npm", "ci", "--offline"),
-    command(commandTimeoutMs, "node", "scripts/ai-change/validate-process.mjs"),
-    command(commandTimeoutMs, "npm", "run", "format:check"),
-    command(commandTimeoutMs, "npm", "run", "lint"),
-    command(
-      commandTimeoutMs,
-      "npm",
-      "run",
-      "typecheck",
-      "--",
-      "--pretty",
-      "false",
-    ),
-    // Historical release builds share the verifier's two CPUs with coverage.
-    command(40 * 60 * 1_000, "npm", "run", "test:coverage"),
-    command(commandTimeoutMs, "npm", "run", "build"),
-    command(
-      commandTimeoutMs,
-      "uv",
-      "lock",
-      "--check",
-      "--offline",
-      "--project",
-      "services/asr",
-    ),
-    command(
-      commandTimeoutMs,
-      "/opt/cloudx-asr/bin/python",
-      "-m",
-      "pytest",
-      "services/asr/tests",
-      "-q",
-      { PYTHONPATH: "services/asr/src" },
-    ),
-    command(
-      commandTimeoutMs,
-      "uv",
-      "lock",
-      "--check",
-      "--offline",
-      "--project",
-      "services/documentation-indexer",
-    ),
-    command(
-      commandTimeoutMs,
-      "/opt/cloudx-documentation/bin/python",
-      "-m",
-      "pytest",
-      "services/documentation-indexer/tests",
-      "-q",
-      { PYTHONPATH: "services/documentation-indexer/src" },
-    ),
-    command(
-      commandTimeoutMs,
-      "npm",
-      "run",
-      "test:browser",
-      "--",
-      "--workers=2",
-      { CI: "1" },
-    ),
-  ];
+export function verificationCommands(lane = "full") {
+  return selectCommands(
+    [
+      command(10 * 60 * 1_000, "npm", "ci", "--offline"),
+      command(
+        commandTimeoutMs,
+        "node",
+        "scripts/ai-change/validate-process.mjs",
+      ),
+      command(commandTimeoutMs, "npm", "run", "format:check"),
+      command(commandTimeoutMs, "npm", "run", "lint"),
+      command(
+        commandTimeoutMs,
+        "npm",
+        "run",
+        "typecheck",
+        "--",
+        "--pretty",
+        "false",
+      ),
+      // Historical release builds share the verifier's two CPUs with coverage.
+      command(40 * 60 * 1_000, "npm", "run", "test:coverage"),
+      command(commandTimeoutMs, "npm", "run", "build"),
+      command(
+        commandTimeoutMs,
+        "uv",
+        "lock",
+        "--check",
+        "--offline",
+        "--project",
+        "services/asr",
+      ),
+      command(
+        commandTimeoutMs,
+        "/opt/cloudx-asr/bin/python",
+        "-m",
+        "pytest",
+        "services/asr/tests",
+        "-q",
+        { PYTHONPATH: "services/asr/src" },
+      ),
+      command(
+        commandTimeoutMs,
+        "uv",
+        "lock",
+        "--check",
+        "--offline",
+        "--project",
+        "services/documentation-indexer",
+      ),
+      command(
+        commandTimeoutMs,
+        "/opt/cloudx-documentation/bin/python",
+        "-m",
+        "pytest",
+        "services/documentation-indexer/tests",
+        "-q",
+        { PYTHONPATH: "services/documentation-indexer/src" },
+      ),
+      command(
+        commandTimeoutMs,
+        "npm",
+        "run",
+        "test:browser",
+        "--",
+        "--workers=2",
+        { CI: "1" },
+      ),
+    ],
+    lane,
+  );
 }
 
 export async function executeVerification({
@@ -109,15 +119,18 @@ export async function executeVerification({
   const digestWorktree =
     worktreeDigest ?? (() => calculateWorktreeDigest(root, trustedManifest));
   const before = await digestWorktree();
+  const started = performance.now();
   const results = [];
   const commandDiagnostics = [];
   for (const planned of commands) {
     const commandBefore = results.at(-1)?.tree_sha256_after ?? before;
+    const commandStarted = performance.now();
     const result = await runner(planned, root, identity);
     await settleCandidates();
     const commandAfter = await digestWorktree();
     results.push({
       command: displayCommand(planned),
+      duration_ms: Math.round(performance.now() - commandStarted),
       exit_code: result.exitCode,
       stdout_sha256:
         result.stdoutSha256 ??
@@ -144,6 +157,7 @@ export async function executeVerification({
   const evidence = {
     schema_version: 1,
     kind: "managed-container-verification",
+    duration_ms: Math.round(performance.now() - started),
     verdict:
       results.length === commands.length &&
       results.every(
@@ -701,25 +715,98 @@ export async function publishAttestation(attestation, evidence) {
 async function main() {
   prepareSupervisor();
   const attestation = await prepareAttestation();
+  const lane = process.argv[2] ?? "full";
+  const candidateSha = process.argv[3];
+  if (lane !== "full" && !/^[0-9a-f]{40}$/.test(candidateSha ?? ""))
+    throw new Error("Exact candidate SHA required.");
   let evidence;
+  let root;
+  const started = performance.now();
+  let preparedMs;
   try {
-    const root = await prepareWorkspace();
+    root = await prepareWorkspace();
+    preparedMs = Math.round(performance.now() - started);
     process.chdir(root);
+    if (lane === "coverage-merge") {
+      await fs.cp("/inputs", "/work/coverage-input", { recursive: true });
+      await execFileAsync("chmod", [
+        "--recursive",
+        "a+rX",
+        "/work/coverage-input",
+      ]);
+    }
     evidence = await executeVerification({
       root,
       identity: candidateIdentity,
+      commands: verificationCommands(lane),
       settleCandidates: () => terminateCandidateProcesses(),
     });
   } catch (error) {
     evidence = failedEvidence("prepare or execute verifier", error);
   }
-  try {
-    await terminateCandidateProcesses();
-  } catch (error) {
-    evidence = failedEvidence("terminate candidate processes", error);
-  }
+  evidence = await completeVerificationEvidence({ root, lane, evidence });
+  evidence.preparation_ms = preparedMs;
+  evidence.total_duration_ms = Math.round(performance.now() - started);
+  evidence.lane = lane;
+  evidence.candidate_sha = candidateSha;
   await publishAttestation(attestation, evidence);
   if (evidence.verdict !== "passed") process.exitCode = 1;
+}
+
+export async function completeVerificationEvidence({
+  root,
+  lane,
+  evidence,
+  settleCandidates = terminateCandidateProcesses,
+}) {
+  try {
+    await settleCandidates();
+  } catch (error) {
+    return {
+      ...failedEvidence("terminate candidate processes", error),
+      unavailable_reports: [
+        {
+          name: "candidate-reports",
+          reason: "candidate-processes-not-quiescent",
+        },
+      ],
+    };
+  }
+  if (root) {
+    try {
+      if (!(await fs.lstat(root)).isDirectory())
+        throw new Error("Report root must not be a symlink.");
+      const reports = {};
+      if (coverageLanes.includes(lane)) {
+        reports.coverage_report = `.vitest-reports/blob-${lane.slice(-1)}-4.json`;
+        reports.timing_report = "test-results/timings/vitest.json";
+      }
+      if (lane.startsWith("browser-"))
+        reports.timing_report = "test-results/timings/browser.json";
+      if (["asr", "documentation"].includes(lane))
+        reports.timing_report = `test-results/timings/${lane}.xml`;
+      if (lane === "coverage-merge")
+        reports.coverage_summary = "coverage/coverage-summary.json";
+      for (const [name, relative] of Object.entries(reports)) {
+        try {
+          evidence[name] = await readReport(root, relative);
+        } catch (error) {
+          if (evidence.verdict === "passed" || error.code !== "ENOENT")
+            throw error;
+          (evidence.unavailable_reports ??= []).push({
+            name,
+            reason: "not-produced",
+          });
+        }
+      }
+      evidence.fixture_reports = await fixtureReports(root);
+      evidence.lifecycle_reports = await lifecycleReports(root);
+    } catch (error) {
+      evidence.verdict = "failed";
+      evidence.report_error = String(error.message);
+    }
+  }
+  return evidence;
 }
 
 async function liveProcessesOwnedBy(uid, procRoot) {
