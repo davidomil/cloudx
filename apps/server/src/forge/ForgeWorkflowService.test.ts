@@ -354,6 +354,58 @@ describe("Named issue batches", () => {
     expect(f.stored()[0]).toMatchObject({ changeNumber: 7, status: "awaiting_review" });
   });
 
+  it.each([
+    { request: "closed", change: { state: "closed" }, error: "closed without merging" },
+    { request: "retargeted", change: { baseBranch: "release" }, error: "branches or identity" },
+    { request: "different source branch", change: { headBranch: "another-worker" }, error: "branches or identity" },
+    { request: "different identity", change: { number: 8 }, error: "branches or identity" },
+    { request: "unchanged", change: {}, error: undefined },
+  ])("revalidates an $request request before retrying its batch description after restart", async ({ change, error }) => {
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    f.reports.read.mockResolvedValue(undefined);
+    await f.service.resume(worker.id, placement);
+    f.report.issueResults[1]!.validation = "test-2 and regression-2 pass";
+    f.reports.read.mockResolvedValue(f.report);
+    f.provider.updateChangeRequest.mockRejectedValueOnce(new Error("Description update failed"));
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: "Description update failed", pendingPublication: {
+      headSha: f.change.headSha, report: f.report,
+    } });
+    const pendingPublication = structuredClone(f.stored()[0]!.pendingPublication);
+    Object.assign(f.change, change, { title: "Manually edited title", body: "Manually edited body" });
+    f.provider.updateChangeRequest.mockClear().mockImplementation(async (_number, input) => {
+      Object.assign(f.change, input);
+    });
+    const restored = new ForgeWorkflowService(f.deps);
+
+    const resumed = await restored.resume(worker.id, placement);
+
+    if (error) {
+      expect(resumed).toMatchObject({ status: "failed", error: expect.stringContaining(error), pendingPublication: {
+        headSha: pendingPublication!.headSha, report: pendingPublication!.report,
+      } });
+      expect(f.provider.updateChangeRequest).not.toHaveBeenCalled();
+      expect(f.change).toMatchObject({ title: "Manually edited title", body: "Manually edited body" });
+    } else {
+      expect(resumed).toMatchObject({ id: worker.id, changeNumber: 7, status: "awaiting_review" });
+      expect(resumed.pendingPublication).toBeUndefined();
+      expect(f.provider.updateChangeRequest).toHaveBeenCalledExactlyOnceWith(7, {
+        title: f.report.title, body: expect.stringContaining("test-2 and regression-2 pass"),
+      });
+      expect(f.change.body).toContain("Closes #1");
+      expect(f.change.body).toContain("Closes #2");
+    }
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(parseWorkers(f.stored())).toHaveLength(1);
+  });
+
   it("preserves the group and checkout through stop, restart and resume", async () => {
     const f = batchFixture();
     const draft = await f.service.saveBatch(f.deps.settings().repository, "Batch", [1, 2]);

@@ -1904,8 +1904,13 @@ export class ForgeWorkflowService {
       worker.publicationState = "created";
       await this.persist();
     }
-    if (worker.batch && !publication.baseUpdate && updateExistingRequest)
+    if (worker.batch && !publication.baseUpdate && updateExistingRequest) {
+      const current = await provider.getChangeRequestStatus(worker.changeNumber!);
+      signal?.throwIfAborted();
+      if (await this.reconcileMergedChange(worker, { change: current, signal })) return;
+      requirePublicationRequest(worker, current);
       await provider.updateChangeRequest(worker.changeNumber!, { title: report.title, body: issueRequestBody(worker, report) });
+    }
     await this.confirmPublication(worker);
   }
   private requireBaseUpdateSource(worker: ForgeWorker, change: ForgeChangeRequestStatus): void {
