@@ -61,6 +61,123 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it("persists an unstarted batch and resumes every member in the same checkout after pause and restart", async () => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
+    const fixture = await LifecycleFixture.create();
+    const draft = await fixture.workflow.saveBatch(repository, "Input handling", [1, 2]);
+    expect(draft).toMatchObject({ status: "draft", title: "Input handling", batch: { issues: [{ number: 1 }, { number: 2 }] } });
+    expect(draft.worktreePath).toBeUndefined();
+    expect(fixture.factory.processes).toEqual([]);
+    await fixture.restartWorkflow();
+    expect(await fixture.worker(draft.id)).toMatchObject({ id: draft.id, status: "draft", title: draft.title, batch: draft.batch });
+    expect(fixture.factory.processes).toEqual([]);
+
+    const started = await fixture.workflow.startBatch(draft.id, fixture.placement);
+    const first = await fixture.completedAssistantTurn(started, false);
+    const checkout = await fs.stat(started.worktreePath!);
+    await fs.writeFile(path.join(started.worktreePath!, "README.md"), "Retained tracked research\n");
+    await fs.writeFile(path.join(started.worktreePath!, "notes.bin"), Buffer.from([0, 255, 128]));
+    expect(first.context.batch).toMatchObject({ name: "Input handling", issues: [{ number: 1 }, { number: 2 }] });
+    expect(first.context.issues).toEqual([...fixture.provider.issues.values()]);
+    expect(first.args.at(-1)).toContain("Include exactly one issueResults entry per member");
+    expect(await fs.readdir(path.join(fixture.dataDir, "forge-workers", "checkouts"))).toEqual([started.id]);
+    await fixture.workflow.pause(started.id);
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", id: draft.id, branch: started.branch, worktreePath: started.worktreePath });
+    expect(await processIsRunning(first.pid)).toBe(false);
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", batch: started.batch });
+    expect(fixture.factory.processes).toHaveLength(1);
+
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "false");
+    const resumed = await fixture.workflow.resume(started.id, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(resumed);
+    expect(resumed).toMatchObject({ id: draft.id, branch: started.branch, worktreePath: started.worktreePath, title: draft.title });
+    expect(resumed.attemptId).not.toBe(started.attemptId);
+    expect((await fs.stat(resumed.worktreePath!)).ino).toBe(checkout.ino);
+    expect(receipt.sessionId).toBe(first.sessionId);
+    expect(receipt.resumedSessionId).toBe(first.sessionId);
+    expect(receipt.sessionPath).toBe(first.sessionPath);
+    expect(receipt.previousMessages).toEqual(expect.arrayContaining([
+      { role: "user", content: first.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining('"issueResults"') },
+    ]));
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
+    expect(await fs.readFile(path.join(resumed.worktreePath!, "README.md"), "utf8")).toBe("Retained tracked research\n");
+    expect(await fs.readFile(path.join(resumed.worktreePath!, "notes.bin"))).toEqual(Buffer.from([0, 255, 128]));
+    await declareHandoff(receipt, { headSha: receipt.headSha, status: "ready", retainedPaths: ["README.md", "notes.bin"], details: "Verified the committed solution with git show HEAD:solution.txt; retain unrelated research files." });
+    expect(await git(resumed.worktreePath!, "status", "--porcelain=v1", "--untracked-files=all")).toBe("M README.md\n?? notes.bin");
+    expect(await git(resumed.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(receipt.context.issues).toEqual([...fixture.provider.issues.values()]);
+    const report = await fixture.reports.read(resumed.attemptId!);
+    expect(report).toMatchObject({ issueResults: [
+      { number: 1, status: "completed", changes: expect.any(String), validation: expect.stringContaining("git show HEAD:solution.txt") },
+      { number: 2, status: "completed", changes: expect.any(String), validation: expect.stringContaining("git show HEAD:solution.txt") },
+    ] });
+    await fixture.workflow.poll();
+    const published = await fixture.worker(started.id);
+    expect(published, published.error).toMatchObject({ status: "awaiting_review", changeNumber: 7, batch: { issues: started.batch!.issues, results: (report as { issueResults: unknown }).issueResults } });
+    expect(fixture.provider.changes.size).toBe(1);
+    expect(fixture.provider.changes.get(7)).toMatchObject({ title: "Input handling", body: expect.stringContaining("Closes #1") });
+    expect(fixture.provider.changes.get(7)!.body).toContain("Closes #2");
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(receipt.headSha);
+    expect(fixture.factory.processes).toHaveLength(2);
+    expect(fixture.gitPushes).toHaveLength(1);
+  }, 30_000);
+
+  it("reviews every batch member through one shared request and waits for each actual issue closure after merge", async () => {
+    const fixture = await LifecycleFixture.create({ autoReview: true });
+    const updating = vi.spyOn(fixture.provider, "updateChangeRequest");
+    const draft = await fixture.workflow.saveBatch(repository, "Input handling", [1, 2]);
+    const started = await fixture.workflow.startBatch(draft.id, fixture.placement, true);
+    const first = await fixture.completedAssistantTurn(started);
+    await fixture.workflow.poll();
+    const firstReview = await fixture.runningWorker("review");
+    const reviewed = await fixture.completedAssistantTurn(firstReview);
+    expect(reviewed.context.issues).toEqual([...fixture.provider.issues.values()]);
+    expect(reviewed.context.batch).toMatchObject({ name: draft.title, results: [{ number: 1, status: "completed" }, { number: 2, status: "completed" }] });
+    await fixture.workflow.poll();
+
+    const revision = await fixture.runningWorker("issue");
+    expect(revision).toMatchObject({ id: started.id, worktreePath: started.worktreePath, branch: started.branch, batch: { issues: started.batch!.issues } });
+    const revised = await fixture.completedAssistantTurn(revision);
+    expect(revised.sessionId).toBe(first.sessionId);
+    expect(revised.resumedSessionId).toBe(first.sessionId);
+    expect(revised.previousMessages).toEqual(expect.arrayContaining([{ role: "assistant", content: expect.stringContaining('"issueResults"') }]));
+    expect(revised.context.issues).toEqual([...fixture.provider.issues.values()]);
+    expect(revised.context.change?.comments).toEqual(expect.arrayContaining([expect.objectContaining({ discussionId: "review-1-finding-1", resolved: false })]));
+    expect(revised.headSha).not.toBe(first.headSha);
+    await fixture.workflow.poll();
+    const lastReview = await fixture.runningWorker("review");
+    const approved = await fixture.completedAssistantTurn(lastReview);
+    expect(approved.context.issues).toEqual([...fixture.provider.issues.values()]);
+    expect(lastReview).toMatchObject({ id: firstReview.id, issueWorkerId: started.id });
+    await fixture.workflow.poll();
+
+    expect(fixture.provider.changes.size).toBe(1);
+    expect(updating).toHaveBeenCalledWith(7, { title: draft.title, body: expect.stringContaining("Closes #2") });
+    expect(fixture.provider.changes.get(7)!.body.match(/Closes #1/g)).toHaveLength(1);
+    expect(fixture.provider.changes.get(7)!.body.match(/Closes #2/g)).toHaveLength(1);
+    expect(fixture.provider.merges).toEqual([revised.headSha]);
+    expect(fixture.provider.submissions.map(({ event }) => event)).toEqual(["request_changes", "approve"]);
+    expect(fixture.provider.resolvedDiscussions).toEqual(["review-1-finding-1"]);
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", error: expect.stringContaining("#2"), batch: { issues: [{ number: 1, state: "closed" }, { number: 2, state: "open" }] } });
+    expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
+    await fixture.restartWorkflow();
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", batch: { issues: [{ number: 1, state: "closed" }, { number: 2, state: "open" }] } });
+
+    fixture.provider.issues.get(2)!.state = "closed";
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(4);
+    expect(fixture.gitPushes).toHaveLength(2);
+    await expectMissing(started.worktreePath!, firstReview.worktreePath!);
+  }, 30_000);
+
   it.each(["issue", "review"] as const)("keeps the %s final response visible and waits for native completion before handoff", async kind => {
     vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
     const fixture = await LifecycleFixture.create();
@@ -908,9 +1025,15 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await expectMissing(started.worktreePath!, reviewer.worktreePath!);
   }, 20_000);
 
-  it.each([false, true])("rebases a conflicting approved branch in a coding worker and requires fresh review and checks (previous target merge: %s)", async previousTargetMerge => {
+  it.each([
+    { previousTargetMerge: false, batch: false },
+    { previousTargetMerge: true, batch: false },
+    { previousTargetMerge: false, batch: true },
+  ])("rebases a conflicting approved branch in a coding worker and requires fresh review and checks (previous target merge: $previousTargetMerge, batch: $batch)", async ({ previousTargetMerge, batch }) => {
     const fixture = await LifecycleFixture.create({ autoReview: true, approveFirst: true });
-    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
+    const started = batch
+      ? await fixture.workflow.startBatch((await fixture.workflow.saveBatch(repository, "Input handling", [1, 2])).id, fixture.placement, true)
+      : await fixture.workflow.startIssue(repository, 1, fixture.placement, true);
     const implementation = await fixture.completedAssistantTurn(started);
     if (previousTargetMerge) {
       const previousTarget = await fixture.advanceMain();
@@ -941,6 +1064,12 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     });
     expect((await fixture.store.read()).find(worker => worker.id === started.id)?.rebaseRecovery).toEqual(resolving.rebaseRecovery);
     const resolution = await fixture.completedAssistantTurn(resolving);
+    if (batch) {
+      expect(resolution.sessionId).toBe(implementation.sessionId);
+      expect(resolution.resumedSessionId).toBe(implementation.sessionId);
+      expect(resolution.previousMessages).toEqual(expect.arrayContaining([{ role: "assistant", content: expect.stringContaining('"issueResults"') }]));
+      expect(resolution.context.issues).toEqual([...fixture.provider.issues.values()]);
+    }
     expect(resolution.context.rebaseRecovery).toEqual(resolving.rebaseRecovery);
     expect(resolution.context.item.body).toBe(fixture.provider.issue.body);
     expect(resolution.context.change?.comments).toEqual(expect.arrayContaining([expect.objectContaining({ body: expect.stringContaining("No actionable findings. The change is ready to merge.") })]));
@@ -992,6 +1121,11 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.provider.merges).toEqual([resolution.headSha]);
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(resolution.headSha);
     expect(fixture.provider.issue.state).toBe("closed");
+    if (batch) {
+      fixture.provider.issues.get(2)!.state = "closed";
+      fixture.advanceCleanupInterval();
+      await fixture.workflow.poll();
+    }
     expect(fixture.factory.processes).toHaveLength(4);
     expect(fixture.gitPushes).toHaveLength(2);
     expect(await fixture.store.read()).toEqual([]);
@@ -1698,7 +1832,7 @@ interface AssistantReceipt {
   sessionPath?: string;
   previousMessages?: Array<{ role: "user" | "assistant"; content: string }>;
   localReview?: { baseSha: string; mergeBaseSha: string; headSha: string; diff: string };
-  context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; change?: ForgeChangeRequest; rebaseRecovery?: ForgeWorker["rebaseRecovery"]; reviewScope?: ForgeReviewScope; previousReviews?: ForgeReviewDraft[] };
+  context: { item: ForgeIssueDetail & Partial<ForgeChangeRequest>; issues?: ForgeIssueDetail[]; batch?: ForgeWorker["batch"] & { name: string }; change?: ForgeChangeRequest; rebaseRecovery?: ForgeWorker["rebaseRecovery"]; reviewScope?: ForgeReviewScope; previousReviews?: ForgeReviewDraft[] };
 }
 
 class RecordingTerminalFactory extends NodePtyTerminalProcessFactory {
@@ -1937,18 +2071,20 @@ class LifecycleFixture {
     expect(this.sessions.getTab(worker.tabId!).pluginMetadata?.["rules-skills"]?.selectedTemplateId).toBe(receipt.templateId);
     expect(receipt.args.filter((argument) => argument.includes("Write only valid JSON"))).toHaveLength(1);
     expect(receipt.trustedProjectPath).toBe(await fs.realpath(worker.worktreePath!));
-    if (worker.kind === "review") {
+    if (worker.kind === "review" || worker.batch) {
       expect(receipt.sessionId).toMatch(/^[a-f0-9-]{36}$/);
       expect(receipt.resumedSessionId).toBe(receipt.sessionId);
       expect(receipt.args.slice(receipt.args.indexOf("resume"), -1)).toEqual(["resume", receipt.sessionId, "--"]);
       expect(receipt.previousMessages).toEqual(expect.any(Array));
       const setup = receipt.previousMessages![0]!;
       expect(setup).toEqual({ role: "user", content: expect.stringContaining(JSON.stringify(worker.worktreePath)) });
-      expect(setup.content).toContain("Wait for the review request before starting work.");
+      expect(setup.content).toContain(worker.batch ? "Wait for the batch request before starting work." : "Wait for the review request before starting work.");
       expect((await this.sessionRequests("thread/inject_items")).filter(request => request.threadId === receipt.sessionId)).toEqual([{
         threadId: receipt.sessionId,
         items: [{ type: "message", role: "user", content: [{ type: "input_text", text: setup.content }] }],
       }]);
+    }
+    if (worker.kind === "review") {
       expect(receipt.context.item).not.toHaveProperty("diff");
       expect(receipt.localReview).toMatchObject({ baseSha: receipt.context.item.baseSha, headSha: worker.headSha });
       expect(receipt.localReview!.mergeBaseSha).toMatch(/^[a-f0-9]{40,64}$/);
@@ -2048,7 +2184,7 @@ test("retains the target behavior and issue fix", () => {
       return;
     }
     await expectMissing(receipt.tabContextPath);
-    if (!receipt.localReview || !receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
+    if ((!receipt.localReview && !receipt.context.batch) || !receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
       await expectMissing(receipt.codexHome);
       return;
     }
@@ -2079,6 +2215,10 @@ test("retains the target behavior and issue fix", () => {
 class LocalForgeProvider implements ForgeProvider {
   detectConflicts = false;
   readonly issue: ForgeIssueDetail = { number: 1, title: "Handle empty input", body: "Implement the missing operation.", url: "https://github.com/fixture/cloudx/issues/1", state: "open", labels: [], author: "maintainer", updatedAt: new Date(0).toISOString(), comments: [] };
+  readonly issues = new Map<number, ForgeIssueDetail>([
+    [1, this.issue],
+    [2, { ...this.issue, number: 2, title: "Cover empty input", body: "Validate empty input handling alongside the operation.", url: "https://github.com/fixture/cloudx/issues/2", comments: [{ id: "second-issue-context", body: "Use the shared input behavior.", author: "maintainer" }] }],
+  ]);
   readonly changes = new Map<number, ForgeChangeRequest>();
   readonly submissions: ForgeReviewSubmission[] = [];
   readonly discussionReplies: Array<{ discussionId: string; body: string; headSha: string }> = [];
@@ -2086,9 +2226,13 @@ class LocalForgeProvider implements ForgeProvider {
   readonly merges: string[] = [];
 
   constructor(private readonly origin: string) {}
-  async listIssues() { return { items: [structuredClone(this.issue)] }; }
+  async listIssues() { return { items: [...this.issues.values()].map(issue => structuredClone(issue)) }; }
   async listChangeRequests() { return { items: [...this.changes.values()].map((change) => structuredClone(change)) }; }
-  async getIssue() { return structuredClone(this.issue); }
+  async getIssue(number: number) {
+    const issue = this.issues.get(number);
+    if (!issue) throw new Error("Unknown fixture issue.");
+    return structuredClone(issue);
+  }
   async getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus> {
     const change = this.changes.get(number);
     if (!change) throw new Error("Unknown fixture change request.");
@@ -2121,6 +2265,11 @@ class LocalForgeProvider implements ForgeProvider {
     const targetHeadSha = await git(this.origin, "rev-parse", input.baseBranch);
     this.changes.set(7, { number: 7, title: input.title, body: input.body, url: "https://github.com/fixture/cloudx/pull/7", state: "open", labels: [], author: "worker-bot", updatedAt: new Date().toISOString(), draft: false, headSha: "", baseSha: targetHeadSha, targetHeadSha, headBranch: input.headBranch, baseBranch: input.baseBranch, merged: false, reviewReady: true, mergeable: true, requiresBaseUpdate: false, approved: false, unresolvedDiscussions: 0, comments: [], linkedIssues: [] });
     return this.getChangeRequest(7);
+  }
+  async updateChangeRequest(number: number, input: { title: string; body: string }): Promise<void> {
+    const change = this.changes.get(number);
+    if (!change) throw new Error("Unknown fixture change request.");
+    Object.assign(change, input);
   }
   async postReview(number: number, review: ForgeReviewSubmission): Promise<ForgeReviewPublication> {
     if ((await this.getChangeRequest(number)).headSha !== review.headSha) throw new Error("Fixture review head changed.");
@@ -2168,7 +2317,8 @@ class LocalForgeProvider implements ForgeProvider {
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  return (await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } })).stdout.trim();
+  const { stdout } = await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } });
+  return args.includes("-z") ? stdout : stdout.trim();
 }
 
 async function declareHandoff(receipt: AssistantReceipt, handoff: ForgeIssueHandoff): Promise<void> {
@@ -2313,6 +2463,7 @@ if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
 }
 const isReview = prompt.startsWith("Review the exact checked-out commit");
 const resumedSessionId = args.includes("resume") ? args[args.indexOf("resume") + 1] : undefined;
+if (context.batch && !resumedSessionId) throw new Error("The batch must resume its exact Codex conversation.");
 const conversation = resumedSessionId ? readConversation(resumedSessionId) : (await request("thread/start", { cwd: trustedProjectPath, runtimeWorkspaceRoots: [trustedProjectPath], ephemeral: false })).thread;
 if (isReview && !conversation) throw new Error("The reviewer must resume its exact Codex conversation.");
 if (isReview && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
@@ -2362,6 +2513,10 @@ const review = process.env.FORGE_FIXTURE_AUTO_REVIEW === "true"
 const report = isReview
   ? review
   : { kind: "issue", title: "Handle empty input", body: "Implemented and verified the fixture changes.", rebase, discussionReplies: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => ({ discussionId: comment.discussionId, body: "Added and verified the empty-input regression." })), resolvedDiscussionIds: (context.change?.comments ?? []).filter(comment => comment.discussionId && comment.resolved === false).map(comment => comment.discussionId) };
+if (!isReview && context.batch) {
+  report.title = context.batch.name;
+  report.issueResults = context.issues.map(issue => ({ number: issue.number, status: "completed", changes: "Implemented shared input handling for #" + issue.number + ".", validation: "git show HEAD:solution.txt: " + git("show", "HEAD:solution.txt") }));
+}
 let ownedChildPid;
 if (process.env.FORGE_FIXTURE_OWNED_CHILD === "true") {
   const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000);"], { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });

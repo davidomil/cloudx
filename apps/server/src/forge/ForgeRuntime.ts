@@ -145,6 +145,8 @@ interface OwnedWorkspace extends ForgeWorkspace {
   reviewBaseSha?: string;
   reviewRefresh?: OwnedReviewRefresh;
   reviewConversation?: ReviewConversationBinding;
+  batchConversation?: ReviewConversationBinding;
+  batchConversationRequired?: true;
   publicationAttemptId?: string;
   publicationHandoffs?: Record<string, OwnedPublicationHandoff>;
   retainedWorkspace?: ForgeRetainedWorkspace;
@@ -562,6 +564,7 @@ export class ForgeRuntime {
       templateId: string;
       model: string;
       reasoningEffort: CodexReasoningEffort;
+      preserveConversation?: true;
       prompt: string;
       windowId: string;
       paneId: string;
@@ -571,6 +574,11 @@ export class ForgeRuntime {
     return this.serialize(input.id, "launch", signal, async () => {
     signal?.throwIfAborted();
     const owned = await this.readOwned(input.id);
+    if (input.preserveConversation && owned.role !== "worker")
+      throw new Error("Only a coding worker can preserve a batch conversation.");
+    if (owned.batchConversation && !input.preserveConversation)
+      throw new Error("Resume this batch with its preserved conversation.");
+    const conversationKey = owned.role === "reviewer" ? "reviewConversation" : input.preserveConversation ? "batchConversation" : undefined;
     if (
       owned.cleaned ||
       !owned.prepared ||
@@ -612,24 +620,26 @@ export class ForgeRuntime {
     owned.launchBootId = (await executionEnvironment()).bootId;
     await this.manifest(owned.id).write(owned);
     let preparingTabId: string | undefined;
-    const prepareCodexSession = owned.role === "reviewer" ? async (launch: PreparedCodexLaunch) => {
+    const prepareCodexSession = conversationKey ? async (launch: PreparedCodexLaunch) => {
       preparingTabId = launch.tabId;
       try {
-        if (launch.cwd !== owned.worktreePath) throw new Error("Reviewer conversation checkout ownership does not match.");
+        if (launch.cwd !== owned.worktreePath) throw new Error("Worker conversation checkout ownership does not match.");
         const tab = this.dependencies.sessions.getTab(launch.tabId);
         if (tab.id !== launch.tabId || tab.cwd !== owned.worktreePath || tab.ownerPluginId !== "forge" || tab.pluginMetadata?.["forge-workers"]?.workerId !== owned.id)
-          throw new Error("Reviewer conversation tab ownership does not match.");
+          throw new Error("Worker conversation tab ownership does not match.");
         const ownership: OwnedTab = { tabId: tab.id, workerId: owned.id, attemptId: input.attemptId, closed: false, quiescent: false };
         this.ownedTabs.set(tab.id, ownership);
         await this.captureTab(tab, ownership);
         await this.authorizeProjectTrust(owned);
       } catch (error) { throw new PluginSessionNotStartedError(error); }
       return this.reviewConversations.prepare(launch, {
-        binding: owned.reviewConversation,
+        purpose: conversationKey === "batchConversation" ? "batch" : "review",
+        binding: owned[conversationKey],
         model: input.model,
         reasoningEffort: input.reasoningEffort,
         save: async binding => {
-          owned.reviewConversation = binding;
+          owned[conversationKey] = binding;
+          if (conversationKey === "batchConversation") owned.batchConversationRequired = binding ? true : undefined;
           await this.manifest(owned.id).write(owned);
         },
       }, signal);
@@ -683,8 +693,8 @@ export class ForgeRuntime {
     this.ownedTabs.set(tab.id, ownedTab);
     try {
       await this.captureTab(tab, ownedTab);
-      if (owned.role === "reviewer" && (preparingTabId !== tab.id || !owned.reviewConversation?.threadId))
-        throw new Error("The reviewer launch did not bind its exact Codex conversation.");
+      if (conversationKey && (preparingTabId !== tab.id || !owned[conversationKey]?.threadId))
+        throw new Error("The worker launch did not bind its exact Codex conversation.");
       owned.launchPending = false;
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
@@ -794,7 +804,7 @@ export class ForgeRuntime {
       if (owned.context) await this.removeContext(owned.context);
       if (owned.launch) {
         const worker = await this.readOwned(owned.workerId);
-        await this.removeLaunch(owned.launch, tabId, worker.role === "reviewer" ? worker.reviewConversation : undefined);
+        await this.removeLaunch(owned.launch, tabId, worker.reviewConversation ?? worker.batchConversation);
       }
       if (owned.execution) await this.executions.remove(owned.execution);
       owned.closed = true;
@@ -917,8 +927,9 @@ export class ForgeRuntime {
       }
     }
     const views = new Map(tabs.filter(tab => tab.launch && !missing.has(tab.launch.path)).map(tab => [tab.launch!.path, tab.launch!]));
-    if (owned.reviewConversation) {
-      const binding = owned.reviewConversation;
+    const conversation = owned.reviewConversation ?? owned.batchConversation;
+    if (conversation) {
+      const binding = conversation;
       const source = await reconciliation.add({ ...binding.source, path: binding.source.home });
       binding.source = { ...binding.source, dev: source.dev, ino: source.ino, durable: source.durable };
       binding.sqliteHome = await reconciliation.add(binding.sqliteHome);
@@ -930,7 +941,7 @@ export class ForgeRuntime {
       const file = new JsonStateFile(this.dependencies.dataDir, path.relative(this.dependencies.dataDir, path.join(view, ".cloudx-source.json")), "Codex source binding", 0o600);
       const binding = await file.read<ResolvedCodexStateSource & { version: number }>();
       if (!binding) {
-        if (owned.reviewConversation) throw new Error("Reviewer source binding is missing; its existing thread was preserved.");
+        if (conversation) throw new Error("Worker source binding is missing; its existing thread was preserved.");
         continue;
       }
       if (binding.version !== 1 || binding.sourceId !== "shared" || !isIdentity({ ...binding, path: binding.home })) throw new Error("Codex source binding is invalid.");
@@ -942,8 +953,8 @@ export class ForgeRuntime {
         save(file, binding, identity);
         Object.assign(binding, selected);
       } finally { await sources.dispose(); }
-      if (owned.reviewConversation && (binding.home !== owned.reviewConversation.source.home || binding.ino !== owned.reviewConversation.source.ino))
-        throw new Error("Reviewer conversation source changed; its existing thread was preserved.");
+      if (conversation && (binding.home !== conversation.source.home || binding.ino !== conversation.source.ino))
+        throw new Error("Worker conversation source changed; its existing thread was preserved.");
       for (const name of ["sessions", "archived_sessions"]) {
         const link = path.join(view, name);
         const stat = await fs.lstat(link).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
@@ -1938,6 +1949,10 @@ export class ForgeRuntime {
         (value.role !== "reviewer" || !isReviewRefresh(value.reviewRefresh))) ||
       (value.reviewConversation !== undefined &&
         (value.role !== "reviewer" || !isReviewConversationBinding(value.reviewConversation))) ||
+      (value.batchConversationRequired !== undefined && value.batchConversationRequired !== true) ||
+      ((value.batchConversation !== undefined) !== (value.batchConversationRequired === true)) ||
+      (value.batchConversation !== undefined &&
+        (value.role !== "worker" || !isReviewConversationBinding(value.batchConversation))) ||
       !isPublicationOwnership(value) ||
       (value.branchPublication !== undefined &&
         (value.role !== "worker" || !value.branchPublication || !isCommitSha(value.branchPublication.headSha) ||

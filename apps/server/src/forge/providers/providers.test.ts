@@ -2332,6 +2332,53 @@ describe("request creation and input boundaries", () => {
   });
 });
 
+describe("request updates", () => {
+  const summary = { title: "Complete issue batch", body: "Closes #7\nCloses #8" };
+
+  it.each([github, gitlab])("updates only the title and description using the worker credential ($provider)", async (repository) => {
+    const { provider, calls } = harness(repository, () => response({}), "reviewer");
+    await provider.updateChangeRequest(7, summary);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url.pathname).toBe(repository.provider === "github"
+      ? "/repos/owner/repo/pulls/7"
+      : "/api/v4/projects/group%2Fsubgroup%2Frepo/merge_requests/7");
+    expect(calls[0].options.method).toBe(repository.provider === "github" ? "PATCH" : "PUT");
+    expect(JSON.parse(String(calls[0].options.body))).toEqual(repository.provider === "github"
+      ? summary : { title: summary.title, description: summary.body });
+    expect(new Headers(calls[0].options.headers).get(repository.provider === "github" ? "authorization" : "private-token"))
+      .toContain("worker-private-token");
+  });
+
+  it.each([github, gitlab])("rejects invalid request updates before network access ($provider)", async (repository) => {
+    const { provider, calls } = harness(repository, () => response({}));
+    for (const number of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])
+      await expect(provider.updateChangeRequest(number, summary)).rejects.toThrow("positive integer");
+    for (const title of ["", " ", "x".repeat(256), "bad\nline", "bad\rline", "bad\x00line"])
+      await expect(provider.updateChangeRequest(7, { ...summary, title })).rejects.toThrow("title");
+    await expect(provider.updateChangeRequest(7, { ...summary, body: "x".repeat(65_001) })).rejects.toThrow("65,000");
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([github, gitlab])("accepts an empty description and the existing text limits ($provider)", async (repository) => {
+    const { provider, calls } = harness(repository, () => response({}));
+    await provider.updateChangeRequest(7, { title: "x".repeat(255), body: "" });
+    await provider.updateChangeRequest(7, { title: "Batch summary", body: "x".repeat(65_000) });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("rejects GitLab quick actions in updated descriptions", async () => {
+    const { provider, calls } = harness(gitlab, () => response({}));
+    await expect(provider.updateChangeRequest(7, { ...summary, body: "Done.\n/merge" })).rejects.toThrow("quick actions");
+    expect(calls).toHaveLength(0);
+  });
+
+  it.each([github, gitlab])("reports a rejected update without retrying or exposing the response body ($provider)", async (repository) => {
+    const { provider, calls } = harness(repository, () => new Response("private-provider-error", { status: 403 }));
+    await expect(provider.updateChangeRequest(7, summary)).rejects.toThrow(`The ${repository.provider} API rejected the operation (HTTP 403).`);
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("discussion replies from coding workers", () => {
   const body = "Fixed the race in the latest commit.\nAdded the requested regression test.";
 

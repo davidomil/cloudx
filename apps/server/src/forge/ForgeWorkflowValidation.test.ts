@@ -885,3 +885,74 @@ describe("Completion deadline evidence", () => {
     expect(parseWorkers([{ ...worker, completion: failed }])[0].completion).toEqual(failed);
   });
 });
+
+describe("Persisted issue batches", () => {
+  const issues = [7, 8].map(number => ({ number, title: `Issue ${number}`, url: `https://github.com/cloudx/example/issues/${number}`, state: "open" as const }));
+  const results = issues.map(({ number }) => ({ number, status: "completed" as const, changes: "Validated input before launch.", validation: "Concurrent starts create one worker." }));
+  const draft = { ...worker, status: "draft" as const, batch: { issues } };
+
+  it("round-trips editable drafts and completed member results without losing issue identity", () => {
+    expect(parseWorkers([draft])).toEqual([draft]);
+    const active = { ...worker, batch: { issues, results } };
+    expect(parseWorkers([active])).toEqual([active]);
+    expect(parseWorkerReport({ ...report, issueResults: results })).toEqual({ ...report, issueResults: results });
+  });
+
+  it.each([
+    null, {}, { issues: [] }, { issues: [issues[0], issues[0]] },
+    { issues: [{ ...issues[0], number: 0 }] }, { issues: [{ ...issues[0], number: 1.5 }] },
+    { issues: [{ ...issues[0], title: " " }] }, { issues: [{ ...issues[0], state: "merged" }] },
+    { issues: [{ ...issues[0], url: "javascript:alert(1)" }] },
+    { issues: [{ ...issues[0], url: "relative" }] },
+    { issues: Array.from({ length: 51 }, (_, i) => ({ ...issues[0], number: i + 1 })) },
+    { issues, results: [results[0]] }, { issues, results: [results[0], { ...results[1], number: 9 }] },
+  ])("rejects malformed membership or saved results %#", batch => {
+    expect(() => parseWorkers([{ ...worker, batch }])).toThrow();
+  });
+
+  it("rejects review-owned batches, mismatched primary members and invalid draft names", () => {
+    expect(() => parseWorkers([{ ...draft, kind: "review" }])).toThrow(/Only issue/);
+    expect(() => parseWorkers([{ ...draft, number: 8 }])).toThrow(/first member/);
+    expect(() => parseWorkers([{ ...draft, title: " " }])).toThrow(/batch name/);
+    expect(() => parseWorkers([{ ...draft, title: "x".repeat(201) }])).toThrow(/batch name/);
+    expect(() => parseWorkers([{ ...draft, batch: undefined }])).toThrow(/draft batch/);
+  });
+
+  it.each([
+    { worktreePath: "/repo/work" }, { tabId: "tab" }, { attemptId: reviewWorkerId },
+    { changeNumber: 9 }, { publicationState: "creating" }, { pendingPublication: {} },
+    { completion: {} }, { retainedWorkspace: {} }, { batch: { issues, results } },
+  ])("rejects execution state on editable drafts %#", fields => {
+    expect(() => parseWorkers([{ ...draft, ...fields }])).toThrow(/draft batch/);
+  });
+
+  it("retains incomplete reports with explicit remaining work for continuation", () => {
+    const issueResults = [results[0], { ...results[1], status: "blocked", blocker: "Need a reproducible failing fixture." }];
+    expect(parseWorkerReport({ ...report, issueResults })).toMatchObject({ issueResults });
+    expect(parseWorkers([{ ...worker, batch: { issues, results: issueResults } }])[0].batch?.results).toEqual(issueResults);
+  });
+
+  it.each([
+    [], null, [results[0], results[0]], [{ ...results[0], number: "7" }],
+    [{ ...results[0], status: "done" }], [{ ...results[0], status: "blocked" }],
+    [{ ...results[0], status: "unfinished", blocker: " " }],
+    [{ ...results[0], status: "completed", blocker: "Runner unavailable" }],
+    [{ ...results[0], changes: " " }], [{ ...results[0], validation: " " }],
+    [{ ...results[0], validation: "v".repeat(20_001) }],
+  ])("rejects malformed member completion evidence %#", issueResults => {
+    expect(() => parseWorkerReport({ ...report, issueResults })).toThrow();
+  });
+
+  it("requires complete member coverage before restoring a pending publication", () => {
+    const publication = (issueResults?: unknown) => ({ report: { ...report, issueResults }, repliedDiscussionIds: [] });
+    const active = { ...worker, batch: { issues, results } };
+    expect(parseWorkers([{ ...active, pendingPublication: publication(results) }])[0].pendingPublication?.report.issueResults).toEqual(results);
+    for (const issueResults of [undefined, [results[0]], [results[0], { ...results[1], number: 9 }], [results[0], { ...results[1], status: "unfinished", blocker: "Needs regression validation." }], [results[0], { ...results[1], blocker: "Runner unavailable" }]]) {
+      expect(() => parseWorkers([{ ...active, pendingPublication: publication(issueResults) }])).toThrow(/batch|Batch/);
+    }
+  });
+
+  it("keeps batch results out of review reports", () => {
+    expect(() => parseWorkerReport({ kind: "review", headSha, event: "approve", body: "Done", comments: [], issueResults: results })).toThrow(/Only issue/);
+  });
+});

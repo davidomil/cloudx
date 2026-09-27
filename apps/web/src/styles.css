@@ -3696,6 +3696,14 @@ a:hover svg {
 .forge-item:hover, .forge-item.selected { background: color-mix(in srgb, var(--color-accent) 10%, transparent); }
 .forge-item.selected { box-shadow: inset 3px 0 var(--color-accent); }
 .forge-item-title { font-weight: 600; }
+.forge-item-row { display: flex; align-items: flex-start; }
+.forge-item-row .forge-item { flex: 1; min-width: 0; }
+.forge-panel .forge-batch-select { flex: none; width: 16px; height: 16px; padding: 0; margin: 16px 0 0 10px; accent-color: var(--color-accent); }
+.forge-batch-selection { padding: 12px; border-bottom: 1px solid var(--color-border); max-height: 35vh; overflow: auto; }
+.forge-batch-selection li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; overflow-wrap: anywhere; }
+.forge-batch-members ul, .forge-batch-selection ul { padding-left: 20px; }
+.forge-batch-members li { margin: 8px 0; overflow-wrap: anywhere; }
+.forge-batch-members p { margin: 4px 0; }
 .forge-item-workers, .forge-item-worker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .forge-item-worker .forge-status { width: fit-content; }
 .forge-item-worker-error { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; color: var(--color-warning); font-size: var(--font-size-xs); }

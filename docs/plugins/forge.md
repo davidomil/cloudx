@@ -56,6 +56,31 @@ worker’s input. Enabling **Auto review** coordinates coding, review,
 corrections, and the eligible merge automatically; a clarification
 request pauses the loop.
 
+## Batch related issues
+
+In **Issues**, select the checkboxes beside related issues, enter a
+**Batch name**, and choose **Save batch**. A batch contains up to 50
+issues from the configured repository. The saved draft survives refresh
+and restart.
+
+Open **Workers** to edit the draft name or its comma-separated **Issue
+numbers**. Save any edits, choose **Auto review**, then select **Start
+batch**. Forge validates all members before starting one worker with one
+checkout and one shared PR/MR. An issue already owned by an unfinished
+worker cannot start in another batch.
+
+The batch card lists every issue and its provider state, together with
+the last reported changes, validation and blockers. Every member must
+have a completed result before publication. If a member remains blocked
+or unfinished, use **Continue with message** on the existing worker
+after resolving the blocker.
+
+**Pause**, **Stop**, **Resume** and **Continue with message** keep the
+existing batch membership, native session history, commits, working
+files and shared request. Changing repository settings does not retarget
+it. After merge, Forge checks actual issue states and waits for any open
+member before cleanup.
+
 ## Review an existing request
 
 Select a PR/MR and choose **Review** to retain a draft, or **Review and

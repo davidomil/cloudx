@@ -36,7 +36,7 @@ import {
   string,
   webUrl,
 } from "./validation.js";
-import { validateCreateRequest, validateReview } from "./reviewValidation.js";
+import { validateCreateRequest, validateRequestText, validateReview } from "./reviewValidation.js";
 import { assertGitHubScopedFilter, resolveListScope } from "./listScope.js";
 
 interface GitHubReadiness {
@@ -229,6 +229,15 @@ export class GitHubProvider implements ForgeProvider {
       ...githubIssue(response.body),
       draft: boolean(record(response.body).draft),
     };
+  }
+
+  async updateChangeRequest(number: number, input: { title: string; body: string }): Promise<void> {
+    validateRequestText(input);
+    await this.http.request(this.pullPath(number), {
+      method: "PATCH",
+      role: "worker",
+      body: { title: input.title, body: input.body },
+    });
   }
 
   async findChangeRequestByBranch(

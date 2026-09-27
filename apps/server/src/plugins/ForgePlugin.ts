@@ -6,7 +6,7 @@ import {
   type WorkspacePlugin,
 } from "@cloudx/plugin-api";
 import type { DirectoryOwnershipReconciliation, ForgePlacement, ForgeRepository, ForgeReviewSubmission } from "@cloudx/shared";
-import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
+import { MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import {
   forgeConfigFields,
   type ForgeSettingsService,
@@ -127,6 +127,37 @@ export class ForgePlugin implements WorkspacePlugin {
             input.autoReview === true,
           ),
         }),
+      ),
+      hook(
+        "batch.save",
+        "Save issue batch draft",
+        "write",
+        { id, repository, name: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" }, numbers: { type: "array", minItems: 1, maxItems: MAX_FORGE_BATCH_ISSUES, uniqueItems: true, items: number } },
+        ["repository", "name", "numbers"],
+        async (input) => ({
+          worker: await this.service().workflow.saveBatch(input.repository as ForgeRepository, String(input.name), input.numbers as number[], input.id as string | undefined),
+        }),
+      ),
+      hook(
+        "batch.start",
+        "Start issue batch worker",
+        "external",
+        { id, autoReview: { type: "boolean" }, ...placement },
+        ["id", "windowId", "paneId"],
+        async (input) => ({
+          worker: await this.service().workflow.startBatch(String(input.id), place(input), input.autoReview === true),
+        }),
+      ),
+      hook(
+        "batch.delete",
+        "Delete issue batch draft",
+        "write",
+        { id },
+        ["id"],
+        async (input) => {
+          await this.service().workflow.deleteBatch(String(input.id));
+          return {};
+        },
       ),
       hook(
         "review.start",

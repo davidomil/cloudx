@@ -45,7 +45,7 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
     if (terminal && terminalRef.current?.contains(document.activeElement)) event.preventDefault();
   }} onClose={event => { if (!event.currentTarget.open) onClose(); }}>
     <header className="forge-worker-overlay-header">
-      <div><h2 id={titleId}>{worker.kind === "issue" ? "Issue" : "Review"} #{worker.number} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
+      <div><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
       <ControlButton size="compact" iconOnly aria-label="Close worker terminal" title="Close worker terminal" onClick={() => dialogRef.current!.close()}><X size={18} /></ControlButton>
     </header>
     {worker.error ? <p className="forge-notice" role="alert">{worker.error}</p> : null}

@@ -4,8 +4,16 @@ import type {
 } from "@cloudx/shared";
 import { ForgeProviderError } from "./ForgeProvider.js";
 
+export function rejectQuickActions(body: string): void {
+  if (/^\s*\/[a-z_]+(?:\s|$)/m.test(body))
+    throw new ForgeProviderError(
+      "GitLab review text cannot contain quick actions. Use the explicit review action buttons.",
+    );
+}
+
 export function validateCreateRequest(input: ForgeCreateChangeRequest): void {
-  for (const value of [input.title, input.headBranch, input.baseBranch]) {
+  validateRequestText(input);
+  for (const value of [input.headBranch, input.baseBranch]) {
     if (
       typeof value !== "string" ||
       !value.trim() ||
@@ -13,9 +21,20 @@ export function validateCreateRequest(input: ForgeCreateChangeRequest): void {
       /[\r\n\x00]/.test(value)
     )
       throw new ForgeProviderError(
-        "Set a title, source branch, and target branch (at most 255 characters each).",
+        "Set a source branch and target branch (at most 255 characters each).",
       );
   }
+}
+
+export function validateRequestText(input: { title: string; body: string }): void {
+  if (
+    !input ||
+    typeof input.title !== "string" ||
+    !input.title.trim() ||
+    input.title.length > 255 ||
+    /[\r\n\x00]/.test(input.title)
+  )
+    throw new ForgeProviderError("Set a title of at most 255 characters on one line.");
   if (typeof input.body !== "string" || input.body.length > 65_000)
     throw new ForgeProviderError(
       "Request descriptions must be at most 65,000 characters.",

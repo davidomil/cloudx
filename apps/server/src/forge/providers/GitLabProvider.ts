@@ -36,7 +36,7 @@ import {
   string,
   webUrl,
 } from "./validation.js";
-import { validateCreateRequest, validateReview } from "./reviewValidation.js";
+import { rejectQuickActions, validateCreateRequest, validateRequestText, validateReview } from "./reviewValidation.js";
 import { resolveListScope } from "./listScope.js";
 
 const commonFilters = new Set([
@@ -263,6 +263,16 @@ export class GitLabProvider implements ForgeProvider {
       },
     });
     return gitlabRequestSummary(response.body);
+  }
+
+  async updateChangeRequest(number: number, input: { title: string; body: string }): Promise<void> {
+    validateRequestText(input);
+    rejectQuickActions(input.body);
+    await this.http.request(this.requestPath(number), {
+      method: "PUT",
+      role: "worker",
+      body: { title: input.title, description: input.body },
+    });
   }
 
   async findChangeRequestByBranch(
@@ -686,11 +696,4 @@ function gitlabComment(value: unknown): ForgeComment {
     ...(line == null ? {} : { line: integer(line) }),
     ...(note.resolvable === true ? { resolved: boolean(note.resolved) } : {}),
   };
-}
-
-function rejectQuickActions(body: string): void {
-  if (/^\s*\/[a-z_]+(?:\s|$)/m.test(body))
-    throw new ForgeProviderError(
-      "GitLab review text cannot contain quick actions. Use the explicit review action buttons.",
-    );
 }

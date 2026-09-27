@@ -3173,16 +3173,18 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
   });
 
-  it("resumes the saved reviewer conversation after its tab and runtime are replaced", async () => {
+  it.each(["review", "batch"] as const)("resumes the saved %s conversation after its tab and runtime are replaced", async purpose => {
     const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
       await options.save(options.binding ?? conversationBinding(launch.tabId));
       return (options.binding ?? conversationBinding(launch.tabId)).threadId!;
     }) };
     runtime = new ForgeRuntime(deps);
-    const workspace = await prepare("review-restart", true);
+    const workspace = await prepare(`${purpose}-restart`, purpose === "review");
     const fixture = installReviewTabs(deps, workspace);
-    const first = await runtime.launch(fixture.request);
+    const request = { ...fixture.request, ...(purpose === "batch" ? { preserveConversation: true as const } : {}) };
+    const first = await runtime.launch(request);
+    if (purpose === "batch") await fs.writeFile(path.join(workspace.worktreePath, "unfinished.txt"), "Unfinished batch work\n");
     const firstView = fixture.launchPath();
     const firstIdentity = await fs.stat(firstView, { bigint: true });
     await runtime.close(first);
@@ -3190,15 +3192,47 @@ describe("ForgeRuntime Codex tabs", () => {
     expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
     runtime = new ForgeRuntime(deps);
 
-    const second = await runtime.launch(fixture.request);
+    const second = await runtime.launch(request);
 
     expect(second).not.toBe(first);
     expect(fixture.resumedIds).toEqual([conversationBinding().threadId, conversationBinding().threadId]);
     expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].binding).toEqual(conversationBinding());
+    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].purpose).toBe(purpose);
+    if (purpose === "batch") expect(await fs.readFile(path.join(workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Unfinished batch work\n");
     const secondView = fixture.launchPath();
     await runtime.close(second);
     await expect(fs.stat(secondView)).rejects.toMatchObject({ code: "ENOENT" });
     expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
+  });
+
+  it.each(["missing binding", "invalid thread", "missing preservation"])("blocks a batch with %s before another native session can launch", async problem => {
+    const deps = dependencies({ trustRepository: true });
+    deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
+      const binding = options.binding ?? conversationBinding(launch.tabId);
+      await options.save(binding);
+      return binding.threadId!;
+    }) };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("batch-invalid-binding");
+    const fixture = installReviewTabs(deps, workspace);
+    const request = { ...fixture.request, preserveConversation: true as const };
+    await runtime.close(await runtime.launch(request));
+    const manifest = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const record = JSON.parse(await fs.readFile(manifest, "utf8"));
+    expect(record).toMatchObject({ batchConversationRequired: true, batchConversation: { threadId: conversationBinding().threadId } });
+    expect(record.reviewConversation).toBeUndefined();
+    if (problem === "missing binding") delete record.batchConversation;
+    if (problem === "invalid thread") record.batchConversation.threadId = "latest";
+    await fs.writeFile(manifest, JSON.stringify(record));
+    const original = await fs.readFile(manifest, "utf8");
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.launch(problem === "missing preservation" ? fixture.request : request)).rejects.toThrow(
+      problem === "missing preservation" ? "preserved conversation" : "ownership record is missing or invalid",
+    );
+    expect(deps.workspaceCommands.createTab).toHaveBeenCalledOnce();
+    expect(deps.reviewConversations.prepare).toHaveBeenCalledOnce();
+    expect(await fs.readFile(manifest, "utf8")).toBe(original);
+    expect((await fs.readdir(fixture.launchPath())).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
   });
 
   it("retains a created reviewer thread and removes disposable paths after verified preparation failure", async () => {
