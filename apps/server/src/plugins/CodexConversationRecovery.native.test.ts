@@ -15,6 +15,7 @@ import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
 import type { PluginSession } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
+import { SessionStateStore } from "../workspace/SessionStateStore.js";
 
 const codexBinary = process.env.CLOUDX_NATIVE_CODEX;
 
@@ -102,7 +103,7 @@ it.skipIf(!codexBinary)("requires selection after native resume changes conversa
 }, 30_000);
 
 it.skipIf(!codexBinary).each([
-  { name: "preserves launch permissions through native new, idle resume and process loss", transition: "new" },
+  { name: "preserves launch permissions and native conversation evidence through new, idle resume, process loss and migration", transition: "new" },
   { name: "preserves native permission changes through fork and process loss", transition: "fork" },
   { name: "preserves native permission changes through first-prompt editing and process loss", transition: "edit" },
   { name: "preserves native permission changes through new and process loss", transition: "restricted-new" },
@@ -264,11 +265,14 @@ it.skipIf(!codexBinary).each([
     expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
 
     // The terminal supervisor stops both the visible TUI and backend. No prompt is replayed.
+    await expect.poll(() => terminal!.restoreInput!()).toMatchObject({ codexExecutionId: executionId, resume: { mode: "session", sessionId: selected } });
+    const savedInput = terminal!.restoreInput!()!;
     await terminal!.terminate!();
     terminal = undefined;
     const persisted = new CodexConversationRecovery(sources.viewPath(tab.id)).read();
     expect(persisted).toMatchObject({ sessionId: selected, selection: { tabId: tab.id, executionId } });
     expect(await plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: selected });
+    if (transition === "new") await expectMigrationSnapshotPreservesNativeConversation({ data, home, sources, tab, initialInput: savedInput });
     const replacementRoot = path.join(root, "configured-after-restart");
     await fs.mkdir(replacementRoot);
     const configPath = path.join(home, "config.toml");
@@ -298,6 +302,41 @@ it.skipIf(!codexBinary).each([
     await fs.rm(root, { recursive: true, force: true });
   }
 }, 45_000);
+
+async function expectMigrationSnapshotPreservesNativeConversation({ data, home, sources, tab, initialInput }: {
+  data: string; home: string; sources: CodexStateSources; tab: WorkspaceTab; initialInput: Record<string, unknown>;
+}) {
+  const view = sources.viewPath(tab.id);
+  const receipt = JSON.parse(await fs.readFile(path.join(view, ".cloudx-conversation.json"), "utf8"));
+  expect(receipt).toMatchObject({ version: 2, authority: "selected", tabId: tab.id, executionId: initialInput.codexExecutionId });
+  expect(receipt.transcriptPath.startsWith(`${path.join(view, "sessions")}${path.sep}`)).toBe(true);
+  expect(await fs.realpath(path.join(view, "sessions"))).toBe(path.join(home, "sessions"));
+  expect(await sources.readBinding(tab.id)).toMatchObject({ sourceId: "shared", home });
+  const transcriptPath = await fs.realpath(receipt.transcriptPath);
+  expect(transcriptPath).not.toBe(receipt.transcriptPath);
+
+  await new SessionStateStore(data).save({ version: 1, activeTabId: tab.id, sessions: [{ tab, initialInput }] });
+  await fs.writeFile(path.join(data, "workspace.json"), JSON.stringify({ windows: [{
+    id: "native-window", name: "Native recovery", defaultCwd: tab.cwd, createdAt: tab.createdAt, updatedAt: tab.updatedAt,
+    layout: { activePaneId: "native-pane", root: { type: "pane", pane: { id: "native-pane", tabIds: [tab.id] } } }
+  }] }));
+  const originals = new Map(await Promise.all([
+    "sessions.json", "workspace.json", `codex-launches/${tab.id}/.cloudx-source.json`, `codex-launches/${tab.id}/.cloudx-conversation.json`
+  ].map(async relative => [relative, await fs.readFile(path.join(data, relative))] as const)));
+  const transcript = await fs.readFile(receipt.transcriptPath);
+  const { snapshotTerminalRecovery } = await import(new URL("../../../../scripts/terminal-upgrade-recovery.mjs", import.meta.url).href);
+  const backup = snapshotTerminalRecovery({ dataDir: data, log: () => undefined });
+  expect(backup).toBeTypeOf("string");
+  for (const [relative, original] of originals) {
+    expect(await fs.readFile(path.join(data, relative))).toEqual(original);
+    expect(await fs.readFile(path.join(backup, relative))).toEqual(original);
+  }
+  expect(await fs.readFile(receipt.transcriptPath)).toEqual(transcript);
+  expect(await fs.readFile(path.join(backup, "transcripts", `${tab.id}.jsonl`))).toEqual(transcript);
+  expect(JSON.parse(await fs.readFile(path.join(backup, "manifest.json"), "utf8")).conversations).toEqual([{
+    tabId: tab.id, lastObservedSessionId: receipt.sessionId, transcriptPath, snapshot: `transcripts/${tab.id}.jsonl`
+  }]);
+}
 
 it.skipIf(!codexBinary)("verifies the supported CLI through the updater's production tab launch contract", async () => {
   const evidence: string[] = [];
