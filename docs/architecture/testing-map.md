@@ -47,6 +47,12 @@ run `npm cache add smol-toml@1.7.0` before these tests: CloudX 0.1.3 pins that
 version while the current lockfile pins 1.7.1. Both the TypeScript job and the
 isolated verifier image seed this extra dependency before offline execution.
 
+Forge migration cases that originated on development branches use the
+[checked-in historical fixtures](../../scripts/fixtures/forge-history/README.md).
+They preserve the prior integrator and native draft-reader state without
+requiring discarded branch commits or network access during tests. Blob-identity
+assertions verify the archived inputs before migration.
+
 ## Terminal reliability stress
 
 The terminal stress job runs three fresh Node 22 V8 coverage processes

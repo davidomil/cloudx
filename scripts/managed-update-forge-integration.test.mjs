@@ -5,7 +5,8 @@ import { afterEach, expect, it } from 'vitest';
 import { FORGE_EVIDENCE_FILE, FORGE_INTEGRATION_FILES, FORGE_RUNTIME_FILE, FORGE_SERVICE_FILE,
   FORGE_VALIDATION_FILE, prepareManagedForgeIntegration } from './managed-update-forge-integration.mjs';
 import { prepareManagedIntegration } from './managed-update-integration.mjs';
-import { cleanupHistoricalForge, historicalForge } from './helpers/managed-update-forge-history-fixture.mjs';
+import { cleanupHistoricalForge, historicalForge, FORGE_WITH_HISTORICAL_DRAFTS } from './helpers/managed-update-forge-history-fixture.mjs';
+import { prepareManagedForgeIntegration as preparePreviousForgeIntegration } from './fixtures/forge-history/previous-integration.mjs';
 
 const sources = new Map();
 const maintained = file => fs.readFileSync(file, 'utf8');
@@ -16,6 +17,19 @@ function historical(file, commit = 'aec0d06e7f9087f9e912f6023cfbde5623f28178') {
 }
 afterEach(cleanupHistoricalForge);
 
+it('preserves the exact historical sources before running migration regressions', () => {
+  const history = historicalForge(FORGE_WITH_HISTORICAL_DRAFTS, { integrate: false });
+  const blobs = [
+    [path.join(history.root, FORGE_RUNTIME_FILE), 'd3aa2388711efa4368e470a54d31eee7a3f078b2'],
+    [path.join(history.root, FORGE_SERVICE_FILE), 'b381c009be062a1353258cd28798d11a50fb4350'],
+    [path.join(history.root, FORGE_VALIDATION_FILE), 'eb49841eab96e94859726539c3ec52463d6d07b4'],
+    ['scripts/fixtures/forge-history/previous-integration.mjs', '0a5ac0720a046e56329c217af1ea6cf6261ae2bc'],
+  ];
+  for (const [file, blob] of blobs)
+    expect(execFileSync('git', ['hash-object', file], { encoding: 'utf8' }).trim()).toBe(blob);
+  expect(execFileSync('git', ['status', '--porcelain'], { cwd: history.root, encoding: 'utf8' })).toBe('');
+});
+
 it.each(['aec0d06e7f9087f9e912f6023cfbde5623f28178', 'c664071e04091db6be78df09d8c91a1975e9313c'])('preserves the native reader/writer contract and accepts integrated %s', commit => {
   const target = file => historical(file, commit);
   expect(prepareManagedForgeIntegration(maintained, maintained)).toEqual({});
@@ -25,20 +39,19 @@ it.each(['aec0d06e7f9087f9e912f6023cfbde5623f28178', 'c664071e04091db6be78df09d8
 });
 
 it.each([
-  ['7604d8d', [FORGE_SERVICE_FILE]],
+  [FORGE_WITH_HISTORICAL_DRAFTS, [FORGE_SERVICE_FILE]],
   ['2f28a100cd765b8c209e85fdacb03b03a57ba0df', [FORGE_VALIDATION_FILE, FORGE_SERVICE_FILE]],
 ])('adds continuation to native %s without replacing its comparison and ownership implementation', (commit, files) => {
-  const target = file => historical(file, commit);
+  const history = historicalForge(commit, { integrate: false });
+  const target = file => fs.readFileSync(path.join(history.root, file), 'utf8');
   const migrated = prepareManagedForgeIntegration(target, maintained);
   expect(Object.keys(migrated)).toEqual(files);
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? target(file), maintained)).toEqual({});
 });
 
-it.each(['a9613faf', 'aec0d06e', 'c664071e'])('adds continuation to previously integrated %s targets', async commit => {
-  const source = historical('scripts/managed-update-forge-integration.mjs', '540da2c');
-  const previous = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+it.each(['a9613faf', 'aec0d06e', 'c664071e'])('adds continuation to previously integrated %s targets', commit => {
   const target = file => historical(file, commit);
-  const integrated = previous.prepareManagedForgeIntegration(target, maintained);
+  const integrated = preparePreviousForgeIntegration(target, maintained);
   const migrated = prepareManagedForgeIntegration(file => integrated[file] ?? target(file), maintained);
   expect(Object.keys(migrated)).toEqual([FORGE_SERVICE_FILE]);
   expect(prepareManagedForgeIntegration(file => migrated[file] ?? integrated[file] ?? target(file), maintained)).toEqual({});
