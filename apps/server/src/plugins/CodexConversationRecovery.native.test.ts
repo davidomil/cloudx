@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { createServer } from "node:http";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 import { AppServerClient, StdioAppServerTransport } from "../appServer/AppServerClient.js";
@@ -14,7 +14,8 @@ import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
 import type { PluginSession } from "@cloudx/plugin-api";
-import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
+import { NodePtyTerminalProcess, NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
+import { SessionStateStore } from "../workspace/SessionStateStore.js";
 
 const codexBinary = process.env.CLOUDX_NATIVE_CODEX;
 
@@ -102,7 +103,7 @@ it.skipIf(!codexBinary)("requires selection after native resume changes conversa
 }, 30_000);
 
 it.skipIf(!codexBinary).each([
-  { name: "preserves launch permissions through native new, idle resume and process loss", transition: "new" },
+  { name: "preserves launch permissions and native conversation evidence through new, idle resume, process loss and migration", transition: "new" },
   { name: "preserves native permission changes through fork and process loss", transition: "fork" },
   { name: "preserves native permission changes through first-prompt editing and process loss", transition: "edit" },
   { name: "preserves native permission changes through new and process loss", transition: "restricted-new" },
@@ -165,11 +166,7 @@ it.skipIf(!codexBinary).each([
     return terminal.restoreInput!()!.codexExecutionId as string;
   };
   const visibleOutput = () => stripVTControlCharacters(output).replace(/\s+/gu, "");
-  const submit = async (text: string) => {
-    terminal!.write!(text);
-    await new Promise(resolve => setTimeout(resolve, 100));
-    terminal!.write!("\r");
-  };
+  const submit = (text: string) => terminal!.write!(`\u001b[200~${text}\u001b[201~\r`);
   const readTranscript = async () => {
     const file = recovery.read()?.transcriptPath;
     if (!file) return [];
@@ -178,7 +175,7 @@ it.skipIf(!codexBinary).each([
   };
   const completeTurn = async (text: string) => {
     const previous = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload.turn_id;
-    await submit(text);
+    submit(text);
     await expect.poll(async () => {
       const completed = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload;
       return completed?.turn_id !== previous ? completed : output;
@@ -222,7 +219,7 @@ it.skipIf(!codexBinary).each([
 
     let selected = original;
     if (transition !== "new") {
-      await submit("/permissions");
+      submit("/permissions");
       await expect.poll(visibleOutput).toContain("1.Askforapproval");
       output = "";
       terminal!.write!("1");
@@ -233,7 +230,7 @@ it.skipIf(!codexBinary).each([
         terminal!.write!("\u001b");
         await new Promise(resolve => setTimeout(resolve, 150));
         terminal!.write!("\r");
-      } else await submit(transition === "fork" ? "/fork" : "/new");
+      } else submit(transition === "fork" ? "/fork" : "/new");
       if (transition === "edit") {
         await expect.poll(visibleOutput, { timeout: 5_000 }).toContain("Conversationrevertedtothispoint.");
         expect(recovery.read()?.sessionId).toBe(original);
@@ -247,7 +244,7 @@ it.skipIf(!codexBinary).each([
       });
       expect(restrictedTranscript.filter(item => item.type === "turn_context").at(-1)?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
     } else {
-      await submit("/new");
+      submit("/new");
       await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
       expect(recovery.read()!.sessionId).toBeTruthy();
       expect(requests.filter(value => value === "conversation")).toHaveLength(1);
@@ -257,18 +254,21 @@ it.skipIf(!codexBinary).each([
         approval_policy: "never", sandbox_policy: { type: "danger-full-access" }
       });
       expect(newTranscript.find(item => item.type === "turn_context")?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
-      await submit(`/resume ${original}`);
+      submit(`/resume ${original}`);
       await expect.poll(() => recovery.read()?.sessionId === original ? original : output, { timeout: 5_000 }).toBe(original);
     }
     const conversationCount = 2;
     expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
 
     // The terminal supervisor stops both the visible TUI and backend. No prompt is replayed.
+    await expect.poll(() => terminal!.restoreInput!()).toMatchObject({ codexExecutionId: executionId, resume: { mode: "session", sessionId: selected } });
+    const savedInput = terminal!.restoreInput!()!;
     await terminal!.terminate!();
     terminal = undefined;
     const persisted = new CodexConversationRecovery(sources.viewPath(tab.id)).read();
     expect(persisted).toMatchObject({ sessionId: selected, selection: { tabId: tab.id, executionId } });
     expect(await plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: selected });
+    if (transition === "new") await expectMigrationSnapshotPreservesNativeConversation({ data, home, sources, tab, initialInput: savedInput });
     const replacementRoot = path.join(root, "configured-after-restart");
     await fs.mkdir(replacementRoot);
     const configPath = path.join(home, "config.toml");
@@ -299,11 +299,61 @@ it.skipIf(!codexBinary).each([
   }
 }, 45_000);
 
-it.skipIf(!codexBinary)("verifies the supported CLI through the updater's production tab launch contract", async () => {
+async function expectMigrationSnapshotPreservesNativeConversation({ data, home, sources, tab, initialInput }: {
+  data: string; home: string; sources: CodexStateSources; tab: WorkspaceTab; initialInput: Record<string, unknown>;
+}) {
+  const view = sources.viewPath(tab.id);
+  const receipt = JSON.parse(await fs.readFile(path.join(view, ".cloudx-conversation.json"), "utf8"));
+  expect(receipt).toMatchObject({ version: 2, authority: "selected", tabId: tab.id, executionId: initialInput.codexExecutionId });
+  expect(receipt.transcriptPath.startsWith(`${path.join(view, "sessions")}${path.sep}`)).toBe(true);
+  expect(await fs.realpath(path.join(view, "sessions"))).toBe(path.join(home, "sessions"));
+  expect(await sources.readBinding(tab.id)).toMatchObject({ sourceId: "shared", home });
+  const transcriptPath = await fs.realpath(receipt.transcriptPath);
+  expect(transcriptPath).not.toBe(receipt.transcriptPath);
+
+  await new SessionStateStore(data).save({ version: 1, activeTabId: tab.id, sessions: [{ tab, initialInput }] });
+  await fs.writeFile(path.join(data, "workspace.json"), JSON.stringify({ windows: [{
+    id: "native-window", name: "Native recovery", defaultCwd: tab.cwd, createdAt: tab.createdAt, updatedAt: tab.updatedAt,
+    layout: { activePaneId: "native-pane", root: { type: "pane", pane: { id: "native-pane", tabIds: [tab.id] } } }
+  }] }));
+  const originals = new Map(await Promise.all([
+    "sessions.json", "workspace.json", `codex-launches/${tab.id}/.cloudx-source.json`, `codex-launches/${tab.id}/.cloudx-conversation.json`
+  ].map(async relative => [relative, await fs.readFile(path.join(data, relative))] as const)));
+  const transcript = await fs.readFile(receipt.transcriptPath);
+  const { snapshotTerminalRecovery } = await import(new URL("../../../../scripts/terminal-upgrade-recovery.mjs", import.meta.url).href);
+  const backup = snapshotTerminalRecovery({ dataDir: data, log: () => undefined });
+  expect(backup).toBeTypeOf("string");
+  for (const [relative, original] of originals) {
+    expect(await fs.readFile(path.join(data, relative))).toEqual(original);
+    expect(await fs.readFile(path.join(backup, relative))).toEqual(original);
+  }
+  expect(await fs.readFile(receipt.transcriptPath)).toEqual(transcript);
+  expect(await fs.readFile(path.join(backup, "transcripts", `${tab.id}.jsonl`))).toEqual(transcript);
+  expect(JSON.parse(await fs.readFile(path.join(backup, "manifest.json"), "utf8")).conversations).toEqual([{
+    tabId: tab.id, lastObservedSessionId: receipt.sessionId, transcriptPath, snapshot: `transcripts/${tab.id}.jsonl`
+  }]);
+}
+
+it.skipIf(!codexBinary).each([false, true])("verifies the updater's production tab launch with coalesced input: %s", async coalesceInput => {
   const evidence: string[] = [];
-  await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
-  expect(evidence).toEqual([
-    "Selected conversation saved before any model prompt.\n",
-    "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
-  ]);
+  const write = NodePtyTerminalProcess.prototype.write;
+  let bufferedInput = "";
+  // A busy native reader can consume prompt text and Enter together, regardless of write timing.
+  const writeSpy = coalesceInput ? vi.spyOn(NodePtyTerminalProcess.prototype, "write").mockImplementation(function (this: NodePtyTerminalProcess, data) {
+    if (data === "\u001b[1;1R") return write.call(this, data);
+    bufferedInput += data;
+    if (bufferedInput.endsWith("\r")) {
+      write.call(this, bufferedInput);
+      bufferedInput = "";
+    }
+  }) : undefined;
+  try {
+    await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
+    expect(evidence).toEqual([
+      "Selected conversation saved before any model prompt.\n",
+      "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
+    ]);
+  } finally {
+    writeSpy?.mockRestore();
+  }
 }, 35_000);

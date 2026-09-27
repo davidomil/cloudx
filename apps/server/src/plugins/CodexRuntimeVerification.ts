@@ -67,7 +67,8 @@ export async function verifyCodexRuntime({ assistantBin, env = process.env, sign
     assert.equal(identity.selection!.tabId, tab.id);
     assert.equal(identity.selection!.executionId, session.restoreInput?.()?.codexExecutionId);
     onOutput?.("Selected conversation saved before any model prompt.\n");
-    await session.handleAction("enter_text", { text: "Verify this isolated CloudX launch.", submit: true });
+    // Explicit paste boundaries keep Enter out of native burst detection even when PTY input is coalesced.
+    session.write!("\u001b[200~Verify this isolated CloudX launch.\u001b[201~\r");
     let transcript: Array<{ type: string; payload?: Record<string, unknown> }> = [];
     await waitFor("The synthetic local-provider turn did not complete", async () => {
       const transcriptPath = recovery.read()?.transcriptPath;
