@@ -117,66 +117,126 @@ superseded result pauses Forge before review feedback can restart
 implementation; refresh the test merge for a new identity before
 resuming.
 
-## Performance evidence still required
+## GitHub performance comparison
 
-The batch issue records three successful GitHub workflows at
-46m33s–48m10s. Local test durations are useful scheduling inputs but are
-not a measured GitHub workflow speedup. After publication, compare
-successful runs by exact commit, sample size, runner resources,
-cold/warm cache status, workflow elapsed time, slowest job and summed
-runner time. Retain the uploaded attestations and timing reports; do not
-infer linear speedup from shard count.
+Three successful baseline workflows took 46m33s–48m10s (mean 47m08s).
+Two successful post-change measurements of the same test merge took
+16m57s with a warm verifier image cache and 17m45s after clearing that
+pull request’s verifier cache indexes. These observations reduce
+workflow elapsed time by 64.0% and 62.3% against the baseline mean. The
+sample size is three before and two after, with one observation per
+post-change cache condition.
 
-## Provider observations before review fixes
+| Run / attempt                                                                                     | Cache condition                    | Workflow elapsed | Slowest job                            | Summed job time |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------- | ---------------- | -------------------------------------- | --------------- |
+| [36336277366](https://github.com/davidomil/cloudx/actions/runs/36336277366)                       | Cold image; warm host dependencies | 46m42s           | 46m32s (isolated verifier)             | 90m10s          |
+| [36335167752](https://github.com/davidomil/cloudx/actions/runs/36335167752)                       | Cold image; warm host dependencies | 48m10s           | 47m40s (isolated verifier)             | 96m02s          |
+| [36334734155](https://github.com/davidomil/cloudx/actions/runs/36334734155)                       | Cold image; warm host dependencies | 46m33s           | 46m26s (isolated verifier)             | 90m33s          |
+| [36356140399, attempt 1](https://github.com/davidomil/cloudx/actions/runs/36356140399/attempts/1) | Warm image; warm host dependencies | 16m57s           | 16m46s (host lifecycle)                | 85m15s          |
+| [36356140399, attempt 2](https://github.com/davidomil/cloudx/actions/runs/36356140399/attempts/2) | Cold image; warm host dependencies | 17m45s           | 14m26s (Isolated verifier (browser-1)) | 104m15s         |
 
-GitHub acceptance remains pending. The three successful baseline
-workflows are
-[36336277366](https://github.com/davidomil/cloudx/actions/runs/36336277366)
-(46m42s elapsed, 46m32s slowest job, 90m10s summed job time),
-[36335167752](https://github.com/davidomil/cloudx/actions/runs/36335167752)
-(48m10s, 47m40s, 96m02s), and
-[36334734155](https://github.com/davidomil/cloudx/actions/runs/36334734155)
-(46m33s, 46m26s, 90m33s). The isolated verifier is the slowest job in
-each. These are three observations across different commits. Times come
-from Actions run/job API timestamps; summed time includes every
-non-skipped job.
+Successful workflows; elapsed time includes setup and image
+construction.
+
+The warm attempt’s slowest job was TypeScript (build, type-check, test);
+the cold attempt’s was Isolated verifier (browser-1). The previous
+critical path was the serial isolated verifier. Summed job time changed
+from a baseline mean of 92m15s to 85m15s warm and 104m15s cold. Summed
+time is 7.6% lower than the baseline mean when warm and 13.0% higher
+when cold. Parallel lanes reduce latency; this separate resource cost
+remains visible. These runs support a material reduction beyond the
+roughly-halved target, but one sample per cache condition cannot
+establish normal variance or attribute the difference between the two
+new runs to caching alone.
+
+Workflow elapsed time uses the attempt’s run_started_at and completion
+updated_at timestamps. Job durations use started_at/completed_at; their
+sum excludes skipped jobs and includes setup, image builds, diagnostics
+and aggregation. This sum measures occupied job time rather than billed
+minutes or CPU time. Different baseline commits contain different
+feature tests, so this is an observed before/after comparison, not a
+controlled attribution to one code change.
+
+## Exact tested identities
+
+Both post-change attempts tested merge
+`2188781a997bcf91319bde4413f7e9b65d9cf5c8`, with base
+`630b42dced9c45951b6fb994b66ce3d69de67dde`, head
+`8477c2bed66af2b17da9e927da3930c62be593f4` and tree
+`15c806653c64758c89a1d759c64bc703e8a917c4`. Trusted identity passed in
+both attempts. The base/head/merge refs were checked again before the
+cold measurement; no code or workflow changed between the samples.
 
 Baseline main run 36336277366 tested
-7d809426c56e7fe49a68f8678951ac01ba20fdf5, whose parent is
-d8e620cf3c009cbb64fe925de24ae6d9daf0996c. PR run 36335167752 tested
-merge 0ccad34bf96b7af1bae1b2c9cbdf5ed746a3504f with base
-d8e620cf3c009cbb64fe925de24ae6d9daf0996c and head
-b5330f72b79be95b55ef135b42ea0a5f1f0832c4. PR run 36334734155 tested
-merge b21c69e46a7c03f48d91048e1b6fa3627a7de52b with the same base and
-head b310866910190daa98aedc72799f9e13ff4ab369. The Git commit API
-confirms these parents.
+`7d809426c56e7fe49a68f8678951ac01ba20fdf5`, with parent
+`d8e620cf3c009cbb64fe925de24ae6d9daf0996c`. PR run 36335167752 tested
+merge `0ccad34bf96b7af1bae1b2c9cbdf5ed746a3504f`, base
+`d8e620cf3c009cbb64fe925de24ae6d9daf0996c` and head
+`b5330f72b79be95b55ef135b42ea0a5f1f0832c4`. PR run 36334734155 tested
+merge `b21c69e46a7c03f48d91048e1b6fa3627a7de52b`, the same base and head
+`b310866910190daa98aedc72799f9e13ff4ab369`. Git commit API responses
+confirm the recorded parents.
 
-[PR \#154 run
-36353377140](https://github.com/davidomil/cloudx/actions/runs/36353377140)
-tested merge 95bd66b60ff9eef151e928fbb98e8817604a9b8f with base
-630b42dced9c45951b6fb994b66ce3d69de67dde and head
-71dff8513afc8ec3343a5ddfe92b036238c8b670. It finished in 14m37s; browser
-shard 1 was slowest at 11m25s, and summed job time was 98m07s. Every
-workload job passed, but Trusted merge identity and CI aggregate failed.
-The identity log reports an invalid or missing test-merge SHA. A
-subsequent public request with the production API version reproduced the
-removed merge_commit_sha field despite mergeable:true; the corrected
-production resolver accepted the exact merge ref in a read-only probe.
-This failed workflow is excluded from successful performance acceptance.
-There are no successful post-change acceptance samples yet.
+## Resources and cache classification
 
-These jobs use ubuntu-24.04 runners; the isolated workloads are bounded
-to two CPUs and 7 GiB. Actual host CPU/RAM were not recorded in the
-recovered job API metadata. Available baseline log excerpts end during
-image construction, so baseline cold/warm state remains unclassified. In
-run 36353377140 the browser shard 1 image build showed no cached steps
-and coverage-merge reused 18 cached steps within that workflow. This
-does not provide independent successful cold and warm workflow samples.
+All runs use public GitHub-hosted ubuntu-24.04 runners. Baseline host
+artifacts measured four available CPUs; physical RAM was not recorded
+and cannot be reconstructed from their unbounded memory-limit sentinel.
+GitHub documents this runner class as four CPUs and 16 GB RAM. New
+Buildx logs measured four CPUs and 15.61–15.62 GiB RAM. This
+distinguishes measured resources from the historical runner contract.
+Isolated verifier workloads retain two-CPU and 7-GiB limits; dedicated
+stress artifacts also confirm zero swap. See the [GitHub runner
+specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
-Before approval, merge or closing \#147, record representative
-successful post-fix GitHub runs, classify cold/warm cache state, record
-actual runner CPU/RAM, and compare exact base/head/merge identities,
-sample size, workflow elapsed, slowest job and summed job time with the
-baseline. Preserve the test/skip inventory and merged thresholds. The
-implementation handoff to CloudX for publication and review does not
-satisfy this acceptance gate.
+Complete baseline log archives show zero cached verifier image steps,
+with image construction taking 105.200s, 101.673s and 98.687s. Separate
+host npm/uv caches were restored. The warm post-change attempt restored
+18 image steps in every lane. For the cold measurement, exactly 20
+verifier manifest indexes were removed only from `refs/pull/154/merge`;
+no default-branch index existed. Layer blobs and host dependency caches
+were retained. All nine workload image builds then executed with zero
+cached steps. Coverage merge reused the image built earlier in that same
+cold attempt. Thus “cold” describes the verifier image build, not an
+entirely cache-free workflow.
+
+The failed earlier PR154 run 36353377140 (14m37s) remains excluded from
+successful performance samples. Its identity failure was reproduced and
+corrected before these measurements. Complete log ZIPs were used for the
+baseline because the CLI text view ended before a long
+diagnostics-fixture line; the ZIPs contain the final successful results.
+
+## Preserved validation inventory
+
+Both new attempts passed all ten isolated attestations, with 7,963
+Vitest tests, 222 desktop/mobile browser tests, 137 ASR tests and 1,054
+documentation tests. Browser reports contain no skipped, failed or flaky
+cases. The host command passed all eight systemd/cgroup cases, and both
+native Codex versions passed all 11 dedicated acceptance cases and their
+production-verifier checks. Terminal stress passed three repetitions of
+57 selected cases per attempt; its other 21 collected cases are outside
+the stress selection and retain ordinary coverage ownership. All seven
+ordinary historical targets remain, with cleanup receipts confirming
+directory removal.
+
+The 98 isolated Vitest skips remain explicitly owned: 86 optional
+documentation-media environment cases, 11 native cases run by the
+dedicated version jobs, and one cgroup case run on the host.
+Documentation retains 12 environment skips. No historical target,
+assertion or coverage threshold was removed for the timing comparison.
+
+Merged warm coverage was 83.29% statements, 84.7% functions, 83.99%
+lines and 76.91% branches. Cold coverage was 83.29%, 84.68%, 83.99% and
+76.91% respectively. Both passed the unchanged 70%
+statements/functions/lines and 60% branches thresholds. Independent
+validation accepted every required lane and its exact candidate/source
+identity.
+
+Baseline main, PR136 and PR145 respectively reported 7,739/7,731,
+7,863/7,855 and 7,805/7,797 passing Vitest tests in their duplicated
+host/isolated executions. Their duplicated browser runs contained 220,
+228 and 222 tests. Those counts reflect different feature contents and
+execution environments. The ownership sections above explain the
+relocation of generic coverage/browser/Python checks while retaining
+distinct host, native and stress behavior; raw count differences are not
+treated as evidence of removed coverage.
