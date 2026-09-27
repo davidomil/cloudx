@@ -14,6 +14,7 @@ let root: Root | undefined;
 const reload = vi.fn();
 const available: CloudxUpdateStatus = { available: true };
 const mainPreview: CloudxUpdatePreview = {
+  runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: false },
   channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00.000Z", state: "available",
   target: { commit: "b".repeat(40), name: "main", url: "https://github.com/davidomil/cloudx/commit/" + "b".repeat(40) },
   changelog: [{ number: 82, title: "Choose an update channel", url: "https://github.com/davidomil/cloudx/pull/82" }],
@@ -177,11 +178,72 @@ describe("CloudX updates", () => {
     expect(container.querySelector("select")?.disabled).toBe(false);
   });
 
-  it("allows dependency updates when the selected commit is already installed", async () => {
+  it.each(["main", "releases"] as const)("distinguishes a current checkout from a verified running server on %s", async channel => {
     vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
-    const container = await mount(undefined, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit, changelog: [] }));
-    expect(container.textContent).toContain("CloudX is up to date with main. You can still update dependencies.");
+    const container = await mount(undefined, async () => reply({ ...mainPreview, channel, state: "current",
+      target: { ...mainPreview.target!, commit: mainPreview.currentCommit }, changelog: [] }));
+    expect(container.textContent).toContain(channel === "main" ? "The checkout is up to date with main." : "The checkout matches the latest release.");
+    expect(container.textContent).toContain("Running server commit: aaaaaaaaaaaa. Build verification: verified at startup.");
+    expect(container.textContent).toContain("The verified running server matches the selected target.");
+    expect(container.textContent).toContain("it does not verify this browser’s loaded frontend");
     expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
+
+  it("offers a pinned rebuild when the checkout advanced but the old server is still running", async () => {
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => reply(init?.method === "POST" ? run() : available));
+    vi.stubGlobal("fetch", fetch);
+    const save = vi.fn(async () => undefined);
+    const container = await mount(save, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit }));
+    expect(container.textContent).toContain("The checkout is up to date with main.");
+    expect(container.textContent).toContain("Checkout commit: bbbbbbbbbbbb");
+    expect(container.textContent).toContain("Running server commit: aaaaaaaaaaaa");
+    expect(container.textContent).toContain("The running server differs from the checkout.");
+    expect(container.textContent).not.toContain("CloudX is up to date");
+    expect(button("Rebuild and activate CloudX").disabled).toBe(false);
+    await click("Rebuild and activate CloudX");
+    expect(save).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([, init]) => JSON.parse(init!.body as string)))
+      .toEqual([{ channel: "main", targetCommit: mainPreview.target!.commit }]);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.each(["A complete runtime build receipt is unavailable.", "The runtime build receipt is invalid."])("offers repair without inventing a running commit: %s", async reason => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit,
+      runtime: { verification: "unverified", reason } }));
+    expect(container.textContent).toContain("Running server commit: unknown. Build verification: unverified.");
+    expect(container.textContent).toContain(reason);
+    expect(container.textContent).not.toContain("The verified running server matches");
+    expect(button("Rebuild and activate CloudX").disabled).toBe(false);
+  });
+
+  it.each(["failed", "prepared"] as const)("keeps a %s update distinct from a current checkout and offers the saved recovery action", async state => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const current: CloudxUpdateStatus = { available: true, run: { id, state, targetCommit: mainPreview.target!.commit, resumable: true,
+      startedAt: "2026-09-15T04:00:00Z", message: state === "failed" ? "The installer failed before activation." : "The selected build is prepared but has not been activated." } };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => reply(init?.method === "POST" ? run("running", id) : current));
+    vi.stubGlobal("fetch", fetch);
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit }));
+    expect(container.textContent).toContain(current.run!.message);
+    expect(container.textContent).toContain("The checkout is up to date with main.");
+    expect(container.textContent).toContain("The running server differs from the checkout.");
+    expect(container.textContent).not.toContain("CloudX is up to date");
+    expect(button("Start selected target").disabled).toBe(true);
+    const action = state === "failed" ? "Resume update" : "Activate prepared update";
+    expect(button(action).disabled).toBe(false);
+    await click(action);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST").map(([, init]) => JSON.parse(init!.body as string)))
+      .toEqual([{ channel: "main", targetCommit: mainPreview.target!.commit, resumeRunId: id }]);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
+  it.each(["a", "b"])("does not describe a dirty running build as the selected commit: %s", async runningCommit => {
+    vi.stubGlobal("fetch", vi.fn(async () => reply(available)));
+    const container = await mount(undefined, async () => reply({ ...mainPreview, state: "current", currentCommit: mainPreview.target!.commit,
+      runtime: { verification: "verified", commit: runningCommit.repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: true } }));
+    expect(container.textContent).toContain("local source changes");
+    expect(container.textContent).not.toContain("The verified running server matches the selected target.");
+    expect(button("Rebuild and activate CloudX").disabled).toBe(false);
   });
 
   it.each(["ahead", "diverged"] as const)("allows the checked %s target with an explanation of the transition", async state => {

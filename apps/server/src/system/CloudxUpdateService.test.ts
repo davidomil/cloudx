@@ -8,7 +8,7 @@ import { CloudxUpdateService } from "./CloudxUpdateService.js";
 const installed = "a".repeat(40);
 const target = "b".repeat(40);
 const selection = { channel: "main" as const, targetCommit: target };
-const checked = (channel: CloudxUpdateChannel = "main", currentCommit = installed): CloudxUpdatePreview => ({
+const checked = (channel: CloudxUpdateChannel = "main", currentCommit = installed): Omit<CloudxUpdatePreview, "runtime"> => ({
   channel, currentCommit, checkedAt: "2026-09-15T00:00:00Z", state: "available",
   target: { commit: target, name: "main", url: `https://github.com/davidomil/cloudx/commit/${target}` },
   changelog: [], changelogComplete: true,
@@ -171,7 +171,7 @@ describe("CloudxUpdateService", () => {
 
   it("coalesces concurrent remote checks, while an explicit later check refreshes the target", async () => {
     const { service, catalog } = fixture();
-    let finish!: (preview: CloudxUpdatePreview) => void;
+    let finish!: (preview: Omit<CloudxUpdatePreview, "runtime">) => void;
     catalog.preview.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
     const first = service.preview();
     const second = service.preview();

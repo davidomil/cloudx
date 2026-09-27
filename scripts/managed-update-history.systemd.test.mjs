@@ -364,6 +364,10 @@ http.createServer((request, response) => {
   async waitUntilReady() { await expect.poll(() => JSON.parse(this.curl("/api/ready")), { timeout: 15000 }).toEqual({ status: "ready" }); }
 
   async startNextUpdateInSettings(currentCommit, targetCommit) {
+    const { verification, build } = JSON.parse(this.curl("/api/runtime"));
+    expect(verification).toBe("verified");
+    expect(build.commit).toBe(currentCommit);
+    const runtime = { verification, commit: build.commit, builtAt: build.builtAt, sourceDirty: build.sourceDirty };
     const browser = await chromium.launch();
     try {
       for (const mobile of [false, true]) {
@@ -373,7 +377,7 @@ http.createServer((request, response) => {
         const run = { id: randomUUID(), state: "running", phase: "prepare", targetCommit, startedAt: new Date().toISOString(), message: "Preparing the selected target." };
         page.on("pageerror", error => errors.push(error.message));
         await page.route("**/api/system/update/preview", route => route.fulfill({ json: {
-          channel: "main", currentCommit, checkedAt: new Date().toISOString(), state: "available", changelog: [], changelogComplete: true,
+          channel: "main", currentCommit, runtime, checkedAt: new Date().toISOString(), state: "available", changelog: [], changelogComplete: true,
           target: { commit: targetCommit, name: "main", url: `https://github.com/davidomil/cloudx/commit/${targetCommit}` },
         } }));
         await page.route("**/api/system/update", route => {
@@ -398,7 +402,12 @@ http.createServer((request, response) => {
           await settings.getByRole("searchbox", { name: "Search settings" }).fill("Updates");
           await browserExpect(settings.getByRole("tab", { name: "Updates", exact: true })).toHaveAttribute("aria-selected", "true");
         }
-        await settings.getByRole("button", { name: "Update CloudX and dependencies", exact: true }).click();
+        const updates = settings.getByRole("region", { name: "CloudX updates", exact: true });
+        await browserExpect(updates.getByText(`Running server commit: ${currentCommit.slice(0, 12)}. Build verification: verified at startup.`, { exact: true })).toBeVisible();
+        await browserExpect(updates.getByRole("alert")).toHaveCount(0);
+        const start = updates.getByRole("button", { name: "Update CloudX and dependencies", exact: true });
+        await browserExpect(start).toBeEnabled();
+        await start.click();
         await expect.poll(() => starts).toEqual([{ channel: "main", targetCommit }]);
         expect(errors).toEqual([]);
         await page.close();
