@@ -222,7 +222,7 @@ it.skipIf(!codexBinary).each([
       submit("/permissions");
       await expect.poll(visibleOutput).toContain("1.Askforapproval");
       output = "";
-      terminal!.write!("1");
+      await terminal!.handleAction("enter_text", { text: "1", submit: false });
       await expect.poll(visibleOutput).toContain("Permissionselectionrequested:Askforapproval");
       if (transition === "edit") {
         terminal!.write!("\u001b");

@@ -1240,7 +1240,7 @@ describe("CodexTerminalPlugin", () => {
 });
 
 describe("CodexTerminalSession", () => {
-  it("types text and submits when requested", () => {
+  it("types plain shell text and submits when requested", () => {
     const process = new FakeTerminalProcess();
     const session = new CodexTerminalSession(tab, process);
 
@@ -1249,20 +1249,59 @@ describe("CodexTerminalSession", () => {
     expect(process.written).toBe("run tests\r");
   });
 
-  it("keeps the submit key separate for Codex TUI input", async () => {
+  it.each(["run tests", "1"])("pastes Codex prompt %j explicitly before sending the submit key", async text => {
     vi.useFakeTimers();
     try {
       const process = new FakeTerminalProcess();
-      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, submitDelayMs: 25 });
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, voiceKind: "codex-terminal", submitDelayMs: 25 });
 
-      session.handleAction("enter_text", { text: "run tests", submit: true });
+      session.handleAction("enter_text", { text, submit: true });
 
-      expect(process.written).toBe("run tests");
+      expect(process.written).toBe(`\u001b[200~${text}\u001b[201~`);
       await vi.advanceTimersByTimeAsync(25);
-      expect(process.written).toBe("run tests\r");
+      expect(process.written).toBe(`\u001b[200~${text}\u001b[201~\r`);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it.each(["1", "y", "?", " "])("sends the unsubmitted Codex dialog reply %j as a character key", text => {
+    for (const input of [{ text }, { text, submit: false }]) {
+      const process = new FakeTerminalProcess();
+      const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, voiceKind: "codex-terminal" });
+
+      expect(session.handleAction("enter_text", input)).toEqual({ typed: 1, submitted: false });
+      expect(process.written).toBe(text);
+    }
+  });
+
+  it.each([
+    ["partial prompt", "partial prompt"],
+    ["1\n", "1\n"],
+    ["1\r", "1\n"],
+    ["\r", "\n"],
+    ["\n", "\n"],
+    ["\t", "\t"],
+    ["\u001b", "\u001b"],
+    ["\u0003", "\u0003"],
+    ["\u007f", "\u007f"],
+    ["é", "é"]
+  ])("keeps unsubmitted Codex input %j inside paste boundaries", (text, pasted) => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, voiceKind: "codex-terminal" });
+
+    expect(session.handleAction("enter_text", { text, submit: false })).toEqual({ typed: text.length, submitted: false });
+    expect(process.written).toBe(`\u001b[200~${pasted}\u001b[201~`);
+  });
+
+  it.each([false, true])("preserves multiline Codex input as one paste with submit: %s", submit => {
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, voiceKind: "codex-terminal" });
+
+    const result = session.handleAction("enter_text", { text: "first\r\nsecond\rthird\n\n", submit });
+
+    expect(process.written).toBe(`\u001b[200~first\nsecond\nthird${submit ? "" : "\n\n"}\u001b[201~${submit ? "\r" : ""}`);
+    expect(result).toEqual({ typed: submit ? 19 : 21, submitted: submit });
   });
 
   it("waits for initial Codex terminal output to become quiet", async () => {

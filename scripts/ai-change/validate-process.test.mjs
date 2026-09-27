@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { describe, expect, it, vi } from "vitest";
 import { parseDocument } from "yaml";
@@ -299,6 +300,119 @@ jobs:
       expect.stringMatching(/test-merge identity artifact/i),
     );
   });
+
+  it.each([
+    ["missing install", (jobs) => delete jobs["clean-install"]],
+    ["missing upgrade", (jobs) => delete jobs.upgrade],
+    [
+      "moving candidate",
+      (jobs) => {
+        jobs.upgrade.env.LIFECYCLE_TARGET = "main";
+      },
+    ],
+    [
+      "conditional upgrade",
+      (jobs) => {
+        jobs.upgrade.if = "false";
+      },
+    ],
+    [
+      "ignored installer failure",
+      (jobs) => {
+        jobs["clean-install"]["continue-on-error"] = true;
+      },
+    ],
+    [
+      "unprivileged container",
+      (jobs) => {
+        jobs.upgrade.container = "ubuntu:24.04";
+      },
+    ],
+    [
+      "skipped host step",
+      (jobs) => {
+        jobs.upgrade.steps.find((step) => step.run?.includes("host.mjs")).if =
+          "false";
+      },
+    ],
+    [
+      "missing failure evidence",
+      (jobs) => {
+        jobs.upgrade.steps.at(-1).if = "success()";
+      },
+    ],
+    [
+      "unbound revision output",
+      (jobs) => {
+        jobs["lifecycle-revisions"].outputs.source = "main";
+      },
+    ],
+    [
+      "conditional revision selection",
+      (jobs) => {
+        jobs["lifecycle-revisions"].if = "false";
+      },
+    ],
+    [
+      "aggregate missing upgrade",
+      (jobs) => {
+        jobs.aggregate.needs = jobs.aggregate.needs.filter(
+          (name) => name !== "upgrade",
+        );
+      },
+    ],
+    [
+      "verifier missing install",
+      (jobs) => {
+        jobs["isolated-verifier"].needs = ["upgrade"];
+      },
+    ],
+    [
+      "identity missing lifecycle",
+      (jobs) => {
+        delete jobs.identity.needs;
+      },
+    ],
+    [
+      "aggregate ignores upgrade result",
+      (jobs) => {
+        delete jobs.aggregate.steps[0].env.UPGRADE_RESULT;
+      },
+    ],
+  ])("rejects a lifecycle gate regression: %s", (_name, mutate) => {
+    const workflow = parseDocument(
+      fs.readFileSync(".github/workflows/ci.yml", "utf8"),
+    ).toJS();
+    mutate(workflow.jobs);
+    const issues = [];
+    validateWorkflow(process.cwd(), "ci.yml", workflow, issues);
+    expect(issues).toContainEqual(expect.stringMatching(/lifecycle/));
+  });
+
+  it.each(["failure", "cancelled", "skipped"])(
+    "aggregate fails when a required lifecycle scenario is %s",
+    (result) => {
+      const workflow = parseDocument(
+        fs.readFileSync(".github/workflows/ci.yml", "utf8"),
+      ).toJS();
+      const aggregate = workflow.jobs.aggregate.steps[0];
+      const env = Object.fromEntries(
+        Object.keys(aggregate.env).map((name) => [
+          name,
+          name === "WORKFLOW_EVENT" ? "pull_request" : "success",
+        ]),
+      );
+      env.UPGRADE_RESULT = result;
+      const execution = spawnSync("bash", ["-c", aggregate.run], {
+        env: { ...env, PATH: process.env.PATH },
+        encoding: "utf8",
+      });
+      expect(execution.status).not.toBe(0);
+      expect(execution.stderr).toContain(
+        `UPGRADE_RESULT was ${result}; expected success`,
+      );
+    },
+  );
 
   it("fails closed when policy references a skill that is not synchronized", () => {
     const issues = [];

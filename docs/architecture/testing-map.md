@@ -7,6 +7,12 @@ through the affected production path that distinguishes the old result. Include
 relevant malformed-input, sibling, cleanup, cancellation, and resource-bound cases.
 A passing helper test is not proof of a route, browser, or platform claim.
 
+Installation and upgrade acceptance runs in the required `clean-install` and
+`upgrade` Ubuntu CI jobs. See [Installation and upgrade CI](installation-lifecycle.md)
+for supported revisions, unattended installer inputs, isolation, and evidence.
+`npm run test:lifecycle-contracts` validates the gate's failure detection; it
+does not replace either disposable-host lifecycle scenario.
+
 ## Commands
 
 Run from the repository root with the documented dependencies installed.

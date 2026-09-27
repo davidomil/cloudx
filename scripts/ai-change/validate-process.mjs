@@ -1806,6 +1806,7 @@ export function validateTrustedAutomergeWorkflow(
 
 export function validateCiWorkflow(workflowName, workflow, issues = []) {
   const jobs = isRecord(workflow.jobs) ? workflow.jobs : {};
+  validateLifecycleJobs(workflowName, jobs, issues);
   for (const [jobName, job] of Object.entries(jobs)) {
     if (!isRecord(job) || !boundedTimeout(job, 120)) {
       issues.push(
@@ -1910,6 +1911,106 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     );
   }
   return issues;
+}
+
+function validateLifecycleJobs(workflowName, jobs, issues) {
+  const selection = jobs["lifecycle-revisions"];
+  if (
+    !isRecord(selection) ||
+    selection.if !== undefined ||
+    selection["continue-on-error"] !== undefined ||
+    selection.outputs?.source !== "${{ steps.revisions.outputs.source }}" ||
+    selection.outputs?.target !== "${{ steps.revisions.outputs.target }}" ||
+    checkoutStep(selection)?.with?.ref !== "${{ github.sha }}" ||
+    checkoutStep(selection)?.with?.["fetch-depth"] !== 0 ||
+    !selection.steps?.some(
+      (step) =>
+        step.id === "revisions" &&
+        step.run ===
+          "node scripts/lifecycle/revisions.mjs --evidence test-results/lifecycle/revisions.json",
+    )
+  ) {
+    issues.push(
+      `Workflow '${workflowName}' must select lifecycle revisions once from the immutable event candidate and expose source/target job outputs.`,
+    );
+  }
+  for (const [name, scenario] of [
+    ["clean-install", "install"],
+    ["upgrade", "upgrade"],
+  ]) {
+    const job = jobs[name];
+    if (
+      !isRecord(job) ||
+      job["runs-on"] !== "ubuntu-24.04" ||
+      job.container !== undefined ||
+      job.if !== undefined ||
+      job["continue-on-error"] !== undefined ||
+      !normalizedNeeds(job).includes("lifecycle-revisions") ||
+      job.env?.LIFECYCLE_SOURCE !==
+        "${{ needs.lifecycle-revisions.outputs.source }}" ||
+      job.env?.LIFECYCLE_TARGET !==
+        "${{ needs.lifecycle-revisions.outputs.target }}" ||
+      checkoutStep(job)?.with?.ref !==
+        "${{ needs.lifecycle-revisions.outputs.target }}" ||
+      checkoutStep(job)?.with?.["fetch-depth"] !== 0 ||
+      !jobCommands(job).includes("scripts/lifecycle/host.mjs") ||
+      !jobCommands(job).includes(`--disposable-host --scenario ${scenario}`) ||
+      !jobCommands(job).includes(
+        '--source "$LIFECYCLE_SOURCE" --target "$LIFECYCLE_TARGET"',
+      ) ||
+      job.steps?.some(
+        (step) =>
+          step["continue-on-error"] !== undefined ||
+          (String(step.run ?? "").includes("scripts/lifecycle/host.mjs") &&
+            step.if !== undefined),
+      ) ||
+      !job.steps?.some(
+        (step) =>
+          String(step.uses ?? "").startsWith("actions/upload-artifact@") &&
+          step.if === "always()" &&
+          step.with?.path === `test-results/lifecycle/${scenario}/` &&
+          step.with?.["if-no-files-found"] === "error",
+      )
+    ) {
+      issues.push(
+        `Workflow '${workflowName}' lifecycle job '${name}' must require the pinned real host scenario on an Ubuntu VM and always retain failure evidence.`,
+      );
+    }
+  }
+  for (const name of ["aggregate", "isolated-verifier", "identity"]) {
+    const job = jobs[name];
+    if (
+      !isRecord(job) ||
+      !["clean-install", "upgrade"].every((dependency) =>
+        normalizedNeeds(job).includes(dependency),
+      )
+    ) {
+      issues.push(
+        `Workflow '${workflowName}' merge gate '${name}' must depend on both lifecycle jobs.`,
+      );
+    }
+  }
+  const aggregate = jobs.aggregate;
+  if (
+    !isRecord(aggregate) ||
+    aggregate.if !== "always()" ||
+    !normalizedNeeds(aggregate).includes("lifecycle-revisions") ||
+    !aggregate.steps?.some(
+      (step) =>
+        step.env?.LIFECYCLE_REVISIONS_RESULT ===
+          "${{ needs.lifecycle-revisions.result }}" &&
+        step.env?.CLEAN_INSTALL_RESULT ===
+          "${{ needs.clean-install.result }}" &&
+        step.env?.UPGRADE_RESULT === "${{ needs.upgrade.result }}" &&
+        String(step.run ?? "").includes(
+          "if (result !== expected) throw new Error(",
+        ),
+    )
+  ) {
+    issues.push(
+      `Workflow '${workflowName}' aggregate must reject failed, cancelled, or skipped lifecycle results.`,
+    );
+  }
 }
 
 function boundedTimeout(job, maximum) {
