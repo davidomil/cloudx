@@ -147,6 +147,7 @@ describe("Settings navigation and search", () => {
     const { container } = await mount({ cloudxUpdate: {
       status: { available: true }, channel: "main", previewLoading: false, starting: false, checking: false, start, resume: vi.fn(), check: vi.fn(), selectChannel: vi.fn(),
       preview: {
+        runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: false },
         channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T04:00:00Z", state: "current", changelog: [], changelogComplete: true,
         target: { commit: "a".repeat(40), name: "main", url: "https://github.com/davidomil/cloudx/tree/main" }
       }

@@ -18,8 +18,8 @@ class CatalogError extends Error {}
 export class CloudxUpdateCatalog {
   constructor(private readonly fetcher: typeof fetch = fetch) {}
 
-  async preview(channel: CloudxUpdateChannel, currentCommit: string): Promise<CloudxUpdatePreview> {
-    const preview: CloudxUpdatePreview = {
+  async preview(channel: CloudxUpdateChannel, currentCommit: string): Promise<Omit<CloudxUpdatePreview, "runtime">> {
+    const preview: Omit<CloudxUpdatePreview, "runtime"> = {
       channel, currentCommit, checkedAt: new Date().toISOString(), state: "unavailable",
       changelog: [], changelogComplete: false
     };

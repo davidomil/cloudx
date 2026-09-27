@@ -25,6 +25,7 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const integration = prepareManagedIntegration(release, coordinator);
   expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file =>
     ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES, ...FORGE_INTEGRATION_FILES].includes(file)), independentReadiness: true });
+  expect(integration.files).toContain("apps/web/src/ui/CloudxUpdatePanel.test.ts");
   for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
 });

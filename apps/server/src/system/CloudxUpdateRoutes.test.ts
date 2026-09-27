@@ -16,6 +16,7 @@ describe("CloudX update HTTP boundary", () => {
   const start = vi.fn<(request: CloudxUpdateRequest) => Promise<CloudxUpdateStatus>>(async () => running);
   const selection = { channel: "releases", targetCommit: "b".repeat(40) };
   const checked: CloudxUpdatePreview = {
+    runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-09-15T00:00:00Z", sourceDirty: false },
     channel: "releases", currentCommit: "a".repeat(40), checkedAt: "2026-09-15T00:00:00Z", state: "available",
     target: { commit: "b".repeat(40), name: "v1.0", url: "https://github.com/davidomil/cloudx/releases/tag/v1.0" },
     changelog: [], changelogComplete: true,
