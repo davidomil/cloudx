@@ -87,6 +87,7 @@ function checkout({ includeInstaller = false } = {}) {
     for (const file of [
       "install-cloudx.mjs",
       "codex-updater.mjs",
+      "codex-selection.mjs",
       "install-update.mjs",
       "install-terminal-upgrade.mjs",
       "install-runtime.mjs",

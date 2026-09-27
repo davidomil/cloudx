@@ -1,8 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { buildInteractiveShellLaunch, buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand, shellQuote } from "./ShellLaunch.js";
+
+const directories: string[] = [];
+afterEach(() => { for (const directory of directories.splice(0)) fs.rmSync(directory, { recursive: true, force: true }); });
 
 describe("ShellLaunch", () => {
   it("starts bash terminals as login shells", () => {
@@ -30,6 +35,41 @@ describe("ShellLaunch", () => {
     expect(resolveAssistantCommand({ CLOUDX_ASSISTANT_BIN: "/opt/bin/claude" })).toBe("/opt/bin/claude");
     expect(resolveAssistantCommand({}, "claude")).toBe("claude");
     expect(resolveAssistantCommand({})).toBe("codex");
+  });
+
+  it("reads each new launch's selected binary without replacing the configured base or an unrelated shell command", () => {
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-launch-selection-"));
+    directories.push(prefix);
+    const base = path.join(prefix, "bin/codex");
+    const candidate = path.join(prefix, ".cloudx-codex/installs/11111111-1111-4111-8111-111111111111/bin/codex");
+    for (const [binary, version] of [[base, "0.153.4"], [candidate, "0.155.1"]]) {
+      const packageDir = path.join(path.dirname(path.dirname(binary)), "lib/node_modules/@openai/codex");
+      fs.mkdirSync(path.join(packageDir, "bin"), { recursive: true });
+      fs.mkdirSync(path.dirname(binary), { recursive: true });
+      fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ name: "@openai/codex", version, bin: { codex: "bin/codex.js" } }));
+      fs.writeFileSync(path.join(packageDir, "bin/codex.js"), "fixture", { mode: 0o755 });
+      fs.symlinkSync(path.join(packageDir, "bin/codex.js"), binary);
+    }
+    const env = { CLOUDX_ASSISTANT_BIN: base };
+    expect(resolveAssistantCommand(env)).toBe(base);
+    fs.writeFileSync(path.join(prefix, ".cloudx-codex-selection.json"), JSON.stringify({
+      schemaVersion: 1, active: { version: "0.155.1", assistantBin: candidate }, previous: null
+    }));
+    expect(resolveAssistantCommand(env)).toBe(candidate);
+    expect(env.CLOUDX_ASSISTANT_BIN).toBe(base);
+    expect(resolveAssistantCommand({ CLOUDX_ASSISTANT_BIN: "codex", CLOUDX_NPM_GLOBAL_DIR: prefix })).toBe("codex");
+    fs.writeFileSync(path.join(prefix, ".cloudx-codex-selection.json"), JSON.stringify({
+      schemaVersion: 1, active: { version: "0.153.4", assistantBin: base }, previous: { version: "0.155.1", assistantBin: candidate }
+    }));
+    expect(resolveAssistantCommand(env)).toBe(base);
+  });
+
+  it("fails a launch clearly when its persisted selection is corrupt", () => {
+    const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-launch-selection-"));
+    directories.push(prefix);
+    fs.writeFileSync(path.join(prefix, ".cloudx-codex-selection.json"), "{");
+    expect(() => resolveAssistantCommand({ CLOUDX_ASSISTANT_BIN: path.join(prefix, "bin/codex") })).toThrow(/selection/i);
+    expect(buildToolEnv({ CLOUDX_ASSISTANT_BIN: path.join(prefix, "bin/codex"), PATH: "/usr/bin" }).PATH).toBe(`${prefix}/bin:/usr/bin`);
   });
 
   it("builds a child env with configured tool paths before the inherited path", () => {

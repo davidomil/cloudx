@@ -21,34 +21,54 @@ Settings affect future launches.
 
 ## Update Codex CLI
 
-The **Codex CLI** section shows the installed version. Select **Update Codex**
-to check npm and install the release tagged `latest`. Progress moves through
-checking, installation, and executable verification. CloudX reports success
-only after `--version` succeeds, or **already current** when the verified
-installation matches the release.
+Open **Settings → Codex** to see the active version for new tabs and
+Forge workers. Search published releases or enter an exact version, such
+as `0.155.1`. **Select latest stable** and **Return to previous
+verified** fill the target for review. Compare the current and selected
+versions, then choose **Apply selected version**. Prereleases are
+labelled and require an explicit choice.
 
-The server keeps the update running when Settings closes or the browser
-disconnects. Reopening Settings shows the same job and its retained result.
-Updating preserves unsaved settings edits, running Codex and terminal sessions,
-conversations, authentication, and configuration. Newly launched Codex processes
-use the updated executable. Explicitly closing the entire Settings dialog still
-discards its unsaved draft, as before.
+CloudX prepares a separate installation and checks its exact package and
+executable versions. Before activation, real native launches must save
+their selected conversation identity and complete ordinary and Forge
+turns with an isolated local provider. An already selected version is
+verified again and reported as already selected and verified.
 
-The button updates the npm-owned executable configured for the running server,
-including its custom npm prefix. Custom wrappers and PATH-only commands require
-their own installer or an absolute npm `CLOUDX_ASSISTANT_BIN`. A shared
-installation lock prevents simultaneous writes by Settings and the CLI installer.
-Updates require CloudX's bundled Linux process supervisor and Python 3.9 or newer
-on the service PATH so detached installer processes are stopped before unlocking.
+The exact selection persists across browser reloads, service restarts,
+and ordinary CloudX updates. Running tabs and workers keep their
+original binaries and dependencies. Their saved conversations,
+authentication, settings, and workspaces remain in place. Installations
+are retained so running processes and the previous verified version
+remain available.
 
-Failures show an actionable message and the usable installed version when it
-can be verified. Raw command output stays in the private, bounded
-`codex-update/update.log` under the CloudX data directory. See
-[setup and troubleshooting](../SETUP.md#update-codex-from-settings) for
-installation requirements and interrupted-update recovery.
+Downgrades require acknowledgement of shared-state risk. When a previous
+verified selection exists, verification also resumes a synthetic
+conversation from that version and completes a turn in a still-running
+previous session. This checks the integration between versions; it
+cannot prove every existing conversation is compatible. Back up shared
+Codex state before downgrading.
 
-**Update Codex** does not restart CloudX. A full CloudX update still installs
-its pinned Codex version and can replace a newer Codex-only update.
+Settings distinguishes the requested version, installed candidate, and
+active version. Failed downloads or verification leave the active
+selection intact. Registry errors are visible; CloudX never substitutes
+another release. The previous-version action is available only after an
+earlier selection passed integration verification.
+
+The server retains the operation and its result when Settings closes or
+the browser disconnects. Closing the Settings dialog retains its
+existing draft-discard behavior. Raw command output stays in the
+private, bounded `codex-update/update.log` under the CloudX data
+directory.
+
+Selection requires an absolute npm-owned `CLOUDX_ASSISTANT_BIN` at
+`prefix/bin/codex`. It uses only the fixed `@openai/codex` package in
+that configured prefix. Other shell installations are unchanged. Custom
+wrappers and PATH-only commands require their own installer. Settings
+and installer writes share one lock and bounded Linux process
+supervision with Python 3.9 or newer.
+
+See [setup and troubleshooting](../SETUP.md#update-codex-from-settings) for
+installation requirements and interrupted-selection recovery.
 
 ## Use it
 

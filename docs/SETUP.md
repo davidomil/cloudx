@@ -212,17 +212,44 @@ instructions. Desktop terminals and files do not require microphone capture.
 
 ### Update Codex from Settings
 
-Open **Settings → Codex** to see the installed version, then select **Update
-Codex**. CloudX checks npm, installs the release tagged `latest` when needed,
-and verifies the executable with `--version`. An installation that already
-matches the release is reported as **already current**.
+Open **Settings → Codex** to see the active version for new tabs and
+Forge workers. Search published releases or enter an exact version, such
+as `0.155.1`. **Select latest stable** and **Return to previous
+verified** fill the target for review. Compare the current and selected
+versions, then choose **Apply selected version**. Prereleases are
+labelled and require an explicit choice.
 
-The server owns the job and retains its result. Closing Settings or reconnecting
-does not cancel it or start another update. Updating preserves unsaved edits in
-the open settings editor, running Codex and terminal sessions, saved
-conversations, authentication, and configuration. Newly launched Codex
-processes use the updated executable. Explicitly closing the entire Settings
-dialog retains its existing draft-discard behavior.
+CloudX prepares a separate installation and checks its exact package and
+executable versions. Before activation, real native launches must save
+their selected conversation identity and complete ordinary and Forge
+turns with an isolated local provider. An already selected version is
+verified again and reported as already selected and verified.
+
+The exact selection persists across browser reloads, service restarts,
+and ordinary CloudX updates. Running tabs and workers keep their
+original binaries and dependencies. Their saved conversations,
+authentication, settings, and workspaces remain in place. Installations
+are retained so running processes and the previous verified version
+remain available.
+
+Downgrades require acknowledgement of shared-state risk. When a previous
+verified selection exists, verification also resumes a synthetic
+conversation from that version and completes a turn in a still-running
+previous session. This checks the integration between versions; it
+cannot prove every existing conversation is compatible. Back up shared
+Codex state before downgrading.
+
+Settings distinguishes the requested version, installed candidate, and
+active version. Failed downloads or verification leave the active
+selection intact. Registry errors are visible; CloudX never substitutes
+another release. The previous-version action is available only after an
+earlier selection passed integration verification.
+
+The server retains the operation and its result when Settings closes or
+the browser disconnects. Closing the Settings dialog retains its
+existing draft-discard behavior. Raw command output stays in the
+private, bounded `codex-update/update.log` under the CloudX data
+directory.
 
 Settings requires the running server's `CLOUDX_ASSISTANT_BIN` to identify an
 absolute npm-owned `prefix/bin/codex` executable. It updates that installation,
@@ -236,8 +263,8 @@ including processes with closed output streams, before an update releases its
 installation lock.
 
 Errors identify unavailable npm, registry/network problems, prefix permissions,
-installation failure, or failed verification. Settings shows the currently usable
-version when it can verify one. Raw output stays in the private
+installation failure, or failed verification. Settings shows requested, installed
+candidate, and active versions separately. Raw output stays in the private
 `codex-update/update.log` under the CloudX data directory, limited to 256 KiB;
 the browser receives status messages. The update has bounded execution and
 stops on server shutdown. Interrupted jobs are reported as failures after restart.
@@ -248,15 +275,17 @@ If process cleanup cannot be confirmed, the job fails and keeps this lock;
 CloudX also pauses version probes until an explicit update succeeds.
 After a forcibly stopped installer or incomplete cleanup, remove
 `.cloudx-codex-update.lock` from that prefix only after confirming no installer
-is running, then select **Update Codex** again.
+is running, then apply the selected version again.
 
-This button does not perform a full CloudX update or restart services. Full
-installation and full update still install their pinned Codex version, which
-can replace a newer Codex-only update.
+Applying a Codex version does not restart CloudX. Full installation and ordinary
+CloudX updates preserve an existing exact selection. The selection record is
+`.cloudx-codex-selection.json` in the configured npm prefix; new launches resolve
+it each time. Keep the configured base `CLOUDX_ASSISTANT_BIN` unchanged so later
+selections remain visible.
 
 ### Update Codex from the CLI
 
-To update only Codex CLI to the release tagged `latest` on npm:
+To explicitly select the latest stable Codex release from npm:
 
 ```bash
 ./install.sh --update-codex
@@ -276,16 +305,19 @@ prefix is `~/.local/share/cloudx/npm-global`. Custom assistant wrappers and
 relative paths are rejected before installation. The CLI and Settings share
 executable selection, installation locking, npm installation, and verification.
 
-It verifies the updated executable with `--version`, without requiring login or
-changing authentication. It leaves the checkout, Cloudx configuration, services,
+It resolves latest once, installs that exact release in a separate prefix, and
+requires package, executable, native tab, and Forge verification before atomic
+activation. Verification uses isolated state and a local synthetic provider;
+it requires no login or paid model calls. It leaves the checkout, Cloudx configuration, services,
 and other dependencies unchanged; no clean Git checkout or systemd installation
-is required. New Codex processes use the updated executable; existing processes
-continue running. The Node entrypoint also accepts this option:
+is required. New CloudX tabs and Forge workers use the selected executable;
+existing processes continue running. The Node entrypoint also accepts this option:
 `node scripts/install-cloudx.mjs --update-codex`.
 
 Use this mode on its own; it cannot be combined with `--update`, `--uninstall`,
-or custom web-service options. Full installation and full update still install
-the pinned Codex version listed below, which can replace a newer Codex-only update.
+or custom web-service options. This explicit action changes an existing selection
+to the latest stable version. Ordinary full installation and CloudX updates
+honor the saved exact selection; the bundled default applies when none exists.
 
 ### Update from Settings
 
@@ -344,8 +376,9 @@ does the operational refresh:
 - Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
   Cloudx npm commands run. Updates require an existing Node.js executable for the
   initial ownership checks.
-- Installs exactly `@openai/codex@0.157.1` in Cloudx's user-owned npm prefix
-  (`~/.local/share/cloudx/npm-global`) and verifies the resolved executable and
+- Preserves an existing exact Codex selection. When none exists, installs
+  `@openai/codex@0.157.1` in Cloudx's user-owned npm prefix
+  (`~/.local/share/cloudx/npm-global`). Verifies the selected executable and
   Codex login status.
 - Applies Cloudx's shared Codex terminal defaults to new and restarted tabs:
   explicit `--yolo` execution, memories/Apps/Agent Plugins disabled, and only

@@ -4,7 +4,7 @@ import {
   type PluginSession,
   type WorkspacePlugin,
 } from "@cloudx/plugin-api";
-import type { CodexGlobalSettingsUpdate } from "@cloudx/shared";
+import { parseCodexUpdateRequest, type CodexGlobalSettingsUpdate } from "@cloudx/shared";
 
 import type { CodexSettingsService } from "./CodexSettingsService.js";
 import type { CodexUpdateService } from "./CodexUpdateService.js";
@@ -62,19 +62,37 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
         id: "codex-update.read",
         owner: { kind: "plugin", pluginId: this.id },
         title: "Read Codex CLI update status",
-        description: "Read the installed version and retained Codex update result.",
+        description: "Read the active selection, requested candidate, and retained Codex update result.",
         exposures: ["ui", "http"],
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
         execute: async () => ({ update: await updates.read() }),
       },
       {
+        id: "codex-update.releases",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "List published Codex releases",
+        description: "List exact published Codex versions and the latest stable release.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async (_input, context) => ({ releases: await updates.releases(context.signal) }),
+      },
+      {
         id: "codex-update.start",
         owner: { kind: "plugin", pluginId: this.id },
         title: "Update Codex CLI",
-        description: "Install and verify the latest Codex npm release without restarting CloudX or running sessions.",
+        description: "Prepare, verify, and select an explicit Codex release for new launches while preserving running sessions.",
         exposures: ["ui", "http"],
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-        execute: async () => ({ update: await updates.start() }),
+        inputSchema: {
+          type: "object",
+          properties: {
+            targetVersion: { type: "string", minLength: 1, maxLength: 128 },
+            acknowledgeDowngrade: { type: "boolean" },
+            recoveryMode: { type: "boolean" },
+          },
+          required: ["targetVersion"],
+          additionalProperties: false,
+        },
+        execute: async input => ({ update: await updates.start(parseCodexUpdateRequest(input)) }),
       },
     );
   }

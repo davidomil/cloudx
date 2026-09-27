@@ -20,6 +20,10 @@ if (!supportedVersions.includes(installedVersion) || process.env.CLOUDX_NATIVE_C
   console.error(`Expected supported Codex ${process.env.CLOUDX_NATIVE_CODEX_VERSION ?? supportedVersions.join(" or ")}; found ${installedVersion}.`);
   process.exit(1);
 }
+if (!process.env.CLOUDX_NATIVE_PREVIOUS_CODEX || !path.isAbsolute(process.env.CLOUDX_NATIVE_PREVIOUS_CODEX)) {
+  console.error("Set CLOUDX_NATIVE_PREVIOUS_CODEX to another absolute Codex executable for required cross-version conversation and running-session validation.");
+  process.exit(1);
+}
 const resultsDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-codex-native-results-"));
 const resultsPath = path.join(resultsDirectory, "results.json");
 console.log(`Validating native conversation recovery with ${version.stdout.trim()}`);

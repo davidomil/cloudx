@@ -6,6 +6,9 @@ import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireCodexInstallationLock,
+  discoverCodexReleases,
+  readCodexSelection,
+  resolveSelectedCodexBinary,
   readCodexVersion,
   resolveCodexInstallation,
   updateCodexInstallation,
@@ -22,7 +25,7 @@ beforeEach(() => {
     const source = `
       const fs = require('node:fs');
       fs.appendFileSync(process.env.TEST_RUNTIME_LOG, process.argv[1] + '\\n');
-      if (process.env.TEST_MODE === 'runtime') {
+      if (process.env.TEST_MODE === 'runtime' || process.env.TEST_MODE === 'previous-runtime' && process.argv[2]) {
         console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
       }
       if (process.env.TEST_MODE === 'runtime-timeout') {
@@ -69,7 +72,7 @@ function installation({ mode = "success", version = "1.0.0" } = {}) {
   fs.writeFileSync(
     path.join(packageDir, "bin/codex.js"),
     `#!${process.execPath}\nconst fs = require('node:fs');
-const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(packageDir, "package.json"))}, 'utf8'));
+const manifest = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, '../package.json'), 'utf8'));
 fs.appendFileSync(process.env.TEST_VERSION_LOG, 'version\\n');
 if (process.env.TEST_MODE === 'version-escape') {
   const { spawn } = require('node:child_process');
@@ -94,7 +97,7 @@ fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(process.argv.slice(2)) + 
 const mode = process.env.TEST_MODE;
 if (process.argv[2] === 'view') {
   if (mode === 'network') { console.error('ENOTFOUND registry.invalid SECRET-TOKEN'); process.exit(1); }
-  console.log(mode === 'registry' ? 'bad json' : '"1.1.0"');
+  console.log(mode === 'registry' ? 'bad json' : JSON.stringify({versions: ['1.0.0', '1.1.0', '1.2.0-rc.1'], 'dist-tags': {latest: '1.1.0'}}));
 } else if (mode === 'failure' || mode === 'permission') {
   console.error(mode === 'permission' ? 'EACCES SECRET-TOKEN' : 'unclassified error SECRET-TOKEN'); process.exit(1);
 } else if (mode === 'flood') process.stdout.write('x'.repeat(600000));
@@ -112,10 +115,17 @@ else if (['timeout', 'cancel', 'escaped-child', 'escaped-silent', 'lost-owner', 
   }
   process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);
 } else {
-  const file = ${JSON.stringify(path.join(packageDir, "package.json"))};
+  const path = require('node:path');
+  const prefix = process.argv[process.argv.indexOf('--prefix') + 1];
+  const target = process.argv.at(-1).replace('@openai/codex@', '');
+  const dir = path.join(prefix, 'lib/node_modules/@openai/codex');
+  fs.cpSync(${JSON.stringify(packageDir)}, dir, {recursive: true});
+  const file = path.join(dir, 'package.json');
   const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
-  manifest.version = mode === 'wrong-version' ? '1.0.1' : '1.1.0';
+  manifest.version = mode === 'wrong-version' ? '1.0.1' : target;
   fs.writeFileSync(file, JSON.stringify(manifest));
+  fs.mkdirSync(path.join(prefix, 'bin'));
+  fs.symlinkSync(path.join(dir, 'bin/codex.js'), path.join(prefix, 'bin/codex'));
 }
 `,
     { mode: 0o755 },
@@ -167,16 +177,16 @@ describe("shared Codex update", () => {
       prefix: "/other-prefix",
       onProgress: (stage) => stages.push(stage),
     });
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       outcome: "updated",
       installedVersion: "1.1.0",
       previousVersion: "1.0.0",
     });
     expect(stages).toEqual(["checking", "updating", "verifying"]);
-    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${resolveSelectedCodexBinary(fixture)}\n`);
     expect(commands(fixture)).toEqual([
-      ["view", "@openai/codex@latest", "version", "--json"],
-      ["i", "-g", "--prefix", fixture.prefix, "@openai/codex@latest"],
+      ["view", "@openai/codex", "versions", "dist-tags", "--json"],
+      ["i", "-g", "--prefix", path.dirname(path.dirname(resolveSelectedCodexBinary(fixture))), "@openai/codex@1.1.0"],
     ]);
     expect(
       fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
@@ -197,17 +207,18 @@ describe("shared Codex update", () => {
     const fixture = installation({ mode: "runtime", version });
     const output = [];
     const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
-    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: null, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: version, installedVersion: "1.1.0", message: expect.stringMatching(/CloudX tab launch.*private update log/) });
     expect(error.message).not.toContain("SECRET-TOKEN");
     expect(output.join("")).toContain("SECRET-TOKEN: selected conversation was not saved");
-    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toContain("/bin/codex\n");
+    expect(readCodexSelection(fixture)).toBeNull();
     expect(fs.readFileSync(fixture.env.TEST_VERSION_LOG, "utf8").trim().split("\n")).toHaveLength(version === "1.1.0" ? 1 : 2);
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
   });
 
   it("reaps runtime-verifier descendants on timeout without claiming the unverified CLI is usable", async () => {
     const fixture = installation({ mode: "runtime-timeout" });
-    await expect(updateCodexInstallation({ ...fixture, timeoutMs: 800 })).rejects.toMatchObject({ code: "timeout", usableVersion: null });
+    await expect(updateCodexInstallation({ ...fixture, timeoutMs: 800 })).rejects.toMatchObject({ code: "timeout", usableVersion: "1.0.0" });
     const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
     expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
@@ -227,7 +238,7 @@ describe("shared Codex update", () => {
           failure: "installation",
           network: "network",
           permission: "permission",
-          registry: "installation",
+          registry: "registry",
         }[mode],
       );
       expect(error.usableVersion).toBe("1.0.0");
@@ -285,7 +296,7 @@ describe("shared Codex update", () => {
       const fixture = installation({ mode });
       await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
         code: "verification",
-        usableVersion: mode === "verification" ? null : "1.0.1",
+        usableVersion: "1.0.0",
       });
     },
   );
@@ -381,7 +392,7 @@ describe("shared Codex update", () => {
       }),
     ).rejects.toMatchObject({
       code: "log-unavailable",
-      usableVersion: "1.0.0",
+      usableVersion: null,
     });
     expect(
       fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
@@ -395,7 +406,7 @@ describe("shared Codex update", () => {
     controller.abort();
     await expect(
       updateCodexInstallation({ ...fixture, signal: controller.signal }),
-    ).rejects.toMatchObject({ code: "cancelled", usableVersion: "1.0.0" });
+    ).rejects.toMatchObject({ code: "cancelled", usableVersion: null });
     expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
     expect(
       fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
@@ -491,7 +502,7 @@ describe("shared Codex update", () => {
           updateCodexInstallation({ ...fixture, timeoutMs: 800 }),
         ).rejects.toMatchObject({
           code: "cleanup-incomplete",
-          usableVersion: null,
+          usableVersion: "1.0.0",
         });
         const bytes = fs.statSync(fixture.env.TEST_WRITES).size;
         await new Promise((resolve) => setTimeout(resolve, 150));
@@ -678,3 +689,177 @@ function stopEscapedFixture(fixture) {
     if (error.code !== "ESRCH") throw error;
   }
 }
+
+describe("exact Codex selection", () => {
+  it.each([10.5, NaN, Infinity, -1, 0])("rejects invalid timeout %s without acquiring a lock", async timeoutMs => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, timeoutMs })).rejects.toMatchObject({ code: "invalid-timeout" });
+    expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
+    expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+  });
+
+  it("discovers published releases with an explicit stable target and labelled prerelease candidates", async () => {
+    const fixture = installation();
+    await expect(discoverCodexReleases(fixture)).resolves.toEqual({ latestStable: "1.1.0", versions: ["1.2.0-rc.1", "1.1.0", "1.0.0"] });
+    expect(commands(fixture)).toEqual([["view", "@openai/codex", "versions", "dist-tags", "--json"]]);
+  });
+
+  it.each(["^1.0.0", "1", "v1.0.0", "01.0.0", "1.0.0-01", "1.0.0-", "1.0.0+", "@other/pkg", "https://example.org/pkg", "../pkg", "1.0.0;touch pwned", "1.0.0\n"])("rejects invalid selection %j before running npm", async targetVersion => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, targetVersion })).rejects.toMatchObject({ code: "invalid-version" });
+    expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+    expect(readCodexSelection(fixture)).toBeNull();
+  });
+
+  it("rejects unpublished exact releases before installing or activating", async () => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "9.9.9" })).rejects.toMatchObject({ code: "unpublished", usableVersion: "1.0.0", installedVersion: null });
+    expect(commands(fixture).map(command => command[0])).toEqual(["view"]);
+    expect(readCodexSelection(fixture)).toBeNull();
+    expect(await readCodexVersion(fixture.assistantBin, fixture)).toBe("1.0.0");
+  });
+
+  it("pins an explicitly selected prerelease and keeps the original executable and its package intact", async () => {
+    const fixture = installation();
+    const original = fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8");
+    const targets = [];
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "1.2.0-rc.1", onTarget: version => targets.push(version) })).resolves.toMatchObject({ activeVersion: "1.2.0-rc.1", previousVerifiedVersion: null });
+    expect(targets).toEqual(["1.2.0-rc.1"]);
+    expect(commands(fixture).at(-1).at(-1)).toBe("@openai/codex@1.2.0-rc.1");
+    expect(fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8")).toBe(original);
+    expect(await readCodexVersion(fixture.assistantBin, fixture)).toBe("1.0.0");
+    expect(await readCodexVersion(resolveSelectedCodexBinary(fixture), fixture)).toBe("1.2.0-rc.1");
+    expect(readCodexSelection(fixture).active.version).toBe("1.2.0-rc.1");
+  });
+
+  it("verifies the current version, upgrades, and explicitly returns to the retained verified installation", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const initial = readCodexSelection(fixture);
+    expect(initial).toMatchObject({ active: { version: "1.0.0", assistantBin: fixture.assistantBin }, previous: null });
+    await updateCodexInstallation({ ...fixture, targetVersion: "latest" });
+    const upgraded = readCodexSelection(fixture);
+    expect(upgraded.previous).toEqual(initial.active);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "previous" })).rejects.toMatchObject({ code: "downgrade-confirmation" });
+    expect(readCodexSelection(fixture)).toEqual(upgraded);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "previous", acknowledgeDowngrade: true })).resolves.toMatchObject({ installedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: "1.1.0" });
+    expect(readCodexSelection(fixture)).toEqual({ schemaVersion: 1, active: initial.active, previous: upgraded.active });
+    expect(commands(fixture).filter(command => command[0] === "i")).toHaveLength(1);
+    expect(fs.existsSync(upgraded.active.assistantBin)).toBe(true);
+  });
+
+  it.each(["previous", "1.0.0"])("explicit recovery to %s verifies the candidate without requiring the active CLI to launch", async targetVersion => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.1.0" });
+    const selected = readCodexSelection(fixture);
+    const binaries = [selected.active, selected.previous].map(({ assistantBin }) => fs.readFileSync(assistantBin, "utf8"));
+    fixture.env.TEST_MODE = "previous-runtime";
+    await expect(updateCodexInstallation({ ...fixture, targetVersion, acknowledgeDowngrade: true })).rejects.toMatchObject({ code: "runtime-verification" });
+    expect(readCodexSelection(fixture)).toEqual(selected);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion, recoveryMode: true })).rejects.toMatchObject({ code: "downgrade-confirmation" });
+    expect(readCodexSelection(fixture)).toEqual(selected);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion, acknowledgeDowngrade: true, recoveryMode: true })).resolves.toMatchObject({ activeVersion: "1.0.0" });
+    expect(readCodexSelection(fixture)).toEqual({ schemaVersion: 1, active: selected.previous, previous: selected.active });
+    expect([selected.active, selected.previous].map(({ assistantBin }) => fs.readFileSync(assistantBin, "utf8"))).toEqual(binaries);
+    expect(commands(fixture).filter(command => command[0] === "i")).toHaveLength(1);
+  });
+
+  it("keeps the selection and both retained binaries if recovery candidate verification fails", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.1.0" });
+    const selected = readCodexSelection(fixture);
+    fixture.env.TEST_MODE = "runtime";
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "previous", acknowledgeDowngrade: true, recoveryMode: true })).rejects.toMatchObject({ code: "runtime-verification", usableVersion: "1.1.0", installedVersion: "1.0.0" });
+    expect(readCodexSelection(fixture)).toEqual(selected);
+    expect(await readCodexVersion(selected.active.assistantBin, fixture)).toBe("1.1.0");
+    expect(await readCodexVersion(selected.previous.assistantBin, fixture)).toBe("1.0.0");
+  });
+
+  it("rejects an invalid recovery mode before changing the selection", async () => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, recoveryMode: "true" })).rejects.toMatchObject({ code: "invalid-version" });
+    expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+    expect(readCodexSelection(fixture)).toBeNull();
+  });
+
+  it("never treats an unverified initial executable as a previous verified selection", async () => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "previous" })).rejects.toMatchObject({ code: "no-previous" });
+    expect(readCodexSelection(fixture)).toBeNull();
+  });
+
+  it.each(["failure", "network", "registry", "verification", "runtime", "wrong-version"])("preserves the selected installation and return target after %s", async mode => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const before = readCodexSelection(fixture);
+    const error = await updateCodexInstallation({ ...fixture, env: { ...fixture.env, TEST_MODE: mode } }).catch(error => error);
+    expect(error.usableVersion).toBe("1.0.0");
+    expect(error.installedVersion).toBe(mode === "runtime" ? "1.1.0" : null);
+    expect(readCodexSelection(fixture)).toEqual(before);
+    expect(resolveSelectedCodexBinary(fixture)).toBe(fixture.assistantBin);
+    expect(await readCodexVersion(fixture.assistantBin, fixture)).toBe("1.0.0");
+  });
+
+  it("leaves the prior manifest and installation intact when atomic activation is interrupted", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const before = readCodexSelection(fixture);
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+      if (String(to).endsWith(".cloudx-codex-selection.json")) throw Object.assign(new Error("activation interrupted"), { code: "EACCES" });
+      return rename(from, to);
+    });
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({ code: "permission", installedVersion: "1.1.0", usableVersion: "1.0.0" });
+    expect(readCodexSelection(fixture)).toEqual(before);
+    expect(await readCodexVersion(fixture.assistantBin, fixture)).toBe("1.0.0");
+  });
+
+  it("refuses corrupted persisted selections instead of silently launching another installation", async () => {
+    const fixture = installation();
+    fs.writeFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"), JSON.stringify({ schemaVersion: 1, active: { version: "1.0.0", assistantBin: "/unrelated/bin/codex" }, previous: null }));
+    expect(() => resolveSelectedCodexBinary(fixture)).toThrow(/Saved Codex selection/);
+    expect(() => readCodexSelection(fixture)).toThrow(/Saved Codex selection/);
+  });
+
+  it("does not run fallible temporary-file cleanup after activation or remove the active candidate", async () => {
+    const fixture = installation();
+    const remove = fs.rmSync;
+    vi.spyOn(fs, "rmSync").mockImplementation((target, options) => {
+      if (String(target).endsWith(".tmp") && fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"))) {
+        throw Object.assign(new Error("cleanup after activation must not happen"), { code: "EIO" });
+      }
+      return remove(target, options);
+    });
+    await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({ activeVersion: "1.1.0" });
+    const selected = readCodexSelection(fixture).active;
+    expect(fs.existsSync(selected.assistantBin)).toBe(true);
+    expect(await readCodexVersion(selected.assistantBin, fixture)).toBe("1.1.0");
+  });
+
+  it("reports the committed active selection accurately if unlocking fails after activation", async () => {
+    const fixture = installation();
+    const unlink = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation(target => {
+      if (String(target).endsWith(".cloudx-codex-update.lock")) throw Object.assign(new Error("private lock diagnostic"), { code: "EACCES" });
+      return unlink(target);
+    });
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({ code: "permission", installedVersion: "1.1.0", usableVersion: "1.1.0", message: expect.not.stringContaining("private lock diagnostic") });
+    expect(await readCodexVersion(readCodexSelection(fixture).active.assistantBin, fixture)).toBe("1.1.0");
+    expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(true);
+  });
+
+  it("refuses changed selected package versions and leaves an unrelated shell command alone", async () => {
+    const fixture = installation();
+    await updateCodexInstallation(fixture);
+    const selected = readCodexSelection(fixture).active;
+    const manifestPath = path.join(path.dirname(path.dirname(selected.assistantBin)), "lib/node_modules/@openai/codex/package.json");
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    fs.writeFileSync(manifestPath, JSON.stringify({ ...manifest, version: "9.9.9" }));
+    expect(() => resolveSelectedCodexBinary(fixture)).toThrow(/selected Codex installation changed/);
+    expect(resolveSelectedCodexBinary({ assistantBin: "codex", prefix: fixture.prefix })).toBe("codex");
+    expect(resolveSelectedCodexBinary({ assistantBin: "/tools/custom-codex", prefix: fixture.prefix })).toBe("/tools/custom-codex");
+    expect(readCodexSelection({ assistantBin: "/tools/custom-codex", prefix: fixture.prefix })).toBeNull();
+  });
+});

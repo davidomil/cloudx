@@ -452,10 +452,11 @@ describe("shared Codex settings", () => {
 describe("Codex settings plugin boundary", () => {
   async function pluginFixture() {
     const f = await fixture('model = "original-model"\n');
-    const plugin = new CodexSettingsPlugin(f.service, new CodexUpdateService(f.dataDir));
+    const updates = new CodexUpdateService(f.dataDir);
+    const plugin = new CodexSettingsPlugin(f.service, updates);
     const hooks = new HookRegistry();
     plugin.hooks.forEach((hook) => hooks.register(hook));
-    return { ...f, plugin, hooks };
+    return { ...f, plugin, hooks, updates };
   }
 
   it.each(["ui", "http"] as const)("reads and updates shared defaults through the %s hook boundary", async (kind) => {
@@ -465,6 +466,30 @@ describe("Codex settings plugin boundary", () => {
     await expect(f.hooks.call("codex-settings.read", {}, { caller: { kind } })).resolves.toEqual({ settings });
     await expect(f.hooks.call("codex-settings.update", { expectedRevision: settings.revision, model: "chosen-model" }, { caller: { kind } })).resolves.toMatchObject({ settings: { model: "chosen-model" } });
     expect(f.plugin.descriptor()).toMatchObject({ id: "codex-settings", creatable: false, requiresDirectory: false });
+  });
+
+  it.each(["ui", "http"] as const)("passes exact selection, recovery mode and downgrade acknowledgement through the %s hook", async kind => {
+    const { hooks, updates } = await pluginFixture();
+    const request = { targetVersion: "0.155.1", acknowledgeDowngrade: true, recoveryMode: true };
+    const update = { jobId: "selection", phase: "checking" as const, requestedVersion: "0.155.1", installedVersion: null,
+      activeVersion: "0.156.1", previousVerifiedVersion: "0.155.1", outcome: null, message: "Checking", startedAt: new Date(0).toISOString(), finishedAt: null };
+    const start = vi.spyOn(updates, "start").mockResolvedValue(update);
+    await expect(hooks.call("codex-update.start", request, { caller: { kind } })).resolves.toEqual({ update });
+    expect(start).toHaveBeenCalledWith(request);
+    const releases = { latestStable: "0.156.1", versions: ["0.155.1", "0.156.1", "0.157.0-rc.1"] };
+    const discover = vi.spyOn(updates, "releases").mockResolvedValue(releases);
+    const controller = new AbortController();
+    await expect(hooks.call("codex-update.releases", {}, { caller: { kind }, signal: controller.signal })).resolves.toEqual({ releases });
+    expect(discover).toHaveBeenCalledWith(controller.signal);
+  });
+
+  it.each([{}, { targetVersion: "^0.155.1" }, { targetVersion: "@openai/codex@0.155.1" }, { targetVersion: "0.155.1", acknowledgeDowngrade: "true" },
+    { targetVersion: "0.155.1", recoveryMode: "true" },
+    { targetVersion: "0.155.1", prefix: "/another/installation" }])("rejects invalid version selection before starting the service %#", async input => {
+    const { hooks, updates } = await pluginFixture();
+    const start = vi.spyOn(updates, "start");
+    await expect(hooks.call("codex-update.start", input, { caller: { kind: "ui" } })).rejects.toThrow(/invalid/i);
+    expect(start).not.toHaveBeenCalled();
   });
 
   it("exposes settings hooks without offering a workspace tab", async () => {

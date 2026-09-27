@@ -28,7 +28,7 @@ beforeEach(() => {
     const verifier = Array.isArray(args) ? args.findIndex(argument => argument.endsWith("/codex-runtime-verification.mjs")) : -1;
     if (verifier < 0 || !Array.isArray(args)) return spawn(command, args as string[], options);
     const source = `
-      if (process.env.CLOUDX_TEST_FAILURE === 'runtime') {
+      if (process.env.CLOUDX_TEST_FAILURE === 'runtime' || process.env.CLOUDX_TEST_FAILURE === 'previous-runtime' && process.argv[2]) {
         console.error('synthetic-private-runtime-detail: selected conversation was not saved');
         process.exit(1);
       }
@@ -91,7 +91,7 @@ if (args[0] === 'view') {
     process.stderr.write('ENOTFOUND synthetic-private-registry-token');
     process.exit(23);
   }
-  console.log(JSON.stringify(process.env.CLOUDX_TEST_LATEST));
+  console.log(JSON.stringify({ versions: ["0.9.0", "1.0.0", "1.1.0", "1.2.0", "1.3.0-rc.1"], "dist-tags": { latest: process.env.CLOUDX_TEST_LATEST } }));
 } else if (args[0] === 'i') {
   fs.writeFileSync(process.env.CLOUDX_TEST_NPM_PID, String(process.pid));
   if (process.env.CLOUDX_TEST_DETACHED_WRITER === 'true') {
@@ -108,9 +108,12 @@ if (args[0] === 'view') {
     }
     const prefix = args[args.indexOf('--prefix') + 1];
     const directory = path.join(prefix, 'lib/node_modules/@openai/codex');
+    fs.cpSync(process.env.CLOUDX_TEST_BASE_PACKAGE, directory, { recursive: true });
+    fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+    fs.symlinkSync('../lib/node_modules/@openai/codex/bin/codex.js', path.join(prefix, 'bin/codex'));
     const manifestPath = path.join(directory, 'package.json');
     const manifest = JSON.parse(fs.readFileSync(manifestPath));
-    manifest.version = process.env.CLOUDX_TEST_LATEST;
+    manifest.version = args.at(-1).slice('@openai/codex@'.length);
     fs.writeFileSync(manifestPath, JSON.stringify(manifest));
     if (failure === 'verification') fs.writeFileSync(path.join(directory, 'broken'), 'broken');
   };
@@ -127,7 +130,7 @@ if (args[0] === 'view') {
   const env: NodeJS.ProcessEnv = {
     HOME: home, CODEX_HOME: path.join(home, ".codex"), PATH: tools, CLOUDX_TOOL_PATH: tools,
     CLOUDX_ASSISTANT_BIN: executable, CLOUDX_NPM_GLOBAL_DIR: prefix,
-    CLOUDX_TEST_COMMAND_LOG: commandLog, CLOUDX_TEST_LATEST: options.current ? "1.0.0" : "1.1.0",
+    CLOUDX_TEST_BASE_PACKAGE: packageDir, CLOUDX_TEST_COMMAND_LOG: commandLog, CLOUDX_TEST_LATEST: options.current ? "1.0.0" : "1.1.0",
     CLOUDX_TEST_FAILURE: options.failure, CLOUDX_TEST_GATE: String(options.gated ?? false),
     CLOUDX_TEST_NOISY: String(options.noisy ?? false), CLOUDX_TEST_RELEASE: releaseFile, CLOUDX_TEST_NPM_PID: npmPid,
     CLOUDX_TEST_DETACHED_WRITER: String(options.detachedWriter ?? false), CLOUDX_TEST_WRITER_PID: writerPid, CLOUDX_TEST_WRITER_LOG: writerLog,
@@ -139,7 +142,7 @@ if (args[0] === 'view') {
   };
   const commands = async (): Promise<string[][]> => (await fs.readFile(commandLog, "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
   const waitForInstall = () => vi.waitFor(async () => {
-    expect(await commands()).toContainEqual(["i", "-g", "--prefix", prefix, "@openai/codex@latest"]);
+    expect((await commands()).filter(args => args[0] === "i")).toHaveLength(1);
     expect(Number(await fs.readFile(npmPid, "utf8"))).toBeGreaterThan(0);
   }, { timeout: 10_000 });
   const release = () => fs.writeFile(releaseFile, "continue");
@@ -175,23 +178,129 @@ async function stop(child: ChildProcess) {
 }
 
 describe("server-owned Codex updates", () => {
-  it("shows the configured executable version, installs latest in its prefix, verifies it, and restores the result", async () => {
+  it("shows the active executable, prepares an exact release separately, and restores its selection and result", async () => {
     const f = await installation();
     f.env.CLOUDX_NPM_GLOBAL_DIR = path.join(f.root, "unused-prefix");
     const updates = f.service();
-    expect(await updates.read()).toMatchObject({ phase: "idle", installedVersion: "1.0.0", outcome: null });
+    expect(await updates.read()).toMatchObject({ phase: "idle", activeVersion: "1.0.0", installedVersion: null, outcome: null });
     expect(await f.commands()).toEqual([]);
 
-    const started = await updates.start();
+    const started = await updates.start({ targetVersion: "latest" });
     expect(started.jobId).toEqual(expect.any(String));
     const result = await finished(updates);
     expect(result).toMatchObject({ jobId: started.jobId, phase: "succeeded", installedVersion: "1.1.0", outcome: "updated", finishedAt: expect.any(String) });
     expect(await f.commands()).toEqual([
-      ["view", "@openai/codex@latest", "version", "--json"],
-      ["i", "-g", "--prefix", f.prefix, "@openai/codex@latest"],
+      ["view", "@openai/codex", "versions", "dist-tags", "--json"],
+      ["i", "-g", "--prefix", expect.stringContaining(path.join(f.prefix, ".cloudx-codex/installs")), "@openai/codex@1.1.0"],
     ]);
     await updates.dispose();
     expect(await f.service().read()).toEqual(result);
+  });
+
+  it("discovers stable and prerelease versions without selecting or installing a release", async () => {
+    const f = await installation();
+    const updates = f.service();
+    const before = await updates.read();
+    await expect(updates.releases()).resolves.toEqual({ latestStable: "1.1.0", versions: ["1.3.0-rc.1", "1.2.0", "1.1.0", "1.0.0", "0.9.0"] });
+    expect(await updates.read()).toEqual(before);
+    expect(await f.commands()).toEqual([["view", "@openai/codex", "versions", "dist-tags", "--json"]]);
+    expect(codexUpdater.readCodexSelection({ assistantBin: f.executable, prefix: f.prefix })).toBeNull();
+  });
+
+  it("surfaces release discovery failure without replacing the active selection", async () => {
+    const f = await installation({ failure: "network" });
+    const updates = f.service();
+    await expect(updates.releases()).rejects.toThrow(/network|registry|connect/i);
+    expect(await updates.read()).toMatchObject({ activeVersion: "1.0.0", requestedVersion: null, installedVersion: null, phase: "idle" });
+    expect((await f.commands()).filter(args => args[0] === "i")).toEqual([]);
+  });
+
+  it("freezes the exact target during installation and retains it across service restart", async () => {
+    const f = await installation({ gated: true });
+    const updates = f.service();
+    await updates.start({ targetVersion: "1.2.0" });
+    await f.waitForInstall();
+    expect(await updates.read()).toMatchObject({ phase: "updating", requestedVersion: "1.2.0", installedVersion: null, activeVersion: "1.0.0" });
+    expect((await f.commands()).find(args => args[0] === "i")?.at(-1)).toBe("@openai/codex@1.2.0");
+    await f.release();
+    const selected = await finished(updates);
+    expect(selected).toMatchObject({ requestedVersion: "1.2.0", installedVersion: "1.2.0", activeVersion: "1.2.0", previousVerifiedVersion: null });
+    expect(JSON.parse(await fs.readFile(path.join(f.packageDir, "package.json"), "utf8")).version).toBe("1.0.0");
+    f.env.CLOUDX_TEST_LATEST = "1.3.0-rc.1";
+    await updates.dispose();
+    expect(await f.service().read()).toEqual(selected);
+    expect((await f.commands()).filter(args => args[0] === "view")).toHaveLength(1);
+  });
+
+  it("observes another instance's active selection without waiting for the binary probe cache to expire", async () => {
+    const f = await installation();
+    const observer = f.service("observer");
+    await observer.start({ targetVersion: "1.0.0" });
+    expect(await finished(observer)).toMatchObject({ activeVersion: "1.0.0", outcome: "current" });
+    const writer = f.service();
+    await writer.start({ targetVersion: "1.2.0" });
+    expect(await finished(writer)).toMatchObject({ activeVersion: "1.2.0" });
+    expect(await observer.read()).toMatchObject({ activeVersion: "1.2.0", installedVersion: "1.0.0", message: expect.stringMatching(/last operation verified Codex 1.0.0.*1.2.0.*currently active/) });
+  });
+
+  it("rejects an executable version that differs from the verified selection after restart", async () => {
+    const f = await installation();
+    const updates = f.service();
+    await updates.start({ targetVersion: "1.2.0" });
+    expect(await finished(updates)).toMatchObject({ activeVersion: "1.2.0" });
+    await updates.dispose();
+    vi.spyOn(codexUpdater, "readCodexVersion").mockResolvedValue("9.9.9");
+    expect(await f.service().read()).toMatchObject({ phase: "failed", activeVersion: null, installedVersion: "1.2.0", outcome: null, message: expect.stringMatching(/executable.*verification/) });
+  });
+
+  it("requires shared-state acknowledgement to return to the previously verified version", async () => {
+    const f = await installation();
+    const updates = f.service();
+    await updates.start({ targetVersion: "1.0.0" });
+    expect(await finished(updates)).toMatchObject({ outcome: "current", activeVersion: "1.0.0", previousVerifiedVersion: null });
+    await updates.start({ targetVersion: "1.1.0" });
+    expect(await finished(updates)).toMatchObject({ activeVersion: "1.1.0", previousVerifiedVersion: "1.0.0" });
+    await updates.start({ targetVersion: "previous" });
+    expect(await finished(updates)).toMatchObject({ phase: "failed", requestedVersion: "1.0.0", installedVersion: null, activeVersion: "1.1.0", previousVerifiedVersion: "1.0.0", message: expect.stringMatching(/shared conversations|shared.state/i) });
+    await updates.start({ targetVersion: "previous", acknowledgeDowngrade: true });
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", requestedVersion: "1.0.0", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: "1.1.0" });
+  });
+
+  it("persists explicit recovery results while keeping downgrade acknowledgement required", async () => {
+    const f = await installation();
+    const updates = f.service();
+    await updates.start({ targetVersion: "1.0.0" });
+    await finished(updates);
+    await updates.start({ targetVersion: "1.1.0" });
+    await finished(updates);
+    await updates.dispose();
+    f.env.CLOUDX_TEST_FAILURE = "previous-runtime";
+    const recovery = f.service();
+    await recovery.start({ targetVersion: "previous", acknowledgeDowngrade: true });
+    expect(await finished(recovery)).toMatchObject({ phase: "failed", activeVersion: "1.1.0" });
+    await recovery.start({ targetVersion: "previous", recoveryMode: true });
+    expect(await finished(recovery)).toMatchObject({ phase: "failed", installedVersion: null, activeVersion: "1.1.0", message: expect.stringContaining("Confirm the downgrade") });
+    await recovery.start({ targetVersion: "previous", acknowledgeDowngrade: true, recoveryMode: true });
+    const completed = await finished(recovery);
+    expect(completed).toMatchObject({ phase: "succeeded", requestedVersion: "1.0.0", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: "1.1.0", message: expect.stringContaining("Cross-version shared-state compatibility was not checked") });
+    await recovery.dispose();
+    expect(await f.service().read()).toEqual(completed);
+  });
+
+  it("selects an explicitly requested prerelease and rejects an unpublished version before installing", async () => {
+    const f = await installation();
+    const updates = f.service();
+    await updates.start({ targetVersion: "9.9.9" });
+    expect(await finished(updates)).toMatchObject({ phase: "failed", requestedVersion: "9.9.9", activeVersion: "1.0.0", installedVersion: null, message: expect.stringMatching(/not published/) });
+    expect((await f.commands()).filter(args => args[0] === "i")).toEqual([]);
+    await updates.start({ targetVersion: "1.3.0-rc.1" });
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", requestedVersion: "1.3.0-rc.1", activeVersion: "1.3.0-rc.1" });
+  });
+
+  it.each(["^1.2.3", "@openai/codex@1.2.3", "https://example.com/codex", "./codex", "1.2.3; echo unsafe"])("rejects invalid direct requests before reading or installing %s", async targetVersion => {
+    const f = await installation();
+    await expect(f.service().start({ targetVersion })).rejects.toThrow(/Invalid Codex update request/);
+    expect(await f.commands()).toEqual([]);
   });
 
   it("rejects an ambiguous PATH-only command without updating another configured prefix", async () => {
@@ -200,9 +309,9 @@ describe("server-owned Codex updates", () => {
     f.env.CLOUDX_NPM_GLOBAL_DIR = path.join(f.root, "unused-prefix");
     f.env.PATH = `${f.tools}${path.delimiter}${path.join(f.prefix, "bin")}`;
     const updates = f.service();
-    expect(await updates.read()).toMatchObject({ installedVersion: "1.0.0" });
-    await updates.start();
-    expect(await finished(updates)).toMatchObject({ phase: "failed", installedVersion: "1.0.0", outcome: null, message: expect.stringMatching(/absolute|configure/i) });
+    expect(await updates.read()).toMatchObject({ activeVersion: "1.0.0" });
+    await updates.start({ targetVersion: "latest" });
+    expect(await finished(updates)).toMatchObject({ phase: "failed", activeVersion: "1.0.0", installedVersion: null, outcome: null, message: expect.stringMatching(/absolute|configure/i) });
     expect(await f.commands()).toEqual([]);
     await expect(fs.stat(f.env.CLOUDX_NPM_GLOBAL_DIR)).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -210,35 +319,67 @@ describe("server-owned Codex updates", () => {
   it("reports already current without reinstalling", async () => {
     const f = await installation({ current: true });
     const updates = f.service();
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", outcome: "current", installedVersion: "1.0.0" });
-    expect(await f.commands()).toEqual([["view", "@openai/codex@latest", "version", "--json"]]);
+    expect(await f.commands()).toEqual([["view", "@openai/codex", "versions", "dist-tags", "--json"]]);
   });
 
-  it.each([false, true])("retains a failed runtime verification across reads and restart until an explicit successful retry (current: %s)", async current => {
+  it.each([false, true])("retains the working active version after failed candidate verification across reads and restart (current: %s)", async current => {
     const f = await installation({ failure: "runtime", current });
     const updates = f.service();
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     const failed = await finished(updates);
-    expect(failed).toMatchObject({ phase: "failed", outcome: null, installedVersion: null, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(failed).toMatchObject({ phase: "failed", outcome: null, installedVersion: current ? "1.0.0" : "1.1.0", activeVersion: "1.0.0", message: expect.stringMatching(/CloudX tab launch.*private update log/) });
     expect(JSON.stringify(failed)).not.toContain("synthetic-private");
     expect(await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8")).toContain("synthetic-private-runtime-detail");
     expect(await updates.read()).toEqual(failed);
     expect(await f.service().read()).toEqual(failed);
     f.env.CLOUDX_TEST_FAILURE = "network";
     const unavailableRegistry = f.service();
-    await unavailableRegistry.start();
+    await unavailableRegistry.start({ targetVersion: "latest" });
     expect(await finished(unavailableRegistry)).toMatchObject({ phase: "failed", outcome: null, installedVersion: null });
     f.env.CLOUDX_TEST_FAILURE = undefined;
     const retry = f.service();
-    await retry.start();
-    expect(await finished(retry)).toMatchObject({ phase: "succeeded", outcome: "current", installedVersion: current ? "1.0.0" : "1.1.0" });
+    await retry.start({ targetVersion: "latest" });
+    expect(await finished(retry)).toMatchObject({ phase: "succeeded", outcome: current ? "current" : "updated", installedVersion: current ? "1.0.0" : "1.1.0" });
+  });
+
+  it("upgrades the previous main status format without changing the selected installation", async () => {
+    const f = await installation();
+    const legacy = { jobId: "previous-main", phase: "succeeded", installedVersion: "1.0.0", outcome: "current",
+      message: "Codex 1.0.0 is already current.", startedAt: new Date(0).toISOString(), finishedAt: new Date(1).toISOString() };
+    const statusPath = path.join(f.dataDir, "codex-update/status.json");
+    await fs.mkdir(path.dirname(statusPath), { recursive: true });
+    await fs.writeFile(statusPath, JSON.stringify({ assistantBin: f.executable, verificationBlocked: false, update: legacy }));
+    const updates = f.service();
+    const upgraded = await updates.read();
+    expect(upgraded).toMatchObject({ ...legacy, requestedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: null });
+    expect(JSON.parse(await fs.readFile(statusPath, "utf8")).update).toEqual(upgraded);
+    expect(await f.commands()).toEqual([]);
+    await updates.start({ targetVersion: "1.1.0" });
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", activeVersion: "1.1.0" });
+  });
+
+  it("keeps interrupted previous-main in-place verification blocked during the status upgrade", async () => {
+    const f = await installation();
+    const statusPath = path.join(f.dataDir, "codex-update/status.json");
+    await fs.mkdir(path.dirname(statusPath), { recursive: true });
+    await fs.writeFile(statusPath, JSON.stringify({ assistantBin: f.executable, verificationBlocked: false,
+      update: { jobId: "old-interrupted", phase: "verifying", installedVersion: "1.0.0", outcome: null,
+        message: "Verifying", startedAt: new Date(0).toISOString(), finishedAt: null } }));
+    const readVersion = vi.spyOn(codexUpdater, "readCodexVersion");
+    const updates = f.service();
+    expect(await updates.read()).toMatchObject({ phase: "failed", activeVersion: null, installedVersion: null, message: expect.stringMatching(/in-place.*interrupted/) });
+    expect(readVersion).not.toHaveBeenCalled();
+    expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(true);
+    await updates.start({ targetVersion: "1.1.0" });
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", activeVersion: "1.1.0" });
   });
 
   it("marks a retained unfinished job interrupted after restart and checks the executable before displaying its version", async () => {
     const f = await installation();
     const updates = f.service();
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     const result = await finished(updates);
     await updates.dispose();
     const statusPath = path.join(f.dataDir, "codex-update/status.json");
@@ -250,7 +391,7 @@ describe("server-owned Codex updates", () => {
     expect((await f.commands()).filter(args => args[0] === "i")).toHaveLength(1);
   });
 
-  it("keeps interrupted runtime verification blocked across restarts until an explicit update verifies the candidate", async () => {
+  it("retains the active installation and reports interrupted candidate verification across restarts", async () => {
     const f = await installation({ current: true });
     const versionLog = path.join(f.root, "version-probes");
     f.env.CLOUDX_TEST_VERSION_LOG = versionLog;
@@ -259,20 +400,20 @@ describe("server-owned Codex updates", () => {
     await fs.mkdir(path.dirname(statusPath), { recursive: true });
     await fs.writeFile(statusPath, JSON.stringify({
       assistantBin: f.executable, verificationBlocked: false,
-      update: { jobId: "interrupted-verification", phase: "verifying", installedVersion: "1.0.0", outcome: null,
+      update: { jobId: "interrupted-verification", phase: "verifying", requestedVersion: "1.0.0", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: null, outcome: null,
         message: "Verifying Codex tab launch, conversation selection, and permissions…", startedAt: new Date(0).toISOString(), finishedAt: null },
     }));
     const updates = f.service();
     const interrupted = await updates.read();
-    expect(interrupted).toMatchObject({ phase: "failed", outcome: null, installedVersion: null, message: expect.stringMatching(/verification was interrupted.*update again.*tab launch/i) });
+    expect(interrupted).toMatchObject({ phase: "failed", outcome: null, installedVersion: "1.0.0", activeVersion: "1.0.0", message: expect.stringMatching(/interrupted.*active selection.*retained/i) });
     expect(await updates.read()).toEqual(interrupted);
     const restored = f.service();
     expect(await restored.read()).toEqual(interrupted);
-    expect(await fs.readFile(versionLog, "utf8")).toBe("");
-    expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(true);
+    expect(await fs.readFile(versionLog, "utf8")).not.toBe("");
+    expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(false);
     expect(await f.commands()).toEqual([]);
 
-    await restored.start();
+    await restored.start({ targetVersion: "latest" });
     expect(await finished(restored)).toMatchObject({ phase: "succeeded", outcome: "current", installedVersion: "1.0.0" });
     expect(vi.mocked(childProcess.spawn).mock.calls.some(([, args]) => Array.isArray(args) && args.some(argument => argument.endsWith("/codex-runtime-verification.mjs")))).toBe(true);
     expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(false);
@@ -286,7 +427,7 @@ describe("server-owned Codex updates", () => {
     const statusPath = path.join(f.dataDir, "codex-update/status.json");
     const lockPath = path.join(f.prefix, ".cloudx-codex-update.lock");
     const failure: CodexUpdateStatus = {
-      jobId: "cleanup-incomplete-job", phase: "failed", installedVersion: null, outcome: null,
+      jobId: "cleanup-incomplete-job", phase: "failed", requestedVersion: "latest", installedVersion: null, activeVersion: null, previousVerifiedVersion: null, outcome: null,
       message: "Codex update subprocess cleanup could not be confirmed. Inspect installer processes before removing .cloudx-codex-update.lock.",
       startedAt: new Date(0).toISOString(), finishedAt: new Date(1).toISOString(),
     };
@@ -301,7 +442,7 @@ describe("server-owned Codex updates", () => {
     expect(await restored.read()).toEqual(failure);
     expect(await fs.readFile(versionLog, "utf8")).toBe("");
 
-    await restored.start();
+    await restored.start({ targetVersion: "latest" });
     expect(await finished(restored)).toMatchObject({ phase: "failed", installedVersion: null, outcome: null, message: expect.stringMatching(/another|lock/i) });
     expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(true);
     expect(await fs.readFile(lockPath, "utf8")).toBe(`${process.pid}\n`);
@@ -309,7 +450,7 @@ describe("server-owned Codex updates", () => {
     expect(await f.commands()).toEqual([]);
 
     await fs.rm(lockPath);
-    await restored.start();
+    await restored.start({ targetVersion: "latest" });
     const recovered = await finished(restored);
     expect(recovered).toMatchObject({ phase: "succeeded", outcome, installedVersion: outcome === "current" ? "1.0.0" : "1.1.0" });
     expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(false);
@@ -327,7 +468,7 @@ describe("server-owned Codex updates", () => {
     if (operation === "version read") readVersion.mockRejectedValue(failure);
     else vi.spyOn(codexUpdater, "updateCodexInstallation").mockRejectedValue(failure);
     const updates = f.service();
-    if (operation === "update") await updates.start();
+    if (operation === "update") await updates.start({ targetVersion: "latest" });
     const failed = await finished(updates);
     expect(failed).toMatchObject({ phase: "failed", outcome: null, installedVersion: null, message: failure.message });
     expect(JSON.parse(await fs.readFile(path.join(f.dataDir, "codex-update/status.json"), "utf8"))).toMatchObject({ verificationBlocked: true, update: failed });
@@ -347,7 +488,7 @@ describe("server-owned Codex updates", () => {
     let finishUpdate!: (result: Awaited<ReturnType<typeof codexUpdater.updateCodexInstallation>>) => void;
     const update = vi.spyOn(codexUpdater, "updateCodexInstallation").mockReturnValue(new Promise(resolve => { finishUpdate = resolve; }));
     const reading = initiator === "first read" ? updates.read() : undefined;
-    const starts = Promise.all([updates.start(), updates.start(), updates.start()]);
+    const starts = Promise.all([updates.start({ targetVersion: "latest" }), updates.start({ targetVersion: "latest" }), updates.start({ targetVersion: "latest" })]);
     await vi.waitFor(() => expect(readVersion).toHaveBeenCalledTimes(1));
     const updatesDuringProbe = update.mock.calls.length;
     const failure = new codexUpdater.CodexUpdateError("cleanup-incomplete", "Codex subprocess cleanup could not be confirmed. Inspect remaining processes before continuing.");
@@ -355,7 +496,7 @@ describe("server-owned Codex updates", () => {
     rejectProbe(failure);
     const requested = await starts;
     const failed = reading ? await reading : requested[0]!;
-    finishUpdate({ installedVersion: "1.1.0", previousVersion: "1.0.0", outcome: "updated" });
+    finishUpdate({ installedVersion: "1.1.0", previousVersion: "1.0.0", activeVersion: "1.1.0", previousVerifiedVersion: null, outcome: "updated" });
     await updates.dispose();
 
     expect(updatesDuringProbe).toBe(0);
@@ -372,7 +513,7 @@ describe("server-owned Codex updates", () => {
     expect(await f.commands()).toEqual([]);
 
     update.mockRestore();
-    await restored.start();
+    await restored.start({ targetVersion: "latest" });
     expect(await finished(restored)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0", outcome: "updated" });
     expect(JSON.parse(await fs.readFile(path.join(f.dataDir, "codex-update/status.json"), "utf8")).verificationBlocked).toBe(false);
   });
@@ -384,14 +525,14 @@ describe("server-owned Codex updates", () => {
     const failure = new codexUpdater.CodexUpdateError("cleanup-incomplete", "Codex subprocess cleanup could not be confirmed. Inspect remaining processes before continuing.");
     let finishUpdate!: (result: Awaited<ReturnType<typeof codexUpdater.updateCodexInstallation>>) => void;
     const update = vi.spyOn(codexUpdater, "updateCodexInstallation").mockReturnValue(new Promise(resolve => { finishUpdate = resolve; }));
-    const starts = Promise.all([updates.start(), updates.start()]);
+    const starts = Promise.all([updates.start({ targetVersion: "latest" }), updates.start({ targetVersion: "latest" })]);
     await Promise.resolve();
     const updatesDuringProbe = update.mock.calls.length;
 
     probe.reject(failure);
     const failed = await probe.reading;
     const requested = await starts;
-    finishUpdate({ installedVersion: "1.1.0", previousVersion: "1.0.0", outcome: "updated" });
+    finishUpdate({ installedVersion: "1.1.0", previousVersion: "1.0.0", activeVersion: "1.1.0", previousVerifiedVersion: null, outcome: "updated" });
     await updates.dispose();
 
     expect(updatesDuringProbe).toBe(0);
@@ -410,7 +551,7 @@ describe("server-owned Codex updates", () => {
     const updates = f.service();
     const probe = await holdExpiredVersionProbe(updates);
     const update = vi.spyOn(codexUpdater, "updateCodexInstallation");
-    const starts = Promise.all([updates.start(), updates.start(), updates.start()]);
+    const starts = Promise.allSettled([updates.start({ targetVersion: "latest" }), updates.start({ targetVersion: "1.0.0" }), updates.start({ targetVersion: "1.2.0" })]);
     await Promise.resolve();
     const updatesDuringProbe = update.mock.calls.length;
     probe.resolve("1.0.0");
@@ -420,7 +561,8 @@ describe("server-owned Codex updates", () => {
     await f.release();
 
     expect(updatesDuringProbe).toBe(0);
-    expect(new Set(started.map(status => status.jobId)).size).toBe(1);
+    expect(started.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(started.filter(result => result.status === "rejected")).toHaveLength(2);
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
     expect(update).toHaveBeenCalledTimes(1);
   });
@@ -430,7 +572,7 @@ describe("server-owned Codex updates", () => {
     const updates = f.service();
     const probe = await holdExpiredVersionProbe(updates);
     const update = vi.spyOn(codexUpdater, "updateCodexInstallation");
-    const starting = updates.start();
+    const starting = updates.start({ targetVersion: "latest" });
     await Promise.resolve();
     const stopping = updates.dispose();
     probe.resolve("1.0.0");
@@ -447,7 +589,7 @@ describe("server-owned Codex updates", () => {
     await fs.mkdir(path.dirname(statusPath), { recursive: true });
     await fs.writeFile(statusPath, content);
     const updates = f.service();
-    await expect(updates.start()).rejects.toThrow(/saved.*status.*read/i);
+    await expect(updates.start({ targetVersion: "latest" })).rejects.toThrow(/saved.*status.*read/i);
     await expect(updates.read()).rejects.not.toThrow(/synthetic-private/);
     expect(await fs.readFile(statusPath, "utf8")).toBe(content);
     expect(await f.commands()).toEqual([]);
@@ -466,7 +608,7 @@ describe("server-owned Codex updates", () => {
     await updates.dispose();
     const restored = f.service();
     await expect(restored.read()).rejects.toThrow(guidance);
-    await expect(restored.start()).rejects.toThrow(guidance);
+    await expect(restored.start({ targetVersion: "latest" })).rejects.toThrow(guidance);
     expect(await f.commands()).toEqual([]);
   });
 
@@ -477,25 +619,25 @@ describe("server-owned Codex updates", () => {
     await fs.mkdir(f.dataDir, { recursive: true });
     const statusDirectory = path.join(f.dataDir, "codex-update");
     await fs.writeFile(statusDirectory, "blocked status storage");
-    await expect(updates.start()).rejects.toThrow("Codex update status could not be saved. Check CloudX data directory permissions.");
+    await expect(updates.start({ targetVersion: "latest" })).rejects.toThrow("Codex update status could not be saved. Check CloudX data directory permissions.");
     expect(await updates.read()).toEqual(idle);
     expect(await f.commands()).toEqual([]);
     await fs.unlink(statusDirectory);
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
   });
 
   it.each([
-    ["network", /network|registry|connect/i, "1.0.0"],
-    ["permissions", /permission|writ|access/i, "1.0.0"],
-    ["install", /install|npm/i, "1.0.0"],
+    ["network", /network|registry|connect/i, null],
+    ["permissions", /permission|writ|access/i, null],
+    ["install", /install|npm/i, null],
     ["verification", /verif|executable/i, null],
   ] as const)("reports %s failure safely and keeps only a verified usable version", async (failure, message, installedVersion) => {
     const f = await installation({ failure });
     const updates = f.service();
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     const result = await finished(updates);
-    expect(result).toMatchObject({ phase: "failed", outcome: null, installedVersion });
+    expect(result).toMatchObject({ phase: "failed", outcome: null, installedVersion, activeVersion: "1.0.0" });
     expect(result.message).toMatch(message);
     expect(JSON.stringify(result)).not.toContain("synthetic-private");
     expect(await f.service().read()).toEqual(result);
@@ -505,8 +647,8 @@ describe("server-owned Codex updates", () => {
     const f = await installation();
     await fs.rm(path.join(f.tools, "npm"));
     const updates = f.service();
-    await updates.start();
-    expect(await finished(updates)).toMatchObject({ phase: "failed", outcome: null, installedVersion: "1.0.0", message: expect.stringMatching(/npm/i) });
+    await updates.start({ targetVersion: "latest" });
+    expect(await finished(updates)).toMatchObject({ phase: "failed", outcome: null, activeVersion: "1.0.0", installedVersion: null, message: expect.stringMatching(/npm/i) });
     expect(await f.commands()).toEqual([]);
   });
 
@@ -526,7 +668,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     await fs.writeFile(versionLog, "");
     const updates = f.service();
 
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     expect(await finished(updates)).toMatchObject({
       phase: "failed", outcome: null, installedVersion: null,
       message: expect.stringMatching(/Python 3\.9 or newer.*Repair these CloudX prerequisites/),
@@ -538,7 +680,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
     await fs.unlink(interpreter);
     await fs.symlink(python, interpreter);
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0", outcome: "updated" });
   });
 
@@ -549,27 +691,28 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     const wrapper = `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(marker)}, JSON.stringify(process.argv.slice(2)) + '\\n');\nconsole.log('codex-cli 1.0.0');\n`;
     await fs.writeFile(f.executable, wrapper, { mode: 0o755 });
     const updates = f.service();
-    await updates.start();
-    expect(await finished(updates)).toMatchObject({ phase: "failed", outcome: null, installedVersion: "1.0.0", message: expect.stringMatching(/wrapper|npm|supported/i) });
+    await updates.start({ targetVersion: "latest" });
+    expect(await finished(updates)).toMatchObject({ phase: "failed", outcome: null, activeVersion: "1.0.0", installedVersion: null, message: expect.stringMatching(/wrapper|npm|supported/i) });
     expect((await fs.readFile(marker, "utf8")).trim().split("\n").every(line => line === '["--version"]')).toBe(true);
     expect(await fs.readFile(f.executable, "utf8")).toBe(wrapper);
     expect(await f.commands()).toEqual([]);
   });
 
-  it("shares one job across concurrent starts and refuses another CloudX instance targeting the same installation", async () => {
+  it("rejects concurrent requests without retargeting the operation and locks the installation across instances", async () => {
     const f = await installation({ gated: true });
     const updates = f.service();
-    const started = await Promise.all([updates.start(), updates.start(), updates.start()]);
-    expect(new Set(started.map(status => status.jobId)).size).toBe(1);
+    const started = await Promise.allSettled([updates.start({ targetVersion: "latest" }), updates.start({ targetVersion: "1.0.0" }), updates.start({ targetVersion: "1.2.0" })]);
+    expect(started.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(started.filter(result => result.status === "rejected")).toHaveLength(2);
     await f.waitForInstall();
     const other = f.service("other-instance");
-    await other.start();
+    await other.start({ targetVersion: "latest" });
     expect(await finished(other)).toMatchObject({ phase: "failed", outcome: null, message: expect.stringMatching(/another|progress|lock/i) });
     expect((await f.commands()).filter(args => args[0] === "i")).toHaveLength(1);
 
     await f.release();
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
-    await other.start();
+    await other.start({ targetVersion: "latest" });
     expect(await finished(other)).toMatchObject({ phase: "succeeded", outcome: "current" });
   });
 
@@ -581,7 +724,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     const hooks = new HookRegistry();
     new CodexSettingsPlugin(new CodexSettingsService(sources), updates).hooks.forEach(hook => hooks.register(hook));
     const controller = new AbortController();
-    const started = await hooks.call("codex-update.start", {}, { caller: { kind: "http" }, signal: controller.signal });
+    const started = await hooks.call("codex-update.start", { targetVersion: "latest" }, { caller: { kind: "http" }, signal: controller.signal });
     await f.waitForInstall();
     controller.abort();
     expect(await hooks.call("codex-update.read", {}, { caller: { kind: "ui" } })).toMatchObject({ update: { jobId: (started.update as CodexUpdateStatus).jobId, phase: "updating" } });
@@ -602,7 +745,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     disposers.push(() => stop(codex), () => stop(terminal));
     await vi.waitFor(async () => expect(await fs.readFile(ready, "utf8")).toBe(String(codex.pid)));
     const updates = f.service();
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
     for (const child of [codex, terminal]) {
       expect(child.exitCode).toBeNull();
@@ -615,7 +758,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
   it("bounds private logs and keeps package output out of persisted public status", async () => {
     const f = await installation({ noisy: true, failure: "install" });
     const updates = f.service();
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     expect((await finished(updates)).phase).toBe("failed");
     const privateDir = path.join(f.dataDir, "codex-update");
     const log = path.join(privateDir, "update.log");
@@ -632,7 +775,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
   ] as const)("stops npm and releases the lock on %s (detached writer: %s)", async (reason, detachedWriter) => {
     const f = await installation({ gated: true, detachedWriter });
     const updates = f.service("data", reason === "deadline" ? { maxDurationMs: 1000 } : {});
-    await updates.start();
+    await updates.start({ targetVersion: "latest" });
     await f.waitForInstall();
     const pid = Number(await fs.readFile(f.npmPid, "utf8"));
     let writerPid: number | undefined;
@@ -647,7 +790,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     f.env.CLOUDX_TEST_DETACHED_WRITER = "false";
     await f.release();
     const next = f.service("after-shutdown");
-    await next.start();
+    await next.start({ targetVersion: "latest" });
     expect(await finished(next)).toMatchObject({ phase: "succeeded", installedVersion: "1.1.0" });
   });
 });
@@ -663,28 +806,34 @@ describe("Codex update HTTP boundary", () => {
     const app = await buildServer(config, services);
     disposers.push(() => app.close());
     const headers = { host: "127.0.0.1:3001", origin: "http://127.0.0.1:3001" };
-    const request = { method: "POST" as const, url: "/api/hooks/codex-update.start", headers, payload: { input: {} } };
+    const request = { method: "POST" as const, url: "/api/hooks/codex-update.start", headers, payload: { input: { targetVersion: "latest" } } };
     for (const rejectedHeaders of [{ host: headers.host }, { ...headers, origin: "https://untrusted.example" }, { ...headers, host: "untrusted.example" }])
       expect((await app.inject({ ...request, headers: rejectedHeaders })).statusCode).toBe(403);
-    for (const input of [{ command: "arbitrary command" }, { prefix: "/arbitrary/path" }, { executable: "/arbitrary/codex" }]) {
+    for (const input of [{}, { targetVersion: "^1.2.3" }, { targetVersion: "https://example.com/package" }, { targetVersion: "1.2.3; echo unsafe" }, { targetVersion: "1.2.3", acknowledgeDowngrade: "true" }, { targetVersion: "1.2.3", command: "arbitrary command" }, { targetVersion: "1.2.3", prefix: "/arbitrary/path" }, { targetVersion: "1.2.3", executable: "/arbitrary/codex" }]) {
       const rejected = await app.inject({ ...request, payload: { input } });
       expect(rejected.statusCode).toBeGreaterThanOrEqual(400);
     }
     expect(await f.commands()).toEqual([]);
-    const before = await app.inject({ ...request, url: "/api/hooks/codex-update.read" });
+    const before = await app.inject({ ...request, url: "/api/hooks/codex-update.read", payload: { input: {} } });
     expect(before.statusCode).toBe(200);
     expect(before.headers["cache-control"]).toBe("no-store");
-    expect(before.json().result.update).toMatchObject({ installedVersion: "1.0.0", phase: "idle" });
+    expect(before.json().result.update).toMatchObject({ activeVersion: "1.0.0", installedVersion: null, phase: "idle" });
+    const releases = await app.inject({ ...request, url: "/api/hooks/codex-update.releases", payload: { input: {} } });
+    expect(releases.statusCode).toBe(200);
+    expect(releases.headers["cache-control"]).toBe("no-store");
+    expect(releases.json().result.releases).toMatchObject({ latestStable: "1.1.0", versions: expect.arrayContaining(["1.0.0", "1.3.0-rc.1"]) });
     const starts = await Promise.all([app.inject(request), app.inject(request)]);
-    starts.forEach(response => expect(response.statusCode, response.body).toBe(200));
-    const jobId = starts[0]!.json().result.update.jobId;
-    expect(starts[1]!.json().result.update.jobId).toBe(jobId);
+    const accepted = starts.find(response => response.statusCode === 200)!;
+    const rejected = starts.find(response => response.statusCode !== 200)!;
+    expect(rejected.statusCode).toBe(409);
+    expect(rejected.json().message).toMatch(/already running/);
+    const jobId = accepted.json().result.update.jobId;
     await f.waitForInstall();
-    const reconnect = await app.inject({ ...request, url: "/api/hooks/codex-update.read" });
+    const reconnect = await app.inject({ ...request, url: "/api/hooks/codex-update.read", payload: { input: {} } });
     expect(reconnect.json().result.update).toMatchObject({ jobId, phase: "updating" });
     await f.release();
     await vi.waitFor(async () => {
-      const response = await app.inject({ ...request, url: "/api/hooks/codex-update.read" });
+      const response = await app.inject({ ...request, url: "/api/hooks/codex-update.read", payload: { input: {} } });
       expect(response.json().result.update).toMatchObject({ jobId, phase: "succeeded", installedVersion: "1.1.0" });
       expect(response.headers["cache-control"]).toBe("no-store");
     }, { timeout: 10_000 });

@@ -118,7 +118,7 @@ use an isolated home and a synthetic local provider; they do not use
 personal credentials or an external model service.
 
 Build the server with `npm run typecheck`, then run
-`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.157.1 npm run test:codex-recovery`.
+`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex-0.157.1 CLOUDX_NATIVE_PREVIOUS_CODEX=/absolute/path/to/codex-0.155.1 CLOUDX_NATIVE_CODEX_VERSION=0.157.1 npm run test:codex-recovery`.
 The runner records the installed version in CI logs and rejects missing binaries,
 unsupported or mismatched versions, failures and skipped native cases.
 
@@ -143,6 +143,13 @@ lifecycle validation can invoke
 `node scripts/codex-runtime-verification.mjs /absolute/path/to/installer-selected/codex`
 against the built server. The native CI matrix validates the installer-pinned
 release; it does not execute the host installer lifecycle.
+
+The selection suite additionally covers Codex 0.155.1. It resumes a synthetic
+saved conversation across versions and completes a turn in a still-running
+previous session. Native updater coverage checks activation, unchanged selection,
+and return to the original verified installation. Installer and managed-profile
+update tests assert that the saved selection and retained process dependencies
+survive a CloudX update.
 
 ## Useful Area Coverage
 

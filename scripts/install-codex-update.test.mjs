@@ -75,21 +75,23 @@ describe("updating only Codex", () => {
     const { options, runner, prefix, envPath } = fixture();
     const result = await runInstaller(options);
     expect(result.assistantBin).toBe(path.join(prefix, "bin/codex"));
+    const candidatePrefix = path.join(prefix, ".cloudx-codex/installs/<candidate-id>");
     expect(
       runner.commands.map(({ command, args }) => [command, ...args]),
     ).toEqual([
       ["node", "-v"],
       ["npm", "-v"],
-      ["npm", "i", "-g", "--prefix", prefix, "@openai/codex@latest"],
-      [path.join(prefix, "bin/codex"), "--version"],
-      [process.execPath, path.join(process.cwd(), "scripts/codex-runtime-verification.mjs"), path.join(prefix, "bin/codex")],
+      ["npm", "view", "@openai/codex", "versions", "dist-tags", "--json"],
+      ["npm", "i", "-g", "--prefix", candidatePrefix, "@openai/codex@<resolved-stable-version>"],
+      [path.join(candidatePrefix, "bin/codex"), "--version"],
+      [process.execPath, path.join(process.cwd(), "scripts/codex-runtime-verification.mjs"), path.join(candidatePrefix, "bin/codex")],
     ]);
-    expect(runner.commands[2].env).toEqual({
-      NPM_CONFIG_PREFIX: prefix,
-      npm_config_prefix: prefix,
-      PATH: `${prefix}/bin:/usr/bin`,
+    expect(runner.commands[3].env).toEqual({
+      NPM_CONFIG_PREFIX: candidatePrefix,
+      npm_config_prefix: candidatePrefix,
+      PATH: `${candidatePrefix}/bin:/usr/bin`,
     });
-    expect(runner.commands[3].env).toEqual(runner.commands[2].env);
+    expect(runner.commands[4].env).toEqual(runner.commands[3].env);
     expect(runner.writes).toEqual([]);
     expect(fs.existsSync(prefix)).toBe(false);
     expect(fs.existsSync(envPath)).toBe(false);
@@ -119,12 +121,8 @@ describe("updating only Codex", () => {
       fs.writeFileSync(localFile, "uncommitted work");
       const result = await runInstaller(options);
       expect(result.assistantBin).toBe(path.join(prefix, "bin/codex"));
-      expect(runner.commands[2].args).toEqual([
-        "i",
-        "-g",
-        "--prefix",
-        prefix,
-        "@openai/codex@latest",
+      expect(runner.commands[3].args).toEqual([
+        "i", "-g", "--prefix", path.join(prefix, ".cloudx-codex/installs/<candidate-id>"), "@openai/codex@<resolved-stable-version>",
       ]);
       expect(runner.writes).toEqual([]);
       expect(fs.readFileSync(envPath, "utf8")).toBe(config);
@@ -175,8 +173,8 @@ describe("updating only Codex", () => {
         failure === "npm prerequisite"
           ? 2
           : failure === "package update"
-            ? 3
-            : 4,
+            ? 4
+            : 5,
       );
       expect(runner.writes).toEqual([]);
     },
@@ -216,12 +214,18 @@ describe("Codex-only CLI entrypoints", () => {
         path.join(bin, "npm"),
         `#!${process.execPath}\nconst fs = require('node:fs');
 fs.appendFileSync(process.env.CLOUDX_TEST_COMMAND_LOG, 'npm ' + process.argv.slice(2).join(' ') + '\\n');
-if (process.argv[2] === 'view') console.log('"1.1.0"');
+if (process.argv[2] === 'view') console.log(JSON.stringify({ versions: ['1.0.0', '1.1.0'], 'dist-tags': { latest: '1.1.0' } }));
 else {
   if (Number(process.env.CLOUDX_TEST_NPM_STATUS)) process.exit(Number(process.env.CLOUDX_TEST_NPM_STATUS));
-  const file = ${JSON.stringify(manifestPath)};
-  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
-  manifest.version = '1.1.0'; fs.writeFileSync(file, JSON.stringify(manifest));
+  const path = require('node:path');
+  const prefix = process.argv[process.argv.indexOf('--prefix') + 1];
+  const packageDir = path.join(prefix, 'lib/node_modules/@openai/codex');
+  fs.mkdirSync(path.join(packageDir, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+  const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(manifestPath)}, 'utf8'));
+  manifest.version = '1.1.0'; fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify(manifest));
+  fs.copyFileSync(${JSON.stringify(path.join(packageDir, "bin/codex.js"))}, path.join(packageDir, 'bin/codex.js'));
+  fs.symlinkSync(path.join(packageDir, 'bin/codex.js'), path.join(prefix, 'bin/codex'));
 }\n`,
         { mode: 0o755 },
       );
@@ -229,8 +233,9 @@ else {
         path.join(packageDir, "bin/codex.js"),
         `#!${process.execPath}\nconst fs = require('node:fs');
 fs.appendFileSync(process.env.CLOUDX_TEST_COMMAND_LOG, 'codex ' + process.argv.slice(2).join(' ') + '\\n');
-if (Number(process.env.CLOUDX_TEST_CODEX_STATUS)) process.exit(Number(process.env.CLOUDX_TEST_CODEX_STATUS));
-console.log('codex-cli ' + JSON.parse(fs.readFileSync(${JSON.stringify(manifestPath)}, 'utf8')).version);\n`,
+const version = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, '../package.json'), 'utf8')).version;
+if (version !== '1.0.0' && Number(process.env.CLOUDX_TEST_CODEX_STATUS)) process.exit(Number(process.env.CLOUDX_TEST_CODEX_STATUS));
+console.log('codex-cli ' + version);\n`,
         { mode: 0o755 },
       );
       fs.symlinkSync(
@@ -257,13 +262,13 @@ console.log('codex-cli ' + JSON.parse(fs.readFileSync(${JSON.stringify(manifestP
       expect(result.status).toBe(1);
       expect(result.stdout).not.toContain("Codex CLI update complete");
       if (outcome === "runtime verification failure") expect(result.stderr).toContain("failed CloudX tab launch");
-      expect(fs.readFileSync(commandLog, "utf8").trim().split("\n").filter(line => line.startsWith("npm ") || line === "codex --version")).toEqual([
-        "codex --version",
-        "npm view @openai/codex@latest version --json",
-        `npm i -g --prefix ${prefix} @openai/codex@latest`,
-        "codex --version",
-        ...(outcome === "Codex failure" ? ["codex --version"] : []),
-      ]);
+      const operations = fs.readFileSync(commandLog, "utf8").trim().split("\n").filter(line => line.startsWith("npm ") || line === "codex --version");
+      expect(operations.slice(0, 2)).toEqual(["codex --version", "npm view @openai/codex versions dist-tags --json"]);
+      expect(operations[2]).toContain(`npm i -g --prefix ${prefix}/.cloudx-codex/installs/`);
+      expect(operations[2]).toContain(" @openai/codex@1.1.0");
+      expect(operations.slice(3)).toEqual(outcome === "npm failure" ? [] : ["codex --version"]);
+      expect(JSON.parse(fs.readFileSync(manifestPath, "utf8")).version).toBe("1.0.0");
+      expect(fs.existsSync(path.join(prefix, ".cloudx-codex-selection.json"))).toBe(false);
       expect(fs.readFileSync(envPath, "utf8")).toBe(config);
     },
   );
@@ -290,8 +295,8 @@ console.log('codex-cli ' + JSON.parse(fs.readFileSync(${JSON.stringify(manifestP
       );
       expect(result.stderr).toBe("");
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain("@openai/codex@latest");
-      expect(result.stdout).toContain(`${prefix}/bin/codex --version`);
+      expect(result.stdout).toContain("@openai/codex@<resolved-stable-version>");
+      expect(result.stdout).toContain(`${prefix}/.cloudx-codex/installs/<candidate-id>/bin/codex`);
       expect(result.stdout).not.toMatch(
         /sudo|apt-get|systemctl|git |npm ci|npm run|python|uv sync|login|write /,
       );

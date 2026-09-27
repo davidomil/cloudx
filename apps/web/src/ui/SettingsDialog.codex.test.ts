@@ -31,7 +31,8 @@ async function mount(read: () => Promise<CodexGlobalSettings> = async () => init
   const calls: { hook: string; input: Record<string, unknown> }[] = [];
   const save = vi.fn(async () => {});
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
-    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
+    if (hook === "codex-update.releases") return { releases: { latestStable: "1.1.0", versions: ["1.1.0", "1.0.0"] } } as unknown as T;
+    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", activeVersion: "1.0.0", requestedVersion: null, previousVerifiedVersion: null, outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
     calls.push({ hook, input });
     return { settings: await read() } as unknown as T;
   };

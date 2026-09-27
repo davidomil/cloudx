@@ -14,6 +14,7 @@ import { prepareTerminalUpgrade } from "./install-terminal-upgrade.mjs";
 import { prepareRuntimeUpdate } from "./install-runtime.mjs";
 import {
   acquireCodexInstallationLock,
+  readCodexSelection,
   resolveCodexInstallation,
   updateCodexInstallation,
 } from "./codex-updater.mjs";
@@ -2228,9 +2229,14 @@ async function runCodexUpdater({ paths, commands, env }) {
   const { assistantBin } = installation;
   if (commands.dryRun) {
     verifyNodeAndNpm(commands);
-    installCodexCli(commands, paths, env, "latest");
-    commands.run(assistantBin, ["--version"], { env: codexNpmEnv(paths, env) });
-    commands.run(process.execPath, [fileURLToPath(new URL("./codex-runtime-verification.mjs", import.meta.url)), assistantBin], { env: codexNpmEnv(paths, env) });
+    commands.run("npm", ["view", "@openai/codex", "versions", "dist-tags", "--json"], { env: codexNpmEnv(paths, env) });
+    const candidatePrefix = path.join(installation.prefix, ".cloudx-codex/installs/<candidate-id>");
+    const candidate = path.join(candidatePrefix, "bin/codex");
+    const candidateEnv = codexNpmEnv({ ...paths, npmGlobalDir: candidatePrefix }, env);
+    commands.run("npm", ["i", "-g", "--prefix", candidatePrefix, "@openai/codex@<resolved-stable-version>"], { env: candidateEnv });
+    commands.run(candidate, ["--version"], { env: candidateEnv });
+    commands.run(process.execPath, [fileURLToPath(new URL("./codex-runtime-verification.mjs", import.meta.url)), candidate], { env: candidateEnv });
+    console.log("Dry run: resolve latest stable once, verify its exact candidate, then atomically select it. Existing binaries and running sessions are retained.");
   } else {
     const result = await updateCodexInstallation({
       ...installation,
@@ -2241,7 +2247,7 @@ async function runCodexUpdater({ paths, commands, env }) {
     console.log(`Codex ${result.installedVersion}${result.outcome === "current" ? " is already current" : " installed"}.`);
   }
   console.log(
-    "Codex CLI update complete. New Codex processes use the updated executable.",
+    "Codex CLI update complete. New CloudX tabs and Forge workers use the selected executable; running processes keep their original version.",
   );
   return { paths, assistantBin };
 }
@@ -2252,6 +2258,7 @@ function installCodexCli(commands, paths, env, version = CODEX_CLI_VERSION) {
   commands.mkdir(paths.npmGlobalDir);
   const release = commands.dryRun ? () => {} : acquireCodexInstallationLock(paths.npmGlobalDir);
   try {
+    if (readCodexSelection({ assistantBin, prefix: paths.npmGlobalDir })) return assistantBin;
     commands.run(
       "npm",
       [
@@ -2267,6 +2274,20 @@ function installCodexCli(commands, paths, env, version = CODEX_CLI_VERSION) {
     release();
   }
   return assistantBin;
+}
+
+function preservedCodexSelection(paths, env) {
+  const savedEnv = fs.existsSync(paths.envPath)
+    ? parseEnvironmentFile(fs.readFileSync(paths.envPath, "utf8"))
+    : {};
+  const installation = resolveCodexInstallation({
+    assistantBin: savedEnv.CLOUDX_ASSISTANT_BIN ?? env.CLOUDX_ASSISTANT_BIN,
+    prefix: savedEnv.CLOUDX_NPM_GLOBAL_DIR ?? paths.npmGlobalDir,
+  });
+  paths.npmGlobalDir = installation.prefix;
+  const selection = readCodexSelection(installation);
+  if (!selection) return null;
+  return { ...installation, selection };
 }
 
 async function verifyCodex(commands, prompt, assistantBin, paths, env) {
@@ -2294,17 +2315,27 @@ async function verifyCodex(commands, prompt, assistantBin, paths, env) {
 }
 
 async function ensureCodex(commands, prompt, paths, env) {
+  const preserved = preservedCodexSelection(paths, env);
+  if (preserved) {
+    const release = commands.dryRun ? () => {} : acquireCodexInstallationLock(preserved.prefix);
+    try {
+      const selection = readCodexSelection(preserved);
+      console.log(`Preserving selected Codex ${selection.active.version}.`);
+      await verifyCodex(commands, prompt, selection.active.assistantBin, paths, env);
+      return preserved.assistantBin;
+    } finally {
+      release();
+    }
+  }
   console.log(`Installing Codex CLI into ${paths.npmGlobalDir}.`);
   const assistantBin = installCodexCli(commands, paths, env);
-  await verifyCodex(commands, prompt, assistantBin, paths, env);
+  const selected = readCodexSelection({ assistantBin, prefix: paths.npmGlobalDir });
+  await verifyCodex(commands, prompt, selected?.active.assistantBin ?? assistantBin, paths, env);
   return assistantBin;
 }
 
 async function updateCodex(commands, prompt, paths, env) {
-  console.log(`Updating Codex CLI in ${paths.npmGlobalDir}.`);
-  const assistantBin = installCodexCli(commands, paths, env);
-  await verifyCodex(commands, prompt, assistantBin, paths, env);
-  return assistantBin;
+  return ensureCodex(commands, prompt, paths, env);
 }
 
 function installerPaths({ repoRoot: root, home, env = process.env }) {
