@@ -53,7 +53,7 @@ export const TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
 });
 export const CODEX_TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions({
   enterTextDescription:
-    "Type into an interactive Codex CLI terminal. For voice, send the coding instruction Codex should receive, usually as natural language rather than a shell command.",
+    "Type into an interactive Codex CLI terminal. A single printable ASCII character with submit false or omitted is sent as a key for dialog replies; other input is pasted. For voice, send the coding instruction Codex should receive, usually as natural language rather than a shell command.",
   enterTextHandlesUnhandledVoice: true
 }).concat(codexReadinessAction(), {
   name: "finish",
@@ -1006,7 +1006,8 @@ export class CodexTerminalSession implements PluginSession {
       const text = requireString(input.text, "text");
       const submit = typeof input.submit === "boolean" ? input.submit : false;
       const textToWrite = submit ? stripTrailingLineTerminators(text) : text;
-      if (this.options.voiceKind === "codex-terminal") this.writeBracketedPaste(textToWrite);
+      const isCharacterKey = !submit && /^[ -~]$/u.test(textToWrite);
+      if (this.options.voiceKind === "codex-terminal" && !isCharacterKey) this.writeBracketedPaste(textToWrite);
       else this.write(textToWrite);
       if (submit) {
         this.markBusy("Input submitted.");
