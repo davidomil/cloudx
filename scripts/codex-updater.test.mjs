@@ -159,6 +159,24 @@ function replaceSupervisorInterpreter(fixture, source) {
 }
 
 describe("shared Codex update", () => {
+  it("acknowledges version completion before the supervisor exits and removes its receipts", async () => {
+    const fixture = installation();
+    const diagnostics = path.join(fixture.root, "diagnostics");
+    fixture.env.CLOUDX_TERMINAL_DIAGNOSTICS_DIR = diagnostics;
+
+    await expect(readCodexVersion(fixture.assistantBin, fixture)).resolves.toBe("1.0.0");
+
+    const launch = childProcess.spawn.mock.calls.find(([, args]) => args[2]?.endsWith("terminal-supervisor.py"));
+    expect(launch).toBeDefined();
+    expect(fs.existsSync(launch[1][3])).toBe(false);
+    const retained = fs.readdirSync(diagnostics);
+    expect(retained).toHaveLength(1);
+    const evidence = JSON.parse(fs.readFileSync(path.join(diagnostics, retained[0], "lifecycle.json"), "utf8"));
+    expect(evidence.events).toContainEqual(expect.objectContaining({ phase: "receipt-acknowledged" }));
+    expect(evidence.events.at(-1).phase).toBe("ephemeral-receipts-removed");
+    expect(fs.existsSync(`/proc/${evidence.pid}`)).toBe(false);
+  });
+
   it("updates the selected npm prefix and verifies the resulting executable", async () => {
     const fixture = installation();
     const stages = [];

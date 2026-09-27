@@ -5,13 +5,14 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import { chromium, expect as browserExpect } from "@playwright/test";
 
 import { InstallerRunner, prepareManagedRelease } from "./install-cloudx.mjs";
 import { ManagedUpdate, UpdateHost, validateSavedTransition } from "./managed-update.mjs";
 import { writeUpdateJson } from "./managed-update-store.mjs";
 import { seedSavedTabProfile } from "./helpers/managed-update-saved-tabs-fixture.mjs";
+import { PreparedTestCheckout } from "./helpers/prepared-test-checkout.mjs";
 
 const sourceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const preBrokerTarget = "224a75ef7b3efced05b2c6b3b136250d9a532dc3";
@@ -22,6 +23,11 @@ const historicalTargets = ["26d8291b89309acb59fdea1cbe09234d41d0164f", "643ad8eb
 const supportedHost = process.platform === "linux"
   && fs.readFileSync("/etc/os-release", "utf8").includes("ID=ubuntu")
   && spawnSync("systemctl", ["--user", "show-environment"], { stdio: "ignore", timeout: 5000 }).status === 0;
+let preparedCheckout;
+beforeAll(async () => {
+  if (supportedHost) preparedCheckout = await PreparedTestCheckout.create(sourceRoot);
+}, 300_000);
+afterAll(async () => { await preparedCheckout?.close(); }, 60_000);
 
 it.skipIf(!supportedHost).each(historicalTargets)("activates historical %s and its required terminal services under isolated systemd units", async historicalTarget => {
   const fixture = await HistoricalInstallation.create({ savedTabs: directTargets.includes(historicalTarget) });
@@ -111,10 +117,7 @@ class HistoricalInstallation {
     this.port = await freePort();
     const dependencyPort = await freePort();
     for (const directory of [this.home, this.dataDir, this.stateDir]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    command("git", ["clone", "--shared", sourceRoot, this.repoRoot]);
-    this.git(["checkout", "--detach", "HEAD"]);
-    command("npm", ["ci", "--no-audit", "--no-fund"], { cwd: this.repoRoot, timeout: 120000 });
-    command("npm", ["run", "build"], { cwd: this.repoRoot, timeout: 120000 });
+    await preparedCheckout.copyTo(this.repoRoot);
     const imagegen = path.join(this.home, ".codex/skills/.system/imagegen");
     fs.mkdirSync(imagegen, { recursive: true });
     fs.writeFileSync(path.join(imagegen, "SKILL.md"), "---\nname: imagegen\ndescription: Isolated fixture.\n---\nSynthetic fixture data.\n");

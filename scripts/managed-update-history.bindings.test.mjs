@@ -3,4 +3,4 @@ import {
   historicalTargets,
 } from "./helpers/managed-history-fixture.mjs";
 
-historicalTargetTest(historicalTargets[0]);
+historicalTargetTest(historicalTargets[3]);

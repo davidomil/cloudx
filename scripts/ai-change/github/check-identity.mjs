@@ -178,6 +178,7 @@ export async function mergeIdentityForPullRequest(
   pullRequest,
   policySha256,
 ) {
+  validatePullRequestTarget(api.repository, pullRequest);
   const identity = validateMergeIdentity(
     {
       pullRequest: positiveInteger(pullRequest?.number, "pull request"),
@@ -189,32 +190,210 @@ export async function mergeIdentityForPullRequest(
     },
     { allowPlaceholderTree: true },
   );
-  if (pullRequest?.base?.ref !== "main") {
-    throw new Error("Pull request merge identity requires base branch main.");
-  }
   if (pullRequest?.mergeable !== true) {
     throw new Error("Pull request test merge is not currently mergeable.");
   }
   const commit = await api.get(
     repoRoute(api.repository, `/git/commits/${identity.testMergeSha}`),
   );
+  const target = await api.get(
+    repoRoute(api.repository, "/git/ref/heads/main"),
+  );
+  if (target?.ref !== "refs/heads/main" || target?.object?.type !== "commit") {
+    throw new Error(
+      "Merge identity requires the exact main branch commit ref.",
+    );
+  }
+  const targetSha = gitSha(target.object.sha, "current target SHA");
   const parents = Array.isArray(commit?.parents)
     ? commit.parents.map((parent) => parent?.sha)
     : [];
   if (
     commit?.sha !== identity.testMergeSha ||
     parents.length !== 2 ||
-    parents[0] !== identity.baseSha ||
     parents[1] !== identity.headSha
   ) {
     throw new Error(
       "Test merge commit parents must be the exact bound base and head in order.",
     );
   }
+  gitSha(parents[0], "test merge base SHA");
+  if (parents[0] !== targetSha) {
+    throw new SupersededMergeIdentityError("target_moved", {
+      testedBaseSha: parents[0],
+      currentBaseSha: targetSha,
+      headSha: identity.headSha,
+      testMergeSha: identity.testMergeSha,
+    });
+  }
   return validateMergeIdentity({
     ...identity,
+    baseSha: targetSha,
     testMergeTreeSha: commit?.tree?.sha,
   });
+}
+
+function validatePullRequestTarget(repository, pullRequest) {
+  if (pullRequest?.base?.repo?.full_name !== validateRepository(repository)) {
+    throw new Error(
+      "Pull request merge identity requires the expected base repository.",
+    );
+  }
+  if (pullRequest?.state !== "open" || pullRequest?.merged !== false) {
+    throw new Error(
+      "Pull request merge identity requires an open, unmerged request.",
+    );
+  }
+  if (pullRequest?.base?.ref !== "main") {
+    throw new Error("Pull request merge identity requires base branch main.");
+  }
+}
+
+export class SupersededMergeIdentityError extends Error {
+  constructor(reason, observed) {
+    super(
+      "CI merge identity is superseded. Refresh the pull request's test merge and run CI for the new identity; do not rerun the unchanged event or change application code.",
+    );
+    this.name = "SupersededMergeIdentityError";
+    this.code = "SUPERSEDED_MERGE_IDENTITY";
+    this.reason = reason;
+    this.observed = observed;
+  }
+}
+
+export async function createCiIdentityArtifact({
+  api,
+  source,
+  event,
+  policySha256,
+  workflowRunId,
+  workflowRunAttempt,
+}) {
+  if (
+    event.eventName !== "pull_request" ||
+    event.baseRef !== "main" ||
+    event.baseRepository !== validateRepository(api.repository)
+  ) {
+    throw new Error(
+      "CI identity requires a pull_request event for main in the expected repository.",
+    );
+  }
+  const pullRequestNumber = positiveInteger(event.pullRequest, "pull request");
+  const eventBaseSha = gitSha(event.baseSha, "event base SHA");
+  const headSha = gitSha(event.headSha, "event head SHA");
+  const testMergeSha = git(source, "rev-parse", "HEAD");
+  const testMergeTreeSha = git(source, "rev-parse", "HEAD^{tree}");
+  const [commit, ...parents] = git(
+    source,
+    "rev-list",
+    "--parents",
+    "-n",
+    "1",
+    "HEAD",
+  ).split(" ");
+  if (
+    commit !== testMergeSha ||
+    testMergeSha !== gitSha(event.testMergeSha, "event test merge SHA") ||
+    parents.length !== 2 ||
+    parents[1] !== headSha
+  ) {
+    throw new Error(
+      "CI checkout must be the exact GitHub test merge with bound base/head parents.",
+    );
+  }
+  const tested = validateMergeIdentity({
+    pullRequest: pullRequestNumber,
+    baseSha: parents[0],
+    headSha,
+    testMergeSha,
+    testMergeTreeSha,
+    policySha256,
+  });
+  const pullRequest = await api.get(
+    repoRoute(api.repository, `/pulls/${pullRequestNumber}`),
+  );
+  if (pullRequest?.number !== pullRequestNumber)
+    throw new Error("GitHub returned the wrong pull request.");
+  validatePullRequestTarget(api.repository, pullRequest);
+  const currentHeadSha = gitSha(pullRequest?.head?.sha, "current head SHA");
+  if (currentHeadSha !== headSha) {
+    throw new SupersededMergeIdentityError("head_moved", {
+      tested,
+      currentHeadSha,
+    });
+  }
+  const current = await mergeIdentityForPullRequest(
+    api,
+    pullRequest,
+    policySha256,
+  );
+  if (
+    current.testMergeSha === tested.testMergeSha &&
+    current.testMergeTreeSha !== tested.testMergeTreeSha
+  ) {
+    throw new Error(
+      "The GitHub test merge tree must match the exact checked-out commit tree.",
+    );
+  }
+  const differences = mergeIdentityDifferences(tested, current);
+  if (differences.length) {
+    throw new SupersededMergeIdentityError("identity_moved", {
+      tested,
+      current,
+      differences,
+    });
+  }
+  return {
+    artifact: ciIdentityArtifact({
+      repository: api.repository,
+      workflowRunId,
+      workflowRunAttempt,
+      ...tested,
+    }),
+    reconciliation: {
+      state: "current",
+      eventBaseSha,
+      testedBaseSha: tested.baseSha,
+      eventBaseReconciled: eventBaseSha !== tested.baseSha,
+    },
+  };
+}
+
+export async function recordCiIdentity({
+  artifactFile,
+  reconciliationFile,
+  githubOutput,
+  ...input
+}) {
+  let result;
+  try {
+    result = await createCiIdentityArtifact(input);
+  } catch (error) {
+    if (!(error instanceof SupersededMergeIdentityError)) {
+      await writeExclusive(reconciliationFile, {
+        state: "rejected",
+        code: "INVALID_MERGE_IDENTITY",
+      });
+      throw error;
+    }
+    result = {
+      reconciliation: {
+        state: "superseded",
+        code: error.code,
+        reason: error.reason,
+        observed: error.observed,
+        recovery: error.message,
+      },
+    };
+  }
+  if (result.artifact) await writeExclusive(artifactFile, result.artifact);
+  await writeExclusive(reconciliationFile, result.reconciliation);
+  if (githubOutput)
+    await fs.appendFile(
+      githubOutput,
+      `identity-state=${result.reconciliation.state}\n`,
+    );
+  return result;
 }
 
 export function checkRunTargetForPullRequest(
@@ -444,48 +623,30 @@ async function main() {
   }
   const policy = await loadPolicy();
   if (command === "create-ci-artifact") {
-    if (required("GITHUB_EVENT_NAME") !== "pull_request") {
-      throw new Error(
-        "CI identity artifacts are valid only for pull_request runs.",
-      );
-    }
-    const source = required("CI_SOURCE_DIRECTORY");
-    const testMergeSha = git(source, "rev-parse", "HEAD");
-    const testMergeTreeSha = git(source, "rev-parse", "HEAD^{tree}");
-    const [commit, ...parents] = git(
-      source,
-      "rev-list",
-      "--parents",
-      "-n",
-      "1",
-      "HEAD",
-    ).split(" ");
-    const baseSha = required("PULL_REQUEST_BASE_SHA");
-    const headSha = required("PULL_REQUEST_HEAD_SHA");
-    if (
-      commit !== testMergeSha ||
-      testMergeSha !== required("GITHUB_SHA") ||
-      parents.length !== 2 ||
-      parents[0] !== baseSha ||
-      parents[1] !== headSha
-    ) {
-      throw new Error(
-        "CI checkout must be the exact GitHub test merge with bound base/head parents.",
-      );
-    }
-    const artifact = ciIdentityArtifact({
+    const api = createGitHubApi({
+      token: required("GH_TOKEN"),
       repository: required("GITHUB_REPOSITORY"),
+    });
+    const result = await recordCiIdentity({
+      artifactFile: required("CI_IDENTITY_OUTPUT"),
+      reconciliationFile: required("CI_RECONCILIATION_OUTPUT"),
+      githubOutput: process.env.GITHUB_OUTPUT,
+      api,
+      source: required("CI_SOURCE_DIRECTORY"),
+      event: {
+        eventName: required("GITHUB_EVENT_NAME"),
+        baseRepository: required("PULL_REQUEST_BASE_REPOSITORY"),
+        baseRef: required("PULL_REQUEST_BASE_REF"),
+        baseSha: required("PULL_REQUEST_BASE_SHA"),
+        headSha: required("PULL_REQUEST_HEAD_SHA"),
+        pullRequest: required("PULL_REQUEST_NUMBER"),
+        testMergeSha: required("GITHUB_SHA"),
+      },
+      policySha256: policy.policySha256,
       workflowRunId: required("GITHUB_RUN_ID"),
       workflowRunAttempt: required("GITHUB_RUN_ATTEMPT"),
-      pullRequest: required("PULL_REQUEST_NUMBER"),
-      baseSha,
-      headSha,
-      testMergeSha,
-      testMergeTreeSha,
-      policySha256: policy.policySha256,
     });
-    await writeExclusive(required("CI_IDENTITY_OUTPUT"), artifact);
-    process.stdout.write(`${JSON.stringify(artifact, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
 

@@ -284,11 +284,16 @@ function runCommand(
     let cleanupTimer;
     let stopping = false;
     let settled = false;
+    let completion;
+    let completionError;
+    let acknowledged = false;
+    let watcher;
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       clearTimeout(cleanupTimer);
+      if (error?.code !== "cleanup-incomplete") watcher?.close();
       signal?.removeEventListener("abort", cancel);
       if (error?.code !== "cleanup-incomplete") {
         try {
@@ -330,6 +335,31 @@ function runCommand(
         ),
       timeoutMs,
     );
+    const acknowledgeCompletion = () => {
+      if (acknowledged || !fs.existsSync(path.join(directory, "complete.json")))
+        return;
+      acknowledged = true;
+      try {
+        completion = completedCommand(directory, child.pid);
+      } catch (error) {
+        completionError = error;
+      }
+      try {
+        const temporary = path.join(directory, "acknowledged.tmp");
+        fs.writeFileSync(temporary, JSON.stringify({ pid: child.pid }), {
+          mode: 0o600,
+        });
+        fs.renameSync(temporary, path.join(directory, "acknowledged.json"));
+      } catch {
+        stop(incompleteCleanupError());
+      }
+    };
+    watcher = fs.watch(directory, (_event, filename) => {
+      if (filename === "complete.json") acknowledgeCompletion();
+    });
+    watcher.unref();
+    watcher.on("error", () => stop(incompleteCleanupError()));
+    acknowledgeCompletion();
     signal?.addEventListener("abort", cancel, { once: true });
     if (signal?.aborted) cancel();
     const collect = (chunk, isError) => {
@@ -364,6 +394,7 @@ function runCommand(
       failure ??= supervisionUnavailable();
     });
     child.on("close", (code, signal) => {
+      watcher?.close();
       if (settled) return;
       if (!child.pid) {
         settle(failure ?? supervisionUnavailable());
@@ -379,7 +410,10 @@ function runCommand(
       }
       let result;
       try {
-        result = completedCommand(directory, child.pid);
+        if (completionError) throw completionError;
+        if (!completion || fs.existsSync(directory))
+          throw incompleteCleanupError();
+        result = completion;
       } catch (error) {
         settle(error);
         return;

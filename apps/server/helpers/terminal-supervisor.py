@@ -1,5 +1,6 @@
 """Keep ownership of every terminal descendant until it has been reaped."""
 
+from collections import deque
 import ctypes
 import json
 import os
@@ -8,6 +9,7 @@ import signal
 import shutil
 import sys
 import time
+import tempfile
 
 
 CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"
@@ -30,6 +32,8 @@ class TerminalSupervisor:
         self.worker = None
         self.worker_status = None
         self.stopping = False
+        self.began = time.monotonic()
+        self.events = deque(maxlen=64)
 
     def run(self):
         if sys.version_info < (3, 9):
@@ -39,6 +43,7 @@ class TerminalSupervisor:
         self.children.read_text()
         self.own_orphaned_descendants()
         self.bind_execution()
+        self.record("ready")
         self.write_receipt("ready", self.identity)
         try:
             if not self.stopping:
@@ -54,10 +59,57 @@ class TerminalSupervisor:
                 time.sleep(0.01)
             raise
         event = self.command_exit()
+        self.record("children-reaped", **event)
         self.write_receipt("complete", {**self.identity, **event})
-        if self.execution is None and os.getppid() != self.parent:
-            shutil.rmtree(self.directory)
+        if self.execution is None:
+            self.remove_ephemeral_receipts()
+        else:
+            self.record("durable-receipts-retained")
+        self.retain_diagnostics()
         return event["exitCode"]
+
+    def remove_ephemeral_receipts(self):
+        self.record("awaiting-receipt-acknowledgement")
+        # Keep an owner alive until the host has consumed the receipt or died.
+        # A one-time getppid() check can miss a host exiting concurrently.
+        while os.getppid() == self.parent:
+            acknowledgement = self.directory / "acknowledged.json"
+            if acknowledgement.exists():
+                if json.loads(acknowledgement.read_text()) != self.identity:
+                    raise RuntimeError("Terminal completion acknowledgement does not match its owner")
+                self.record("receipt-acknowledged")
+                break
+            time.sleep(0.01)
+        else:
+            self.record("parent-exited")
+        self.record("removing-ephemeral-receipts")
+        shutil.rmtree(self.directory)
+        self.record("ephemeral-receipts-removed")
+
+    def record(self, phase, **values):
+        self.events.append({"phase": phase, "elapsedMs": round((time.monotonic() - self.began) * 1000), **values})
+
+    def diagnostics(self):
+        return {"pid": os.getpid(), "parent": self.parent, "processGroup": os.getpgrp(),
+                "started": Path("/proc/self/stat").read_text().rsplit(") ", 1)[1].split()[19],
+                "events": list(self.events)}
+
+    def retain_diagnostics(self, error=None):
+        parent = os.environ.get("CLOUDX_TERMINAL_DIAGNOSTICS_DIR")
+        if not parent and error is None:
+            return
+        if error is not None:
+            self.record("error", errorType=type(error).__name__, errno=getattr(error, "errno", None))
+        try:
+            if parent:
+                Path(parent).mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix="supervisor-", dir=parent))
+            descriptor = os.open(directory / "lifecycle.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w") as output:
+                json.dump(self.diagnostics(), output)
+        except OSError:
+            # Diagnostic I/O must not replace the process or cleanup failure.
+            pass
 
     def bind_execution(self):
         if self.execution is None:
@@ -117,6 +169,7 @@ class TerminalSupervisor:
                     print(f"Terminal command failed to start: {error}", file=sys.stderr, flush=True)
                     os._exit(127)
             os.setpgid(self.worker, self.worker)
+            self.record("command-launched", worker=self.child_identity(self.worker))
             if os.isatty(0):
                 os.tcsetpgrp(0, self.worker)
             os.write(write_gate, b"1")
@@ -137,11 +190,16 @@ class TerminalSupervisor:
 
     def kill_children(self):
         children = self.children.read_text().split()
+        self.record("kill-children", children=[self.child_identity(int(child)) for child in children[:32]], count=len(children))
         # These are our unreaped children: their PIDs cannot be reused here.
         # Killing a parent reparents its descendants to this still-living owner.
         # waitpid's ECHILD proves completion even when adoption changes this list.
         for child in children:
             os.kill(int(child), signal.SIGKILL)
+
+    def child_identity(self, pid):
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+        return {"pid": pid, "started": fields[19], "processGroup": int(fields[2]), "state": fields[0]}
 
     def command_exit(self):
         code = os.waitstatus_to_exitcode(self.worker_status) if self.worker_status is not None else 0
@@ -178,5 +236,7 @@ if __name__ == "__main__":
             ) from error
         sys.exit(supervisor.run())
     except Exception as error:
-        supervisor.write_receipt("error", {**supervisor.identity, "message": str(error)})
+        supervisor.retain_diagnostics(error)
+        supervisor.write_receipt("error", {**supervisor.identity, "message": str(error),
+                                           "diagnostics": list(supervisor.events)[-1]})
         sys.exit(125)

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, watch } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { IPty } from "node-pty";
@@ -14,6 +14,7 @@ export class TerminalSupervisor {
   readonly completion: Promise<SupervisorExit>;
   private readonly started: string | undefined;
   private exited = false;
+  private acknowledged: Promise<SupervisorExit> | undefined;
   private termination: Promise<void> | undefined;
 
   constructor(
@@ -23,10 +24,18 @@ export class TerminalSupervisor {
   ) {
     this.started = processStarted(process.pid);
     this.completion = new Promise((resolve) => {
+      const watcher = this.execution ? undefined : watch(directory, (_event, filename) => {
+        if (filename === "complete.json") this.acknowledgeCompletion();
+      });
       process.onExit(() => {
         this.exited = true;
+        watcher?.close();
         void this.confirmExit().then(resolve, (error: Error) => resolve({ event: { exitCode: 125 }, error }));
       });
+      // The helper may have completed before the watcher was installed.
+      if (watcher) void this.readReceipt("complete").then(receipt => {
+        if (receipt && !this.exited) this.acknowledgeCompletion();
+      }, () => this.acknowledgeCompletion());
     });
   }
 
@@ -75,7 +84,39 @@ export class TerminalSupervisor {
     }
   }
 
+  private acknowledgeCompletion(): void {
+    if (this.exited || this.acknowledged) return;
+    this.acknowledged = this.readCompletion().then(async result => {
+      // Even rejected evidence must release the helper to remove its owned directory.
+      // The saved error still prevents this execution from being accepted.
+      const temporary = path.join(this.directory, "acknowledged.tmp");
+      await fs.writeFile(temporary, JSON.stringify({ pid: this.process.pid }), { mode: 0o600 });
+      await fs.rename(temporary, path.join(this.directory, "acknowledged.json"));
+      return result;
+    }).catch((error: Error) => ({ event: { exitCode: 125 }, error }));
+  }
+
   private async confirmExit(): Promise<SupervisorExit> {
+    try {
+      const result = await (this.acknowledged ?? this.readCompletion());
+      if (!this.execution && !result.error) {
+        try {
+          await fs.access(this.directory);
+          const error = await this.readReceipt("error");
+          throw new Error("Terminal supervisor exited before removing its ephemeral receipt directory.", {
+            cause: { pid: this.process.pid, started: this.started, phase: "receipt-cleanup", helperError: error?.diagnostics }
+          });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
+      return result;
+    } finally {
+      if (!this.execution) await fs.rm(this.directory, { recursive: true, force: true });
+    }
+  }
+
+  private async readCompletion(): Promise<SupervisorExit> {
     try {
       const receipt = await this.readReceipt("complete");
       const ready = this.execution ? await this.readReceipt("ready") : undefined;
@@ -87,8 +128,6 @@ export class TerminalSupervisor {
       return { event: { exitCode: receipt.exitCode, ...(receipt.signal !== undefined ? { signal: receipt.signal } : {}) } };
     } catch (error) {
       return { event: { exitCode: 125 }, error: error instanceof Error ? error : new Error("Terminal ownership verification failed.") };
-    } finally {
-      if (!this.execution) await fs.rm(this.directory, { recursive: true, force: true });
     }
   }
 

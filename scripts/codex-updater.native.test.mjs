@@ -45,6 +45,7 @@ else if (process.argv[2] === 'i') {
         throw new Error(`${error.message}\n${output}`, { cause: error });
       }
       expect(result).toEqual({ outcome, installedVersion: version, previousVersion: outcome === "current" ? version : "0.0.0" });
+      expect(output).toContain("Resumed Forge turn matched the selected thread, native completion and final shutdown.");
       expect(await fs.readFile(commandLog, "utf8")).toBe(outcome === "current" ? "view\n" : "view\ni\n");
       await expect(fs.stat(path.join(prefix, ".cloudx-codex-update.lock"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally {

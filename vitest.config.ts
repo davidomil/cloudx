@@ -1,19 +1,21 @@
 import { defineConfig } from "vitest/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import MeasuredSequencer from "./scripts/ci/shards.mjs";
 
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   test: {
     environment: "node",
+    sequence: { sequencer: MeasuredSequencer },
     include: [
       "packages/**/*.test.ts",
       "apps/**/*.test.ts",
       "scripts/**/*.test.mjs",
     ],
     coverage: {
-      reporter: ["text", "html"],
+      reporter: ["text", "html", "json-summary"],
       include: [
         "packages/**/*.ts",
         "apps/server/src/**/*.ts",

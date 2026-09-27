@@ -354,6 +354,7 @@ function githubPermissions(
     contents: access,
     issues: access,
     pull_requests: "write",
+    checks: "read",
     ...(role === "worker" ? { workflows: "write" } : {}),
   };
 }
