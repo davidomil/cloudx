@@ -1,7 +1,10 @@
 export default [
   {
-    files: ["scripts/ai-change/**/*.mjs"],
-    ignores: ["scripts/ai-change/**/*.test.mjs"],
+    files: ["scripts/ai-change/**/*.mjs", "scripts/lifecycle/**/*.mjs"],
+    ignores: [
+      "scripts/ai-change/**/*.test.mjs",
+      "scripts/lifecycle/**/*.test.mjs",
+    ],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "module",
