@@ -15,6 +15,7 @@ function run(env = {}) {
   const base = { ...process.env };
   delete base.CLOUDX_NATIVE_CODEX;
   delete base.CLOUDX_NATIVE_CODEX_VERSION;
+  delete base.CLOUDX_NATIVE_PREVIOUS_CODEX;
   return spawnSync(process.execPath, [runner], { env: { ...base, ...env }, encoding: "utf8", timeout: 5_000 });
 }
 
@@ -33,8 +34,9 @@ it("rejects a selected executable that cannot report its version", () => {
 it.each([
   ["0.153.4", undefined, "Expected supported Codex 0.156.1 or 0.157.1; found 0.153.4"],
   ["0.155.1", undefined, "Expected supported Codex 0.156.1 or 0.157.1; found 0.155.1"],
-  ["0.156.1", "0.157.1", "Expected supported Codex 0.157.1; found 0.156.1"]
-])("rejects unsupported or mismatched native version %s", async (version, expected, diagnostic) => {
+  ["0.156.1", "0.157.1", "Expected supported Codex 0.157.1; found 0.156.1"],
+  ["0.157.1", "0.157.1", "Set CLOUDX_NATIVE_PREVIOUS_CODEX"]
+])("rejects incomplete required native version configuration %s", async (version, expected, diagnostic) => {
   const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-version-"));
   fixtures.push(fixture);
   const binary = path.join(fixture, "codex");

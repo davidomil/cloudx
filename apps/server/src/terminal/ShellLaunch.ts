@@ -1,4 +1,5 @@
 import path from "node:path";
+import { resolveSelectedCodexBinary } from "../../../../scripts/codex-updater.mjs";
 
 export interface ProcessLaunch {
   command: string;
@@ -12,13 +13,15 @@ export function resolveUserShell(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 export function resolveAssistantCommand(env: NodeJS.ProcessEnv = process.env, defaultCommand = "codex"): string {
-  return env.CLOUDX_ASSISTANT_BIN?.trim() || defaultCommand;
+  const command = env.CLOUDX_ASSISTANT_BIN?.trim() || defaultCommand;
+  if (!path.isAbsolute(command) || path.basename(command) !== "codex" || path.basename(path.dirname(command)) !== "bin") return command;
+  return resolveSelectedCodexBinary({ assistantBin: command, prefix: path.dirname(path.dirname(command)) });
 }
 
 export function buildToolEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const pathEntries = [
     ...splitPath(env.CLOUDX_TOOL_PATH),
-    commandDirectory(resolveAssistantCommand(env, "")),
+    commandDirectory(env.CLOUDX_ASSISTANT_BIN?.trim() || ""),
     ...splitPath(env.PATH)
   ].filter((entry): entry is string => Boolean(entry));
   return {

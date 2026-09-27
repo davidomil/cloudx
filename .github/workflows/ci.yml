@@ -94,10 +94,14 @@ jobs:
           fi
           npm install --global --prefix "$RUNNER_TEMP/codex" --ignore-scripts --no-audit --no-fund "@openai/codex@$codex_version"
           printf 'version=%s\n' "$codex_version" >> "$GITHUB_OUTPUT"
+      - name: Install another version for shared-state downgrade and upgrade coverage
+        run: npm install --global --prefix "$RUNNER_TEMP/codex-previous" --ignore-scripts --no-audit --no-fund '@openai/codex@0.155.1'
       - name: Require production launch, permissions and conversation recovery
         env:
           CLOUDX_NATIVE_CODEX_VERSION: ${{ steps.codex.outputs.version }}
-        run: CLOUDX_NATIVE_CODEX="$RUNNER_TEMP/codex/bin/codex" npm run test:codex-recovery
+        run: CLOUDX_NATIVE_CODEX="$RUNNER_TEMP/codex/bin/codex" CLOUDX_NATIVE_PREVIOUS_CODEX="$RUNNER_TEMP/codex-previous/bin/codex" npm run test:codex-recovery
+      - name: Require native downgrade, previous-version return and running-session preservation
+        run: CLOUDX_NATIVE_CODEX="$RUNNER_TEMP/codex-previous/bin/codex" CLOUDX_NATIVE_PREVIOUS_CODEX="$RUNNER_TEMP/codex/bin/codex" npx vitest run scripts/codex-updater.native.test.mjs
 
   terminal-stress:
     name: Terminal stress (Node 22, 2 CPUs, 7 GiB)

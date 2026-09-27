@@ -1655,7 +1655,7 @@ describe("runInstaller dry-run", () => {
     expect(runner.commands.some((command) => command.remove)).toBe(false);
   });
 
-  it("plans an update from main that preserves configuration and verifies its services", async () => {
+  it.each(["default", "selected"])("plans an update from main that preserves configuration and its %s Codex installation", async (installation) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-repo-"));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-home-"));
     const runner = new InstallerRunner({
@@ -1696,8 +1696,20 @@ describe("runInstaller dry-run", () => {
       path.join(home, ".config/systemd/user/cloudx-asr.service"),
       "",
     );
-    const codexPrefix = path.join(home, CLOUDX_NPM_GLOBAL_DIR);
+    const codexPrefix = installation === "selected" ? path.join(home, "custom-codex-prefix") : path.join(home, CLOUDX_NPM_GLOBAL_DIR);
     const codexBin = path.join(codexPrefix, "bin/codex");
+    const selectedBin = path.join(codexPrefix, ".cloudx-codex/installs/11111111-1111-4111-8111-111111111111/bin/codex");
+    const selectionPath = path.join(codexPrefix, ".cloudx-codex-selection.json");
+    let selectedContent;
+    if (installation === "selected") {
+      fs.mkdirSync(path.dirname(selectedBin), { recursive: true });
+      fs.mkdirSync(path.dirname(codexBin), { recursive: true });
+      fs.writeFileSync(codexBin, "retained original process dependency");
+      fs.writeFileSync(selectedBin, "selected verified process dependency");
+      selectedContent = JSON.stringify({ schemaVersion: 1, active: { version: "0.155.1", assistantBin: selectedBin }, previous: { version: "0.153.4", assistantBin: codexBin } });
+      fs.writeFileSync(selectionPath, selectedContent);
+      fs.appendFileSync(path.join(home, ".config/cloudx/cloudx.env"), `CLOUDX_ASSISTANT_BIN=${codexBin}\n`);
+    }
 
     const result = await runInstaller({
       repoRoot: root,
@@ -1730,6 +1742,12 @@ describe("runInstaller dry-run", () => {
       restartServices: true,
     });
     expect(result.urls).toEqual(["https://127.0.0.1:3443"]);
+    if (installation === "selected") {
+      expect(planned.some(([command, action]) => command === "npm" && action === "i")).toBe(false);
+      expect(fs.readFileSync(selectionPath, "utf8")).toBe(selectedContent);
+      expect(fs.readFileSync(codexBin, "utf8")).toBe("retained original process dependency");
+      expect(fs.readFileSync(selectedBin, "utf8")).toBe("selected verified process dependency");
+    }
     const updatedEnv = runner.writes.find(
       (write) => write.path === path.join(home, ".config/cloudx/cloudx.env"),
     )?.contents;
@@ -1766,8 +1784,8 @@ describe("runInstaller dry-run", () => {
           "+refs/heads/main:refs/remotes/origin/main",
         ],
         ["git", "merge", "--ff-only", "--no-edit", "refs/remotes/origin/main"],
-        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.157.1"],
-        [codexBin, "--version"],
+        ...(installation === "selected" ? [] : [["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.157.1"]]),
+        [installation === "selected" ? selectedBin : codexBin, "--version"],
         ["npm", "ci"],
         ["python3", "-m", "venv", path.join(home, ".local/share/cloudx/uv")],
         [

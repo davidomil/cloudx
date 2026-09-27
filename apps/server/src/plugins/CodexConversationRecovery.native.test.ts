@@ -304,6 +304,7 @@ it.skipIf(!codexBinary)("verifies the supported CLI through the updater's produc
   await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
   expect(evidence).toEqual([
     "Selected conversation saved before any model prompt.\n",
-    "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
+    "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n",
+    "Native Forge worker saved its conversation identity and completed its owned turn.\n"
   ]);
 }, 35_000);
