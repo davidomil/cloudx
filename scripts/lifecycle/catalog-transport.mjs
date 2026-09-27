@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
-// An external catalog fixture, loaded by the isolated web service only. The
+// An external catalog fixture, loaded by the isolated application services. The
 // installed source's catalog, selection cache, routes and updater stay intact.
 export function pinnedCatalogFetch({ source, target }, networkFetch = fetch) {
   for (const commit of [source, target]) assert.match(commit, /^[a-f0-9]{40}$/);

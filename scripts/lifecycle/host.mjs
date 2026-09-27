@@ -363,7 +363,7 @@ export class DisposableHost {
       "lifecycle@example.invalid",
     ]);
     this.assertFreshInstallation();
-    this.prepareCatalog();
+    await this.prepareCatalog();
     const { startProfileProvider } = await import("./profile.mjs");
     this.provider = await startProfileProvider({
       home: this.home,
@@ -437,7 +437,7 @@ export class DisposableHost {
     );
   }
 
-  prepareCatalog() {
+  async prepareCatalog() {
     const fixtures = path.join(this.home, "lifecycle-fixtures");
     fs.mkdirSync(fixtures);
     fs.copyFileSync(
@@ -451,15 +451,14 @@ export class DisposableHost {
         target: this.options.target,
       }),
     );
-    const dropIn = path.join(
-      this.home,
-      ".config/systemd/user/cloudx.service.d",
-    );
-    fs.mkdirSync(dropIn, { recursive: true });
-    fs.writeFileSync(
-      path.join(dropIn, "lifecycle-catalog.conf"),
-      `[Service]\nEnvironment="NODE_OPTIONS=--import=${fixtures}/catalog-transport.mjs"\nEnvironment="CLOUDX_LIFECYCLE_REVISIONS=${fixtures}/revisions.json"\n`,
-    );
+    // Standard update preflight rejects unit overrides. The isolated user
+    // manager passes these fixtures to its services without changing their definitions.
+    await this.runAsUser("systemctl", [
+      "--user",
+      "set-environment",
+      `NODE_OPTIONS=--import=${fixtures}/catalog-transport.mjs`,
+      `CLOUDX_LIFECYCLE_REVISIONS=${fixtures}/revisions.json`,
+    ]);
   }
 
   async install() {

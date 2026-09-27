@@ -2,7 +2,9 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { inspectUpdateTarget, SERVICE_NAMES } from "../install-update.mjs";
 import {
   DisposableHost,
   makeEvidenceReadable,
@@ -179,6 +181,81 @@ describe("disposable lifecycle host", () => {
     expect(host.controllerEnvironment()).not.toHaveProperty(
       "CLOUDX_ASSISTANT_BIN",
     );
+  });
+
+  it("pins the catalog without making standard installed services fail update preflight", async () => {
+    const host = new DisposableHost({
+      scenario: "upgrade",
+      source,
+      target,
+      evidence: directory(),
+    });
+    host.home = directory();
+    host.repoRoot = directory();
+    const paths = {
+      repoRoot: host.repoRoot,
+      envPath: path.join(host.home, ".config/cloudx/cloudx.env"),
+      systemdDir: path.join(host.home, ".config/systemd/user"),
+    };
+    fs.mkdirSync(path.dirname(paths.envPath), { recursive: true });
+    fs.mkdirSync(paths.systemdDir, { recursive: true });
+    fs.writeFileSync(paths.envPath, "CLOUDX_PORT=3001\n");
+    for (const unit of SERVICE_NAMES)
+      fs.writeFileSync(path.join(paths.systemdDir, unit), "[Service]\n");
+    const managerEnvironment = {};
+    host.runAsUser = vi.fn(async (command, args) => {
+      expect([command, ...args.slice(0, 2)]).toEqual([
+        "systemctl",
+        "--user",
+        "set-environment",
+      ]);
+      for (const assignment of args.slice(2)) {
+        const equal = assignment.indexOf("=");
+        managerEnvironment[assignment.slice(0, equal)] = assignment.slice(
+          equal + 1,
+        );
+      }
+    });
+    await host.prepareCatalog();
+
+    const commands = {
+      inspect: (_command, args) => {
+        const unit = args[2],
+          dropIns = path.join(paths.systemdDir, `${unit}.d`);
+        return Object.entries({
+          LoadState: "loaded",
+          NeedDaemonReload: "no",
+          WorkingDirectory: paths.repoRoot,
+          FragmentPath: path.join(paths.systemdDir, unit),
+          EnvironmentFiles: `${paths.envPath} (ignore_errors=no)`,
+          DropInPaths: fs.existsSync(dropIns)
+            ? fs
+                .readdirSync(dropIns)
+                .map((file) => path.join(dropIns, file))
+                .join(" ")
+            : "",
+        })
+          .map(([key, value]) => `${key}=${value}`)
+          .join("\n");
+      },
+    };
+    expect(inspectUpdateTarget({ paths, commands }).kind).toBe("standard");
+    expect(managerEnvironment.NODE_OPTIONS).toContain("--import=");
+    const child = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        "console.log(await (await fetch('https://api.github.com/repos/davidomil/cloudx/commits/main')).text())",
+      ],
+      {
+        env: { PATH: process.env.PATH, ...managerEnvironment },
+        encoding: "utf8",
+        timeout: 5000,
+      },
+    );
+    expect(child.status, child.stderr).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual({ sha: target });
   });
 
   it("preserves Git porcelain bytes from a real child process", async () => {

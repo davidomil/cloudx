@@ -49,8 +49,9 @@ descend from the oldest supported baseline
 must differ.
 
 The isolated application has a frozen local Git origin containing the
-exact target. A Node preload fixtures only external GitHub catalog reads
-so the source’s real catalog can select that target without consulting
+exact target. The isolated systemd user manager supplies a Node preload
+without overriding the standard service definitions. It fixtures only
+external GitHub catalog reads so the source’s real catalog can select that target without consulting
 moving remote main. It preserves the source UI, preview cache, routes,
 updater, and coordinator scripts. Application HTTP, model-provider HTTP,
 and Git operations remain real. Unexpected GitHub catalog requests fail
