@@ -514,7 +514,7 @@ it.each(["signalled exit", "cancellation before exit", "cancellation during clea
   expect(session.snapshot().status).toBe(scenario === "signalled exit" ? "failed" : "stopped");
 });
 
-it("waits past auxiliary completion, retains the worker final response before rendering, and reaps descendants", async () => {
+it.each([0, 1_200])("waits past auxiliary completion delayed %i ms, retains the worker final response before rendering, and reaps descendants", async titleDelayMs => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-bridge-"));
   directories.push(directory);
   const command = path.join(directory, "codex.mjs");
@@ -542,8 +542,10 @@ if (process.argv.includes('app-server')) {
     if (message.method !== 'turn/start') return;
     if (message.params.threadId === 'title-thread') {
       send({ id: message.id, result: { turn: { id: 'title-turn', status: 'inProgress' } } });
-      send({ method: 'item/completed', params: { threadId: 'title-thread', turnId: 'title-turn', item: { type: 'agentMessage', phase: 'final_answer', text: '{"title":"Auxiliary title"}' } } });
-      send(${JSON.stringify(complete("completed", "title-thread", "title-turn"))});
+      setTimeout(() => {
+        send({ method: 'item/completed', params: { threadId: 'title-thread', turnId: 'title-turn', item: { type: 'agentMessage', phase: 'final_answer', text: '{"title":"Auxiliary title"}' } } });
+        send(${JSON.stringify(complete("completed", "title-thread", "title-turn"))});
+      }, ${titleDelayMs});
       return;
     }
     send({ id: message.id, result: { turn: { id: 'turn', status: 'inProgress' } } });
@@ -577,14 +579,14 @@ if (process.argv.includes('app-server')) {
   const tab: WorkspaceTab = { id: "owned", pluginId: "codex-terminal", title: "Owned", cwd: directory, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "", updatedAt: "" } };
   const session = new CodexTerminalSession(tab, terminal, undefined, { closeOnExit: false, nativeTurn: { ...binding, receiptPath } });
   try {
-    await expect.poll(async () => fs.access(reportPath).then(() => true, () => false)).toBe(true);
-    await expect.poll(async () => fs.access(titleCompletedPath).then(() => true, () => false)).toBe(true);
-    await expect.poll(async () => fs.readFile(receiptPath, "utf8").then(text => JSON.parse(text).status, () => undefined)).toBe("running");
+    await expect.poll(() => fs.readFile(titleCompletedPath, "utf8"), { timeout: 5_000 }).toBe("completed");
+    expect(JSON.parse(await fs.readFile(reportPath, "utf8"))).toEqual({});
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8")).status).toBe("running");
     await expect(fs.access(`${receiptPath}.final.json`)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(session.handleAction("finish", { threadId: "thread", turnId: "turn" })).rejects.toThrow("not completed successfully");
     expect(session.hasExited()).toBe(false);
     await fs.writeFile(releasePath, "release");
-    await expect.poll(async () => JSON.parse(await fs.readFile(receiptPath, "utf8")).status).toBe("completed");
+    await expect.poll(async () => JSON.parse(await fs.readFile(receiptPath, "utf8")).status, { timeout: 5_000 }).toBe("completed");
     await expect(session.handleAction("finish", { threadId: "thread", turnId: "old-turn" })).rejects.toThrow("not completed successfully");
     await session.handleAction("finish", { threadId: "thread", turnId: "turn" });
     expect(session.snapshot()).toMatchObject({ status: "completed" });
@@ -596,4 +598,4 @@ if (process.argv.includes('app-server')) {
     const child = (await fs.readFile(childPath, "utf8")).trim();
     await expect(fs.access(`/proc/${child}`)).rejects.toMatchObject({ code: "ENOENT" });
   } finally { await terminal.terminate(); }
-}, 10_000);
+}, 20_000);

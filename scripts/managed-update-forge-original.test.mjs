@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { ForgeWorkflowService } from '../apps/server/src/forge/ForgeWorkflowService.ts';
 import { ForgeWorkflowStore, ForgeWorkerReports } from '../apps/server/src/forge/ForgeWorkflowStore.ts';
 import { ForgeRuntime } from '../apps/server/src/forge/ForgeRuntime.ts';
@@ -12,14 +12,24 @@ import { cleanupUpdates, git, runPreparedUpdate, updateFixture, write } from './
 import { cleanupHistoricalForge, historicalForge, FORGE_WITH_HISTORICAL_DRAFTS } from './helpers/managed-update-forge-history-fixture.mjs';
 
 const services = [];
+const nativeTarget = '2f28a100cd765b8c209e85fdacb03b03a57ba0df';
+const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e120', FORGE_WITH_HISTORICAL_DRAFTS, nativeTarget];
+const draftIdentityTargets = ['c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e1204ca86a84e3722248bb619a644326e34e'];
+let originalHistory;
+const integratedTargets = new Map();
+beforeAll(() => {
+  originalHistory = historicalForge('c664071e', { integrate: false });
+  for (const target of new Set([...continuationTargets.filter(Boolean), ...draftIdentityTargets]))
+    integratedTargets.set(target, historicalForge(target));
+}, 60000);
+afterAll(cleanupHistoricalForge);
 afterEach(async () => {
   for (const service of services.splice(0)) await service.dispose();
   cleanupUpdates();
-  cleanupHistoricalForge();
 });
 
 async function originalProfile(targetCommit) {
-  const history = historicalForge('c664071e', { integrate: false });
+  const history = originalHistory;
   const f = updateFixture({ activate: false, originalWeb: 'active' });
   fs.unlinkSync(f.forgeFile);
   const repository = { provider: 'github', apiUrl: 'https://api.github.com', projectPath: 'fixture/cloudx' };
@@ -61,7 +71,7 @@ async function originalProfile(targetCommit) {
     expect(worker.reviewBaseline).toBeUndefined();
     expect(worker.completion).toBeUndefined();
   }
-  const target = targetCommit ? historicalForge(targetCommit) :
+  const target = targetCommit ? integratedTargets.get(targetCommit) :
     { ForgeWorkflowService, ForgeWorkflowStore, ForgeRuntime, PluginDataStore };
   const currentStore = new target.ForgeWorkflowStore(new target.PluginDataStore(f.dataDir));
   const currentRuntime = new target.ForgeRuntime(runtimeDeps);
@@ -99,8 +109,6 @@ it('loads every original 0.1.3 review on upgrade and preserves posted receipts w
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
-const nativeTarget = '2f28a100cd765b8c209e85fdacb03b03a57ba0df';
-const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e120', FORGE_WITH_HISTORICAL_DRAFTS, nativeTarget];
 it.each(continuationTargets.flatMap(target => ['draft', 'posted'].map(status => ({ target, status }))))(
   'starts a fresh full review after an original 0.1.3 $status review on $target', async ({ target, status }) => {
   const f = await originalProfile(target);
@@ -225,9 +233,9 @@ it.each([
   expect(f.provider.postReview).toHaveBeenCalledOnce();
 }, 15000);
 
-it.each(['c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e1204ca86a84e3722248bb619a644326e34e'])('retains original draft identity when the selected target is %s', async commit => {
+it.each(draftIdentityTargets)('retains original draft identity when the selected target is %s', async commit => {
   const f = await originalProfile();
-  const target = historicalForge(commit);
+  const target = integratedTargets.get(commit);
   const record = { ...f.record, transition: { ...f.record.transition, release: target.root } };
   f.host.planData(record);
   expect(record.transition.dataCompatibility.compatible).toBe(true);
