@@ -471,7 +471,7 @@ async function verifyCodexLaunch(assistantBin, options, previousAssistantBin) {
     if (["cancelled", "timeout", "output-limit", "log-unavailable", "cleanup-incomplete", "supervision-unavailable"].includes(error.code)) throw error;
     throw new CodexUpdateError(
       "runtime-verification",
-      "The candidate Codex CLI failed CloudX tab launch, conversation selection, Forge turn, or shared-state verification. The active selection was preserved. Check the private update log or installer output for the failed step, then explicitly select a supported release.",
+      "The candidate Codex CLI failed CloudX tab launch, conversation selection, Forge turn, or shared-state verification. The active selection was preserved. Check the private update log or installer output for the failed step. If the active CLI can no longer launch, enable recovery mode in Settings and apply your chosen release.",
     );
   }
 }
@@ -497,6 +497,7 @@ export async function updateCodexInstallation({
   prefix,
   targetVersion = "latest",
   acknowledgeDowngrade = false,
+  recoveryMode = false,
   env = process.env,
   signal,
   onProgress,
@@ -509,6 +510,7 @@ export async function updateCodexInstallation({
     throw new CodexUpdateError("invalid-version", "Select an exact published Codex version, latest stable, or the previous verified version.");
   }
   if (typeof acknowledgeDowngrade !== "boolean") throw new CodexUpdateError("invalid-version", "Invalid downgrade acknowledgement.");
+  if (typeof recoveryMode !== "boolean") throw new CodexUpdateError("invalid-version", "Invalid recovery mode.");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new CodexUpdateError("invalid-timeout", "Codex selection requires a positive integer timeout.");
   const installation = resolveCodexInstallation({ assistantBin, prefix });
   const deadline = AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, UPDATE_TIMEOUT_MS)));
@@ -543,7 +545,7 @@ export async function updateCodexInstallation({
     if (!releases.versions.includes(target)) throw new CodexUpdateError("unpublished", "The requested exact Codex version is not published in the configured npm registry. The active selection was preserved.");
     onTarget?.(target);
     if (previousVersion && compareCodexVersions(target, previousVersion) < 0 && !acknowledgeDowngrade) {
-      throw new CodexUpdateError("downgrade-confirmation", "Confirm the downgrade in Settings: shared conversations may contain newer state. CloudX checks synthetic cross-version resume, but cannot prove every existing conversation is compatible.");
+      throw new CodexUpdateError("downgrade-confirmation", "Confirm the downgrade in Settings: shared conversations may contain newer state. Integration verification cannot prove every existing conversation is compatible; recovery mode also skips cross-version resume checks.");
     }
     if (target === previousVersion) {
       onProgress?.("verifying");
@@ -575,7 +577,8 @@ export async function updateCodexInstallation({
     }
     installedVersion = target;
     onInstalled?.(target);
-    await verifyCodexLaunch(candidate.assistantBin, commandOptions, selection?.active.assistantBin);
+    if (recoveryMode) onOutput?.("Recovery mode: verifying the requested candidate without launching the active CLI. Cross-version shared-state compatibility is not checked.\n");
+    await verifyCodexLaunch(candidate.assistantBin, commandOptions, recoveryMode ? undefined : selection?.active.assistantBin);
     operationSignal.throwIfAborted();
     writeSelection(installation, { version: target, assistantBin: candidate.assistantBin }, selection?.active ?? null);
     activated = true;

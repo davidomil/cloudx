@@ -138,6 +138,35 @@ describe("Codex CLI update in Settings", () => {
     expect(panel.starts).toHaveBeenCalledExactlyOnceWith({ targetVersion: "0.9.0", acknowledgeDowngrade: true });
   });
 
+  it("requires explicit recovery and downgrade acknowledgement for the exact retained version", async () => {
+    const panel = await mount();
+    await act(async () => panel.button("Return to previous verified").click());
+    const recovery = () => panel.container.querySelector<HTMLInputElement>('[aria-label="Recovery mode"]')!;
+    expect(recovery().checked).toBe(false);
+    await act(async () => recovery().click());
+    expect(panel.container.textContent).toContain("Cross-version compatibility of saved conversations and shared state will not be checked");
+    expect(panel.updateButton().disabled).toBe(true);
+    await act(async () => panel.container.querySelector<HTMLInputElement>('[aria-label="Acknowledge shared state downgrade risk"]')!.click());
+    expect(panel.updateButton().disabled).toBe(false);
+    await act(async () => panel.updateButton().click());
+    expect(panel.starts).toHaveBeenCalledExactlyOnceWith({ targetVersion: "0.9.0", acknowledgeDowngrade: true, recoveryMode: true });
+  });
+
+  it("resets recovery consent when the target or active version changes", async () => {
+    let status = installed;
+    const panel = await mount(async () => status);
+    const recovery = () => panel.container.querySelector<HTMLInputElement>('[aria-label="Recovery mode"]')!;
+    await act(async () => recovery().click());
+    await enterVersion(panel, "1.2.0-beta.1");
+    expect(recovery().checked).toBe(false);
+    await act(async () => recovery().click());
+    status = { ...installed, activeVersion: "1.1.0" };
+    await poll();
+    expect(recovery().checked).toBe(false);
+    await act(async () => panel.updateButton().click());
+    expect(panel.starts).toHaveBeenCalledExactlyOnceWith({ targetVersion: "1.2.0-beta.1" });
+  });
+
   it("renews downgrade acknowledgement when the active version changes during confirmation", async () => {
     let status = installed;
     const panel = await mount(async () => status);

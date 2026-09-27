@@ -1,6 +1,7 @@
 export interface CodexUpdateRequest {
   targetVersion: string;
   acknowledgeDowngrade?: boolean;
+  recoveryMode?: boolean;
 }
 
 export interface CodexReleases {
@@ -57,13 +58,15 @@ export function compareCodexVersions(left: string, right: string): number {
 export function parseCodexUpdateRequest(value: unknown): CodexUpdateRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid Codex update request.");
   const request = value as Record<string, unknown>;
-  if (Object.keys(request).some(key => !["targetVersion", "acknowledgeDowngrade"].includes(key))
+  if (Object.keys(request).some(key => !["targetVersion", "acknowledgeDowngrade", "recoveryMode"].includes(key))
     || (!isExactCodexVersion(request.targetVersion) && request.targetVersion !== "latest" && request.targetVersion !== "previous")
-    || (request.acknowledgeDowngrade !== undefined && typeof request.acknowledgeDowngrade !== "boolean")) {
+    || (request.acknowledgeDowngrade !== undefined && typeof request.acknowledgeDowngrade !== "boolean")
+    || (request.recoveryMode !== undefined && typeof request.recoveryMode !== "boolean")) {
     throw new Error("Invalid Codex update request. Choose an exact published version, latest, or previous.");
   }
   return { targetVersion: request.targetVersion as string,
-    ...(request.acknowledgeDowngrade === undefined ? {} : { acknowledgeDowngrade: request.acknowledgeDowngrade as boolean }) };
+    ...(request.acknowledgeDowngrade === undefined ? {} : { acknowledgeDowngrade: request.acknowledgeDowngrade as boolean }),
+    ...(request.recoveryMode === undefined ? {} : { recoveryMode: request.recoveryMode as boolean }) };
 }
 
 export function parseCodexReleases(value: unknown): CodexReleases {

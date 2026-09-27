@@ -807,91 +807,164 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   expect(current.tabs).toEqual(original.tabs);
 });
 
-test("Codex version selection searches releases, labels prereleases and confirms a return to the previous verified version", async ({
+test("Codex release discovery preserves a Settings save error when its delayed response succeeds", async ({
   page,
   isMobile,
-}, testInfo) => {
-  const starts: unknown[] = [];
-  await page.route("**/api/hooks/codex-update.start", async (route) => {
-    starts.push(route.request().postDataJSON());
+}) => {
+  let finishDiscovery!: () => void;
+  const discovery = new Promise<void>((resolve) => {
+    finishDiscovery = resolve;
+  });
+  await page.route("**/api/hooks/codex-update.releases", async (route) => {
+    await discovery;
     await route.fulfill({
       json: {
         result: {
-          update: {
-            ...installedCodex,
-            jobId: "previous-version",
-            phase: "checking",
-            requestedVersion: "0.9.0",
-            installedVersion: null,
-            message: "Verifying Codex 0.9.0 before activation.",
-            startedAt: "2026-09-22T00:00:00.000Z",
-          },
+          releases: { latestStable: "1.1.0", versions: ["1.1.0", "1.0.0"] },
         },
       },
     });
   });
+  const discoveryRequested = page.waitForRequest(
+    "**/api/hooks/codex-update.releases",
+  );
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const settings = await openCodexSettings(page, isMobile);
   const control = settings.getByRole("region", { name: "Codex CLI update" });
-  const version = control.getByRole("textbox", {
-    name: "Search releases or enter an exact version",
-  });
-  const published = control.getByRole("combobox", {
-    name: "Published releases",
-  });
-  const apply = control.getByRole("button", {
-    name: "Apply selected version",
-    exact: true,
-  });
-  await expect(apply).toBeDisabled();
-  await version.fill("beta");
-  await expect(published.locator("option")).toHaveCount(2);
-  await expect(published).toContainText("1.2.0-beta.1 — Prerelease");
-  await expect(apply).toBeDisabled();
-  await published.selectOption("1.2.0-beta.1");
-  await expect(control).toContainText(
-    "Confirm selection: 1.0.0 → 1.2.0-beta.1 (Prerelease)",
+  await discoveryRequested;
+  await expect(
+    control.getByRole("combobox", { name: "Published releases" }),
+  ).toBeDisabled();
+  await page.route("**/api/config", (route) =>
+    route.fulfill({
+      status: 500,
+      json: { message: "CloudX settings could not be saved." },
+    }),
   );
-  await expect(apply).toBeEnabled();
-  expect(starts).toEqual([]);
-  await version.fill("1.0.0");
-  await expect(control).toContainText("already selected for new launches");
-  await control
-    .getByRole("button", {
-      name: "Return to previous verified (0.9.0)",
-      exact: true,
-    })
+  await page
+    .getByRole("dialog", { name: "Settings", exact: true })
+    .getByRole("button", { name: "Save", exact: true })
     .click();
-  await expect(version).toHaveValue("0.9.0");
-  await expect(control).toContainText("Confirm downgrade: 1.0.0 → 0.9.0");
-  await expect(apply).toBeDisabled();
-  await expect(control).toContainText(
-    "shared Codex state may use a newer format",
+  await expect(page.locator(".error-banner")).toHaveText(
+    "CloudX settings could not be saved.",
   );
-  await control
-    .getByRole("checkbox", { name: "Acknowledge shared state downgrade risk" })
-    .check();
-  await expect(apply).toBeEnabled();
-  expect(
-    await control.evaluate(
-      (element) => element.scrollWidth <= element.clientWidth + 1,
-    ),
-  ).toBe(true);
-  for (const field of [version, published, apply]) {
-    await field.scrollIntoViewIfNeeded();
-    await expect(field).toBeInViewport({ ratio: 1 });
-    expect((await field.boundingBox())!.height).toBeGreaterThanOrEqual(44);
-  }
-  await captureSample(page, testInfo, "codex-version-downgrade-confirmation");
-  await apply.click();
-  await expect(control).toContainText("Requested version: 0.9.0");
-  await expect(control).toContainText(
-    "Active for new tabs and Forge workers: 1.0.0",
+
+  finishDiscovery();
+  await expect(
+    control.getByRole("button", {
+      name: "Select latest stable (1.1.0)",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  await expect(page.locator(".error-banner")).toHaveText(
+    "CloudX settings could not be saved.",
   );
-  expect(starts).toEqual([
-    { input: { targetVersion: "0.9.0", acknowledgeDowngrade: true } },
-  ]);
 });
+
+for (const recoveryMode of [false, true]) {
+  test(`Codex version selection searches releases, labels prereleases and confirms a return to the previous verified version${recoveryMode ? " in recovery mode" : ""}`, async ({
+    page,
+    isMobile,
+  }, testInfo) => {
+    const starts: unknown[] = [];
+    await page.route("**/api/hooks/codex-update.start", async (route) => {
+      starts.push(route.request().postDataJSON());
+      await route.fulfill({
+        json: {
+          result: {
+            update: {
+              ...installedCodex,
+              jobId: "previous-version",
+              phase: "checking",
+              requestedVersion: "0.9.0",
+              installedVersion: null,
+              message: "Verifying Codex 0.9.0 before activation.",
+              startedAt: "2026-09-22T00:00:00.000Z",
+            },
+          },
+        },
+      });
+    });
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    const settings = await openCodexSettings(page, isMobile);
+    const control = settings.getByRole("region", { name: "Codex CLI update" });
+    const version = control.getByRole("textbox", {
+      name: "Search releases or enter an exact version",
+    });
+    const published = control.getByRole("combobox", {
+      name: "Published releases",
+    });
+    const apply = control.getByRole("button", {
+      name: "Apply selected version",
+      exact: true,
+    });
+    await expect(apply).toBeDisabled();
+    await version.fill("beta");
+    await expect(published.locator("option")).toHaveCount(2);
+    await expect(published).toContainText("1.2.0-beta.1 — Prerelease");
+    await expect(apply).toBeDisabled();
+    await published.selectOption("1.2.0-beta.1");
+    await expect(control).toContainText(
+      "Confirm selection: 1.0.0 → 1.2.0-beta.1 (Prerelease)",
+    );
+    await expect(apply).toBeEnabled();
+    expect(starts).toEqual([]);
+    await version.fill("1.0.0");
+    await expect(control).toContainText("already selected for new launches");
+    await control
+      .getByRole("button", {
+        name: "Return to previous verified (0.9.0)",
+        exact: true,
+      })
+      .click();
+    await expect(version).toHaveValue("0.9.0");
+    await expect(control).toContainText("Confirm downgrade: 1.0.0 → 0.9.0");
+    const recovery = control.getByRole("checkbox", { name: "Recovery mode" });
+    await expect(recovery).not.toBeChecked();
+    if (recoveryMode) {
+      await recovery.check();
+      await expect(recovery).toBeChecked();
+      await expect(control).toContainText(
+        "Cross-version compatibility of saved conversations and shared state will not be checked.",
+      );
+    }
+    await expect(apply).toBeDisabled();
+    await expect(control).toContainText(
+      "shared Codex state may use a newer format",
+    );
+    await control
+      .getByRole("checkbox", {
+        name: "Acknowledge shared state downgrade risk",
+      })
+      .check();
+    await expect(apply).toBeEnabled();
+    expect(
+      await control.evaluate(
+        (element) => element.scrollWidth <= element.clientWidth + 1,
+      ),
+    ).toBe(true);
+    for (const field of [version, published, apply]) {
+      await field.scrollIntoViewIfNeeded();
+      await expect(field).toBeInViewport({ ratio: 1 });
+      expect((await field.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    }
+    await captureSample(page, testInfo, "codex-version-downgrade-confirmation");
+    await apply.click();
+    await expect(control).toContainText("Requested version: 0.9.0");
+    await expect(control).toContainText(
+      "Active for new tabs and Forge workers: 1.0.0",
+    );
+    expect(starts).toEqual([
+      {
+        input: {
+          targetVersion: "0.9.0",
+          acknowledgeDowngrade: true,
+          ...(recoveryMode ? { recoveryMode: true } : {}),
+        },
+      },
+    ]);
+  });
+}
 
 test("Codex version discovery exposes registry failures without substituting a release", async ({
   page,

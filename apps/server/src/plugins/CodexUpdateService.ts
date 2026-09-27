@@ -157,7 +157,8 @@ export class CodexUpdateService {
       this.verificationBlocked = false;
       this.save({ ...this.state, phase: "succeeded", installedVersion: result.installedVersion, requestedVersion: result.installedVersion,
         activeVersion: result.activeVersion, previousVerifiedVersion: result.previousVerifiedVersion, outcome: result.outcome,
-        message: result.outcome === "current" ? `Codex ${result.installedVersion} is already selected and verified.` : `Codex ${result.installedVersion} is selected for new tabs and Forge workers. Existing processes keep their original version.`,
+        message: (result.outcome === "current" ? `Codex ${result.installedVersion} is already selected and verified.` : `Codex ${result.installedVersion} is selected for new tabs and Forge workers. Existing processes keep their original version.`)
+          + (request.recoveryMode ? " Recovery verified the selected CLI's native tab and Forge turn. Cross-version shared-state compatibility was not checked." : ""),
         finishedAt: new Date().toISOString() });
     } catch (error) {
       const known = error instanceof CodexUpdateError;

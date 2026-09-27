@@ -25,7 +25,7 @@ beforeEach(() => {
     const source = `
       const fs = require('node:fs');
       fs.appendFileSync(process.env.TEST_RUNTIME_LOG, process.argv[1] + '\\n');
-      if (process.env.TEST_MODE === 'runtime') {
+      if (process.env.TEST_MODE === 'runtime' || process.env.TEST_MODE === 'previous-runtime' && process.argv[2]) {
         console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
       }
       if (process.env.TEST_MODE === 'runtime-timeout') {
@@ -746,6 +746,42 @@ describe("exact Codex selection", () => {
     expect(readCodexSelection(fixture)).toEqual({ schemaVersion: 1, active: initial.active, previous: upgraded.active });
     expect(commands(fixture).filter(command => command[0] === "i")).toHaveLength(1);
     expect(fs.existsSync(upgraded.active.assistantBin)).toBe(true);
+  });
+
+  it.each(["previous", "1.0.0"])("explicit recovery to %s verifies the candidate without requiring the active CLI to launch", async targetVersion => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.1.0" });
+    const selected = readCodexSelection(fixture);
+    const binaries = [selected.active, selected.previous].map(({ assistantBin }) => fs.readFileSync(assistantBin, "utf8"));
+    fixture.env.TEST_MODE = "previous-runtime";
+    await expect(updateCodexInstallation({ ...fixture, targetVersion, acknowledgeDowngrade: true })).rejects.toMatchObject({ code: "runtime-verification" });
+    expect(readCodexSelection(fixture)).toEqual(selected);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion, recoveryMode: true })).rejects.toMatchObject({ code: "downgrade-confirmation" });
+    expect(readCodexSelection(fixture)).toEqual(selected);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion, acknowledgeDowngrade: true, recoveryMode: true })).resolves.toMatchObject({ activeVersion: "1.0.0" });
+    expect(readCodexSelection(fixture)).toEqual({ schemaVersion: 1, active: selected.previous, previous: selected.active });
+    expect([selected.active, selected.previous].map(({ assistantBin }) => fs.readFileSync(assistantBin, "utf8"))).toEqual(binaries);
+    expect(commands(fixture).filter(command => command[0] === "i")).toHaveLength(1);
+  });
+
+  it("keeps the selection and both retained binaries if recovery candidate verification fails", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.1.0" });
+    const selected = readCodexSelection(fixture);
+    fixture.env.TEST_MODE = "runtime";
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "previous", acknowledgeDowngrade: true, recoveryMode: true })).rejects.toMatchObject({ code: "runtime-verification", usableVersion: "1.1.0", installedVersion: "1.0.0" });
+    expect(readCodexSelection(fixture)).toEqual(selected);
+    expect(await readCodexVersion(selected.active.assistantBin, fixture)).toBe("1.1.0");
+    expect(await readCodexVersion(selected.previous.assistantBin, fixture)).toBe("1.0.0");
+  });
+
+  it("rejects an invalid recovery mode before changing the selection", async () => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, recoveryMode: "true" })).rejects.toMatchObject({ code: "invalid-version" });
+    expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+    expect(readCodexSelection(fixture)).toBeNull();
   });
 
   it("never treats an unverified initial executable as a previous verified selection", async () => {

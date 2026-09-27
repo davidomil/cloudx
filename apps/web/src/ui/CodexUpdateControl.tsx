@@ -32,6 +32,7 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
   const [releaseRevision, setReleaseRevision] = useState(0);
   const [targetVersion, setTargetVersion] = useState("");
   const [acknowledgedChange, setAcknowledgedChange] = useState<string>();
+  const [recoveryChange, setRecoveryChange] = useState<string>();
   const startUpdate = useRef<((request: CodexUpdateRequest) => Promise<void>) | undefined>(undefined);
 
   useEffect(() => {
@@ -125,10 +126,11 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
   const downgrade = Boolean(exactVersion && update?.activeVersion && compareCodexVersions(targetVersion, update.activeVersion) < 0);
   const change = `${update?.activeVersion}:${targetVersion}`;
   const acknowledgeDowngrade = acknowledgedChange === change;
+  const recoveryMode = recoveryChange === change;
   const prerelease = exactVersion && targetVersion.split("+")[0]!.includes("-");
   const matchingVersions = releases?.versions.filter(version => version.toLowerCase().includes(targetVersion.toLowerCase())) ?? [];
   const canApply = !blocked && update && !active && publishedVersion && (!downgrade || acknowledgeDowngrade);
-  const selectVersion = (version: string) => { setTargetVersion(version); setAcknowledgedChange(undefined); };
+  const selectVersion = (version: string) => { setTargetVersion(version); setAcknowledgedChange(undefined); setRecoveryChange(undefined); };
 
   return <section className="codex-update-control" aria-label="Codex CLI update">
     <h3>Codex CLI</h3>
@@ -159,6 +161,12 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
       {publishedVersion && targetVersion === update?.activeVersion ? <p>Codex {targetVersion} {update.phase === "succeeded" ? "is already selected and verified." : "is already selected for new launches. Apply to confirm its verification status."}</p> : null}
       {prerelease ? <p className="codex-settings-notice">You selected a prerelease. Apply only if you intend to use this prerelease for new launches.</p> : null}
     </> : null}
+    {publishedVersion ? <div className="codex-settings-form">
+      <label className="codex-settings-toggle">
+        <input type="checkbox" aria-label="Recovery mode" checked={recoveryMode} disabled={active} onChange={event => setRecoveryChange(event.target.checked ? change : undefined)} />
+        <span>Recovery mode<small>Use when the active CLI can no longer launch. Verify the selected version's new tab and Forge turn without starting the active CLI. Cross-version compatibility of saved conversations and shared state will not be checked.</small></span>
+      </label>
+    </div> : null}
     {downgrade ? <div className="codex-settings-form">
       <label className="codex-settings-toggle">
         <input type="checkbox" aria-label="Acknowledge shared state downgrade risk" checked={acknowledgeDowngrade} disabled={active} onChange={event => setAcknowledgedChange(event.target.checked ? change : undefined)} />
@@ -166,7 +174,7 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
       </label>
     </div> : null}
     <div className="codex-settings-actions">
-      <ControlButton disabled={!canApply} onClick={() => { void startUpdate.current?.({ targetVersion, ...(downgrade ? { acknowledgeDowngrade } : {}) }); }}>
+      <ControlButton disabled={!canApply} onClick={() => { void startUpdate.current?.({ targetVersion, ...(downgrade ? { acknowledgeDowngrade } : {}), ...(recoveryMode ? { recoveryMode } : {}) }); }}>
         <Download size={16} aria-hidden="true" /> Apply selected version
       </ControlButton>
     </div>

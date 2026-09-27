@@ -28,7 +28,7 @@ beforeEach(() => {
     const verifier = Array.isArray(args) ? args.findIndex(argument => argument.endsWith("/codex-runtime-verification.mjs")) : -1;
     if (verifier < 0 || !Array.isArray(args)) return spawn(command, args as string[], options);
     const source = `
-      if (process.env.CLOUDX_TEST_FAILURE === 'runtime') {
+      if (process.env.CLOUDX_TEST_FAILURE === 'runtime' || process.env.CLOUDX_TEST_FAILURE === 'previous-runtime' && process.argv[2]) {
         console.error('synthetic-private-runtime-detail: selected conversation was not saved');
         process.exit(1);
       }
@@ -264,6 +264,27 @@ describe("server-owned Codex updates", () => {
     expect(await finished(updates)).toMatchObject({ phase: "failed", requestedVersion: "1.0.0", installedVersion: null, activeVersion: "1.1.0", previousVerifiedVersion: "1.0.0", message: expect.stringMatching(/shared conversations|shared.state/i) });
     await updates.start({ targetVersion: "previous", acknowledgeDowngrade: true });
     expect(await finished(updates)).toMatchObject({ phase: "succeeded", requestedVersion: "1.0.0", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: "1.1.0" });
+  });
+
+  it("persists explicit recovery results while keeping downgrade acknowledgement required", async () => {
+    const f = await installation();
+    const updates = f.service();
+    await updates.start({ targetVersion: "1.0.0" });
+    await finished(updates);
+    await updates.start({ targetVersion: "1.1.0" });
+    await finished(updates);
+    await updates.dispose();
+    f.env.CLOUDX_TEST_FAILURE = "previous-runtime";
+    const recovery = f.service();
+    await recovery.start({ targetVersion: "previous", acknowledgeDowngrade: true });
+    expect(await finished(recovery)).toMatchObject({ phase: "failed", activeVersion: "1.1.0" });
+    await recovery.start({ targetVersion: "previous", recoveryMode: true });
+    expect(await finished(recovery)).toMatchObject({ phase: "failed", installedVersion: null, activeVersion: "1.1.0", message: expect.stringContaining("Confirm the downgrade") });
+    await recovery.start({ targetVersion: "previous", acknowledgeDowngrade: true, recoveryMode: true });
+    const completed = await finished(recovery);
+    expect(completed).toMatchObject({ phase: "succeeded", requestedVersion: "1.0.0", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVerifiedVersion: "1.1.0", message: expect.stringContaining("Cross-version shared-state compatibility was not checked") });
+    await recovery.dispose();
+    expect(await f.service().read()).toEqual(completed);
   });
 
   it("selects an explicitly requested prerelease and rejects an unpublished version before installing", async () => {

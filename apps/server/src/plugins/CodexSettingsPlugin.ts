@@ -87,6 +87,7 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
           properties: {
             targetVersion: { type: "string", minLength: 1, maxLength: 128 },
             acknowledgeDowngrade: { type: "boolean" },
+            recoveryMode: { type: "boolean" },
           },
           required: ["targetVersion"],
           additionalProperties: false,

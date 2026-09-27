@@ -468,9 +468,9 @@ describe("Codex settings plugin boundary", () => {
     expect(f.plugin.descriptor()).toMatchObject({ id: "codex-settings", creatable: false, requiresDirectory: false });
   });
 
-  it.each(["ui", "http"] as const)("passes exact selection and downgrade acknowledgement through the %s hook", async kind => {
+  it.each(["ui", "http"] as const)("passes exact selection, recovery mode and downgrade acknowledgement through the %s hook", async kind => {
     const { hooks, updates } = await pluginFixture();
-    const request = { targetVersion: "0.155.1", acknowledgeDowngrade: true };
+    const request = { targetVersion: "0.155.1", acknowledgeDowngrade: true, recoveryMode: true };
     const update = { jobId: "selection", phase: "checking" as const, requestedVersion: "0.155.1", installedVersion: null,
       activeVersion: "0.156.1", previousVerifiedVersion: "0.155.1", outcome: null, message: "Checking", startedAt: new Date(0).toISOString(), finishedAt: null };
     const start = vi.spyOn(updates, "start").mockResolvedValue(update);
@@ -484,6 +484,7 @@ describe("Codex settings plugin boundary", () => {
   });
 
   it.each([{}, { targetVersion: "^0.155.1" }, { targetVersion: "@openai/codex@0.155.1" }, { targetVersion: "0.155.1", acknowledgeDowngrade: "true" },
+    { targetVersion: "0.155.1", recoveryMode: "true" },
     { targetVersion: "0.155.1", prefix: "/another/installation" }])("rejects invalid version selection before starting the service %#", async input => {
     const { hooks, updates } = await pluginFixture();
     const start = vi.spyOn(updates, "start");

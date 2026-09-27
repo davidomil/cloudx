@@ -37,9 +37,15 @@ describe("Codex version selection contracts", () => {
     expect(parseCodexUpdateRequest({ targetVersion })).toEqual({ targetVersion });
   });
 
+  it.each([true, false])("retains explicit recovery mode %s without implying downgrade acknowledgement", recoveryMode => {
+    const request = { targetVersion: "0.155.1", recoveryMode };
+    expect(parseCodexUpdateRequest(request)).toEqual(request);
+  });
+
   it.each([undefined, {}, [], null, { targetVersion: "^1.2.3" }, { targetVersion: "1.2" }, { targetVersion: "1.2.3", package: "evil" },
     { targetVersion: "@openai/codex@1.2.3" }, { targetVersion: "https://example.com/pkg" }, { targetVersion: "/tmp/pkg" },
     { targetVersion: "1.2.3;touch /tmp/pkg" }, { targetVersion: " 1.2.3" }, { targetVersion: "1.2.3", acknowledgeDowngrade: "true" },
+    { targetVersion: "1.2.3", recoveryMode: "true" }, { targetVersion: "1.2.3", recoveryMode: null },
   ])("rejects implicit, ranged, and caller-selected package requests %#", value => {
     expect(() => parseCodexUpdateRequest(value)).toThrow(/Invalid Codex update request/);
   });

@@ -37,6 +37,7 @@ export function updateCodexInstallation(
     prefix: string;
     targetVersion?: string;
     acknowledgeDowngrade?: boolean;
+    recoveryMode?: boolean;
     onTarget?: (version: string) => void;
     onInstalled?: (version: string) => void;
     onProgress?: (stage: "checking" | "updating" | "verifying") => void;
