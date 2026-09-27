@@ -77,7 +77,7 @@ function expectRuntimeSchemaWrites(runner, root) {
 
 describe("install-cloudx helpers", () => {
   it("pins the supported Codex CLI release literally", () => {
-    expect(CODEX_CLI_VERSION).toBe("0.153.4");
+    expect(CODEX_CLI_VERSION).toBe("0.157.1");
   });
 
   it.each([
@@ -1078,7 +1078,7 @@ describe("runInstaller dry-run", () => {
           "-g",
           "--prefix",
           TEST_CODEX_PREFIX,
-          "@openai/codex@0.153.4",
+          "@openai/codex@0.157.1",
         ],
         [TEST_CODEX_BIN, "--version"],
         ["npm", "ci"],
@@ -1766,7 +1766,7 @@ describe("runInstaller dry-run", () => {
           "+refs/heads/main:refs/remotes/origin/main",
         ],
         ["git", "merge", "--ff-only", "--no-edit", "refs/remotes/origin/main"],
-        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.153.4"],
+        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.157.1"],
         [codexBin, "--version"],
         ["npm", "ci"],
         ["python3", "-m", "venv", path.join(home, ".local/share/cloudx/uv")],
