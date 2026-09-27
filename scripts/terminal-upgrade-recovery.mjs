@@ -23,7 +23,7 @@ export function inspectTerminalRecovery({ dataDir, allowLegacyState = false }) {
   const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
   snapshot.readForgeState();
   snapshot.readSessions();
-  return { legacySessionIdentitiesUnavailable: snapshot.legacySessions, warnings: snapshot.legacySessions ? [LEGACY_RECOVERY] : [] };
+  return { legacySessionIdentitiesUnavailable: snapshot.legacySessions, warnings: snapshot.warnings() };
 }
 
 /** The caller must stop the web service before this runs, and stop the broker only after it returns. */
@@ -33,7 +33,7 @@ export function snapshotTerminalRecovery({ dataDir, log = console.warn, allowLeg
   snapshot.readSessions();
   if (!snapshot.files.size) return undefined;
   const backup = snapshot.save();
-  if (snapshot.legacySessions) log(LEGACY_RECOVERY);
+  for (const warning of snapshot.warnings()) log(warning);
   log(`Verified terminal recovery snapshot: ${backup}. Broker replacement interrupts processes. Reopen shells explicitly and select an exact saved Codex conversation in each existing tab; no commands or prompts are replayed.`);
   return backup;
 }
@@ -41,6 +41,8 @@ export function snapshotTerminalRecovery({ dataDir, log = console.warn, allowLeg
 class RecoverySnapshot {
   files = new Map();
   conversations = [];
+  transcriptBindings = [];
+  unavailableConversations = [];
   sources = [];
   bytes = 0;
   entries = 0;
@@ -156,25 +158,39 @@ class RecoverySnapshot {
   readConversation({ tab, initialInput }) {
     const view = `codex-launches/${tab.id}`;
     const binding = this.json(`${view}/.cloudx-source.json`, true);
-    if (!isRecord(binding) || Object.keys(binding).some(key => !["dev", "home", "ino", "sourceId", "version", "durable"].includes(key)) ||
+    const receiptPath = `${view}/.cloudx-conversation.json`;
+    const receipt = this.json(receiptPath, true);
+    const unavailable = receipt === undefined && tab.status === "failed" && tab.recovery?.state === "missing" && tab.recovery.canResume === false &&
+      initialInput?.codexExecutionId === undefined;
+    if (binding !== undefined || !unavailable) {
+      if (!isRecord(binding) || Object.keys(binding).some(key => !["dev", "home", "ino", "sourceId", "version", "durable"].includes(key)) ||
         binding.durable !== undefined && !validDurableIdentity(binding.durable) ||
         binding.version !== 1 || binding.sourceId !== "shared" ||
         ![binding.home, binding.sourceId, binding.dev, binding.ino].every(value => typeof value === "string") || !path.isAbsolute(binding.home))
-      throw new Error(`Codex tab ${tab.id} has invalid source ownership.`);
-    assertSourceIdentity(binding);
-    this.sources.push(binding);
-    const receipt = this.json(`${view}/.cloudx-conversation.json`, true);
+        throw new Error(`Codex tab ${tab.id} has invalid source ownership.`);
+      assertSourceIdentity(binding);
+      this.sources.push(binding);
+    }
+    if (unavailable) {
+      this.unavailableConversations.push({ tabId: tab.id, receiptPath, message:
+        `Codex tab ${tab.id} has an ended legacy process without a saved conversation receipt and remains unavailable. In CloudX, select an exact saved session in Terminal recovery or close the tab. No conversation ID was inferred.` });
+      return;
+    }
     const launchId = initialInput?.resume?.mode === "session" ? initialInput.resume.sessionId : undefined;
-    if (!receipt || !CONVERSATION_ID.test(receipt.sessionId) ||
+    if (!isRecord(receipt) || typeof receipt.sessionId !== "string" || !CONVERSATION_ID.test(receipt.sessionId) ||
         typeof receipt.cwd !== "string" || !path.isAbsolute(receipt.cwd) ||
         typeof receipt.transcriptPath !== "string" || !path.isAbsolute(receipt.transcriptPath) ||
         launchId !== undefined && launchId !== receipt.sessionId)
-      throw new Error(`Codex tab ${tab.id} has missing or conflicting conversation identity. Select and save its exact conversation before replacement.`);
-    const transcriptPath = path.resolve(receipt.transcriptPath);
-    const relative = path.relative(path.join(binding.home, "sessions"), transcriptPath);
-    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || relative === ".." ||
-        !path.basename(transcriptPath).endsWith(`-${receipt.sessionId}.jsonl`))
-      throw new Error(`Codex tab ${tab.id} transcript is outside its bound session store or has a different identity.`);
+      throw new Error(`Codex tab ${tab.id} has missing or conflicting conversation identity. In CloudX, recover its exact saved conversation or close the tab before replacement; do not infer a conversation ID.`);
+    const selected = receipt.version === 2 && receipt.authority === "selected";
+    if ((receipt.version !== undefined || receipt.authority !== undefined) && !selected ||
+        selected && (typeof receipt.tabId !== "string" || !receipt.tabId || typeof receipt.executionId !== "string" || !CONVERSATION_ID.test(receipt.executionId)))
+      throw new Error(`Codex tab ${tab.id} has an invalid conversation selection binding.`);
+    if (selected && (receipt.tabId !== tab.id || receipt.executionId !== initialInput?.codexExecutionId))
+      throw new Error(`Codex tab ${tab.id} conversation belongs to a different tab or execution. Select and save its exact conversation before replacement.`);
+    const transcriptBinding = { tabId: tab.id, view: path.join(this.dataDir, view), binding, receipt };
+    const { transcriptPath, storeIdentity } = resolveBoundTranscript(transcriptBinding);
+    this.transcriptBindings.push({ ...transcriptBinding, transcriptPath, storeIdentity });
     const destination = `transcripts/${tab.id}.jsonl`;
     const transcript = this.capture(destination, false, transcriptPath, TRANSCRIPT_LIMIT);
     const end = transcript.indexOf(10);
@@ -184,6 +200,10 @@ class RecoverySnapshot {
     if (metadata?.type !== "session_meta" || metadata.payload?.id !== receipt.sessionId || metadata.payload?.cwd !== receipt.cwd)
       throw new Error(`Codex tab ${tab.id} transcript metadata does not match its conversation receipt.`);
     this.conversations.push({ tabId: tab.id, lastObservedSessionId: receipt.sessionId, transcriptPath, snapshot: destination });
+  }
+
+  warnings() {
+    return [...(this.legacySessions ? [LEGACY_RECOVERY] : []), ...this.unavailableConversations.map(({ message }) => message)];
   }
 
   save() {
@@ -201,9 +221,19 @@ class RecoverySnapshot {
       for (const { source, bytes } of this.files.values())
         if (!readFile(source, TRANSCRIPT_LIMIT).equals(bytes)) throw new Error(`Recovery source changed during snapshot: ${source}`);
       for (const source of this.sources) assertSourceIdentity(source);
+      for (const transcript of this.transcriptBindings) {
+        const current = resolveBoundTranscript(transcript);
+        if (current.transcriptPath !== transcript.transcriptPath ||
+            ["dev", "ino", "uid", "birthtimeNs"].some(key => current.storeIdentity[key] !== transcript.storeIdentity[key]))
+          throw new Error(`Codex tab ${transcript.tabId} session store changed during snapshot.`);
+      }
+      for (const { receiptPath } of this.unavailableConversations)
+        if (readFile(path.join(this.dataDir, receiptPath), STATE_LIMIT, true) !== undefined)
+          throw new Error(`Recovery source changed during snapshot: ${receiptPath}`);
       fs.writeFileSync(path.join(backup, "manifest.json"), `${JSON.stringify({ version: 1, capturedAt: new Date().toISOString(), files, conversations: this.conversations,
+        unavailableConversations: this.unavailableConversations.map(({ tabId, message }) => ({ tabId, message })),
         legacySessionIdentitiesUnavailable: this.legacySessions,
-        warnings: this.legacySessions ? [LEGACY_RECOVERY] : [],
+        warnings: this.warnings(),
         recovery: "Keep existing tabs and layouts. Start shells explicitly. Select an exact saved Codex session in its existing tab; lastObservedSessionId is not proof of the current native selection. Never replay saved shell commands or AI prompts. Forge ownership records remain unchanged." }, null, 2)}\n`,
       { flag: "wx", mode: 0o600, flush: true });
       syncDirectories(backup);
@@ -291,6 +321,34 @@ function optionalText(value) {
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isWithin(directory, candidate) {
+  const relative = path.relative(directory, candidate);
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function resolveBoundTranscript({ tabId, view, binding, receipt }) {
+  const store = path.join(binding.home, "sessions");
+  safeDirectory(store);
+  const storeIdentity = fs.lstatSync(store, { bigint: true });
+  const supplied = path.resolve(receipt.transcriptPath);
+  const link = path.join(view, "sessions");
+  let transcriptPath = supplied;
+  const invalid = () => new Error(`Codex tab ${tabId} transcript is outside its bound session store or has a different identity.`);
+  if (!isWithin(store, supplied)) {
+    if (!isWithin(link, supplied)) throw invalid();
+    safeDirectory(view);
+    const stat = fs.lstatSync(link);
+    if (!stat.isSymbolicLink() || stat.uid !== process.getuid() ||
+        path.resolve(view, fs.readlinkSync(link)) !== store || fs.realpathSync.native(link) !== store)
+      throw invalid();
+    transcriptPath = path.join(store, path.relative(link, supplied));
+  }
+  // Only the owned launch-view link may be traversed; nested and external aliases stay invalid.
+  if (!path.basename(transcriptPath).endsWith(`-${receipt.sessionId}.jsonl`) || fs.realpathSync.native(receipt.transcriptPath) !== transcriptPath)
+    throw invalid();
+  return { transcriptPath, storeIdentity };
 }
 
 function assertSourceIdentity(binding) {

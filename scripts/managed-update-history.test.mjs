@@ -23,7 +23,10 @@ const targets = [
   ["native retained-review selector", "2f28a100cd765b8c209e85fdacb03b03a57ba0df", false, true],
 ];
 const temporary = [];
-afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+// Each fixture owns two checkouts and a full npm install; CI teardown can exceed the default hook budget.
+afterEach(async () => {
+  for (const root of temporary.splice(0)) await fs.promises.rm(root, { recursive: true, force: true });
+}, 60_000);
 
 it.skipIf(process.platform !== "linux").each(targets)("builds the actual %s target with retained managed Settings and real terminal readiness", async (_name, commit, independentReadiness, persistentBroker) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-managed-history-")); temporary.push(root);

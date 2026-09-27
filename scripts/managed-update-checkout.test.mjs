@@ -160,6 +160,20 @@ function activateForRecovery(f) {
   return host;
 }
 
+function savedCheckoutRestoration() {
+  const home = '/home/cloudx-checkout-test', id = '12345678-1234-4123-8123-123456789abc';
+  const runDir = path.join(home, '.local/state/cloudx/settings-update', id);
+  const record = {
+    home, repoRoot: path.join(home, 'installed'), dataDir: path.join(home, 'profile'), run: { id },
+    transition: {
+      checkoutRestoration: 'copying', activationIntent: true, mutating: true, restored: false, snapshotVerified: true,
+      sourceFiles: [{ relative: serviceFile, type: 'file', mode: 0o100644, content: Buffer.from('installed source').toString('base64') }],
+      targetFiles: [{ relative: serviceFile, type: 'file', mode: 0o100644, content: Buffer.from('historical source').toString('base64') }],
+    },
+  };
+  return { record, runDir };
+}
+
 describe('historical checkout recovery', () => {
   it('recovers source, index, artifacts and local work in a fresh coordinator after a partial ENOSPC write', async () => {
     const f = historicalDowngrade({ originalWeb: 'active' });
@@ -294,15 +308,23 @@ describe('historical checkout recovery', () => {
     expect(git(f.root, 'show', `${f.record.transition.sourceCommit}:${path.relative(f.root, temporary)}`)).toBe('tracked operator work');
   });
 
+  it('accepts saved checkout restoration progress with coherent evidence', () => {
+    const f = savedCheckoutRestoration();
+    expect(() => validateSavedTransition(f.record, f.runDir)).not.toThrow();
+  });
+
   it.each([null, 'complete', false])('rejects an invalid saved checkout restoration state: %j', state => {
-    const f = historicalDowngrade(); activateForRecovery(f);
+    const f = savedCheckoutRestoration();
     f.record.transition.checkoutRestoration = state;
     expect(() => validateSavedTransition(f.record, f.runDir)).toThrow('checkout restoration progress');
   });
 
-  it.each([{ activationIntent: false }, { mutating: false }, { restored: true }, { snapshotVerified: false }, { sourceFiles: undefined }, { targetFiles: undefined }])('rejects contradictory checkout restoration evidence: %j', flags => {
-    const f = historicalDowngrade(); activateForRecovery(f);
-    Object.assign(f.record.transition, { checkoutRestoration: 'copying' }, flags);
+  it.each([
+    ['activationIntent', false], ['mutating', false], ['restored', true], ['snapshotVerified', false],
+    ['sourceFiles', undefined], ['targetFiles', undefined],
+  ])('rejects contradictory checkout restoration evidence: %s = %j', (field, value) => {
+    const f = savedCheckoutRestoration();
+    f.record.transition[field] = value;
     expect(() => validateSavedTransition(f.record, f.runDir)).toThrow('checkout restoration progress');
   });
 

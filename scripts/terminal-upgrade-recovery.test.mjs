@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +9,8 @@ import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStor
 import { WorkspaceLayoutStore } from "../apps/server/src/workspace/WorkspaceLayoutStore.ts";
 import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
 import { CodexStateSources } from "../apps/server/src/plugins/CodexStateSources.ts";
+import { CodexConversationRecovery } from "../apps/server/src/plugins/CodexConversationRecovery.ts";
+import { CodexConversationSelection } from "../apps/server/helpers/codex-conversation-selection.mjs";
 import { assertTerminalMigrationSafe, inspectTerminalRecovery, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
 import { inspectRuntimeUpdate } from "./install-runtime.mjs";
 
@@ -25,7 +28,7 @@ function fixture() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-migration-"));
   roots.push(dataDir);
   const write = (name, value) => {
-    const target = path.join(dataDir, name);
+    const target = path.resolve(dataDir, name);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, typeof value === "string" ? value : `${JSON.stringify(value)}\n`);
     return target;
@@ -70,7 +73,124 @@ async function currentCodexFixture() {
   return { ...f, bindingFile, plan: () => inspectRuntimeUpdate({ paths: { dataDir: f.dataDir, repoRoot: f.dataDir }, commands, target: { kind: "standard" } }) };
 }
 
+async function launchViewFixture(selected = false) {
+  const f = await currentCodexFixture();
+  const view = path.join(f.dataDir, "codex-launches", f.tab.id);
+  const store = path.join(f.read(f.bindingFile).home, "sessions");
+  fs.symlinkSync(store, path.join(view, "sessions"));
+  const receiptPath = path.join(view, ".cloudx-conversation.json");
+  const transcriptPath = path.join(view, "sessions", path.relative(store, f.transcriptPath));
+  if (selected) {
+    const saved = f.read("sessions.json");
+    saved.sessions[0].initialInput.codexExecutionId = otherId;
+    f.write("sessions.json", saved);
+    const selection = new CodexConversationSelection({ tabId: f.tab.id, executionId: otherId, receiptPath }, value => f.write(receiptPath, value));
+    selection.fromClient({ id: 1, method: "thread/resume" });
+    selection.fromServer({ id: 1, result: { thread: { id: conversationId, cwd: f.tab.cwd, path: transcriptPath } } });
+  } else {
+    execFileSync(process.execPath, [new URL("../apps/server/helpers/codex-conversation-hook.mjs", import.meta.url).pathname, receiptPath], {
+      input: JSON.stringify({ hook_event_name: "SessionStart", session_id: conversationId, cwd: f.tab.cwd, transcript_path: transcriptPath }),
+    });
+  }
+  return { ...f, view, store, receiptPath, aliasPath: transcriptPath };
+}
+
 describe("controlled terminal replacement snapshots", () => {
+  it.each([false, true])("preserves a launch-view receipt and snapshots its canonical transcript (selected=%s)", async selected => {
+    const f = await launchViewFixture(selected);
+    const receipt = fs.readFileSync(f.receiptPath);
+    expect(f.plan().blockers).toEqual([]);
+    const backup = snapshotTerminalRecovery(f);
+    expect(fs.readFileSync(path.join(backup, `codex-launches/${f.tab.id}/.cloudx-conversation.json`))).toEqual(receipt);
+    expect(fs.readFileSync(f.receiptPath)).toEqual(receipt);
+    expect(fs.readFileSync(path.join(backup, `transcripts/${f.tab.id}.jsonl`))).toEqual(fs.readFileSync(f.transcriptPath));
+    expect(JSON.parse(fs.readFileSync(path.join(backup, "manifest.json"))).conversations)
+      .toEqual([{ tabId: f.tab.id, lastObservedSessionId: conversationId, transcriptPath: f.transcriptPath, snapshot: `transcripts/${f.tab.id}.jsonl` }]);
+  });
+
+  it.each(["external alias", "other tab", "replaced launch link", "nested directory link", "transcript link", "sibling store"])("rejects a receipt through an %s without changing saved tabs or evidence", async kind => {
+    const f = await launchViewFixture(true);
+    const receipt = JSON.parse(fs.readFileSync(f.receiptPath));
+    if (kind === "external alias" || kind === "other tab") {
+      const alias = path.join(f.dataDir, kind === "other tab" ? "codex-launches/other/sessions" : "external-sessions");
+      fs.mkdirSync(path.dirname(alias), { recursive: true });
+      fs.symlinkSync(f.store, alias);
+      receipt.transcriptPath = path.join(alias, path.relative(f.store, f.transcriptPath));
+    } else if (kind === "replaced launch link") {
+      fs.cpSync(f.store, `${f.store}.copy`, { recursive: true });
+      fs.unlinkSync(path.join(f.view, "sessions"));
+      fs.symlinkSync(`${f.store}.copy`, path.join(f.view, "sessions"));
+    } else if (kind === "nested directory link") {
+      fs.renameSync(path.dirname(f.transcriptPath), `${f.store}.year`);
+      fs.symlinkSync(`${f.store}.year`, path.dirname(f.transcriptPath));
+    } else if (kind === "transcript link") {
+      fs.renameSync(f.transcriptPath, `${f.transcriptPath}.original`);
+      fs.symlinkSync(`${f.transcriptPath}.original`, f.transcriptPath);
+    } else {
+      fs.cpSync(f.store, `${f.store}-sibling`, { recursive: true });
+      receipt.transcriptPath = f.transcriptPath.replace(f.store, `${f.store}-sibling`);
+    }
+    f.write(f.receiptPath, receipt);
+    const originals = ["sessions.json", "workspace.json", f.receiptPath, f.transcriptPath].map(file => [file, fs.readFileSync(path.resolve(f.dataDir, file))]);
+    expect(f.plan().blockers).toHaveLength(1);
+    expect(() => snapshotTerminalRecovery(f)).toThrow(/session store|symlink/);
+    for (const [file, bytes] of originals) expect(fs.readFileSync(path.resolve(f.dataDir, file))).toEqual(bytes);
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it.each(["link", "store"])("rejects a %s replaced with identical transcript bytes during snapshot", async kind => {
+    const f = await launchViewFixture(true);
+    const write = fs.writeFileSync;
+    let replaced = false;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, bytes, options) => {
+      if (!replaced && String(file).includes("terminal-recovery-")) {
+        replaced = true;
+        if (kind === "link") {
+          fs.cpSync(f.store, `${f.store}.copy`, { recursive: true });
+          fs.unlinkSync(path.join(f.view, "sessions"));
+          fs.symlinkSync(`${f.store}.copy`, path.join(f.view, "sessions"));
+        } else {
+          fs.renameSync(f.store, `${f.store}.original`);
+          fs.cpSync(`${f.store}.original`, f.store, { recursive: true });
+        }
+      }
+      return write(file, bytes, options);
+    });
+    expect(() => snapshotTerminalRecovery(f)).toThrow(/session store/);
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it("does not erase an external link traversal when resolving receipt dot segments", async () => {
+    const f = await launchViewFixture(true);
+    const outside = path.join(f.dataDir, "outside");
+    fs.cpSync(f.store, outside, { recursive: true });
+    fs.mkdirSync(path.join(outside, "deep"));
+    fs.symlinkSync(path.join(outside, "deep"), path.join(f.store, "traversal"));
+    const receipt = JSON.parse(fs.readFileSync(f.receiptPath));
+    receipt.transcriptPath = `${f.store}/traversal/../${path.relative(f.store, f.transcriptPath)}`;
+    expect(path.resolve(receipt.transcriptPath)).toBe(f.transcriptPath);
+    expect(fs.realpathSync.native(receipt.transcriptPath)).not.toBe(f.transcriptPath);
+    f.write(f.receiptPath, receipt);
+    expect(() => snapshotTerminalRecovery(f)).toThrow("outside its bound session store");
+  });
+
+  it.each(["tabId", "executionId", "missing execution", "version", "authority"])("rejects stale or invalid native %s", async field => {
+    const f = await launchViewFixture(true);
+    const receipt = JSON.parse(fs.readFileSync(f.receiptPath));
+    if (field === "missing execution") {
+      const saved = f.read("sessions.json");
+      delete saved.sessions[0].initialInput.codexExecutionId;
+      f.write("sessions.json", saved);
+    } else {
+      receipt[field] = field === "executionId" ? conversationId : field === "version" ? 3 : "wrong";
+      f.write(f.receiptPath, receipt);
+    }
+    const executionId = f.read("sessions.json").sessions[0].initialInput.codexExecutionId;
+    expect(() => new CodexConversationRecovery(f.view).readForExecution(f.tab.id, executionId)).toThrow();
+    expect(f.plan().blockers).toHaveLength(1);
+    expect(() => snapshotTerminalRecovery(f)).toThrow(/selection binding|different tab or execution/);
+  });
+
   it("plans and snapshots production-written Codex bindings and saved tabs without replaying inputs", async () => {
     const f = await currentCodexFixture();
     const binding = f.read(f.bindingFile);
@@ -296,6 +416,59 @@ describe("controlled terminal replacement snapshots", () => {
       : missing === "source binding" ? path.join(f.dataDir, "codex-launches/codex-1/.cloudx-source.json") : f.transcriptPath;
     fs.unlinkSync(target);
     expect(() => snapshotTerminalRecovery(f)).toThrow();
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it.each([true, false])("preserves an explicitly ended legacy tab without guessing a conversation (binding=%s)", binding => {
+    const f = fixture();
+    fs.unlinkSync(path.join(f.dataDir, "codex-launches/codex-1/.cloudx-conversation.json"));
+    if (!binding) fs.unlinkSync(path.join(f.dataDir, "codex-launches/codex-1/.cloudx-source.json"));
+    const saved = f.read("sessions.json");
+    saved.sessions[0] = { tab: { ...f.tab, status: "failed", recovery: { state: "missing", canResume: false, message: "Select a saved session." } } };
+    f.write("sessions.json", saved);
+    const originals = ["sessions.json", "workspace.json", f.transcriptPath].map(file => [file, fs.readFileSync(path.resolve(f.dataDir, file))]);
+    expect(inspectTerminalRecovery(f).warnings).toEqual([expect.stringContaining("select an exact saved session in Terminal recovery or close the tab")]);
+    const backup = snapshotTerminalRecovery(f);
+    const manifest = JSON.parse(fs.readFileSync(path.join(backup, "manifest.json")));
+    expect(manifest.conversations).toEqual([]);
+    expect(manifest.unavailableConversations).toEqual([{ tabId: f.tab.id, message: expect.stringContaining("No conversation ID was inferred") }]);
+    expect(f.log).toHaveBeenCalledWith(manifest.unavailableConversations[0].message);
+    expect(JSON.parse(fs.readFileSync(path.join(backup, "sessions.json")))).toEqual(saved);
+    for (const [file, bytes] of originals) expect(fs.readFileSync(path.resolve(f.dataDir, file))).toEqual(bytes);
+  });
+
+  it.each(["unknown process", "running status", "resumable", "native execution", "malformed receipt"])("does not waive conversation evidence for an ended tab with %s", kind => {
+    const f = fixture();
+    const receipt = path.join(f.dataDir, "codex-launches/codex-1/.cloudx-conversation.json");
+    fs.unlinkSync(receipt);
+    const saved = f.read("sessions.json");
+    saved.sessions[0].tab = { ...f.tab, status: "failed", recovery: { state: "missing", canResume: false, message: "Unavailable." } };
+    if (kind === "unknown process") saved.sessions[0].tab.recovery.state = "unavailable";
+    if (kind === "running status") saved.sessions[0].tab.status = "running";
+    if (kind === "resumable") saved.sessions[0].tab.recovery.canResume = true;
+    if (kind === "native execution") saved.sessions[0].initialInput.codexExecutionId = otherId;
+    if (kind === "malformed receipt") f.write(receipt, {});
+    f.write("sessions.json", saved);
+    expect(() => snapshotTerminalRecovery(f)).toThrow("missing or conflicting conversation identity");
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it("stops if conversation evidence appears while snapshotting an unavailable legacy tab", () => {
+    const f = fixture();
+    const receiptPath = path.join(f.dataDir, "codex-launches/codex-1/.cloudx-conversation.json");
+    const receipt = fs.readFileSync(receiptPath);
+    fs.unlinkSync(receiptPath);
+    const saved = f.read("sessions.json");
+    saved.sessions[0].tab.status = "failed";
+    saved.sessions[0].tab.recovery = { state: "missing", canResume: false, message: "Unavailable." };
+    f.write("sessions.json", saved);
+    const write = fs.writeFileSync;
+    vi.spyOn(fs, "writeFileSync").mockImplementation((file, bytes, options) => {
+      if (String(file).includes("terminal-recovery-")) write(receiptPath, receipt);
+      return write(file, bytes, options);
+    });
+    expect(() => snapshotTerminalRecovery(f)).toThrow("Recovery source changed during snapshot");
+    expect(fs.readFileSync(receiptPath)).toEqual(receipt);
     expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
   });
 
