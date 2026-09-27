@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { createServer } from "node:http";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 import { AppServerClient, StdioAppServerTransport } from "../appServer/AppServerClient.js";
@@ -14,7 +14,7 @@ import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
 import type { PluginSession } from "@cloudx/plugin-api";
-import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
+import { NodePtyTerminalProcess, NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import { SessionStateStore } from "../workspace/SessionStateStore.js";
 
 const codexBinary = process.env.CLOUDX_NATIVE_CODEX;
@@ -166,11 +166,7 @@ it.skipIf(!codexBinary).each([
     return terminal.restoreInput!()!.codexExecutionId as string;
   };
   const visibleOutput = () => stripVTControlCharacters(output).replace(/\s+/gu, "");
-  const submit = async (text: string) => {
-    terminal!.write!(text);
-    await new Promise(resolve => setTimeout(resolve, 100));
-    terminal!.write!("\r");
-  };
+  const submit = (text: string) => terminal!.write!(`\u001b[200~${text}\u001b[201~\r`);
   const readTranscript = async () => {
     const file = recovery.read()?.transcriptPath;
     if (!file) return [];
@@ -179,7 +175,7 @@ it.skipIf(!codexBinary).each([
   };
   const completeTurn = async (text: string) => {
     const previous = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload.turn_id;
-    await submit(text);
+    submit(text);
     await expect.poll(async () => {
       const completed = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload;
       return completed?.turn_id !== previous ? completed : output;
@@ -223,7 +219,7 @@ it.skipIf(!codexBinary).each([
 
     let selected = original;
     if (transition !== "new") {
-      await submit("/permissions");
+      submit("/permissions");
       await expect.poll(visibleOutput).toContain("1.Askforapproval");
       output = "";
       terminal!.write!("1");
@@ -234,7 +230,7 @@ it.skipIf(!codexBinary).each([
         terminal!.write!("\u001b");
         await new Promise(resolve => setTimeout(resolve, 150));
         terminal!.write!("\r");
-      } else await submit(transition === "fork" ? "/fork" : "/new");
+      } else submit(transition === "fork" ? "/fork" : "/new");
       if (transition === "edit") {
         await expect.poll(visibleOutput, { timeout: 5_000 }).toContain("Conversationrevertedtothispoint.");
         expect(recovery.read()?.sessionId).toBe(original);
@@ -248,7 +244,7 @@ it.skipIf(!codexBinary).each([
       });
       expect(restrictedTranscript.filter(item => item.type === "turn_context").at(-1)?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
     } else {
-      await submit("/new");
+      submit("/new");
       await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
       expect(recovery.read()!.sessionId).toBeTruthy();
       expect(requests.filter(value => value === "conversation")).toHaveLength(1);
@@ -258,7 +254,7 @@ it.skipIf(!codexBinary).each([
         approval_policy: "never", sandbox_policy: { type: "danger-full-access" }
       });
       expect(newTranscript.find(item => item.type === "turn_context")?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
-      await submit(`/resume ${original}`);
+      submit(`/resume ${original}`);
       await expect.poll(() => recovery.read()?.sessionId === original ? original : output, { timeout: 5_000 }).toBe(original);
     }
     const conversationCount = 2;
@@ -338,11 +334,26 @@ async function expectMigrationSnapshotPreservesNativeConversation({ data, home, 
   }]);
 }
 
-it.skipIf(!codexBinary)("verifies the supported CLI through the updater's production tab launch contract", async () => {
+it.skipIf(!codexBinary).each([false, true])("verifies the updater's production tab launch with coalesced input: %s", async coalesceInput => {
   const evidence: string[] = [];
-  await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
-  expect(evidence).toEqual([
-    "Selected conversation saved before any model prompt.\n",
-    "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
-  ]);
+  const write = NodePtyTerminalProcess.prototype.write;
+  let bufferedInput = "";
+  // A busy native reader can consume prompt text and Enter together, regardless of write timing.
+  const writeSpy = coalesceInput ? vi.spyOn(NodePtyTerminalProcess.prototype, "write").mockImplementation(function (this: NodePtyTerminalProcess, data) {
+    if (data === "\u001b[1;1R") return write.call(this, data);
+    bufferedInput += data;
+    if (bufferedInput.endsWith("\r")) {
+      write.call(this, bufferedInput);
+      bufferedInput = "";
+    }
+  }) : undefined;
+  try {
+    await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
+    expect(evidence).toEqual([
+      "Selected conversation saved before any model prompt.\n",
+      "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
+    ]);
+  } finally {
+    writeSpy?.mockRestore();
+  }
 }, 35_000);
