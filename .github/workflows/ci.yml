@@ -71,7 +71,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        codex: ["0.156.1", "0.157.1"]
+        codex: ["installer", "0.156.1"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -84,10 +84,19 @@ jobs:
       - run: npm ci
       - run: npm run typecheck -- --pretty false
       - name: Install the exact supported native CLI
-        run: npm install --global --prefix "$RUNNER_TEMP/codex" --ignore-scripts --no-audit --no-fund '@openai/codex@${{ matrix.codex }}'
+        id: codex
+        env:
+          CODEX_RELEASE: ${{ matrix.codex }}
+        run: |
+          codex_version="$CODEX_RELEASE"
+          if [ "$codex_version" = installer ]; then
+            codex_version="$(node --input-type=module -e 'import { CODEX_CLI_VERSION } from "./scripts/install-cloudx.mjs"; console.log(CODEX_CLI_VERSION)')"
+          fi
+          npm install --global --prefix "$RUNNER_TEMP/codex" --ignore-scripts --no-audit --no-fund "@openai/codex@$codex_version"
+          printf 'version=%s\n' "$codex_version" >> "$GITHUB_OUTPUT"
       - name: Require production launch, permissions and conversation recovery
         env:
-          CLOUDX_NATIVE_CODEX_VERSION: ${{ matrix.codex }}
+          CLOUDX_NATIVE_CODEX_VERSION: ${{ steps.codex.outputs.version }}
         run: CLOUDX_NATIVE_CODEX="$RUNNER_TEMP/codex/bin/codex" npm run test:codex-recovery
 
   terminal-stress:
