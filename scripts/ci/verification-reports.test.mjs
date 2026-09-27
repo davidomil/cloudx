@@ -2,8 +2,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { completeVerificationEvidence } from "../../containers/ci/run.mjs";
-import { reportBytes } from "../../containers/ci/reports.mjs";
+import {
+  calculateWorktreeDigest,
+  completeVerificationEvidence,
+} from "../../containers/ci/run.mjs";
+import { readReport, reportBytes } from "../../containers/ci/reports.mjs";
 
 const directories = [];
 afterEach(async () => {
@@ -24,6 +27,46 @@ async function fixture() {
   );
   return root;
 }
+
+it("does not export outside reports from a replaced root even when source mutation already failed verification", async () => {
+  const root = await fixture();
+  const outside = await fixture();
+  const relative = "test-results/timings/vitest.json";
+  await fs.writeFile(
+    path.join(outside, relative),
+    "generated outside-root marker",
+  );
+  const before = await calculateWorktreeDigest(root, [relative]);
+  const original = `${root}-original`;
+  await fs.rename(root, original);
+  directories.push(original);
+  await fs.symlink(outside, root);
+  const after = await calculateWorktreeDigest(root, [relative]);
+  expect(after).not.toBe(before);
+  const open = vi.spyOn(fs, "open");
+
+  const result = await completeVerificationEvidence({
+    root,
+    lane: "coverage-1",
+    evidence: {
+      verdict: "failed",
+      tree_sha256_before: before,
+      tree_sha256_after: after,
+    },
+    settleCandidates: async () => {},
+  });
+
+  expect(result.verdict).toBe("failed");
+  expect(result.report_error).toBe("Report root must not be a symlink.");
+  expect(result).not.toHaveProperty("coverage_report");
+  expect(result).not.toHaveProperty("timing_report");
+  expect(result).not.toHaveProperty("fixture_reports");
+  expect(result).not.toHaveProperty("lifecycle_reports");
+  await expect(readReport(root, relative)).rejects.toThrow(
+    "Report root must not be a symlink.",
+  );
+  expect(open).not.toHaveBeenCalled();
+});
 
 it.each(["passed", "failed"])(
   "never reads mutable candidate files after cleanup fails following a %s result",

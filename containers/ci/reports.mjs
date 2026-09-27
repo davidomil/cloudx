@@ -13,6 +13,8 @@ export async function readReport(
   const parts = relative.split("/");
   if (parts.some((part) => !part || part === "." || part === ".."))
     throw new Error("Invalid report path.");
+  if (!(await fs.lstat(root)).isDirectory())
+    throw new Error("Report root must not be a symlink.");
   let current = root;
   for (const part of parts.slice(0, -1)) {
     current = path.join(current, part);

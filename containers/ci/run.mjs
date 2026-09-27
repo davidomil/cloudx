@@ -774,6 +774,8 @@ export async function completeVerificationEvidence({
   }
   if (root) {
     try {
+      if (!(await fs.lstat(root)).isDirectory())
+        throw new Error("Report root must not be a symlink.");
       const reports = {};
       if (coverageLanes.includes(lane)) {
         reports.coverage_report = `.vitest-reports/blob-${lane.slice(-1)}-4.json`;
