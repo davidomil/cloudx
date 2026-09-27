@@ -23,12 +23,16 @@ networked dependency audit. The static isolated lane owns type checking
 and the production build. Each test lane builds its own runtime when its
 tests require compiled output.
 
-The TypeScript check retains the real user-systemd tests on the host.
-Generic TypeScript coverage, the two Python suites, and desktop/mobile
-browser tests move from duplicated host executions to their isolated
-lanes. Existing required check names remain aggregation gates. Dedicated
-native Codex version checks and constrained terminal stress repetitions
-remain unchanged in purpose.
+The TypeScript check retains the real user-systemd tests and
+broker-owned migration refusal on the host. The latter requires a
+non-root unified cgroup, so
+scripts/install-runtime-caller.integration.test.mjs must remain in the
+host command even though its filename does not mention systemd. Generic
+TypeScript coverage, the two Python suites, and desktop/mobile browser
+tests move from duplicated host executions to their isolated lanes.
+Existing required check names remain aggregation gates. Dedicated native
+Codex version checks and constrained terminal stress repetitions remain
+unchanged in purpose.
 
 ## Complete coverage and isolation
 
