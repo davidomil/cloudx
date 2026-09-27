@@ -9,7 +9,7 @@ const terminalPanelMocks = vi.hoisted(() => ({
   fitCalls: [] as unknown[],
   installMobileScroller: vi.fn(),
   releaseMobileScroller: vi.fn(),
-  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
+  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; options: Record<string, unknown>; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
   uploadFileBrowserFile: vi.fn()
 }));
 
@@ -314,6 +314,72 @@ describe("TerminalPanel", () => {
     })));
     expect(host!.textContent).toContain("Open new shell");
     expect(TestWebSocket.instances).toHaveLength(0);
+  });
+
+  it.each(["mounted", "cached"])("preserves %s Codex startup output beside recovery after exit", (viewState) => {
+    vi.useFakeTimers();
+    const codexTab = { ...tab, pluginId: "codex-terminal" };
+    const renderTab = (currentTab: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: currentTab, active: true, uiScale: 1, onRecover: vi.fn()
+    })));
+    renderTab(codexTab);
+    const socket = TestWebSocket.latest!;
+    socket.open();
+    socket.output("CloudX native worker bridge: startup failed.\r\n");
+    const terminal = terminalPanelMocks.terminals[0]!;
+    const output = terminal.element;
+    if (viewState === "cached") act(() => root!.render(createElement("div")));
+    renderTab({
+      ...codexTab, status: "failed",
+      recovery: { state: "missing", message: "Codex exited before a selected conversation was confirmed.", canResume: false, startupFailed: true }
+    });
+    act(() => socket.close(1000));
+    vi.advanceTimersByTime(10_000);
+
+    expect(host!.textContent).toContain("Codex startup failed");
+    expect(host!.querySelector('[aria-label="Codex terminal output"]')?.contains(output!)).toBe(true);
+    expect(terminal.writeCalls).toEqual(["CloudX native worker bridge: startup failed.\r\n"]);
+    expect(terminal.disposed).toBe(false);
+    expect(terminal.options.disableStdin).toBe(true);
+    expect(TestWebSocket.instances).toHaveLength(1);
+  });
+
+  it("replaces retained Codex output when another client recovers the process", () => {
+    const codexTab = { ...tab, pluginId: "codex-terminal" };
+    const renderTab = (currentTab: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: currentTab, active: true, uiScale: 1, onRecover: vi.fn()
+    })));
+    renderTab(codexTab);
+    TestWebSocket.latest!.open();
+    const originalTerminal = terminalPanelMocks.terminals[0]!;
+    renderTab({ ...codexTab, status: "failed", recovery: { state: "unavailable", message: "The terminal connection failed." } });
+    act(() => TestWebSocket.latest!.close(1000));
+
+    renderTab({ ...codexTab, updatedAt: new Date(1000).toISOString() });
+    TestWebSocket.latest!.open();
+    TestWebSocket.latest!.output("Recovered conversation");
+
+    expect(originalTerminal.disposed).toBe(true);
+    expect(TestWebSocket.instances).toHaveLength(2);
+    expect(terminalPanelMocks.terminals[1]!.writeCalls).toEqual(["Recovered conversation"]);
+    expect(terminalPanelMocks.terminals[1]!.options.disableStdin).toBe(false);
+    expect(host!.textContent).not.toContain("Terminal recovery");
+  });
+
+  it("reads retained startup diagnostics when the process exited before the panel mounted", () => {
+    act(() => root!.render(createElement(TerminalPanel, {
+      tab: { ...tab, pluginId: "codex-terminal", status: "failed", recovery: {
+        state: "missing", startupFailed: true, canResume: false, message: "No selected conversation was confirmed."
+      } },
+      active: true, uiScale: 1, onRecover: vi.fn()
+    })));
+    TestWebSocket.latest!.open();
+    TestWebSocket.latest!.screen("CloudX native worker bridge: startup failed.\r\n");
+
+    expect(host!.textContent).toContain("Codex startup failed");
+    expect(terminalPanelMocks.terminals[0]!.writeCalls).toEqual(["\x1bcCloudX native worker bridge: startup failed.\r\n"]);
+    expect(terminalPanelMocks.terminals[0]!.options.disableStdin).toBe(true);
+    expect(TestWebSocket.instances).toHaveLength(1);
   });
 
   it("replaces a code 1008 dead end with a connection check and reconnects after recovery", async () => {

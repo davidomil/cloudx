@@ -442,6 +442,24 @@ export async function readCodexVersion(
   );
 }
 
+async function verifyCodexLaunch(assistantBin, options) {
+  const verifier = fileURLToPath(
+    new URL("./codex-runtime-verification.mjs", import.meta.url),
+  );
+  try {
+    await runCommand(process.execPath, [verifier, assistantBin], {
+      ...options,
+      timeoutMs: 60_000,
+    });
+  } catch (error) {
+    if (["cancelled", "timeout", "output-limit", "log-unavailable", "cleanup-incomplete", "supervision-unavailable"].includes(error.code)) throw error;
+    throw new CodexUpdateError(
+      "runtime-verification",
+      "The installed Codex CLI failed CloudX tab launch, conversation selection, or permission verification. Check the private update log or installer output for the failed step. Repair the installation or select a supported Codex executable before launching new tabs; run the Codex update again to verify it.",
+    );
+  }
+}
+
 export async function updateCodexInstallation({
   assistantBin,
   prefix,
@@ -468,6 +486,7 @@ export async function updateCodexInstallation({
   };
   let previousVersion = null;
   let retainLock = false;
+  let verifyingRuntime = false;
   try {
     const initialPackageVersion = verifyNpmOwnership(installation, true);
     onProgress?.("checking");
@@ -511,6 +530,9 @@ export async function updateCodexInstallation({
           "verification",
           "Codex reports a different version from its installed npm package. Repair the npm installation before trying again.",
         );
+      onProgress?.("verifying");
+      verifyingRuntime = true;
+      await verifyCodexLaunch(installation.assistantBin, commandOptions);
       return {
         outcome: "current",
         installedVersion: previousVersion,
@@ -534,6 +556,8 @@ export async function updateCodexInstallation({
         "verification",
         "Codex reports a different version from the requested npm release. Check the private update log and repair the npm installation before trying again.",
       );
+    verifyingRuntime = true;
+    await verifyCodexLaunch(installation.assistantBin, commandOptions);
     return { outcome: "updated", installedVersion, previousVersion };
   } catch (error) {
     if (error.code === "cleanup-incomplete") {
@@ -541,18 +565,20 @@ export async function updateCodexInstallation({
       throw error;
     }
     let usableVersion = null;
-    try {
-      verifyNpmOwnership(installation);
-      usableVersion = await readCodexVersion(installation.assistantBin, {
-        env: npmEnv,
-        timeoutMs: 5_000,
-      });
-    } catch (verificationError) {
-      if (verificationError.code === "cleanup-incomplete") {
-        retainLock = true;
-        throw verificationError;
+    if (!verifyingRuntime) {
+      try {
+        verifyNpmOwnership(installation);
+        usableVersion = await readCodexVersion(installation.assistantBin, {
+          env: npmEnv,
+          timeoutMs: 5_000,
+        });
+      } catch (verificationError) {
+        if (verificationError.code === "cleanup-incomplete") {
+          retainLock = true;
+          throw verificationError;
+        }
+        /* A failed verification must clear the displayed usable version. */
       }
-      /* A failed verification must clear the displayed usable version. */
     }
     const failure =
       error instanceof CodexUpdateError

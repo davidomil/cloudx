@@ -1527,6 +1527,10 @@ a:hover svg {
   overflow-wrap: anywhere;
 }
 
+.terminal-recovery-with-output { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.terminal-recovery-with-output > .workspace-recovery-panel { height: auto; max-height: 50%; flex-shrink: 0; }
+.terminal-recovery-with-output > .terminal-panel { flex: 1; }
+
 .workspace-recovery-panel h2 { display: flex; align-items: center; gap: 8px; font-size: var(--font-size-md); }
 .workspace-recovery-panel p { max-width: 680px; }
 .workspace-recovery-directory { color: var(--color-muted-foreground); }

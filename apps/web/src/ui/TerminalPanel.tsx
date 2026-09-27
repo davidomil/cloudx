@@ -76,7 +76,8 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     state: "unavailable",
     message: connectionError ?? tab.statusMessage ?? "The terminal could not be restored. Check its connection to determine whether its process is still running."
   } : undefined) : undefined;
-  const needsRecovery = Boolean(recovery);
+  const preserveOutput = Boolean(recovery && tab.pluginId === CODEX_TERMINAL_PLUGIN_ID && tab.status === "failed" && (recovery.startupFailed || terminalViews.has(tab.id)));
+  const needsRecovery = Boolean(recovery) && !preserveOutput;
   const recoveryEnabled = Boolean(onRecover);
 
   useEffect(() => {
@@ -88,7 +89,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     const view = terminalViews.get(tab.id);
     if (view) view.tabUpdatedAt = tab.updatedAt;
     if (!recoveryEnabled || tab.status !== "running" || tab.recovery) return;
-    if (view?.connectionError && view.connectionError.tabUpdatedAt !== tab.updatedAt) disposeTerminalViewInternal(tab.id);
+    if (view?.terminal.options.disableStdin || view?.connectionError && view.connectionError.tabUpdatedAt !== tab.updatedAt) disposeTerminalViewInternal(tab.id);
     setConnectionError(undefined);
   }, [tab.id, tab.status, tab.recovery, tab.updatedAt, recoveryEnabled]);
 
@@ -101,6 +102,11 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
 
     const view = getTerminalView(tab, containerRef.current, uiScale);
     viewRef.current = view;
+    view.terminal.options.disableStdin = preserveOutput;
+    if (preserveOutput) {
+      window.clearTimeout(view.reconnectTimer);
+      view.reconnectTimer = undefined;
+    }
     view.onConnectionError = recoveryEnabled ? error => {
       const currentTab = tabRef.current;
       if (currentTab.status === "running" && !currentTab.recovery && error.tabUpdatedAt !== currentTab.updatedAt) {
@@ -133,7 +139,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
       view.onConnectionError = undefined;
       viewRef.current = null;
     };
-  }, [tab.id, tab.cwd, tab.title, uiScale, needsRecovery, recoveryEnabled]);
+  }, [tab.id, tab.cwd, tab.title, uiScale, needsRecovery, recoveryEnabled, preserveOutput]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -142,10 +148,14 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     }
   }, [active]);
 
-  return recovery && onRecover ? <WorkspaceRecoveryPanel tab={tab} recovery={recovery} onRecover={async input => {
+  const recoveryPanel = recovery && onRecover ? <WorkspaceRecoveryPanel tab={tab} recovery={recovery} onRecover={async input => {
     await onRecover(input);
     setConnectionError(undefined);
-  }} /> : <div className="terminal-panel" ref={containerRef} />;
+  }} /> : undefined;
+  return preserveOutput ? <div className="terminal-recovery-with-output">
+    {recoveryPanel}
+    <div className="terminal-panel" ref={containerRef} role="region" aria-label="Codex terminal output" />
+  </div> : recoveryPanel ?? <div className="terminal-panel" ref={containerRef} />;
 }
 
 function disposeTerminalViewInternal(tabId: string): void {
@@ -242,6 +252,7 @@ function subscribeTerminalSocket(view: TerminalView): void {
   });
   socket.addEventListener("close", (event) => {
     if (!isCurrentSocket()) return;
+    if (view.terminal.options.disableStdin) return;
     if (event.code === 1008) {
       view.connectionError = {
         tabUpdatedAt,

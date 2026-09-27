@@ -2230,11 +2230,13 @@ async function runCodexUpdater({ paths, commands, env }) {
     verifyNodeAndNpm(commands);
     installCodexCli(commands, paths, env, "latest");
     commands.run(assistantBin, ["--version"], { env: codexNpmEnv(paths, env) });
+    commands.run(process.execPath, [fileURLToPath(new URL("./codex-runtime-verification.mjs", import.meta.url)), assistantBin], { env: codexNpmEnv(paths, env) });
   } else {
     const result = await updateCodexInstallation({
       ...installation,
       env,
       onProgress: (stage) => console.log(`Codex: ${stage}.`),
+      onOutput: output => process.stderr.write(output),
     });
     console.log(`Codex ${result.installedVersion}${result.outcome === "current" ? " is already current" : " installed"}.`);
   }

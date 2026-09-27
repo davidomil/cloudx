@@ -1,0 +1,66 @@
+--- a/apps/server/src/forge/ForgeWorkflowService.ts
++++ b/apps/server/src/forge/ForgeWorkflowService.ts
+@@ -365,8 +365,9 @@
+       if ((item as ForgeChangeRequest).headSha !== issueWorker.headSha || !(item as ForgeChangeRequest).reviewReady)
+         throw new Error("The published commit changed or is still processing. Inspect the request before resuming auto review.");
+     }
+-    const reviewer = kind === "review" ? this.workers.find(worker =>
+-      worker.kind === "review" && worker.number === number && !worker.retainedWorkspace && sameRepository(worker.repository, repository)) : undefined;
++    const reviewer = kind === "review"
++      ? this.reviewWorkers(repository, number).filter(worker => !worker.retainedWorkspace).at(-1)
++      : undefined;
+     if (reviewer)
+       return this.startReviewRound(reviewer, item as ForgeChangeRequest, autoPost, placement, controller, issueWorker);
+     const now = new Date().toISOString();
+@@ -425,6 +426,15 @@
+     }
+     return structuredClone(worker);
+   }
++  private reviewWorkers(repository: ForgeRepository, number: number): ForgeWorker[] {
++    return this.workers.filter(worker => worker.kind === "review" && worker.number === number && sameRepository(worker.repository, repository))
++      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
++  }
++  private previousReviews(worker: ForgeWorker): ForgeReviewDraft[] {
++    return this.reviewWorkers(worker.repository, worker.number)
++      .flatMap(reviewer => [...(reviewer.reviewHistory ?? []), ...(reviewer.draft ? [reviewer.draft] : [])])
++      .sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt));
++  }
+   private async startReviewRound(
+     worker: ForgeWorker,
+     change: ForgeChangeRequest,
+@@ -2019,7 +2029,7 @@
+     await this.persist();
+     const { reportPath, contextPath } = await this.deps.reports.prepare(
+       worker.attemptId,
+-      reviewScope ? { ...context, reviewScope, previousReviews: [...(worker.reviewHistory ?? []), ...(worker.draft ? [worker.draft] : [])] } :
++      reviewScope ? { ...context, reviewScope, previousReviews: this.previousReviews(worker) } :
+         worker.rebaseRecovery?.phase === "resolving" ? { ...context, rebaseRecovery: worker.rebaseRecovery } : context,
+     );
+     signal?.throwIfAborted();
+--- a/apps/server/src/forge/ForgeWorkflowValidation.ts
++++ b/apps/server/src/forge/ForgeWorkflowValidation.ts
+@@ -142,6 +142,15 @@
+   if (status !== "posted" || input.publication === undefined || input.postedAt === undefined)
+     throw new Error("Review publication requires a posted review, receipt, and timestamp.");
+   return { id, startedAt, ...review, status, publication: parseReviewPublication(input.publication), postedAt: isoTimestamp(input.postedAt, "review publication timestamp") };
++}
++
++function parseHistoricalReviewDraft(worker: Record<string, unknown>): ForgeReviewDraft {
++  const draft = object(worker.draft);
++  // Before review rounds, each worker owned one draft identified by the worker.
++  if (draft.id === undefined && draft.startedAt === undefined &&
++      worker.reviewHistory === undefined && worker.reviewBaseline === undefined && worker.completion === undefined)
++    return parseSavedReview({ id: worker.id, startedAt: worker.startedAt, ...draft });
++  return parseSavedReview(draft);
+ }
+
+ export function parseReview(value: unknown): ForgeReviewSubmission {
+@@ -551,7 +560,7 @@
+       parsed.providerRetryAt = isoTimestamp(worker.providerRetryAt, "provider retry deadline");
+     if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined || worker.reviewBaseline !== undefined))
+       throw new Error("Only review workers can have review drafts or history.");
+-    if (worker.draft !== undefined) parsed.draft = parseSavedReview(worker.draft);
++    if (worker.draft !== undefined) parsed.draft = parseHistoricalReviewDraft(worker);
+     if (worker.reviewHistory !== undefined) {
+       if (!Array.isArray(worker.reviewHistory) || worker.reviewHistory.length > MAX_FORGE_REVIEW_HISTORY)
+         throw new Error(`Review history must contain at most ${MAX_FORGE_REVIEW_HISTORY} drafts.`);

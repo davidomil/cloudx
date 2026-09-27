@@ -3,17 +3,18 @@ import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { createServer } from "node:http";
-import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 
 import type { WorkspaceTab } from "@cloudx/shared";
 import { AppServerClient, StdioAppServerTransport } from "../appServer/AppServerClient.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexStateSources } from "./CodexStateSources.js";
-import { buildCodexRemoteTuiArgs, CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
+import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
+import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
+import type { PluginSession } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
-import type { TerminalProcess } from "../terminal/TerminalProcess.js";
 
 const codexBinary = process.env.CLOUDX_NATIVE_CODEX;
 
@@ -102,13 +103,16 @@ it.skipIf(!codexBinary)("requires selection after native resume changes conversa
 
 it.skipIf(!codexBinary).each([
   { name: "preserves launch permissions through native new, idle resume and process loss", transition: "new" },
+  { name: "preserves native permission changes through fork and process loss", transition: "fork" },
   { name: "preserves native permission changes through first-prompt editing and process loss", transition: "edit" },
-  { name: "preserves native permission changes through new and process loss", transition: "restricted-new" }
-])("$name", async ({ transition }) => {
+  { name: "preserves native permission changes through new and process loss", transition: "restricted-new" },
+  { name: "preserves configured permissions and roots through native new and process loss", transition: "configured" }
+].map(({ name, transition }) => [name, transition]))("%s", async (_name, transition) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-selection-"));
   const home = path.join(root, "home");
-  const skills = path.join(root, "skills");
   const data = path.join(root, "data");
+  const skills = path.join(data, "rules-skills");
+  const configuredRoot = path.join(root, "configured-workspace");
   const sources = new CodexStateSources(data, { CODEX_HOME: home });
   const tab: WorkspaceTab = {
     id: "native-selection", pluginId: "codex-terminal", title: "Native selection", cwd: root,
@@ -139,47 +143,62 @@ it.skipIf(!codexBinary).each([
   });
   await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
   const port = (provider.address() as { port: number }).port;
-  let terminal: TerminalProcess | undefined;
+  let terminal: PluginSession | undefined;
   let stopObserving: (() => void) | undefined;
   let output = "";
-  const executionId = "11111111-1111-4111-8111-111111111111";
-  const restartedExecutionId = "22222222-2222-4222-8222-222222222222";
+  let executionId: string;
+  let restartedExecutionId: string;
   const recovery = new CodexConversationRecovery(sources.viewPath(tab.id));
-  const launch = async (args: string[], execution = executionId) => {
+  const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: codexBinary, SHELL: "/bin/sh", TERM: "xterm-256color" };
+  const production = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env);
+  const launch = async (sessionId?: string) => {
     output = "";
-    terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [
-      fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
-      JSON.stringify({
-        selection: { tabId: tab.id, executionId: execution, receiptPath: recovery.receiptPath },
-        permissions: { yoloMode: true, additionalWritableRoots: [skills] },
-        command: codexBinary,
-        serverArgs: ["--config", 'approval_policy="never"', "--config", 'sandbox_mode="danger-full-access"', "app-server", "--listen", "stdio://"],
-        tuiArgs: buildCodexRemoteTuiArgs(["--yolo", "--no-alt-screen", "--add-dir", skills], ["--cd", root, "--model", "cloudx-native", ...args])
-      })
-    ], { cwd: root, env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, TERM: "xterm-256color" }, cols: 100, rows: 30 });
-    terminal.onData(data => {
-      output = (output + data).slice(-32_768);
-      if (data.includes("\u001b[6n")) terminal!.write("\u001b[1;1R");
+    terminal = await production.createSession({
+      tab, cwd: root,
+      initialInput: sessionId ? { resume: { mode: "session", sessionId } } : undefined,
+      controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
     });
+    terminal.onData!(data => {
+      output = (output + data).slice(-32_768);
+      if (data.includes("\u001b[6n")) terminal!.write!("\u001b[1;1R");
+    });
+    return terminal.restoreInput!()!.codexExecutionId as string;
   };
+  const visibleOutput = () => stripVTControlCharacters(output).replace(/\s+/gu, "");
   const submit = async (text: string) => {
-    terminal!.write(text);
+    terminal!.write!(text);
     await new Promise(resolve => setTimeout(resolve, 100));
-    terminal!.write("\r");
+    terminal!.write!("\r");
+  };
+  const readTranscript = async () => {
+    const file = recovery.read()?.transcriptPath;
+    if (!file) return [];
+    try { return (await fs.readFile(file, "utf8")).split("\n").slice(0, -1).map(line => JSON.parse(line)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+  };
+  const completeTurn = async (text: string) => {
+    const previous = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload.turn_id;
+    await submit(text);
+    await expect.poll(async () => {
+      const completed = (await readTranscript()).filter(item => item.type === "event_msg" && item.payload?.type === "task_complete").at(-1)?.payload;
+      return completed?.turn_id !== previous ? completed : output;
+    }, { timeout: 10_000 }).toMatchObject({ type: "task_complete", last_agent_message: "The conversation is saved." });
+    return readTranscript();
   };
   try {
     await fs.mkdir(home, { mode: 0o700 });
-    await fs.mkdir(skills, { mode: 0o700 });
+    await fs.mkdir(configuredRoot);
     await fs.writeFile(path.join(home, "config.toml"), [
+      `# CloudX launch preferences: ${JSON.stringify({ yoloMode: transition !== "configured", defaultSkills: { imagegen: false } })}`,
       'model = "cloudx-native"', 'model_provider = "cloudx-native"',
       'check_for_update_on_startup = false',
       'approval_policy = "on-request"', 'sandbox_mode = "read-only"',
+      '[sandbox_workspace_write]', `writable_roots = [${JSON.stringify(configuredRoot)}]`,
       '[model_providers.cloudx-native]', 'name = "CloudX native test"',
       `base_url = "http://127.0.0.1:${port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
       `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
     ].join("\n"));
-    await sources.bind(tab.id, await sources.resolve());
-    await launch([]);
+    executionId = await launch();
     await expect.poll(() => recovery.read()?.sessionId ?? output, { timeout: 15_000 }).toMatch(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u);
     const original = recovery.read()!.sessionId;
     expect(requests).toEqual([]);
@@ -192,52 +211,52 @@ it.skipIf(!codexBinary).each([
     stopObserving = new CodexConversationRecovery(sources.viewPath(tab.id)).observe(identity => { observed = identity.sessionId; }, error => { throw error; });
     expect(observed).toBe(original);
     stopObserving();
-    await submit("Save this native test conversation.");
-    await expect.poll(() => output, { timeout: 10_000 }).toContain("The conversation is saved.");
+    const transcript = await completeTurn("Save this native test conversation.");
     await expect.poll(() => requests.includes("title"), { timeout: 5_000 }).toBe(true);
     await expect.poll(() => plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: original });
-    const transcript = (await fs.readFile(recovery.read()!.transcriptPath!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    expect(transcript.find(item => item.type === "turn_context")?.payload).toMatchObject({ approval_policy: "never", sandbox_policy: { type: "danger-full-access" } });
-    expect(transcript.find(item => item.type === "session_meta")?.payload.runtime_workspace_roots).toEqual(expect.arrayContaining([root, skills]));
+    expect(transcript.find(item => item.type === "turn_context")?.payload).toMatchObject({
+      approval_policy: transition === "configured" ? "on-request" : "never",
+      sandbox_policy: { type: transition === "configured" ? "read-only" : "danger-full-access" }
+    });
+    expect(transcript.find(item => item.type === "turn_context")?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
 
     let selected = original;
     if (transition !== "new") {
       await submit("/permissions");
-      await expect.poll(() => output).toContain("1. Ask for approval");
+      await expect.poll(visibleOutput).toContain("1.Askforapproval");
       output = "";
-      terminal!.write("1");
-      await expect.poll(() => output).toContain("Permissions updated");
+      terminal!.write!("1");
+      await expect.poll(visibleOutput).toContain("Permissionselectionrequested:Askforapproval");
       if (transition === "edit") {
-        terminal!.write("\u001b");
+        terminal!.write!("\u001b");
         await new Promise(resolve => setTimeout(resolve, 150));
-        terminal!.write("\u001b");
+        terminal!.write!("\u001b");
         await new Promise(resolve => setTimeout(resolve, 150));
-        terminal!.write("\r");
-      } else await submit("/new");
-      await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
+        terminal!.write!("\r");
+      } else await submit(transition === "fork" ? "/fork" : "/new");
+      if (transition === "edit") {
+        await expect.poll(visibleOutput, { timeout: 5_000 }).toContain("Conversationrevertedtothispoint.");
+        expect(recovery.read()?.sessionId).toBe(original);
+      } else await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
       selected = recovery.read()!.sessionId;
       expect(selected).toBeTruthy();
       output = "";
-      await submit(transition === "edit" ? "" : "Save the new restricted conversation.");
-      await expect.poll(() => output, { timeout: 10_000 }).toContain("The conversation is saved.");
-      const restrictedTranscript = (await fs.readFile(recovery.read()!.transcriptPath!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-      expect(restrictedTranscript.find(item => item.type === "turn_context")?.payload).toMatchObject({
+      const restrictedTranscript = await completeTurn(transition === "edit" ? "" : "Save the selected restricted conversation.");
+      expect(restrictedTranscript.filter(item => item.type === "turn_context").at(-1)?.payload).toMatchObject({
         approval_policy: "on-request", sandbox_policy: { type: "workspace-write", writable_roots: expect.arrayContaining([skills]) }
       });
-      expect(restrictedTranscript.find(item => item.type === "session_meta")?.payload.runtime_workspace_roots).toEqual(expect.arrayContaining([root, skills]));
+      expect(restrictedTranscript.filter(item => item.type === "turn_context").at(-1)?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
     } else {
       await submit("/new");
       await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
       expect(recovery.read()!.sessionId).toBeTruthy();
       expect(requests.filter(value => value === "conversation")).toHaveLength(1);
       output = "";
-      await submit("Save the new unrestricted conversation.");
-      await expect.poll(() => output, { timeout: 10_000 }).toContain("The conversation is saved.");
-      const newTranscript = (await fs.readFile(recovery.read()!.transcriptPath!, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      const newTranscript = await completeTurn("Save the new unrestricted conversation.");
       expect(newTranscript.find(item => item.type === "turn_context")?.payload).toMatchObject({
         approval_policy: "never", sandbox_policy: { type: "danger-full-access" }
       });
-      expect(newTranscript.find(item => item.type === "session_meta")?.payload.runtime_workspace_roots).toEqual(expect.arrayContaining([root, skills]));
+      expect(newTranscript.find(item => item.type === "turn_context")?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
       await submit(`/resume ${original}`);
       await expect.poll(() => recovery.read()?.sessionId === original ? original : output, { timeout: 5_000 }).toBe(original);
     }
@@ -245,23 +264,46 @@ it.skipIf(!codexBinary).each([
     expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
 
     // The terminal supervisor stops both the visible TUI and backend. No prompt is replayed.
-    await terminal!.terminate();
+    await terminal!.terminate!();
     terminal = undefined;
     const persisted = new CodexConversationRecovery(sources.viewPath(tab.id)).read();
     expect(persisted).toMatchObject({ sessionId: selected, selection: { tabId: tab.id, executionId } });
     expect(await plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: selected });
-    await launch(["resume", selected], restartedExecutionId);
+    const replacementRoot = path.join(root, "configured-after-restart");
+    await fs.mkdir(replacementRoot);
+    const configPath = path.join(home, "config.toml");
+    await fs.writeFile(configPath, (await fs.readFile(configPath, "utf8")).replace(JSON.stringify(configuredRoot), JSON.stringify(replacementRoot)));
+    restartedExecutionId = await launch(selected);
     await expect.poll(() => {
       const identity = new CodexConversationRecovery(sources.viewPath(tab.id)).read();
       return identity?.selection?.executionId === restartedExecutionId ? identity : output;
     }, { timeout: 10_000 }).toMatchObject({ sessionId: selected, selection: { executionId: restartedExecutionId } });
     expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
+    output = "";
+    const restoredTranscript = await completeTurn("Verify the restored conversation permissions and saved roots.");
+    const restoredContext = restoredTranscript.filter(item => item.type === "turn_context").at(-1)?.payload;
+    expect(restoredContext).toMatchObject({
+      approval_policy: transition === "new" ? "never" : "on-request",
+      sandbox_policy: { type: transition === "new" ? "danger-full-access" : "workspace-write" },
+      workspace_roots: expect.arrayContaining([root, configuredRoot, skills])
+    });
+    expect(restoredContext.workspace_roots).not.toContain(replacementRoot);
+    expect(recovery.read()!.sessionId).toBe(selected);
   } finally {
     stopObserving?.();
-    await terminal?.terminate();
+    await terminal?.terminate?.();
     provider.closeAllConnections();
     await new Promise<void>(resolve => provider.close(() => resolve()));
     await sources.dispose();
     await fs.rm(root, { recursive: true, force: true });
   }
 }, 45_000);
+
+it.skipIf(!codexBinary)("verifies the supported CLI through the updater's production tab launch contract", async () => {
+  const evidence: string[] = [];
+  await verifyCodexRuntime({ assistantBin: codexBinary!, onOutput: text => evidence.push(text) });
+  expect(evidence).toEqual([
+    "Selected conversation saved before any model prompt.\n",
+    "Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n"
+  ]);
+}, 35_000);

@@ -47,6 +47,12 @@ run `npm cache add smol-toml@1.7.0` before these tests: CloudX 0.1.3 pins that
 version while the current lockfile pins 1.7.1. Both the TypeScript job and the
 isolated verifier image seed this extra dependency before offline execution.
 
+Forge migration cases that originated on development branches use the
+[checked-in historical fixtures](../../scripts/fixtures/forge-history/README.md).
+They preserve the prior integrator and native draft-reader state without
+requiring discarded branch commits or network access during tests. Blob-identity
+assertions verify the archived inputs before migration.
+
 ## Terminal reliability stress
 
 The terminal stress job runs three fresh Node 22 V8 coverage processes
@@ -100,6 +106,39 @@ docker run --rm \
   --volume "${PWD}/test-results/terminal-stress:/work/test-results/terminal-stress:rw" \
   cloudx-terminal-stress
 ```
+
+## Native Codex contract
+
+The required native CI matrix runs Codex 0.156.1 and 0.157.1 through the
+production tab launcher, generated overlay, bridge and PTY. The tests
+use an isolated home and a synthetic local provider; they do not use
+personal credentials or an external model service.
+
+Build the server with `npm run typecheck`, then run
+`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.157.1 npm run test:codex-recovery`.
+The runner records the installed version and rejects missing binaries,
+unsupported or mismatched versions, failures and skipped native cases.
+
+Native cases require a selected-conversation receipt before the first
+model prompt. Synthetic turns verify effective permissions and roots
+across startup, `/new`, fork, prompt editing and process-loss resume.
+Resume must preserve saved roots even when the source configuration
+changes. Effective persisted roots are read from
+`turn_context.workspace_roots`; the initial `session_meta` header does
+not describe later settings changes.
+
+The supported remote TUI leaves workspace-root resolution to the native
+server. The bridge forwards omitted or null roots, adds the CloudX
+skills directory to the resolved response, and the TUI adopts those
+roots for its next turn. See the [versioned native
+implementation](https://github.com/openai/codex/blob/rust-v0.156.1/codex-rs/tui/src/app_server_session.rs).
+
+Codex update acceptance runs the same startup and synthetic-turn probe
+before reporting either an updated or current installation. Installer
+lifecycle validation can invoke
+`node scripts/codex-runtime-verification.mjs /absolute/path/to/installer-selected/codex`
+against the built server. The pinned matrix is separate from installer
+selection coverage tracked by \#128.
 
 ## Useful Area Coverage
 

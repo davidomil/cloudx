@@ -9,7 +9,7 @@ import { PluginDataStore } from '../apps/server/src/plugins/PluginDataStore.ts';
 import { PathPolicy } from '../apps/server/src/pathPolicy.ts';
 import { ManagedUpdate, UpdateHost, validateSavedTransition } from './managed-update.mjs';
 import { cleanupUpdates, git, runPreparedUpdate, updateFixture, write } from './helpers/managed-update-rollback-fixture.mjs';
-import { cleanupHistoricalForge, historicalForge } from './helpers/managed-update-forge-history-fixture.mjs';
+import { cleanupHistoricalForge, historicalForge, FORGE_WITH_HISTORICAL_DRAFTS } from './helpers/managed-update-forge-history-fixture.mjs';
 
 const services = [];
 afterEach(async () => {
@@ -100,7 +100,7 @@ it('loads every original 0.1.3 review on upgrade and preserves posted receipts w
 }, 15000);
 
 const nativeTarget = '2f28a100cd765b8c209e85fdacb03b03a57ba0df';
-const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e120', '7604d8d', nativeTarget];
+const continuationTargets = [undefined, 'c664071e', '224a75ef', 'a9613faf', 'aec0d06e', '4083e120', FORGE_WITH_HISTORICAL_DRAFTS, nativeTarget];
 it.each(continuationTargets.flatMap(target => ['draft', 'posted'].map(status => ({ target, status }))))(
   'starts a fresh full review after an original 0.1.3 $status review on $target', async ({ target, status }) => {
   const f = await originalProfile(target);
@@ -192,8 +192,8 @@ it.each(continuationTargets.flatMap(target => ['posting', 'post_failed'].map(sta
 it.each([
   { target: 'a9613faf', missing: 'ownership' },
   { target: 'aec0d06e', missing: 'ownership' },
-  { target: '7604d8d', missing: 'ownership' },
-  { target: '7604d8d', missing: 'baseline' },
+  { target: FORGE_WITH_HISTORICAL_DRAFTS, missing: 'ownership' },
+  { target: FORGE_WITH_HISTORICAL_DRAFTS, missing: 'baseline' },
   { target: nativeTarget, missing: 'ownership' },
   { target: nativeTarget, missing: 'baseline' },
 ])('retains modern $missing protection on $target', async ({ target, missing }) => {

@@ -2,11 +2,12 @@ import { createServer } from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import type { WorkspaceTab } from "@cloudx/shared";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
-import { CODEX_SUBMIT_DELAY_MS, CodexTerminalSession } from "./CodexTerminalPlugin.js";
+import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
+import { CodexStateSources } from "./CodexStateSources.js";
+import type { PluginSession } from "@cloudx/plugin-api";
 
 const codex = process.env.CLOUDX_NATIVE_CODEX;
 
@@ -15,6 +16,8 @@ it.skipIf(!codex)("preserves the native worker completion while Codex generates 
   expect(path.isAbsolute(codex!)).toBe(true);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-worker-"));
   const home = path.join(root, "home");
+  const data = path.join(root, "data");
+  const sources = new CodexStateSources(data, { CODEX_HOME: home });
   const finalText = "The native final response remains visible after handoff.";
   const title = "Verify native worker completion";
   const providerRequests: string[] = [];
@@ -41,10 +44,12 @@ it.skipIf(!codex)("preserves the native worker completion while Codex generates 
   });
   await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
   const address = provider.address() as { port: number };
-  let terminal;
+  let terminal: PluginSession | undefined;
   try {
     await fs.mkdir(home, { mode: 0o700 });
     await fs.writeFile(path.join(home, "config.toml"), [
+      '# CloudX launch preferences: {"defaultSkills":{"imagegen":false}}',
+      'check_for_update_on_startup = false',
       'model = "cloudx-native"', 'model_provider = "cloudx-native"',
       'approval_policy = "never"', 'sandbox_mode = "danger-full-access"',
       '[model_providers.cloudx-native]', 'name = "CloudX native test"',
@@ -52,16 +57,16 @@ it.skipIf(!codex)("preserves the native worker completion while Codex generates 
       'wire_api = "responses"', 'requires_openai_auth = false',
       `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
     ].join("\n"));
-    const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, TERM: "xterm-256color" };
+    const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: codex, SHELL: "/bin/sh", TERM: "xterm-256color" };
     const binding = { workerId: "native-worker", attemptId: "native-attempt", receiptPath: path.join(root, "turn.json") };
-    terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)), JSON.stringify({
-      binding, command: codex,
-      serverArgs: ["app-server", "--listen", "stdio://"],
-      tuiArgs: ["--no-alt-screen", "--yolo", "--cd", root, "--", "Return the configured native test response."]
-    })], { cwd: root, env, cols: 100, rows: 30 });
-    terminal.onData(data => { if (data.includes("\u001b[6n")) terminal!.write("\u001b[1;1R"); });
-    const tab: WorkspaceTab = { id: "native", pluginId: "codex-terminal", title: "Native", cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "", updatedAt: "" } };
-    const session = new CodexTerminalSession(tab, terminal, undefined, { closeOnExit: false, nativeTurn: binding, submitDelayMs: CODEX_SUBMIT_DELAY_MS });
+    const tab: WorkspaceTab = { id: "native", pluginId: "codex-terminal", ownerPluginId: "forge", title: "Native", cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "", updatedAt: "" } };
+    terminal = await new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env).createSession({
+      tab, cwd: root, codexTurn: binding,
+      initialInput: { prompt: "Return the configured native test response." },
+      controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
+    });
+    terminal.onData!(data => { if (data.includes("\u001b[6n")) terminal!.write!("\u001b[1;1R"); });
+    const session = terminal;
     let receipt: { status: string; threadId: string; turnId: string } | undefined;
     await expect.poll(async () => {
       try { receipt = JSON.parse(await fs.readFile(binding.receiptPath, "utf8")); }
@@ -79,9 +84,10 @@ it.skipIf(!codex)("preserves the native worker completion while Codex generates 
     expect(session.snapshot().status).toBe("completed");
     expect(session.snapshot().recentOutput).toContain(finalText);
   } finally {
-    await terminal?.terminate();
+    await terminal?.terminate?.();
     provider.closeAllConnections();
     await new Promise<void>(resolve => provider.close(() => resolve()));
+    await sources.dispose();
     await fs.rm(root, { recursive: true, force: true });
   }
 }, 25_000);

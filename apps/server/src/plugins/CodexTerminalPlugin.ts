@@ -82,7 +82,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     private readonly factory: TerminalProcessFactory,
     private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES,
     private readonly dataDir?: string,
-    private readonly sources = dataDir ? new CodexStateSources(dataDir) : undefined
+    private readonly sources = dataDir ? new CodexStateSources(dataDir) : undefined,
+    private readonly env: NodeJS.ProcessEnv = process.env
   ) {}
 
   descriptor() {
@@ -119,7 +120,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   private async startSession(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
     const template = templateFromRuntimeContext(input.runtimeContext);
-    const baseEnv = { ...process.env };
+    const baseEnv = { ...this.env };
     let launchTemplate: MaterializedCodexTemplate;
     let initialArgs: string[];
     try {
@@ -167,9 +168,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
             additionalWritableRoots: launchTemplate.overlay ? [launchTemplate.overlay.rulesSkillsRoot] : []
           },
           command,
-          serverArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS,
-            ...(launchTemplate.args.includes("--yolo") ? ["--config", 'approval_policy="never"', "--config", 'sandbox_mode="danger-full-access"'] : []),
-            "app-server", "--listen", "stdio://"],
+          serverArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS, "app-server", "--listen", "stdio://"],
           tuiArgs: launchArgs
         })
       ], launchTemplate.env)
@@ -246,7 +245,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       }),
       applyRuntimeContext: async (runtimeContext) => {
         const template = templateFromRuntimeContext(runtimeContext);
-        const launch = await materializeCodexTemplate(template, { ...process.env }, {
+        const launch = await materializeCodexTemplate(template, { ...this.env }, {
           dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources
         });
         restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext };
@@ -261,13 +260,19 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     });
   }
 
-  async describeRecovery(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume: boolean }> {
+  async describeRecovery(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume: boolean; startupFailed?: boolean }> {
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
     try {
       const resume = codexResumeInput(input.initialInput);
       const identity = conversation?.readForExecution(input.tab.id, input.initialInput?.codexExecutionId);
       const conversationId = identity?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
-      if (!conversationId) return { message: "The previous Codex process ended. Its exact conversation ID was not saved. Select a saved session.", canResume: false };
+      if (!conversationId) {
+        if (input.initialInput?.codexExecutionId) return {
+          message: "Codex exited before a selected conversation was confirmed. Review the terminal output and Settings → Codex, then open a new Codex tab.",
+          canResume: false, startupFailed: true
+        };
+        return { message: "The previous Codex process ended. Its exact conversation ID was not saved. Select a saved session.", canResume: false };
+      }
       await this.requireConversation(input.tab.id, conversationId);
       if (!identity?.selection)
         return { message: "The previous Codex process ended. Its current conversation cannot be confirmed from the last recorded ID. Select a saved session.", canResume: false };
@@ -793,8 +798,8 @@ export class CodexTerminalSession implements PluginSession {
       this.clearPendingSubmitTimers();
       this.clearReadyQuietTimer();
       this.setReadiness("closed", "Terminal process exited.");
+      const completed = event.exitCode === 0 && !event.signal && !event.reason;
       if (this.finishing && !this.stopped) {
-        const completed = event.exitCode === 0 && !event.signal && !event.reason;
         this.setStatus(completed ? "completed" : "failed", completed ? "Codex turn completed." : `Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`} during completion.`);
         return;
       }
@@ -807,19 +812,19 @@ export class CodexTerminalSession implements PluginSession {
         return;
       }
       if (this.options.closeOnExit) {
-        const message = event.exitCode === 0 ? "Codex exited cleanly." : `Codex exited with code ${event.exitCode}.`;
+        const message = completed ? "Codex exited cleanly." : `Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`;
         const closeAfterMs = this.options.closeOnExitAfterMs ?? 0;
-        if (Date.now() - this.startedAt >= closeAfterMs) {
+        if (completed && Date.now() - this.startedAt >= closeAfterMs) {
           this.controls.closeTab(message);
           return;
         }
-        this.setStatus(event.exitCode === 0 ? "completed" : "failed", message);
+        this.setStatus(completed ? "completed" : "failed", message);
         return;
       }
-      if (event.exitCode === 0) {
+      if (completed) {
         this.setStatus("completed", "Terminal exited cleanly.");
       } else {
-        this.setStatus("failed", `Terminal exited with code ${event.exitCode}.`);
+        this.setStatus("failed", `Terminal exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`);
       }
     }));
     const disconnect = this.terminalProcess.onDisconnect?.((error) => {

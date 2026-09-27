@@ -1,11 +1,12 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import * as childProcess from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import type { CodexUpdateStatus } from "@cloudx/shared";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as codexUpdater from "../../../../scripts/codex-updater.mjs";
 import { loadConfig } from "../config.js";
@@ -16,8 +17,25 @@ import { CodexSettingsService } from "./CodexSettingsService.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexUpdateService } from "./CodexUpdateService.js";
 
+vi.mock("node:child_process", async importOriginal => ({ ...await importOriginal<typeof import("node:child_process")>() }));
+
 const roots: string[] = [];
 const disposers: Array<() => Promise<unknown>> = [];
+
+beforeEach(() => {
+  const spawn = childProcess.spawn;
+  vi.spyOn(childProcess, "spawn").mockImplementation((command, args, options) => {
+    const verifier = Array.isArray(args) ? args.findIndex(argument => argument.endsWith("/codex-runtime-verification.mjs")) : -1;
+    if (verifier < 0 || !Array.isArray(args)) return spawn(command, args as string[], options);
+    const source = `
+      if (process.env.CLOUDX_TEST_FAILURE === 'runtime') {
+        console.error('synthetic-private-runtime-detail: selected conversation was not saved');
+        process.exit(1);
+      }
+    `;
+    return spawn(command, [...args.slice(0, verifier), "-e", source, "--", ...args.slice(verifier + 1)], options);
+  });
+});
 
 afterEach(async () => {
   for (const dispose of disposers.splice(0).reverse()) await dispose();
@@ -197,6 +215,26 @@ describe("server-owned Codex updates", () => {
     expect(await f.commands()).toEqual([["view", "@openai/codex@latest", "version", "--json"]]);
   });
 
+  it.each([false, true])("retains a failed runtime verification across reads and restart until an explicit successful retry (current: %s)", async current => {
+    const f = await installation({ failure: "runtime", current });
+    const updates = f.service();
+    await updates.start();
+    const failed = await finished(updates);
+    expect(failed).toMatchObject({ phase: "failed", outcome: null, installedVersion: null, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(JSON.stringify(failed)).not.toContain("synthetic-private");
+    expect(await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8")).toContain("synthetic-private-runtime-detail");
+    expect(await updates.read()).toEqual(failed);
+    expect(await f.service().read()).toEqual(failed);
+    f.env.CLOUDX_TEST_FAILURE = "network";
+    const unavailableRegistry = f.service();
+    await unavailableRegistry.start();
+    expect(await finished(unavailableRegistry)).toMatchObject({ phase: "failed", outcome: null, installedVersion: null });
+    f.env.CLOUDX_TEST_FAILURE = undefined;
+    const retry = f.service();
+    await retry.start();
+    expect(await finished(retry)).toMatchObject({ phase: "succeeded", outcome: "current", installedVersion: current ? "1.0.0" : "1.1.0" });
+  });
+
   it("marks a retained unfinished job interrupted after restart and checks the executable before displaying its version", async () => {
     const f = await installation();
     const updates = f.service();
@@ -210,6 +248,34 @@ describe("server-owned Codex updates", () => {
     const restored = await f.service().read();
     expect(restored).toMatchObject({ jobId: result.jobId, phase: "failed", outcome: null, installedVersion: "1.1.0", message: expect.stringMatching(/interrupted/i) });
     expect((await f.commands()).filter(args => args[0] === "i")).toHaveLength(1);
+  });
+
+  it("keeps interrupted runtime verification blocked across restarts until an explicit update verifies the candidate", async () => {
+    const f = await installation({ current: true });
+    const versionLog = path.join(f.root, "version-probes");
+    f.env.CLOUDX_TEST_VERSION_LOG = versionLog;
+    await fs.writeFile(versionLog, "");
+    const statusPath = path.join(f.dataDir, "codex-update/status.json");
+    await fs.mkdir(path.dirname(statusPath), { recursive: true });
+    await fs.writeFile(statusPath, JSON.stringify({
+      assistantBin: f.executable, verificationBlocked: false,
+      update: { jobId: "interrupted-verification", phase: "verifying", installedVersion: "1.0.0", outcome: null,
+        message: "Verifying Codex tab launch, conversation selection, and permissions…", startedAt: new Date(0).toISOString(), finishedAt: null },
+    }));
+    const updates = f.service();
+    const interrupted = await updates.read();
+    expect(interrupted).toMatchObject({ phase: "failed", outcome: null, installedVersion: null, message: expect.stringMatching(/verification was interrupted.*update again.*tab launch/i) });
+    expect(await updates.read()).toEqual(interrupted);
+    const restored = f.service();
+    expect(await restored.read()).toEqual(interrupted);
+    expect(await fs.readFile(versionLog, "utf8")).toBe("");
+    expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(true);
+    expect(await f.commands()).toEqual([]);
+
+    await restored.start();
+    expect(await finished(restored)).toMatchObject({ phase: "succeeded", outcome: "current", installedVersion: "1.0.0" });
+    expect(vi.mocked(childProcess.spawn).mock.calls.some(([, args]) => Array.isArray(args) && args.some(argument => argument.endsWith("/codex-runtime-verification.mjs")))).toBe(true);
+    expect(JSON.parse(await fs.readFile(statusPath, "utf8")).verificationBlocked).toBe(false);
   });
 
   it.each(["updated", "current"] as const)("keeps verification blocked after uncertain cleanup until an explicit update succeeds as %s", async outcome => {

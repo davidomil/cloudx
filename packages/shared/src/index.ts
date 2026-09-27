@@ -100,6 +100,7 @@ export interface TabRecovery {
   message: string;
   conversationId?: string;
   canResume?: boolean;
+  startupFailed?: boolean;
 }
 
 export interface RecoverTabRequest {
@@ -1151,7 +1152,8 @@ export function isTabRecovery(value: unknown): value is TabRecovery {
   return isRecord(value) && (value.state === "missing" || value.state === "unavailable" || value.state === "retired") &&
     typeof value.message === "string" &&
     (value.conversationId === undefined || typeof value.conversationId === "string") &&
-    (value.canResume === undefined || typeof value.canResume === "boolean");
+    (value.canResume === undefined || typeof value.canResume === "boolean") &&
+    (value.startupFailed === undefined || typeof value.startupFailed === "boolean");
 }
 
 function isTabIndicator(value: unknown): value is TabIndicator {
