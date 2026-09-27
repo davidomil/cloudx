@@ -91,8 +91,10 @@ for 14 days. A selection record is created before dependency
 provisioning, so early setup failures still identify the intended
 scenario and immutable revisions.
 
-`npm run test:lifecycle-contracts` checks the harness contracts,
-including failure on installer errors, failed readiness, an unchanged
+After installing Chromium with `npx playwright install chromium`,
+`npm run test:lifecycle-contracts` checks the harness contracts and the
+browser paste used to seed the source conversation.
+The checks reject installer errors, failed readiness, an unchanged
 old web process, a mismatched running commit, stale frontend assets, and
 accidental generated Git changes. These tests do not establish that
 either full lifecycle ran. Only a passed disposable-host scenario

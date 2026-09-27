@@ -235,7 +235,7 @@ export async function seedProfile({
     input: { timeoutMs: 30_000 },
   });
   const requestsBeforePrompt = conversationCount(provider);
-  await enterText(api, codex.id, PROMPT);
+  await pasteConversationPrompt(page, PROMPT);
   await waitForSavedTurn(receiptPath);
   assert.equal(
     conversationCount(provider),
@@ -312,6 +312,21 @@ export async function seedProfile({
     unrelatedFiles,
     allowedStatusPaths: unrelatedFiles.map((value) => value.relativePath),
   };
+}
+
+export async function pasteConversationPrompt(page, text) {
+  const composer = page.locator(
+    ".workspace-pane.active .xterm-helper-textarea",
+  );
+  // Use the source UI's paste protocol; its enter_text action may send raw key bursts.
+  await composer.evaluate((element, text) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", text);
+    element.dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData, bubbles: true }),
+    );
+  }, text);
+  await composer.press("Enter");
 }
 
 export async function waitForSavedTurn(receiptPath) {

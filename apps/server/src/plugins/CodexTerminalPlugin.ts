@@ -1006,7 +1006,8 @@ export class CodexTerminalSession implements PluginSession {
       const text = requireString(input.text, "text");
       const submit = typeof input.submit === "boolean" ? input.submit : false;
       const textToWrite = submit ? stripTrailingLineTerminators(text) : text;
-      this.write(textToWrite);
+      if (this.options.voiceKind === "codex-terminal") this.writeBracketedPaste(textToWrite);
+      else this.write(textToWrite);
       if (submit) {
         this.markBusy("Input submitted.");
         this.submit();
@@ -1192,7 +1193,12 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   private writeBracketedPasteSubmit(text: string): void {
-    this.write(`\u001b[200~${normalizeTerminalPasteText(text)}\u001b[201~\r`);
+    this.writeBracketedPaste(text);
+    this.write("\r");
+  }
+
+  private writeBracketedPaste(text: string): void {
+    this.write(`\u001b[200~${normalizeTerminalPasteText(text)}\u001b[201~`);
   }
 
   private recordCommandFinish(exitCode: number | undefined): void {
