@@ -96,6 +96,7 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.change.review": { change },
       "forge.worker.pause": { worker: { ...worker, status: "paused" } },
       "forge.worker.history": {},
+      "forge.worker.ownershipAvailability": { availability: { status: "not_needed" } },
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
       "forge.worker.resume": { worker },
       "forge.worker.continue": { worker },
@@ -144,6 +145,105 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("removes a confirmed completed merge from the queue display", async () => {
+    const completed = { ...worker, status: "completed" as const, mergeQueue: {
+      sequence: 1, enteredAt: "2026-09-28", phase: "blocked" as const, active: false, position: 0, outcome: "merged" as const,
+    } };
+    const panel = await renderPanel(fixture({ workers: [completed] }));
+    await click(panel, "Workers (1)");
+    expect(panel.querySelector('[aria-label="Merge queues"]')).toBeNull();
+    expect(panel.querySelector('[aria-label="Merge queue"]')).toBeNull();
+  });
+
+  it("shows repository-scoped queue order and selects waiting workers without starting them", async () => {
+    const entry = { sequence: 1, enteredAt: "2026-09-28", phase: "waiting_ci" as const, active: true, position: 1, activeWorkerId: worker.id };
+    const active = { ...worker, status: "awaiting_merge" as const, title: "Active candidate", mergeQueue: entry };
+    const waiting = { ...worker, id: "waiting", number: 9, status: "awaiting_merge" as const, title: "Waiting candidate", mergeQueue: { ...entry, sequence: 2, active: false, phase: "queued" as const, position: 2 } };
+    const f = fixture({ workers: [waiting, active] });
+    const panel = await renderPanel(f);
+    await click(panel, "Workers (2)");
+    const queue = panel.querySelector('[aria-label="Merge queues"]')!;
+    expect([...queue.querySelectorAll('li button')].map(button => button.textContent)).toEqual(["Active · Active candidate", "#2 · Waiting candidate"]);
+    await click(queue, "#2 · Waiting candidate");
+    expect(panel.querySelector('[aria-label="Merge queue"]')!.textContent).toContain("Queued · Position 2");
+    expect(panel.querySelector('[aria-label="Merge queue"]')!.textContent).toContain("Active: Active candidate");
+    expect(f.calls.some(call => ["forge.worker.resume", "forge.worker.continue"].includes(call.hook))).toBe(false);
+  });
+
+  it.each(["draft", "running", "paused", "completed"] as const)("groups persisted %s batches and hides their selection controls", async status => {
+    const issues = [7, 9, 11, 13].map(number => ({ ...issue, number, state: "open" as const, title: `Issue ${number}` }));
+    const first = { ...worker, id: "batch-a", title: "Reliability", status, batch: { issues: issues.slice(0, 2) } };
+    const second = { ...worker, id: "batch-b", title: "Workspace cleanup", status, batch: { issues: [issues[2]] } };
+    const foreign = { ...worker, id: "foreign", title: "Other repository", repository: { ...repository, projectPath: "cloudx/other" }, batch: { issues: [issues[3]] } };
+    const f = fixture({ workers: [first, second, foreign] }, (hook, input) => {
+      if (hook === "forge.issues.list") return { items: [issues[1], issues[2], issues[3]] };
+      if (hook === "forge.issue.get") return { issue: issues.find(issue => issue.number === input.number) };
+    });
+    const panel = await renderPanel(f);
+    const group = panel.querySelector('[role="group"][aria-label="Reliability"]')!;
+    expect(group.textContent).toContain("1 of 2 issues shown");
+    expect(group.textContent).toContain("#9 Issue 9");
+    expect(panel.querySelector('[role="group"][aria-label="Workspace cleanup"]')!.textContent).toContain("#11 Issue 11");
+    expect(panel.querySelector('[aria-label="Select issue #9 for batch"]')).toBeNull();
+    expect(panel.querySelector('[aria-label="Select issue #11 for batch"]')).toBeNull();
+    expect(panel.querySelector('[role="group"][aria-label="Other repository"]')).toBeNull();
+    expect(panel.querySelector<HTMLInputElement>('[aria-label="Select issue #13 for batch"]')!.disabled).toBe(false);
+    await act(async () => group.querySelector('button')!.click());
+    expect(panel.querySelector('[aria-label="issue detail"]')!.textContent).toContain("#9 Issue 9");
+  });
+
+  it.each(["draft", "running"] as const)("keeps every overlapping batch membership when the first batch is %s", async status => {
+    const issues = [7, 9, 11].map(number => ({ ...issue, number, state: "open" as const, title: `Issue ${number}` }));
+    const first = { ...worker, id: "first", title: "First", status, batch: { issues: issues.slice(0, 2) } };
+    const second = { ...worker, id: "second", title: "Second", status: "draft" as const, batch: { issues: issues.slice(1) } };
+    const duplicate = { ...first, id: "duplicate", title: "Same members", status: "draft" as const };
+    const f = fixture({ workers: [first, second, duplicate] }, hook => hook === "forge.issues.list" ? { items: issues } : undefined);
+    let panel = await renderPanel(f);
+    const members = (name: string) => [...panel.querySelectorAll(`[role="group"][aria-label="${name}"] .forge-item-title`)].map(item => item.textContent);
+    const assertMemberships = () => {
+      expect(members("First")).toEqual(["#7 Issue 7", "#9 Issue 9"]);
+      expect(members("Second")).toEqual(["#9 Issue 9", "#11 Issue 11"]);
+      expect(members("Same members")).toEqual(["#7 Issue 7", "#9 Issue 9"]);
+      expect(panel.querySelectorAll('.forge-batch-select')).toHaveLength(0);
+    };
+    assertMemberships();
+    await click(panel, "Refresh Forge");
+    assertMemberships();
+    await act(async () => { roots.pop()!.unmount(); });
+    panel.remove();
+    panel = await renderPanel(f);
+    assertMemberships();
+    f.dashboard.workers = [first, { ...second, batch: { issues: [issues[2]] } }];
+    await click(panel, "Refresh Forge");
+    expect(members("First")).toEqual(["#7 Issue 7", "#9 Issue 9"]);
+    expect(members("Second")).toEqual(["#11 Issue 11"]);
+    expect(members("Same members")).toEqual([]);
+  });
+
+  it("removes newly batched pending selections on refresh and restores selection after draft deletion", async () => {
+    const f = fixture();
+    const panel = await renderPanel(f);
+    await act(async () => panel.querySelector<HTMLInputElement>('[aria-label="Select issue #7 for batch"]')!.click());
+    expect(panel.querySelector('[aria-label="Create issue batch"]')).not.toBeNull();
+    f.dashboard.workers = [{ ...worker, status: "draft", title: "Saved elsewhere", batch: { issues: [{ ...issue, state: "open" }] } }];
+    await click(panel, "Refresh Forge");
+    expect(panel.querySelector('[aria-label="Create issue batch"]')).toBeNull();
+    expect(panel.querySelector('[aria-label="Select issue #7 for batch"]')).toBeNull();
+    f.dashboard.workers = [];
+    await click(panel, "Refresh Forge");
+    expect(panel.querySelector('[role="group"][aria-label="Saved elsewhere"]')).toBeNull();
+    expect(panel.querySelector<HTMLInputElement>('[aria-label="Select issue #7 for batch"]')!.checked).toBe(false);
+  });
+
+  it.each(["paused", "stopped", "failed", "cleanup_failed"] as const)("keeps recovery controls without irrelevant ownership inspection for a %s worker", async status => {
+    const f = fixture({ workers: [{ ...worker, status, error: "Unrelated CI or disk failure" }] });
+    const panel = await renderPanel(f);
+    expect(panel.querySelector('[aria-label="Directory ownership recovery"]')).toBeNull();
+    expect(button(panel, "Resume").disabled).toBe(false);
+    expect(button(panel, "Continue with message").disabled).toBe(false);
+    expect(f.calls.some(call => ["forge.worker.previewOwnership", "forge.worker.reconcileOwnership", "forge.worker.resume"].includes(call.hook))).toBe(false);
+  });
+
   it("selects issues across pages, reloads the saved draft, edits membership and starts one batch", async () => {
     const issues = [issue, { ...issue, number: 9, title: "Fix cache" }, { ...issue, number: 11, title: "Fix retries" }];
     let saved: ForgeWorker | undefined;
@@ -217,7 +317,7 @@ describe("ForgePanel", () => {
     expect(card.querySelector(`a[href="${change.url}"]`)).not.toBeNull();
     expect(panel.querySelector('[aria-label="review worker #12"]')).not.toBeNull();
     expect(button(panel, "Start work").disabled).toBe(true);
-    expect(panel.querySelector<HTMLInputElement>('[aria-label="Select issue #9 for batch"]')?.disabled).toBe(true);
+    expect(panel.querySelector('[aria-label="Select issue #9 for batch"]')).toBeNull();
     await click(panel, "Pull requests");
     expect(panel.querySelectorAll('[aria-label="Batch worker Reliable builds"]')).toHaveLength(1);
     expect(testFixture.calls.some(call => call.hook === "forge.issue.start")).toBe(false);
@@ -243,9 +343,11 @@ describe("ForgePanel", () => {
       { path: "/repo", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ext4" },
       { path: "/repo/.git", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ext4" },
     ] };
+    let repaired = false;
     const testFixture = fixture({ workers: [{ ...worker, status: "cleanup_failed" }] }, hook => {
+      if (hook === "forge.worker.ownershipAvailability") return { availability: repaired ? { status: "not_needed" } : { status: "available", reason: "Device changed." } };
       if (hook === "forge.worker.previewOwnership") return { preview };
-      if (hook === "forge.worker.reconcileOwnership") return { worker };
+      if (hook === "forge.worker.reconcileOwnership") { repaired = true; return { worker }; }
     });
     const panel = await renderPanel(testFixture);
     await click(panel, "Inspect directory ownership");
@@ -261,7 +363,8 @@ describe("ForgePanel", () => {
       id: worker.id, fingerprint: preview.fingerprint, attestations: [{ device: "64521", filesystemId: "original-root", filesystemType: "ext4" }],
     } });
     expect(testFixture.calls.some(call => call.hook === "forge.worker.resume")).toBe(false);
-    expect(recovery.textContent).toContain("Directory ownership reconciled");
+    expect(panel.textContent).toContain("Directory ownership reconciled");
+    expect(panel.querySelector('[aria-label="Directory ownership recovery"]')).toBeNull();
   });
 
   it.each(["awaiting_publication", "awaiting_review"] as const)("shows retained file recovery while %s", async status => {
@@ -370,12 +473,12 @@ describe("ForgePanel", () => {
     const panel = await renderPanel(f);
     await click(panel, "Omit reply");
     expect(panel.querySelector('[aria-label="Uncertain discussion reply"]')).toBeNull();
-    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(f.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.omitDiscussionReply", input: { id: worker.id, ...uncertainReply, headSha: selected.pendingPublication!.headSha }, tabId: tab.id },
     ]);
     expect(button(panel, "Retry publication").disabled).toBe(false);
     await click(panel, "Retry publication");
-    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(f.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.omitDiscussionReply", input: { id: worker.id, ...uncertainReply, headSha: selected.pendingPublication!.headSha }, tabId: tab.id },
       { hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
     ]);
@@ -407,7 +510,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector('[role="alert"]')?.textContent).toContain("The uncertain discussion reply changed. Refresh Forge.");
     expect(panel.querySelector<HTMLTextAreaElement>('[aria-label="Uncertain discussion reply"] textarea')?.value).toBe(uncertainReply.body);
     expect(button(panel, "Omit reply").disabled).toBe(false);
-    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(f.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.omitDiscussionReply", input: { id: worker.id, ...uncertainReply, headSha: uncertainReplyWorker.pendingPublication!.headSha }, tabId: tab.id },
     ]);
   });
@@ -465,9 +568,18 @@ describe("ForgePanel", () => {
     expect(button(container, "Send and continue").disabled).toBe(false);
   });
 
+  it("accepts a recovery message while a failed publication needs reconciliation", async () => {
+    const f = fixture({ workers: [{ ...publishingWorker, status: "failed" }] });
+    const panel = await renderPanel(f);
+    await click(panel, "Continue with message");
+    await fill(panel.querySelector<HTMLTextAreaElement>('form textarea')!, "Preserve my diagnostics while recovering.");
+    expect(button(panel, "Send and continue").disabled).toBe(false);
+    await click(panel, "Send and continue");
+    expect(f.calls.filter(call => call.hook === "forge.worker.continue")).toEqual([{ hook: "forge.worker.continue", input: { id: worker.id, message: "Preserve my diagnostics while recovering.", windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }]);
+  });
+
   it.each([
     { ...worker, status: "running" as const },
-    { ...publishingWorker, status: "failed" as const },
     { ...reviewWorker, draft: { ...reviewWorker.draft!, status: "post_failed" as const } },
   ])("explains why a blocked worker cannot receive a continuation %#", async selected => {
     const f = fixture({ workers: [selected] });
@@ -605,7 +717,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector(".forge-items")).not.toBeNull();
     expect(panel.textContent).toContain(nextRepository.projectPath);
     expect(panel.querySelector("dialog")).toBe(overlay);
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it("ignores a dashboard response from before a repository settings change", async () => {
@@ -646,7 +758,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector<HTMLTextAreaElement>(".forge-review-decision textarea")?.value).toBe("");
     expect(testFixture.calls.filter(call => call.hook === "forge.changes.list").at(-1)?.input.repository).toEqual(nextRepository);
     expect(testFixture.calls.filter(call => call.hook === "forge.change.get").at(-1)?.input.repository).toEqual(nextRepository);
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it("keeps a pending item action on its original repository and requires a fresh action after settings change", async () => {
@@ -765,7 +877,7 @@ describe("ForgePanel", () => {
     expect(autoReviewToggle(panel).checked).toBe(true);
     expect(button(panel, "Resume").disabled).toBe(false);
     expect(panel.querySelector(".forge-auto-review-status")?.textContent).toContain("Resume");
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.")).map(call => call.hook)).toEqual(["forge.worker.autoReview"]);
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability")).map(call => call.hook)).toEqual(["forge.worker.autoReview"]);
   });
 
   it("keeps an in-flight auto review setting targeted to its original worker and prevents duplicate saves", async () => {
@@ -865,7 +977,7 @@ describe("ForgePanel", () => {
     expect(button(card, "Pause").disabled).toBe(false);
     expect(button(card, "Stop").disabled).toBe(false);
     expect(panel.querySelector("dialog")).toBeNull();
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it.each([
@@ -878,7 +990,7 @@ describe("ForgePanel", () => {
     const testFixture = fixture({ workers: [coding] });
     const panel = await renderPanel(testFixture);
     await click(panel.querySelector('[aria-label="issue worker #7"]')!, action);
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: `forge.worker.${action.toLowerCase()}`, input: { id: coding.id }, tabId: tab.id }
     ]);
   });
@@ -1114,7 +1226,7 @@ describe("ForgePanel", () => {
       expect(history.querySelector(".forge-worker > .forge-actions")).toBeNull();
     }
     expect(panel.querySelector(".forge-item")?.textContent).not.toContain("review draft");
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it("preserves open unsaved messages as readonly history when polling replaces the same worker's draft on the same SHA", async () => {
@@ -1143,7 +1255,7 @@ describe("ForgePanel", () => {
     expect(histories[0].querySelector<HTMLTextAreaElement>(".forge-review textarea")?.value).toBe(nextDraft.body);
     expect(histories[0].querySelector<HTMLFieldSetElement>("fieldset")?.disabled).toBe(false);
     expect(panel.querySelector("dialog")).toBeNull();
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it("preserves expanded reviews and all unsaved messages when polling adds a newer worker", async () => {
@@ -1179,7 +1291,7 @@ describe("ForgePanel", () => {
     expect(Array.from(history.querySelectorAll<HTMLTextAreaElement>(".forge-review textarea"), textarea => textarea.value)).toEqual(["Keep my unsaved summary.", "Keep my unsaved inline comment.", "Keep my new general comment."]);
     expect(history.querySelector(".forge-review textarea")).toBe(summary);
     expect(panel.querySelector("dialog")).toBeNull();
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it.each(["github", "gitlab"] as const)("keeps the %s issue worker beside review actions above a long description without losing draft edits", async provider => {
@@ -1477,7 +1589,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector('[role="tab"][aria-selected="true"] small')?.textContent).toBe("awaiting publication");
     assertWaitingCard(panel.querySelector('[role="tabpanel"] .forge-worker')!);
     expect(panel.querySelector(".forge-item-worker-error, [role=alert], dialog")).toBeNull();
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it.each(["github", "gitlab"] as const)("shows delayed %s publication as one waiting status with collapsed diagnostics", async provider => {
@@ -1518,7 +1630,7 @@ describe("ForgePanel", () => {
       await act(async () => { diagnostics.querySelector("summary")!.click(); });
       expect(diagnostics.open).toBe(true);
     }
-    expect(f.calls.some(call => call.hook.startsWith("forge.worker."))).toBe(false);
+    expect(f.calls.some(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toBe(false);
   });
 
   it("shows stopped publication confirmation as an alert with the preserved diagnostics and retry action", async () => {
@@ -1535,7 +1647,7 @@ describe("ForgePanel", () => {
     expect(card.textContent).not.toContain("Next automatic check");
     expect(card.querySelector('[aria-label="Publication diagnostics"]')?.textContent).toContain("confirmation · exhausted");
     await click(card, "Retry publication");
-    expect(f.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(f.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.resume", input: { id: publishingWorker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
     ]);
   });
@@ -1559,7 +1671,7 @@ describe("ForgePanel", () => {
     });
     const panel = await renderPanel(testFixture);
     await click(panel.querySelector(".forge-worker")!, action);
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([{ hook, input: { id: publishing.id }, tabId: tab.id }]);
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([{ hook, input: { id: publishing.id }, tabId: tab.id }]);
     expect(panel.querySelector(".forge-worker-heading .forge-status")?.textContent).toBe(status);
     expect(button(panel, "Retry publication").disabled).toBe(false);
     expect(panel.textContent).not.toContain("work continues automatically");
@@ -1635,7 +1747,7 @@ describe("ForgePanel", () => {
       { repository: currentRepository, number: selected.number, autoPost: false, windowId: "window-1", paneId: "pane-2" },
       { repository: currentRepository, number: selected.number, autoPost: true, windowId: "window-1", paneId: "pane-2" }
     ]);
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toHaveLength(0);
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toHaveLength(0);
   });
 
   it.each([
@@ -1667,7 +1779,7 @@ describe("ForgePanel", () => {
     expect(draft.closest("fieldset")!.disabled).toBe(false);
     expect(button(panel.querySelector(".forge-change-toolbar .forge-worker")!, "Retry publication").disabled).toBe(false);
     expect(panel.textContent).not.toContain("work continues automatically");
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
 
     const confirmed: ForgeWorker = { ...publishing, headSha: publishing.pendingPublication!.headSha, pendingPublication: { ...publishing.pendingPublication!, confirmed: true } };
     testFixture.dashboard.workers = [confirmed, reviewer];
@@ -1812,7 +1924,7 @@ describe("ForgePanel", () => {
       } else expect(row.querySelectorAll(".forge-item-worker")).toHaveLength(0);
     }
     expect(panel.querySelectorAll(".forge-detail .forge-worker")).toHaveLength(0);
-    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
+    expect(testFixture.calls.every(call => call.hook === "forge.dashboard" || call.hook === "forge.worker.ownershipAvailability" || call.hook.endsWith(".list") || call.hook.endsWith(".get"))).toBe(true);
   });
 
   it("allows adding and removing comments and blocks incomplete inline locations", async () => {
@@ -1836,7 +1948,7 @@ describe("ForgePanel", () => {
     const testFixture = fixture({ workers: [published] });
     const panel = await renderPanel(testFixture);
     await click(panel, "Sync and re-review");
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.syncAndReview", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
     ]);
   });
@@ -1856,7 +1968,7 @@ describe("ForgePanel", () => {
     const testFixture = fixture({ workers: [{ ...conflictedWorker, status }] });
     const panel = await renderPanel(testFixture);
     await click(panel, "Rebase and resolve conflicts");
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.rebaseAndResolve", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
     ]);
   });
@@ -1879,10 +1991,10 @@ describe("ForgePanel", () => {
         expect(card.textContent).not.toContain("Merge conflicts block this request.");
         expect(card.textContent).not.toContain("Rebase and resolve conflicts");
       }
-      expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([]);
+      expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([]);
     }
     await click(panel, "Rebase and resolve conflicts");
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.rebaseAndResolve", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id }
     ]);
   });
@@ -2022,7 +2134,7 @@ describe("ForgePanel", () => {
     expect(button(card, "Retry publication").disabled).toBe(false);
 
     await click(card, "Retry publication");
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.") || call.hook === "forge.issue.start")).toEqual([
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability") || call.hook === "forge.issue.start")).toEqual([
       { hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
     ]);
   });
@@ -2193,7 +2305,7 @@ describe("ForgePanel", () => {
     await click(panel, "View worker");
     expect(panel.querySelector("dialog")?.textContent).toContain(message);
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.")).map(call => call.hook)).toEqual(status === "starting" ? [] : ["forge.worker.history"]);
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability")).map(call => call.hook)).toEqual(status === "starting" ? [] : ["forge.worker.history"]);
   });
 
   it.each(["failed", "completed", "stopped", "paused", "cleanup_failed"] as const)("opens saved %s worker output without resuming or starting work", async status => {
@@ -2208,7 +2320,7 @@ describe("ForgePanel", () => {
     await click(panel, "Close worker terminal");
     await click(panel, "View worker");
     expect(panel.querySelector('[aria-label="Saved worker terminal output"]')).not.toBeNull();
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker."))).toEqual([
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toEqual([
       { hook: "forge.worker.history", input: { id: worker.id }, tabId: tab.id },
       { hook: "forge.worker.history", input: { id: worker.id }, tabId: tab.id }
     ]);
@@ -2297,7 +2409,7 @@ describe("ForgePanel", () => {
     await act(async () => tabs[0].dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true })));
     expect(document.activeElement).toBe(tabs[1]);
     expect(panel.querySelector("dialog")).toBeNull();
-    expect(testFixture.calls.every(call => !call.hook.startsWith("forge.worker.") || call.hook === "forge.worker.history")).toBe(true);
+    expect(testFixture.calls.every(call => !(call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability") || call.hook === "forge.worker.history")).toBe(true);
   });
 
   it("keeps the selected worker through Resume replacing its terminal and cleanup removing it", async () => {
@@ -2337,7 +2449,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #7");
     expect(panel.querySelector("dialog")).toBeNull();
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
-    expect(testFixture.calls.filter(call => call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.history")).toEqual([{ hook: "forge.worker.resume", input: { id: second.id, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" }]);
+    expect(testFixture.calls.filter(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability") && call.hook !== "forge.worker.history")).toEqual([{ hook: "forge.worker.resume", input: { id: second.id, windowId: "window-1", paneId: "pane-2" }, tabId: "forge-tab" }]);
   });
 
   it("preserves the current pull request and its unsaved review while viewing its worker", async () => {

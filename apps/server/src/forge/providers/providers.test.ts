@@ -11,6 +11,7 @@ import {
   validateRepository,
   type ForgeListIdentity,
 } from "./index.js";
+import { ForgeMergeRejectedError } from "./ForgeProvider.js";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 
 const headSha = "a".repeat(40);
@@ -2133,7 +2134,7 @@ describe("GitLab reviewer assignment before requesting changes", () => {
   it.each([403, 500])("does not repeat an assignment after HTTP %s", async status => {
     const { provider, calls } = fixture({ assignmentResponse: new Response(null, { status }) });
     const error = await provider.postReview(7, submission).catch(error => error);
-    expect(error).toMatchObject({ name: "ForgeProviderError", statusCode: status === 500 ? 409 : status });
+    expect(error).toMatchObject({ name: status === 500 ? "ForgeMutationUncertainError" : "ForgeProviderError", statusCode: status === 500 ? 409 : status });
     if (status === 500) expect(error.message).toContain("remote result is unknown");
     else expect(error.message).toContain("API rejected the operation (HTTP 403)");
     expect(assignments(calls)).toHaveLength(1);
@@ -2195,6 +2196,14 @@ describe("merge preflight and mutation boundaries", () => {
     expect(calls.some(call => call.options.method === "PUT")).toBe(false);
   });
 
+  it.each([github, gitlab])("rejects a $provider target that moved since queue verification before sending the merge", async repository => {
+    const { provider, calls } = repository.provider === "github" ? hubFixture() : labFixture();
+    const error = await provider.merge(7, headSha, "f".repeat(40)).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error.message).toContain("target branch advanced");
+    expect(calls.some(call => call.options.method === "PUT")).toBe(false);
+  });
+
   it.each([github, gitlab])("preserves $provider read failures without recording an attempted merge", async repository => {
     const base = repository.provider === "github" ? hubFixture() : labFixture();
     const { provider, calls } = harness(repository, (url, options) => /\/(pulls|merge_requests)\/7$/.test(url.pathname)
@@ -2214,14 +2223,28 @@ describe("merge preflight and mutation boundaries", () => {
     expect(calls.some(call => call.options.method === "PUT")).toBe(false);
   });
 
-  it.each([github, gitlab])("does not classify a $provider merge HTTP failure as an unstarted mutation", async repository => {
+  it.each([github, gitlab].flatMap(repository => [403, 409, 422, 503].map(status => ({ repository, status }))))("preserves an attempted merge after HTTP $status ($repository.provider)", async ({ repository, status }) => {
     const base = repository.provider === "github" ? hubFixture() : labFixture();
     const { provider, calls } = harness(repository, (url, options) => options.method === "PUT"
-      ? new Response(null, { status: 409 }) : base.fetcher(url, options));
+      ? new Response(null, { status }) : base.fetcher(url, options));
     const error = await provider.merge(7, headSha).catch(error => error);
     expect(error).toBeInstanceOf(ForgeProviderError);
     expect(error).not.toBeInstanceOf(ForgeMergeNotStartedError);
-    expect(error).toMatchObject({ statusCode: 409, message: expect.stringContaining("HTTP 409") });
+    expect(error instanceof ForgeMergeRejectedError).toBe(status < 500);
+    if (status < 500) expect(error).toMatchObject({ statusCode: status, message: expect.stringContaining(`HTTP ${status}`) });
+    else expect(error.message).toContain("remote result is unknown");
+    expect(calls.filter(call => call.options.method === "PUT")).toHaveLength(1);
+  });
+
+  it.each([github, gitlab])("retains uncertainty after a lost $provider merge response", async repository => {
+    const base = repository.provider === "github" ? hubFixture() : labFixture();
+    const { provider, calls } = harness(repository, (url, options) => {
+      if (options.method === "PUT") throw new Error("Connection lost after writing request");
+      return base.fetcher(url, options);
+    });
+    const error = await provider.merge(7, headSha).catch(error => error);
+    expect(error).not.toBeInstanceOf(ForgeMergeRejectedError);
+    expect(error).not.toBeInstanceOf(ForgeMergeNotStartedError);
     expect(calls.filter(call => call.options.method === "PUT")).toHaveLength(1);
   });
 
@@ -2232,6 +2255,7 @@ describe("merge preflight and mutation boundaries", () => {
     const error = await provider.merge(7, headSha).catch(error => error);
     expect(error).toBeInstanceOf(ForgeProviderError);
     expect(error).not.toBeInstanceOf(ForgeMergeNotStartedError);
+    expect(error instanceof ForgeMergeRejectedError).toBe(repository.provider === "github");
     expect(error.statusCode).toBe(409);
     expect(calls.filter(call => call.options.method === "PUT")).toHaveLength(1);
   });

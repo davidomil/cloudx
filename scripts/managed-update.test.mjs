@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ManagedUpdate, validateSavedTransition } from './managed-update.mjs';
 import { SERVICE_NAMES } from './install-update.mjs';
 import { writeUpdateJson } from './managed-update-store.mjs';
+import { ForgeUpdateBlockedError } from './terminal-upgrade-recovery.mjs';
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
@@ -29,6 +30,19 @@ function transition() {
 }
 
 describe('durable managed transition', () => {
+  it('persists an actionable Forge blocker at quiesce and clears it when Resume reaches readiness', async () => {
+    const f = transition();
+    f.host.quiesce.mockImplementationOnce(() => { throw new ForgeUpdateBlockedError('Forge issue #129 has an uncertain merge.', { id: 'worker-149', kind: 'issue', number: 129 }); });
+    const failed = await f.execute(f.record);
+    expect(failed).toMatchObject({ state: 'failed', phase: 'quiesce', component: 'forge', resumable: true,
+      cause: 'Forge issue #129 has an uncertain merge.', forgeBlocker: { workerId: 'worker-149', issueNumber: 129 } });
+    expect(f.actions).toEqual(['prepare']);
+    const saved = JSON.parse(fs.readFileSync(f.journal));
+    expect(saved.run.forgeBlocker).toEqual(failed.forgeBlocker);
+    expect(await f.execute(saved)).toMatchObject({ state: 'succeeded', phase: 'complete' });
+    expect(saved.run.forgeBlocker).toBeUndefined();
+    expect(f.actions).toEqual(['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify']);
+  });
   it('retains a prepared release until an explicit activation resumes and verifies the target', async () => {
     const f = transition();
     f.record.noStart = true;

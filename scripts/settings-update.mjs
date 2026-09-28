@@ -16,6 +16,7 @@ import { inspectRuntimeUpdate } from "./install-runtime.mjs";
 import { MANAGED_INTEGRATION_SOURCE_FILES } from "./managed-update-integration.mjs";
 import { CURRENT_TERMINAL_CONTRACT } from "./managed-update.mjs";
 import { parseEnvironmentFile } from "./installer-environment.mjs";
+import { assertTerminalMigrationSafe } from "./terminal-upgrade-recovery.mjs";
 
 export const UPDATE_UNIT = "cloudx-settings-update.service";
 export const UPDATE_TIMEOUT_MS = 60 * 60 * 1000;
@@ -340,10 +341,16 @@ export class SettingsUpdater {
     const unavailableReason = record?.transition?.mutating && run?.resumable
       ? this.recoveryPreflight(record) : this.preflight();
     const confirmation = this.pointer("confirmation");
+    let forgeBlocker;
+    if (!unavailableReason && !unit.running && !record?.transition?.mutating) {
+      try { assertTerminalMigrationSafe({ dataDir: this.dataDir }); }
+      catch (error) { if (!error.forgeBlocker) throw error; forgeBlocker = error.forgeBlocker; }
+    }
     return {
       available: !unavailableReason,
       ...(unavailableReason ? { unavailableReason } : {}),
       ...(run ? { run } : {}),
+      ...(forgeBlocker ? { forgeBlocker } : {}),
       ...(confirmation?.repoRoot === this.repoRoot ? { confirmation: { targetCommit: confirmation.targetCommit, message: confirmation.message, ...(confirmation.restoreSnapshotRunId ? { restoreSnapshotRunId: confirmation.restoreSnapshotRunId, requiresInterruption: confirmation.requiresInterruption } : {}) } } : {}),
     };
   }
@@ -378,6 +385,7 @@ export class SettingsUpdater {
       if (!["failed", "prepared"].includes(saved.run.state) || !saved.run.resumable) throw new Error("The selected update cannot be resumed.");
     }
     if (!saved?.transition?.mutating) {
+      if (status.forgeBlocker) return status;
       const runtimePlan = this.runtimeInspector({ paths: { ...this.paths, dataDir: this.dataDir }, commands: this.commands,
         target: { kind: this.serviceName ? "web" : "standard", serviceNames: this.serviceName ? [this.serviceName] : SERVICE_NAMES }, targetRuntime: CURRENT_TERMINAL_CONTRACT });
       if (runtimePlan.blockers.length) return { ...status, available: false, unavailableReason: runtimePlan.blockers.map(item => item.message).join(" ") };
@@ -416,6 +424,7 @@ export class SettingsUpdater {
       delete record.run.cause;
       delete record.run.component;
       delete record.run.recoveryAction;
+      delete record.run.forgeBlocker;
       record.serverPid = this.serverPid;
       record.confirmInterruption ||= confirmInterruption;
       if (restoreSnapshotRunId) record.restoreSnapshotRunId = restoreSnapshotRunId;

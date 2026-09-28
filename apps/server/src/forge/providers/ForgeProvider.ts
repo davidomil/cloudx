@@ -50,7 +50,7 @@ export interface ForgeProvider {
     discussionId: string,
     expectedHeadSha: string,
   ): Promise<void>;
-  merge(number: number, expectedHeadSha: string): Promise<ForgeMergeResult>;
+  merge(number: number, expectedHeadSha: string, expectedTargetHeadSha?: string): Promise<ForgeMergeResult>;
 }
 
 export function requireDiscussion(
@@ -180,6 +180,21 @@ export class ForgeHeadChangedError extends ForgeProviderError {
     this.observations = Object.freeze([...new Map(observations.map(({ source, headSha }) => [
       `${source}:${headSha}`, Object.freeze({ source, headSha }),
     ])).values()]);
+  }
+}
+
+export class ForgeMutationUncertainError extends ForgeProviderError {
+  constructor(error: ForgeProviderUnavailableError) {
+    super(`${error.message} Its remote result is unknown. Refresh provider state before submitting again.`, 409);
+    this.name = "ForgeMutationUncertainError";
+  }
+}
+
+export class ForgeMergeRejectedError extends ForgeProviderError {
+  constructor(error: ForgeProviderError) {
+    super(error.message, error.statusCode);
+    this.name = "ForgeMergeRejectedError";
+    this.cause = error;
   }
 }
 

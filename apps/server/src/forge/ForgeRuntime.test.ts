@@ -13,6 +13,7 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeReviewRevision, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
+import { WorkspaceCleanupService } from "../workspace/WorkspaceCleanupService.js";
 import * as filesystemEvidence from "../filesystemIdentity.js";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
 import type { ConfigService } from "../configService.js";
@@ -1483,7 +1484,7 @@ describe("ForgeRuntime publication handoff", () => {
     await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "New notes\n");
     runtime = new ForgeRuntime(deps);
     await expect(runtime.publishBranch(workspace)).rejects.toMatchObject({ name: "ForgeHandoffError", publicationNotStarted: !pushed });
-    await expect(runtime.publishBranch(workspace)).rejects.toThrow(pushed ? "restore the recorded retained files" : "Continue with message");
+    await expect(runtime.publishBranch(workspace)).rejects.toThrow(pushed ? "Resume with message" : "Continue with message");
     expect(pushes).toBe(pushed ? 1 : 0);
     expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("New notes\n");
   });
@@ -1504,12 +1505,13 @@ describe("ForgeRuntime publication handoff", () => {
     expect(await fs.readFile(path.join(workspace.worktreePath, "diagnostics/result.bin"))).toEqual(Buffer.from([0, 255]));
   });
 
-  it("preserves retained checkout ownership and prevents branch mutation even after an accepted handoff", async () => {
+  it("preserves retained files during base synchronization and still rejects replaced checkout ownership", async () => {
     const workspace = await prepare();
     await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retained work\n");
     await runtime.preparePublication(workspace, "attempt", ready(headSha, ["notes.txt"]));
     await runtime.publishBranch(workspace);
-    await expect(runtime.updateIssueBranch(workspace, headSha, "main")).rejects.toThrow("retained checkout");
+    expect(await runtime.updateIssueBranch(workspace, headSha, "main")).toBe(headSha);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Retained work\n");
     await expect(runtime.syncPublishedBranch(workspace, headSha, headSha)).rejects.toThrow("retained checkout");
     await fs.rename(workspace.worktreePath, `${workspace.worktreePath}-original`);
     await fs.mkdir(workspace.worktreePath);
@@ -1648,6 +1650,90 @@ describe("ForgeRuntime owned branch updates", () => {
       expect(await fs.readFile(path.join(workspace.worktreePath, "target.txt", ...(condition === "ignored directory collision" ? ["local.txt"] : [])), "utf8")).toBe("Ignored local work");
   });
 
+  it("updates with eight declared diagnostics, preserving every byte and the exact publication checkpoint", async () => {
+    const { workspace, publishedHead } = await publishedIssue();
+    const retainedPaths = Array.from({ length: 8 }, (_, index) => `debug_tooling/report-${index}.json`);
+    await fs.mkdir(path.join(workspace.worktreePath, "debug_tooling"));
+    for (const [index, file] of retainedPaths.entries())
+      await fs.writeFile(path.join(workspace.worktreePath, file), Buffer.from([index, 0, 255, 10]));
+    await runtime.preparePublication(workspace, "retained-diagnostics", { headSha: publishedHead, status: "ready", retainedPaths, details: "Validated the committed content independently." });
+    const target = await advanceTarget();
+    const updated = await runtime.updateIssueBranch(workspace, publishedHead, "main");
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", updated)).toBe(`${updated} ${publishedHead} ${target}`);
+    for (const [index, file] of retainedPaths.entries())
+      expect(await fs.readFile(path.join(workspace.worktreePath, file))).toEqual(Buffer.from([index, 0, 255, 10]));
+    await runtime.verifyPublishedWorkspace(workspace, updated);
+    expect(await runtime.publishBranch(workspace, undefined, updated)).toBe(updated);
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.updateIssueBranch(workspace, publishedHead, "main")).toBe(updated);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(updated);
+  });
+
+  it.each(["tracked", "collision"])("preserves declared %s work for an actionable recovery turn", async kind => {
+    const { workspace, publishedHead } = await publishedIssue();
+    const file = kind === "tracked" ? "issue.txt" : "target.txt";
+    await fs.writeFile(path.join(workspace.worktreePath, file), "Retained bytes\n");
+    if (kind === "tracked") await git(workspace.worktreePath, "add", file);
+    await runtime.preparePublication(workspace, "retained-work", { headSha: publishedHead, status: "ready", retainedPaths: [file], details: "Committed content validated separately." });
+    await advanceTarget();
+    const status = await git(workspace.worktreePath, "status", "--porcelain");
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toBeInstanceOf(ForgeHandoffError);
+    expect(await fs.readFile(path.join(workspace.worktreePath, file), "utf8")).toBe("Retained bytes\n");
+    expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe(status);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
+  });
+
+  it.each(["handoff", "publication", "lost publication response", "interrupted publication receipt"])("settles a recovered base update across restart after %s", async checkpoint => {
+    const { workspace, publishedHead } = await publishedIssue();
+    await fs.writeFile(path.join(workspace.worktreePath, "issue.txt"), "Retained issue edits\n");
+    await runtime.preparePublication(workspace, "retained-edits", { headSha: publishedHead, status: "ready", retainedPaths: ["issue.txt"], details: "The previous commit was validated independently." });
+    const targetHead = await advanceTarget();
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow("Retained tracked edits");
+    expect((await ownership(workspace.id)).value.baseUpdate.headSha).toBeUndefined();
+
+    await git(workspace.worktreePath, "add", "issue.txt");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: recover retained edits");
+    if (checkpoint !== "publication") await git(workspace.worktreePath, "merge", "--no-edit", targetHead);
+    const recoveredHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    const bytes = Buffer.from([0, 255, 6, 10]);
+    await fs.writeFile(path.join(workspace.worktreePath, "recovery.bin"), bytes);
+    await runtime.preparePublication(workspace, "recovered-work", { headSha: recoveredHead, status: "ready", retainedPaths: ["recovery.bin"], details: "Recovered commit validated independently; retain diagnostics." });
+    expect((await ownership(workspace.id)).value.baseUpdate.headSha).toBeUndefined();
+
+    if (checkpoint === "handoff") runtime = new ForgeRuntime(dependencies());
+    if (checkpoint === "lost publication response" || checkpoint === "interrupted publication receipt") {
+      const deps = dependencies();
+      const executeGit = deps.git!;
+      deps.git = async (...args) => {
+        const result = await executeGit(...args);
+        if (args[1][0] === "push") throw new Error("recovery publication response was lost");
+        return result;
+      };
+      runtime = new ForgeRuntime(deps);
+      await expect(runtime.publishBranch(workspace, undefined, recoveredHead)).rejects.toThrow("response was lost");
+      expect((await ownership(workspace.id)).value.baseUpdate.headSha).toBeUndefined();
+      expect((await ownership(workspace.id)).value.branchPublication.confirmed).toBe(false);
+      if (checkpoint === "interrupted publication receipt") {
+        const manifest = await ownership(workspace.id);
+        manifest.value.gitPending = true;
+        await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+      }
+      runtime = new ForgeRuntime(dependencies());
+      await runtime.recover(workspace.id);
+    }
+    expect(await runtime.publishBranch(workspace, undefined, recoveredHead)).toBe(recoveredHead);
+    expect((await ownership(workspace.id)).value.baseUpdate).toBeUndefined();
+    runtime = new ForgeRuntime(dependencies());
+    expect((await runtime.recover(workspace.id)).workspace).toEqual(workspace);
+    const latestTarget = await advanceTarget("next-target.txt", "Target advances again\n");
+    const preparedHead = await runtime.updateIssueBranch(workspace, recoveredHead, "main");
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", preparedHead)).toBe(`${preparedHead} ${recoveredHead} ${latestTarget}`);
+    expect(await runtime.publishBranch(workspace, undefined, preparedHead)).toBe(preparedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(preparedHead);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "issue.txt"), "utf8")).toBe("Retained issue edits\n");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "recovery.bin"))).toEqual(bytes);
+  });
+
   it("updates the owned issue from the current target and publishes only the recorded result", async () => {
     const deps = dependencies();
     deps.git = vi.fn(deps.git!);
@@ -1783,6 +1869,93 @@ describe("ForgeRuntime owned branch updates", () => {
     const rebasedHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
     return { workspace, publishedHead, targetHead, rebasedHead };
   }
+
+  it.each(["base update", "no-op update", "rebase", "synchronization", "saved synchronization"])("reclaims retained work after a completed %s and restart", async operation => {
+    let workspace: ForgeWorkspace;
+    let completedHead: string;
+    if (operation === "rebase") {
+      const issue = await rebasedIssue();
+      workspace = issue.workspace;
+      completedHead = await runtime.publishBranch(workspace, undefined, issue.rebasedHead, issue.publishedHead);
+    } else {
+      const issue = await publishedIssue();
+      workspace = issue.workspace;
+      if (operation.includes("synchronization")) {
+        completedHead = await advanceTarget();
+        await git(repositoryPath, "push", "--force", "origin", `${completedHead}:refs/heads/${workspace.branch}`);
+        await runtime.syncPublishedBranch(workspace, issue.publishedHead, completedHead);
+        if (operation === "saved synchronization") {
+          const manifest = await ownership(workspace.id);
+          delete manifest.value.publishedSync.confirmed;
+          await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+        }
+      } else {
+        if (operation === "base update") await advanceTarget();
+        completedHead = await runtime.updateIssueBranch(workspace, issue.publishedHead, "main");
+        await runtime.publishBranch(workspace, undefined, completedHead);
+      }
+    }
+    const retainedPath = path.join(workspace.worktreePath, "retained.txt");
+    await fs.writeFile(retainedPath, "Keep until explicitly reviewed for deletion\n");
+    const retainedWorkspace = await runtime.cleanup({ ...workspace, expectedHeadSha: completedHead });
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: undefined });
+    let saved: ForgeWorker[] = [{
+      id: workspace.id, kind: "issue", number: 152, title: `Completed ${operation}`, repository: expectedRepository,
+      repositoryPath: workspace.repositoryPath, baseBranch: "main", templateId: "worker", status: "completed", headSha: completedHead,
+      retainedWorkspace: retainedWorkspace!, autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }];
+    const service = new ForgeWorkflowService({
+      settings: () => ({ repository: expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker", workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "xhigh", maxRunMinutes: 60 }),
+      refreshPublicationCredentials: async () => {}, runtime,
+      store: { read: async () => structuredClone(saved), write: async workers => { saved = structuredClone(workers); } },
+      reports: new ForgeWorkerReports(path.join(root, "data")), notify: vi.fn(), provider: vi.fn(),
+    });
+    const cleanup = new WorkspaceCleanupService({ dataDir: path.join(root, "data"), pathPolicy: new PathPolicy([root]), forge: service, openDirectories: () => [], withInactiveDirectory: async (_directory, action) => action(), protectedDirectories: [], processDirectories: async () => [], trashDirectory: path.join(root, "trash") });
+    try {
+      const preview = await cleanup.preview();
+      const candidate = preview.candidates.find(item => item.workerId === workspace.id)!;
+      expect(candidate).toMatchObject({ eligible: true, requiresDiscard: true, sourceChanges: ["retained.txt"] });
+      await cleanup.start({ previewId: preview.id, candidateIds: [candidate.id], discardCandidateIds: [candidate.id], emptyTrash: false, confirmation: "Delete permanently" });
+      await cleanup.settled();
+      expect((await cleanup.status())!.results[0]!.status).toBe("deleted");
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(saved[0]).toMatchObject({ status: "completed", headSha: completedHead });
+      expect(saved[0]!.retainedWorkspace).toBeUndefined();
+      const owned = (await ownership(workspace.id)).value;
+      expect(owned.cleaned).toBe(true);
+      expect(owned.baseUpdate).toBeUndefined();
+      expect(owned.issueRebase).toBeUndefined();
+      expect(owned.publishedSync).toBeUndefined();
+      runtime = new ForgeRuntime(dependencies());
+      expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: undefined });
+    } finally { await service.dispose(); }
+  });
+
+  it.each(["base update", "unpublished rebase", "synchronization", "uncertain publication", "Git process"])("preserves a checkout with an unfinished %s during explicit cleanup", async operation => {
+    const { workspace, publishedHead } = await publishedIssue(operation === "unpublished rebase");
+    const targetHead = await advanceTarget(operation === "unpublished rebase" ? "README.md" : "target.txt");
+    if (operation === "unpublished rebase") {
+      await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+      await resolveContentRebase(workspace, targetHead);
+      await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+    } else {
+      const manifest = await ownership(workspace.id);
+      if (operation === "base update") manifest.value.baseUpdate = { expectedHeadSha: publishedHead, baseBranch: "main", targetHeadSha: targetHead };
+      if (operation === "synchronization") manifest.value.publishedSync = { expectedLocalHeadSha: publishedHead, expectedRemoteHeadSha: targetHead };
+      if (operation === "uncertain publication") manifest.value.branchPublication.confirmed = false;
+      if (operation === "Git process") manifest.value.gitPending = true;
+      await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+    }
+    runtime = new ForgeRuntime(dependencies());
+    const before = await fs.readFile((await ownership(workspace.id)).file, "utf8");
+    const remove = vi.fn();
+    await expect(runtime.inspectWorkspaceCleanup(workspace.id)).rejects.toThrow(/unfinished|unresolved/);
+    await expect(runtime.discardWorkspace(workspace.id, remove)).rejects.toThrow(/unfinished|unresolved/);
+    expect(remove).not.toHaveBeenCalled();
+    expect(await fs.readFile((await ownership(workspace.id)).file, "utf8")).toBe(before);
+    expect((await fs.stat(workspace.worktreePath)).isDirectory()).toBe(true);
+  });
 
   it("completes and publishes an exact rebased handoff with intentionally retained files", async () => {
     const { workspace, publishedHead, targetHead, rebasedHead } = await rebasedIssue();
@@ -2321,7 +2494,7 @@ describe("ForgeRuntime owned branch updates", () => {
     const { workspace, publishedHead } = await publishedIssue();
     await fs.writeFile(path.join(workspace.worktreePath, "unpublished.txt"), "Keep this work\n");
     vi.mocked(deps.git).mockClear();
-    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/retained checkout/i);
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/explicit publication handoff/i);
     await fs.rm(path.join(workspace.worktreePath, "unpublished.txt"));
     await fs.writeFile(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"), `${headSha}\n`);
     await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow(/in progress|pending|unfinished/i);
@@ -2755,7 +2928,7 @@ describe.skipIf(process.platform !== "linux")(
       await runtime.cleanup(workspace);
     });
 
-    it("waits for a cancelled update merge to exit before aborting its staged changes", async () => {
+    it("waits for a cancelled update merge to exit and preserves its interrupted Git state", async () => {
       const fixture = await installGitFixture("merge");
       const deps = dependencies();
       delete deps.git;
@@ -2788,14 +2961,14 @@ describe.skipIf(process.platform !== "linux")(
           expect(stat === undefined || stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")).toBe(true);
         }
         expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
-        expect(await git(workspace.worktreePath, "status", "--porcelain")).toBe("");
-        await expect(fs.lstat(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
-        await expect(fs.lstat(path.join(workspace.worktreePath, "target.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await git(workspace.worktreePath, "status", "--porcelain")).toContain("A  target.txt");
+        expect(await fs.readFile(path.join(workspace.worktreePath, ".git", "MERGE_HEAD"), "utf8")).toMatch(/[a-f0-9]{40}/);
+        expect(await fs.readFile(path.join(workspace.worktreePath, "target.txt"), "utf8")).toBe("Target work\n");
         expect(await fs.readFile(path.join(workspace.worktreePath, "issue.txt"), "utf8")).toBe("Published issue work\n");
         expect(await git(origin, "rev-parse", workspace.branch)).toBe(publishedHead);
         const ownership = JSON.parse(await fs.readFile(path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
         expect(ownership).toMatchObject({ gitPending: false });
-        expect(ownership.baseUpdate).toBeUndefined();
+        expect(ownership.baseUpdate).toMatchObject({ expectedHeadSha: publishedHead, baseBranch: "main" });
       } finally {
         controller.abort();
         await pending.catch(() => undefined);
@@ -3834,6 +4007,7 @@ describe("Legacy filesystem ownership reconciliation", () => {
     vi.stubGlobal("document", dom.window.document);
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     const { DirectoryOwnershipRecovery } = await vi.importActual<{ DirectoryOwnershipRecovery: ComponentType<{
+      availability(): Promise<import("@cloudx/shared").DirectoryOwnershipAvailability>;
       preview(): Promise<DirectoryOwnershipPreview>;
       reconcile(input: DirectoryOwnershipReconciliation): Promise<void>;
     }> }>("../../../web/src/ui/DirectoryOwnershipRecovery.js");
@@ -3842,14 +4016,19 @@ describe("Legacy filesystem ownership reconciliation", () => {
     const rendered = createRoot(container);
     const preview = vi.fn(() => runtime.previewOwnership(workspaceId));
     const reconcile = vi.fn((input: DirectoryOwnershipReconciliation) => runtime.reconcileOwnership(workspaceId, input));
-    await act(async () => rendered.render(createElement(DirectoryOwnershipRecovery, { preview, reconcile })));
+    const availability = vi.fn(async (): Promise<import("@cloudx/shared").DirectoryOwnershipAvailability> => (await runtime.previewOwnership(workspaceId)).directories.length ? { status: "available", reason: "Device changed." } : { status: "not_needed" });
+    await act(async () => rendered.render(createElement(DirectoryOwnershipRecovery, { availability, preview, reconcile })));
+    await act(async () => { await availability.mock.results[0]!.value; });
     const click = async (label: string) => {
       await act(async () => {
         const button = Array.from(container.querySelectorAll("button")).find(candidate => candidate.textContent === label)!;
         expect(button.disabled).toBe(false);
         button.click();
         if (label === "Inspect directory ownership") await preview.mock.results.at(-1)!.value;
-        if (label === "Reconcile verified ownership") await reconcile.mock.results.at(-1)!.value.catch(() => undefined);
+        if (label === "Reconcile verified ownership") {
+          await reconcile.mock.results.at(-1)!.value.catch(() => undefined);
+          await availability.mock.results.at(-1)!.value;
+        }
       });
     };
     return {
@@ -3908,7 +4087,6 @@ describe("Legacy filesystem ownership reconciliation", () => {
       failure.mockRestore();
       runtime = new ForgeRuntime(f.deps);
 
-      await ui.click("Cancel ownership recovery");
       await ui.click("Inspect directory ownership");
       await ui.confirmMappings();
       await ui.click("Reconcile verified ownership");
@@ -4095,5 +4273,106 @@ describe("Legacy filesystem ownership reconciliation", () => {
     await expect(runtime.reconcileOwnership(f.workspace.id, confirmations(preview))).rejects.toThrow(/ownership changed|symbolic links/);
     expect(await fs.readFile(f.workspaceFile, "utf8")).toBe(before);
     expect(await fs.readFile(path.join(`${context}-original`, "context.md"), "utf8")).toBe("Worker context");
+  });
+});
+
+
+describe("Forge permanent workspace cleanup", () => {
+  it("deletes explicitly reviewed retained files through the runtime owner and reconciles workflow metadata", async () => {
+    const workspace = await prepare("cleanup-reviewed");
+    await fs.writeFile(path.join(workspace.worktreePath, "retained.txt"), "kept until explicit discard");
+    const retained = await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    const worker: ForgeWorker = {
+      id: workspace.id, kind: "issue", number: 152, title: "Completed cleanup fixture", repository: expectedRepository,
+      repositoryPath: workspace.repositoryPath, baseBranch: "main", templateId: "worker", status: "completed", headSha,
+      retainedWorkspace: retained!, autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+    let saved = [worker];
+    const service = new ForgeWorkflowService({
+      settings: () => ({ repository: expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker", workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "xhigh", maxRunMinutes: 60 }),
+      refreshPublicationCredentials: async () => {},
+      runtime, store: { read: async () => structuredClone(saved), write: async workers => { saved = structuredClone(workers); } },
+      reports: new ForgeWorkerReports(path.join(root, "data")), notify: vi.fn(), provider: vi.fn(),
+    });
+    const cleanup = new WorkspaceCleanupService({ dataDir: path.join(root, "data"), pathPolicy: new PathPolicy([root]), forge: service, openDirectories: () => [], withInactiveDirectory: async (_directory, operation) => operation(), protectedDirectories: [], processDirectories: async () => [], trashDirectory: path.join(root, "trash") });
+    try {
+      const preview = await cleanup.preview();
+      expect(preview.candidates[0]).toMatchObject({ eligible: true, requiresDiscard: true, sourceChanges: ["retained.txt"] });
+      await cleanup.start({ previewId: preview.id, candidateIds: [preview.candidates[0]!.id], discardCandidateIds: [preview.candidates[0]!.id], emptyTrash: false, confirmation: "Delete permanently" });
+      await cleanup.settled();
+      expect((await cleanup.status())!.results[0]!.status).toBe("deleted");
+      expect(saved[0]!.status).toBe("completed");
+      expect(saved[0]!.retainedWorkspace).toBeUndefined();
+      expect((await cleanup.preview()).candidates.some(item => item.workerId === workspace.id)).toBe(false);
+      const owned = JSON.parse(await fs.readFile(path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
+      expect(owned.cleaned).toBe(true); expect(owned.retainedWorkspace).toBeUndefined();
+    } finally { await service.dispose(); }
+  });
+
+  it("protects a dependent worktree when retrying a durable Forge deletion after restart", async () => {
+    const workspace = await prepare("cleanup-dependent-worktree");
+    await fs.writeFile(path.join(workspace.worktreePath, "retained.txt"), "kept until explicit discard");
+    const retained = await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    await expect(runtime.discardWorkspace(workspace.id, async (directory, markDeleting) => {
+      await markDeleting();
+      await fs.unlink(path.join(directory, "README.md"));
+      throw new Error("simulated interruption before deleting .git");
+    })).rejects.toThrow("simulated interruption before deleting .git");
+    const sibling = path.join(root, "active-dependent-worktree");
+    await git(workspace.worktreePath, "worktree", "add", "-b", "new-work", sibling);
+    await fs.writeFile(path.join(sibling, "new-work.txt"), "committed work after cleanup stopped");
+    await git(sibling, "add", "new-work.txt");
+    await git(sibling, "-c", "user.name=Forge Test", "-c", "user.email=forge-test@example.invalid", "commit", "-m", "Preserve dependent work");
+    const siblingHead = await git(sibling, "rev-parse", "HEAD");
+
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: true });
+    let saved: ForgeWorker[] = [{
+      id: workspace.id, kind: "issue", number: 152, title: "Interrupted cleanup fixture", repository: expectedRepository,
+      repositoryPath: workspace.repositoryPath, baseBranch: "main", templateId: "worker", status: "completed", headSha,
+      retainedWorkspace: retained!, autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }];
+    const service = new ForgeWorkflowService({
+      settings: () => ({ repository: expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker", workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "xhigh", maxRunMinutes: 60 }),
+      refreshPublicationCredentials: async () => {},
+      runtime, store: { read: async () => structuredClone(saved), write: async workers => { saved = structuredClone(workers); } },
+      reports: new ForgeWorkerReports(path.join(root, "data")), notify: vi.fn(), provider: vi.fn(),
+    });
+    const cleanup = new WorkspaceCleanupService({ dataDir: path.join(root, "data"), pathPolicy: new PathPolicy([root]), forge: service, openDirectories: () => [sibling], withInactiveDirectory: async (_directory, operation) => operation(), protectedDirectories: [], processDirectories: async () => [sibling], trashDirectory: path.join(root, "trash") });
+    try {
+      const preview = await cleanup.preview();
+      const candidate = preview.candidates.find(item => item.workerId === workspace.id)!;
+      expect(candidate).toMatchObject({ eligible: false, reason: "Other worktrees still depend on this repository." });
+      await expect(cleanup.start({ previewId: preview.id, candidateIds: [candidate.id], discardCandidateIds: [candidate.id], emptyTrash: false, confirmation: "Delete permanently" })).rejects.toThrow("protected or unknown workspace");
+      expect(await git(sibling, "show", `${siblingHead}:new-work.txt`)).toBe("committed work after cleanup stopped");
+      expect(saved[0]!.retainedWorkspace).toEqual(retained);
+      expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: true });
+    } finally { await cleanup.settled(); await service.dispose(); }
+  });
+
+  it("allows a reviewed retry after interruption within .git while preserving replaced roots", async () => {
+    const workspace = await prepare("cleanup-partial-git");
+    await expect(runtime.discardWorkspace(workspace.id, async (directory, markDeleting) => {
+      await markDeleting();
+      await fs.unlink(path.join(directory, ".git", "config"));
+      throw new Error("simulated crash inside .git");
+    })).rejects.toThrow("simulated crash inside .git");
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: true });
+    await runtime.discardWorkspace(workspace.id, async (directory, markDeleting) => { await markDeleting(); await fs.rm(directory, { recursive: true }); });
+    await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reconciles a deletion interrupted after removal without permitting a replacement directory", async () => {
+    const workspace = await prepare("cleanup-interrupted");
+    await expect(runtime.discardWorkspace(workspace.id, async (directory, markDeleting) => {
+      await markDeleting(); await fs.rm(directory, { recursive: true }); throw new Error("simulated interruption");
+    })).rejects.toThrow("simulated interruption");
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: true });
+    const remove = vi.fn(); await runtime.discardWorkspace(workspace.id, remove); expect(remove).not.toHaveBeenCalled();
+    await fs.mkdir(workspace.worktreePath); await fs.writeFile(path.join(workspace.worktreePath, "new-work"), "preserve");
+    await expect(runtime.discardWorkspace(workspace.id, remove)).rejects.toThrow(/ownership changed/);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "new-work"), "utf8")).toBe("preserve");
   });
 });

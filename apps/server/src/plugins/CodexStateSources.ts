@@ -4,8 +4,8 @@ import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation } from "@cloudx/shared";
-import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
+import type { DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation } from "@cloudx/shared";
+import { DirectoryOwnershipReconciler, directoryOwnershipAvailability } from "../directoryOwnershipReconciliation.js";
 import { openOwnedDirectoryNoFollow, stringifyJsonDocument } from "../jsonStateFile.js";
 
 import { assertDirectoryIdentity, readDirectoryIdentity, sameDirectoryIdentity, isDurableDirectoryIdentity, type DurableDirectoryIdentity } from "../directoryIdentity.js";
@@ -237,6 +237,10 @@ export class CodexStateSources {
     signal?: AbortSignal,
   ): Promise<ResolvedCodexStateSource | undefined> {
     return this.work(signal, (check) => this.bindingChecked(tabId, check));
+  }
+
+  ownershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
+    return directoryOwnershipAvailability(() => this.previewOwnership(tabId));
   }
 
   previewOwnership(tabId: string): Promise<DirectoryOwnershipPreview> {

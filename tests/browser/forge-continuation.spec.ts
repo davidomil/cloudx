@@ -48,6 +48,7 @@ async function workers(
     holdFirstContinuation?: boolean;
     historyScreen?: ForgeWorkerHistory["screen"];
     issueWorker?: Partial<ForgeWorker>;
+    secondWorker?: Partial<ForgeWorker>;
   } = {},
 ) {
   const repository = {
@@ -82,6 +83,7 @@ async function workers(
       number: 12,
       title: "Review deployment changes",
       status: "completed",
+      ...options.secondWorker,
     },
   ];
   const continuations: Array<{
@@ -99,6 +101,10 @@ async function workers(
     const hook = new URL(route.request().url()).pathname.split("/").pop();
     const body = route.request().postDataJSON();
     switch (hook) {
+      case "forge.worker.ownershipAvailability":
+        return route.fulfill({
+          json: { availability: { status: "not_needed" } },
+        });
       case "forge.dashboard":
         return route.fulfill({
           json: { configured: true, repository, workers: entries },
@@ -709,6 +715,10 @@ test("omits the displayed uncertain reply before explicitly retrying publication
     const hook = new URL(route.request().url()).pathname.split("/").pop()!;
     const body = route.request().postDataJSON();
     switch (hook) {
+      case "forge.worker.ownershipAvailability":
+        return route.fulfill({
+          json: { availability: { status: "not_needed" } },
+        });
       case "forge.dashboard":
         return route.fulfill({
           json: { configured: true, repository, workers: [worker] },
@@ -819,6 +829,10 @@ test("saves a batch across reload, edits members and associates every issue with
     const hook = new URL(route.request().url()).pathname.split("/").pop();
     const { input } = route.request().postDataJSON();
     switch (hook) {
+      case "forge.worker.ownershipAvailability":
+        return route.fulfill({
+          json: { availability: { status: "not_needed" } },
+        });
       case "forge.dashboard":
         return route.fulfill({
           json: {
@@ -981,6 +995,350 @@ test("saves a batch across reload, edits members and associates every issue with
     ).toBeDisabled();
     await expect(
       page.getByRole("checkbox", { name: `Select issue #${number} for batch` }),
-    ).toBeDisabled();
+    ).toHaveCount(0);
   }
+});
+
+test("groups overlapping persisted batches through start, edit and reconnect with keyboard selection", async ({
+  page,
+}, testInfo) => {
+  const repository = {
+    provider: "github" as const,
+    apiUrl: "https://api.github.com",
+    projectPath: "cloudx/example",
+  };
+  const issues = [7, 9, 11, 13].map((number) => ({
+    number,
+    title: `Repair ${number}: keep retained workspace diagnostics and source changes through recovery`,
+    url: `https://github.com/cloudx/example/issues/${number}`,
+    body: "Reproduction and validation",
+    state: "open" as const,
+    author: "ari",
+    labels: [],
+    updatedAt: "2026-09-28",
+    comments: [],
+  }));
+  const common = {
+    repository,
+    repositoryPath: "/fixture/repository",
+    baseBranch: "main",
+    templateId: "worker-template",
+    autoPost: false,
+    startedAt: "2026-09-28",
+    updatedAt: "2026-09-28",
+    kind: "issue" as const,
+    status: "draft" as const,
+  };
+  let entries: ForgeWorker[] = [
+    {
+      ...common,
+      id: "batch-a",
+      number: 7,
+      title: "Reliable builds with preserved investigation files",
+      batch: { issues: issues.slice(0, 2) },
+    },
+    {
+      ...common,
+      id: "batch-b",
+      number: 11,
+      title: "Workspace cleanup",
+      batch: { issues: issues.slice(1, 3) },
+    },
+  ];
+  entries.push({ ...entries[0], id: "same-members", title: "Same members" });
+  await page.route("**/fixture-hooks/**", async (route) => {
+    const hook = new URL(route.request().url()).pathname.split("/").pop();
+    const { input } = route.request().postDataJSON();
+    if (hook === "forge.dashboard")
+      return route.fulfill({
+        json: { configured: true, repository, workers: entries },
+      });
+    if (hook === "forge.issues.list")
+      return route.fulfill({ json: { items: issues.slice(1) } });
+    if (hook === "forge.issue.get")
+      return route.fulfill({
+        json: { issue: issues.find((issue) => issue.number === input.number) },
+      });
+    throw new Error(`Unexpected hook ${hook}`);
+  });
+  await page.goto(baseUrl);
+  const first = page.getByRole("group", { name: entries[0].title });
+  await expect(first).toContainText("1 of 2 issues shown");
+  await expect(
+    page.getByRole("group", { name: "Workspace cleanup", exact: true }),
+  ).toContainText("2 of 2 issues shown");
+  const duplicate = page.getByRole("group", {
+    name: "Same members",
+    exact: true,
+  });
+  await expect(duplicate).toContainText("1 of 2 issues shown");
+  entries[0].status = "running";
+  await page.getByRole("button", { name: "Refresh Forge" }).click();
+  await expect(first).toContainText(`#9 ${issues[1].title}`);
+  await expect(duplicate).toContainText(`#9 ${issues[1].title}`);
+  await page.reload();
+  await expect(first).toContainText("1 of 2 issues shown");
+  await expect(duplicate).toContainText("1 of 2 issues shown");
+  for (const number of [9, 11])
+    await expect(
+      page.getByRole("checkbox", { name: `Select issue #${number} for batch` }),
+    ).toHaveCount(0);
+  const details = first.getByRole("button");
+  await details.focus();
+  await page.keyboard.press("Enter");
+  await expect(
+    page.getByRole("heading", { name: `#9 ${issues[1].title}`, exact: true }),
+  ).toBeVisible();
+  const selection = page.getByRole("checkbox", {
+    name: "Select issue #13 for batch",
+  });
+  await selection.focus();
+  await page.keyboard.press("Space");
+  await expect(selection).toBeChecked();
+  await expect(
+    page.getByRole("form", { name: "Create issue batch" }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Remove issue #13 from selection" })
+    .click();
+  await page.locator(".forge-list").evaluate((element) => {
+    element.scrollTop = 0;
+  });
+  const screenshot = testInfo.outputPath("grouped-batches.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("grouped-batches", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    ),
+  ).toBe(true);
+  entries = [{ ...entries[1], batch: { issues: [issues[2]] } }];
+  await page.getByRole("button", { name: "Refresh Forge" }).click();
+  await expect(first).toHaveCount(0);
+  await expect(
+    page.getByRole("checkbox", { name: "Select issue #9 for batch" }),
+  ).toBeEnabled();
+});
+
+test("ownership inspection is contextual and disappears after an empty stale preview", async ({
+  page,
+}, testInfo) => {
+  await workers(page);
+  await page.goto(baseUrl);
+  await page.getByRole("button", { name: "Workers (2)", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Inspect directory ownership" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Resume", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Continue with message" }),
+  ).toBeEnabled();
+  let needed = true;
+  await page.route(
+    "**/fixture-hooks/forge.worker.ownershipAvailability",
+    (route) =>
+      route.fulfill({
+        json: {
+          availability: needed
+            ? {
+                status: "available",
+                reason: "A saved directory device changed.",
+              }
+            : { status: "not_needed" },
+        },
+      }),
+  );
+  await page.route(
+    "**/fixture-hooks/forge.worker.previewOwnership",
+    (route) => {
+      needed = false;
+      return route.fulfill({
+        json: { preview: { fingerprint: "a".repeat(64), directories: [] } },
+      });
+    },
+  );
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page
+    .getByRole("button", { name: "Inspect directory ownership" })
+    .click();
+  await expect(
+    page.getByText(
+      "No directory ownership repair is needed. Resume when ready.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Directory ownership recovery" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Resume", exact: true }),
+  ).toBeEnabled();
+  const screenshot = testInfo.outputPath("contextual-ownership.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("contextual-ownership", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+});
+
+test("shows queue order and the active candidate while recovery controls stay usable", async ({
+  page,
+}, testInfo) => {
+  await workers(page, {
+    issueWorker: {
+      status: "awaiting_merge",
+      error: undefined,
+      changeNumber: 42,
+      changeUrl: "https://github.com/cloudx/example/pull/42",
+      mergeQueue: {
+        sequence: 2,
+        enteredAt: "2026-09-28",
+        phase: "queued",
+        active: false,
+        position: 2,
+        activeWorkerId: "review-worker",
+        reason: "Waiting for the current merge turn.",
+      },
+    },
+    secondWorker: {
+      kind: "issue",
+      title: "Prepare deployment dependencies",
+      status: "awaiting_merge",
+      changeNumber: 43,
+      changeUrl: "https://github.com/cloudx/example/pull/43",
+      mergeQueue: {
+        sequence: 1,
+        enteredAt: "2026-09-28",
+        phase: "waiting_ci",
+        active: true,
+        position: 1,
+        activeWorkerId: "review-worker",
+      },
+    },
+  });
+  await page.goto(baseUrl);
+  await page.getByRole("button", { name: "Workers (2)", exact: true }).click();
+  const queue = page.getByRole("region", { name: "Merge queue", exact: true });
+  await expect(queue).toContainText("Queued · Position 2 · main");
+  await expect(queue).toContainText("Active: Prepare deployment dependencies");
+  await expect(
+    page.getByRole("region", { name: "Merge queues", exact: true }),
+  ).toContainText("Waiting for CI");
+  await expect(queue.getByRole("link", { name: "PR #42" })).toHaveAttribute(
+    "href",
+    "https://github.com/cloudx/example/pull/42",
+  );
+  await expect(
+    page.getByRole("button", { name: "Resume", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("button", { name: "Pause", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "Continue with message" }).click();
+  await expect(
+    page.getByRole("textbox", { name: "Message to worker" }),
+  ).toBeEnabled();
+  const screenshot = testInfo.outputPath("merge-queue.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("merge-queue", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+});
+
+test("Codex recovery keeps conversation controls and offers ownership repair only when applicable", async ({
+  page,
+}, testInfo) => {
+  let needed = false;
+  let repairs = 0;
+  const resumes: unknown[] = [];
+  await page.route("**/api/tabs/codex-recovery/ownership", (route) =>
+    route.fulfill({
+      json: needed
+        ? { status: "available", reason: "A saved directory device changed." }
+        : { status: "not_needed" },
+    }),
+  );
+  await page.route("**/api/tabs/codex-recovery/ownership/preview", (route) =>
+    route.fulfill({
+      json: {
+        fingerprint: "a".repeat(64),
+        directories: [
+          {
+            path: "/home/user/.codex",
+            device: "1",
+            currentDevice: "2",
+            filesystemId: "aaaa",
+            filesystemType: "ef53",
+          },
+        ],
+      },
+    }),
+  );
+  await page.route(
+    "**/api/tabs/codex-recovery/ownership/reconcile",
+    (route) => {
+      repairs++;
+      needed = false;
+      return route.fulfill({ json: {} });
+    },
+  );
+  await page.route("**/fixture-recover", (route) => {
+    resumes.push(route.request().postDataJSON());
+    return route.fulfill({ json: {} });
+  });
+  await page.goto(`${baseUrl}?codex-recovery`);
+  await expect(
+    page.getByRole("button", { name: "Inspect directory ownership" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "Resume conversation", exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole("textbox", { name: "Conversation session ID" }),
+  ).toBeEnabled();
+  needed = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page
+    .getByRole("button", { name: "Inspect directory ownership" })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Reconcile verified ownership" }),
+  ).toBeDisabled();
+  await page.getByRole("checkbox").check();
+  await page
+    .getByRole("button", { name: "Reconcile verified ownership" })
+    .click();
+  await expect(
+    page.getByRole("region", { name: "Directory ownership recovery" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByText("Directory ownership reconciled. Resume when ready."),
+  ).toBeVisible();
+  expect(repairs).toBe(1);
+  expect(resumes).toEqual([]);
+  await page
+    .getByRole("textbox", { name: "Conversation session ID" })
+    .fill("selected-conversation");
+  await page
+    .getByRole("button", { name: "Resume selected conversation" })
+    .click();
+  expect(resumes).toEqual([
+    { action: "resume-conversation", sessionId: "selected-conversation" },
+  ]);
+  const screenshot = testInfo.outputPath("codex-recovery.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("codex-recovery", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
 });

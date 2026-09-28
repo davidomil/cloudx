@@ -1,6 +1,7 @@
 import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
 import {
   ForgeProviderError,
+  ForgeMutationUncertainError,
   ForgeProviderUnavailableError,
   forgeRequestFailure,
   forgeRequestTimeoutMs,
@@ -104,7 +105,7 @@ export class ForgeRequestFailures {
     this.report(phase, details);
     const unavailable = new ForgeProviderUnavailableError(details.failure, this.context.operation, details);
     return changesRemoteState
-      ? new ForgeProviderError(`${unavailable.message} Its remote result is unknown. Refresh provider state before submitting again.`, 409)
+      ? new ForgeMutationUncertainError(unavailable)
       : unavailable;
   }
 

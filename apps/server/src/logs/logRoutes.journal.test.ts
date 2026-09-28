@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -57,6 +58,7 @@ async function warmConnection(): Promise<http.Agent> {
 
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-journal-http-"));
+  await fs.symlink(execFileSync("sh", ["-c", "command -v flock"], { encoding: "utf8" }).trim(), path.join(root, "flock"));
   await fs.writeFile(path.join(root, "starts.jsonl"), "");
   await fs.writeFile(path.join(root, "journalctl"), `#!${process.execPath}
 const fs = require("node:fs");

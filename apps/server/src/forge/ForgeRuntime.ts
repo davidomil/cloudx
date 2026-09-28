@@ -82,6 +82,7 @@ export interface ForgeRuntimeDependencies {
 interface OwnedPublishedSync {
   expectedLocalHeadSha: string;
   expectedRemoteHeadSha: string;
+  confirmed?: true;
 }
 interface OwnedBaseUpdate {
   expectedHeadSha: string;
@@ -135,6 +136,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   branchOwned: boolean;
   cleaned: boolean;
   cleanupHeadSha?: string;
+  cleanupDiscardPending?: true;
   baseCommit: string;
   prepared: boolean;
   launchPending: boolean;
@@ -1156,6 +1158,7 @@ export class ForgeRuntime {
       await this.verifyPublicationHead(owned, intendedHeadSha, signal, owned.branchPublication?.headSha !== intendedHeadSha);
       if (owned.branchPublication?.headSha === headSha && await this.publishedBranchHeadOrMissing(owned, access, signal) === headSha) {
         owned.branchPublication.confirmed = true;
+        await this.settleRecoveredBaseUpdate(owned, headSha, signal);
         await this.manifest(owned.id).write(owned);
         return headSha;
       }
@@ -1169,6 +1172,7 @@ export class ForgeRuntime {
       );
       await this.verifyPublicationHead(owned, headSha, signal);
       owned.branchPublication.confirmed = true;
+      await this.settleRecoveredBaseUpdate(owned, headSha, signal);
       await this.manifest(owned.id).write(owned);
       return headSha;
     });
@@ -1211,6 +1215,8 @@ export class ForgeRuntime {
         await this.runOwnedGit(owned, ["reset", "--keep", expectedRemoteHeadSha], signal);
       }
       await this.verifyCleanHead(owned, expectedRemoteHeadSha);
+      await this.requireNoGitOperation(owned);
+      owned.publishedSync!.confirmed = true;
       owned.baseUpdate = undefined;
       owned.issueRebase = undefined;
       await this.manifest(owned.id).write(owned);
@@ -1225,6 +1231,21 @@ export class ForgeRuntime {
       ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], signal)).split("\0").filter(Boolean).map(entry => entry.replace(/\/$/u, ""));
     if (added.some(file => ignored.some(entry => file === entry || file.startsWith(`${entry}/`) || entry.startsWith(`${file}/`))))
       throw new Error("Ignored local files would be overwritten by the published branch. Move them before syncing.");
+  }
+
+  confirmCompletedMerge(id: string, repository: ForgeRepository, headSha: string, branch: string): Promise<void> {
+    return this.serialize(id, "confirmCompletedMerge", undefined, async () => {
+      const owned = await this.readOwned(id);
+      if (!owned || !owned.cleaned || owned.gitPending || owned.launchPending || owned.cleanupHeadSha !== headSha ||
+          owned.branch !== branch || owned.expectedRepository.provider !== repository.provider ||
+          owned.expectedRepository.apiUrl !== repository.apiUrl || owned.expectedRepository.projectPath !== repository.projectPath)
+        throw new Error("The completed merge has missing or conflicting owned workspace evidence.");
+      if (owned.retainedWorkspace) {
+        await this.assertCheckout(owned);
+        await this.verifyHead(owned, headSha);
+      }
+      await this.assertQuiescent(owned);
+    });
   }
 
   updateIssueBranch(
@@ -1256,14 +1277,16 @@ export class ForgeRuntime {
       const previous = owned.baseUpdate;
       const sameUpdate = previous?.expectedHeadSha === expectedHeadSha && previous.baseBranch === baseBranch;
       if (sameUpdate && previous.headSha && previous.headSha !== expectedHeadSha) {
-        await this.verifyCleanHead(owned, previous.headSha, signal);
+        await this.verifyPublicationHead(owned, previous.headSha, signal);
         return previous.headSha;
       }
       if (previous && !previous.headSha && !sameUpdate)
         throw new Error("A previous branch update is unfinished. Inspect it before starting another update.");
       if (previous && !previous.headSha && await this.requireBranchHead(owned, signal) !== expectedHeadSha)
-        throw new Error("The local branch changed before its update result was recorded. Inspect the retained work before resuming.");
-      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+        throw new ForgeHandoffError("The local branch changed before its update result was recorded. Resume a recovery turn to inspect the retained work.");
+      if (await this.requireBranchHead(owned, signal) !== expectedHeadSha)
+        throw new ForgeHandoffError("The local branch contains unpublished work beyond the recorded published commit. A recovery turn must inspect it before updating the target.");
+      await this.verifyPublicationHead(owned, expectedHeadSha, signal);
       const access = await this.access(owned.expectedRepository, "worker", signal);
       if (access.cloneUrl !== owned.origin)
         throw new Error("Repository origin changed while the worker was running.");
@@ -1280,7 +1303,13 @@ export class ForgeRuntime {
       update.targetHeadSha = targetHeadSha;
       await this.manifest(owned.id).write(owned);
       await this.requireNoGitOperation(owned);
-      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      if (await this.isAncestor(owned, targetHeadSha, expectedHeadSha, signal)) {
+        await this.verifyPublicationHead(owned, expectedHeadSha, signal);
+        update.headSha = expectedHeadSha;
+        await this.manifest(owned.id).write(owned);
+        return expectedHeadSha;
+      }
+      await this.verifyBranchUpdateFiles(owned, expectedHeadSha, signal);
       try {
         await this.runGit(owned.worktreePath, ["merge-tree", "--write-tree", expectedHeadSha, targetHeadSha], signal);
       } catch (error) {
@@ -1288,26 +1317,28 @@ export class ForgeRuntime {
         if ((error as { code?: unknown }).code === 1) throw new ForgeBranchConflictError(targetHeadSha);
         throw error;
       }
-      await this.verifyCleanHead(owned, expectedHeadSha, signal);
+      await this.verifyBranchUpdateFiles(owned, expectedHeadSha, signal);
       try {
         await this.runOwnedGit(owned, [
           "merge", "--no-ff", "--no-edit", "--no-stat", "--no-gpg-sign", "--no-autostash", "--no-overwrite-ignore",
           "-m", `FORGE: update from ${baseBranch}`, targetHeadSha,
         ], signal);
       } catch (error) {
-        try {
-          await this.abortBaseUpdate(owned, expectedHeadSha, targetHeadSha);
-          owned.baseUpdate = undefined;
-          await this.manifest(owned.id).write(owned);
-        } catch (abortError) {
-          throw new AggregateError([error, abortError], "Branch update failed and its merge could not be fully aborted. Local work was preserved.");
-        }
         signal?.throwIfAborted();
-        throw new Error("The target branch merge failed. Its changes were aborted and the published issue work was preserved.", { cause: error });
+        throw new ForgeHandoffError("The branch update needs a recovery turn. Its working files and any interrupted Git operation were preserved.", true);
       }
       const headSha = await this.requireBranchHead(owned);
       await this.requireNoGitOperation(owned);
-      await this.verifyCleanHead(owned, headSha);
+      await this.verifyHead(owned, headSha);
+      const handoff = this.publicationHandoff(owned);
+      if (handoff?.headSha === expectedHeadSha) {
+        const files = await this.workingFiles(owned);
+        if (!samePaths(handoff.retainedPaths, files) || handoff.fingerprint !== await this.workingFingerprint(owned, files))
+          throw new ForgeHandoffError("Retained files changed during the branch update. Resume with a message to inspect the preserved work.");
+        handoff.headSha = headSha;
+      } else if ((await this.workingFiles(owned)).length) {
+        throw new ForgeHandoffError("Working files appeared during the branch update. Resume to inspect the preserved work.");
+      }
       if (headSha === expectedHeadSha) {
         await this.runGit(owned.worktreePath, ["merge-base", "--is-ancestor", targetHeadSha, headSha]);
       } else {
@@ -1477,7 +1508,19 @@ export class ForgeRuntime {
       throw new Error("The interrupted publication remains uncertain. Confirm the previous Git process has stopped and inspect the remote branch before resuming; local work was preserved.");
     publication.confirmed = true;
     owned.gitPending = false;
+    await this.settleRecoveredBaseUpdate(owned, publication.headSha, signal);
     await this.manifest(owned.id).write(owned);
+  }
+
+  private async settleRecoveredBaseUpdate(owned: OwnedWorkspace, headSha: string, signal?: AbortSignal): Promise<void> {
+    const update = owned.baseUpdate;
+    if (!update || update.headSha || update.expectedHeadSha === headSha ||
+        this.publicationHandoff(owned)?.headSha !== headSha ||
+        !owned.branchPublication?.confirmed || owned.branchPublication.headSha !== headSha ||
+        owned.issueRebase && !owned.issueRebase.publication?.confirmed)
+      return;
+    if (await this.isAncestor(owned, update.expectedHeadSha, headSha, signal))
+      owned.baseUpdate = undefined;
   }
 
   private async reconcilePendingRebasePush(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
@@ -1531,28 +1574,6 @@ export class ForgeRuntime {
     return expectedHeadSha;
   }
 
-  private async abortBaseUpdate(owned: OwnedWorkspace, expectedHeadSha: string, targetHeadSha: string): Promise<void> {
-    await this.assertCheckout(owned);
-    await this.requireNoGitOperation(owned, { ownedMerge: true });
-    let mergeExists = false;
-    try {
-      const stat = await fs.lstat(path.join(owned.worktreePath, ".git", "MERGE_HEAD"));
-      if (!stat.isFile()) throw new Error("Merge ownership changed. Local work was preserved.");
-      mergeExists = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-    if (mergeExists) {
-      const mergeHead = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "MERGE_HEAD^{commit}"])).trim();
-      const originalHead = (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "ORIG_HEAD^{commit}"])).trim();
-      if (mergeHead !== targetHeadSha || originalHead !== expectedHeadSha || await this.requireBranchHead(owned) !== expectedHeadSha)
-        throw new Error("The pending merge does not match this branch update. Local work was preserved.");
-      await this.runOwnedGit(owned, ["merge", "--abort"]);
-    }
-    await this.requireNoGitOperation(owned);
-    await this.verifyCleanHead(owned, expectedHeadSha);
-  }
-
   private async requireNoGitOperation(owned: OwnedWorkspace, { ownedMerge = false, ownedRebase = false } = {}): Promise<void> {
     const names = ["MERGE_HEAD", "MERGE_AUTOSTASH", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "index.lock", "HEAD.lock"];
     for (const name of names) {
@@ -1564,6 +1585,63 @@ export class ForgeRuntime {
         throw error;
       }
       throw new ForgeHandoffError("A Git operation is already in progress. Inspect the owned checkout before updating its branch.");
+    }
+  }
+
+  inspectWorkspaceCleanup(id: string): Promise<{ path: string; discardPending?: true }> {
+    return this.serialize(id, "inspectWorkspaceCleanup", undefined, async () => {
+      const owned = await this.readOwned(id);
+      await this.assertQuiescent(owned);
+      await this.requireSettledWorkspaceOperations(owned);
+      if (owned.cleanupDiscardPending) {
+        if (await optionalIdentity(owned.worktreePath)) await this.assertIdentity(owned.worktree);
+      } else if (!(owned.cleaned && !owned.retainedWorkspace) || await optionalIdentity(owned.worktreePath)) {
+        await this.assertCheckout(owned);
+        await this.requireNoGitOperation(owned);
+      }
+      return { path: owned.worktreePath, discardPending: owned.cleanupDiscardPending };
+    });
+  }
+
+  discardWorkspace(id: string, remove: (directory: string, markDeleting: () => Promise<void>) => Promise<void>): Promise<void> {
+    return this.serialize(id, "discardWorkspace", undefined, async () => {
+      const owned = await this.readOwned(id);
+      await this.assertQuiescent(owned);
+      await this.requireSettledWorkspaceOperations(owned);
+      if (await optionalIdentity(owned.worktreePath)) {
+        if (owned.cleanupDiscardPending) await this.assertIdentity(owned.worktree);
+        else {
+          await this.assertCheckout(owned);
+          await this.requireNoGitOperation(owned);
+        }
+        await remove(owned.worktreePath, async () => {
+          owned.cleanupDiscardPending = true;
+          owned.baseUpdate = undefined;
+          owned.issueRebase = undefined;
+          owned.publishedSync = undefined;
+          await this.manifest(id).write(owned);
+        });
+      } else if (!owned.cleanupDiscardPending && !(owned.cleaned && !owned.retainedWorkspace)) {
+        throw new Error("The checkout disappeared without a recorded cleanup; ownership was preserved.");
+      }
+      owned.cleaned = true;
+      owned.retainedWorkspace = undefined;
+      owned.cleanupDiscardPending = undefined;
+      await this.manifest(id).write(owned);
+    });
+  }
+
+  private async requireSettledWorkspaceOperations(owned: OwnedWorkspace): Promise<void> {
+    if (owned.launchPending || owned.gitPending ||
+        owned.baseUpdate && !owned.baseUpdate.headSha ||
+        owned.issueRebase && !owned.issueRebase.publication?.confirmed ||
+        owned.branchPublication && !owned.branchPublication.confirmed)
+      throw new Error("An unfinished workspace operation still needs this checkout.");
+    if (owned.publishedSync && !owned.publishedSync.confirmed) {
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      if (await this.requireBranchHead(owned) !== owned.publishedSync.expectedRemoteHeadSha)
+        throw new Error("An unfinished workspace synchronization still needs this checkout.");
     }
   }
 
@@ -1638,9 +1716,16 @@ export class ForgeRuntime {
       if (!(error instanceof ForgeHandoffError)) throw error;
       const recovery = publicationNotStarted
         ? "Use Continue with message to finish implementation or declare the retained paths in a new completion report."
-        : `Preserve new edits elsewhere and restore the recorded retained files in ${owned.worktreePath} before Resume.`;
+        : `Use Resume or Resume with message to inspect the preserved files in ${owned.worktreePath} and prepare a fresh handoff.`;
       throw new ForgeHandoffError(`${error.message} Local files were preserved. ${recovery}`, publicationNotStarted);
     }
+  }
+
+  private async verifyBranchUpdateFiles(owned: OwnedWorkspace, expectedHeadSha: string, signal?: AbortSignal): Promise<void> {
+    await this.verifyPublicationHead(owned, expectedHeadSha, signal);
+    const status = await this.runGit(owned.worktreePath, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], signal);
+    if (status.split("\0").some(entry => entry && !entry.startsWith("?? ")))
+      throw new ForgeHandoffError("Retained tracked edits need a coding recovery turn before updating the branch. All files and the index are preserved.", true);
   }
 
   private async verifyCleanHead(owned: OwnedWorkspace, expectedHeadSha: string, signal?: AbortSignal): Promise<void> {
@@ -1917,6 +2002,7 @@ export class ForgeRuntime {
       typeof value.gitPending !== "boolean" ||
       typeof value.branchOwned !== "boolean" ||
       typeof value.cleaned !== "boolean" ||
+      (value.cleanupDiscardPending !== undefined && value.cleanupDiscardPending !== true) ||
       typeof value.prepared !== "boolean" ||
       typeof value.launchPending !== "boolean" ||
       (value.launchBootId !== undefined && !isUuid(value.launchBootId)) ||
@@ -1939,7 +2025,8 @@ export class ForgeRuntime {
       (value.gitConfigHash !== undefined &&
         !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
       (value.publishedSync !== undefined &&
-        (value.role !== "worker" || !isCommitSha(value.publishedSync.expectedLocalHeadSha) || !isCommitSha(value.publishedSync.expectedRemoteHeadSha))) ||
+        (value.role !== "worker" || !isCommitSha(value.publishedSync.expectedLocalHeadSha) || !isCommitSha(value.publishedSync.expectedRemoteHeadSha) ||
+          value.publishedSync.confirmed !== undefined && value.publishedSync.confirmed !== true)) ||
       (value.issueRebase !== undefined &&
         (value.role !== "worker" || !isOwnedIssueRebase(value.issueRebase))) ||
       (value.baseUpdate !== undefined &&

@@ -1,3 +1,8 @@
+export type DirectoryOwnershipAvailability =
+  | { status: "available"; reason: string }
+  | { status: "not_needed" }
+  | { status: "unavailable"; reason: string };
+
 export interface DirectoryOwnershipAttestation {
   device: string;
   filesystemId: string;

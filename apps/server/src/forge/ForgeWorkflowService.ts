@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_BATCH_ISSUES, forgeWorkerIssueNumbers } from "@cloudx/shared";
 import type {
   CodexReasoningEffort,
+  DirectoryOwnershipAvailability,
   DirectoryOwnershipPreview,
   DirectoryOwnershipReconciliation,
   ForgeChangeRequest,
@@ -25,9 +26,11 @@ import type {
   ForgeWorker,
   ForgeWorkerHistory,
 } from "@cloudx/shared";
-import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { MAX_FORGE_WORKFLOW_TEXT_LENGTH, parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
+import { directoryOwnershipAvailability } from "../directoryOwnershipReconciliation.js";
+import { ForgeMergeQueue } from "./ForgeMergeQueue.js";
 import { reviewScopeInstructions } from "./ForgeReviewScope.js";
 import { rejectQuickActions, validateRequestText, validateReview } from "./providers/reviewValidation.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
@@ -44,6 +47,9 @@ export interface ForgeSettings {
   maxRunMinutes: number;
 }
 interface Runtime {
+  confirmCompletedMerge(id: string, repository: ForgeRepository, headSha: string, branch: string): Promise<void>;
+  inspectWorkspaceCleanup?(id: string): Promise<{ path: string; discardPending?: true }>;
+  discardWorkspace?(id: string, remove: (directory: string, markDeleting: () => Promise<void>) => Promise<void>): Promise<void>;
   previewOwnership(id: string): Promise<DirectoryOwnershipPreview>;
   reconcileOwnership(id: string, input: DirectoryOwnershipReconciliation): Promise<void>;
   isActive(tabId: string): boolean;
@@ -174,6 +180,8 @@ export interface ForgeWorkflowDependencies {
   ): ForgeProvider;
   runtime: Runtime;
   store: {
+    claimWriter?(): Promise<void>;
+    releaseWriter?(): Promise<void>;
     read(): Promise<ForgeWorker[]>;
     write(workers: ForgeWorker[]): Promise<void>;
   };
@@ -224,11 +232,13 @@ interface WorkerContext {
 
 export class ForgeWorkflowService {
   private workers: ForgeWorker[] = [];
+  private readonly mergeQueue = new ForgeMergeQueue(() => this.workers);
   private readonly loggedWorkerStates = new Map<string, string>();
   private loaded = false;
   private queue: Promise<unknown> = Promise.resolve();
   private timer?: ReturnType<typeof setTimeout>;
   private disposed = false;
+  private disposal?: Promise<void>;
   private nextCompletionCheckAt = 0;
   private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
@@ -257,7 +267,10 @@ export class ForgeWorkflowService {
     this.timer.unref();
     forgeLog(this.deps.logger, "info", "polling_started", { intervalMs: 2000 });
   }
-  async dispose(): Promise<void> {
+  dispose(): Promise<void> {
+    return this.disposal ??= this.disposeOwned();
+  }
+  private async disposeOwned(): Promise<void> {
     forgeLog(this.deps.logger, "info", "shutdown_started", { workerCount: this.workers.length });
     this.disposed = true;
     clearTimeout(this.timer);
@@ -269,13 +282,16 @@ export class ForgeWorkflowService {
         (w) => w.status === "running" || w.status === "starting" ||
           w.autoReview?.enabled && ["awaiting_review", "awaiting_merge"].includes(w.status),
       )) {
+        const queueWait = ["awaiting_review", "awaiting_merge"].includes(worker.status) &&
+          worker.mergeQueue && worker.mergeQueue.phase !== "blocked" && !this.providerRecoveries.has(worker.id);
         await this.quiesce(worker, { retainReport: true });
         this.cancelProviderRecovery(worker);
-        worker.status = "paused";
+        if (!queueWait) worker.status = "paused";
       }
       await this.persist();
       this.providerRecoveries.clear();
     });
+    await this.deps.store.releaseWriter?.();
     forgeLog(this.deps.logger, "info", "shutdown_completed", { workerCount: this.workers.length });
   }
   dashboard(): Promise<ForgeDashboard> {
@@ -296,6 +312,39 @@ export class ForgeWorkflowService {
     };
     return this.loaded ? snapshot() : this.exclusive(snapshot);
   }
+  async inspectWorkspaceCleanup(id: string): Promise<{ path: string; discardPending?: true }> {
+    await this.dashboard();
+    this.requireCompletedCleanupWorker(id);
+    if (!this.deps.runtime.inspectWorkspaceCleanup) throw new Error("Workspace cleanup is unavailable.");
+    return this.deps.runtime.inspectWorkspaceCleanup(id);
+  }
+
+  async discardCompletedWorkspace(id: string, remove: (directory: string, markDeleting: () => Promise<void>) => Promise<void>): Promise<void> {
+    await this.dashboard();
+    this.requireCompletedCleanupWorker(id);
+    if (!this.deps.runtime.discardWorkspace) throw new Error("Workspace cleanup is unavailable.");
+    await this.deps.runtime.discardWorkspace(id, async (directory, markDeleting) => {
+      this.requireCompletedCleanupWorker(id);
+      await remove(directory, markDeleting);
+    });
+    await this.exclusive(async () => {
+      const worker = this.requireCompletedCleanupWorker(id);
+      worker.retainedWorkspace = undefined;
+      worker.worktreePath = undefined;
+      worker.repositoryPath = undefined;
+      worker.branch = undefined;
+      await this.persist();
+    });
+  }
+
+  private requireCompletedCleanupWorker(id: string): ForgeWorker {
+    const worker = this.requireWorker(id);
+    if (worker.status !== "completed" || worker.pendingPublication || worker.mergeAttempted ||
+        this.controlGroup(id).some(member => member.status !== "completed" || member.tabId && this.deps.runtime.isActive(member.tabId)))
+      throw new Error("An unfinished worker or reviewer still needs this checkout.");
+    return worker;
+  }
+
   workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
     const read = async () => {
       this.requireWorker(id);
@@ -678,21 +727,36 @@ export class ForgeWorkflowService {
       return structuredClone(requested);
     });
   }
+  reconcileCompletedMerges(): Promise<void> {
+    return this.exclusive(async () => {
+      for (const worker of [...this.workers])
+        if (worker.kind === "issue" && worker.status === "completed" && worker.mergeAttempted)
+          await this.reconcileMergedChange(worker);
+    });
+  }
   resume(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {
       const worker = this.requireWorker(id);
       const parent = this.autoReviewParent(worker);
       const issue = parent ?? worker;
+      if (await this.reconcileContinuationDelivery(issue)) await this.persist();
+      issue.placement = placement;
       this.cancelProviderRecovery(issue);
       if (issue.mergeAttempted) {
         if (await this.reconcileMergedChange(issue, { retryCleanupId: issue.id })) return structuredClone(issue);
-        throw new Error("The previous merge must be reconciled with the provider before continuing. Forge will not repeat it.");
+        if (!await this.reconcileRejectedMerge(issue))
+          throw new Error("The previous merge outcome is still uncertain. Resume will check it again without repeating the merge; any recovery message is retained.");
       }
+      if (issue.mergeQueue?.phase === "blocked" && issue.mergeQueue.outcome !== "merged") issue.mergeQueue = undefined;
+      if (issue.pendingContinuation) return this.continueWorkerTurn(issue, issue.pendingContinuation.message, placement);
       if (issue.autoReview) issue.autoReview.placement = placement;
       if (issue.autoReview?.enabled && issue.autoReview.phase !== "implementing" && !issue.pendingPublication)
         return this.resumeAutoReview(issue, placement);
       return this.resumeWorker(issue.id, placement, { refreshPublicationCredentials: true });
     });
+  }
+  ownershipAvailability(id: string): Promise<DirectoryOwnershipAvailability> {
+    return directoryOwnershipAvailability(() => this.previewOwnership(id));
   }
   previewOwnership(id: string): Promise<DirectoryOwnershipPreview> {
     return this.exclusive(async () => {
@@ -717,102 +781,136 @@ export class ForgeWorkflowService {
     return worker;
   }
   continueWorker(id: string, input: string, placement: ForgePlacement): Promise<ForgeWorker> {
-    return this.exclusive(async () => {
-      if (this.disposed) throw new Error("Forge Workers is shutting down.");
-      if (typeof input !== "string" || !input.trim() || input.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH)
-        throw new Error(`A continuation message must contain 1 to ${MAX_FORGE_CONTINUATION_MESSAGE_LENGTH} characters.`);
-      const worker = this.requireWorker(id);
-      const blocker = forgeWorkerContinuationBlocker(worker, this.workers);
-      if (blocker) throw new Error(blocker);
-      if (!sameRepository(worker.repository, this.deps.settings().repository))
-        throw new Error("The configured repository changed. Restore it before continuing this worker.");
-      const parent = worker.issueWorkerId ? this.requireWorker(worker.issueWorkerId) : undefined;
-      const members = parent ? [parent, worker] : [worker];
-      const controller = new AbortController();
-      for (const member of members) this.operations.set(member.id, controller);
-      try {
-        for (const member of members) {
-          if (!member.attemptId || member.completion?.reportError || member.completion?.continuationRequired) continue;
-          const report = await this.deps.reports.read(member.attemptId);
-          controller.signal.throwIfAborted();
-          if (report !== undefined && (!member.completion || member.completion.turn?.status === "completed" &&
-            (member.completion.readyAt || Date.now() < Date.parse(member.completion.deadlineAt))))
-            throw new Error("A retained completion report must be reconciled with Resume before continuing with a message.");
-        }
-        if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
-      } catch (error) {
-        for (const member of members) this.operations.delete(member.id);
-        throw error;
-      }
-      const manualContinuation: ManualContinuation = { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
-      for (const member of members) this.cancelProviderRecovery(member);
-      try {
-        const provider = this.providerFor(worker);
-        const item = worker.kind === "issue" ? await provider.getIssue(worker.number) : await provider.getChangeRequest(worker.number);
-        if (item.number !== worker.number || item.state !== "open" || "merged" in item && item.merged)
-          throw new Error("Continuation requires the original issue or change request to remain open.");
-        const change = worker.kind === "review" ? item as ForgeChangeRequest : worker.changeNumber ? await provider.getChangeRequest(worker.changeNumber) : undefined;
-        const publishedIssue = parent ?? (worker.kind === "issue" ? worker : undefined);
-        if (change && publishedIssue) {
-          requirePublicationRequest(publishedIssue, change);
-          if (change.merged || change.headSha !== publishedIssue.headSha)
-            throw new Error("The published change request moved or merged. Inspect and reconcile it before continuing this worker.");
-        }
-        if (parent && !change?.reviewReady)
-          throw new Error("The published commit is still processing. Wait until it is ready before continuing this review.");
-        const issue = parent ? await this.providerFor(parent).getIssue(parent.number) : undefined;
-        if (issue && (issue.number !== parent!.number || issue.state !== "open"))
-          throw new Error("Continuation requires the original issue to remain open.");
-        controller.signal.throwIfAborted();
-        for (const member of members) {
-          await this.recoverResources(member);
-          await this.quiesce(member, { retainReport: Boolean(member.completion && !member.completion.readyAt) });
-          member.attemptId = undefined;
-        }
-        if (!worker.worktreePath) {
-          if (worker.kind === "review" && change) {
-            worker.headSha = change.headSha;
-            worker.baseBranch = change.baseBranch;
-          }
-          Object.assign(worker, await this.deps.runtime.prepareWorkspace({
-            id: worker.id,
-            baseBranch: worker.baseBranch,
-            headSha: worker.headSha,
-            ...(worker.kind === "review" ? { baseSha: change!.baseSha } : {}),
-            review: worker.kind === "review",
-            expectedRepository: worker.repository,
-          }, controller.signal));
-        } else if (worker.kind === "review" && change) {
-          await this.refreshReview(worker, change, controller.signal);
-        }
-        if (worker.draft) {
-          (worker.reviewHistory ??= []).push(worker.draft);
-          worker.draft = undefined;
-        }
-        worker.startedAt = new Date().toISOString();
-        worker.status = "starting";
-        if (worker.autoReview) {
-          worker.autoReview.phase = "implementing";
-          worker.autoReview.placement = placement;
-          worker.autoReview.waitingSince = undefined;
-        }
-        if (parent?.autoReview) {
-          parent.autoReview.phase = "reviewing";
-          parent.autoReview.placement = placement;
-          parent.autoReview.waitingSince = undefined;
-          parent.status = "awaiting_review";
-          parent.error = undefined;
-        }
+    return this.exclusive(() => this.continueWorkerTurn(this.requireWorker(id), input, placement));
+  }
+  private async continueWorkerTurn(worker: ForgeWorker, input: string, placement: ForgePlacement): Promise<ForgeWorker> {
+    if (this.disposed) throw new Error("Forge Workers is shutting down.");
+    if (typeof input !== "string" || !input.trim() || input.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH)
+      throw new Error(`A continuation message must contain 1 to ${MAX_FORGE_CONTINUATION_MESSAGE_LENGTH} characters.`);
+    const blocker = forgeWorkerContinuationBlocker(worker, this.workers);
+    if (blocker) throw new Error(blocker);
+    if (!sameRepository(worker.repository, this.deps.settings().repository))
+      throw new Error("The configured repository changed. Restore it before continuing this worker.");
+    const savedMessage = worker.pendingContinuation?.message;
+    if (await this.reconcileContinuationDelivery(worker)) {
+      await this.persist();
+      if (savedMessage === input.trim()) return structuredClone(worker);
+    }
+    if (worker.pendingContinuation && worker.pendingContinuation.message !== input.trim())
+      throw new Error("A recovery message is already saved for the next worker turn. Resume to deliver that message before sending a different one.");
+    if (worker.mergeAttempted || worker.pendingPublication || ["creating", "uncertain"].includes(worker.publicationState ?? "")) {
+      worker.pendingContinuation ??= { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
+      await this.persist();
+    }
+    if (worker.mergeAttempted) {
+      if (await this.reconcileMergedChange(worker)) return structuredClone(worker);
+      if (!await this.reconcileRejectedMerge(worker)) return structuredClone(worker);
+    }
+    if (!worker.changeNumber && ["creating", "uncertain"].includes(worker.publicationState ?? ""))
+      await this.reconcilePublication(worker, this.providerFor(worker));
+    if (worker.pendingPublication) {
+      const publication = worker.pendingPublication;
+      if (publication.baseUpdate && !publication.headSha) {
+        const change = await this.providerFor(worker).getChangeRequest(worker.changeNumber!);
+        requirePublicationRequest(worker, change);
+        if (change.headSha !== publication.baseUpdate.expectedHeadSha)
+          throw new Error("The remote head changed. The recovery message and checkout are preserved until the publication is reconciled.");
+        worker.recoveryContext = { operation: "branch_update", reason: worker.error ?? "The pending local branch update needs attention.", baseUpdate: publication.baseUpdate };
+        worker.pendingPublication = undefined;
         await this.persist();
-        if (worker.kind === "issue" && (worker.rebaseRecovery?.phase === "resolving" || change?.hasConflicts))
-          await this.startRebaseRecovery(worker, placement, false, manualContinuation);
-        else await this.launch(worker, placement, { item, change, issue, manualContinuation });
-        return structuredClone(worker);
-      } catch (error) {
-        await this.fail(worker, error, { retryProvider: false });
-        throw error;
+      } else {
+        await this.resumeWorker(worker.id, placement, { refreshPublicationCredentials: true });
+        if (worker.pendingPublication || worker.mergeAttempted || worker.status === "completed") return structuredClone(worker);
+        if (["starting", "running"].includes(worker.status)) return structuredClone(worker);
       }
-    });
+    }
+    const parent = worker.issueWorkerId ? this.requireWorker(worker.issueWorkerId) : undefined;
+    const members = parent ? [parent, worker] : [worker];
+    const controller = new AbortController();
+    for (const member of members) this.operations.set(member.id, controller);
+    try {
+      for (const member of members) {
+        if (!member.attemptId || member.completion?.reportError || member.completion?.continuationRequired) continue;
+        const report = await this.deps.reports.read(member.attemptId);
+        controller.signal.throwIfAborted();
+        if (report !== undefined && (!member.completion || member.completion.turn?.status === "completed" &&
+          (member.completion.readyAt || Date.now() < Date.parse(member.completion.deadlineAt))))
+          throw new Error("A retained completion report must be reconciled with Resume before continuing with a message.");
+      }
+      if (worker.kind === "review") this.requireConfirmedPublication(worker.repository, worker.number);
+    } catch (error) {
+      for (const member of members) this.operations.delete(member.id);
+      throw error;
+    }
+    worker.pendingContinuation ??= { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
+    for (const member of members) this.cancelProviderRecovery(member);
+    try {
+      const provider = this.providerFor(worker);
+      const item = worker.kind === "issue" ? await provider.getIssue(worker.number) : await provider.getChangeRequest(worker.number);
+      if (item.number !== worker.number || item.state !== "open" || "merged" in item && item.merged)
+        throw new Error("Continuation requires the original issue or change request to remain open.");
+      const change = worker.kind === "review" ? item as ForgeChangeRequest : worker.changeNumber ? await provider.getChangeRequest(worker.changeNumber) : undefined;
+      const publishedIssue = parent ?? (worker.kind === "issue" ? worker : undefined);
+      if (change && publishedIssue) {
+        requirePublicationRequest(publishedIssue, change);
+        if (change.merged || change.headSha !== publishedIssue.headSha)
+          throw new Error("The published change request moved or merged. Inspect and reconcile it before continuing this worker.");
+      }
+      if (parent && !change?.reviewReady)
+        throw new Error("The published commit is still processing. Wait until it is ready before continuing this review.");
+      const issue = parent ? await this.providerFor(parent).getIssue(parent.number) : undefined;
+      if (issue && (issue.number !== parent!.number || issue.state !== "open"))
+        throw new Error("Continuation requires the original issue to remain open.");
+      controller.signal.throwIfAborted();
+      for (const member of members) {
+        await this.recoverResources(member);
+        await this.quiesce(member, { retainReport: Boolean(member.completion && !member.completion.readyAt) });
+        member.attemptId = undefined;
+      }
+      if (!worker.worktreePath) {
+        if (worker.kind === "review" && change) {
+          worker.headSha = change.headSha;
+          worker.baseBranch = change.baseBranch;
+        }
+        Object.assign(worker, await this.deps.runtime.prepareWorkspace({
+          id: worker.id,
+          baseBranch: worker.baseBranch,
+          headSha: worker.headSha,
+          ...(worker.kind === "review" ? { baseSha: change!.baseSha } : {}),
+          review: worker.kind === "review",
+          expectedRepository: worker.repository,
+        }, controller.signal));
+      } else if (worker.kind === "review" && change) {
+        await this.refreshReview(worker, change, controller.signal);
+      }
+      if (worker.draft) {
+        (worker.reviewHistory ??= []).push(worker.draft);
+        worker.draft = undefined;
+      }
+      worker.startedAt = new Date().toISOString();
+      worker.status = "starting";
+      if (worker.autoReview) {
+        worker.autoReview.phase = "implementing";
+        worker.autoReview.placement = placement;
+        worker.autoReview.waitingSince = undefined;
+      }
+      if (parent?.autoReview) {
+        parent.autoReview.phase = "reviewing";
+        parent.autoReview.placement = placement;
+        parent.autoReview.waitingSince = undefined;
+        parent.status = "awaiting_review";
+        parent.error = undefined;
+      }
+      await this.persist();
+      if (worker.kind === "issue" && (worker.rebaseRecovery?.phase === "resolving" || change?.hasConflicts))
+        await this.startRebaseRecovery(worker, placement);
+      else await this.launch(worker, placement, { item, change, issue });
+      return structuredClone(worker);
+    } catch (error) {
+      await this.fail(worker, error, { retryProvider: false });
+      throw error;
+    }
+
   }
   syncAndReview(id: string, placement: ForgePlacement): Promise<ForgeWorker> {
     return this.exclusive(async () => {
@@ -893,7 +991,8 @@ export class ForgeWorkflowService {
   }
   private async resumeWorker(id: string, placement: ForgePlacement, { refreshPublicationCredentials = false } = {}): Promise<ForgeWorker> {
     const worker = this.requireWorker(id);
-    if (worker.completion?.continuationRequired) throw new Error(worker.completion.continuationRequired);
+    if (worker.completion?.continuationRequired)
+      return this.continueWorkerTurn(worker, worker.pendingContinuation?.message ?? "Resume the retained implementation and produce a complete validated handoff.", placement);
     if (
       ![
         "paused",
@@ -1110,6 +1209,7 @@ export class ForgeWorkflowService {
     });
   }
   poll(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
     return this.exclusive(async () => {
       if (this.disposed) return;
       await this.resumeScheduledWorkers();
@@ -1137,7 +1237,34 @@ export class ForgeWorkflowService {
         }
       }
       await this.advanceAutoReviews();
+      for (const worker of this.workers.filter(worker => worker.mergeQueue && !worker.autoReview?.enabled && worker.status === "awaiting_review" &&
+        (worker.pendingPublication || worker.mergeQueue.phase === "queued" && worker.rebaseRecovery))) {
+        try {
+          if (worker.mergeAttempted) {
+            if (await this.reconcileRejectedMerge(worker) && this.workers.includes(worker) && worker.mergeConflict) {
+              worker.pendingPublication = undefined;
+              if (!worker.placement) throw new Error("Resume this worker to select its conflict recovery placement.");
+              await this.startRebaseRecovery(worker, worker.placement);
+            }
+          } else if (worker.pendingPublication) await this.issueReady(worker);
+          else {
+            if (!worker.placement) throw new Error("Resume this worker to select its conflict recovery placement.");
+            await this.startRebaseRecovery(worker, worker.placement);
+          }
+        } catch (error) { await this.fail(worker, error); }
+      }
     });
+  }
+  private async reconcileContinuationDelivery(worker: ForgeWorker): Promise<boolean> {
+    const attemptId = worker.pendingContinuation?.deliveryAttemptId;
+    if (!attemptId || worker.attemptId !== attemptId || worker.completion?.attemptId !== attemptId) return false;
+    const turn = await this.deps.runtime.readTurnCompletion(worker.id, attemptId);
+    const previous = worker.completion.turn;
+    if (!isForgeTurnCompletion(turn) || turn.workerId !== worker.id || turn.attemptId !== attemptId ||
+        previous && (previous.threadId !== turn.threadId || previous.turnId !== turn.turnId)) return false;
+    worker.completion.turn ??= turn;
+    worker.pendingContinuation = undefined;
+    return true;
   }
   private async observeCompletion(worker: ForgeWorker): Promise<void> {
     const completion = worker.completion;
@@ -1145,9 +1272,9 @@ export class ForgeWorkflowService {
       throw new Error("The worker has no matching native turn completion checkpoint. Its work and report were preserved.");
     const observed = await this.deps.runtime.readTurnCompletion(worker.id, completion.attemptId);
     if (isForgeTurnCompletion(observed) && observed.workerId === worker.id && observed.attemptId === completion.attemptId &&
-      (!completion.turn || completion.turn.threadId === observed.threadId && completion.turn.turnId === observed.turnId) &&
-      (!completion.turn || completion.turn.status === "running")) {
-      completion.turn = observed;
+      (!completion.turn || completion.turn.threadId === observed.threadId && completion.turn.turnId === observed.turnId)) {
+      if (!completion.turn || completion.turn.status === "running") completion.turn = observed;
+      if (worker.pendingContinuation?.deliveryAttemptId === completion.attemptId) worker.pendingContinuation = undefined;
       await this.persist();
     }
     if (!completion.report && !completion.reportError) {
@@ -1379,6 +1506,7 @@ export class ForgeWorkflowService {
     if (signal?.aborted && (error === signal.reason || unavailable instanceof ForgeProviderUnavailableError)) return true;
     if (!(unavailable instanceof ForgeProviderUnavailableError)) return false;
     this.log(worker, "warn", "provider_interrupted", forgeErrorFields(unavailable));
+    this.mergeQueue.block(worker, unavailable.message);
     if (await this.scheduleProviderReset(worker, error)) return true;
     if (worker.mergeAttempted || worker.pendingPublication ||
       !["awaiting_review", "awaiting_merge", "paused", "stopped", "failed"].includes(worker.status)) return false;
@@ -1523,6 +1651,7 @@ export class ForgeWorkflowService {
   }
   private async startAutoReview(worker: ForgeWorker): Promise<void> {
     const loop = worker.autoReview!;
+    this.mergeQueue.phase(worker, "reviewing");
     loop.phase = "reviewing";
     loop.waitingSince = undefined;
     worker.status = "awaiting_review";
@@ -1539,8 +1668,15 @@ export class ForgeWorkflowService {
   private async advanceAutoReview(worker: ForgeWorker): Promise<void> {
     const loop = worker.autoReview!;
     const review = this.autoReviewer(worker);
-    if (worker.mergeAttempted)
-      throw new Error("The previous merge must be reconciled with the provider. Forge will not repeat it.");
+    if (worker.mergeAttempted && !await this.reconcileRejectedMerge(worker)) {
+      await this.waitForMergeRequirements(worker, await this.providerFor(worker).getChangeRequest(worker.changeNumber!));
+      return;
+    }
+    if (!this.workers.includes(worker) || worker.status === "completed") return;
+    if (worker.rebaseRecovery?.phase === "resolving") {
+      await this.startRebaseRecovery(worker, loop.placement);
+      return;
+    }
     let context = await this.autoReviewContext(worker);
     if (!context) return;
     const recovery = this.providerRecoveries.get(worker.id);
@@ -1552,6 +1688,7 @@ export class ForgeWorkflowService {
     if (review && review.status !== "completed")
       throw new Error(`The review worker needs attention. ${review.error ?? "Inspect and resume the issue loop explicitly."}`);
     if (context.change.hasConflicts) {
+      if (!await this.reserveMergeTurn(worker, context.change)) return;
       await this.startRebaseRecovery(worker, loop.placement);
       return;
     }
@@ -1581,6 +1718,7 @@ export class ForgeWorkflowService {
       context = await this.autoReviewContext(worker);
       if (!context) return;
       if (context.change.hasConflicts) {
+        if (!await this.reserveMergeTurn(worker, context.change)) return;
         await this.startRebaseRecovery(worker, loop.placement);
         return;
       }
@@ -1615,6 +1753,11 @@ export class ForgeWorkflowService {
       await this.pauseAutoReview(worker, "The review approved, but review discussions remain unresolved. Inspect the feedback before continuing.");
       return;
     }
+    if (!await this.reserveMergeTurn(worker, context.change)) return;
+    if (worker.mergeQueue?.candidate) {
+      worker.mergeQueue.candidate.reviewId = draft.id;
+      worker.mergeQueue.candidate.checksUrl = context.change.checks?.url;
+    }
     loop.phase = "merging";
     worker.status = "awaiting_merge";
     await this.persist();
@@ -1622,9 +1765,10 @@ export class ForgeWorkflowService {
       await this.waitForMergeRequirements(worker, context.change);
       return;
     }
-    if (context.change.requiresBaseUpdate || context.change.checks?.state === "failed") {
+    if (context.change.requiresBaseUpdate || context.change.checks?.state === "failed" || !worker.mergeQueue?.candidate?.prepared) {
+      const head = worker.headSha;
       await this.updateBranchForMerge(worker);
-      return;
+      if (worker.headSha !== head || worker.pendingPublication || worker.status !== "awaiting_merge") return;
     }
     if (!context.change.mergeable || context.change.checks?.state === "pending") {
       await this.waitForMergeRequirements(worker, context.change);
@@ -1639,7 +1783,7 @@ export class ForgeWorkflowService {
       await this.startRebaseRecovery(worker, loop.placement);
       return;
     }
-    if (latest.change.requiresBaseUpdate || latest.change.baseSha !== context.change.baseSha) {
+    if (latest.change.requiresBaseUpdate || latest.change.baseSha !== context.change.baseSha || latest.change.targetHeadSha !== context.change.targetHeadSha) {
       await this.updateBranchForMerge(worker);
       return;
     }
@@ -1662,12 +1806,22 @@ export class ForgeWorkflowService {
           await this.startRebaseRecovery(worker, loop.placement);
           return;
         }
-        if (change.headSha === worker.headSha && change.requiresBaseUpdate) {
+        if (change.headSha === worker.headSha && (change.requiresBaseUpdate ||
+            worker.mergeQueue?.candidate && change.targetHeadSha !== worker.mergeQueue.candidate.targetHeadSha)) {
+          if (worker.mergeQueue?.candidate) {
+            worker.mergeQueue.candidate.targetHeadSha = change.targetHeadSha;
+            worker.mergeQueue.candidate.prepared = undefined;
+          }
           await this.updateBranchForMerge(worker);
           return;
         }
         if (change.headSha === worker.headSha &&
           (!change.reviewReady || !change.approved || !change.mergeable || change.draft || change.unresolvedDiscussions)) return;
+      }
+      if (worker.mergeAttempted && worker.mergeRejectionPending) {
+        worker.error = `The merge response needs reconciliation: ${message(error)}. Forge is checking the original request and will not repeat an uncertain merge.`;
+        await this.persist();
+        return;
       }
       throw error;
     }
@@ -1675,12 +1829,26 @@ export class ForgeWorkflowService {
       await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
     this.deps.notify("Issue merged", `${worker.title} has merged. Local workers are cleaned up once linked issues are closed.`);
   }
+  private async reserveMergeTurn(worker: ForgeWorker, change: ForgeChangeRequest): Promise<boolean> {
+    const active = this.mergeQueue.reserve(worker, change);
+    if (!active || ["paused", "stopped", "failed", "cleanup_failed"].includes(worker.status)) {
+      worker.status = worker.autoReview?.enabled && worker.autoReview.phase === "merging" ? "awaiting_merge" : "awaiting_review";
+      worker.error = undefined;
+    }
+    await this.persist();
+    return active;
+  }
   private async waitForMergeRequirements(worker: ForgeWorker, change: ForgeChangeRequest): Promise<void> {
+    this.mergeQueue.phase(worker, worker.mergeAttempted ? "merging" : "waiting_ci");
     worker.error = change.draft ? "The request is a draft. Mark it ready for review in the provider." :
       !change.approved ? "Waiting for approval of the published commit." :
       change.checks?.state === "pending" ? `Waiting for CI checks to finish. ${change.checks.url}` :
       change.checks?.state === "failed" ? `CI checks failed. Inspect ${change.checks.url}, resolve the failure, then Resume the issue loop.` :
       `Waiting for the provider's merge requirements. Inspect ${worker.changeUrl ?? change.url}.`;
+    if (change.checks?.state === "failed") {
+      worker.status = "paused";
+      this.mergeQueue.block(worker, worker.error);
+    }
     await this.persist();
   }
   private async pauseForSupersededMergeIdentity(worker: ForgeWorker, change: ForgeChangeRequest): Promise<void> {
@@ -1693,6 +1861,8 @@ export class ForgeWorkflowService {
       throw new Error("Merging requires a published issue request and commit.");
     const signal = this.operations.get(worker.id)?.signal;
     signal?.throwIfAborted();
+    this.mergeQueue.phase(worker, "merging");
+    if (worker.mergeQueue) worker.mergeQueue.outcome = "uncertain";
     worker.mergeAttempted = true;
     try {
       await this.persist();
@@ -1702,16 +1872,62 @@ export class ForgeWorkflowService {
     }
     try {
       if (signal?.aborted) throw new ForgeMergeNotStartedError(signal.reason);
-      await provider.merge(worker.changeNumber, worker.headSha);
+      if (worker.mergeQueue?.candidate)
+        await provider.merge(worker.changeNumber, worker.headSha, worker.mergeQueue.candidate.targetHeadSha);
+      else await provider.merge(worker.changeNumber, worker.headSha);
     } catch (error) {
       if (error instanceof ForgeMergeNotStartedError) {
         worker.mergeAttempted = undefined;
+        if (worker.mergeQueue) worker.mergeQueue.outcome = undefined;
         await this.persist();
+      } else {
+        if (error instanceof ForgeMergeRejectedError && ![405, 409, 422].includes(error.statusCode)) {
+          worker.mergeAttempted = undefined;
+          if (worker.mergeQueue) worker.mergeQueue.outcome = undefined;
+          await this.persist();
+          throw error;
+        }
+        if (error instanceof ForgeMergeRejectedError) {
+          worker.mergeRejectionPending = { observedAt: new Date(Date.now()).toISOString(), reason: error.message };
+          await this.persist();
+        }
+        if (await this.reconcileRejectedMerge(worker)) {
+          if (!this.workers.includes(worker) || worker.status === "completed" || !worker.mergeAttempted && worker.status === "paused") return;
+          const change = await provider.getChangeRequest(worker.changeNumber);
+          throw new ForgeMergeNotStartedError(error, change);
+        }
       }
       throw error;
     }
   }
+  private async reconcileRejectedMerge(worker: ForgeWorker): Promise<boolean> {
+    if (!worker.mergeAttempted || !worker.changeNumber) return false;
+    if (worker.mergeRejectionPending && Date.now() - Date.parse(worker.mergeRejectionPending.observedAt) >= 120_000) {
+      worker.mergeAttempted = undefined;
+      worker.mergeRejectionPending = undefined;
+      if (worker.mergeQueue) worker.mergeQueue.outcome = undefined;
+      this.mergeQueue.block(worker, "The provider rejected the merge without confirming a recoverable conflict.");
+      await this.persist();
+      throw new Error("The provider rejected this merge without confirming a recoverable conflict. Inspect the provider blocker, then Resume to rejoin the queue.");
+    }
+    const change = await this.providerFor(worker).getChangeRequest(worker.changeNumber);
+    if (change.merged) {
+      await this.reconcileMergedChange(worker, { change });
+      return true;
+    }
+    requirePublicationRequest(worker, change);
+    // A confirmed conflicting, open request at our exact head cannot have merged.
+    // Unknown mergeability, permission errors, or a moved head never authorize recovery.
+    if (change.headSha !== worker.headSha || !change.hasConflicts) return false;
+    worker.mergeAttempted = undefined;
+    worker.mergeRejectionPending = undefined;
+    if (worker.mergeQueue) worker.mergeQueue.outcome = undefined;
+    worker.mergeConflict = { headSha: change.headSha, targetHeadSha: change.targetHeadSha };
+    await this.persist();
+    return true;
+  }
   private async updateBranchForMerge(worker: ForgeWorker): Promise<void> {
+    this.mergeQueue.phase(worker, "updating");
     worker.pendingPublication = {
       report: {
         kind: "issue",
@@ -1740,7 +1956,7 @@ export class ForgeWorkflowService {
     if (!sameRepository(worker.repository, this.deps.settings().repository))
       throw new Error("The configured repository changed. Restore it before rebasing this worker.");
   }
-  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false, manualContinuation?: ManualContinuation): Promise<void> {
+  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false): Promise<void> {
     this.requireRecoveryPublication(worker);
     this.requireIdleReviewers(worker);
     const signal = this.operations.get(worker.id)?.signal;
@@ -1753,6 +1969,7 @@ export class ForgeWorkflowService {
     requirePublicationRequest(worker, change);
     if (change.headSha !== worker.headSha)
       throw new Error("The published branch changed before conflict recovery. Inspect the retained checkout before resuming.");
+    if (!await this.reserveMergeTurn(worker, change)) return;
     const saved = worker.rebaseRecovery;
     if (saved?.phase !== "resolving" && !change.hasConflicts && !localConflict)
       throw new Error("The provider no longer reports a merge conflict. Resume the issue loop to check its current requirements.");
@@ -1767,6 +1984,7 @@ export class ForgeWorkflowService {
       throw new Error("This commit was already rebased onto the reported target. Inspect the provider's unchanged conflict status, then Resume; the work is retained.");
     if (saved?.phase === "resolving" && (saved.targetHeadSha !== prepared.targetHeadSha || saved.originalHeadSha !== prepared.originalHeadSha))
       throw new Error("The saved rebase checkpoint no longer matches the owned checkout. Inspect the retained work before resuming.");
+    this.mergeQueue.phase(worker, "resolving");
     worker.mergeConflict = { headSha: worker.headSha!, targetHeadSha: prepared.targetHeadSha };
     worker.rebaseRecovery = {
       branch: worker.branch!, baseBranch: worker.baseBranch, expectedHeadSha: worker.headSha!,
@@ -1779,7 +1997,7 @@ export class ForgeWorkflowService {
     await this.persist();
     if (saved?.phase !== "resolving" && prepared.targetHeadSha !== change.targetHeadSha)
       throw new Error("The target branch changed during conflict detection. Resume to continue the preserved rebase on its saved target.");
-    await this.launch(worker, placement, { item, change, ...(manualContinuation ? { manualContinuation } : {}) });
+    await this.launch(worker, placement, { item, change });
   }
   private async acceptRebaseReport(worker: ForgeWorker): Promise<boolean> {
     const recovery = worker.rebaseRecovery!;
@@ -1834,10 +2052,16 @@ export class ForgeWorkflowService {
           try {
             headSha = await this.deps.runtime.updateIssueBranch(workspace, update.expectedHeadSha, update.baseBranch, signal);
           } catch (error) {
+            if (error instanceof ForgeHandoffError) {
+              await this.startLocalRecovery(worker, error);
+              return;
+            }
             if (!(error instanceof ForgeBranchConflictError)) throw error;
             worker.pendingPublication = undefined;
             await this.persist();
-            await this.startRebaseRecovery(worker, worker.autoReview!.placement, true);
+            const placement = worker.autoReview?.placement ?? worker.placement;
+            if (!placement) throw new Error("Resume this worker to select the conflict recovery placement.");
+            await this.startRebaseRecovery(worker, placement, true);
             return;
           }
           if (headSha === update.expectedHeadSha) {
@@ -1854,12 +2078,20 @@ export class ForgeWorkflowService {
             if (current.requiresBaseUpdate)
               throw new Error("The worker branch already contains the current base branch, but the provider still requires an update. Inspect the request before resuming.");
             worker.pendingPublication = undefined;
+            if (worker.mergeQueue?.candidate) {
+              worker.mergeQueue.candidate.prepared = true;
+              this.mergeQueue.phase(worker, "waiting_ci");
+            }
             worker.status = worker.autoReview?.enabled ? "awaiting_merge" : "awaiting_review";
             worker.error = undefined;
             await this.persist();
             return;
           }
           update.headSha = headSha;
+          if (worker.mergeQueue?.candidate) {
+            worker.mergeQueue.candidate.headSha = headSha;
+            worker.mergeQueue.candidate.prepared = true;
+          }
           await this.persist();
         }
         await this.deps.runtime.verifyPublishedWorkspace(workspace, update.headSha);
@@ -1923,6 +2155,24 @@ export class ForgeWorkflowService {
       await provider.updateChangeRequest(worker.changeNumber!, { title: report.title, body: issueRequestBody(worker, report) });
     }
     await this.confirmPublication(worker);
+  }
+  private async startLocalRecovery(worker: ForgeWorker, error: Error): Promise<void> {
+    const update = worker.pendingPublication?.baseUpdate;
+    if (!update || worker.pendingPublication?.headSha) throw error;
+    const provider = this.providerFor(worker);
+    const change = await provider.getChangeRequest(worker.changeNumber!);
+    requirePublicationRequest(worker, change);
+    if (change.headSha !== update.expectedHeadSha) throw error;
+    const item = await provider.getIssue(worker.number);
+    if (item.state !== "open") throw error;
+    worker.recoveryContext = { operation: "branch_update", reason: error.message, baseUpdate: update };
+    worker.pendingPublication = undefined;
+    worker.status = "starting";
+    if (worker.autoReview) worker.autoReview.phase = "implementing";
+    await this.persist();
+    const placement = worker.autoReview?.placement ?? worker.placement;
+    if (!placement) throw new Error("Resume this worker to select its recovery placement.");
+    await this.launch(worker, placement, { item, change });
   }
   private requireBaseUpdateSource(worker: ForgeWorker, change: ForgeChangeRequestStatus): void {
     const update = worker.pendingPublication?.baseUpdate;
@@ -2009,8 +2259,33 @@ export class ForgeWorkflowService {
             change: latest,
           })
       ) {
+        if (!await this.reserveMergeTurn(worker, latest)) return;
+        if (!worker.mergeQueue?.candidate?.prepared) {
+          await this.updateBranchForMerge(worker);
+          if (worker.headSha !== headSha || worker.pendingPublication || !["awaiting_review"].includes(worker.status)) return;
+        }
+        worker.pendingPublication = publication;
+        worker.status = "starting";
+        await this.persist();
         await this.deps.runtime.verifyPublishedWorkspace(workspace, headSha);
-        await this.mergePublishedIssue(worker, provider);
+        try {
+          await this.mergePublishedIssue(worker, provider);
+        } catch (error) {
+          if (error instanceof ForgeMergeNotStartedError && error.change?.hasConflicts && error.change.headSha === worker.headSha) {
+            worker.pendingPublication = undefined;
+            const placement = worker.placement;
+            if (!placement) throw new Error("Resume this worker to select its conflict recovery placement.");
+            await this.startRebaseRecovery(worker, placement);
+            return;
+          }
+          if (worker.mergeAttempted && worker.mergeRejectionPending) {
+            worker.status = "awaiting_review";
+            worker.error = "The rejected merge is awaiting authoritative provider reconciliation.";
+            await this.persist();
+            return;
+          }
+          throw error;
+        }
         if (!(await this.reconcileMergedChange(worker, { signal }))) {
           await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
         }
@@ -2024,7 +2299,9 @@ export class ForgeWorkflowService {
       }
     }
     worker.status = "awaiting_review";
+    this.mergeQueue.phase(worker, "reviewing");
     worker.pendingPublication = undefined;
+    worker.recoveryContext = undefined;
     if (worker.rebaseRecovery?.phase === "publishing") worker.rebaseRecovery.phase = "reviewing";
     worker.error = undefined;
     if (worker.autoReview) {
@@ -2175,6 +2452,10 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(worker.id)?.signal;
     signal?.throwIfAborted();
     const settings = this.deps.settings();
+    if (worker.pendingContinuation) {
+      const { message, previousError } = worker.pendingContinuation;
+      context = { ...context, manualContinuation: { message, ...(previousError ? { previousError } : {}) } };
+    }
     const owner = this.issueOwner(worker);
     if (owner?.batch) {
       const issues = (await this.batchIssues(owner))!;
@@ -2196,6 +2477,8 @@ export class ForgeWorkflowService {
     else if (context.issue)
       worker.feedbackDigest = feedbackDigest({ item: context.issue, issues: context.issues, change: context.item as ForgeChangeRequest });
     worker.attemptId = randomUUID();
+    worker.placement = placement;
+    if (context.manualContinuation && worker.pendingContinuation) worker.pendingContinuation.deliveryAttemptId = worker.attemptId;
     worker.completion = {
       attemptId: worker.attemptId,
       deadlineAt: new Date(Date.now() + settings.maxRunMinutes * 60_000).toISOString(),
@@ -2204,6 +2487,7 @@ export class ForgeWorkflowService {
     worker.status = "starting";
     worker.error = undefined;
     await this.persist();
+    if (worker.recoveryContext) Object.assign(context, { recovery: worker.recoveryContext });
     const { reportPath, contextPath } = await this.deps.reports.prepare(
       worker.attemptId,
       reviewScope ? { ...context, reviewScope, previousReviews: this.previousReviews(worker) } :
@@ -2227,6 +2511,9 @@ export class ForgeWorkflowService {
     if (reviewScope) instructions += ` ${reviewScopeInstructions(reviewScope)}`;
     if (worker.issueWorkerId)
       instructions += " This review belongs to an automatic issue loop. Set event to request_changes when actionable findings remain, with specific changes and validation needed. Set event to approve only when the implementation satisfies the issue and review feedback and no actionable findings remain. Use comment only when a human clarification or decision is required; it pauses the loop. CloudX publishes the review and chooses the next step. Do not approve merely to finish the loop.";
+    if (worker.recoveryContext) {
+      instructions += " The recovery context records a failed local operation. Inspect its preserved Git state and files, complete or supersede the local operation without deleting expected working files, and validate the exact intended commit independently of retained edits. Do not publish; CloudX reconciles publication.";
+    }
     if (context.manualContinuation)
       instructions += " The task context includes manualContinuation from the user. Apply its message together with the original task and current feedback; previousError records why the worker needed attention. Inspect and preserve the existing work, follow these workflow limits, and write a fresh completion report when finished.";
     const shape =
@@ -2278,6 +2565,7 @@ export class ForgeWorkflowService {
       },
       signal,
     );
+    await this.reconcileContinuationDelivery(worker);
     signal?.throwIfAborted();
     worker.status = "running";
     worker.updatedAt = new Date().toISOString();
@@ -2291,7 +2579,7 @@ export class ForgeWorkflowService {
     for (const worker of [...this.workers]) {
       if (this.disposed) return;
       const number = changeNumber(worker);
-      if (!number || worker.retainedWorkspace && worker.status === "completed" || worker.status === "cleanup_failed" || !this.workers.includes(worker)) continue;
+      if (!number || worker.retainedWorkspace && worker.status === "completed" && !worker.mergeAttempted || worker.status === "cleanup_failed" || !this.workers.includes(worker)) continue;
       if (this.workers.some(candidate => hasUnconfirmedPublication(candidate) && candidate.changeNumber === number &&
         sameRepository(candidate.repository, worker.repository))) continue;
       if (recovering.some(candidate => changeNumber(candidate) === number && sameRepository(candidate.repository, worker.repository))) continue;
@@ -2336,6 +2624,20 @@ export class ForgeWorkflowService {
     const associated = this.workers.filter(candidate =>
       sameRepository(candidate.repository, worker.repository) && changeNumber(candidate) === number,
     );
+    const settlesMerge = associated.some(candidate => candidate.mergeAttempted || candidate.mergeQueue);
+    for (const candidate of associated) {
+      if (candidate.kind !== "issue" || !candidate.mergeAttempted) continue;
+      if (candidate.headSha !== change.headSha || candidate.branch && candidate.branch !== change.headBranch || candidate.baseBranch !== change.baseBranch)
+        throw new Error("The merged request does not match the saved merge attempt. Its outcome and local work remain unresolved.");
+      if (candidate.status === "completed" || !candidate.branch)
+        await this.deps.runtime.confirmCompletedMerge(candidate.id, candidate.repository, change.headSha, change.headBranch);
+      candidate.mergeAttempted = undefined;
+      candidate.mergeRejectionPending = undefined;
+      this.mergeQueue.complete(candidate);
+    }
+    for (const candidate of associated) if (candidate.mergeQueue) this.mergeQueue.complete(candidate);
+    // Persist authoritative merge confirmation before any cleanup can fail or be interrupted.
+    if (settlesMerge) await this.persist();
     let issuesClosed = change.linkedIssues.every(issue => issue.state === "closed");
     for (const issueNumber of new Set(associated.flatMap(candidate => forgeWorkerIssueNumbers(candidate)))) {
       const issue = await this.observeProvider({ number: issueNumber, changeNumber: number }, "getIssue", () => provider.getIssue(issueNumber));
@@ -2575,6 +2877,10 @@ export class ForgeWorkflowService {
       throw new Error("Wait for the coding worker's publication to be confirmed before reviewing this request.");
   }
   private async persist(): Promise<void> {
+    for (const worker of this.workers)
+      if (["paused", "stopped", "failed", "cleanup_failed"].includes(worker.status))
+        this.mergeQueue.block(worker, worker.error ?? "Paused by the operator. Resume to rejoin the queue.");
+    this.mergeQueue.refresh();
     const now = new Date().toISOString();
     for (const worker of this.workers)
       if (worker.status !== "running") worker.updatedAt = now;
@@ -2609,6 +2915,7 @@ export class ForgeWorkflowService {
   }
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const run = this.queue.then(async () => {
+      await this.deps.store.claimWriter?.();
       if (!this.loaded) {
         this.workers = await this.deps.store.read();
         for (const worker of this.workers) {
@@ -2638,12 +2945,19 @@ export class ForgeWorkflowService {
           } else if (["running", "starting", "cleanup_failed"].includes(worker.status) || worker.autoReview?.enabled &&
             ["awaiting_review", "awaiting_merge"].includes(worker.status)) {
             const cleanupFailed = worker.status === "cleanup_failed";
+            const resumeQueueWait = ["awaiting_review", "awaiting_merge"].includes(worker.status) &&
+              !worker.providerRetryAt && worker.mergeQueue && ["queued", "waiting_ci", "merging"].includes(worker.mergeQueue.phase);
             try {
               const recovered = await this.recoverResources(worker);
               if (cleanupFailed && !recovered.tabIds.length && !recovered.executionEnded && !worker.tabId) continue;
               await this.quiesce(worker, { retainReport: true });
-              worker.status = "paused";
-              worker.error ??= "CloudX restarted. Inspect and resume this worker explicitly.";
+              if (!resumeQueueWait) {
+                worker.status = "paused";
+                worker.error ??= "CloudX restarted. Inspect and resume this worker explicitly.";
+              } else if (worker.mergeQueue) {
+                worker.status = worker.autoReview?.enabled && worker.autoReview.phase === "merging" ? "awaiting_merge" : "awaiting_review";
+                this.operations.set(worker.id, new AbortController());
+              }
             } catch (error) {
               worker.status = "cleanup_failed";
               worker.error = message(error);

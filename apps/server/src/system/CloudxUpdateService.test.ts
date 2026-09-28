@@ -35,6 +35,45 @@ describe("CloudxUpdateService", () => {
     expect(catalog.preview).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("reconciles confirmed completed merges before %s update launch", async resume => {
+    const { execute, catalog } = fixture();
+    const id = "11111111-1111-4111-8111-111111111111";
+    const run = { id, state: "failed", targetCommit: target, resumable: true, startedAt: "2026-09-15T00:00:00Z", message: "Forge blocked the update." };
+    let reconciled = false;
+    const forge = { reconcileCompletedMerges: vi.fn(async () => { reconciled = true; }) };
+    execute.mockImplementation(async (file, _args) => {
+      if (file === "git") return { stdout: installed };
+      if (_args[1] === "start") expect(reconciled).toBe(true);
+      return { stdout: JSON.stringify({ available: true, ...(resume ? { run } : {}) }) };
+    });
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge);
+    if (!resume) await service.preview();
+    await service.start({ ...selection, ...(resume ? { resumeRunId: id } : {}) });
+    expect(forge.reconcileCompletedMerges).toHaveBeenCalledOnce();
+    expect(execute.mock.calls.at(-1)?.[1][1]).toBe("start");
+  });
+
+  it("leaves Forge state untouched while an update is already running", async () => {
+    const { execute, catalog } = fixture();
+    execute.mockResolvedValue({ stdout: JSON.stringify({ available: true,
+      run: { id: "active", state: "running", startedAt: "2026-09-15T00:00:00Z", message: "Snapshotting" } }) });
+    const forge = { reconcileCompletedMerges: vi.fn() };
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge);
+    expect((await service.start(selection)).run?.state).toBe("running");
+    expect(forge.reconcileCompletedMerges).not.toHaveBeenCalled();
+  });
+
+  it("returns the structured blocker when provider confirmation remains uncertain", async () => {
+    const { execute, catalog } = fixture();
+    const blocked = { available: true, forgeBlocker: { kind: "forge", workerId: "worker-149", issueNumber: 129,
+      message: "The saved merge outcome remains uncertain.", recoveryAction: "Open Forge and Resume the worker." } };
+    execute.mockResolvedValue({ stdout: JSON.stringify(blocked) });
+    const forge = { reconcileCompletedMerges: vi.fn(async () => { throw new Error("Provider unavailable"); }) };
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge);
+    expect(await service.start(selection)).toEqual(blocked);
+    expect(execute.mock.calls.every(([, args]) => args[1] === "status")).toBe(true);
+  });
+
   it("uses the installed checkout when managed build modules live in a separate release directory", async () => {
     vi.stubEnv("CLOUDX_INSTALL_ROOT", dataDir);
     try {

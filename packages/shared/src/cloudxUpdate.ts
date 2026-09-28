@@ -1,3 +1,12 @@
+export interface CloudxUpdateForgeBlocker {
+  kind: "forge";
+  workerId?: string;
+  issueNumber?: number;
+  changeNumber?: number;
+  message: string;
+  recoveryAction: string;
+}
+
 export interface CloudxUpdateRun {
   id: string;
   state: "running" | "prepared" | "succeeded" | "failed";
@@ -10,12 +19,14 @@ export interface CloudxUpdateRun {
   cause?: string;
   recoveryAction?: string;
   resumable?: boolean;
+  forgeBlocker?: CloudxUpdateForgeBlocker;
 }
 
 export interface CloudxUpdateStatus {
   available: boolean;
   unavailableReason?: string;
   run?: CloudxUpdateRun;
+  forgeBlocker?: CloudxUpdateForgeBlocker;
   confirmation?: { targetCommit: string; message: string; restoreSnapshotRunId?: string; requiresInterruption?: boolean };
 }
 
@@ -137,6 +148,7 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
     throw new Error("Invalid CloudX update status.");
   }
   const result: CloudxUpdateStatus = { available: value.available };
+  if (value.forgeBlocker !== undefined) result.forgeBlocker = parseForgeBlocker(value.forgeBlocker);
   if (value.unavailableReason !== undefined) result.unavailableReason = value.unavailableReason as string;
   if (value.confirmation !== undefined) {
     if (!record(value.confirmation) || !commit(value.confirmation.targetCommit) || !text(value.confirmation.message)
@@ -174,9 +186,23 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
       ...(run.cause === undefined ? {} : { cause: run.cause as string }),
       ...(run.recoveryAction === undefined ? {} : { recoveryAction: run.recoveryAction as string }),
       ...(run.resumable === undefined ? {} : { resumable: run.resumable as boolean }),
+      ...(run.forgeBlocker === undefined ? {} : { forgeBlocker: parseForgeBlocker(run.forgeBlocker) }),
     };
   }
   return result;
+}
+
+function parseForgeBlocker(value: unknown): CloudxUpdateForgeBlocker {
+  if (!record(value) || value.kind !== "forge" || !text(value.message) || !text(value.recoveryAction)
+    || (value.workerId !== undefined && (!text(value.workerId, 128) || !/^[A-Za-z0-9_-]+$/u.test(value.workerId)))
+    || ["issueNumber", "changeNumber"].some(key => value[key] !== undefined && (!Number.isSafeInteger(value[key]) || (value[key] as number) <= 0))) {
+    throw new Error("Invalid Forge update blocker.");
+  }
+  return { kind: "forge", message: value.message, recoveryAction: value.recoveryAction,
+    ...(value.workerId === undefined ? {} : { workerId: value.workerId as string }),
+    ...(value.issueNumber === undefined ? {} : { issueNumber: value.issueNumber as number }),
+    ...(value.changeNumber === undefined ? {} : { changeNumber: value.changeNumber as number }),
+  };
 }
 
 function record(value: unknown): value is Record<string, unknown> {

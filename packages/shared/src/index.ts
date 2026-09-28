@@ -1341,3 +1341,5 @@ function stripNullishValues(input: Record<string, unknown>): Record<string, unkn
       .map(([key, value]) => [key, isRecord(value) ? stripNullishValues(value) : value])
   );
 }
+
+export * from "./workspaceCleanup.js";

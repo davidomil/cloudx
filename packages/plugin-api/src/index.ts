@@ -2,6 +2,7 @@ import {
   UI_RENDERER_STATUS_DOT,
   type ConfigFieldDescriptor,
   type ConfigValue,
+  type DirectoryOwnershipAvailability,
   type DirectoryOwnershipPreview,
   type DirectoryOwnershipReconciliation,
   type CloudxRule,
@@ -256,6 +257,7 @@ export interface WorkspacePlugin {
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  ownershipAvailability?(input: CreatePluginSessionInput): Promise<DirectoryOwnershipAvailability>;
   previewOwnership?(input: CreatePluginSessionInput): Promise<DirectoryOwnershipPreview>;
   reconcileOwnership?(input: CreatePluginSessionInput, request: DirectoryOwnershipReconciliation): Promise<void>;
   describeRecovery?(input: CreatePluginSessionInput): Promise<Omit<TabRecovery, "state">> | Omit<TabRecovery, "state">;

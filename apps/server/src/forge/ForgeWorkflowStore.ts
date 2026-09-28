@@ -7,15 +7,34 @@ import {
   writeNewTextFileNoFollow,
 } from "../jsonStateFile.js";
 import type { PluginDataStore } from "../plugins/PluginDataStore.js";
+import { ForgeWriterLease } from "./ForgeWriterLease.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 
 export class ForgeWorkflowStore {
+  private readonly writer = new ForgeWriterLease();
+  private claimed = false;
   constructor(private readonly data: PluginDataStore) {}
+  async claimWriter(): Promise<void> {
+    if (this.claimed) { this.writer.assertHeld(); return; }
+    await this.writer.acquire(await this.data.writerLockPath("forge"));
+    this.claimed = true;
+  }
+  async releaseWriter(): Promise<void> {
+    await this.writer.release();
+    this.claimed = false;
+  }
   async read(): Promise<ForgeWorker[]> {
     return parseWorkers((await this.data.read("forge")) ?? []);
   }
   async write(workers: ForgeWorker[]): Promise<void> {
-    await this.data.write("forge", parseWorkers(workers));
+    const temporaryOwner = !this.claimed;
+    await this.claimWriter();
+    try {
+      this.writer.assertHeld();
+      await this.data.write("forge", parseWorkers(workers));
+    } finally {
+      if (temporaryOwner) await this.releaseWriter();
+    }
   }
 }
 export class ForgeWorkerReports {

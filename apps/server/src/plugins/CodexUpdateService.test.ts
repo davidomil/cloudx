@@ -655,6 +655,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 describe("Codex update HTTP boundary", () => {
   it("requires a trusted browser origin, rejects arbitrary commands and paths, and exposes one uncached job through reconnects", async () => {
     const f = await installation({ gated: true });
+    await fs.symlink(execFileSync("sh", ["-c", "command -v flock"], { encoding: "utf8" }).trim(), path.join(f.tools, "flock"));
     for (const [key, value] of Object.entries(f.env)) vi.stubEnv(key, value);
     const config = loadConfig({ CLOUDX_DATA_DIR: f.dataDir, CLOUDX_ALLOWED_ROOTS: f.root, CLOUDX_LOG_LEVEL: "silent",
       CLOUDX_APP_SERVER_ENABLED: "false", CLOUDX_AUTOMATION_START_DISABLED: "true", CLOUDX_WEB_DIST_DIR: path.join(f.root, "web") });

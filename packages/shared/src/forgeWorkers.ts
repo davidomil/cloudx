@@ -108,6 +108,7 @@ export interface ForgeWorker {
   repositoryPath?: string;
   baseBranch: string;
   templateId: string;
+  placement?: ForgePlacement;
   status: ForgeWorkerStatus;
   worktreePath?: string;
   branch?: string;
@@ -150,6 +151,24 @@ export interface ForgeWorker {
   changeUrl?: string;
   headSha?: string;
   mergeAttempted?: true;
+  mergeRejectionPending?: { observedAt: string; reason: string };
+  mergeQueue?: {
+    sequence: number;
+    enteredAt: string;
+    phase: "queued" | "updating" | "resolving" | "reviewing" | "waiting_ci" | "merging" | "blocked";
+    active: boolean;
+    position: number;
+    activeWorkerId?: string;
+    reason?: string;
+    candidate?: { headSha: string; targetHeadSha: string; prepared?: true; reviewId?: string; checksUrl?: string };
+    outcome?: "uncertain" | "merged";
+  };
+  pendingContinuation?: { message: string; previousError?: string; deliveryAttemptId?: string };
+  recoveryContext?: {
+    operation: "branch_update";
+    reason: string;
+    baseUpdate: { expectedHeadSha: string; baseBranch: string; headSha?: string };
+  };
   feedbackDigest?: string;
   autoPost: boolean;
   autoReview?: ForgeAutoReview;
@@ -223,7 +242,7 @@ export function forgeWorkerContinuationBlocker(worker: ForgeWorker, workers: rea
       return "Finish the existing review and reconcile its submission before continuing the issue worker.";
   } else {
     const issues = related.filter(candidate => candidate.kind === "issue" && candidate.changeNumber === worker.number);
-    if (issues.some(issue => continuationStateBlocker(issue) || issue.rebaseRecovery && issue.rebaseRecovery.phase !== "reviewing"))
+    if (issues.some(issue => continuationStateBlocker(issue) || issue.pendingPublication || issue.mergeAttempted || ["creating", "uncertain"].includes(issue.publicationState ?? "") || issue.rebaseRecovery && issue.rebaseRecovery.phase !== "reviewing"))
       return "Pause the issue worker and reconcile its publication or merge before continuing this review.";
     if (worker.issueWorkerId && !issues.some(issue => issue.id === worker.issueWorkerId && issue.autoReview?.reviewWorkerId === worker.id))
       return "Restore this review's issue loop before continuing.";
@@ -241,7 +260,7 @@ function continuationStateBlocker(worker: ForgeWorker): string | undefined {
   if (!["paused", "stopped", "failed", "awaiting_review", "awaiting_merge"].includes(worker.status) &&
     !(worker.kind === "review" && worker.status === "completed"))
     return "This worker is not ready to continue with a message. Use Resume to recover unfinished cleanup.";
-  if (worker.pendingPublication || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState ?? ""))
+  if (worker.kind !== "issue" && (worker.pendingPublication || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState ?? "")))
     return "Reconcile the pending publication or merge using Resume before continuing with a message.";
   if (uncertainReview(worker))
     return "Reconcile the previous review submission before continuing with a message.";

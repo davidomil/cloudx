@@ -19,7 +19,7 @@ const GENERATED = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/
 const PHASES = ['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify'];
 const FORGE_WORKFLOW_FILE = `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`;
 export const CURRENT_TERMINAL_CONTRACT = { brokerProtocol: 1, supervisorContract: 'execution-json-v1', persistentSessions: true };
-const runtimeData = relative => /^(terminal-runtime|terminal-broker|terminal-recovery-[^/]+|terminal-upgrade-backup-[^/]+)(\/|$)/u.test(relative);
+const runtimeData = relative => relative === `${FORGE_WORKFLOW_FILE}.writer-lock` || /^(terminal-runtime|terminal-broker|terminal-recovery-[^/]+|terminal-upgrade-backup-[^/]+)(\/|$)/u.test(relative);
 
 export class ManagedUpdate {
   constructor({ record, save, host, checkpoint = () => {} }) {
@@ -43,6 +43,7 @@ export class ManagedUpdate {
     record.run = { ...record.run, state: 'running', resumable: false };
     delete record.run.finishedAt;
     delete record.run.cause;
+    delete record.run.forgeBlocker;
     try {
       if (transition.mutating) {
         await this.restore();
@@ -86,6 +87,7 @@ export class ManagedUpdate {
       }
       const blocker = restorationError ?? error;
       record.run = { ...record.run, state: 'failed', phase: failedPhase, component: blocker.component ?? failedPhase,
+        ...(blocker.forgeBlocker ? { forgeBlocker: blocker.forgeBlocker } : {}),
         cause: failureCause(blocker, record.run.component ?? failedPhase),
         resumable: true, finishedAt: new Date().toISOString(),
         message: restored ? 'Update stopped; the previous installation is retained.' : 'Update stopped; restoration needs to continue.',
@@ -142,6 +144,7 @@ export class UpdateHost {
   git(args, cwd = this.paths.repoRoot) { return this.runner.inspect('git', args, { cwd }); }
 
   prepare(record) {
+    assertTerminalMigrationSafe({ dataDir: this.paths.dataDir });
     const transition = record.transition;
     const root = this.paths.repoRoot;
     delete transition.sourceFiles;
@@ -806,6 +809,8 @@ function forgeRecords(root, restoringFiles = new Set()) {
     const stat = fs.lstatSync(full, { throwIfNoEntry: false });
     if (!stat) return;
     if (stat.isSymbolicLink()) throw new Error('Forge ownership recovery cannot follow symlinks.');
+    // The kernel lease has no persisted workflow state. Keep its inode across restoration.
+    if (relative === `${FORGE_WORKFLOW_FILE}.writer-lock` && stat.isFile() && stat.size === 0) return;
     if (stat.isDirectory()) for (const name of fs.readdirSync(full).sort()) inspect(path.join(relative, name));
     else if (stat.isFile()) {
       const restoring = /^(.*\.json)\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.restore$/u.exec(relative);
@@ -835,6 +840,7 @@ function forgeRecords(root, restoringFiles = new Set()) {
 
 function clearProfile(root, manifest) {
   const directories = new Set(manifest.filter(entry => entry.type === 'directory').map(entry => entry.path));
+  directories.add('plugin-data');
   function clear(directory, relative) {
     const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
     try {

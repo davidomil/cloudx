@@ -1,3 +1,4 @@
+import os from "node:os";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest, type HTTPMethods } from "fastify";
 import websocket from "@fastify/websocket";
 import staticPlugin from "@fastify/static";
@@ -106,10 +107,13 @@ import { AutomationService } from "./automation/AutomationService.js";
 import { AutomationTypeService } from "./automation/AutomationTypeService.js";
 import { CloudxLogService } from "./logs/CloudxLogService.js";
 import { registerLogRoutes } from "./logs/logRoutes.js";
+import { WorkspaceCleanupService } from "./workspace/WorkspaceCleanupService.js";
+import { registerWorkspaceCleanupRoutes } from "./workspace/WorkspaceCleanupRoutes.js";
 import { redactUrlSearchAndHash } from "./urlRedaction.js";
 
 export interface AppServices {
   logs?: CloudxLogService;
+  workspaceCleanup?: WorkspaceCleanupService;
   plugins: PluginRegistry;
   sessions: SessionStore;
   pathPolicy: PathPolicy;
@@ -358,7 +362,26 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   registerLogRoutes(app, logs);
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
-  registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir), config.trustedOrigins);
+  registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir, undefined, undefined, undefined, services.forge), config.trustedOrigins);
+  const installationRoot = path.resolve(import.meta.dirname, "../../..");
+  services.workspaceCleanup ??= new WorkspaceCleanupService({
+    dataDir: config.dataDir, pathPolicy: services.pathPolicy, forge: services.forge,
+    openDirectories: () => services.sessions.listTabs().map(tab => tab.cwd),
+    withInactiveDirectory: (directory, operation) => services.sessions.withInactiveDirectory(directory, operation),
+    protectedDirectories: [
+      ...["apps", "packages", "services", "node_modules", ".git", "docs"].map(name => path.join(installationRoot, name)),
+      ...["codex-homes", "codex-launches", "rules-skills", "documentation", "forge-reports", "updates", "certs"].map(name => path.join(config.dataDir, name)),
+      path.join(os.homedir(), ".local", "state", "cloudx", "settings-update"),
+      ...(process.env.CLOUDX_UPDATE_COORDINATOR_ROOT?.trim() && path.resolve(process.env.CLOUDX_UPDATE_COORDINATOR_ROOT) !== installationRoot &&
+        path.resolve(process.env.CLOUDX_UPDATE_COORDINATOR_ROOT) !== path.resolve(process.env.CLOUDX_INSTALL_ROOT?.trim() || installationRoot)
+        ? [path.resolve(process.env.CLOUDX_UPDATE_COORDINATOR_ROOT)] : []),
+      ...(process.env.CLOUDX_INSTALL_ROOT?.trim() ? ["apps", "packages", "services", "node_modules", ".git", "docs"].map(name => path.join(path.resolve(process.env.CLOUDX_INSTALL_ROOT!), name)) : []),
+      process.execPath,
+      services.codexStateSources!.originalHome,
+      ...(process.env.CODEX_SQLITE_HOME?.trim() ? [path.resolve(process.env.CODEX_SQLITE_HOME)] : []),
+    ],
+  });
+  registerWorkspaceCleanupRoutes(app, services.workspaceCleanup, config.trustedOrigins);
   if (services.forgeConnections) registerForgeConnectionRoutes(app, services.forgeConnections, config.trustedOrigins);
 
   app.get("/api/plugins/installed", async () => ({ plugins: services.installedPlugins!.listPublicRecordsSync() }));
@@ -568,6 +591,9 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     }
     return services.sessions.recoverTab(request.params.tabId, { action, sessionId });
   });
+
+  app.get<{ Params: { tabId: string } }>("/api/tabs/:tabId/ownership", async request =>
+    services.sessions.tabOwnershipAvailability(request.params.tabId));
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/ownership/preview", async request => {
     if (Object.keys(optionalRequestBody(request.body)).length) throwBadRequest("Ownership preview does not accept input fields.");

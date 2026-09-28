@@ -414,6 +414,15 @@ async function heldSourceFixture(stage: string, failLate = false) {
 }
 
 describe("durable Codex source ownership", () => {
+  it("does not offer ownership recovery for an absent launch binding or an unchanged source", async () => {
+    const f = await fixture();
+    await expect(f.sources.ownershipAvailability("missing")).resolves.toMatchObject({ status: "unavailable" });
+    const source = await f.sources.resolve();
+    await f.sources.bind("unchanged", source);
+    await expect(f.sources.ownershipAvailability("unchanged")).resolves.toEqual({ status: "not_needed" });
+    await f.sources.dispose();
+  });
+
   it("keeps the bound shared source after device renumbering with matching filesystem evidence", async () => {
     const f = await fixture();
     const source = await f.sources.resolve();
@@ -432,6 +441,9 @@ describe("durable Codex source ownership", () => {
     const legacy = { version: 1, sourceId: source.sourceId, home: source.home, ino: source.ino, dev: "1" };
     await fs.writeFile(bindingPath, JSON.stringify(legacy));
     await expect(f.sources.readBinding("legacy")).rejects.toThrow(/device changed from 1.*reconcile/);
+    const beforeAvailability = await fs.readFile(bindingPath, "utf8");
+    await expect(f.sources.ownershipAvailability("legacy")).resolves.toMatchObject({ status: "available" });
+    expect(await fs.readFile(bindingPath, "utf8")).toBe(beforeAvailability);
     const preview = await f.sources.previewOwnership("legacy");
     await expect(f.sources.reconcileOwnership("legacy", { fingerprint: preview.fingerprint, attestations: [] })).rejects.toThrow(/Confirm that saved device 1/);
     expect(JSON.parse(await fs.readFile(bindingPath, "utf8"))).toEqual(legacy);
@@ -443,6 +455,7 @@ describe("durable Codex source ownership", () => {
     expect(staging).toMatch(/^\/proc\/self\/fd\/\d+\/\.cloudx-binding-.*\.tmp$/u);
     expect(committedBinding).toBe(path.join(path.dirname(staging!), ".cloudx-source.json"));
     await expect(f.sources.readBinding("legacy")).resolves.toEqual(source);
+    await expect(f.sources.ownershipAvailability("legacy")).resolves.toEqual({ status: "not_needed" });
     expect(JSON.parse(await fs.readFile(bindingPath, "utf8"))).toMatchObject({ ...source, durable: source.durable });
     expect((await fs.stat(bindingPath)).mode & 0o777).toBe(0o600);
     expect(await fs.readdir(view)).toEqual([".cloudx-source.json"]);
@@ -454,6 +467,7 @@ describe("durable Codex source ownership", () => {
     const source = await f.sources.resolve();
     const view = await f.sources.bind("changed", source);
     await fs.writeFile(path.join(view, ".cloudx-source.json"), JSON.stringify({ version: 1, ...source, durable: { ...source.durable!, filesystemId: "ffff" } }));
+    await expect(f.sources.ownershipAvailability("changed")).resolves.toMatchObject({ status: "unavailable" });
     await expect(f.sources.previewOwnership("changed")).rejects.toThrow(/ownership changed/);
     await expect(f.sources.readBinding("changed")).rejects.toThrow(/ownership changed/);
     await f.sources.dispose();

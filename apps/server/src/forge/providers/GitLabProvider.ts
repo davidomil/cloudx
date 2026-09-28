@@ -18,6 +18,9 @@ import {
   ForgeDiscussionReplyNotStartedError,
   ForgeHeadChangedError,
   ForgeMergeNotStartedError,
+  ForgeMergeRejectedError,
+  ForgeMutationUncertainError,
+  ForgeProviderUnavailableError,
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
@@ -459,32 +462,41 @@ export class GitLabProvider implements ForgeProvider {
   async merge(
     number: number,
     expectedHeadSha: string,
+    expectedTargetHeadSha?: string,
   ): Promise<ForgeMergeResult> {
     let request: ForgeChangeRequest | undefined;
     try {
       request = await this.getChangeRequest(number);
       requireMergeReady(request, expectedHeadSha);
+      if (expectedTargetHeadSha && request.targetHeadSha !== expectedTargetHeadSha)
+        throw new ForgeProviderError("The target branch advanced after final verification. Prepare a fresh candidate before merging.", 409);
     } catch (error) {
       throw new ForgeMergeNotStartedError(error, request);
     }
-    const result = record(
-      (
-        await this.http.request(`${this.requestPath(number)}/merge`, {
-          method: "PUT",
-          role: "worker",
-          body: {
-            sha: expectedHeadSha,
-            should_remove_source_branch: true,
-            auto_merge: false,
-          },
-        })
-      ).body,
-    );
-    if (result.state !== "merged")
-      throw new ForgeProviderError(
-        "GitLab has not confirmed the merge; local work is retained.",
-        409,
+    let result: Record<string, unknown>;
+    try {
+      result = record(
+        (
+          await this.http.request(`${this.requestPath(number)}/merge`, {
+            method: "PUT",
+            role: "worker",
+            body: {
+              sha: expectedHeadSha,
+              should_remove_source_branch: true,
+              auto_merge: false,
+            },
+          })
+        ).body,
       );
+    } catch (error) {
+      if (error instanceof ForgeProviderError && !(error instanceof ForgeProviderUnavailableError) &&
+          !(error instanceof ForgeMutationUncertainError) &&
+          error.statusCode >= 400 && error.statusCode < 500)
+        throw new ForgeMergeRejectedError(error);
+      throw error;
+    }
+    if (result.state !== "merged")
+      throw new ForgeProviderError("GitLab has not confirmed the merge; local work is retained.", 409);
     return { merged: true, sha: string(result.merge_commit_sha) };
   }
 

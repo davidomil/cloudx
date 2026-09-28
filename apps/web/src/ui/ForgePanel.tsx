@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
 import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
-import type { DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
+import type { DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
@@ -14,6 +14,7 @@ type Request = <T>(hook: string, input?: Record<string, unknown>) => Promise<T>;
 type RunAction = (work: () => Promise<unknown>, interrupt?: boolean) => Promise<boolean>;
 type View = "issues" | "changes" | "workers";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
+const queuePhaseLabels = { queued: "Queued", updating: "Updating branch", resolving: "Resolving conflicts", reviewing: "Reviewing changes", waiting_ci: "Waiting for CI", merging: "Merging", blocked: "Blocked" };
 const WorkerContinuations = createContext<{
   messages: Record<string, string>;
   setMessage: (workerId: string, message?: string) => void;
@@ -138,6 +139,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
           {item === "workers" && awaitingReview ? <span className="forge-badge">{awaitingReview} awaiting review</span> : null}
         </ControlButton>)}
       </nav>
+      {view === "workers" ? <MergeQueues workers={workers} onSelect={setSelectedWorkerId} /> : null}
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
         {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
@@ -173,6 +175,13 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
   const [autoReviewDrafts, setAutoReviewDrafts] = useState<Record<number, boolean>>({});
   const [batchMembers, setBatchMembers] = useState<ForgeIssue[]>([]);
   const [batchName, setBatchName] = useState("");
+  const batches = workers.filter(worker => worker.kind === "issue" && worker.batch);
+  const batchedIssueNumbers = new Set(batches.flatMap(worker => worker.batch!.issues.map(issue => issue.number)));
+  const membershipKey = [...batchedIssueNumbers].sort((a, b) => a - b).join(",");
+  useEffect(() => {
+    const members = new Set(membershipKey.split(",").filter(Boolean).map(Number));
+    setBatchMembers(current => current.some(issue => members.has(issue.number)) ? current.filter(issue => !members.has(issue.number)) : current);
+  }, [membershipKey]);
   const singular = kind === "issues" ? "issue" : provider === "gitlab" ? "merge request" : "pull request";
   const selectedNumber = selected?.number;
 
@@ -248,21 +257,27 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
       <div className="forge-list" aria-label={`${kind === "issues" ? "Issue" : "Change request"} list`} aria-busy={listBusy}>
         {listError ? <p className="forge-notice" role="alert">{listError}</p> : null}
         {listBusy ? <p role="status" className="forge-empty">Loading {kind === "issues" ? "issues" : "requests"}…</p> : null}
-        {page?.items.map((entry) => {
+        {(kind === "issues" ? [
+          ...batches.map(batch => ({ id: batch.id, title: batch.title, total: batch.batch!.issues.length,
+            items: page?.items.filter(issue => batch.batch!.issues.some(member => member.number === issue.number)) ?? [] })),
+          { id: "unbatched", title: "Unbatched issues", total: undefined, items: page?.items.filter(issue => !batchedIssueNumbers.has(issue.number)) ?? [] },
+        ] : [{ id: "changes", title: "", total: undefined, items: page?.items ?? [] }]).filter(group => group.items.length).map(group => <div key={group.id} className="forge-issue-group" role={kind === "issues" ? "group" : undefined} aria-label={kind === "issues" ? group.title : undefined}>
+          {kind === "issues" ? <h3 className="forge-issue-group-heading"><span>{group.title}</span><small>{group.total === undefined ? `${group.items.length} on this page` : `${group.items.length} of ${group.total} issues shown`}</small></h3> : null}
+          {group.items.map((entry) => {
           const itemWorkers = workersForItem(workers, kind, entry.number);
           const drafts = itemWorkers.filter((worker) => worker.kind === "review" && worker.draft && worker.draft.status !== "posted");
           const comments = drafts.reduce((count, worker) => count + (worker.draft?.comments.length ?? 0), 0);
           const checked = batchMembers.some(member => member.number === entry.number);
           const owned = itemWorkers.some(worker => worker.kind === "issue" && worker.status !== "draft" && worker.status !== "completed");
           return <div key={entry.number} className="forge-item-row">
-            {kind === "issues" ? <input type="checkbox" className="forge-batch-select" aria-label={`Select issue #${entry.number} for batch`} checked={checked} disabled={busy || (!checked && (entry.state !== "open" || owned || batchMembers.length >= MAX_FORGE_BATCH_ISSUES))} onChange={event => setBatchMembers(members => event.target.checked ? [...members, entry] : members.filter(member => member.number !== entry.number))} /> : null}
+            {kind === "issues" && !batchedIssueNumbers.has(entry.number) ? <input type="checkbox" className="forge-batch-select" aria-label={`Select issue #${entry.number} for batch`} checked={checked} disabled={busy || (!checked && (entry.state !== "open" || owned || batchMembers.length >= MAX_FORGE_BATCH_ISSUES))} onChange={event => setBatchMembers(members => event.target.checked ? [...members, entry] : members.filter(member => member.number !== entry.number))} /> : null}
             <button type="button" className={`forge-item${selectedNumber === entry.number ? " selected" : ""}`} onClick={() => setSelected(entry)} aria-pressed={selectedNumber === entry.number}>
             <span className="forge-item-title">#{entry.number} {entry.title}</span>
             <span className="forge-muted">{entry.state} · {entry.author}{entry.labels.length ? ` · ${entry.labels.join(", ")}` : ""}</span>
             <ItemWorkerStats workers={itemWorkers} />
             {kind === "changes" && drafts.length ? <span className="forge-badge"><MessageSquare size={13} /> {comments} suggested {comments === 1 ? "comment" : "comments"} · {drafts.length} review {drafts.length === 1 ? "draft" : "drafts"}</span> : null}
           </button></div>;
-        })}
+        })}</div>)}
         {page && !page.items.length ? <p className="forge-empty">No {kind === "issues" ? "issues" : "requests"} match this filter.</p> : null}
         <div className="forge-pagination">
           <ControlButton size="compact" disabled={listBusy || query.page === 1} onClick={() => { setSelected(undefined); setQuery({ ...query, page: query.page - 1 }); }}>Previous</ControlButton>
@@ -424,6 +439,39 @@ function BatchIssues({ worker }: { worker: ForgeWorker }) {
   </section>;
 }
 
+function MergeQueues({ workers, onSelect }: { workers: ForgeWorker[]; onSelect: (id: string) => void }) {
+  const queues = new Map<string, ForgeWorker[]>();
+  for (const worker of workers) {
+    if (!worker.mergeQueue || worker.mergeQueue.outcome === "merged") continue;
+    const key = JSON.stringify([worker.repository.provider, worker.repository.apiUrl, worker.repository.projectPath, worker.baseBranch]);
+    queues.set(key, [...(queues.get(key) ?? []), worker]);
+  }
+  if (!queues.size) return null;
+  return <section className="forge-merge-queues" aria-label="Merge queues">
+    {[...queues].map(([key, entries]) => <div key={key} role="group" aria-label={`${entries[0].repository.projectPath} → ${entries[0].baseBranch}`}>
+      <h3>{entries[0].repository.projectPath} → {entries[0].baseBranch}</h3>
+      <ol>{entries.sort((a, b) => Number(b.mergeQueue!.active) - Number(a.mergeQueue!.active) || a.mergeQueue!.sequence - b.mergeQueue!.sequence).map(worker => <li key={worker.id}>
+        <ControlButton size="compact" onClick={() => onSelect(worker.id)}>{worker.mergeQueue!.active ? "Active" : worker.mergeQueue!.position ? `#${worker.mergeQueue!.position}` : "Blocked"} · {worker.title}</ControlButton>
+        <span className="forge-muted">{queuePhaseLabels[worker.mergeQueue!.phase]}</span>
+        {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer" aria-label={`Open queued ${worker.repository.provider === "github" ? "PR" : "MR"} #${worker.changeNumber}`}><ExternalLink size={14} /></a> : null}
+      </li>)}</ol>
+    </div>)}
+  </section>;
+}
+
+function MergeQueueStatus({ worker, workers }: { worker: ForgeWorker; workers: ForgeWorker[] }) {
+  const queue = worker.mergeQueue;
+  if (!queue || queue.outcome === "merged" || worker.status === "completed") return null;
+  const active = workers.find(candidate => candidate.id === queue.activeWorkerId);
+  return <section className="forge-merge-queue" aria-label="Merge queue">
+    <p role="status"><strong>{queuePhaseLabels[queue.phase]}</strong> · {queue.active ? "Active merge turn" : queue.position > 0 ? `Position ${queue.position}` : "Turn released"} · {worker.baseBranch}</p>
+    {worker.changeUrl ? <a href={worker.changeUrl} target="_blank" rel="noreferrer">{worker.repository.provider === "github" ? "PR" : "MR"} #{worker.changeNumber}</a> : null}
+    {!queue.active && active ? <p className="forge-muted">Active: {active.changeUrl ? <a href={active.changeUrl} target="_blank" rel="noreferrer">{active.title}</a> : active.title}</p> : null}
+    {queue.reason ? <p className="forge-muted">{queue.reason}</p> : null}
+    {queue.outcome === "uncertain" ? <p className="forge-notice">Confirming the previous merge outcome before the queue can advance.</p> : null}
+  </section>;
+}
+
 function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: WorkerCardProps) {
   const [controlling, setControlling] = useState(false);
   const continuation = useContext(WorkerContinuations)!;
@@ -484,9 +532,11 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     {!archivedDraft && worker.providerRetryAt ? <p role="status">Worker will retry automatically at <time dateTime={worker.providerRetryAt}>{new Date(worker.providerRetryAt).toLocaleString()}</time>.</p> : null}
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
+    {!archivedDraft ? <MergeQueueStatus worker={worker} workers={workers} /> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && !conflict && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     {!archivedDraft && ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) ? <DirectoryOwnershipRecovery key={worker.id}
       disabled={busy || controlling || reviewRunning}
+      availability={async () => (await request<{ availability: DirectoryOwnershipAvailability }>("forge.worker.ownershipAvailability", { id: worker.id })).availability}
       preview={async () => (await request<{ preview: DirectoryOwnershipPreview }>("forge.worker.previewOwnership", { id: worker.id })).preview}
       reconcile={async input => { await request("forge.worker.reconcileOwnership", { id: worker.id, ...input }); }}
     /> : null}

@@ -187,7 +187,7 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
       requested = true;
       timer = setTimeout(() => controller.abort(), requestTimeout);
       const next = await startCloudxUpdate(request, controller.signal);
-      if (next.confirmation) {
+      if (next.forgeBlocker || next.confirmation) {
         sessionStorage.removeItem(pendingRunKey);
         sessionStorage.removeItem(previousRunKey);
       } else if (!next.available && next.run?.state !== "running") {
@@ -224,7 +224,7 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
   };
 }
 
-export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }) {
+export function CloudxUpdatePanel({ update, onOpenForge }: { update: CloudxUpdateController; onOpenForge?: () => void }) {
   const { status, preview, channel, previewLoading, starting, checking, notice, error } = update;
   const running = status?.run?.state === "running";
   const prepared = status?.run?.state === "prepared";
@@ -236,6 +236,7 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
   const confirmingResume = canResume && status?.confirmation?.targetCommit === status.run?.targetCommit;
   const confirmation = confirmingResume || status?.confirmation?.targetCommit === preview?.target?.commit ? status?.confirmation : undefined;
   const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || Boolean(error) || canResume && !selectedTargetDiffers;
+  const forgeBlocker = status?.forgeBlocker ?? status?.run?.forgeBlocker;
   return <section className="settings-section browser-notification-settings cloudx-update-settings" aria-label="CloudX updates">
     <h3>Update CloudX</h3>
     <p>Update CloudX and its application dependencies.</p>
@@ -255,6 +256,13 @@ export function CloudxUpdatePanel({ update }: { update: CloudxUpdateController }
     {status?.run?.component ? <p>Affected component: {status.run.component}</p> : null}
     {status?.run?.cause ? <p>Cause: {status.run.cause}</p> : null}
     {status?.run?.recoveryAction ? <p>Recovery: {status.run.recoveryAction}</p> : null}
+    {forgeBlocker ? <div role="alert" className="cloudx-update-forge-blocker">
+      <strong>Forge needs attention{forgeBlocker.issueNumber ? `: issue #${forgeBlocker.issueNumber}` : forgeBlocker.changeNumber ? `: change #${forgeBlocker.changeNumber}` : ""}</strong>
+      <p>{forgeBlocker.message}</p>
+      {forgeBlocker.workerId ? <p>Worker: <code>{forgeBlocker.workerId}</code></p> : null}
+      <p>Update and Resume update first reconcile completed merges. If work remains unresolved, open Forge and use the affected worker’s Resume or Resume with message action, then retry this update.</p>
+      {onOpenForge ? <ControlButton size="compact" onClick={onOpenForge}>Open Forge recovery</ControlButton> : null}
+    </div> : null}
     {canResume ? <p>{prepared ? "Prepared target" : "Resume target"}: <code>{status?.run?.targetCommit?.slice(0, 12)}</code>. {prepared ? "Activation restarts CloudX and verifies the prepared build." : "Resume continues this saved update."}</p> : null}
     {notice ? <p role="status">{notice}</p> : null}
     {error ? <p role="alert">{error}</p> : null}

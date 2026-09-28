@@ -26,7 +26,8 @@ export class CloudxUpdateService {
 
   constructor(private readonly dataDir: string, private readonly execute: UpdateCommand = executeFile,
     private readonly catalog: Pick<CloudxUpdateCatalog, "preview"> = new CloudxUpdateCatalog(),
-    private readonly runtime: Pick<RuntimeBuild, "identity"> = runtimeBuild) {
+    private readonly runtime: Pick<RuntimeBuild, "identity"> = runtimeBuild,
+    private readonly forge?: { reconcileCompletedMerges(): Promise<void> }) {
     if (!path.isAbsolute(this.repoRoot)) throw new Error("CLOUDX_INSTALL_ROOT must be an absolute checkout path.");
     if (!path.isAbsolute(this.coordinatorRoot)) throw new Error("CLOUDX_UPDATE_COORDINATOR_ROOT must be an absolute coordinator path.");
   }
@@ -76,8 +77,18 @@ export class CloudxUpdateService {
     const request = parseCloudxUpdateRequest(value);
     this.beginChange();
     try {
-      const status = await this.status();
+      let status = await this.status();
       if (!status.available || status.run?.state === "running") return status;
+      if (this.forge) {
+        try { await this.forge.reconcileCompletedMerges(); }
+        catch (error) {
+          const current = await this.status();
+          if (current.forgeBlocker) return current;
+          throw error;
+        }
+        status = await this.status();
+        if (!status.available || status.run?.state === "running") return status;
+      }
       if (request.restoreSnapshotRunId && (status.confirmation?.restoreSnapshotRunId !== request.restoreSnapshotRunId
         || status.confirmation.targetCommit !== request.targetCommit)) {
         throw conflict("The recovery snapshot selection changed. Check update status and review the current data restoration notice.");

@@ -1,13 +1,16 @@
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import type { ConfigValue, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
+import type { ConfigValue, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
+import { isSameOrChildPath } from "./pathBoundary.js";
+import { WorkspaceCleanupConflictError } from "./workspace/WorkspaceErrors.js";
 import { PluginRegistry } from "./pluginRegistry.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { WORKSPACE_CONTROL_PLUGIN_ID } from "./plugins/WorkspaceControlPlugin.js";
@@ -44,6 +47,8 @@ const reportSessionBackgroundError: SessionBackgroundErrorReporter = (error, det
 
 export class SessionStore {
   private readonly tabs = new Map<string, WorkspaceTab>();
+  private readonly deletingDirectories = new Set<string>();
+  private readonly startingDirectories = new Map<string, number>();
   private readonly sessions = new Map<string, PluginSession>();
   private readonly launchOptions = new Map<string, PluginSessionLaunchOptions>();
   private readonly unpublishedTabIds = new Set<string>();
@@ -226,6 +231,17 @@ export class SessionStore {
     return this.getTab(tabId);
   }
 
+  async tabOwnershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
+    const tab = this.getTab(tabId);
+    const plugin = this.plugins.get(tab.pluginId);
+    if (this.disposed || this.tabClosures.has(tabId) || this.tabRecoveries.has(tabId) || this.tabOwnershipActions.has(tabId) ||
+        tab.ownerPluginId || tab.recovery?.state !== "missing" || !plugin.ownershipAvailability)
+      return { status: "unavailable", reason: "Ownership recovery is not applicable to this tab." };
+    const session = this.sessions.get(tabId);
+    if (session && !session.hasExited?.()) return { status: "unavailable", reason: "The Codex process is still active." };
+    return plugin.ownershipAvailability(await this.sessionInput(tab));
+  }
+
   previewTabOwnership(tabId: string): Promise<DirectoryOwnershipPreview> {
     return this.withStoppedTab(tabId, async (plugin, input) => {
       if (!plugin.previewOwnership) throw new Error("Directory ownership recovery is unavailable for this tab.");
@@ -282,6 +298,36 @@ export class SessionStore {
     this.triggers = triggers;
   }
 
+  async withInactiveDirectory<T>(directory: string, operation: () => Promise<T>): Promise<T> {
+    const resolved = path.resolve(directory);
+    if ([...this.deletingDirectories].some(active => isSameOrChildPath(active, resolved) || isSameOrChildPath(resolved, active)))
+      throw new WorkspaceCleanupConflictError("This workspace already has a cleanup in progress.");
+    this.deletingDirectories.add(resolved);
+    try {
+      if ([...this.startingDirectories.keys()].some(active => isSameOrChildPath(resolved, active)))
+        throw new WorkspaceCleanupConflictError("A session is starting in this workspace; cleanup was skipped.");
+      for (const tab of this.tabs.values()) {
+        const cwd = await fs.realpath(tab.cwd).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return path.resolve(tab.cwd);
+          throw error;
+        });
+        if (isSameOrChildPath(resolved, cwd)) throw new WorkspaceCleanupConflictError("An open or prepared session still uses this workspace.");
+      }
+      return await operation();
+    } finally { this.deletingDirectories.delete(resolved); }
+  }
+
+  private reserveSessionDirectory(directory: string): () => void {
+    if ([...this.deletingDirectories].some(deleting => isSameOrChildPath(deleting, directory)))
+      throw new Error("This workspace is being permanently deleted. Wait for cleanup to finish and select another directory.");
+    this.startingDirectories.set(directory, (this.startingDirectories.get(directory) ?? 0) + 1);
+    return () => {
+      const remaining = (this.startingDirectories.get(directory) ?? 1) - 1;
+      if (remaining) this.startingDirectories.set(directory, remaining);
+      else this.startingDirectories.delete(directory);
+    };
+  }
+
   async createTab(request: StartTabRequest): Promise<WorkspaceTab> {
     const tab = await this.prepareTab(request);
     return this.publishPreparedTab(tab.id);
@@ -312,7 +358,9 @@ export class SessionStore {
       updatedAt: now,
       contextPath: ""
     };
+    const releaseDirectory = this.reserveSessionDirectory(await fs.realpath(cwd));
     try {
+      await this.pathPolicy.ensureDirectory(cwd, false);
       const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
       const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
       if (templateIndicator) {
@@ -351,7 +399,7 @@ export class SessionStore {
         throw new AggregateError([error, cleanupError], "Plugin session creation failed and its cleanup is incomplete.");
       }
       throw error;
-    }
+    } finally { releaseDirectory(); }
     return this.getTab(id);
   }
 

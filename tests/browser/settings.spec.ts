@@ -2303,6 +2303,111 @@ test("workspace recovery retires saved CFG into Settings Codex without writing p
   expect(writes).not.toContain("/api/config");
 });
 
+test("Open Forge reveals its pane when another pane is maximized", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const state = (await (
+    await page.request.get(`${baseUrl}/api/workspace`)
+  ).json()) as WorkspaceStateResponse;
+  const timestamp = "2026-09-28T00:00:00Z";
+  state.tabs = [
+    {
+      id: "existing-forge",
+      pluginId: "forge",
+      title: "Forge",
+      cwd: testRoot,
+      status: "idle",
+      indicator: { color: "green", label: "Ready", updatedAt: timestamp },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+  ];
+  state.activeTabId = undefined;
+  state.windows[0].layout = {
+    activePaneId: "other-pane",
+    root: {
+      type: "split",
+      id: "split",
+      direction: "horizontal",
+      sizes: [50, 50],
+      children: [
+        { type: "pane", pane: { id: "other-pane", tabIds: [] } },
+        {
+          type: "pane",
+          pane: {
+            id: "forge-pane",
+            tabIds: ["existing-forge"],
+            activeTabId: "existing-forge",
+          },
+        },
+      ],
+    },
+  };
+  await page.route("**/api/workspace", (route) =>
+    route.fulfill({ json: state }),
+  );
+  await page.route("**/api/windows/*", (route) =>
+    route.fulfill({
+      json: {
+        ...state,
+        persistence: [{ name: "Workspace layout", state: "available" }],
+      },
+    }),
+  );
+  await page.route("**/api/tabs/*/active", (route) =>
+    route.fulfill({ json: {} }),
+  );
+  await page.routeWebSocket("**/ws/workspace", (socket) =>
+    socket.send(JSON.stringify({ type: "workspace", ...state })),
+  );
+  await page.route("**/api/hooks/forge.dashboard", (route) =>
+    route.fulfill({ json: { result: { configured: false, workers: [] } } }),
+  );
+  await page.route("**/api/system/update", (route) =>
+    route.fulfill({
+      json: {
+        available: true,
+        forgeBlocker: {
+          kind: "forge",
+          workerId: "worker-149",
+          issueNumber: 149,
+          message: "Forge has an uncertain merge.",
+          recoveryAction: "Recover the worker through Forge.",
+        },
+      },
+    }),
+  );
+  const creations: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      new URL(request.url()).pathname === "/api/tabs"
+    )
+      creations.push(request.url());
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await page
+    .locator('[data-pane-id="other-pane"]')
+    .getByRole("button", { name: "Maximize pane", exact: true })
+    .click();
+  const forge = page.locator('[data-pane-id="forge-pane"]');
+  await expect(forge).toBeHidden();
+  const settings = await openSettings(page, isMobile);
+  await settings.getByRole("tab", { name: "Updates", exact: true }).click();
+  await settings
+    .getByRole("button", { name: "Open Forge recovery", exact: true })
+    .click();
+  await expect(settings).toBeHidden();
+  await expect(forge).toBeVisible();
+  await expect(forge).toHaveClass(/active/);
+  await expect(
+    forge.getByRole("button", { name: "Configure Forge", exact: true }),
+  ).toBeVisible();
+  expect(creations).toEqual([]);
+  await captureSample(page, testInfo, "revealed-forge-pane");
+});
+
 async function showRecoveryWorkspace(page: Page, pluginId: string) {
   const state = (await (
     await page.request.get(`${baseUrl}/api/workspace`)

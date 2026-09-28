@@ -18,6 +18,9 @@ import {
   ForgeDiscussionReplyNotStartedError,
   ForgeHeadChangedError,
   ForgeMergeNotStartedError,
+  ForgeMergeRejectedError,
+  ForgeMutationUncertainError,
+  ForgeProviderUnavailableError,
   ForgeProviderError,
   requireDiscussion,
   requireMergeReady,
@@ -351,28 +354,39 @@ export class GitHubProvider implements ForgeProvider {
   async merge(
     number: number,
     expectedHeadSha: string,
+    expectedTargetHeadSha?: string,
   ): Promise<ForgeMergeResult> {
     let request: ForgeChangeRequest | undefined;
     let mergeMethod: GitHubMergeMethod;
     try {
       request = await this.getChangeRequest(number);
       requireMergeReady(request, expectedHeadSha);
+      if (expectedTargetHeadSha && request.targetHeadSha !== expectedTargetHeadSha)
+        throw new ForgeProviderError("The target branch advanced after final verification. Prepare a fresh candidate before merging.", 409);
       mergeMethod = await this.chooseMergeMethod(request.baseBranch);
     } catch (error) {
       throw new ForgeMergeNotStartedError(error, request);
     }
-    const response = record(
-      (
-        await this.http.request(`${this.pullPath(number)}/merge`, {
-          method: "PUT",
-          role: "worker",
-          body: { sha: expectedHeadSha, merge_method: mergeMethod },
-        })
-      ).body,
-    );
-    if (!boolean(response.merged))
-      throw new ForgeProviderError("GitHub did not confirm the merge.", 409);
-    return { merged: true, sha: string(response.sha) };
+    try {
+      const response = record(
+        (
+          await this.http.request(`${this.pullPath(number)}/merge`, {
+            method: "PUT",
+            role: "worker",
+            body: { sha: expectedHeadSha, merge_method: mergeMethod },
+          })
+        ).body,
+      );
+      if (!boolean(response.merged))
+        throw new ForgeProviderError("GitHub did not confirm the merge.", 409);
+      return { merged: true, sha: string(response.sha) };
+    } catch (error) {
+      if (error instanceof ForgeProviderError && !(error instanceof ForgeProviderUnavailableError) &&
+          !(error instanceof ForgeMutationUncertainError) &&
+          error.statusCode >= 400 && error.statusCode < 500)
+        throw new ForgeMergeRejectedError(error);
+      throw error;
+    }
   }
 
   private async chooseMergeMethod(baseBranch: string): Promise<GitHubMergeMethod> {

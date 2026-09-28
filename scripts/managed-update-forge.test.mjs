@@ -156,12 +156,14 @@ describe('Forge rollback ownership', () => {
   it.each([false, true])('restores a profile without prior Forge state after empty-store initialization (fresh coordinator: %s)', async freshCoordinator => {
     const f = await forgeUpdate();
     fs.unlinkSync(f.forgeFile);
+    let writerInode;
     const start = f.host.start.bind(f.host), restore = f.host.restore.bind(f.host);
     vi.spyOn(f.host, 'start').mockImplementation(async record => {
       start(record);
       f.forge.start();
       expect((await f.forge.dashboard()).workers).toEqual([]);
       expect(await f.store.read()).toEqual([]);
+      writerInode = fs.statSync(`${f.forgeFile}.writer-lock`).ino;
     });
     vi.spyOn(f.host, 'restore').mockImplementation(async record => {
       await f.forge.dispose();
@@ -187,6 +189,7 @@ describe('Forge rollback ownership', () => {
 
     expect(record.transition).toMatchObject({ restored: true, mutating: false });
     expect(fs.existsSync(f.forgeFile)).toBe(false);
+    expect(fs.statSync(`${f.forgeFile}.writer-lock`).ino).toBe(writerInode);
     expect(await f.store.read()).toEqual([]);
     expect(git(f.root, 'rev-parse', 'HEAD')).toBe(record.transition.sourceCommit);
     expect(fs.readFileSync(path.join(f.root, 'apps/server/dist/index.js'), 'utf8')).toBe('previous runtime');

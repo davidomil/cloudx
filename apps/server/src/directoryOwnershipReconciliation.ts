@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation } from "@cloudx/shared";
+import type { DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation } from "@cloudx/shared";
 import { assertDirectoryIdentity, readDirectoryIdentity, sameDirectoryIdentity, type DirectoryIdentity } from "./directoryIdentity.js";
 
 /** A reviewed legacy-device mapping never overrides existing durable evidence. */
@@ -10,6 +10,8 @@ export class DirectoryOwnershipReconciler {
     const current = await readDirectoryIdentity(saved.path, "Filesystem reconciliation directory");
     if (saved.path !== current.path || saved.ino !== current.ino || saved.durable && !sameDirectoryIdentity(saved, current))
       assertDirectoryIdentity(saved, current, "Filesystem reconciliation directory");
+    if (!sameDirectoryIdentity(saved, current) && (!current.durable || !["ef53", "9123683e"].includes(current.durable.filesystemType) || current.durable.birthtimeNs === "0"))
+      throw new Error("This filesystem cannot establish durable ownership after device reassignment. Restore the original mount before Resume.");
     this.identities.push({ saved: { ...saved }, current });
     return current;
   }
@@ -45,5 +47,16 @@ export class DirectoryOwnershipReconciler {
   async assertCurrent(): Promise<void> {
     for (const { current } of this.identities)
       assertDirectoryIdentity(current, await readDirectoryIdentity(current.path), "Filesystem reconciliation directory");
+  }
+}
+
+/** Availability uses the same read-only evidence and safety checks as inspection. */
+export async function directoryOwnershipAvailability(inspect: () => Promise<DirectoryOwnershipPreview>): Promise<DirectoryOwnershipAvailability> {
+  try {
+    const preview = await inspect();
+    if (!preview.directories.length) return { status: "not_needed" };
+    return { status: "available", reason: "A saved directory device changed. Verify its original filesystem before resuming." };
+  } catch (error) {
+    return { status: "unavailable", reason: error instanceof Error ? error.message : String(error) };
   }
 }
