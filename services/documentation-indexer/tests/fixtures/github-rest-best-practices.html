@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Best practices for using the REST API - GitHub Docs</title>
+  <script>window.documentationNavigation = "Do not index scripts";</script>
+  <style>.sidebar { display: block; }</style>
+</head>
+<body>
+  <!-- A representative documentation layout, with a shared sidebar longer than three chunks. -->
+  <header><a href="/">GitHub Docs</a><button>Choose a documentation version</button></header>
+  <nav id="docs-sidebar" aria-label="REST API documentation">
+    <h2>REST API documentation navigation</h2>
+    <section><h3>Get started with the REST API</h3><ul>
+      <li><a href="/rest/about">About the GitHub REST API and available endpoints</a></li>
+      <li><a href="/rest/quickstart">Quickstart for using the GitHub REST API</a></li>
+      <li><a href="/rest/versions">API versions and supported REST API request headers</a></li>
+      <li><a href="/rest/breaking-changes">Breaking changes and migration notices for REST API clients</a></li>
+      <li><a href="/rest/openapi">About the OpenAPI description for the REST API</a></li>
+      <li><a href="/rest/resources">Resources available through the GitHub REST API</a></li>
+      <li><a href="/rest/libraries">Libraries and examples for calling the REST API</a></li>
+      <li><a href="/rest/glossary">REST API terminology and request parameter glossary</a></li>
+    </ul></section>
+    <section><h3>Using the REST API</h3><ul>
+      <li><a href="/rest/best-practices">Best practices for using the REST API</a></li>
+      <li><a href="/rest/authentication">Authenticating requests to the GitHub REST API</a></li>
+      <li><a href="/rest/credentials">Keeping your REST API credentials secure</a></li>
+      <li><a href="/rest/rate-limits">Rate limits for the REST API and request quotas</a></li>
+      <li><a href="/rest/pagination">Using pagination in the GitHub REST API</a></li>
+      <li><a href="/rest/troubleshooting">Troubleshooting common REST API request errors</a></li>
+      <li><a href="/rest/cors">Cross origin resource sharing for the REST API</a></li>
+      <li><a href="/rest/jsonp">Using JSONP callbacks with REST API responses</a></li>
+    </ul></section>
+    <section><h3>Repository REST API endpoints</h3><ul>
+      <li><a href="/rest/repos/about">About repositories and repository REST API permissions</a></li>
+      <li><a href="/rest/repos/list">List repositories available to the authenticated user</a></li>
+      <li><a href="/rest/repos/create">Create and configure repositories with the REST API</a></li>
+      <li><a href="/rest/repos/contents">Read repository contents and download files using the REST API</a></li>
+      <li><a href="/rest/repos/branches">Manage repository branches and protection using the REST API</a></li>
+      <li><a href="/rest/repos/releases">Create repository releases and upload release assets</a></li>
+      <li><a href="/rest/repos/tags">List repository tags and annotated tag references</a></li>
+      <li><a href="/rest/repos/statistics">Retrieve repository statistics and contributor activity</a></li>
+    </ul></section>
+    <section><h3>Issue and pull request REST API endpoints</h3><ul>
+      <li><a href="/rest/issues/list">List and filter repository issues using the REST API</a></li>
+      <li><a href="/rest/issues/create">Create issues and update issue descriptions and metadata</a></li>
+      <li><a href="/rest/issues/comments">Read and create comments on repository issues</a></li>
+      <li><a href="/rest/issues/labels">Manage labels and milestones for repository issues</a></li>
+      <li><a href="/rest/pulls/list">List and filter repository pull requests using the REST API</a></li>
+      <li><a href="/rest/pulls/reviews">Create and submit pull request reviews through the REST API</a></li>
+      <li><a href="/rest/pulls/comments">Read and create pull request review discussion comments</a></li>
+      <li><a href="/rest/pulls/merge">Merge pull requests and inspect merge eligibility</a></li>
+    </ul></section>
+    <section><h3>Organization and team REST API endpoints</h3><ul>
+      <li><a href="/rest/orgs/about">About organizations and supported organization REST API operations</a></li>
+      <li><a href="/rest/orgs/members">List organization members and inspect membership status</a></li>
+      <li><a href="/rest/orgs/invitations">Manage organization membership invitations using the REST API</a></li>
+      <li><a href="/rest/orgs/outside">Manage outside collaborators and repository permissions</a></li>
+      <li><a href="/rest/teams/list">List organization teams and inspect team membership</a></li>
+      <li><a href="/rest/teams/repositories">Manage team access to organization repositories</a></li>
+      <li><a href="/rest/teams/discussions">Read organization team discussions using the REST API</a></li>
+      <li><a href="/rest/orgs/audit-log">Retrieve organization audit log records through the REST API</a></li>
+    </ul></section>
+    <section><h3>Actions and deployment REST API endpoints</h3><ul>
+      <li><a href="/rest/actions/workflows">List repository workflows and trigger workflow dispatch events</a></li>
+      <li><a href="/rest/actions/runs">Inspect workflow runs and download execution logs</a></li>
+      <li><a href="/rest/actions/jobs">Inspect workflow jobs and step execution results</a></li>
+      <li><a href="/rest/actions/artifacts">List workflow artifacts and download retained build outputs</a></li>
+      <li><a href="/rest/actions/runners">Manage self hosted workflow runners using the REST API</a></li>
+      <li><a href="/rest/actions/secrets">Configure encrypted workflow secrets and organization access</a></li>
+      <li><a href="/rest/deployments">Create repository deployments and deployment status updates</a></li>
+      <li><a href="/rest/environments">Manage repository environments and deployment protection rules</a></li>
+    </ul></section>
+    <section><h3>Application and webhook REST API endpoints</h3><ul>
+      <li><a href="/rest/apps/about">About GitHub Apps and REST API installation authentication</a></li>
+      <li><a href="/rest/apps/installations">List application installations and inspect installation access</a></li>
+      <li><a href="/rest/apps/tokens">Create and revoke installation access tokens for applications</a></li>
+      <li><a href="/rest/apps/permissions">Inspect application permissions and repository selections</a></li>
+      <li><a href="/rest/webhooks/configuration">Configure repository webhook subscriptions using the REST API</a></li>
+      <li><a href="/rest/webhooks/deliveries">List webhook deliveries and inspect delivery responses</a></li>
+      <li><a href="/rest/webhooks/redelivery">Request redelivery of a repository webhook event</a></li>
+      <li><a href="/rest/webhooks/signatures">Validate webhook signatures and secure event delivery</a></li>
+    </ul></section>
+    <section><h3>Security and account REST API endpoints</h3><ul>
+      <li><a href="/rest/security/advisories">Read repository security advisories and vulnerability details</a></li>
+      <li><a href="/rest/security/alerts">List repository security alerts using the GitHub REST API</a></li>
+      <li><a href="/rest/security/code-scanning">Inspect code scanning analyses and alert locations</a></li>
+      <li><a href="/rest/security/secret-scanning">Inspect secret scanning alerts and resolution metadata</a></li>
+      <li><a href="/rest/users/profile">Read authenticated account profile information using the REST API</a></li>
+      <li><a href="/rest/users/emails">Manage account email addresses and verification metadata</a></li>
+      <li><a href="/rest/users/keys">Manage account public keys and inspect authentication keys</a></li>
+      <li><a href="/rest/users/notifications">List account notifications and manage notification subscriptions</a></li>
+    </ul></section>
+    <section><h3>Additional REST API reference</h3><ul>
+      <li><a href="/rest/search">Search repositories issues and users through REST API endpoints</a></li>
+      <li><a href="/rest/licenses">Read repository licenses and supported license templates</a></li>
+      <li><a href="/rest/markdown">Render Markdown using the GitHub REST API</a></li>
+      <li><a href="/rest/meta">Inspect GitHub service metadata and published IP ranges</a></li>
+      <li><a href="/rest/emojis">List available emoji identifiers through the REST API</a></li>
+      <li><a href="/rest/enterprise">Manage enterprise accounts and enterprise REST API settings</a></li>
+      <li><a href="/rest/metrics">Read organization metrics and repository activity reports</a></li>
+      <li><a href="/rest/support">REST API support resources and service status information</a></li>
+      <li><a href="/rest/changelog">Read REST API changelog entries and upcoming deprecation notices</a></li>
+      <li><a href="/rest/examples">Browse integration examples for common REST API workflows</a></li>
+    </ul></section>
+  </nav>
+  <main id="main-content">
+    <nav aria-label="Breadcrumbs">REST API / Using the REST API / Best practices</nav>
+    <article>
+      <header><h1>Best practices for using the REST API</h1></header>
+      <p>This guide covers consuming GitHub's REST API, rather than designing a general REST API.</p>
+      <section><h2>Prefer events to repeated reads</h2>
+        <p>Use webhooks instead of polling the API. Subscribe to the events your integration needs and process each delivery.</p>
+      </section>
+      <section><h2>Authenticate requests</h2>
+        <p>Make authenticated requests to obtain the appropriate rate limit. Keep credentials secret and grant only the permissions required by your integration.</p>
+      </section>
+      <section><h2>Avoid concurrent requests</h2>
+        <p>Send requests serially to reduce the risk of secondary rate limits. Pause between large numbers of mutating requests.</p>
+      </section>
+      <section><h2>Handle rate limit responses</h2>
+        <p>Respect Retry-After when the server returns it. Wait for the rate limit reset when the remaining quota is zero.</p>
+        <table><thead><tr><th>Response header</th><th>Client action</th></tr></thead><tbody>
+          <tr><td>Retry-After</td><td>Wait the specified number of seconds before another request.</td></tr>
+          <tr><td>x-ratelimit-reset</td><td>Resume after the reset time when the quota is exhausted.</td></tr>
+        </tbody></table>
+      </section>
+      <section><h2>Use conditional requests</h2>
+        <p>Cache the ETag response value and send it in If-None-Match on subsequent requests.</p>
+        <pre><code>curl --header 'If-None-Match: "cached-etag"' https://api.github.com/repos/example/project</code></pre>
+        <aside role="note">A 304 response can reuse the cached representation.</aside>
+      </section>
+      <section><h2>Follow published URLs</h2>
+        <p>Follow pagination links supplied in the Link response header. Do not parse identifiers out of URLs or assume undocumented URL shapes remain stable.</p>
+      </section>
+    </article>
+    <div role="navigation" aria-label="Article pagination">Previous REST API guide / Next REST API guide</div>
+  </main>
+  <footer>Privacy statement / Terms of service / Contact support</footer>
+</body>
+</html>
