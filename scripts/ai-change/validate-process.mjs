@@ -1813,6 +1813,73 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
       );
     }
   }
+  for (const [name, scenario] of [
+    ["clean-install", "install"],
+    ["installed-upgrade", "upgrade"],
+  ]) {
+    const job = jobs[name];
+    const steps = Array.isArray(job?.steps) ? job.steps.filter(isRecord) : [];
+    const space = steps.find((step) => step.id === "lifecycle-space");
+    if (
+      !space ||
+      !boundedTimeout(space, 5) ||
+      !String(space.run).includes(
+        "sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet",
+      ) ||
+      !["before", "after"].every((phase) =>
+        String(space.run).includes(
+          `lifecycle-${scenario}/disk-space-${phase}.txt`,
+        ),
+      )
+    ) {
+      issues.push(
+        `Workflow '${workflowName}' ${name} must reclaim only unused runner SDKs with a bounded step and retained disk-space evidence.`,
+      );
+    }
+    if (
+      !isRecord(job) ||
+      job["runs-on"] !== "ubuntu-24.04" ||
+      job.container !== undefined ||
+      job.if !== undefined ||
+      job["continue-on-error"] !== undefined ||
+      !normalizedNeeds(job).includes("lifecycle-revisions") ||
+      job.env?.SOURCE_SHA !==
+        "${{ needs.lifecycle-revisions.outputs.source-sha }}" ||
+      job.env?.TARGET_SHA !==
+        "${{ needs.lifecycle-revisions.outputs.target-sha }}" ||
+      !jobCommands(job).includes(
+        `bash scripts/ci/lifecycle-host.sh ${scenario} \"$SOURCE_SHA\" \"$TARGET_SHA\"`,
+      ) ||
+      !steps.some(
+        (step) =>
+          step.uses?.startsWith("actions/upload-artifact@") &&
+          step.if === "always()" &&
+          step.with?.["if-no-files-found"] === "error",
+      ) ||
+      !normalizedNeeds(jobs.aggregate ?? {}).includes(name) ||
+      !(jobs.aggregate?.steps ?? []).some((step) =>
+        Object.values(step.env ?? {}).includes(`\${{ needs.${name}.result }}`),
+      )
+    ) {
+      issues.push(
+        `Workflow '${workflowName}' must require ${name} on a disposable Ubuntu host, retain failure evidence, and include its result in the aggregate.`,
+      );
+    }
+  }
+  const revisions = jobs["lifecycle-revisions"];
+  if (
+    !isRecord(revisions) ||
+    !jobCommands(revisions).includes("scripts/ci/lifecycle-revisions.mjs") ||
+    revisions.outputs?.["source-sha"] !==
+      "${{ steps.revisions.outputs.source-sha }}" ||
+    revisions.outputs?.["target-sha"] !==
+      "${{ steps.revisions.outputs.target-sha }}" ||
+    !normalizedNeeds(jobs.aggregate ?? {}).includes("lifecycle-revisions")
+  ) {
+    issues.push(
+      `Workflow '${workflowName}' must select immutable supported lifecycle revisions once and require that selection in the aggregate.`,
+    );
+  }
   const verifier = jobs["isolated-lanes"];
   if (!isRecord(verifier)) {
     issues.push(`Workflow '${workflowName}' must define isolated-lanes.`);

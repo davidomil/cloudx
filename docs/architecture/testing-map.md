@@ -29,6 +29,11 @@ Browser setup is defined in `playwright.config.ts`; service setup is described
 in `docs/SETUP.md`. Missing environments and skipped checks are verification gaps,
 not passes. Actual supported-host checks are needed for platform-specific claims.
 
+The required [installation and upgrade jobs](../CI_LIFECYCLES.md) run the real
+installer on fresh Ubuntu application accounts and exercise the previous
+version's Settings handoff to a pinned candidate. Their systemd, native Codex,
+frontend and saved-profile assertions complement the lower-level updater tests.
+
 The legacy Gate-B smart HTTP publisher tests use immutable historical Git data
 retained by `test-fixtures/gate-b-smart-http-v1`, pointing to
 `465896c9ec4da70af5f312db3a35d2c137a5513c`. Keep this test-fixture tag when deleting
