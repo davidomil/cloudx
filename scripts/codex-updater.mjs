@@ -3,16 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isExactCodexVersion as isVersion, readCodexSelection } from "./codex-selection.mjs";
 
-const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const UPDATE_TIMEOUT_MS = 180_000;
 const OUTPUT_LIMIT = 512 * 1024;
-
-function isVersion(value) {
-  return (
-    typeof value === "string" && value.length <= 128 && VERSION.test(value)
-  );
-}
 
 export class CodexUpdateError extends Error {
   constructor(code, message, usableVersion = null) {
@@ -87,6 +81,7 @@ function verifyNpmOwnership({ assistantBin, prefix }, allowMissing = false) {
     if (
       !entrypoint.startsWith(`${packageDir}${path.sep}`) ||
       fs.realpathSync(packageDir) !== packageDir ||
+      !fs.realpathSync(entrypoint).startsWith(`${packageDir}${path.sep}`) ||
       fs.realpathSync(assistantBin) !== fs.realpathSync(entrypoint)
     )
       throw unsupportedInstallation();
@@ -493,158 +488,196 @@ export async function readCodexVersion(
   );
 }
 
-async function verifyCodexLaunch(assistantBin, options) {
+async function verifyCodexLaunch(assistantBin, options, previousAssistantBin) {
   const verifier = fileURLToPath(
     new URL("./codex-runtime-verification.mjs", import.meta.url),
   );
+  const stateHome = path.resolve(options.env.CODEX_HOME?.trim() || path.join(options.env.HOME?.trim() || os.homedir(), ".codex"));
+  const args = [verifier, assistantBin, "--shared-state-home", stateHome];
+  if (options.env.CLOUDX_DATA_DIR) args.push("--cloudx-data-dir", options.env.CLOUDX_DATA_DIR);
+  if (previousAssistantBin && previousAssistantBin !== assistantBin) args.push("--previous-bin", previousAssistantBin);
   try {
-    await runCommand(process.execPath, [verifier, assistantBin], {
+    await runCommand(process.execPath, args, {
       ...options,
-      timeoutMs: 60_000,
+      timeoutMs: 120_000,
     });
   } catch (error) {
     if (["cancelled", "timeout", "output-limit", "log-unavailable", "cleanup-incomplete", "supervision-unavailable"].includes(error.code)) throw error;
     throw new CodexUpdateError(
       "runtime-verification",
-      "The installed Codex CLI failed CloudX tab launch, conversation selection, or permission verification. Check the private update log or installer output for the failed step. Repair the installation or select a supported Codex executable before launching new tabs; run the Codex update again to verify it.",
+      "The candidate Codex CLI failed CloudX tab launch, conversation selection, Forge turn, or shared-state compatibility verification. The active selection is unchanged. Check the private update log or installer output for the failed step before selecting a supported release.",
     );
+  }
+}
+
+function compareVersions(left, right) {
+  const parts = version => {
+    const [, core, prerelease] = /^(\d+\.\d+\.\d+)(?:-([^+]+))?/.exec(version);
+    return [...core.split("."), ...(prerelease?.split(".") ?? [])];
+  };
+  const a = parts(left), b = parts(right);
+  for (let index = 0; index < Math.max(a.length, b.length); index++) {
+    if (a[index] === b[index]) continue;
+    if (index >= 3 && (a[index] === undefined || b[index] === undefined)) {
+      if (index === 3) return a[index] === undefined ? 1 : -1;
+      return a[index] === undefined ? -1 : 1;
+    }
+    const numericA = /^\d+$/.test(a[index]), numericB = /^\d+$/.test(b[index]);
+    if (numericA && numericB) return BigInt(a[index]) > BigInt(b[index]) ? 1 : -1;
+    if (numericA !== numericB) return numericA ? -1 : 1;
+    return a[index] > b[index] ? 1 : -1;
+  }
+  return 0;
+}
+
+export async function listCodexReleases({ prefix, env = process.env, ...options } = {}) {
+  const response = await runCommand("npm", ["view", "@openai/codex", "versions", "dist-tags", "--json"], {
+    ...options,
+    env: prefix ? npmEnvironment(prefix, env) : { ...env, npm_config_fetch_retries: "0", npm_config_update_notifier: "false", npm_config_logs_max: "0" },
+    timeoutMs: options.timeoutMs ?? 30_000,
+  });
+  let metadata;
+  try { metadata = JSON.parse(response); } catch { /* Rejected below. */ }
+  const versions = metadata?.versions;
+  const latestStable = metadata?.["dist-tags"]?.latest;
+  if (!Array.isArray(versions) || !versions.length || versions.some(version => !isVersion(version)) ||
+      !isVersion(latestStable) || latestStable.split("+")[0].includes("-") || !versions.includes(latestStable)) {
+    throw new CodexUpdateError("installation", "npm did not report a valid published Codex release list and latest stable version. Check the registry configuration and private update log.");
+  }
+  return {
+    latestStable,
+    versions: [...new Set(versions)].sort((a, b) => compareVersions(b, a)).map(version => ({ version, prerelease: version.split("+")[0].includes("-") })),
+  };
+}
+
+function activateCodexSelection(prefix, active, previous, signal) {
+  if (signal.aborted) throw new CodexUpdateError("cancelled", "The Codex selection was cancelled before activation. The previously active installation is unchanged.");
+  const destination = path.join(prefix, ".cloudx-codex-selection.json");
+  const temporary = `${destination}.${process.pid}.tmp`;
+  let descriptor;
+  try {
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify({ schemaVersion: 1, active, previous }, null, 2)}\n`);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    fs.renameSync(temporary, destination);
+  } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    fs.rmSync(temporary, { force: true });
+    throw filesystemError(error);
   }
 }
 
 export async function updateCodexInstallation({
   assistantBin,
   prefix,
+  targetVersion = "latest",
   env = process.env,
   signal,
   onProgress,
   onOutput,
+  onTarget,
+  onInstalled,
   timeoutMs = UPDATE_TIMEOUT_MS,
 }) {
+  if (targetVersion !== "latest" && !isVersion(targetVersion)) {
+    throw new CodexUpdateError("invalid-version", "Select an exact published Codex version, such as 0.155.1, or explicitly select latest stable.");
+  }
   const installation = resolveCodexInstallation({ assistantBin, prefix });
   const release = acquireCodexInstallationLock(installation.prefix);
-  const deadline = AbortSignal.timeout(
-    Math.max(1, Math.min(timeoutMs, UPDATE_TIMEOUT_MS)),
-  );
-  const operationSignal = signal
-    ? AbortSignal.any([signal, deadline])
-    : deadline;
+  const deadline = AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, UPDATE_TIMEOUT_MS)));
+  const operationSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
   const npmEnv = npmEnvironment(installation.prefix, env);
-  const commandOptions = {
-    env: npmEnv,
-    signal: operationSignal,
-    onOutput,
-    outputBudget: { remaining: OUTPUT_LIMIT },
-  };
-  let previousVersion = null;
+  const commandOptions = { env: npmEnv, signal: operationSignal, onOutput, outputBudget: { remaining: OUTPUT_LIMIT } };
+  let activeVersion = null;
+  let selectedVersion = null;
   let retainLock = false;
-  let verifyingRuntime = false;
+  let activeInstallation = installation;
   try {
-    const initialPackageVersion = verifyNpmOwnership(installation, true);
+    const selection = readCodexSelection(installation.prefix);
+    if (selection) activeInstallation = { assistantBin: selection.active.assistantBin, prefix: path.dirname(path.dirname(selection.active.assistantBin)) };
+    const initialPackageVersion = verifyNpmOwnership(activeInstallation, !selection);
     onProgress?.("checking");
     try {
-      previousVersion = await readCodexVersion(
-        installation.assistantBin,
-        commandOptions,
-      );
+      activeVersion = await readCodexVersion(activeInstallation.assistantBin, commandOptions);
     } catch (error) {
-      if (
-        [
-          "cancelled",
-          "timeout",
-          "output-limit",
-          "log-unavailable",
-          "cleanup-incomplete",
-          "supervision-unavailable",
-        ].includes(error.code)
-      )
-        throw error;
+      if (error.code !== "verification") throw error;
     }
-    const response = await runCommand(
-      "npm",
-      ["view", "@openai/codex@latest", "version", "--json"],
-      { ...commandOptions, timeoutMs: 30_000 },
-    );
-    let latest;
-    try {
-      latest = JSON.parse(response);
-    } catch {
-      /* Invalid registry output is handled below. */
+    if ((selection && activeVersion !== selection.active.version) || (activeVersion && activeVersion !== initialPackageVersion)) {
+      throw new CodexUpdateError("verification", "The active Codex executable no longer matches its installed package or verified selection. Repair that installation before selecting another version.");
     }
-    if (!isVersion(latest))
-      throw new CodexUpdateError(
-        "installation",
-        "npm did not report a valid latest Codex version. Check the npm registry configuration and private update log.",
-      );
-    if (previousVersion === latest) {
-      if (previousVersion !== initialPackageVersion)
-        throw new CodexUpdateError(
-          "verification",
-          "Codex reports a different version from its installed npm package. Repair the npm installation before trying again.",
-        );
+    const releases = await listCodexReleases({ ...commandOptions, prefix: installation.prefix });
+    const target = targetVersion === "latest" ? releases.latestStable : targetVersion;
+    if (!releases.versions.some(release => release.version === target)) throw new CodexUpdateError("unpublished-version", `Codex ${target} is not a published @openai/codex release. Select a version from the release list.`);
+    onTarget?.(target);
+    if (activeVersion === target) {
+      onInstalled?.(activeVersion);
       onProgress?.("verifying");
-      verifyingRuntime = true;
-      await verifyCodexLaunch(installation.assistantBin, commandOptions);
-      return {
-        outcome: "current",
-        installedVersion: previousVersion,
-        previousVersion,
-      };
+      await verifyCodexLaunch(activeInstallation.assistantBin, commandOptions);
+      if (!selection) activateCodexSelection(installation.prefix, { version: activeVersion, assistantBin: activeInstallation.assistantBin }, null, operationSignal);
+      selectedVersion = activeVersion;
+      return { outcome: "current", installedVersion: activeVersion, activeVersion, previousVersion: selection?.previous?.version ?? null };
     }
-    onProgress?.("updating");
-    await runCommand(
-      "npm",
-      ["i", "-g", "--prefix", installation.prefix, "@openai/codex@latest"],
-      { ...commandOptions, timeoutMs: 120_000 },
-    );
+    let candidate;
+    if (selection?.previous?.version === target) {
+      candidate = { assistantBin: selection.previous.assistantBin, prefix: path.dirname(path.dirname(selection.previous.assistantBin)) };
+    } else {
+      onProgress?.("updating");
+      const candidates = path.join(installation.prefix, ".cloudx-codex");
+      fs.mkdirSync(candidates, { recursive: true });
+      if (fs.realpathSync(candidates) !== candidates) throw unsupportedInstallation();
+      const candidatePrefix = fs.mkdtempSync(path.join(candidates, `${target}-`));
+      candidate = { prefix: candidatePrefix, assistantBin: path.join(candidatePrefix, "bin/codex") };
+      await runCommand("npm", ["i", "-g", "--prefix", candidate.prefix, `@openai/codex@${target}`], {
+        ...commandOptions,
+        env: npmEnvironment(candidate.prefix, env),
+        timeoutMs: 120_000,
+      });
+    }
     onProgress?.("verifying");
-    const packageVersion = verifyNpmOwnership(installation);
-    const installedVersion = await readCodexVersion(
-      installation.assistantBin,
-      commandOptions,
-    );
-    if (installedVersion !== packageVersion || installedVersion !== latest)
-      throw new CodexUpdateError(
-        "verification",
-        "Codex reports a different version from the requested npm release. Check the private update log and repair the npm installation before trying again.",
-      );
-    verifyingRuntime = true;
-    await verifyCodexLaunch(installation.assistantBin, commandOptions);
-    return { outcome: "updated", installedVersion, previousVersion };
+    const packageVersion = verifyNpmOwnership(candidate);
+    const installedVersion = await readCodexVersion(candidate.assistantBin, commandOptions);
+    onInstalled?.(installedVersion);
+    if (installedVersion !== packageVersion || installedVersion !== target) throw new CodexUpdateError("verification", "Codex reports a different version from the requested npm release. The active installation is unchanged; check the private update log.");
+    await verifyCodexLaunch(candidate.assistantBin, commandOptions, selection?.active.assistantBin);
+    activateCodexSelection(installation.prefix, { version: installedVersion, assistantBin: candidate.assistantBin }, selection?.active ?? null, operationSignal);
+    selectedVersion = installedVersion;
+    return { outcome: "updated", installedVersion, activeVersion: installedVersion, previousVersion: selection?.active.version ?? null };
   } catch (error) {
     if (error.code === "cleanup-incomplete") {
       retainLock = true;
       throw error;
     }
-    let usableVersion = null;
-    if (!verifyingRuntime) {
+    // Candidate preparation never writes the active installation or its dependencies.
+    // A second bounded check can establish the original version after early cancellation.
+    if (!activeVersion) {
       try {
-        verifyNpmOwnership(installation);
-        usableVersion = await readCodexVersion(installation.assistantBin, {
-          env: npmEnv,
-          timeoutMs: 5_000,
-        });
+        verifyNpmOwnership(activeInstallation);
+        activeVersion = await readCodexVersion(activeInstallation.assistantBin, { env: npmEnv, timeoutMs: 5_000 });
       } catch (verificationError) {
         if (verificationError.code === "cleanup-incomplete") {
           retainLock = true;
           throw verificationError;
         }
-        /* A failed verification must clear the displayed usable version. */
       }
     }
-    const failure =
-      error instanceof CodexUpdateError
-        ? error
-        : commandFailure(error, "", "npm");
-    if (deadline.aborted && !signal?.aborted) {
-      throw new CodexUpdateError(
-        "timeout",
-        "The Codex update exceeded its time limit. Check network access and the private update log before trying again.",
-        usableVersion,
-      );
-    }
-    failure.usableVersion = usableVersion;
+    const failure = error instanceof CodexUpdateError ? error :
+      error.code === "selection" ? new CodexUpdateError("selection", error.message) : commandFailure(error, "", "npm");
+    if (deadline.aborted && !signal?.aborted) throw new CodexUpdateError("timeout", "The Codex update exceeded its time limit. Check network access and the private update log before trying again.", activeVersion);
+    failure.usableVersion = activeVersion;
     throw failure;
   } finally {
-    if (!retainLock) release();
+    if (!retainLock) {
+      try { release(); }
+      catch (error) {
+        if (!selectedVersion) throw error;
+        throw new CodexUpdateError(
+          "lock-release",
+          `Codex ${selectedVersion} is selected for new launches, but the installation lock could not be removed. Check prefix permissions and remove any remaining .cloudx-codex-update.lock only after confirming no installer is running.`,
+          selectedVersion,
+        );
+      }
+    }
   }
 }

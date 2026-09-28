@@ -17,6 +17,7 @@ import {
   resolveCodexInstallation,
   updateCodexInstallation,
 } from "./codex-updater.mjs";
+import { readCodexSelection, resolveSelectedCodexCommand } from "./codex-selection.mjs";
 import {
   SERVICE_NAMES,
   TERMINAL_SERVICE_NAME,
@@ -2223,6 +2224,11 @@ async function runCodexUpdater({ paths, commands, env }) {
     prefix: savedEnv.CLOUDX_NPM_GLOBAL_DIR ?? paths.npmGlobalDir,
   });
   paths.npmGlobalDir = installation.prefix;
+  const verificationEnv = { ...env };
+  for (const key of ["CODEX_HOME", "CODEX_SQLITE_HOME", "CLOUDX_DATA_DIR"]) {
+    if (savedEnv[key] !== undefined) verificationEnv[key] = savedEnv[key];
+  }
+  verificationEnv.CLOUDX_DATA_DIR ??= paths.dataDir;
 
   section("Update only Codex CLI");
   const { assistantBin } = installation;
@@ -2234,7 +2240,7 @@ async function runCodexUpdater({ paths, commands, env }) {
   } else {
     const result = await updateCodexInstallation({
       ...installation,
-      env,
+      env: verificationEnv,
       onProgress: (stage) => console.log(`Codex: ${stage}.`),
       onOutput: output => process.stderr.write(output),
     });
@@ -2247,11 +2253,24 @@ async function runCodexUpdater({ paths, commands, env }) {
 }
 
 function installCodexCli(commands, paths, env, version = CODEX_CLI_VERSION) {
+  const savedEnv = fs.existsSync(paths.envPath)
+    ? parseEnvironmentFile(fs.readFileSync(paths.envPath, "utf8"))
+    : {};
+  const configuredBin = savedEnv.CLOUDX_ASSISTANT_BIN ?? env.CLOUDX_ASSISTANT_BIN;
+  if (configuredBin && path.isAbsolute(configuredBin) && path.basename(configuredBin) === "codex" && path.basename(path.dirname(configuredBin)) === "bin") {
+    const configured = resolveCodexInstallation({ assistantBin: configuredBin });
+    if (readCodexSelection(configured.prefix)) paths.npmGlobalDir = configured.prefix;
+  }
   const assistantBin = codexCliBin(paths);
   const npmEnv = codexNpmEnv(paths, env);
   commands.mkdir(paths.npmGlobalDir);
   const release = commands.dryRun ? () => {} : acquireCodexInstallationLock(paths.npmGlobalDir);
   try {
+    const selected = readCodexSelection(paths.npmGlobalDir);
+    if (selected && version !== "latest") {
+      console.log(`Retaining selected Codex ${selected.active.version}. Change the selection in Settings > Codex.`);
+      return assistantBin;
+    }
     commands.run(
       "npm",
       [
@@ -2270,6 +2289,7 @@ function installCodexCli(commands, paths, env, version = CODEX_CLI_VERSION) {
 }
 
 async function verifyCodex(commands, prompt, assistantBin, paths, env) {
+  assistantBin = resolveSelectedCodexCommand(assistantBin);
   const npmEnv = codexNpmEnv(paths, env);
   commands.run(assistantBin, ["--version"], { env: npmEnv });
   if (!commands.statusOk(assistantBin, ["login", "status"], { env: npmEnv })) {

@@ -13,6 +13,7 @@ import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProces
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
+import { CodexStateCompatibility } from "./CodexStateCompatibility.js";
 import { completedVerificationTurn, readVerificationTranscript, type VerificationTranscriptEvent } from "./CodexVerificationTranscript.js";
 
 export interface CodexRuntimeVerificationOptions {
@@ -20,10 +21,35 @@ export interface CodexRuntimeVerificationOptions {
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   onOutput?: (text: string) => void;
+  sharedStateHome?: string;
+  dataDir?: string;
+  previousAssistantBin?: string;
 }
 
 /** Verify the installed binary through the same isolated overlay, PTY and bridge as a new tab. */
-export async function verifyCodexRuntime({ assistantBin, env = process.env, signal, onOutput }: CodexRuntimeVerificationOptions): Promise<void> {
+export async function verifyCodexRuntime(options: CodexRuntimeVerificationOptions): Promise<void> {
+  await verifyIsolatedCodexRuntime(options);
+  if (!options.sharedStateHome) return;
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-state-verification-"));
+  try {
+    const compatibility = new CodexStateCompatibility(options.env ?? process.env, options.signal);
+    const snapshots = await compatibility.snapshots(options.sharedStateHome, options.dataDir, path.join(directory, "snapshots"));
+    for (const sqliteHome of snapshots) {
+      const sessionId = await verifyIsolatedCodexRuntime(options, sqliteHome);
+      await compatibility.verifyConversation(sqliteHome, sessionId);
+      if (options.previousAssistantBin && options.previousAssistantBin !== options.assistantBin) {
+        const previousSessionId = await verifyIsolatedCodexRuntime({ ...options, assistantBin: options.previousAssistantBin }, sqliteHome);
+        await compatibility.verifyConversation(sqliteHome, previousSessionId);
+        await compatibility.verifyConversation(sqliteHome, sessionId);
+      }
+    }
+    options.onOutput?.(`Native compatibility verified against ${snapshots.length} distinct retained SQLite schemas using isolated copies.\n`);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, signal, onOutput }: CodexRuntimeVerificationOptions, sqliteHome?: string): Promise<string> {
   if (typeof assistantBin !== "string" || !path.isAbsolute(assistantBin)) throw new Error("Codex runtime verification requires an absolute executable path.");
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-verification-"));
   const home = path.join(root, "home");
@@ -63,6 +89,7 @@ export async function verifyCodexRuntime({ assistantBin, env = process.env, sign
       '# CloudX launch preferences: {"defaultSkills":{"imagegen":false}}',
       'model = "cloudx-native"', 'model_provider = "cloudx-native"',
       'check_for_update_on_startup = false', 'approval_policy = "on-request"', 'sandbox_mode = "read-only"',
+      ...(sqliteHome ? [`sqlite_home = ${JSON.stringify(sqliteHome)}`] : []),
       '[model_providers.cloudx-native]', 'name = "CloudX runtime verification"',
       `base_url = "http://127.0.0.1:${port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
       `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
@@ -138,6 +165,7 @@ export async function verifyCodexRuntime({ assistantBin, env = process.env, sign
     assert.equal(session.snapshot().status, "completed");
     assert.equal(requests.filter(value => value === "conversation").length, 2);
     onOutput?.("Resumed Forge turn matched the selected thread, native completion and final shutdown.\n");
+    return identity.sessionId;
   } catch (error) {
     // Read the latest evidence before teardown, including failures before the transcript checkpoint.
     let selected: ReturnType<CodexConversationRecovery["read"]>;

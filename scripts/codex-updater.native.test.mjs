@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { updateCodexInstallation } from "./codex-updater.mjs";
+import { readCodexSelection, resolveSelectedCodexCommand } from "./codex-selection.mjs";
 
 const nativeBinary = process.env.CLOUDX_NATIVE_CODEX;
 
@@ -29,22 +30,36 @@ describe.skipIf(!nativeBinary)("native Codex update acceptance", () => {
       await fs.writeFile(path.join(tools, "npm"), `#!${process.execPath}
 const fs = require('node:fs');
 fs.appendFileSync(${JSON.stringify(commandLog)}, process.argv[2] + '\\n');
-if (process.argv[2] === 'view') console.log(${JSON.stringify(JSON.stringify(version))});
+if (process.argv[2] === 'view') console.log(JSON.stringify({versions: [${JSON.stringify(version)}], 'dist-tags': {latest: ${JSON.stringify(version)}}}));
 else if (process.argv[2] === 'i') {
+  const path = require('node:path');
+  const candidatePrefix = process.argv[process.argv.indexOf('--prefix') + 1];
+  const candidatePackage = path.join(candidatePrefix, 'lib/node_modules/@openai/codex');
+  fs.mkdirSync(path.join(candidatePackage, 'bin'), {recursive: true});
+  fs.mkdirSync(path.join(candidatePrefix, 'bin'), {recursive: true});
   const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(manifestPath)}, 'utf8'));
   manifest.version = ${JSON.stringify(version)};
-  fs.writeFileSync(${JSON.stringify(manifestPath)}, JSON.stringify(manifest));
-  fs.copyFileSync(${JSON.stringify(candidatePath)}, ${JSON.stringify(entrypoint)});
+  fs.writeFileSync(path.join(candidatePackage, 'package.json'), JSON.stringify(manifest));
+  fs.copyFileSync(${JSON.stringify(candidatePath)}, path.join(candidatePackage, 'bin/codex.js'));
+  fs.symlinkSync(path.join(candidatePackage, 'bin/codex.js'), path.join(candidatePrefix, 'bin/codex'));
 } else process.exit(91);
 `, { mode: 0o755 });
       let output = "";
       let result;
       try {
-        result = await updateCodexInstallation({ assistantBin, prefix, env: { ...process.env, PATH: `${tools}${path.delimiter}${process.env.PATH ?? ""}` }, onOutput: text => { output += text; } });
+        result = await updateCodexInstallation({ assistantBin, prefix, env: {
+          HOME: path.join(root, "home"), CODEX_HOME: path.join(root, "shared-state"), CLOUDX_DATA_DIR: path.join(root, "data"),
+          PATH: `${tools}${path.delimiter}${process.env.PATH ?? ""}`,
+        }, onOutput: text => { output += text; } });
       } catch (error) {
         throw new Error(`${error.message}\n${output}`, { cause: error });
       }
-      expect(result).toEqual({ outcome, installedVersion: version, previousVersion: outcome === "current" ? version : "0.0.0" });
+      expect(result).toEqual({ outcome, installedVersion: version, activeVersion: version, previousVersion: null });
+      const selected = readCodexSelection(prefix).active;
+      expect(resolveSelectedCodexCommand(assistantBin)).toBe(selected.assistantBin);
+      expect(selected.version).toBe(version);
+      expect(JSON.parse(await fs.readFile(manifestPath, "utf8")).version).toBe(outcome === "current" ? version : "0.0.0");
+      expect(selected.assistantBin === assistantBin).toBe(outcome === "current");
       expect(output).toContain("Resumed Forge turn matched the selected thread, native completion and final shutdown.");
       expect(await fs.readFile(commandLog, "utf8")).toBe(outcome === "current" ? "view\n" : "view\ni\n");
       await expect(fs.stat(path.join(prefix, ".cloudx-codex-update.lock"))).rejects.toMatchObject({ code: "ENOENT" });

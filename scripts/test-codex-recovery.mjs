@@ -29,12 +29,13 @@ const requiredSuites = [
   "apps/server/src/plugins/CodexWorkerBridge.native.test.ts",
   "apps/server/src/plugins/CodexModelDefaults.native.test.ts",
   "apps/server/src/rulesSkills/CodexHomeOverlay.native.test.ts",
+  "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
   "scripts/codex-updater.native.test.mjs"
 ];
 const result = spawnSync(process.execPath, [
   fileURLToPath(new URL("vitest.mjs", import.meta.resolve("vitest/package.json"))), "run",
   ...requiredSuites,
-  "--reporter=default", "--reporter=json", `--outputFile.json=${resultsPath}`
+  "--maxWorkers=1", "--reporter=default", "--reporter=json", `--outputFile.json=${resultsPath}`
 ], { cwd: root, env: process.env, stdio: "inherit", timeout: 120_000 });
 try {
   if (result.error) throw result.error;

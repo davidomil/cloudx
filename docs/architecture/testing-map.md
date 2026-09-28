@@ -142,11 +142,18 @@ roots for its next turn. See the versioned native implementations for
 and [0.157.1](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/tui/src/app_server_session.rs).
 
 Codex update acceptance runs the same startup and synthetic-turn probe
-before reporting either an updated or current installation. Installer
-lifecycle validation can invoke
+before reporting either an updated or current installation. The required
+version-selection case also checks that new ordinary tabs and Forge
+workers use the selected installation, preserve conversation identity
+and complete turns while existing native sessions retain their original
+installation. It exercises shared-state verification on isolated copies
+of retained SQLite state.
+
+Installer lifecycle validation can invoke
 `node scripts/codex-runtime-verification.mjs /absolute/path/to/installer-selected/codex`
-against the built server. The native CI matrix validates the installer-pinned
-release; it does not execute the host installer lifecycle.
+against the built server. The native CI matrix validates the
+installer-pinned release; it does not execute the host installer
+lifecycle.
 
 ## Useful Area Coverage
 
