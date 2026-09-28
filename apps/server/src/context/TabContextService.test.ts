@@ -21,6 +21,96 @@ const fileOperations: TabContextFileOperations = {
 };
 
 describe("TabContextService", () => {
+  it("bounds sustained owned terminal output to an active write and one recent UTF-8 batch", async () => {
+    const output = "🙂".repeat(1000);
+    const chunksPerRound = 400;
+    const started = Array.from({ length: 4 }, () => deferred<void>());
+    const releases = Array.from({ length: 4 }, () => deferred<void>());
+    let opens = 0;
+    await withOwnedContext(async ({ service, tab }) => {
+      const identity = service.directory(tab.contextPath)!;
+      const recording = new Set([service.record(tab, "terminal-output", "initial output")]);
+      try {
+        for (let round = 0; round < 3; round++) {
+          await started[round]!.promise;
+          recording.clear();
+          for (let chunk = 0; chunk < chunksPerRound; chunk++) {
+            recording.add(service.record(tab, "terminal-output", `${output}\nround-${round}-chunk-${chunk}\n`));
+            if (chunk % 100 === 0) recording.add(service.record(tab, "plugin-action", `action-${round}-${chunk}`));
+          }
+          recording.add(service.record(tab, "plugin-action", `action-${round}-tail`));
+          expect(recording.size).toBe(1);
+          expect(opens).toBe(round + 1);
+          releases[round]!.resolve();
+        }
+        await started[3]!.promise;
+        releases[3]!.resolve();
+        await Promise.all(recording);
+        expect(opens).toBe(4);
+        const saved = await service.read(tab);
+        expect(Buffer.byteLength(saved)).toBeLessThanOrEqual(64_000);
+        expect(saved).toContain("Older pending context was trimmed");
+        const retainedEvents = ["round-2-chunk-398", "round-2-chunk-399", "action-2-tail"];
+        expect(retainedEvents.every(event => saved.includes(event))).toBe(true);
+        expect(saved).not.toContain("round-2-chunk-0\n");
+        expect(saved).not.toContain("\uFFFD");
+        expect(retainedEvents.map(event => saved.indexOf(event))).toEqual([...retainedEvents.map(event => saved.indexOf(event))].sort((a, b) => a - b));
+        expect(service.directory(tab.contextPath)).toEqual(identity);
+      } finally { releases.forEach(release => release.resolve()); }
+    }, {
+      openOwnedDirectoryNoFollow: async (...args) => {
+        const directory = await openOwnedDirectoryNoFollow(...args);
+        if (args[3] && opens < 4) {
+          const index = opens++;
+          started[index]!.resolve();
+          await releases[index]!.promise;
+        }
+        return directory;
+      }
+    });
+  });
+
+  it("keeps pending records bounded across action and read requests in event order", async () => {
+    const started = deferred<void>();
+    const release = deferred<void>();
+    let held = false;
+    await withOwnedContext(async ({ service, tab }) => {
+      const first = service.record(tab, "terminal-output", "first output");
+      try {
+        await started.promise;
+        const second = service.record(tab, "terminal-output", "second output");
+        const third = service.record(tab, "terminal-output", "third output");
+        expect(third).toBe(second);
+        const action = service.record(tab, "plugin-action", "finish conversation-exact-id");
+        const fourth = service.record(tab, "terminal-output", "fourth output");
+        expect(action).toBe(second);
+        expect(fourth).toBe(second);
+        const reading = service.read(tab);
+        const fifth = service.record(tab, "terminal-output", "fifth output");
+        expect(fifth).toBe(fourth);
+        const reads = [];
+        for (let index = 0; index < 100; index++) {
+          reads.push(service.read(tab));
+          expect(service.record(tab, "plugin-action", `action-${index}`)).toBe(second);
+          expect(service.record(tab, "terminal-output", `output-${index}`)).toBe(second);
+        }
+        release.resolve();
+        await Promise.all([first, second, third, action, fourth, fifth]);
+        const saved = await reading;
+        const events = ["first output", "second output", "third output", "finish conversation-exact-id", "fourth output", "fifth output", "action-99", "output-99"];
+        expect(events.map(event => saved.indexOf(event))).toEqual([...events.map(event => saved.indexOf(event))].sort((a, b) => a - b));
+        expect(events.every(event => saved.includes(event))).toBe(true);
+        expect(await Promise.all(reads)).toEqual(Array(100).fill(saved));
+      } finally { release.resolve(); }
+    }, {
+      openOwnedDirectoryNoFollow: async (...args) => {
+        const directory = await openOwnedDirectoryNoFollow(...args);
+        if (args[3] && !held) { held = true; started.resolve(); await release.promise; }
+        return directory;
+      }
+    });
+  });
+
   it("keeps owned directory identity stable across bounded UTF-8 log rotation", async () => {
     await withOwnedContext(async ({ service, tab }) => {
       const original = service.directory(tab.contextPath)!;
@@ -41,6 +131,44 @@ describe("TabContextService", () => {
       await service.delete(tab);
       expect(service.directory(tab.contextPath)).toBeUndefined();
       await expect(fs.stat(original.path)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it.each(["ENOSPC", "EDQUOT"])("recovers owned context after a batched append cannot rotate with %s", async code => {
+    await withOwnedContext(async ({ service, tab }) => {
+      const identity = service.directory(tab.contextPath)!;
+      for (let index = 0; index < 6; index++) await service.record(tab, "terminal-output", "x".repeat(12_000));
+      expect((await fs.stat(tab.contextPath!)).size).toBe(64_000);
+
+      let capacityAvailable = false;
+      const originalOpen = fs.open.bind(fs);
+      const open = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        if (!capacityAvailable && String(args[0]).endsWith(".tmp")) throw Object.assign(new Error("context rotation capacity exhausted"), { code });
+        return originalOpen(...args);
+      });
+      try {
+        const burst = Array.from({ length: 6 }, (_, index) => service.record(tab, "terminal-output", `${"x".repeat(11_980)}\nburst-${index}`));
+        expect(new Set(burst).size).toBe(1);
+        await expect(Promise.all(burst)).rejects.toMatchObject({ code });
+        const appended = await service.read(tab);
+        expect(Buffer.byteLength(appended)).toBeGreaterThan(116_000);
+        expect(Buffer.byteLength(appended)).toBeLessThanOrEqual(128_000);
+        expect(appended).toContain("burst-5");
+
+        await expect(service.record(tab, "terminal-output", "y".repeat(12_000))).rejects.toMatchObject({ code });
+        expect(await service.read(tab)).toBe(appended);
+
+        capacityAvailable = true;
+        await service.record(tab, "terminal-output", `${"z".repeat(11_980)}\ncapacity-restored`);
+        await service.record(tab, "plugin-action", "finish conversation-exact-id");
+        const recovered = await service.read(tab);
+        expect(Buffer.byteLength(recovered)).toBeLessThanOrEqual(64_000);
+        const events = ["burst-5", "capacity-restored", "finish conversation-exact-id"];
+        expect(events.every(event => recovered.includes(event))).toBe(true);
+        expect(events.map(event => recovered.indexOf(event))).toEqual([...events.map(event => recovered.indexOf(event))].sort((a, b) => a - b));
+        expect(service.directory(tab.contextPath)).toEqual(identity);
+        expect(await fs.readdir(identity.path)).toEqual(["context.md"]);
+      } finally { open.mockRestore(); }
     });
   });
 
@@ -283,7 +411,7 @@ describe("TabContextService", () => {
     await expect(fs.readdir(renamedContextDir)).resolves.toEqual([]);
   });
 
-  it("drops context history writes instead of crashing when the disk is full", async () => {
+  it.each(["ENOSPC", "EDQUOT"])("reports %s context write failures while preserving existing history", async code => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-tab-context-record-enospc-"));
     const dataDir = path.join(root, ".cloudx");
     const initialService = new TabContextService(dataDir);
@@ -292,11 +420,12 @@ describe("TabContextService", () => {
     const service = new TabContextService(dataDir, {
       ...fileOperations,
       appendTextFileNoFollow: vi.fn(async () => {
-        throw capacityError();
+        throw Object.assign(new Error("context capacity exhausted"), { code });
       })
     });
 
-    await expect(service.record(tab, "terminal-output", "still running")).resolves.toBeUndefined();
+    await expect(service.record(tab, "terminal-output", "still running")).rejects.toMatchObject({ code });
+    await expect(initialService.read(tab)).resolves.toContain("Cloudx Tab Context");
     await expect(initialService.read(tab)).resolves.not.toContain("still running");
   });
 
@@ -413,6 +542,12 @@ function tabFixture(root: string, id = "tab-1"): WorkspaceTab {
 
 function capacityError(): Error & { code: string } {
   return Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
 }
 
 async function withOwnedContext(run: (fixture: { root: string; dataDir: string; service: TabContextService; tab: WorkspaceTab }) => Promise<void>, files: Partial<TabContextFileOperations> = {}): Promise<void> {

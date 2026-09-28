@@ -13,6 +13,9 @@ import { isCapacityStateWriteError } from "../statePersistence.js";
 const MAX_CONTEXT_BYTES = 64_000;
 const MAX_CONTEXT_ENTRY_BYTES = 12_000;
 const TRIMMED_CONTEXT_HEADER = `# Cloudx Tab Context\n\n_Trimmed to the latest ${MAX_CONTEXT_BYTES} bytes._\n\n`;
+const MAX_PENDING_CONTEXT_BYTES = MAX_CONTEXT_BYTES - Buffer.byteLength(TRIMMED_CONTEXT_HEADER, "utf8");
+const TRIMMED_PENDING_HEADER = "_Older pending context was trimmed to the latest context bytes._\n\n";
+const NO_CONTEXT_WRITE = Promise.resolve();
 const URL_PATTERN = /\bhttps?:\/\/[^\s"'<>\\)]+/giu;
 const SENSITIVE_URL_PARAM_NAMES = new Set([
   "access_token",
@@ -60,10 +63,16 @@ interface OwnedTabContext {
   deleting?: Promise<void>;
 }
 
+interface ContextBatch {
+  text: string;
+  written: Promise<void>;
+}
+
 export class TabContextService {
   private readonly dataRoot: string;
   private readonly contextDir: string;
   private readonly writeQueues = new Map<string, Promise<void>>();
+  private readonly pendingBatches = new Map<string, ContextBatch>();
   private readonly ownedContexts = new Map<string, OwnedTabContext>();
 
   constructor(dataDir: string, private readonly files: TabContextFileOperations = defaultFileOperations) {
@@ -93,30 +102,32 @@ export class TabContextService {
     return owned ? { ...owned.identity } : undefined;
   }
 
-  async record(tab: WorkspaceTab, kind: string, payload: string): Promise<void> {
-    const owned = tab.contextPath ? this.ownedContexts.get(path.resolve(tab.contextPath)) : undefined;
-    if (owned?.deleting) return;
-    const contextPath = owned ? path.resolve(tab.contextPath!) : await this.requireContextPath(tab.contextPath);
-    if (!contextPath) {
-      return;
-    }
+  record(tab: WorkspaceTab, kind: string, payload: string): Promise<void> {
+    if (!tab.contextPath) return NO_CONTEXT_WRITE;
+    const contextPath = path.resolve(tab.contextPath);
+    const owned = this.ownedContexts.get(contextPath);
+    if (owned?.deleting) return NO_CONTEXT_WRITE;
     const sanitized = sanitize(payload);
-    if (!sanitized) {
-      return;
-    }
+    if (!sanitized) return NO_CONTEXT_WRITE;
     const entry = [`### ${new Date().toISOString()} ${kind}`, "", "```text", sanitized, "```", ""].join("\n");
-    await this.ignoreCapacityError(() => this.enqueue(contextPath, async () => {
-      if (owned) return this.withOwnedDirectory(owned, async directory => {
-        await withContextFile(directory, constants.O_WRONLY | constants.O_APPEND, file => file.writeFile(entry, "utf8"));
-        const content = await readOwnedContext(directory);
-        if (Buffer.byteLength(content, "utf8") > MAX_CONTEXT_BYTES) await writeOwnedContextAtomic(directory, trimmedContext(content));
-      });
-      await this.files.appendTextFileNoFollow(contextPath, entry, "Tab context file");
-      await this.truncate(contextPath);
-    }));
+    // Records retain arrival order and share the next write's success or failure.
+    // Only the latest bounded tail survives overload, matching on-disk retention.
+    const pending = this.pendingBatches.get(contextPath);
+    if (pending) {
+      pending.text = boundedPendingContext(pending.text + entry);
+      return pending.written;
+    }
+    const batch: ContextBatch = { text: entry, written: NO_CONTEXT_WRITE };
+    batch.written = this.enqueue(contextPath, () => {
+      this.pendingBatches.delete(contextPath);
+      return this.append(contextPath, owned, batch.text);
+    });
+    this.pendingBatches.set(contextPath, batch);
+    return batch.written;
   }
 
   async read(tab: WorkspaceTab): Promise<string> {
+    // A read includes preceding records and may include later arrivals in their batch.
     const owned = tab.contextPath ? this.ownedContexts.get(path.resolve(tab.contextPath)) : undefined;
     if (owned?.deleting) {
       await owned.deleting;
@@ -173,6 +184,24 @@ export class TabContextService {
     } finally {
       await owned.close();
     }
+  }
+
+  private async append(contextPath: string, owned: OwnedTabContext | undefined, entry: string): Promise<void> {
+    if (owned) return this.withOwnedDirectory(owned, async directory => {
+      await withContextFile(directory, constants.O_WRONLY | constants.O_APPEND, async (file, size) => {
+        if (size > MAX_CONTEXT_BYTES) {
+          const retained = await readOwnedContext(directory);
+          await writeOwnedContextAtomic(directory, trimmedContext(retained + entry));
+          return;
+        }
+        await file.writeFile(entry, "utf8");
+        const content = await readOwnedContext(directory);
+        if (Buffer.byteLength(content, "utf8") > MAX_CONTEXT_BYTES) await writeOwnedContextAtomic(directory, trimmedContext(content));
+      });
+    });
+    if (!await this.requireContextPath(contextPath)) return;
+    await this.files.appendTextFileNoFollow(contextPath, entry, "Tab context file");
+    await this.truncate(contextPath);
   }
 
   private async truncate(contextPath: string): Promise<void> {
@@ -264,13 +293,18 @@ function trimmedContext(content: string): string {
   return `${TRIMMED_CONTEXT_HEADER}${trimUtf8ToLastBytes(content, keepBytes)}`;
 }
 
-async function withContextFile<T>(directory: OwnedDirectory, flags: number, operation: (file: Awaited<ReturnType<typeof fs.open>>) => Promise<T>): Promise<T> {
+function boundedPendingContext(content: string): string {
+  if (Buffer.byteLength(content, "utf8") <= MAX_PENDING_CONTEXT_BYTES) return content;
+  return TRIMMED_PENDING_HEADER + trimUtf8ToLastBytes(content, MAX_PENDING_CONTEXT_BYTES - Buffer.byteLength(TRIMMED_PENDING_HEADER, "utf8"));
+}
+
+async function withContextFile<T>(directory: OwnedDirectory, flags: number, operation: (file: Awaited<ReturnType<typeof fs.open>>, size: number) => Promise<T>): Promise<T> {
   const file = await fs.open(directory.childPath("context.md"), flags | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await file.stat();
     if (!stat.isFile() || stat.nlink !== 1) throw new Error("Owned tab context must be a regular file without hard links.");
     if (stat.size > MAX_CONTEXT_BYTES * 2) throw new Error("Owned tab context exceeds its bounded file size.");
-    return await operation(file);
+    return await operation(file, stat.size);
   } finally { await file.close(); }
 }
 

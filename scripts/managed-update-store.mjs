@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 class Directory {
   constructor(directory) {
@@ -56,11 +57,12 @@ export function writeUpdateJson(file, value) {
 }
 
 // Sockets are live process state. Links are retained as links, never followed.
-export function snapshotTree(source, destination, { exclude = () => false } = {}) {
+export function snapshotTree(source, destination, { exclude = () => false, progress = () => {} } = {}) {
   if (inside(source, destination)) throw new Error('A recovery snapshot must be outside its source directory.');
   const original = new Directory(source);
   let backup;
   const manifest = [];
+  let files = 0, bytes = 0;
   function copy(from, to, relative) {
     const before = fs.fstatSync(from.fd);
     const names = fs.readdirSync(from.entry('.')).sort().filter(name => !exclude(path.join(relative, name)));
@@ -81,6 +83,7 @@ export function snapshotTree(source, destination, { exclude = () => false } = {}
       } else if (stat.isFile()) {
         const file = copyRegular(from.entry(name), to.entry(name), 0o600);
         manifest.push({ path: child, type: 'file', mode: stat.mode & 0o777, ...file });
+        progress({ files: ++files, bytes: bytes += file.size, path: child });
       } else throw new Error(`Recovery source contains an unsupported special file: ${child}`);
     }
     const after = fs.fstatSync(from.fd);
@@ -180,15 +183,130 @@ function verifyMetadata(root, entries) {
   });
 }
 
-export function verifySnapshot(root, manifest, { expectedRoot } = {}) {
+export function verifySnapshot(root, manifest, { expectedRoot, progress = () => {} } = {}) {
   const entries = validateManifest(manifest);
   const directory = new Directory(snapshotRoot(root, expectedRoot));
   try {
     verifyMetadata(directory, entries);
+    let files = 0, bytes = 0;
     for (const entry of entries.filter(entry => entry.type === 'file')) withEntry(directory, entry.path, false, file => {
       if (hashFile(file) !== entry.sha256) throw new Error(`Recovery snapshot digest verification failed: ${entry.path}`);
+      progress({ files: ++files, bytes: bytes += entry.size, path: entry.path });
     });
   } finally { directory.close(); }
+}
+
+// Use the same descriptor-relative, no-follow traversal as recovery copying.
+function inspectTree(source, exclude, visit, stable = false) {
+  function walk(directory, relative) {
+    const before = fs.fstatSync(directory.fd);
+    visit(relative, before, directory.entry('.'));
+    for (const name of fs.readdirSync(directory.entry('.'))) {
+      const child = path.join(relative, name);
+      if (exclude(child)) continue;
+      const file = directory.entry(name), stat = fs.lstatSync(file);
+      if (stat.isSocket()) continue;
+      if (stat.isDirectory()) {
+        const nested = new Directory(file);
+        try { walk(nested, child); } finally { nested.close(); }
+      } else if (stat.isFile() || stat.isSymbolicLink()) visit(child, stat, file);
+      else throw new Error(`Recovery source contains an unsupported special file: ${child}`);
+    }
+    if (stable && before.mtimeMs !== fs.fstatSync(directory.fd).mtimeMs)
+      throw new Error(`Prepared release directory changed during manifesting: ${relative}`);
+  }
+  const directory = new Directory(source);
+  try { walk(directory, ''); } finally { directory.close(); }
+}
+
+export function estimateSnapshot(source, { exclude = () => false, blockSize = 4096 } = {}) {
+  const estimate = { bytes: 0, entries: 0, files: 0, fileBytes: 0, manifestBytes: 0 };
+  inspectTree(source, exclude, (relative, stat) => {
+    // A reflink is optional, and each hardlink pathname is copied independently.
+    const size = stat.isFile() ? Math.max(stat.size, stat.blocks * 512) : blockSize;
+    estimate.bytes += Math.ceil(size / blockSize) * blockSize;
+    estimate.entries++;
+    estimate.manifestBytes += 512 + Buffer.byteLength(relative) * 6 + (stat.isSymbolicLink() ? stat.size * 6 : 0);
+    if (stat.isFile()) { estimate.files++; estimate.fileBytes += stat.size; }
+  });
+  if (!Object.values(estimate).every(Number.isSafeInteger)) throw new Error('Recovery capacity estimate exceeds the supported integer range.');
+  return estimate;
+}
+
+export function manifestTree(source) {
+  const manifest = [];
+  inspectTree(source, () => false, (relative, stat, file) => {
+    const entry = { path: relative };
+    if (stat.isSymbolicLink()) Object.assign(entry, { type: 'link', link: fs.readlinkSync(file) });
+    else Object.assign(entry, { type: stat.isDirectory() ? 'directory' : 'file', mode: stat.mode & 0o777 },
+      stat.isFile() ? { size: stat.size, sha256: hashFile(file) } : {});
+    manifest.push(entry);
+  }, true);
+  verifySnapshot(source, manifest);
+  return manifest;
+}
+
+export function parseQuotaCapacity(output) {
+  let bytes = Infinity, inodes = Infinity;
+  for (const line of output.split('\n')) {
+    if (!line.trim() || /^(Disk quotas|Filesystem)/u.test(line.trim())) continue;
+    if (/none\s*$/u.test(line)) continue;
+    const columns = line.trim().split(/\s+/u);
+    // --raw-grace always supplies both grace columns, including zero.
+    const values = columns.slice(-8).map(value => Number(value.replace(/\*$/u, '')));
+    if (columns.length < 9 || values.some(value => !Number.isSafeInteger(value) || value < 0))
+      throw new Error('Cannot parse quota capacity; inspect quota-tools output before resuming.');
+    const [used, soft, hard, , files, softFiles, hardFiles] = values;
+    const limits = [soft, hard].filter(Boolean), fileLimits = [softFiles, hardFiles].filter(Boolean);
+    if (limits.length) bytes = Math.min(bytes, Math.max(0, Math.min(...limits) - used) * 1024);
+    if (fileLimits.length) inodes = Math.min(inodes, Math.max(0, Math.min(...fileLimits) - files));
+  }
+  return { bytes, inodes };
+}
+
+export function filesystemCapacity(destination, { quotaCommand = spawnSync } = {}) {
+  let existing = path.resolve(destination);
+  while (!fs.existsSync(existing)) existing = path.dirname(existing);
+  existing = fs.realpathSync(existing);
+  const stat = fs.statSync(existing), capacity = fs.statfsSync(existing);
+  const mounts = fs.readFileSync('/proc/self/mountinfo', 'utf8').trim().split('\n').map(line => {
+    const [fields, filesystem] = line.split(' - '), parts = fields.split(' ');
+    return { root: parts[4].replace(/\\([0-7]{3})/gu, (_, octal) => String.fromCharCode(parseInt(octal, 8))), options: `${parts[5]},${filesystem.split(' ').slice(2).join(',')}` };
+  });
+  const mount = mounts.filter(mount => inside(mount.root, existing)).sort((a, b) => b.root.length - a.root.length)[0];
+  const configuredQuotas = {
+    user: /(?:^|,)(?:usrquota|usrjquota|uquota|quota)(?:=|,|$)/u.test(mount.options),
+    group: /(?:^|,)(?:grpquota|grpjquota|gquota)(?:=|,|$)/u.test(mount.options),
+  };
+  const quotaChecks = [];
+  let quota = { bytes: Infinity, inodes: Infinity };
+  const group = stat.mode & 0o2000 ? stat.gid : process.getgid();
+  for (const [kind, id] of [['user', process.getuid()], ['group', group]]) {
+    const result = quotaCommand('quota', ['--verbose', '--no-wrap', '--raw-grace', `--filesystem=${mount.root}`, `--${kind}`, String(id)],
+      { encoding: 'utf8', timeout: 5000, env: { ...process.env, LC_ALL: 'C' } });
+    if (result.error?.code === 'ENOENT') {
+      if (Object.values(configuredQuotas).some(Boolean)) throw new Error(`Install quota-tools to inspect enabled quotas on ${mount.root}, then resume.`);
+      break;
+    }
+    const label = kind === 'group' ? 'destination group' : kind;
+    const diagnostics = (result.stderr ?? '').trim().split('\n').map(line => line.replace(/^quota: /u, '').replace(/\.$/u, ''));
+    const disabled = !configuredQuotas[kind] && result.status === 1 && !result.stdout?.trim() && diagnostics.every(line =>
+      line === `Mountpoint (or device) ${mount.root} not found or has no quota enabled` || line === 'Not all specified mountpoints are using quota');
+    if (!result.error && !result.signal && disabled) {
+      quotaChecks.push(`${label} not enabled`);
+      continue;
+    }
+    if (result.error || result.signal || result.stderr?.trim() || result.status && !result.stdout?.trim())
+      throw new Error(`Cannot inspect ${kind} quota on ${mount.root}; resolve quota-tools errors before resuming.`);
+    const limits = parseQuotaCapacity(result.stdout ?? '');
+    quota = { bytes: Math.min(quota.bytes, limits.bytes), inodes: Math.min(quota.inodes, limits.inodes) };
+    quotaChecks.push(`${label} checked`);
+  }
+  let quotaStatus = quotaChecks.join('; ') || 'unavailable (quota-tools is not installed)';
+  if (/(?:^|,)(?:prjquota|pquota)(?:=|,|$)/u.test(mount.options)) quotaStatus += '; project quota unavailable to this probe';
+  return { device: String(stat.dev), destination, mount: mount.root, blockSize: capacity.bsize,
+    availableBytes: Math.min(Math.max(0, capacity.bavail) * capacity.bsize, quota.bytes),
+    availableInodes: Math.min(capacity.files > 0 ? capacity.ffree : Infinity, quota.inodes), quotaStatus };
 }
 
 export function restoreSnapshot(source, target, manifest) {

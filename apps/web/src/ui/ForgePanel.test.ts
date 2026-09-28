@@ -145,6 +145,83 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("shows the pending terminal phase and queue delay while an unrelated CI-paused worker remains actionable", async () => {
+    const finishing: ForgeWorker = { ...worker, activity: {
+      phase: "Finishing terminal and saving context", since: "2026-09-28T02:00:00.000Z", elapsedMs: 566_000, queueDelayMs: 2400,
+    } };
+    const paused: ForgeWorker = { ...worker, id: "ci-paused", number: 9, status: "paused", error: "Required CI failed.",
+      autoReview: { enabled: true, phase: "merging", placement: { windowId: "window-1", paneId: "pane-2" } } };
+    const f = fixture({ workers: [finishing, paused] });
+    const panel = await renderPanel(f);
+    const compact = panel.querySelector(".forge-item-workers")!;
+    expect(compact.textContent).toContain("Finishing terminal and saving context · 9m 26s elapsed · Queue delay 3s");
+    await click(panel, "Workers (2)");
+    const finishingCard = panel.querySelector('[aria-label="issue worker #7"]')!;
+    const pausedCard = panel.querySelector('[aria-label="issue worker #9"]')!;
+    expect(finishingCard.textContent).toContain("Finishing terminal and saving context · 9m 26s elapsed · Queue delay 3s");
+    expect(button(finishingCard, "Continue with message").disabled).toBe(true);
+    expect(button(finishingCard, "Pause").disabled).toBe(false);
+    expect(button(finishingCard, "Stop").disabled).toBe(false);
+    expect(pausedCard.textContent).toContain("Required CI failed.");
+    expect(button(pausedCard, "Resume").disabled).toBe(false);
+    await click(pausedCard, "Resume");
+    expect(f.calls.filter(call => call.hook === "forge.worker.resume")).toEqual([
+      { hook: "forge.worker.resume", input: { id: paused.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+    await click(pausedCard, "Continue with message");
+    expect(pausedCard.textContent).toContain("This starts implementation work; Resume rechecks the existing loop.");
+    expect(pausedCard.querySelector<HTMLTextAreaElement>("textarea")!.disabled).toBe(false);
+  });
+
+  it("keeps simultaneous worker actions scoped to their original targets and rejects repeated clicks", async () => {
+    const first = { ...worker, status: "paused" as const };
+    const second = { ...worker, id: "ci-paused", number: 9, status: "paused" as const, error: "Required CI failed." };
+    const resume = deferred<unknown>();
+    const continuation = deferred<unknown>();
+    const f = fixture({ workers: [first, second] }, hook =>
+      hook === "forge.worker.resume" ? resume.promise : hook === "forge.worker.continue" ? continuation.promise : undefined);
+    const panel = await renderPanel(f);
+    await click(panel, "Workers (2)");
+    const firstCard = panel.querySelector('[aria-label="issue worker #7"]')!;
+    const secondCard = panel.querySelector('[aria-label="issue worker #9"]')!;
+    await act(async () => { button(firstCard, "Resume").click(); button(firstCard, "Resume").click(); });
+    expect(firstCard.textContent).toContain("Worker action pending. Waiting for Forge to report its phase.");
+    expect(button(firstCard, "Resume").disabled).toBe(true);
+    expect(button(firstCard, "Continue with message").disabled).toBe(true);
+    const secondTab = [...panel.querySelectorAll<HTMLButtonElement>('[role="tab"]')].find(tab => tab.textContent?.includes("Issue #9"))!;
+    await act(async () => { secondTab.click(); });
+    expect(button(secondCard, "Resume").disabled).toBe(false);
+    await click(secondCard, "Continue with message");
+    await fill(secondCard.querySelector<HTMLTextAreaElement>("textarea")!, "Repair the failing CI check.");
+    await act(async () => { button(secondCard, "Send and continue").click(); button(secondCard, "Send and continue").click(); });
+    expect(button(secondCard, "Continuing…").disabled).toBe(true);
+    expect(button(secondCard, "Resume").disabled).toBe(true);
+    expect(f.calls.filter(call => call.hook === "forge.worker.resume")).toHaveLength(1);
+    expect(f.calls.filter(call => call.hook === "forge.worker.continue")).toEqual([
+      { hook: "forge.worker.continue", input: { id: second.id, message: "Repair the failing CI check.", windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+    await act(async () => { resume.reject(new Error("The first worker needs attention.")); });
+    expect(button(firstCard, "Resume").disabled).toBe(false);
+    expect(button(secondCard, "Resume").disabled).toBe(true);
+    await act(async () => { continuation.resolve({ worker: second }); });
+    expect(button(secondCard, "Resume").disabled).toBe(false);
+    expect(secondCard.querySelector("form")).toBeNull();
+  });
+
+  it("blocks an associated reviewer while snapshot activity owns their shared request", async () => {
+    const parent: ForgeWorker = { ...worker, status: "paused", changeNumber: reviewWorker.number, activity: {
+      phase: "Closing terminal", since: "2026-09-28T02:00:00.000Z", elapsedMs: 800, queueDelayMs: 0,
+    } };
+    const f = fixture({ workers: [parent, reviewWorker] });
+    const panel = await renderPanel(f);
+    await click(panel, "Workers (2)");
+    const review = panel.querySelector('[aria-label="review worker #12"]')!;
+    expect(button(review, "Continue with message").disabled).toBe(true);
+    expect(button(review, "Submit review").closest("fieldset")?.disabled).toBe(true);
+    await click(review, "Continue with message");
+    expect(f.calls.some(call => call.hook === "forge.worker.continue")).toBe(false);
+  });
+
   it("removes a confirmed completed merge from the queue display", async () => {
     const completed = { ...worker, status: "completed" as const, mergeQueue: {
       sequence: 1, enteredAt: "2026-09-28", phase: "blocked" as const, active: false, position: 0, outcome: "merged" as const,

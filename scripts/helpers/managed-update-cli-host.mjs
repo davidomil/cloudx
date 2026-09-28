@@ -21,6 +21,7 @@ fs.readFileSync = (file, ...options) => readFileSync(
 
 function commandResult(command, args, options = {}) {
   fs.appendFileSync(path.join(home, 'commands.jsonl'), JSON.stringify({ command, args, cwd: options.cwd }) + '\n');
+  if (command === 'quota') return result('Disk quotas for fixture: none\n');
   if (command === 'systemctl' && args[0] === '--user' && args[1] === 'show') {
     const name = args[2];
     const unit = name === 'cloudx-settings-update.service'

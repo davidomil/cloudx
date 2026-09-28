@@ -6,7 +6,7 @@ import path from 'node:path';
 import { vi } from 'vitest';
 import { ManagedUpdate, UpdateHost } from '../managed-update.mjs';
 import { SERVICE_NAMES } from '../install-update.mjs';
-import { writeUpdateJson } from '../managed-update-store.mjs';
+import { writeUpdateJson, filesystemCapacity } from '../managed-update-store.mjs';
 
 export const BROKER = 'cloudx-terminal.service';
 export const FORGE_STATE = `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`;
@@ -88,7 +88,7 @@ export function updateFixture({ originalBroker = 'inactive', preserveBroker = fa
   if (originalBroker === 'active' && !preserveBroker) Object.assign(states[BROKER], { ActiveState: 'inactive', MainPID: '0', InvocationID: '' });
   const recordPath = `${runDir}.json`, save = value => writeUpdateJson(recordPath, value);
   const host = Object.assign(Object.create(UpdateHost.prototype), {
-    home, runDir, save, runner: commands, paths: { repoRoot: root, dataDir, envPath, systemdDir },
+    home, runDir, save, runner: commands, inspectCapacity: filesystemCapacity, paths: { repoRoot: root, dataDir, envPath, systemdDir },
     target: record.transition.serviceTarget, envConfig: record.transition.environment,
   });
   const draft = [{ id: 'review', status: 'awaiting_review', draft: { status: 'draft', body: 'review result' } }];

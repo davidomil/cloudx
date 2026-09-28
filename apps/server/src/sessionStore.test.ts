@@ -1597,6 +1597,64 @@ describe("SessionStore voice actions", () => {
     expect(store.listTabs()).toEqual([]);
   });
 
+  it.each(["written", "failed"] as const)("bounds owned terminal context work and drains later output after the first batch is %s", async outcome => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-owned-session-context-"));
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    const failure = Object.assign(new Error("context capacity exhausted"), { code: "ENOSPC" });
+    let writes = 0;
+    const context = new TabContextService(path.join(root, ".cloudx"), {
+      ...contextFiles,
+      openOwnedDirectoryNoFollow: async (...args) => {
+        const directory = await contextFiles.openOwnedDirectoryNoFollow(...args);
+        if (args[3] && writes++ === 0) {
+          writeStarted.resolve();
+          await releaseWrite.promise;
+          if (outcome === "failed") { await directory.close(); throw failure; }
+        }
+        return directory;
+      }
+    });
+    const plugin = new FakeDefaultPlugin();
+    const registry = new PluginRegistry();
+    registry.register(plugin);
+    const reportError = vi.fn();
+    const store = new SessionStore(registry, new PathPolicy([root]), context, undefined, undefined, undefined, reportError);
+    try {
+      const tab = await store.prepareTab({ pluginId: plugin.id, cwd: root }, undefined, { ownerPluginId: plugin.id });
+      store.publishPreparedTab(tab.id);
+      plugin.lastSession!.emitData("first output");
+      await writeStarted.promise;
+      for (let index = 0; index < 12_000; index++) plugin.lastSession!.emitData(`chunk-${index}: ${"x".repeat(100)}\n`);
+      const trackedWrites = Reflect.get(store, "contextWrites") as Set<Promise<void>>;
+      expect(trackedWrites.size).toBe(2);
+      expect(writes).toBe(1);
+      const conversationId = "01995187-8814-72c1-bd7c-e878741ffb7d";
+      const action = store.executePluginAction(tab.id, "enter_text", { text: conversationId });
+      let closed = false;
+      const closing = store.dispose().then(() => { closed = true; });
+      await new Promise(resolve => setImmediate(resolve));
+      expect(closed).toBe(false);
+      releaseWrite.resolve();
+      await expect(action).resolves.toEqual({ action: "enter_text", input: { text: conversationId } });
+      await closing;
+      expect(writes).toBe(2);
+      expect(trackedWrites.size).toBe(0);
+      const saved = await fs.readFile(tab.contextPath!, "utf8");
+      expect(saved).toContain("chunk-11999");
+      expect(saved).toContain(conversationId);
+      expect(saved.indexOf("chunk-11999")).toBeLessThan(saved.indexOf(conversationId));
+      expect(Buffer.byteLength(saved)).toBeLessThanOrEqual(64_000);
+      expect(plugin.lastSession!.stopped).toBe(true);
+      if (outcome === "failed") expect(reportError).toHaveBeenCalledExactlyOnceWith(failure, { operation: "record terminal output", tabId: tab.id });
+      else expect(reportError).not.toHaveBeenCalled();
+    } finally {
+      releaseWrite.resolve();
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["written", "failed"] as const)("waits for terminal context to be %s before disposal completes", async outcome => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-session-context-close-"));
     const writeStarted = deferred<void>();

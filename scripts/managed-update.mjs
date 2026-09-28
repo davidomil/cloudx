@@ -13,7 +13,7 @@ import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePor
 import { inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
 import { assertTerminalMigrationSafe } from './terminal-upgrade-recovery.mjs';
 import { parseEnvironmentFile, updateEnvironmentFile } from './installer-environment.mjs';
-import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile } from './managed-update-store.mjs';
+import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile, estimateSnapshot, manifestTree, filesystemCapacity } from './managed-update-store.mjs';
 
 const GENERATED = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/dist', 'apps/server/dist', 'apps/web/dist', 'services/asr/.venv', 'services/documentation-indexer/.venv'];
 const PHASES = ['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify'];
@@ -109,11 +109,12 @@ export class ManagedUpdate {
 }
 
 export class UpdateHost {
-  constructor({ repoRoot, home = os.homedir(), dataDir, service, port, host, runDir, commands, verbose = false, save = () => {}, prepareRelease = prepareManagedRelease, recovery }) {
+  constructor({ repoRoot, home = os.homedir(), dataDir, service, port, host, runDir, commands, verbose = false, save = () => {}, prepareRelease = prepareManagedRelease, recovery, inspectCapacity = filesystemCapacity }) {
     this.home = home;
     this.runDir = runDir;
     this.save = save;
     this.prepareRelease = prepareRelease;
+    this.inspectCapacity = inspectCapacity;
     this.paths = { repoRoot: fs.realpathSync(repoRoot), dataDir, envPath: path.join(home, '.config/cloudx/cloudx.env'), systemdDir: path.join(home, '.config/systemd/user') };
     this.runner = commands ?? new InstallerRunner({ cwd: this.paths.repoRoot, nonInteractive: true, verbose });
     this.target = recovery?.mutating ? recovery.serviceTarget : inspectUpdateTarget({ paths: this.paths, commands: this.runner, service, port, host });
@@ -153,6 +154,7 @@ export class UpdateHost {
     if (this.git(['rev-parse', '--show-toplevel']) !== root) throw new Error('Update requires the installed checkout root.');
     transition.sourceCommit = this.git(['rev-parse', 'HEAD']);
     transition.sourceIndex = this.git(['write-tree']);
+    this.preflightCapacity(record, 'build-staging');
     const release = path.join(this.runDir, 'release');
     // Only an uncommitted preparation directory is disposable.
     fs.rmSync(release, { recursive: true, force: true });
@@ -199,16 +201,97 @@ export class UpdateHost {
       throw publicFailure('target', 'The target has neither terminal readiness nor a buildable terminal integration. The installed version is unchanged.');
     this.planData(record);
     transition.artifacts = GENERATED.filter(relative => fs.existsSync(path.join(release, relative)));
-    for (const relative of transition.artifacts) {
-      // Manifest the actual built bytes, independently of checkout HEAD.
-      {
-        const destination = path.join(this.runDir, 'prepared-evidence', relative);
-        fs.rmSync(destination, { recursive: true, force: true });
-        transition.buildManifests ??= {};
-        transition.buildManifests[relative] = snapshotTree(path.join(release, relative), destination);
-      }
-    }
+    // The retained release is the build evidence; verification never used the
+    // second full prepared-evidence copy. Existing recovery data stays intact.
+    transition.buildManifests = Object.fromEntries(transition.artifacts.map(relative => [relative, manifestTree(path.join(release, relative))]));
+    this.preflightCapacity(record, 'prepared');
     this.save(record);
+  }
+
+  dataRoots() {
+    const documentation = this.envConfig.CLOUDX_DOCUMENTATION_DATA_DIR ?? path.join(this.paths.dataDir, 'documentation');
+    const roots = [this.paths.dataDir, ...(this.target.kind === 'standard' && !inside(this.paths.dataDir, documentation) ? [documentation] : [])];
+    if (roots.some(root => !path.isAbsolute(root) || root === '/' || inside(root, this.runDir) || fs.existsSync(root) && fs.realpathSync(root) !== root))
+      throw new Error('Recovery directory must be outside persisted data roots.');
+    return roots;
+  }
+
+  preflightCapacity(record, stage) {
+    record.run.component = 'capacity';
+    record.run.message = `Checking update disk capacity (${stage}). Services remain running.`;
+    this.save(record);
+    try {
+      const destinations = new Map(), filesystems = new Map();
+      const inspect = destination => {
+        if (!destinations.has(destination)) destinations.set(destination, this.inspectCapacity(destination));
+        return destinations.get(destination);
+      };
+      const reserve = (destination, purpose, bytes, inodes = 0) => {
+        const capacity = inspect(destination);
+        if (!filesystems.has(capacity.device)) filesystems.set(capacity.device, { ...capacity, reservations: [], requiredBytes: 0, requiredInodes: 0 });
+        const required = filesystems.get(capacity.device);
+        required.availableBytes = Math.min(required.availableBytes, capacity.availableBytes);
+        required.availableInodes = Math.min(required.availableInodes, capacity.availableInodes);
+        required.reservations.push({ destination, purpose, bytes, inodes });
+        required.requiredBytes += bytes;
+        required.requiredInodes += inodes;
+      };
+      let manifestBytes = 0;
+      for (const root of this.dataRoots()) {
+        if (!fs.existsSync(root)) continue;
+        const estimate = estimateSnapshot(root, { exclude: runtimeData, blockSize: inspect(this.runDir).blockSize });
+        // A failed startup preserves its newer profile before restoring the old
+        // profile, so reserve both copies without counting on deletion/reflinks.
+        reserve(this.runDir, `snapshot and failed-start recovery: ${root}`, estimate.bytes * 2, estimate.entries * 2);
+        const restore = estimateSnapshot(root, { exclude: runtimeData, blockSize: inspect(root).blockSize });
+        reserve(root, 'profile restoration', restore.bytes, restore.entries);
+        manifestBytes += estimate.manifestBytes * 2;
+      }
+      for (const snapshot of record.transition.restoreData ?? []) {
+        for (const [destination, purpose] of [[snapshot.root, 'selected historical profile'], [this.runDir, 'selected historical failed-start recovery']]) {
+          const blockSize = inspect(destination).blockSize;
+          const bytes = snapshot.manifest.reduce((sum, entry) => sum + Math.ceil((entry.type === 'file' ? entry.size : blockSize) / blockSize) * blockSize, 0);
+          reserve(destination, purpose, bytes, snapshot.manifest.length);
+        }
+        // Restoring the original installation preserves the applied historical
+        // profile in failed-data, including its separately persisted manifest.
+        manifestBytes += snapshot.manifest.reduce((sum, entry) => sum + 512 + Buffer.byteLength(entry.path) * 6
+          + (entry.type === 'link' ? Buffer.byteLength(entry.link) * 6 : 0), 0);
+      }
+      if (stage === 'build-staging') {
+        const root = this.paths.repoRoot;
+        const estimate = estimateSnapshot(root, { blockSize: inspect(this.runDir).blockSize,
+          exclude: relative => inside(this.paths.dataDir, path.join(root, relative)) || relative === '.cloudx' || GENERATED.some(generated => relative === generated) });
+        let generatedBytes = 0, generatedEntries = 0;
+        for (const relative of GENERATED) {
+          const artifact = path.join(root, relative);
+          if (!fs.existsSync(artifact)) continue;
+          const generated = estimateSnapshot(fs.realpathSync(artifact), { blockSize: inspect(this.runDir).blockSize });
+          generatedBytes += generated.bytes; generatedEntries += generated.entries;
+        }
+        reserve(this.runDir, 'release checkout and build staging estimate', (estimate.bytes + generatedBytes) * 2, (estimate.entries + generatedEntries) * 2);
+      }
+      const checkoutBytes = stage === 'build-staging' ? 0 : this.changedPaths(record.transition.sourceCommit, record.targetCommit)
+        .reduce((sum, relative) => sum + (optionalStat(path.join(this.paths.repoRoot, relative), this.paths.repoRoot)?.size ?? 0)
+          + (optionalStat(path.join(record.transition.release, relative), record.transition.release)?.size ?? 0), 0);
+      const stateBytes = Buffer.byteLength(JSON.stringify(record, null, 2)) + checkoutBytes * 2;
+      // Atomic JSON replacement temporarily retains the old and new generations.
+      reserve(this.runDir, 'durable state and recovery manifests', (stateBytes + manifestBytes) * 3, 32);
+      reserve(this.paths.repoRoot, 'checkout activation and recovery', Math.max(stateBytes * 2, 1024 * 1024), 32);
+      for (const directory of [path.dirname(this.paths.envPath), this.paths.systemdDir]) reserve(directory, 'service configuration', 1024 * 1024, 16);
+      const checks = [...filesystems.values()].map(check => {
+        check.headroomBytes = Math.max(256 * 1024 * 1024, Math.ceil(check.requiredBytes / 10));
+        check.requiredBytes += check.headroomBytes;
+        check.requiredInodes += 1024;
+        return check;
+      });
+      record.transition.capacity = { stage, checkedAt: new Date().toISOString(), filesystems: checks };
+      this.save(record);
+      const shortfall = checks.find(check => check.requiredBytes > check.availableBytes || check.requiredInodes > check.availableInodes);
+      if (shortfall) throw new Error(`Insufficient update capacity on ${shortfall.mount} (${shortfall.destination}): required ${shortfall.requiredBytes} bytes and ${shortfall.requiredInodes} inodes, available ${shortfall.availableBytes} bytes and ${shortfall.availableInodes} inodes, including recovery and ${shortfall.headroomBytes} bytes operational headroom. Free space or increase the quota on this filesystem, then resume to reassess. Retained worker files, installed releases and recovery snapshots were not removed.`);
+    } catch (error) {
+      throw publicFailure('capacity', error.message, error);
+    }
   }
 
   requireInterruption(record, plan) {
@@ -319,6 +402,8 @@ export class UpdateHost {
     if (currentPlan.requiresInterruption && !record.confirmInterruption) this.requireInterruption(record, currentPlan);
     t.serviceStates = Object.fromEntries(this.target.serviceNames.map(service => [service, this.runner.inspect('systemctl', ['--user', 'show', service, '--property=ActiveState,MainPID,InvocationID'])]));
     if (t.directBroker) t.directBroker.state = this.inspectOwnedBrokerConfiguration(t.directBroker.file).state;
+    // This is the final safe boundary before terminal migration or service stop.
+    this.preflightCapacity(record, 'before-stop');
     t.restored = false;
     t.mutating = true;
     this.save(record);
@@ -340,15 +425,26 @@ export class UpdateHost {
     const t = record.transition;
     const backup = path.join(this.runDir, `snapshot-${randomUUID()}`);
     fs.mkdirSync(backup, { recursive: true, mode: 0o700 });
-    const documentation = this.envConfig.CLOUDX_DOCUMENTATION_DATA_DIR ?? path.join(this.paths.dataDir, 'documentation');
-    const roots = [this.paths.dataDir, ...(this.target.kind === 'standard' && !inside(this.paths.dataDir, documentation) ? [documentation] : [])];
-    if (roots.some(root => !path.isAbsolute(root) || root === '/' || inside(root, this.runDir) || fs.existsSync(root) && fs.realpathSync(root) !== root)) throw new Error('Recovery directory must be outside persisted data roots.');
+    const roots = this.dataRoots();
     t.snapshots = [];
     for (const [index, root] of roots.entries()) {
       if (!fs.existsSync(root)) continue;
       const destination = path.join(backup, `data-${index}`);
-      const manifest = snapshotTree(root, destination, { exclude: runtimeData });
-      verifySnapshot(destination, manifest);
+      let lastSaved = 0;
+      const progress = (operation, force = false) => current => {
+        if (!force && Date.now() - lastSaved < 5000) return;
+        lastSaved = Date.now();
+        t.snapshotProgress = { operation, root, ...current, updatedAt: new Date().toISOString() };
+        record.run.component = 'snapshot';
+        record.run.message = `Recovery snapshot ${index + 1}/${roots.length}: ${operation}, ${current.files} files, ${current.bytes} bytes.`;
+        this.save(record);
+      };
+      progress('copying', true)({ files: 0, bytes: 0 });
+      const manifest = snapshotTree(root, destination, { exclude: runtimeData, progress: progress('copying') });
+      progress('verifying', true)({ files: 0, bytes: 0 });
+      verifySnapshot(destination, manifest, { progress: progress('verifying') });
+      progress('verified', true)({ files: manifest.filter(entry => entry.type === 'file').length,
+        bytes: manifest.reduce((sum, entry) => sum + (entry.size ?? 0), 0) });
       t.snapshots.push({ root, destination, manifest });
     }
     this.assertDirectBrokerUnchanged(t);

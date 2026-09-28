@@ -110,6 +110,8 @@ export interface ForgeWorker {
   templateId: string;
   placement?: ForgePlacement;
   status: ForgeWorkerStatus;
+  /** Live operation diagnostics; not persisted across process restarts. */
+  activity?: { phase: string; since: string; elapsedMs: number; queueDelayMs: number };
   worktreePath?: string;
   branch?: string;
   tabId?: string;
@@ -230,6 +232,7 @@ export function forgeWorkerIssueNumbers(worker: ForgeWorker): number[] {
 }
 
 export function forgeWorkerContinuationBlocker(worker: ForgeWorker, workers: readonly ForgeWorker[]): string | undefined {
+  if (worker.activity) return `${worker.activity.phase}. Wait for this action to finish before continuing.`;
   const blocker = continuationStateBlocker(worker);
   if (blocker) return blocker;
   if (worker.rebaseRecovery && worker.rebaseRecovery.phase !== "resolving")

@@ -91,6 +91,7 @@ async function workers(
     tabId: string;
   }> = [];
   const historyRequests: string[] = [];
+  const resumes: Array<{ input: Record<string, unknown>; tabId: string }> = [];
   let held!: Route;
   let requested!: () => void;
   const pending = new Promise<void>((resolve) => {
@@ -126,6 +127,11 @@ async function workers(
             },
           },
         });
+      case "forge.worker.resume": {
+        resumes.push(body);
+        const worker = entries.find((entry) => entry.id === body.input.id);
+        return route.fulfill({ json: { worker } });
+      }
       case "forge.worker.continue": {
         continuations.push(body);
         if (options.holdFirstContinuation && continuations.length === 1) {
@@ -146,6 +152,8 @@ async function workers(
   await page.goto(baseUrl);
   await page.getByRole("button", { name: "Workers (2)", exact: true }).click();
   return {
+    entries,
+    resumes,
     continuations,
     historyRequests,
     pending,
@@ -602,6 +610,90 @@ test("preserves near-limit worker history through mobile fitting and repeated re
   }
   expect(fixture.historyRequests).toEqual(["issue-worker"]);
   expect(fixture.continuations).toEqual([]);
+});
+
+test("keeps a CI-paused worker responsive while another worker waits for terminal context", async ({
+  page,
+}, testInfo) => {
+  const fixture = await workers(page, {
+    holdFirstContinuation: true,
+    issueWorker: { status: "paused", title: "Finish noisy terminal" },
+    secondWorker: {
+      kind: "issue",
+      number: 9,
+      status: "paused",
+      title: "Repair failed CI",
+      error: "Required CI failed.",
+    },
+  });
+  const noisy = page.getByRole("article", { name: "issue worker #7" });
+  await noisy.getByRole("button", { name: "Continue with message" }).click();
+  await noisy
+    .getByRole("textbox", { name: "Message to worker" })
+    .fill("Continue the noisy worker.");
+  await noisy.getByRole("button", { name: "Send and continue" }).click();
+  await fixture.pending;
+  await expect(
+    noisy.getByRole("button", { name: "Resume", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    noisy.getByRole("button", { name: "Continuing…" }),
+  ).toBeDisabled();
+  fixture.entries[0].activity = {
+    phase: "Closing terminal and saving context",
+    since: "2026-09-28T02:00:00.000Z",
+    elapsedMs: 566_000,
+    queueDelayMs: 2400,
+  };
+  await page
+    .getByRole("button", { name: "Refresh Forge", exact: true })
+    .click();
+  await expect(noisy).toContainText(
+    "Closing terminal and saving context · 9m 26s elapsed · Queue delay 3s",
+  );
+  await page.getByRole("tab", { name: /Issue #9/i }).click();
+  const recovery = page.getByRole("article", { name: "issue worker #9" });
+  await expect(recovery).toContainText("Required CI failed.");
+  await expect(
+    recovery.getByRole("button", { name: "Resume", exact: true }),
+  ).toBeEnabled();
+  await recovery.getByRole("button", { name: "Resume", exact: true }).click();
+  await expect.poll(() => fixture.resumes.length).toBe(1);
+  expect(fixture.resumes[0].input.id).toBe("review-worker");
+  await recovery.getByRole("button", { name: "Continue with message" }).click();
+  await expect(recovery).toContainText(
+    "This starts implementation work; Resume rechecks the existing loop.",
+  );
+  await recovery
+    .getByRole("textbox", { name: "Message to worker" })
+    .fill("Repair the failing CI check.");
+  const submit = recovery.getByRole("button", { name: "Send and continue" });
+  await expect(submit).toBeEnabled();
+  await submit.scrollIntoViewIfNeeded();
+  await expect(submit).toBeInViewport({ ratio: 1 });
+  const screenshot = testInfo.outputPath("independent-worker-controls.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("independent-worker-controls", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await submit.click();
+  await expect(recovery.getByRole("form")).toHaveCount(0);
+  expect(fixture.continuations.map((request) => request.input.id)).toEqual([
+    "issue-worker",
+    "review-worker",
+  ]);
+  expect(fixture.continuations[1].input.message).toBe(
+    "Repair the failing CI check.",
+  );
+  await page.getByRole("tab", { name: /Issue #7/i }).click();
+  await expect(
+    noisy.getByRole("button", { name: "Resume", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    noisy.getByRole("textbox", { name: "Message to worker" }),
+  ).toHaveValue("Continue the noisy worker.");
+  await fixture.fail();
 });
 
 test("retains a failed message and allows an explicit retry", async ({
