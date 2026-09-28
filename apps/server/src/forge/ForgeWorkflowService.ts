@@ -961,7 +961,8 @@ export class ForgeWorkflowService {
           await this.recoverResources(member);
           await this.quiesce(member);
         }
-        await this.deps.runtime.syncPublishedBranch(workerWorkspace(worker), worker.headSha, change.headSha, controller.signal);
+        await this.waitForWorkerIO(worker, "Syncing published checkout", () => this.deps.runtime.syncPublishedBranch(workerWorkspace(worker), worker.headSha!, change.headSha, controller.signal));
+        controller.signal.throwIfAborted();
         worker.headSha = change.headSha;
         this.observeMergeConflict(worker, change);
         worker.rebaseRecovery = undefined;
@@ -2016,7 +2017,7 @@ export class ForgeWorkflowService {
       throw new Error("Conflict recovery requires the original issue to remain open.");
     signal?.throwIfAborted();
     await this.quiesce(worker);
-    const prepared = await this.deps.runtime.prepareIssueRebase(workerWorkspace(worker), worker.headSha!, worker.baseBranch, signal);
+    const prepared = await this.waitForWorkerIO(worker, "Preparing conflict recovery", () => this.deps.runtime.prepareIssueRebase(workerWorkspace(worker), worker.headSha!, worker.baseBranch, signal));
     signal?.throwIfAborted();
     if (saved?.phase === "reviewing" && saved.headSha === worker.headSha && saved.targetHeadSha === prepared.targetHeadSha)
       throw new Error("This commit was already rebased onto the reported target. Inspect the provider's unchanged conflict status, then Resume; the work is retained.");
@@ -2505,7 +2506,8 @@ export class ForgeWorkflowService {
     if (worker.kind === "review") {
       if (!worker.reviewBaseline && (worker.draft || worker.reviewHistory?.length))
         throw new Error("Incremental comparison cannot be established: the previous review has no verified baseline evidence. Restore its completed comparison and retained Git objects before resuming.");
-      reviewScope = await this.deps.runtime.prepareReviewScope(workerWorkspace(worker), worker.reviewBaseline?.revision, signal);
+      reviewScope = await this.waitForWorkerIO(worker, "Preparing review comparison", () => this.deps.runtime.prepareReviewScope(workerWorkspace(worker), worker.reviewBaseline?.revision, signal));
+      signal?.throwIfAborted();
       const change = context.item as ForgeChangeRequest;
       if (reviewScope.current.headSha !== change.headSha || reviewScope.current.baseSha !== change.baseSha)
         throw new Error("The review comparison does not match the current pinned request.");

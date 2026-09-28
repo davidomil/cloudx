@@ -248,9 +248,15 @@ export class UpdateHost {
         manifestBytes += estimate.manifestBytes * 2;
       }
       for (const snapshot of record.transition.restoreData ?? []) {
-        const blockSize = inspect(snapshot.root).blockSize;
-        const bytes = snapshot.manifest.reduce((sum, entry) => sum + Math.ceil((entry.type === 'file' ? entry.size : blockSize) / blockSize) * blockSize, 0);
-        reserve(snapshot.root, 'selected historical profile', bytes, snapshot.manifest.length);
+        for (const [destination, purpose] of [[snapshot.root, 'selected historical profile'], [this.runDir, 'selected historical failed-start recovery']]) {
+          const blockSize = inspect(destination).blockSize;
+          const bytes = snapshot.manifest.reduce((sum, entry) => sum + Math.ceil((entry.type === 'file' ? entry.size : blockSize) / blockSize) * blockSize, 0);
+          reserve(destination, purpose, bytes, snapshot.manifest.length);
+        }
+        // Restoring the original installation preserves the applied historical
+        // profile in failed-data, including its separately persisted manifest.
+        manifestBytes += snapshot.manifest.reduce((sum, entry) => sum + 512 + Buffer.byteLength(entry.path) * 6
+          + (entry.type === 'link' ? Buffer.byteLength(entry.link) * 6 : 0), 0);
       }
       if (stage === 'build-staging') {
         const root = this.paths.repoRoot;

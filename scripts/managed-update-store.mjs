@@ -274,22 +274,36 @@ export function filesystemCapacity(destination, { quotaCommand = spawnSync } = {
     return { root: parts[4].replace(/\\([0-7]{3})/gu, (_, octal) => String.fromCharCode(parseInt(octal, 8))), options: `${parts[5]},${filesystem.split(' ').slice(2).join(',')}` };
   });
   const mount = mounts.filter(mount => inside(mount.root, existing)).sort((a, b) => b.root.length - a.root.length)[0];
-  let quota = { bytes: Infinity, inodes: Infinity }, quotaStatus = 'unavailable (quota-tools is not installed)';
+  const configuredQuotas = {
+    user: /(?:^|,)(?:usrquota|usrjquota|uquota|quota)(?:=|,|$)/u.test(mount.options),
+    group: /(?:^|,)(?:grpquota|grpjquota|gquota)(?:=|,|$)/u.test(mount.options),
+  };
+  const quotaChecks = [];
+  let quota = { bytes: Infinity, inodes: Infinity };
   const group = stat.mode & 0o2000 ? stat.gid : process.getgid();
   for (const [kind, id] of [['user', process.getuid()], ['group', group]]) {
     const result = quotaCommand('quota', ['--verbose', '--no-wrap', '--raw-grace', `--filesystem=${mount.root}`, `--${kind}`, String(id)],
       { encoding: 'utf8', timeout: 5000, env: { ...process.env, LC_ALL: 'C' } });
     if (result.error?.code === 'ENOENT') {
-      if (/(usrquota|grpquota|uquota|gquota)/u.test(mount.options)) throw new Error(`Install quota-tools to inspect enabled quotas on ${mount.root}, then resume.`);
+      if (Object.values(configuredQuotas).some(Boolean)) throw new Error(`Install quota-tools to inspect enabled quotas on ${mount.root}, then resume.`);
       break;
     }
-    if (result.error || result.stderr?.trim() || result.status && !result.stdout?.trim())
+    const label = kind === 'group' ? 'destination group' : kind;
+    const diagnostics = (result.stderr ?? '').trim().split('\n').map(line => line.replace(/^quota: /u, '').replace(/\.$/u, ''));
+    const disabled = !configuredQuotas[kind] && result.status === 1 && !result.stdout?.trim() && diagnostics.every(line =>
+      line === `Mountpoint (or device) ${mount.root} not found or has no quota enabled` || line === 'Not all specified mountpoints are using quota');
+    if (!result.error && !result.signal && disabled) {
+      quotaChecks.push(`${label} not enabled`);
+      continue;
+    }
+    if (result.error || result.signal || result.stderr?.trim() || result.status && !result.stdout?.trim())
       throw new Error(`Cannot inspect ${kind} quota on ${mount.root}; resolve quota-tools errors before resuming.`);
     const limits = parseQuotaCapacity(result.stdout ?? '');
     quota = { bytes: Math.min(quota.bytes, limits.bytes), inodes: Math.min(quota.inodes, limits.inodes) };
-    quotaStatus = 'user and destination group checked';
+    quotaChecks.push(`${label} checked`);
   }
-  if (/(prjquota|pquota)/u.test(mount.options)) quotaStatus += '; project quota unavailable to this probe';
+  let quotaStatus = quotaChecks.join('; ') || 'unavailable (quota-tools is not installed)';
+  if (/(?:^|,)(?:prjquota|pquota)(?:=|,|$)/u.test(mount.options)) quotaStatus += '; project quota unavailable to this probe';
   return { device: String(stat.dev), destination, mount: mount.root, blockSize: capacity.bsize,
     availableBytes: Math.min(Math.max(0, capacity.bavail) * capacity.bsize, quota.bytes),
     availableInodes: Math.min(capacity.files > 0 ? capacity.ffree : Infinity, quota.inodes), quotaStatus };

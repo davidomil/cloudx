@@ -188,9 +188,16 @@ export class TabContextService {
 
   private async append(contextPath: string, owned: OwnedTabContext | undefined, entry: string): Promise<void> {
     if (owned) return this.withOwnedDirectory(owned, async directory => {
-      await withContextFile(directory, constants.O_WRONLY | constants.O_APPEND, file => file.writeFile(entry, "utf8"));
-      const content = await readOwnedContext(directory);
-      if (Buffer.byteLength(content, "utf8") > MAX_CONTEXT_BYTES) await writeOwnedContextAtomic(directory, trimmedContext(content));
+      await withContextFile(directory, constants.O_WRONLY | constants.O_APPEND, async (file, size) => {
+        if (size > MAX_CONTEXT_BYTES) {
+          const retained = await readOwnedContext(directory);
+          await writeOwnedContextAtomic(directory, trimmedContext(retained + entry));
+          return;
+        }
+        await file.writeFile(entry, "utf8");
+        const content = await readOwnedContext(directory);
+        if (Buffer.byteLength(content, "utf8") > MAX_CONTEXT_BYTES) await writeOwnedContextAtomic(directory, trimmedContext(content));
+      });
     });
     if (!await this.requireContextPath(contextPath)) return;
     await this.files.appendTextFileNoFollow(contextPath, entry, "Tab context file");
@@ -291,13 +298,13 @@ function boundedPendingContext(content: string): string {
   return TRIMMED_PENDING_HEADER + trimUtf8ToLastBytes(content, MAX_PENDING_CONTEXT_BYTES - Buffer.byteLength(TRIMMED_PENDING_HEADER, "utf8"));
 }
 
-async function withContextFile<T>(directory: OwnedDirectory, flags: number, operation: (file: Awaited<ReturnType<typeof fs.open>>) => Promise<T>): Promise<T> {
+async function withContextFile<T>(directory: OwnedDirectory, flags: number, operation: (file: Awaited<ReturnType<typeof fs.open>>, size: number) => Promise<T>): Promise<T> {
   const file = await fs.open(directory.childPath("context.md"), flags | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await file.stat();
     if (!stat.isFile() || stat.nlink !== 1) throw new Error("Owned tab context must be a regular file without hard links.");
     if (stat.size > MAX_CONTEXT_BYTES * 2) throw new Error("Owned tab context exceeds its bounded file size.");
-    return await operation(file);
+    return await operation(file, stat.size);
   } finally { await file.close(); }
 }
 

@@ -7114,3 +7114,118 @@ describe("Independent Forge progress during terminal persistence", () => {
   });
 
 });
+
+describe("Independent Forge progress during checkout preparation", () => {
+  it.each(["review", "sync"].flatMap(preparation => ["pause", "stop"].map(action => ({ preparation, action }))))
+  ("honors $action during $preparation preparation before creating a new attempt", async ({ preparation, action }) => {
+    const f = fixture();
+    const repository = f.deps.settings().repository;
+    let issue: ForgeWorker | undefined;
+    if (preparation === "sync") {
+      issue = await f.service.startIssue(repository, 1, placement);
+      f.reports.read.mockResolvedValue({ kind: "issue", title: "Fixed", body: "Validated", discussionReplies: [], resolvedDiscussionIds: [] });
+      await f.service.poll();
+    }
+    f.runtime.launch.mockClear();
+    f.reports.prepare.mockClear();
+    const entered = deferred<string>();
+    const release = deferred<void>();
+    if (preparation === "sync") {
+      f.runtime.syncPublishedBranch.mockImplementation(async workspace => {
+        entered.resolve((workspace as { id: string }).id);
+        await release.promise;
+      });
+    } else {
+      const prepare = f.runtime.prepareReviewScope.getMockImplementation()!;
+      f.runtime.prepareReviewScope.mockImplementation(async (...args) => {
+        entered.resolve((args[0] as { id: string }).id);
+        await release.promise;
+        return prepare(...args);
+      });
+    }
+    const preparing = (preparation === "sync" ? f.service.syncAndReview(issue!.id, placement)
+      : f.service.startReview(repository, 7, false, placement)).catch(error => error);
+    const workerId = await entered.promise;
+    const interrupting = action === "pause" ? f.service.pause(workerId) : f.service.stop(workerId);
+    release.resolve();
+    await Promise.all([preparing, interrupting]);
+    expect(f.stored().find(worker => worker.id === workerId)).toMatchObject({ status: action === "pause" ? "paused" : "stopped" });
+    expect(f.reports.prepare).not.toHaveBeenCalled();
+    expect(f.runtime.launch).not.toHaveBeenCalled();
+  });
+
+  it.each(["rebase", "review", "sync"].flatMap(preparation => ["continue", "resume"].map(action => ({ preparation, action }))))
+  ("keeps unrelated $action and completion responsive during $preparation preparation", async ({ preparation, action }) => {
+    const f = fixture();
+    f.runtime.launch.mockImplementation(async input => `tab-${input.id}`);
+    f.provider.getIssue.mockImplementation(async number => ({ ...f.issue, number: number! }));
+    f.provider.getChangeRequest.mockImplementation(async (number?: number) => ({ ...f.change, number: number ?? 7 }));
+    const repository = f.deps.settings().repository;
+    let issue: ForgeWorker | undefined;
+    if (preparation !== "review") {
+      issue = await f.service.startIssue(repository, 1, placement);
+      f.reports.read.mockResolvedValue({ kind: "issue", title: "Fixed", body: "Validated", discussionReplies: [], resolvedDiscussionIds: [] });
+      await f.service.poll();
+      f.change.hasConflicts = preparation === "rebase";
+      f.reports.read.mockResolvedValue(undefined);
+    }
+    const paused = await f.service.startIssue(repository, 2, placement);
+    await f.service.pause(paused.id);
+    const review = await f.service.startReview(repository, 8, false, placement);
+    f.reports.read.mockImplementation(async id => id === review.attemptId
+      ? { kind: "review", headSha: f.change.headSha, event: "approve", body: "Reviewed", comments: [] } : undefined);
+    f.runtime.publishBranch.mockClear();
+    const entered = deferred<string>();
+    const release = deferred<void>();
+    if (preparation === "rebase") {
+      const prepare = f.runtime.prepareIssueRebase.getMockImplementation()!;
+      f.runtime.prepareIssueRebase.mockImplementation(async (...args) => {
+        entered.resolve((args[0] as { id: string }).id);
+        await release.promise;
+        return prepare(...args);
+      });
+    } else if (preparation === "sync") {
+      const prepare = f.runtime.syncPublishedBranch.getMockImplementation()!;
+      f.runtime.syncPublishedBranch.mockImplementation(async (...args) => {
+        entered.resolve((args[0] as { id: string }).id);
+        await release.promise;
+        return prepare(...args);
+      });
+    } else {
+      const prepare = f.runtime.prepareReviewScope.getMockImplementation()!;
+      f.runtime.prepareReviewScope.mockImplementation(async (...args) => {
+        entered.resolve((args[0] as { id: string }).id);
+        await release.promise;
+        return prepare(...args);
+      });
+    }
+    const preparing = preparation === "rebase" ? f.service.rebaseAndResolve(issue!.id, placement)
+      : preparation === "sync" ? f.service.syncAndReview(issue!.id, placement)
+      : f.service.startReview(repository, 7, false, placement);
+    const workerId = await entered.promise;
+    const hooks = new HookRegistry();
+    new ForgePlugin(() => ({ workflow: f.service, settings: {} as ForgeSettingsService })).hooks.forEach(hook => hooks.register(hook));
+    const control = hooks.call(`forge.worker.${action}`, {
+      id: paused.id, ...placement, ...(action === "continue" ? { message: "Fix the failed CI" } : {}),
+    }, { caller: { kind: "ui" } });
+    const polling = f.service.poll();
+    try {
+      await vi.waitFor(() => expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === paused.id)).toHaveLength(2));
+      await expect(control).resolves.toMatchObject({ worker: { status: "running", id: paused.id } });
+      await vi.waitFor(() => expect(f.stored().find(worker => worker.id === review.id)).toMatchObject({
+        status: "completed", draft: { body: expect.stringContaining("Reviewed") },
+      }));
+      const phase = preparation === "rebase" ? "Preparing conflict recovery" : preparation === "sync" ? "Syncing published checkout" : "Preparing review comparison";
+      expect((await f.service.dashboard()).workers.find(worker => worker.id === workerId)).toMatchObject({ activity: { phase } });
+      await expect(f.service.continueWorker(workerId, "duplicate", placement)).rejects.toThrow("already in progress");
+      expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+      expect(f.provider.merge).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await Promise.all([preparing, control, polling]);
+    }
+    expect(await preparing).toMatchObject({ id: workerId, status: preparation === "sync" ? "awaiting_review" : "running" });
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === workerId)).toHaveLength(preparation === "rebase" ? 2 : 1);
+    expect((await f.service.dashboard()).workers.every(worker => !worker.activity)).toBe(true);
+  });
+});

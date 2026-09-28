@@ -130,6 +130,44 @@ describe("TabContextService", () => {
     });
   });
 
+  it.each(["ENOSPC", "EDQUOT"])("recovers owned context after a batched append cannot rotate with %s", async code => {
+    await withOwnedContext(async ({ service, tab }) => {
+      const identity = service.directory(tab.contextPath)!;
+      for (let index = 0; index < 6; index++) await service.record(tab, "terminal-output", "x".repeat(12_000));
+      expect((await fs.stat(tab.contextPath!)).size).toBe(64_000);
+
+      let capacityAvailable = false;
+      const originalOpen = fs.open.bind(fs);
+      const open = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        if (!capacityAvailable && String(args[0]).endsWith(".tmp")) throw Object.assign(new Error("context rotation capacity exhausted"), { code });
+        return originalOpen(...args);
+      });
+      try {
+        const burst = Array.from({ length: 6 }, (_, index) => service.record(tab, "terminal-output", `${"x".repeat(11_980)}\nburst-${index}`));
+        expect(new Set(burst).size).toBe(1);
+        await expect(Promise.all(burst)).rejects.toMatchObject({ code });
+        const appended = await service.read(tab);
+        expect(Buffer.byteLength(appended)).toBeGreaterThan(116_000);
+        expect(Buffer.byteLength(appended)).toBeLessThanOrEqual(128_000);
+        expect(appended).toContain("burst-5");
+
+        await expect(service.record(tab, "terminal-output", "y".repeat(12_000))).rejects.toMatchObject({ code });
+        expect(await service.read(tab)).toBe(appended);
+
+        capacityAvailable = true;
+        await service.record(tab, "terminal-output", `${"z".repeat(11_980)}\ncapacity-restored`);
+        await service.record(tab, "plugin-action", "finish conversation-exact-id");
+        const recovered = await service.read(tab);
+        expect(Buffer.byteLength(recovered)).toBeLessThanOrEqual(64_000);
+        const events = ["burst-5", "capacity-restored", "finish conversation-exact-id"];
+        expect(events.every(event => recovered.includes(event))).toBe(true);
+        expect(events.map(event => recovered.indexOf(event))).toEqual([...events.map(event => recovered.indexOf(event))].sort((a, b) => a - b));
+        expect(service.directory(tab.contextPath)).toEqual(identity);
+        expect(await fs.readdir(identity.path)).toEqual(["context.md"]);
+      } finally { open.mockRestore(); }
+    });
+  });
+
   it.each(["directory", "symlink"])("preserves a replacement owned context %s during reads, writes and deletion", async replacement => {
     await withOwnedContext(async ({ service, tab, root }) => {
       const owned = service.directory(tab.contextPath)!;

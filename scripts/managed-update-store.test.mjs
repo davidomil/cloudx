@@ -65,7 +65,7 @@ it('limits available space and inodes by unprivileged blocks and both destinatio
   vi.spyOn(fs, 'statfsSync').mockReturnValue({ bsize: 4096, bavail: 100, bfree: 1000, files: 1000, ffree: 900 });
   const quotaCommand = vi.fn((_, args) => ({ status: 0, stdout: `Disk quotas for user example:\nFilesystem blocks quota limit grace files quota limit grace\n/dev/test 10 ${args.includes('--group') ? 20 : 30} 40 0 3 20 30 0\n`, stderr: '' }));
   const capacity = filesystemCapacity(path.join(source, 'not-created'), { quotaCommand });
-  expect(capacity).toMatchObject({ availableBytes: 10 * 1024, availableInodes: 17, quotaStatus: 'user and destination group checked' });
+  expect(capacity).toMatchObject({ availableBytes: 10 * 1024, availableInodes: 17, quotaStatus: 'user checked; destination group checked' });
   expect(quotaCommand).toHaveBeenCalledTimes(2);
   expect(parseQuotaCapacity('/dev/test 50* 20 40 1 31* 20 30 1')).toEqual({ bytes: 0, inodes: 0 });
   expect(() => parseQuotaCapacity('/dev/test invalid quota output')).toThrow('Cannot parse quota');
@@ -77,6 +77,46 @@ it('reports unavailable quota tools and fails clearly when a quota query fails',
   vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => file === '/proc/self/mountinfo' ? '1 0 8:1 / / rw - ext4 /dev/test rw\n' : read(file, ...args));
   expect(filesystemCapacity(source, { quotaCommand: () => ({ error: { code: 'ENOENT' } }) }).quotaStatus).toContain('not installed');
   expect(() => filesystemCapacity(source, { quotaCommand: () => ({ status: 1, stdout: '', stderr: 'Permission denied' }) })).toThrow('Cannot inspect user quota');
+});
+
+it.each([
+  'quota: Mountpoint (or device) / not found or has no quota enabled.\nquota: Not all specified mountpoints are using quota.\n',
+  'Mountpoint (or device) / not found or has no quota enabled',
+])('uses filesystem capacity when quota-tools reports disabled quotas: %s', stderr => {
+  const { source } = fixture();
+  const read = fs.readFileSync;
+  vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => file === '/proc/self/mountinfo' ? '1 0 8:1 / / rw - ext4 /dev/test rw\n' : read(file, ...args));
+  vi.spyOn(fs, 'statfsSync').mockReturnValue({ bsize: 4096, bavail: 100, files: 1000, ffree: 900 });
+  const quotaCommand = vi.fn(() => ({ status: 1, stdout: '', stderr }));
+  expect(filesystemCapacity(source, { quotaCommand })).toMatchObject({ availableBytes: 409600, availableInodes: 900,
+    quotaStatus: 'user not enabled; destination group not enabled' });
+  expect(quotaCommand).toHaveBeenCalledTimes(2);
+});
+
+it.each(['user', 'group'])('retains %s quota limits when the other quota type is disabled', kind => {
+  const { source } = fixture();
+  const read = fs.readFileSync;
+  const option = kind === 'user' ? 'usrquota' : 'grpquota';
+  vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => file === '/proc/self/mountinfo'
+    ? `1 0 8:1 / / rw - ext4 /dev/test rw,${option}\n` : read(file, ...args));
+  vi.spyOn(fs, 'statfsSync').mockReturnValue({ bsize: 4096, bavail: 100, files: 1000, ffree: 900 });
+  const quotaCommand = vi.fn((_, args) => args.includes(`--${kind}`)
+    ? { status: 0, stdout: '/dev/test 10 20 30 0 3 20 30 0\n', stderr: '' }
+    : { status: 1, stdout: '', stderr: 'quota: Not all specified mountpoints are using quota.\n' });
+  expect(filesystemCapacity(source, { quotaCommand })).toMatchObject({ availableBytes: 10240, availableInodes: 17,
+    quotaStatus: kind === 'user' ? 'user checked; destination group not enabled' : 'user not enabled; destination group checked' });
+});
+
+it.each([
+  ['rw,usrquota', 'quota: Not all specified mountpoints are using quota.\n'],
+  ['rw', 'quota: Permission denied\nquota: Not all specified mountpoints are using quota.\n'],
+  ['rw', 'quota: Mountpoint (or device) /other not found or has no quota enabled.\n'],
+])('rejects failed quota inspection with mount options %s and diagnostics %s', (options, stderr) => {
+  const { source } = fixture();
+  const read = fs.readFileSync;
+  vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => file === '/proc/self/mountinfo'
+    ? `1 0 8:1 / / rw - ext4 /dev/test ${options}\n` : read(file, ...args));
+  expect(() => filesystemCapacity(source, { quotaCommand: () => ({ status: 1, stdout: '', stderr }) })).toThrow('Cannot inspect user quota');
 });
 
 it('snapshots and restores bytes, modes and links while preserving their external targets', () => {
