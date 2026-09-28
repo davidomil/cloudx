@@ -1126,10 +1126,13 @@ def frame_count(image: Image.Image) -> int:
 def extract_html(content: bytes, content_type: str | None = None) -> str:
     soup = BeautifulSoup(decode_html_text(content, content_type), "html.parser")
     for element in soup.select(
-        'script, style, template, noscript, nav, search, [hidden], '
+        'script, style, template, noscript, nav, search, '
         '[role~="navigation"], [role~="search"], [role~="banner"], [role~="contentinfo"]'
     ):
         element.extract()
+    for element in soup.select("[hidden]"):
+        if element["hidden"].lower() != "until-found":
+            element.extract()
     for selector in ('main, [role~="main"]', 'article'):
         regions = [region for region in soup.select(selector) if region.get_text(strip=True)]
         if regions:
