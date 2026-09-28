@@ -1683,6 +1683,57 @@ describe("ForgeRuntime owned branch updates", () => {
     expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(publishedHead);
   });
 
+  it.each(["handoff", "publication", "lost publication response", "interrupted publication receipt"])("settles a recovered base update across restart after %s", async checkpoint => {
+    const { workspace, publishedHead } = await publishedIssue();
+    await fs.writeFile(path.join(workspace.worktreePath, "issue.txt"), "Retained issue edits\n");
+    await runtime.preparePublication(workspace, "retained-edits", { headSha: publishedHead, status: "ready", retainedPaths: ["issue.txt"], details: "The previous commit was validated independently." });
+    const targetHead = await advanceTarget();
+    await expect(runtime.updateIssueBranch(workspace, publishedHead, "main")).rejects.toThrow("Retained tracked edits");
+    expect((await ownership(workspace.id)).value.baseUpdate.headSha).toBeUndefined();
+
+    await git(workspace.worktreePath, "add", "issue.txt");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: recover retained edits");
+    if (checkpoint !== "publication") await git(workspace.worktreePath, "merge", "--no-edit", targetHead);
+    const recoveredHead = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    const bytes = Buffer.from([0, 255, 6, 10]);
+    await fs.writeFile(path.join(workspace.worktreePath, "recovery.bin"), bytes);
+    await runtime.preparePublication(workspace, "recovered-work", { headSha: recoveredHead, status: "ready", retainedPaths: ["recovery.bin"], details: "Recovered commit validated independently; retain diagnostics." });
+    expect((await ownership(workspace.id)).value.baseUpdate.headSha).toBeUndefined();
+
+    if (checkpoint === "handoff") runtime = new ForgeRuntime(dependencies());
+    if (checkpoint === "lost publication response" || checkpoint === "interrupted publication receipt") {
+      const deps = dependencies();
+      const executeGit = deps.git!;
+      deps.git = async (...args) => {
+        const result = await executeGit(...args);
+        if (args[1][0] === "push") throw new Error("recovery publication response was lost");
+        return result;
+      };
+      runtime = new ForgeRuntime(deps);
+      await expect(runtime.publishBranch(workspace, undefined, recoveredHead)).rejects.toThrow("response was lost");
+      expect((await ownership(workspace.id)).value.baseUpdate.headSha).toBeUndefined();
+      expect((await ownership(workspace.id)).value.branchPublication.confirmed).toBe(false);
+      if (checkpoint === "interrupted publication receipt") {
+        const manifest = await ownership(workspace.id);
+        manifest.value.gitPending = true;
+        await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+      }
+      runtime = new ForgeRuntime(dependencies());
+      await runtime.recover(workspace.id);
+    }
+    expect(await runtime.publishBranch(workspace, undefined, recoveredHead)).toBe(recoveredHead);
+    expect((await ownership(workspace.id)).value.baseUpdate).toBeUndefined();
+    runtime = new ForgeRuntime(dependencies());
+    expect((await runtime.recover(workspace.id)).workspace).toEqual(workspace);
+    const latestTarget = await advanceTarget("next-target.txt", "Target advances again\n");
+    const preparedHead = await runtime.updateIssueBranch(workspace, recoveredHead, "main");
+    expect(await git(workspace.worktreePath, "rev-list", "--parents", "-n", "1", preparedHead)).toBe(`${preparedHead} ${recoveredHead} ${latestTarget}`);
+    expect(await runtime.publishBranch(workspace, undefined, preparedHead)).toBe(preparedHead);
+    expect(await git(origin, "rev-parse", workspace.branch)).toBe(preparedHead);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "issue.txt"), "utf8")).toBe("Retained issue edits\n");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "recovery.bin"))).toEqual(bytes);
+  });
+
   it("updates the owned issue from the current target and publishes only the recorded result", async () => {
     const deps = dependencies();
     deps.git = vi.fn(deps.git!);
@@ -1818,6 +1869,93 @@ describe("ForgeRuntime owned branch updates", () => {
     const rebasedHead = await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
     return { workspace, publishedHead, targetHead, rebasedHead };
   }
+
+  it.each(["base update", "no-op update", "rebase", "synchronization", "saved synchronization"])("reclaims retained work after a completed %s and restart", async operation => {
+    let workspace: ForgeWorkspace;
+    let completedHead: string;
+    if (operation === "rebase") {
+      const issue = await rebasedIssue();
+      workspace = issue.workspace;
+      completedHead = await runtime.publishBranch(workspace, undefined, issue.rebasedHead, issue.publishedHead);
+    } else {
+      const issue = await publishedIssue();
+      workspace = issue.workspace;
+      if (operation.includes("synchronization")) {
+        completedHead = await advanceTarget();
+        await git(repositoryPath, "push", "--force", "origin", `${completedHead}:refs/heads/${workspace.branch}`);
+        await runtime.syncPublishedBranch(workspace, issue.publishedHead, completedHead);
+        if (operation === "saved synchronization") {
+          const manifest = await ownership(workspace.id);
+          delete manifest.value.publishedSync.confirmed;
+          await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+        }
+      } else {
+        if (operation === "base update") await advanceTarget();
+        completedHead = await runtime.updateIssueBranch(workspace, issue.publishedHead, "main");
+        await runtime.publishBranch(workspace, undefined, completedHead);
+      }
+    }
+    const retainedPath = path.join(workspace.worktreePath, "retained.txt");
+    await fs.writeFile(retainedPath, "Keep until explicitly reviewed for deletion\n");
+    const retainedWorkspace = await runtime.cleanup({ ...workspace, expectedHeadSha: completedHead });
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: undefined });
+    let saved: ForgeWorker[] = [{
+      id: workspace.id, kind: "issue", number: 152, title: `Completed ${operation}`, repository: expectedRepository,
+      repositoryPath: workspace.repositoryPath, baseBranch: "main", templateId: "worker", status: "completed", headSha: completedHead,
+      retainedWorkspace: retainedWorkspace!, autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }];
+    const service = new ForgeWorkflowService({
+      settings: () => ({ repository: expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker", workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "xhigh", maxRunMinutes: 60 }),
+      refreshPublicationCredentials: async () => {}, runtime,
+      store: { read: async () => structuredClone(saved), write: async workers => { saved = structuredClone(workers); } },
+      reports: new ForgeWorkerReports(path.join(root, "data")), notify: vi.fn(), provider: vi.fn(),
+    });
+    const cleanup = new WorkspaceCleanupService({ dataDir: path.join(root, "data"), pathPolicy: new PathPolicy([root]), forge: service, openDirectories: () => [], withInactiveDirectory: async (_directory, action) => action(), protectedDirectories: [], processDirectories: async () => [], trashDirectory: path.join(root, "trash") });
+    try {
+      const preview = await cleanup.preview();
+      const candidate = preview.candidates.find(item => item.workerId === workspace.id)!;
+      expect(candidate).toMatchObject({ eligible: true, requiresDiscard: true, sourceChanges: ["retained.txt"] });
+      await cleanup.start({ previewId: preview.id, candidateIds: [candidate.id], discardCandidateIds: [candidate.id], emptyTrash: false, confirmation: "Delete permanently" });
+      await cleanup.settled();
+      expect((await cleanup.status())!.results[0]!.status).toBe("deleted");
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(saved[0]).toMatchObject({ status: "completed", headSha: completedHead });
+      expect(saved[0]!.retainedWorkspace).toBeUndefined();
+      const owned = (await ownership(workspace.id)).value;
+      expect(owned.cleaned).toBe(true);
+      expect(owned.baseUpdate).toBeUndefined();
+      expect(owned.issueRebase).toBeUndefined();
+      expect(owned.publishedSync).toBeUndefined();
+      runtime = new ForgeRuntime(dependencies());
+      expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: undefined });
+    } finally { await service.dispose(); }
+  });
+
+  it.each(["base update", "unpublished rebase", "synchronization", "uncertain publication", "Git process"])("preserves a checkout with an unfinished %s during explicit cleanup", async operation => {
+    const { workspace, publishedHead } = await publishedIssue(operation === "unpublished rebase");
+    const targetHead = await advanceTarget(operation === "unpublished rebase" ? "README.md" : "target.txt");
+    if (operation === "unpublished rebase") {
+      await runtime.prepareIssueRebase(workspace, publishedHead, "main");
+      await resolveContentRebase(workspace, targetHead);
+      await runtime.completeIssueRebase(workspace, { expectedHeadSha: publishedHead, targetHeadSha: targetHead });
+    } else {
+      const manifest = await ownership(workspace.id);
+      if (operation === "base update") manifest.value.baseUpdate = { expectedHeadSha: publishedHead, baseBranch: "main", targetHeadSha: targetHead };
+      if (operation === "synchronization") manifest.value.publishedSync = { expectedLocalHeadSha: publishedHead, expectedRemoteHeadSha: targetHead };
+      if (operation === "uncertain publication") manifest.value.branchPublication.confirmed = false;
+      if (operation === "Git process") manifest.value.gitPending = true;
+      await fs.writeFile(manifest.file, JSON.stringify(manifest.value));
+    }
+    runtime = new ForgeRuntime(dependencies());
+    const before = await fs.readFile((await ownership(workspace.id)).file, "utf8");
+    const remove = vi.fn();
+    await expect(runtime.inspectWorkspaceCleanup(workspace.id)).rejects.toThrow(/unfinished|unresolved/);
+    await expect(runtime.discardWorkspace(workspace.id, remove)).rejects.toThrow(/unfinished|unresolved/);
+    expect(remove).not.toHaveBeenCalled();
+    expect(await fs.readFile((await ownership(workspace.id)).file, "utf8")).toBe(before);
+    expect((await fs.stat(workspace.worktreePath)).isDirectory()).toBe(true);
+  });
 
   it("completes and publishes an exact rebased handoff with intentionally retained files", async () => {
     const { workspace, publishedHead, targetHead, rebasedHead } = await rebasedIssue();

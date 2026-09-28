@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -13,6 +14,7 @@ import type {
 
 import { isDirectChildPath } from "../pathBoundary.js";
 import { PathPolicy } from "../pathPolicy.js";
+import { assertDirectoryIdentity, readDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
 
 const BARE_DIRECTORY_NAME = ".bare";
 const MAX_GIT_OUTPUT_BYTES = 2_000_000;
@@ -61,6 +63,47 @@ interface DeleteWorktreeInput {
   folderName: string;
   confirmation: string;
   force?: boolean;
+}
+
+export interface WorktreeCleanupReceipt {
+  identity: DirectoryIdentity;
+  repositoryIdentity: DirectoryIdentity;
+  head: string;
+  branch?: string;
+  gitFile: WorktreeGitFileIdentity;
+}
+
+export interface WorktreeGitFileIdentity {
+  dev: string;
+  ino: string;
+  birthtimeNs: string;
+  uid: string;
+  target: string;
+}
+
+export async function readWorktreeGitFile(directory: string): Promise<WorktreeGitFileIdentity | undefined> {
+  const gitFile = path.join(directory, ".git");
+  const named = await fs.lstat(gitFile, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (!named) return undefined;
+  if (!named.isFile() || named.isSymbolicLink()) throw new Error("Worktree Git metadata was replaced; the replacement was preserved.");
+  const file = await fs.open(gitFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = await file.stat({ bigint: true });
+    if (!opened.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) throw new Error("Worktree Git metadata changed while reading; its contents were preserved.");
+    const contents = Buffer.alloc(16_385);
+    const { bytesRead } = await file.read(contents, 0, contents.length, 0);
+    const target = bytesRead <= 16_384 && /^gitdir: ([^\r\n\0]+)\r?\n?$/u.exec(contents.subarray(0, bytesRead).toString("utf8"))?.[1];
+    if (!target) throw new Error("Worktree Git metadata is invalid; its contents were preserved.");
+    return { dev: opened.dev.toString(), ino: opened.ino.toString(), birthtimeNs: opened.birthtimeNs.toString(), uid: opened.uid.toString(), target: path.resolve(directory, target) };
+  } finally { await file.close(); }
+}
+
+export function assertWorktreeGitFile(expected: WorktreeGitFileIdentity, current: WorktreeGitFileIdentity | undefined): void {
+  if (current && (current.dev !== expected.dev || current.ino !== expected.ino || current.birthtimeNs !== expected.birthtimeNs || current.uid !== expected.uid || current.target !== expected.target))
+    throw new Error("Worktree Git metadata was replaced or retargeted; the replacement was preserved.");
 }
 
 interface WorktreeStateOptions {
@@ -312,6 +355,55 @@ export class WorktreeService {
       options,
     );
     return this.getState(projectDir, options);
+  }
+
+  async defaultBranchRef(projectDir: string): Promise<string> {
+    const context = await this.requireReadyProject(projectDir);
+    const remote = await this.runBareGit(context.bareAuthority, ["ls-remote", "--symref", "origin", "HEAD"]);
+    const branch = /^ref: (refs\/heads\/.+)\tHEAD$/mu.exec(remote.stdout)?.[1];
+    const head = /^([a-f0-9]{40,64})\tHEAD$/mu.exec(remote.stdout)?.[1];
+    if (!branch || !head) throw new Error("Origin did not identify its default branch. Workspaces were preserved.");
+    const trackingRef = branch.replace("refs/heads/", "refs/remotes/origin/");
+    const fetched = await this.runBareGit(context.bareAuthority, ["rev-parse", "--verify", trackingRef]);
+    if (fetched.stdout.trim() !== head) throw new Error("Fetch the current origin default branch before cleaning up its workspaces.");
+    return trackingRef;
+  }
+
+  async resumeWorkspaceCleanup(
+    projectDir: string,
+    receipt: WorktreeCleanupReceipt,
+    beforeDelete: () => Promise<void>,
+    removeDirectory: () => Promise<void>,
+  ): Promise<void> {
+    const admitted = await this.requireReadyProject(projectDir);
+    const folderName = requireValidFolderName(path.basename(receipt.identity.path), admitted.bareName);
+    if (path.join(admitted.projectDir, folderName) !== receipt.identity.path) throw new Error("Cleanup receipt is outside its worktree project.");
+    await this.serializeDestination(receipt.identity.path, async () => {
+      const context = await this.requireReadyProject(projectDir);
+      assertDirectoryIdentity(receipt.repositoryIdentity, await readDirectoryIdentity(context.barePath), "Worktree repository");
+      const remaining = await fs.lstat(receipt.identity.path).catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (remaining) assertDirectoryIdentity(receipt.identity, await readDirectoryIdentity(receipt.identity.path), "Interrupted cleanup workspace");
+      assertWorktreeGitFile(receipt.gitFile, await readWorktreeGitFile(receipt.identity.path));
+      const listing = await this.runBareGit(context.bareAuthority, ["worktree", "list", "--porcelain", "-z"]);
+      const record = listing.stdout.split("\0\0").find(item => item.split("\0").includes(`worktree ${receipt.identity.path}`));
+      if (record) {
+        const fields = record.split("\0");
+        if (fields.some(field => field.startsWith("locked"))) throw new Error("This worktree is now locked.");
+        if (fields.find(field => field.startsWith("HEAD "))?.slice(5) !== receipt.head || fields.find(field => field.startsWith("branch "))?.slice(7) !== receipt.branch)
+          throw new Error("Worktree registration changed since deletion began; its contents were preserved.");
+      }
+      await beforeDelete();
+      await removeDirectory();
+      if (record) {
+        if (await fs.lstat(receipt.identity.path).then(() => true).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; }))
+          throw new Error("Workspace still exists after cleanup; its registration was preserved.");
+        await this.runBareGit(context.bareAuthority, ["worktree", "remove", "--force", receipt.identity.path]);
+      }
+      this.sizeCache.delete(receipt.identity.path);
+    });
   }
 
   async createWorktree(

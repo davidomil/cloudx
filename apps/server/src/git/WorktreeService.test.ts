@@ -9,11 +9,42 @@ import { describe, expect, it, vi } from "vitest";
 import type { WorktreeProjectState } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
-import { WorktreeService } from "./WorktreeService.js";
+import { readDirectoryIdentity } from "../directoryIdentity.js";
+import { readWorktreeGitFile, WorktreeService } from "./WorktreeService.js";
 
 const execFileAsync = promisify(execFile);
 
 describe("WorktreeService", () => {
+  it("finishes interrupted deletion with a surviving registration and missing worktree Git metadata", async () => {
+    const { baseRef, project, root } = await createClonedProject("cloudx-wt-cleanup-resume-");
+    const service = worktreeService();
+    const directory = path.join(project, "finished");
+    try {
+      await service.createWorktree(project, createInput("finished", "finished", baseRef));
+      const receipt = { gitFile: (await readWorktreeGitFile(directory))!, identity: await readDirectoryIdentity(directory), repositoryIdentity: await readDirectoryIdentity(path.join(project, ".bare")), head: await gitOutput(directory, "rev-parse", "HEAD"), branch: "refs/heads/finished" };
+      await fs.unlink(path.join(directory, ".git"));
+      const revalidate = vi.fn(async () => {});
+      await service.resumeWorkspaceCleanup(project, receipt, revalidate, async () => { await fs.rm(directory, { recursive: true }); });
+      expect(revalidate).toHaveBeenCalledOnce();
+      await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await gitOutput(path.join(project, ".bare"), "worktree", "list", "--porcelain")).not.toContain(directory);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+  it.each(["locked", "branch changed"])("preserves an interrupted worktree when its registration is %s", async change => {
+    const { baseRef, project, root } = await createClonedProject("cloudx-wt-cleanup-registration-");
+    const service = worktreeService();
+    const directory = path.join(project, "finished");
+    try {
+      await service.createWorktree(project, createInput("finished", "finished", baseRef));
+      const receipt = { gitFile: (await readWorktreeGitFile(directory))!, identity: await readDirectoryIdentity(directory), repositoryIdentity: await readDirectoryIdentity(path.join(project, ".bare")), head: await gitOutput(directory, "rev-parse", "HEAD"), branch: "refs/heads/finished" };
+      if (change === "locked") await git(directory, "worktree", "lock", directory);
+      else await git(directory, "switch", "-c", "new-work");
+      const remove = vi.fn(async () => {});
+      await expect(service.resumeWorkspaceCleanup(project, receipt, async () => {}, remove)).rejects.toThrow(change === "locked" ? "now locked" : "registration changed");
+      expect(remove).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(directory, "README.md"), "utf8")).toBe("hello\n");
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
   it("rejects every public operation outside configured roots before Git or filesystem mutation", async () => {
     const allowedRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-policy-allowed-"));
     const outsideProject = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-wt-policy-outside-"));
@@ -26,6 +57,7 @@ describe("WorktreeService", () => {
       () => service.initializeBareRepository(outsideProject),
       () => service.cloneBareRepository(outsideProject, "https://example.test/repo.git"),
       () => service.fetchRefs(outsideProject),
+      () => service.defaultBranchRef(outsideProject),
       () => service.createWorktree(outsideProject, createInput("feature", "feature", "HEAD")),
       () => service.deleteWorktree(outsideProject, { folderName: "feature", confirmation: "feature" }),
     ];

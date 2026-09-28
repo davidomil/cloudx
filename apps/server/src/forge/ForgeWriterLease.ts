@@ -13,7 +13,14 @@ export class ForgeWriterLease {
     try {
       if (!(await handle.stat()).isFile()) throw new Error("Forge writer ownership must be a regular file.");
       const child = spawn("flock", ["--nonblock", "--conflict-exit-code", "73", "--no-fork", "/proc/self/fd/3",
-        process.execPath, "-e", 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0)); process.stdout.write("owned\\n");'],
+        process.execPath, "-e", `
+          // The owner closes stdin only after graceful shutdown has persisted its state.
+          process.on("SIGINT", () => {});
+          process.on("SIGTERM", () => {});
+          process.stdin.resume();
+          process.stdin.on("end", () => process.exit(0));
+          process.stdout.write("owned\\n");
+        `],
       { stdio: ["pipe", "pipe", "ignore", handle.fd] });
       this.child = child;
       child.on("exit", () => { this.held = false; });

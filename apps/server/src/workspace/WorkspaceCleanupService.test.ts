@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { workspaceCleanupReclaimableBytes } from "@cloudx/shared";
 import type { ForgeWorker, WorkspaceCleanupPreview, WorkspaceCleanupRequest } from "@cloudx/shared";
 import { PathPolicy } from "../pathPolicy.js";
+import { WorktreeService } from "../git/WorktreeService.js";
 import { WorkspaceCleanupService } from "./WorkspaceCleanupService.js";
 import { registerWorkspaceCleanupRoutes } from "./WorkspaceCleanupRoutes.js";
 
@@ -43,6 +44,22 @@ function selection(preview: WorkspaceCleanupPreview, discard = false): Workspace
   const candidates = preview.candidates.filter(item => item.eligible && (discard || !item.requiresDiscard));
   return { previewId: preview.id, candidateIds: candidates.map(item => item.id), discardCandidateIds: discard ? candidates.filter(item => item.requiresDiscard).map(item => item.id) : [], emptyTrash: discard, confirmation: "Delete permanently" };
 }
+async function managedWorktrees() {
+  const seed = await checkout("managed-seed"); workers = [];
+  const project = path.join(root, "managed"); await fs.mkdir(project);
+  const manager = new WorktreeService(new PathPolicy([root]));
+  await manager.cloneBareRepository(project, seed);
+  await manager.createWorktree(project, { mode: "new_branch", folderName: "main", branchName: "main", baseRef: "origin/main" });
+  await manager.createWorktree(project, { mode: "new_branch", folderName: "finished", branchName: "finished", baseRef: "origin/main" });
+  return { manager, project, seed, bare: path.join(project, ".bare"), finished: path.join(project, "finished"), main: path.join(project, "main") };
+}
+async function standaloneCheckout() {
+  const seed = await checkout("standalone-seed"); workers = [];
+  const directory = path.join(root, "finished-development");
+  await git(root, "clone", seed, directory);
+  await git(directory, "switch", "-c", "finished");
+  return directory;
+}
 beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-cleanup-"));
   dataDir = path.join(root, "data"); await fs.mkdir(dataDir);
@@ -66,6 +83,141 @@ beforeEach(async () => {
 afterEach(async () => { await cleanup.settled(); await fs.rm(root, { recursive: true, force: true }); });
 
 describe("reviewed workspace cleanup", () => {
+  it("uses authoritative default-branch evidence for production manager clone/create layouts without origin/HEAD", async () => {
+    const { manager, project, bare, finished, main } = await managedWorktrees();
+    await expect(git(bare, "symbolic-ref", "refs/remotes/origin/HEAD")).rejects.toThrow();
+    await manager.fetchRefs(project);
+    await expect(git(bare, "symbolic-ref", "refs/remotes/origin/HEAD")).rejects.toThrow();
+    const preview = await cleanup.preview();
+    expect(preview.candidates.find(item => item.path === finished)).toMatchObject({ eligible: true, requiresDiscard: false });
+    expect(preview.candidates.find(item => item.path === main)).toMatchObject({ eligible: false, reason: "The default branch workspace is protected." });
+    await cleanup.start(selection(preview)); await cleanup.settled();
+    expect((await cleanup.status())!.results).toEqual([expect.objectContaining({ path: finished, status: "deleted" })]);
+    expect(await fs.stat(main)).toBeTruthy();
+    expect(await git(bare, "worktree", "list", "--porcelain")).not.toContain(finished);
+  });
+  it("protects manager workspaces when the remote default branch cannot be verified or needs fetching", async () => {
+    const { project, seed, finished, bare } = await managedWorktrees();
+    await fs.writeFile(path.join(seed, "source.ts"), "new default branch revision");
+    await git(seed, "commit", "-am", "advance default branch");
+    let preview = await cleanup.preview();
+    expect(preview.candidates.find(item => item.path === finished)?.eligible).toBe(false);
+    expect(preview.warnings.join(" ")).toContain("Fetch the current origin default branch");
+    await git(bare, "remote", "set-url", "origin", path.join(root, "missing-origin"));
+    preview = await cleanup.preview();
+    expect(preview.candidates.filter(item => item.repository === project).every(item => !item.eligible)).toBe(true);
+    expect(await fs.stat(finished)).toBeTruthy();
+  });
+  it.each(["checkout", "worktree"] as const)("rediscovers partially deleted %s contents after restart and requires another explicit discard", async kind => {
+    const managed = kind === "worktree" ? await managedWorktrees() : undefined;
+    const directory = managed?.finished ?? await standaloneCheckout();
+    const denied = path.join(directory, kind === "worktree" ? "node_modules" : ".git/objects");
+    await fs.mkdir(denied, { recursive: true }); await fs.writeFile(path.join(denied, "remaining"), "retained until explicit retry");
+    await fs.chmod(denied, 0o500);
+    try {
+      const preview = await cleanup.preview();
+      await cleanup.start(selection(preview)); await cleanup.settled();
+      expect((await cleanup.status())!.results.find(item => item.path === directory)).toMatchObject({ status: "failed", reason: expect.stringMatching(/EACCES|Permission denied/) });
+      if (managed) expect(await git(managed.bare, "worktree", "list", "--porcelain")).not.toContain(directory);
+      else await expect(fs.stat(path.join(directory, ".git", "HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
+      await fs.chmod(denied, 0o700);
+      cleanup = service();
+      const retry = await cleanup.preview();
+      const candidate = retry.candidates.find(item => item.path === directory)!;
+      expect(candidate).toMatchObject({ eligible: true, requiresDiscard: true, state: "interrupted cleanup" });
+      expect(selection(retry).candidateIds).not.toContain(candidate.id);
+      expect(await fs.readFile(path.join(denied, "remaining"), "utf8")).toBe("retained until explicit retry");
+      await cleanup.start(selection(retry, true)); await cleanup.settled();
+      expect((await cleanup.status())!.results.find(item => item.path === directory)?.status).toBe("deleted");
+      await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await service().preview()).candidates.some(item => item.path === directory)).toBe(false);
+      expect(JSON.parse(await fs.readFile(path.join(dataDir, "workspace-cleanup-deletions.json"), "utf8"))).toEqual([]);
+    } finally { await fs.chmod(denied, 0o700).catch(() => {}); }
+  });
+  it.each(["checkout", "worktree"] as const)("preserves a replaced %s directory when retrying its persisted deletion receipt", async kind => {
+    const managed = kind === "worktree" ? await managedWorktrees() : undefined;
+    const directory = managed?.finished ?? await standaloneCheckout();
+    const denied = path.join(directory, "node_modules"); await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "old work");
+    await fs.chmod(denied, 0o500);
+    const preview = await cleanup.preview(); await cleanup.start(selection(preview)); await cleanup.settled();
+    expect((await cleanup.status())!.results.find(item => item.path === directory)?.status).toBe("failed");
+    await fs.chmod(denied, 0o700);
+    await fs.rename(directory, `${directory}-saved`); await fs.mkdir(directory); await fs.writeFile(path.join(directory, "new-work"), "keep");
+    cleanup = service(); const retry = await cleanup.preview();
+    expect(retry.candidates.find(item => item.path === directory)).toMatchObject({ eligible: false, reason: expect.stringContaining("replacement was preserved") });
+    expect(await fs.readFile(path.join(directory, "new-work"), "utf8")).toBe("keep");
+  });
+  it("reconciles a completed standalone deletion receipt after restart without deleting anything new", async () => {
+    const directory = await standaloneCheckout();
+    const denied = path.join(directory, "node_modules"); await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "old work");
+    await fs.chmod(denied, 0o500);
+    await cleanup.start(selection(await cleanup.preview())); await cleanup.settled();
+    await fs.chmod(denied, 0o700); await fs.rm(directory, { recursive: true });
+    cleanup = service(); const retry = await cleanup.preview();
+    expect(retry.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true, requiresDiscard: true, reason: expect.stringContaining("reconcile") });
+    await cleanup.start(selection(retry, true)); await cleanup.settled();
+    expect((await cleanup.status())!.results.find(item => item.path === directory)?.status).toBe("deleted");
+    expect((await service().preview()).candidates.some(item => item.path === directory)).toBe(false);
+  });
+  it("requires the worktree repository identity and unchanged remaining files on explicit retry", async () => {
+    const { finished, bare } = await managedWorktrees();
+    const denied = path.join(finished, "node_modules"); await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "old work");
+    await fs.chmod(denied, 0o500);
+    await cleanup.start(selection(await cleanup.preview())); await cleanup.settled();
+    await fs.chmod(denied, 0o700);
+    cleanup = service(); const retry = await cleanup.preview();
+    await fs.writeFile(path.join(finished, "new-source.ts"), "new work");
+    await cleanup.start(selection(retry, true)); await cleanup.settled();
+    expect((await cleanup.status())!.results.find(item => item.path === finished)).toMatchObject({ status: "skipped", reason: expect.stringContaining("changed after preview") });
+    await fs.rename(bare, `${bare}-saved`); await fs.mkdir(bare);
+    const replaced = (await service().preview()).candidates.find(item => item.path === finished)!;
+    expect(replaced).toMatchObject({ eligible: false, reason: expect.stringContaining("replacement was preserved") });
+    expect(await fs.readFile(path.join(finished, "new-source.ts"), "utf8")).toBe("new work");
+  });
+  it("preserves a standalone repository reinitialized inside the retained directory after interrupted deletion", async () => {
+    const directory = await standaloneCheckout();
+    const denied = path.join(directory, "node_modules"); await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "old work");
+    await fs.chmod(denied, 0o500);
+    await cleanup.start(selection(await cleanup.preview())); await cleanup.settled();
+    await fs.chmod(denied, 0o700);
+    await fs.rename(path.join(directory, ".git"), path.join(directory, "previous-git"));
+    await git(directory, "init", "-b", "new-work");
+    const candidate = (await service().preview()).candidates.find(item => item.path === directory)!;
+    expect(candidate).toMatchObject({ eligible: false, reason: expect.stringContaining("replacement was preserved") });
+    expect(await git(directory, "symbolic-ref", "HEAD")).toBe("refs/heads/new-work");
+  });
+  it.each(["new repository", "replaced gitfile", "retargeted gitfile", "missing gitfile"] as const)("revalidates linked-worktree Git metadata after partial deletion: %s", async change => {
+    const { finished, bare } = await managedWorktrees();
+    const denied = path.join(finished, "node_modules"); await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "old work");
+    await fs.chmod(denied, 0o500);
+    await cleanup.start(selection(await cleanup.preview())); await cleanup.settled();
+    expect((await cleanup.status())!.results.find(item => item.path === finished)?.status).toBe("failed");
+    expect(await git(bare, "worktree", "list", "--porcelain")).not.toContain(finished);
+    await fs.chmod(denied, 0o700);
+    const gitFile = path.join(finished, ".git");
+    if (change === "new repository") {
+      await fs.rename(gitFile, path.join(finished, "previous-git"));
+      await git(finished, "init", "-b", "new-work");
+      await git(finished, "config", "user.name", "New work"); await git(finished, "config", "user.email", "new@example.invalid");
+      await fs.writeFile(path.join(finished, "new-source.ts"), "new committed work");
+      await git(finished, "add", "new-source.ts"); await git(finished, "commit", "-m", "new work");
+    } else if (change === "replaced gitfile") {
+      const contents = await fs.readFile(gitFile);
+      await fs.rename(gitFile, path.join(finished, "previous-git")); await fs.writeFile(gitFile, contents);
+    } else if (change === "retargeted gitfile") await fs.writeFile(gitFile, `gitdir: ${path.join(bare, "worktrees", "new-owner")}\n`);
+    else await fs.unlink(gitFile);
+    cleanup = service(); const retry = await cleanup.preview();
+    const candidate = retry.candidates.find(item => item.path === finished)!;
+    if (change === "missing gitfile") {
+      expect(candidate).toMatchObject({ eligible: true, requiresDiscard: true, state: "interrupted cleanup" });
+      await cleanup.start(selection(retry, true)); await cleanup.settled();
+      expect((await cleanup.status())!.results.find(item => item.path === finished)?.status).toBe("deleted");
+    } else {
+      expect(candidate).toMatchObject({ eligible: false, reason: expect.stringContaining("replacement was preserved") });
+      expect(await fs.readFile(path.join(denied, "remaining"), "utf8")).toBe("old work");
+      if (change === "new repository") expect(await git(finished, "show", "HEAD:new-source.ts")).toBe("new committed work");
+    }
+  });
   it("permanently deletes multiple completed checkouts with ignored build outputs and retires retention metadata", async () => {
     for (const name of ["one", "two"]) { const directory = await checkout(name); await fs.mkdir(path.join(directory, "node_modules")); await fs.writeFile(path.join(directory, "node_modules", "large.bin"), Buffer.alloc(1024 * 1024)); }
     const preview = await cleanup.preview();

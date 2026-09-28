@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
-import type { ForgeIssueCompletionReport, ForgeIssueDetail, ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
+import type { ForgeIssueCompletionReport, ForgeIssueDetail, ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeTurnCompletion, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
@@ -101,7 +101,7 @@ function fixture(issueNumber = 1) {
     })),
     retainReviewBaseline: vi.fn(async (_workspace: unknown, _revision: ForgeReviewRevision, _signal?: AbortSignal) => {}),
     launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
-    readTurnCompletion: vi.fn(async (workerId: string, attemptId: string) => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: (await reports.read.getMockImplementation()?.(attemptId) ? "completed" : "running") as "running" | "completed" | "interrupted" | "failed", error: undefined as string | undefined })),
+    readTurnCompletion: vi.fn(async (workerId: string, attemptId: string): Promise<ForgeTurnCompletion | undefined> => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: (await reports.read.getMockImplementation()?.(attemptId) ? "completed" : "running") as "running" | "completed" | "interrupted" | "failed", error: undefined as string | undefined })),
     finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
@@ -4718,6 +4718,56 @@ describe("Forge issue auto review", () => {
       .toMatchObject({ active: true, phase: "resolving", position: 1 });
   });
 
+  it.each([false, true].flatMap(autoReview => [false, true].flatMap(restart =>
+    [false, true].map(savedMessage => ({ autoReview, restart, savedMessage })))))
+  ("delivers one queued recovery message after admission (automatic: $autoReview, restart: $restart, saved: $savedMessage)", async ({ autoReview, restart, savedMessage }) => {
+    const f = await approvedIssue();
+    f.change.hasConflicts = true;
+    f.reports.read.mockResolvedValue(undefined);
+    await f.poll();
+    await f.service.pause(f.issue.id);
+    const saved = f.stored();
+    const issue = saved.find(worker => worker.id === f.issue.id)!;
+    issue.autoReview!.enabled = autoReview;
+    const message = "Preserve the validation fix while resolving this conflict.";
+    const previousError = "Conflict resolution needs the retained validation fix.";
+    issue.error = previousError;
+    if (savedMessage) issue.pendingContinuation = { message, previousError };
+    const owner: ForgeWorker = { ...issue, id: randomUUID(), number: 2, changeNumber: 8,
+      autoReview: undefined, rebaseRecovery: undefined, pendingContinuation: undefined,
+      status: "awaiting_review", attemptId: undefined, completion: undefined,
+      mergeQueue: { sequence: 2, enteredAt: new Date().toISOString(), phase: "waiting_ci", active: true, position: 1,
+        candidate: { headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha, prepared: true } } };
+    await f.deps.store.write([...saved, owner]);
+    let service = new ForgeWorkflowService(f.deps);
+    const launches = f.runtime.launch.mock.calls.length;
+    const before = await service.continueWorker(issue.id, message, placement);
+    expect(before).toMatchObject({ status: "awaiting_review", pendingContinuation: { message, previousError },
+      mergeQueue: { active: false, phase: "queued", activeWorkerId: owner.id } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+    expect(before.pendingContinuation?.deliveryAttemptId).toBeUndefined();
+    await service.continueWorker(issue.id, message, placement);
+    await expect(service.continueWorker(issue.id, "Replace the saved message.", placement)).rejects.toThrow("already saved");
+    if (restart) {
+      await service.dispose();
+      await f.deps.store.write(parseWorkers(f.stored()));
+      service = new ForgeWorkflowService(f.deps);
+    }
+    f.advanceTime(5_001); await service.poll();
+    expect(f.currentIssue().pendingContinuation).toMatchObject({ message, previousError });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(launches);
+    await service.stop(owner.id);
+    f.advanceTime(5_001); await service.poll();
+    const delivered = (await service.dashboard()).workers.find(worker => worker.id === issue.id)!;
+    expect(delivered).toMatchObject({ status: "running", mergeQueue: { active: true, phase: "resolving" } });
+    expect(delivered.pendingContinuation).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(launches + 1);
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(delivered.attemptId, expect.objectContaining({ manualContinuation: { message, previousError } }));
+    await expect(service.continueWorker(issue.id, message, placement)).rejects.toThrow("Pause");
+    await service.poll(); await service.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(launches + 1);
+  });
+
   it("releases a definite rejected merge after bounded conflict observation without retrying the write", async () => {
     const f = await approvedIssue();
     f.change.mergeable = true;
@@ -4836,6 +4886,81 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
     await expect(restarted.continueWorker(f.issue.id, "Inspect the preserved diagnostics.", placement)).rejects.toThrow("Pause");
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it("retains a message when its identified launch fails and delivers it after restart", async () => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    const message = "Inspect the preserved diagnostics.";
+    f.runtime.launch.mockImplementationOnce(async input => {
+      expect(f.currentIssue().pendingContinuation).toMatchObject({ message, deliveryAttemptId: input.attemptId });
+      throw new Error("Runner could not start.");
+    });
+    await expect(f.service.continueWorker(f.issue.id, message, placement)).rejects.toThrow("Runner could not start");
+    const failedAttempt = f.currentIssue().attemptId;
+    expect(f.currentIssue()).toMatchObject({ status: "failed", pendingContinuation: { message, deliveryAttemptId: failedAttempt } });
+    await f.service.dispose();
+    f.reports.read.mockResolvedValue(undefined);
+    const readCompletion = f.runtime.readTurnCompletion.getMockImplementation()!;
+    f.runtime.readTurnCompletion.mockImplementation((workerId, attemptId) => attemptId === failedAttempt
+      ? Promise.resolve(undefined) : readCompletion(workerId, attemptId));
+    const restarted = new ForgeWorkflowService(f.deps);
+    const continued = await restarted.resume(f.issue.id, placement);
+    expect(continued.status).toBe("running");
+    expect(continued.attemptId).not.toBe(failedAttempt);
+    expect(continued.pendingContinuation).toBeUndefined();
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({ manualContinuation: expect.objectContaining({ message }) }));
+    await expect(restarted.continueWorker(f.issue.id, message, placement)).rejects.toThrow("Pause");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps a launched message across restart until the matching native turn identifies delivery", async () => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    f.reports.read.mockResolvedValue(undefined);
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    const message = "Inspect the preserved diagnostics.";
+    const continued = await f.service.continueWorker(f.issue.id, message, placement);
+    expect(continued).toMatchObject({ status: "running", pendingContinuation: { message, deliveryAttemptId: continued.attemptId } });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(f.currentIssue().pendingContinuation?.message).toBe(message);
+    await expect(restarted.continueWorker(f.issue.id, message, placement)).rejects.toThrow("Pause");
+    const turn: ForgeTurnCompletion = { workerId: f.issue.id, attemptId: continued.attemptId!, threadId: "thread", turnId: "turn", status: "running" };
+    for (const mismatch of [{ workerId: randomUUID() }, { attemptId: randomUUID() }]) {
+      f.runtime.readTurnCompletion.mockResolvedValue({ ...turn, ...mismatch });
+      await restarted.poll();
+      expect(f.currentIssue().pendingContinuation?.message).toBe(message);
+    }
+    f.runtime.readTurnCompletion.mockResolvedValue(turn);
+    await restarted.poll();
+    expect(f.currentIssue().pendingContinuation).toBeUndefined();
+    expect(f.currentIssue().completion?.turn).toEqual(turn);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["resume", "repeat"] as const)("reconciles late delivery before %s after pausing startup", async action => {
+    const f = await approvedIssue();
+    await f.service.pause(f.issue.id);
+    f.reports.read.mockResolvedValue(undefined);
+    const readCompletion = f.runtime.readTurnCompletion.getMockImplementation()!;
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    const message = "Inspect the preserved diagnostics.";
+    const continued = await f.service.continueWorker(f.issue.id, message, placement);
+    await f.service.pause(f.issue.id);
+    expect(f.currentIssue().pendingContinuation).toMatchObject({ message, deliveryAttemptId: continued.attemptId });
+    f.runtime.readTurnCompletion.mockImplementation(readCompletion);
+    const resumed = action === "resume" ? await f.service.resume(f.issue.id, placement)
+      : await f.service.continueWorker(f.issue.id, message, placement);
+    expect(resumed.pendingContinuation).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(action === "resume" ? 4 : 3);
+    if (action === "resume") expect(f.reports.prepare.mock.calls.at(-1)![1]).not.toHaveProperty("manualContinuation");
+    else {
+      expect(resumed.status).toBe("paused");
+      await f.service.continueWorker(f.issue.id, "Add the new regression case.", placement);
+      expect(f.reports.prepare).toHaveBeenLastCalledWith(f.currentIssue().attemptId, expect.objectContaining({ manualContinuation: { message: "Add the new regression case." } }));
+      expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+    }
   });
 
   it("preserves a waiting queue turn through graceful shutdown while an explicit pause stays paused", async () => {

@@ -739,6 +739,7 @@ export class ForgeWorkflowService {
       const worker = this.requireWorker(id);
       const parent = this.autoReviewParent(worker);
       const issue = parent ?? worker;
+      if (await this.reconcileContinuationDelivery(issue)) await this.persist();
       issue.placement = placement;
       this.cancelProviderRecovery(issue);
       if (issue.mergeAttempted) {
@@ -790,8 +791,13 @@ export class ForgeWorkflowService {
     if (blocker) throw new Error(blocker);
     if (!sameRepository(worker.repository, this.deps.settings().repository))
       throw new Error("The configured repository changed. Restore it before continuing this worker.");
+    const savedMessage = worker.pendingContinuation?.message;
+    if (await this.reconcileContinuationDelivery(worker)) {
+      await this.persist();
+      if (savedMessage === input.trim()) return structuredClone(worker);
+    }
     if (worker.pendingContinuation && worker.pendingContinuation.message !== input.trim())
-      throw new Error("A recovery message is already saved while the remote operation is reconciled. Resume to deliver that message before sending a different one.");
+      throw new Error("A recovery message is already saved for the next worker turn. Resume to deliver that message before sending a different one.");
     if (worker.mergeAttempted || worker.pendingPublication || ["creating", "uncertain"].includes(worker.publicationState ?? "")) {
       worker.pendingContinuation ??= { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
       await this.persist();
@@ -836,9 +842,7 @@ export class ForgeWorkflowService {
       for (const member of members) this.operations.delete(member.id);
       throw error;
     }
-    const savedMessage = worker.pendingContinuation;
-    const manualContinuation: ManualContinuation = { message: savedMessage?.message ?? input.trim(),
-      ...(savedMessage?.previousError ?? worker.error ? { previousError: savedMessage?.previousError ?? worker.error } : {}) };
+    worker.pendingContinuation ??= { message: input.trim(), ...(worker.error ? { previousError: worker.error } : {}) };
     for (const member of members) this.cancelProviderRecovery(member);
     try {
       const provider = this.providerFor(worker);
@@ -899,10 +903,8 @@ export class ForgeWorkflowService {
       }
       await this.persist();
       if (worker.kind === "issue" && (worker.rebaseRecovery?.phase === "resolving" || change?.hasConflicts))
-        await this.startRebaseRecovery(worker, placement, false, manualContinuation);
-      else await this.launch(worker, placement, { item, change, issue, manualContinuation });
-      worker.pendingContinuation = undefined;
-      await this.persist();
+        await this.startRebaseRecovery(worker, placement);
+      else await this.launch(worker, placement, { item, change, issue });
       return structuredClone(worker);
     } catch (error) {
       await this.fail(worker, error, { retryProvider: false });
@@ -1253,15 +1255,25 @@ export class ForgeWorkflowService {
       }
     });
   }
+  private async reconcileContinuationDelivery(worker: ForgeWorker): Promise<boolean> {
+    const attemptId = worker.pendingContinuation?.deliveryAttemptId;
+    if (!attemptId || worker.attemptId !== attemptId || worker.completion?.attemptId !== attemptId) return false;
+    const turn = await this.deps.runtime.readTurnCompletion(worker.id, attemptId);
+    const previous = worker.completion.turn;
+    if (!isForgeTurnCompletion(turn) || turn.workerId !== worker.id || turn.attemptId !== attemptId ||
+        previous && (previous.threadId !== turn.threadId || previous.turnId !== turn.turnId)) return false;
+    worker.completion.turn ??= turn;
+    worker.pendingContinuation = undefined;
+    return true;
+  }
   private async observeCompletion(worker: ForgeWorker): Promise<void> {
     const completion = worker.completion;
     if (!completion || completion.attemptId !== worker.attemptId)
       throw new Error("The worker has no matching native turn completion checkpoint. Its work and report were preserved.");
     const observed = await this.deps.runtime.readTurnCompletion(worker.id, completion.attemptId);
     if (isForgeTurnCompletion(observed) && observed.workerId === worker.id && observed.attemptId === completion.attemptId &&
-      (!completion.turn || completion.turn.threadId === observed.threadId && completion.turn.turnId === observed.turnId) &&
-      (!completion.turn || completion.turn.status === "running")) {
-      completion.turn = observed;
+      (!completion.turn || completion.turn.threadId === observed.threadId && completion.turn.turnId === observed.turnId)) {
+      if (!completion.turn || completion.turn.status === "running") completion.turn = observed;
       if (worker.pendingContinuation?.deliveryAttemptId === completion.attemptId) worker.pendingContinuation = undefined;
       await this.persist();
     }
@@ -1944,7 +1956,7 @@ export class ForgeWorkflowService {
     if (!sameRepository(worker.repository, this.deps.settings().repository))
       throw new Error("The configured repository changed. Restore it before rebasing this worker.");
   }
-  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false, manualContinuation?: ManualContinuation): Promise<void> {
+  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false): Promise<void> {
     this.requireRecoveryPublication(worker);
     this.requireIdleReviewers(worker);
     const signal = this.operations.get(worker.id)?.signal;
@@ -1985,7 +1997,7 @@ export class ForgeWorkflowService {
     await this.persist();
     if (saved?.phase !== "resolving" && prepared.targetHeadSha !== change.targetHeadSha)
       throw new Error("The target branch changed during conflict detection. Resume to continue the preserved rebase on its saved target.");
-    await this.launch(worker, placement, { item, change, ...(manualContinuation ? { manualContinuation } : {}) });
+    await this.launch(worker, placement, { item, change });
   }
   private async acceptRebaseReport(worker: ForgeWorker): Promise<boolean> {
     const recovery = worker.rebaseRecovery!;
@@ -2160,11 +2172,7 @@ export class ForgeWorkflowService {
     await this.persist();
     const placement = worker.autoReview?.placement ?? worker.placement;
     if (!placement) throw new Error("Resume this worker to select its recovery placement.");
-    await this.launch(worker, placement, {
-      item, change, ...(worker.pendingContinuation ? { manualContinuation: worker.pendingContinuation } : {}),
-    });
-    worker.pendingContinuation = undefined;
-    await this.persist();
+    await this.launch(worker, placement, { item, change });
   }
   private requireBaseUpdateSource(worker: ForgeWorker, change: ForgeChangeRequestStatus): void {
     const update = worker.pendingPublication?.baseUpdate;
@@ -2444,6 +2452,10 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(worker.id)?.signal;
     signal?.throwIfAborted();
     const settings = this.deps.settings();
+    if (worker.pendingContinuation) {
+      const { message, previousError } = worker.pendingContinuation;
+      context = { ...context, manualContinuation: { message, ...(previousError ? { previousError } : {}) } };
+    }
     const owner = this.issueOwner(worker);
     if (owner?.batch) {
       const issues = (await this.batchIssues(owner))!;
@@ -2553,6 +2565,7 @@ export class ForgeWorkflowService {
       },
       signal,
     );
+    await this.reconcileContinuationDelivery(worker);
     signal?.throwIfAborted();
     worker.status = "running";
     worker.updatedAt = new Date().toISOString();

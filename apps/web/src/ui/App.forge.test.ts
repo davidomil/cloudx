@@ -41,7 +41,7 @@ function deferred<T>() {
 }
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-async function fixture(updateBlocked = false) {
+async function fixture(updateBlocked = false, splitWindow = false) {
   let current = repository;
   let saving = false;
   let submitted: CloudxConfigResponse["values"] | undefined;
@@ -55,6 +55,8 @@ async function fixture(updateBlocked = false) {
   const issue = () => ({ number: 7, title: `Issue in ${current.projectPath}`, body: "Inspect this issue before starting.", state: "open", author: "author", labels: [], comments: [], updatedAt: "2026-09-08", url: "https://example.test/issue/7" });
   const dashboardBody = () => ({ result: { configured: true, repository: current, workers: [] } });
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+    if (url === "/api/windows/window" && init?.method === "PATCH") return reply({ persistence: [{ name: "Workspace layout", state: "available" }] });
+    if (url === "/api/tabs/forge-tab/active") return reply({});
     if (updateBlocked && url === "/api/system/update") return reply({ available: true, forgeBlocker: {
       kind: "forge", workerId: "worker-149", issueNumber: 149,
       message: "Forge has an uncertain merge.", recoveryAction: "Recover the worker through Forge.",
@@ -66,7 +68,7 @@ async function fixture(updateBlocked = false) {
     if (url === "/api/hooks/forge.issue.start") { mutations.push(JSON.parse(String(init?.body)).input); return reply({ result: {} }); }
     const responses: Record<string, unknown> = {
       "/api/plugins": { plugins: [plugin] },
-      "/api/workspace": { tabs: [tab], activeTabId: tab.id, activeWindowId: "window", templates: [], windows: [{ id: "window", name: "Test", defaultCwd: "/unused", createdAt: "2026-09-08", updatedAt: "2026-09-08", layout: { root: { type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, activePaneId: "pane-1" } }] },
+      "/api/workspace": { tabs: [tab], activeTabId: tab.id, activeWindowId: "window", templates: [], windows: [{ id: "window", name: "Test", defaultCwd: "/unused", createdAt: "2026-09-08", updatedAt: "2026-09-08", layout: { root: splitWindow ? { type: "split", id: "split", direction: "horizontal", sizes: [50, 50], children: [{ type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, { type: "pane", pane: { id: "pane-2", tabIds: [] } }] } : { type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, activePaneId: "pane-1" } }] },
       "/api/config": config,
       "/api/hooks/rules-skills.catalog.list": { result: {} },
       "/api/automation/catalog": { nodes: [] },
@@ -119,6 +121,22 @@ describe("Forge repository settings in App", () => {
     await click(f.container, "Open Forge recovery");
     expect(f.container.querySelector(".settings-dialog")).toBeNull();
     expect(f.container.querySelector(".forge-panel")).not.toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([url, init]) => url === "/api/tabs" && init?.method === "POST")).toBe(false);
+  });
+
+  it("reveals an existing Forge pane hidden by another maximized pane", async () => {
+    const f = await fixture(true, true);
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[data-pane-id="pane-2"] [aria-label="Maximize pane"]')!.click());
+    const forgePane = f.container.querySelector('[data-pane-id="pane-1"]')!;
+    expect(forgePane.closest(".maximized-hidden-branch")).not.toBeNull();
+    await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="General"]')!.click());
+    await vi.waitFor(() => expect(f.container.textContent).toContain("Open Forge recovery"));
+    await click(f.container, "Open Forge recovery");
+    expect(f.container.querySelector(".settings-dialog")).toBeNull();
+    expect(forgePane.closest(".maximized-hidden-branch")).toBeNull();
+    expect(forgePane.classList.contains("active")).toBe(true);
+    expect(f.container.querySelectorAll(".forge-panel")).toHaveLength(1);
     expect(vi.mocked(fetch).mock.calls.some(([url, init]) => url === "/api/tabs" && init?.method === "POST")).toBe(false);
   });
 

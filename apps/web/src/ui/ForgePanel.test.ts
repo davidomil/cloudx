@@ -192,6 +192,34 @@ describe("ForgePanel", () => {
     expect(panel.querySelector('[aria-label="issue detail"]')!.textContent).toContain("#9 Issue 9");
   });
 
+  it.each(["draft", "running"] as const)("keeps every overlapping batch membership when the first batch is %s", async status => {
+    const issues = [7, 9, 11].map(number => ({ ...issue, number, state: "open" as const, title: `Issue ${number}` }));
+    const first = { ...worker, id: "first", title: "First", status, batch: { issues: issues.slice(0, 2) } };
+    const second = { ...worker, id: "second", title: "Second", status: "draft" as const, batch: { issues: issues.slice(1) } };
+    const duplicate = { ...first, id: "duplicate", title: "Same members", status: "draft" as const };
+    const f = fixture({ workers: [first, second, duplicate] }, hook => hook === "forge.issues.list" ? { items: issues } : undefined);
+    let panel = await renderPanel(f);
+    const members = (name: string) => [...panel.querySelectorAll(`[role="group"][aria-label="${name}"] .forge-item-title`)].map(item => item.textContent);
+    const assertMemberships = () => {
+      expect(members("First")).toEqual(["#7 Issue 7", "#9 Issue 9"]);
+      expect(members("Second")).toEqual(["#9 Issue 9", "#11 Issue 11"]);
+      expect(members("Same members")).toEqual(["#7 Issue 7", "#9 Issue 9"]);
+      expect(panel.querySelectorAll('.forge-batch-select')).toHaveLength(0);
+    };
+    assertMemberships();
+    await click(panel, "Refresh Forge");
+    assertMemberships();
+    await act(async () => { roots.pop()!.unmount(); });
+    panel.remove();
+    panel = await renderPanel(f);
+    assertMemberships();
+    f.dashboard.workers = [first, { ...second, batch: { issues: [issues[2]] } }];
+    await click(panel, "Refresh Forge");
+    expect(members("First")).toEqual(["#7 Issue 7", "#9 Issue 9"]);
+    expect(members("Second")).toEqual(["#11 Issue 11"]);
+    expect(members("Same members")).toEqual([]);
+  });
+
   it("removes newly batched pending selections on refresh and restores selection after draft deletion", async () => {
     const f = fixture();
     const panel = await renderPanel(f);

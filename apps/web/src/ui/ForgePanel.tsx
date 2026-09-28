@@ -176,8 +176,8 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
   const [batchMembers, setBatchMembers] = useState<ForgeIssue[]>([]);
   const [batchName, setBatchName] = useState("");
   const batches = workers.filter(worker => worker.kind === "issue" && worker.batch);
-  const batchForIssue = new Map(batches.flatMap(worker => worker.batch!.issues.map(issue => [issue.number, worker] as const)));
-  const membershipKey = [...batchForIssue.keys()].sort((a, b) => a - b).join(",");
+  const batchedIssueNumbers = new Set(batches.flatMap(worker => worker.batch!.issues.map(issue => issue.number)));
+  const membershipKey = [...batchedIssueNumbers].sort((a, b) => a - b).join(",");
   useEffect(() => {
     const members = new Set(membershipKey.split(",").filter(Boolean).map(Number));
     setBatchMembers(current => current.some(issue => members.has(issue.number)) ? current.filter(issue => !members.has(issue.number)) : current);
@@ -259,8 +259,8 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
         {listBusy ? <p role="status" className="forge-empty">Loading {kind === "issues" ? "issues" : "requests"}…</p> : null}
         {(kind === "issues" ? [
           ...batches.map(batch => ({ id: batch.id, title: batch.title, total: batch.batch!.issues.length,
-            items: page?.items.filter(issue => batchForIssue.get(issue.number)?.id === batch.id) ?? [] })),
-          { id: "unbatched", title: "Unbatched issues", total: undefined, items: page?.items.filter(issue => !batchForIssue.has(issue.number)) ?? [] },
+            items: page?.items.filter(issue => batch.batch!.issues.some(member => member.number === issue.number)) ?? [] })),
+          { id: "unbatched", title: "Unbatched issues", total: undefined, items: page?.items.filter(issue => !batchedIssueNumbers.has(issue.number)) ?? [] },
         ] : [{ id: "changes", title: "", total: undefined, items: page?.items ?? [] }]).filter(group => group.items.length).map(group => <div key={group.id} className="forge-issue-group" role={kind === "issues" ? "group" : undefined} aria-label={kind === "issues" ? group.title : undefined}>
           {kind === "issues" ? <h3 className="forge-issue-group-heading"><span>{group.title}</span><small>{group.total === undefined ? `${group.items.length} on this page` : `${group.items.length} of ${group.total} issues shown`}</small></h3> : null}
           {group.items.map((entry) => {
@@ -270,7 +270,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
           const checked = batchMembers.some(member => member.number === entry.number);
           const owned = itemWorkers.some(worker => worker.kind === "issue" && worker.status !== "draft" && worker.status !== "completed");
           return <div key={entry.number} className="forge-item-row">
-            {kind === "issues" && !batchForIssue.has(entry.number) ? <input type="checkbox" className="forge-batch-select" aria-label={`Select issue #${entry.number} for batch`} checked={checked} disabled={busy || (!checked && (entry.state !== "open" || owned || batchMembers.length >= MAX_FORGE_BATCH_ISSUES))} onChange={event => setBatchMembers(members => event.target.checked ? [...members, entry] : members.filter(member => member.number !== entry.number))} /> : null}
+            {kind === "issues" && !batchedIssueNumbers.has(entry.number) ? <input type="checkbox" className="forge-batch-select" aria-label={`Select issue #${entry.number} for batch`} checked={checked} disabled={busy || (!checked && (entry.state !== "open" || owned || batchMembers.length >= MAX_FORGE_BATCH_ISSUES))} onChange={event => setBatchMembers(members => event.target.checked ? [...members, entry] : members.filter(member => member.number !== entry.number))} /> : null}
             <button type="button" className={`forge-item${selectedNumber === entry.number ? " selected" : ""}`} onClick={() => setSelected(entry)} aria-pressed={selectedNumber === entry.number}>
             <span className="forge-item-title">#{entry.number} {entry.title}</span>
             <span className="forge-muted">{entry.state} · {entry.author}{entry.labels.length ? ` · ${entry.labels.join(", ")}` : ""}</span>

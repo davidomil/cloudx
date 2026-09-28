@@ -82,6 +82,7 @@ export interface ForgeRuntimeDependencies {
 interface OwnedPublishedSync {
   expectedLocalHeadSha: string;
   expectedRemoteHeadSha: string;
+  confirmed?: true;
 }
 interface OwnedBaseUpdate {
   expectedHeadSha: string;
@@ -1157,6 +1158,7 @@ export class ForgeRuntime {
       await this.verifyPublicationHead(owned, intendedHeadSha, signal, owned.branchPublication?.headSha !== intendedHeadSha);
       if (owned.branchPublication?.headSha === headSha && await this.publishedBranchHeadOrMissing(owned, access, signal) === headSha) {
         owned.branchPublication.confirmed = true;
+        await this.settleRecoveredBaseUpdate(owned, headSha, signal);
         await this.manifest(owned.id).write(owned);
         return headSha;
       }
@@ -1170,6 +1172,7 @@ export class ForgeRuntime {
       );
       await this.verifyPublicationHead(owned, headSha, signal);
       owned.branchPublication.confirmed = true;
+      await this.settleRecoveredBaseUpdate(owned, headSha, signal);
       await this.manifest(owned.id).write(owned);
       return headSha;
     });
@@ -1212,6 +1215,8 @@ export class ForgeRuntime {
         await this.runOwnedGit(owned, ["reset", "--keep", expectedRemoteHeadSha], signal);
       }
       await this.verifyCleanHead(owned, expectedRemoteHeadSha);
+      await this.requireNoGitOperation(owned);
+      owned.publishedSync!.confirmed = true;
       owned.baseUpdate = undefined;
       owned.issueRebase = undefined;
       await this.manifest(owned.id).write(owned);
@@ -1503,7 +1508,19 @@ export class ForgeRuntime {
       throw new Error("The interrupted publication remains uncertain. Confirm the previous Git process has stopped and inspect the remote branch before resuming; local work was preserved.");
     publication.confirmed = true;
     owned.gitPending = false;
+    await this.settleRecoveredBaseUpdate(owned, publication.headSha, signal);
     await this.manifest(owned.id).write(owned);
+  }
+
+  private async settleRecoveredBaseUpdate(owned: OwnedWorkspace, headSha: string, signal?: AbortSignal): Promise<void> {
+    const update = owned.baseUpdate;
+    if (!update || update.headSha || update.expectedHeadSha === headSha ||
+        this.publicationHandoff(owned)?.headSha !== headSha ||
+        !owned.branchPublication?.confirmed || owned.branchPublication.headSha !== headSha ||
+        owned.issueRebase && !owned.issueRebase.publication?.confirmed)
+      return;
+    if (await this.isAncestor(owned, update.expectedHeadSha, headSha, signal))
+      owned.baseUpdate = undefined;
   }
 
   private async reconcilePendingRebasePush(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
@@ -1575,8 +1592,7 @@ export class ForgeRuntime {
     return this.serialize(id, "inspectWorkspaceCleanup", undefined, async () => {
       const owned = await this.readOwned(id);
       await this.assertQuiescent(owned);
-      if (owned.launchPending || owned.gitPending || owned.issueRebase || owned.baseUpdate || owned.publishedSync)
-        throw new Error("An unfinished workspace operation still needs this checkout.");
+      await this.requireSettledWorkspaceOperations(owned);
       if (owned.cleanupDiscardPending) {
         if (await optionalIdentity(owned.worktreePath)) await this.assertIdentity(owned.worktree);
       } else if (!(owned.cleaned && !owned.retainedWorkspace) || await optionalIdentity(owned.worktreePath)) {
@@ -1591,8 +1607,7 @@ export class ForgeRuntime {
     return this.serialize(id, "discardWorkspace", undefined, async () => {
       const owned = await this.readOwned(id);
       await this.assertQuiescent(owned);
-      if (owned.launchPending || owned.gitPending || owned.issueRebase || owned.baseUpdate || owned.publishedSync)
-        throw new Error("An unfinished workspace operation still needs this checkout.");
+      await this.requireSettledWorkspaceOperations(owned);
       if (await optionalIdentity(owned.worktreePath)) {
         if (owned.cleanupDiscardPending) await this.assertIdentity(owned.worktree);
         else {
@@ -1601,6 +1616,9 @@ export class ForgeRuntime {
         }
         await remove(owned.worktreePath, async () => {
           owned.cleanupDiscardPending = true;
+          owned.baseUpdate = undefined;
+          owned.issueRebase = undefined;
+          owned.publishedSync = undefined;
           await this.manifest(id).write(owned);
         });
       } else if (!owned.cleanupDiscardPending && !(owned.cleaned && !owned.retainedWorkspace)) {
@@ -1611,6 +1629,20 @@ export class ForgeRuntime {
       owned.cleanupDiscardPending = undefined;
       await this.manifest(id).write(owned);
     });
+  }
+
+  private async requireSettledWorkspaceOperations(owned: OwnedWorkspace): Promise<void> {
+    if (owned.launchPending || owned.gitPending ||
+        owned.baseUpdate && !owned.baseUpdate.headSha ||
+        owned.issueRebase && !owned.issueRebase.publication?.confirmed ||
+        owned.branchPublication && !owned.branchPublication.confirmed)
+      throw new Error("An unfinished workspace operation still needs this checkout.");
+    if (owned.publishedSync && !owned.publishedSync.confirmed) {
+      await this.assertCheckout(owned);
+      await this.requireNoGitOperation(owned);
+      if (await this.requireBranchHead(owned) !== owned.publishedSync.expectedRemoteHeadSha)
+        throw new Error("An unfinished workspace synchronization still needs this checkout.");
+    }
   }
 
   cleanup(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<ForgeRetainedWorkspace | void> {
@@ -1993,7 +2025,8 @@ export class ForgeRuntime {
       (value.gitConfigHash !== undefined &&
         !/^[a-f0-9]{64}$/u.test(value.gitConfigHash)) ||
       (value.publishedSync !== undefined &&
-        (value.role !== "worker" || !isCommitSha(value.publishedSync.expectedLocalHeadSha) || !isCommitSha(value.publishedSync.expectedRemoteHeadSha))) ||
+        (value.role !== "worker" || !isCommitSha(value.publishedSync.expectedLocalHeadSha) || !isCommitSha(value.publishedSync.expectedRemoteHeadSha) ||
+          value.publishedSync.confirmed !== undefined && value.publishedSync.confirmed !== true)) ||
       (value.issueRebase !== undefined &&
         (value.role !== "worker" || !isOwnedIssueRebase(value.issueRebase))) ||
       (value.baseUpdate !== undefined &&

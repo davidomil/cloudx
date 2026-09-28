@@ -768,6 +768,7 @@ export function App() {
   }
 
   async function openForge() {
+    setMaximizedPaneId(undefined);
     setSettingsOpen(false);
     setSettingsCategory("general");
     const candidates = [...windowsRef.current].sort((a, b) => Number(b.id === activeWindowIdRef.current) - Number(a.id === activeWindowIdRef.current));

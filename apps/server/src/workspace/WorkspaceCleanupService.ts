@@ -6,11 +6,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ForgeWorker, WorkspaceCleanupCandidate, WorkspaceCleanupJob, WorkspaceCleanupPreview, WorkspaceCleanupRequest } from "@cloudx/shared";
-import { assertDirectoryIdentity, readDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
+import { assertDirectoryIdentity, isDurableDirectoryIdentity, readDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile } from "../jsonStateFile.js";
 import { isSameOrChildPath } from "../pathBoundary.js";
 import { WorkspaceCleanupConflictError } from "./WorkspaceErrors.js";
-import { WorktreeService } from "../git/WorktreeService.js";
+import { assertWorktreeGitFile, readWorktreeGitFile, WorktreeService, type WorktreeGitFileIdentity } from "../git/WorktreeService.js";
 import type { PathPolicy } from "../pathPolicy.js";
 import type { ForgeWorkflowService } from "../forge/ForgeWorkflowService.js";
 
@@ -25,12 +25,28 @@ interface CleanupSource {
   trashInfo?: string;
   state: string;
   protectedReason?: string;
+  worktreeHead?: string;
+  worktreeBranch?: string;
+  deletion?: DeletionReceipt;
+}
+interface DeletionReceipt {
+  path: string;
+  kind: "checkout" | "worktree";
+  repository: string;
+  projectDir?: string;
+  repositoryIdentity: DirectoryIdentity;
+  identity: DirectoryIdentity;
+  worktreeHead?: string;
+  worktreeBranch?: string;
+  worktreeGitFile?: WorktreeGitFileIdentity;
+  startedAt: string;
 }
 interface Snapshot {
   candidate: WorkspaceCleanupCandidate;
   source: CleanupSource;
   identity?: DirectoryIdentity;
   fingerprint?: string;
+  worktreeGitFile?: WorktreeGitFileIdentity;
   allocations: Map<string, { bytes: number; links: number; count: number }>;
 }
 interface Dependencies {
@@ -51,10 +67,12 @@ export class WorkspaceCleanupService {
   private running?: Promise<void>;
   private starting = false;
   private readonly journal: JsonStateFile;
+  private readonly deletions: JsonStateFile;
   private readonly worktrees: WorktreeService;
   constructor(private readonly deps: Dependencies) {
     this.worktrees = new WorktreeService(deps.pathPolicy);
     this.journal = new JsonStateFile(deps.dataDir, "workspace-cleanup.json", "Workspace cleanup", 0o600);
+    this.deletions = new JsonStateFile(deps.dataDir, "workspace-cleanup-deletions.json", "Workspace deletion receipts", 0o600);
   }
 
   async preview(): Promise<WorkspaceCleanupPreview> {
@@ -134,21 +152,38 @@ export class WorkspaceCleanupService {
             if (directory !== item.source.path) throw new Error("Workspace ownership changed after preview.");
             const current = await this.inspect(item.source, Boolean(item.source.worker), item.candidate.state === "interrupted cleanup");
             if (!current.candidate.eligible) throw new CleanupSkipped(current.candidate.reason);
-            if (!item.identity || !current.identity) throw new CleanupSkipped("Workspace identity is unavailable.");
-            assertDirectoryIdentity(item.identity, current.identity, "Reviewed workspace");
+            if (!item.identity || !current.identity) {
+              if (!item.source.deletion || item.fingerprint !== "recorded-deletion" || current.fingerprint !== "recorded-deletion") throw new CleanupSkipped("Workspace identity is unavailable.");
+            } else assertDirectoryIdentity(item.identity, current.identity, "Reviewed workspace");
             if (current.fingerprint !== item.fingerprint) throw new CleanupSkipped("Workspace contents or Git state changed after preview. Scan again.");
             await this.assertInactive(item.source.path);
             await markDeleting();
-            if (item.source.kind === "worktree") {
+            if (item.source.deletion) {
+              const receipt = item.source.deletion;
+              const revalidate = async () => {
+                const final = await this.inspect(item.source);
+                if (!final.candidate.eligible || final.fingerprint !== item.fingerprint) throw new CleanupSkipped(final.candidate.eligible ? "Workspace changed immediately before deletion. Scan again." : final.candidate.reason);
+              };
+              const removeRemainder = async () => { if (item.identity) await removeOwnedTree(item.identity); };
+              if (receipt.kind === "worktree") await this.worktrees.resumeWorkspaceCleanup(receipt.projectDir!, {
+                identity: receipt.identity, repositoryIdentity: receipt.repositoryIdentity, head: receipt.worktreeHead!, branch: receipt.worktreeBranch, gitFile: receipt.worktreeGitFile!,
+              }, revalidate, removeRemainder);
+              else { await revalidate(); await removeRemainder(); }
+            } else if (item.source.kind === "worktree") {
               await this.worktrees.deleteWorktree(item.source.projectDir!, {
                 folderName: path.basename(directory), confirmation: path.basename(directory), force: true,
-              }, { cleanupReview: { dev: item.identity.dev, ino: item.identity.ino, beforeDelete: async () => {
+              }, { cleanupReview: { dev: item.identity!.dev, ino: item.identity!.ino, beforeDelete: async () => {
                 await this.assertInactive(directory);
                 const final = await this.inspect(item.source);
                 if (!final.candidate.eligible || final.fingerprint !== item.fingerprint) throw new CleanupSkipped(final.candidate.eligible ? "Workspace changed immediately before deletion. Scan again." : final.candidate.reason);
+                await this.recordDeletion(item);
               } } });
-            } else await removeOwnedTree(item.identity);
+            } else {
+              if (item.source.kind === "checkout") await this.recordDeletion(item);
+              await removeOwnedTree(item.identity!);
+            }
             if (item.source.trashInfo) await fs.unlink(item.source.trashInfo);
+            if (["checkout", "worktree"].includes(item.source.kind)) await this.forgetDeletion(item.source.path);
           };
           await this.deps.withInactiveDirectory(item.source.path, async () => {
             if (item.source.worker) await this.deps.forge!.discardCompletedWorkspace(item.source.worker.id, remove);
@@ -177,11 +212,15 @@ export class WorkspaceCleanupService {
   }
 
   private async sources(warnings: string[]): Promise<CleanupSource[]> {
-    const sources: CleanupSource[] = [];
+    const sources: CleanupSource[] = (await this.readDeletions()).map(deletion => ({ ...deletion, state: "interrupted cleanup", deletion }));
     const workers = this.deps.forge ? (await this.deps.forge.dashboard()).workers : [];
     for (const worker of workers) {
       const directory = worker.retainedWorkspace?.worktreePath ?? worker.worktreePath;
-      if (directory) sources.push({ path: directory, kind: "forge", repository: worker.repository.projectPath, worker, state: worker.status });
+      if (directory) {
+        const previous = sources.findIndex(source => source.path === directory);
+        if (previous >= 0) sources.splice(previous, 1);
+        sources.push({ path: directory, kind: "forge", repository: worker.repository.projectPath, worker, state: worker.status });
+      }
     }
     for (const root of this.deps.pathPolicy.configuredRoots()) {
       // Only the existing worktree-manager layout establishes authority for development workspaces.
@@ -207,15 +246,15 @@ export class WorkspaceCleanupService {
           const bare = path.join(projectDir, ".bare");
           const repositoryIdentity = await readDirectoryIdentity(bare, "Worktree repository");
           const records = (await git(bare, ["worktree", "list", "--porcelain", "-z"])).split("\0\0");
+          const defaultRef = await this.worktrees.defaultBranchRef(projectDir).catch(error => { warnings.push(`${projectDir}: ${message(error)}`); return ""; });
           for (const record of records) {
             const fields = record.split("\0");
             const directory = fields.find(field => field.startsWith("worktree "))?.slice(9);
             if (!directory || fields.includes("bare") || path.dirname(directory) !== projectDir || sources.some(source => source.path === directory)) continue;
             const branch = fields.find(field => field.startsWith("branch "))?.slice(7);
-            const defaultRef = (await git(bare, ["symbolic-ref", "refs/remotes/origin/HEAD"]).catch(() => "")).trim();
             const merged = defaultRef && (await git(bare, ["merge-base", "--is-ancestor", fields.find(field => field.startsWith("HEAD "))?.slice(5) ?? "", defaultRef]).then(() => true, () => false));
             const defaultBranch = defaultRef.replace("refs/remotes/origin/", "refs/heads/");
-            sources.push({ path: directory, kind: "worktree", repository: projectDir, projectDir, repositoryIdentity, state: merged ? "merged into recorded origin default branch" : "completion unverified",
+            sources.push({ path: directory, kind: "worktree", repository: projectDir, projectDir, repositoryIdentity, worktreeHead: fields.find(field => field.startsWith("HEAD "))?.slice(5), worktreeBranch: branch, state: merged ? "merged into recorded origin default branch" : "completion unverified",
               protectedReason: fields.some(field => field.startsWith("locked")) ? "This worktree is locked." : branch === defaultBranch ? "The default branch workspace is protected." : !merged ? "No merged-default-branch evidence establishes that this development workspace is finished." : undefined });
           }
         } catch (error) { warnings.push(`${projectDir}: ${message(error)}`); }
@@ -262,13 +301,22 @@ export class WorkspaceCleanupService {
         verifiedOwner = true;
         discardAlreadyStarted = ownership.discardPending === true;
       }
-      if (source.kind === "checkout") {
+      if (source.deletion) {
+        discardAlreadyStarted = true;
+        if (await exists(source.path)) assertDirectoryIdentity(source.deletion.identity, await readDirectoryIdentity(source.path), "Interrupted cleanup workspace");
+        if (source.kind === "worktree") {
+          assertDirectoryIdentity(source.deletion.repositoryIdentity, await readDirectoryIdentity(path.join(source.projectDir!, ".bare")), "Worktree repository");
+          assertWorktreeGitFile(source.deletion.worktreeGitFile!, await readWorktreeGitFile(source.path));
+        } else if (await exists(source.deletion.repositoryIdentity.path)) assertDirectoryIdentity(source.deletion.repositoryIdentity, await readDirectoryIdentity(source.deletion.repositoryIdentity.path), "Standalone checkout Git directory");
+        verifiedOwner = true;
+      }
+      if (source.kind === "checkout" && !source.deletion) {
         if (!source.repositoryIdentity) throw new Error("Standalone checkout ownership is unavailable.");
         assertDirectoryIdentity(source.repositoryIdentity, await readDirectoryIdentity(path.join(source.path, ".git")), "Standalone checkout Git directory");
         const protectedReason = await checkoutProtection(source.path);
         if (protectedReason) throw new Error(protectedReason);
       }
-      if (source.kind === "worktree") {
+      if (source.kind === "worktree" && !source.deletion) {
         const bare = path.join(source.projectDir!, ".bare");
         if (!source.repositoryIdentity) throw new Error("Worktree repository ownership is unavailable.");
         assertDirectoryIdentity(source.repositoryIdentity, await readDirectoryIdentity(bare), "Worktree repository");
@@ -277,9 +325,11 @@ export class WorkspaceCleanupService {
         if (!record) throw new Error("Worktree registration changed after preview.");
         const fields = record.split("\0");
         if (fields.some(field => field.startsWith("locked"))) throw new Error("This worktree is now locked.");
-        const defaultRef = (await git(bare, ["symbolic-ref", "refs/remotes/origin/HEAD"])).trim();
+        const defaultRef = await this.worktrees.defaultBranchRef(source.projectDir!);
         if (fields.includes(`branch ${defaultRef.replace("refs/remotes/origin/", "refs/heads/")}`)) throw new Error("The default branch workspace is protected.");
         await git(bare, ["merge-base", "--is-ancestor", fields.find(field => field.startsWith("HEAD "))?.slice(5) ?? "", defaultRef]);
+        snapshot.worktreeGitFile = await readWorktreeGitFile(source.path);
+        if (!snapshot.worktreeGitFile) throw new Error("Worktree Git metadata is missing; its contents were preserved.");
       }
       snapshot.identity = await readDirectoryIdentity(source.path, "Cleanup workspace");
       const hash = createHash("sha256");
@@ -317,11 +367,39 @@ export class WorkspaceCleanupService {
       candidate.reason = message(error);
       if (verifiedOwner && (error as NodeJS.ErrnoException).code === "ENOENT" && !await exists(source.path)) {
         candidate.eligible = true;
+        candidate.requiresDiscard = true;
         candidate.reason = "A previously recorded cleanup removed this checkout. Confirm cleanup to reconcile its retained metadata.";
         snapshot.fingerprint = "recorded-deletion";
       }
     }
     return snapshot;
+  }
+
+  private async readDeletions(): Promise<DeletionReceipt[]> {
+    const saved = await this.deletions.read<unknown>();
+    if (saved === undefined) return [];
+    if (!Array.isArray(saved) || !saved.every(isDeletionReceipt) || new Set(saved.map(item => item.path)).size !== saved.length) throw new Error("Workspace deletion receipts are invalid. Remaining files were preserved.");
+    return saved;
+  }
+
+  private async recordDeletion(item: Snapshot): Promise<void> {
+    const source = item.source;
+    if (!item.identity || !source.repositoryIdentity || (source.kind !== "checkout" && source.kind !== "worktree")) throw new Error("Reviewed deletion ownership is unavailable.");
+    const receipt: DeletionReceipt = { path: source.path, kind: source.kind, repository: source.repository, projectDir: source.projectDir,
+      repositoryIdentity: source.repositoryIdentity, identity: item.identity, worktreeHead: source.worktreeHead, worktreeBranch: source.worktreeBranch, worktreeGitFile: item.worktreeGitFile, startedAt: new Date().toISOString() };
+    if (source.kind === "worktree") {
+      if (!item.worktreeGitFile) throw new Error("Reviewed worktree Git metadata is unavailable.");
+      const current = await readWorktreeGitFile(source.path);
+      if (!current) throw new Error("Worktree Git metadata disappeared before deletion began.");
+      assertWorktreeGitFile(item.worktreeGitFile, current);
+    }
+    const receipts = await this.readDeletions();
+    if (receipts.some(previous => previous.path === receipt.path)) throw new Error("Deletion is already recorded. Scan again to review its remaining contents.");
+    await this.deletions.write([...receipts, receipt]);
+  }
+
+  private async forgetDeletion(directory: string): Promise<void> {
+    await this.deletions.write((await this.readDeletions()).filter(receipt => receipt.path !== directory));
   }
 
   private async assertInactive(directory: string): Promise<void> {
@@ -348,6 +426,18 @@ export class WorkspaceCleanupService {
 }
 
 class CleanupSkipped extends Error {}
+function isDeletionReceipt(value: unknown): value is DeletionReceipt {
+  if (!value || typeof value !== "object") return false;
+  const item = value as DeletionReceipt;
+  const directoryIdentity = (identity: DirectoryIdentity | undefined) => identity && typeof identity.path === "string" && path.resolve(identity.path) === identity.path &&
+    typeof identity.dev === "string" && /^\d+$/u.test(identity.dev) && typeof identity.ino === "string" && /^\d+$/u.test(identity.ino) && isDurableDirectoryIdentity(identity.durable);
+  const gitFileIdentity = (identity: WorktreeGitFileIdentity | undefined) => identity && [identity.dev, identity.ino, identity.birthtimeNs, identity.uid].every(field => typeof field === "string" && /^\d+$/u.test(field)) &&
+    typeof identity.target === "string" && path.resolve(identity.target) === identity.target;
+  return typeof item.path === "string" && directoryIdentity(item.identity) === true && item.identity.path === item.path && directoryIdentity(item.repositoryIdentity) === true &&
+    typeof item.repository === "string" && typeof item.startedAt === "string" && Number.isFinite(Date.parse(item.startedAt)) &&
+    (item.kind === "checkout" ? item.repositoryIdentity.path === path.join(item.path, ".git") : item.kind === "worktree" && typeof item.projectDir === "string" && path.dirname(item.path) === item.projectDir &&
+      item.repositoryIdentity.path === path.join(item.projectDir, ".bare") && gitFileIdentity(item.worktreeGitFile) === true && typeof item.worktreeHead === "string" && /^[a-f0-9]{40,64}$/u.test(item.worktreeHead) && (item.worktreeBranch === undefined || typeof item.worktreeBranch === "string" && item.worktreeBranch.startsWith("refs/heads/")));
+}
 async function exists(file: string): Promise<boolean> {
   return fs.lstat(file).then(() => true).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
 }

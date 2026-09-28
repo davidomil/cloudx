@@ -999,7 +999,7 @@ test("saves a batch across reload, edits members and associates every issue with
   }
 });
 
-test("groups persisted batches with partial counts and usable keyboard selection", async ({
+test("groups overlapping persisted batches through start, edit and reconnect with keyboard selection", async ({
   page,
 }, testInfo) => {
   const repository = {
@@ -1042,9 +1042,10 @@ test("groups persisted batches with partial counts and usable keyboard selection
       id: "batch-b",
       number: 11,
       title: "Workspace cleanup",
-      batch: { issues: [issues[2]] },
+      batch: { issues: issues.slice(1, 3) },
     },
   ];
+  entries.push({ ...entries[0], id: "same-members", title: "Same members" });
   await page.route("**/fixture-hooks/**", async (route) => {
     const hook = new URL(route.request().url()).pathname.split("/").pop();
     const { input } = route.request().postDataJSON();
@@ -1065,7 +1066,19 @@ test("groups persisted batches with partial counts and usable keyboard selection
   await expect(first).toContainText("1 of 2 issues shown");
   await expect(
     page.getByRole("group", { name: "Workspace cleanup", exact: true }),
-  ).toContainText("1 of 1 issues shown");
+  ).toContainText("2 of 2 issues shown");
+  const duplicate = page.getByRole("group", {
+    name: "Same members",
+    exact: true,
+  });
+  await expect(duplicate).toContainText("1 of 2 issues shown");
+  entries[0].status = "running";
+  await page.getByRole("button", { name: "Refresh Forge" }).click();
+  await expect(first).toContainText(`#9 ${issues[1].title}`);
+  await expect(duplicate).toContainText(`#9 ${issues[1].title}`);
+  await page.reload();
+  await expect(first).toContainText("1 of 2 issues shown");
+  await expect(duplicate).toContainText("1 of 2 issues shown");
   for (const number of [9, 11])
     await expect(
       page.getByRole("checkbox", { name: `Select issue #${number} for batch` }),
@@ -1102,7 +1115,7 @@ test("groups persisted batches with partial counts and usable keyboard selection
       () => document.documentElement.scrollWidth <= window.innerWidth,
     ),
   ).toBe(true);
-  entries = entries.slice(1);
+  entries = [{ ...entries[1], batch: { issues: [issues[2]] } }];
   await page.getByRole("button", { name: "Refresh Forge" }).click();
   await expect(first).toHaveCount(0);
   await expect(
