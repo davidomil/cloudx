@@ -331,6 +331,7 @@ export class WorkspaceCleanupService {
         snapshot.worktreeGitFile = await readWorktreeGitFile(source.path);
         if (!snapshot.worktreeGitFile) throw new Error("Worktree Git metadata is missing; its contents were preserved.");
       }
+      if (source.kind === "checkout" || source.kind === "forge") await assertNoDependentWorktrees(source.path);
       snapshot.identity = await readDirectoryIdentity(source.path, "Cleanup workspace");
       const hash = createHash("sha256");
       await inventory(source.path, source.path, hash, snapshot.allocations);
@@ -456,6 +457,15 @@ async function checkoutProtection(directory: string): Promise<string | undefined
   return undefined;
 }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+async function assertNoDependentWorktrees(directory: string): Promise<void> {
+  // Partial deletion can remove HEAD while linked worktrees still need the shared Git data.
+  const registrations = await fs.open(path.join(directory, ".git", "worktrees"), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+    .catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return undefined; throw error; });
+  if (!registrations) return;
+  try {
+    if ((await fs.readdir(`/proc/self/fd/${registrations.fd}`)).length) throw new Error("Other worktrees still depend on this repository.");
+  } finally { await registrations.close(); }
+}
 async function inventory(root: string, directory: string, hash: ReturnType<typeof createHash>, allocations: Snapshot["allocations"], relative = ""): Promise<void> {
   const stat = await fs.lstat(directory);
   const key = `${stat.dev}:${stat.ino}`;

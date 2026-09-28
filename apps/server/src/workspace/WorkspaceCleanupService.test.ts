@@ -134,6 +134,70 @@ describe("reviewed workspace cleanup", () => {
       expect(JSON.parse(await fs.readFile(path.join(dataDir, "workspace-cleanup-deletions.json"), "utf8"))).toEqual([]);
     } finally { await fs.chmod(denied, 0o700).catch(() => {}); }
   });
+  it.each(["before restart", "after retry preview", "with missing main HEAD"] as const)("preserves shared Git history when a dependent worktree is added after partial deletion: %s", async timing => {
+    const directory = await standaloneCheckout();
+    const denied = path.join(directory, "node_modules");
+    await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "unfinished cleanup");
+    await fs.chmod(denied, 0o500);
+    try {
+      await cleanup.start(selection(await cleanup.preview())); await cleanup.settled();
+      expect((await cleanup.status())!.results.find(item => item.path === directory)).toMatchObject({ status: "failed", reason: expect.stringMatching(/EACCES|Permission denied/) });
+      await fs.chmod(denied, 0o700);
+      const originalHead = await git(directory, "rev-parse", "HEAD");
+      cleanup = service();
+      const reviewed = timing === "after retry preview" ? await cleanup.preview() : undefined;
+      const sibling = path.join(root, "active-sibling");
+      await git(directory, "worktree", "add", "-b", "new-work", sibling);
+      await fs.writeFile(path.join(sibling, "new-source.ts"), "committed sibling work\n");
+      await git(sibling, "add", "new-source.ts");
+      await git(sibling, "-c", "user.name=Cleanup fixture", "-c", "user.email=cleanup@example.invalid", "commit", "-m", "new sibling work");
+      const siblingHead = await git(sibling, "rev-parse", "HEAD");
+      expect(siblingHead).not.toBe(originalHead);
+      open = [sibling]; active = [sibling];
+      if (timing === "with missing main HEAD") await fs.unlink(path.join(directory, ".git", "HEAD"));
+      if (reviewed) {
+        await cleanup.start(selection(reviewed, true)); await cleanup.settled();
+        expect((await cleanup.status())!.results.find(item => item.path === directory)).toMatchObject({ status: "skipped", reason: "Other worktrees still depend on this repository." });
+      } else {
+        cleanup = service();
+        const retry = await cleanup.preview();
+        const candidate = retry.candidates.find(item => item.path === directory)!;
+        expect(candidate).toMatchObject({ eligible: false, reason: "Other worktrees still depend on this repository." });
+        await expect(cleanup.start({ ...selection(retry, true), candidateIds: [candidate.id], discardCandidateIds: [candidate.id] })).rejects.toThrow("protected or unknown workspace");
+      }
+      // Registration alone protects the shared history even after the sibling becomes idle.
+      open = []; active = [];
+      expect((await cleanup.preview()).candidates.find(item => item.path === directory)?.eligible).toBe(false);
+      expect(await git(sibling, "rev-parse", "HEAD")).toBe(siblingHead);
+      expect(await git(sibling, "show", "HEAD:new-source.ts")).toBe("committed sibling work");
+      expect(await fs.readFile(path.join(denied, "remaining"), "utf8")).toBe("unfinished cleanup");
+      expect(JSON.parse(await fs.readFile(path.join(dataDir, "workspace-cleanup-deletions.json"), "utf8"))).toEqual([expect.objectContaining({ path: directory })]);
+    } finally { await fs.chmod(denied, 0o700).catch(() => {}); }
+  });
+  it.each(["unreadable directory", "file", "symlink"] as const)("preserves interrupted cleanup when worktree registrations cannot be read as a directory: %s", async kind => {
+    const directory = await standaloneCheckout();
+    const denied = path.join(directory, "node_modules");
+    const registrations = path.join(directory, ".git", "worktrees");
+    await fs.mkdir(denied); await fs.writeFile(path.join(denied, "remaining"), "keep until dependencies can be checked");
+    await fs.chmod(denied, 0o500);
+    try {
+      await cleanup.start(selection(await cleanup.preview())); await cleanup.settled();
+      expect((await cleanup.status())!.results.find(item => item.path === directory)?.status).toBe("failed");
+      await fs.chmod(denied, 0o700);
+      if (kind === "unreadable directory") { await fs.mkdir(registrations); await fs.chmod(registrations, 0o000); }
+      else if (kind === "file") await fs.writeFile(registrations, "unrecognized worktree metadata");
+      else await fs.symlink(path.join(root, "missing-registrations"), registrations);
+      cleanup = service();
+      const retry = await cleanup.preview();
+      const candidate = retry.candidates.find(item => item.path === directory)!;
+      expect(candidate).toMatchObject({ eligible: false, reason: expect.stringMatching(/EACCES|ENOTDIR|ELOOP/) });
+      await expect(cleanup.start({ ...selection(retry, true), candidateIds: [candidate.id], discardCandidateIds: [candidate.id] })).rejects.toThrow("protected or unknown workspace");
+      expect(await fs.readFile(path.join(denied, "remaining"), "utf8")).toBe("keep until dependencies can be checked");
+    } finally {
+      await fs.chmod(denied, 0o700).catch(() => {});
+      if (kind === "unreadable directory") await fs.chmod(registrations, 0o700).catch(() => {});
+    }
+  });
   it.each(["checkout", "worktree"] as const)("preserves a replaced %s directory when retrying its persisted deletion receipt", async kind => {
     const managed = kind === "worktree" ? await managedWorktrees() : undefined;
     const directory = managed?.finished ?? await standaloneCheckout();

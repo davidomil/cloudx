@@ -4309,6 +4309,47 @@ describe("Forge permanent workspace cleanup", () => {
     } finally { await service.dispose(); }
   });
 
+  it("protects a dependent worktree when retrying a durable Forge deletion after restart", async () => {
+    const workspace = await prepare("cleanup-dependent-worktree");
+    await fs.writeFile(path.join(workspace.worktreePath, "retained.txt"), "kept until explicit discard");
+    const retained = await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    await expect(runtime.discardWorkspace(workspace.id, async (directory, markDeleting) => {
+      await markDeleting();
+      await fs.unlink(path.join(directory, "README.md"));
+      throw new Error("simulated interruption before deleting .git");
+    })).rejects.toThrow("simulated interruption before deleting .git");
+    const sibling = path.join(root, "active-dependent-worktree");
+    await git(workspace.worktreePath, "worktree", "add", "-b", "new-work", sibling);
+    await fs.writeFile(path.join(sibling, "new-work.txt"), "committed work after cleanup stopped");
+    await git(sibling, "add", "new-work.txt");
+    await git(sibling, "-c", "user.name=Forge Test", "-c", "user.email=forge-test@example.invalid", "commit", "-m", "Preserve dependent work");
+    const siblingHead = await git(sibling, "rev-parse", "HEAD");
+
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: true });
+    let saved: ForgeWorker[] = [{
+      id: workspace.id, kind: "issue", number: 152, title: "Interrupted cleanup fixture", repository: expectedRepository,
+      repositoryPath: workspace.repositoryPath, baseBranch: "main", templateId: "worker", status: "completed", headSha,
+      retainedWorkspace: retained!, autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }];
+    const service = new ForgeWorkflowService({
+      settings: () => ({ repository: expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker", workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "xhigh", maxRunMinutes: 60 }),
+      refreshPublicationCredentials: async () => {},
+      runtime, store: { read: async () => structuredClone(saved), write: async workers => { saved = structuredClone(workers); } },
+      reports: new ForgeWorkerReports(path.join(root, "data")), notify: vi.fn(), provider: vi.fn(),
+    });
+    const cleanup = new WorkspaceCleanupService({ dataDir: path.join(root, "data"), pathPolicy: new PathPolicy([root]), forge: service, openDirectories: () => [sibling], withInactiveDirectory: async (_directory, operation) => operation(), protectedDirectories: [], processDirectories: async () => [sibling], trashDirectory: path.join(root, "trash") });
+    try {
+      const preview = await cleanup.preview();
+      const candidate = preview.candidates.find(item => item.workerId === workspace.id)!;
+      expect(candidate).toMatchObject({ eligible: false, reason: "Other worktrees still depend on this repository." });
+      await expect(cleanup.start({ previewId: preview.id, candidateIds: [candidate.id], discardCandidateIds: [candidate.id], emptyTrash: false, confirmation: "Delete permanently" })).rejects.toThrow("protected or unknown workspace");
+      expect(await git(sibling, "show", `${siblingHead}:new-work.txt`)).toBe("committed work after cleanup stopped");
+      expect(saved[0]!.retainedWorkspace).toEqual(retained);
+      expect(await runtime.inspectWorkspaceCleanup(workspace.id)).toEqual({ path: workspace.worktreePath, discardPending: true });
+    } finally { await cleanup.settled(); await service.dispose(); }
+  });
+
   it("allows a reviewed retry after interruption within .git while preserving replaced roots", async () => {
     const workspace = await prepare("cleanup-partial-git");
     await expect(runtime.discardWorkspace(workspace.id, async (directory, markDeleting) => {
