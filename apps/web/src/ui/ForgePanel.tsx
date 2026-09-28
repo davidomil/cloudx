@@ -11,10 +11,11 @@ import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 type Request = <T>(hook: string, input?: Record<string, unknown>) => Promise<T>;
-type RunAction = (work: () => Promise<unknown>, interrupt?: boolean) => Promise<boolean>;
+type RunAction = (work: () => Promise<unknown>, interrupt?: boolean, workerId?: string) => Promise<boolean>;
 type View = "issues" | "changes" | "workers";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
 const queuePhaseLabels = { queued: "Queued", updating: "Updating branch", resolving: "Resolving conflicts", reviewing: "Reviewing changes", waiting_ci: "Waiting for CI", merging: "Merging", blocked: "Blocked" };
+const WorkerActions = createContext<{ globalBusy: boolean; pending: Set<string> }>({ globalBusy: false, pending: new Set() });
 const WorkerContinuations = createContext<{
   messages: Record<string, string>;
   setMessage: (workerId: string, message?: string) => void;
@@ -67,6 +68,8 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const [actionError, setActionError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const actionRunning = useRef(false);
+  const workerActions = useRef(new Set<string>());
+  const [pendingWorkers, setPendingWorkers] = useState(new Set<string>());
   const mounted = useRef(false);
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
 
@@ -94,9 +97,18 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
     return () => { cancelled = true; clearTimeout(timer); };
   }, [request, revision, repositorySettingsKey, repositoryChangePending]);
 
-  const runAction: RunAction = async (work, interrupt = false) => {
-    if (!interrupt && actionRunning.current) return false;
-    if (!interrupt) { actionRunning.current = true; setBusy(true); }
+  const runAction: RunAction = async (work, interrupt = false, workerId) => {
+    const group = workerId ? relatedWorkers(workerId, dashboard?.workers ?? []) : [];
+    const ids = group.length ? group.map(worker => worker.id) : workerId ? [workerId] : [];
+    if (!interrupt) {
+      if (actionRunning.current || (workerId
+        ? ids.some(id => workerActions.current.has(id)) || group.some(worker => worker.activity)
+        : workerActions.current.size > 0)) return false;
+      if (workerId) {
+        ids.forEach(id => workerActions.current.add(id));
+        setPendingWorkers(new Set(workerActions.current));
+      } else { actionRunning.current = true; setBusy(true); }
+    }
     setActionError(undefined);
     try {
       await work();
@@ -105,8 +117,17 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       if (mounted.current) setActionError(errorMessage(error));
       return false;
     } finally {
-      if (!interrupt) actionRunning.current = false;
-      if (mounted.current) { if (!interrupt) setBusy(false); refresh(); }
+      if (!interrupt) {
+        if (workerId) ids.forEach(id => workerActions.current.delete(id));
+        else actionRunning.current = false;
+      }
+      if (mounted.current) {
+        if (!interrupt) {
+          if (workerId) setPendingWorkers(new Set(workerActions.current));
+          else setBusy(false);
+        }
+        refresh();
+      }
     }
   };
 
@@ -117,7 +138,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const changeLabel = repository?.provider === "gitlab" ? "Merge requests" : "Pull requests";
   const awaitingReview = workers.filter((worker) => worker.status === "awaiting_review" && !worker.autoReview?.enabled).length;
 
-  return <WorkerContinuations.Provider value={{ messages: continuationMessages, setMessage: setContinuationMessage }}><section className="forge-panel" aria-label="Forge">
+  return <WorkerActions.Provider value={{ globalBusy: busy, pending: pendingWorkers }}><WorkerContinuations.Provider value={{ messages: continuationMessages, setMessage: setContinuationMessage }}><section className="forge-panel" aria-label="Forge">
     <header className="forge-header">
       <div><h2><GitPullRequest size={18} /> Forge</h2><p>{repository ? `${repository.provider === "github" ? "GitHub" : "GitLab"} · ${repository.projectPath}` : "Issue workers and reviews"}</p></div>
       <div className="forge-actions">
@@ -141,11 +162,11 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </nav>
       {view === "workers" ? <MergeQueues workers={workers} onSelect={setSelectedWorkerId} /> : null}
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
-        {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />}
-      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
+        {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} />}
+      </ForgeWorkerTabs> : dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
-  </section></WorkerContinuations.Provider>;
+  </section></WorkerContinuations.Provider></WorkerActions.Provider>;
 }
 
 function ForgeItems({ kind, repository, request, revision, workers, placement, runAction, busy, onViewWorker, onBatchSaved }: {
@@ -296,7 +317,7 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
                 <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { repository, number: item.number, autoPost: false, ...placement }))}>Review</ControlButton>
                 <ControlButton size="compact" disabled={reviewDisabled || !!activeWorker} onClick={() => void runAction(() => request("forge.review.start", { repository, number: item.number, autoPost: true, ...placement }))}>Review and post</ControlButton>
               </div>
-              {selectedWorkers.filter(worker => worker.kind === "issue").map(worker => <WorkerCard key={worker.id} worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} />)}
+              {selectedWorkers.filter(worker => worker.kind === "issue").map(worker => <WorkerCard key={worker.id} worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} />)}
             </div>
             <div className="forge-review-decision">
               <label className="forge-field">Review message<textarea value={reviewBody} onChange={(event) => setReviewBody(event.target.value)} placeholder="Message for approval or requested changes" rows={2} /></label>
@@ -309,13 +330,13 @@ function ForgeItems({ kind, repository, request, revision, workers, placement, r
           </section> : null}
           {detailBusy ? <p role="status">Loading latest details…</p> : null}
           {detailError ? <p role="alert" className="forge-notice">{detailError}</p> : null}
-          {kind === "changes" ? reviews.map(({ worker, archivedDraft }) => <WorkerCard key={`${worker.id}:${archivedDraft?.id ?? worker.draft?.id ?? worker.attemptId ?? "active"}`} worker={worker} workers={workers} archivedDraft={archivedDraft} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} collapsible canSubmitReview={!unconfirmedPublication && !reviewDisabled && worker.draft?.headSha === changeDetail?.headSha} />) : selectedWorkers.map(worker => <WorkerCard key={worker.id} worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} busy={busy} onViewWorker={onViewWorker} showAutoReview={false} canSubmitReview={!unconfirmedPublication} />)}
+          {kind === "changes" ? reviews.map(({ worker, archivedDraft }) => <WorkerCard key={`${worker.id}:${archivedDraft?.id ?? worker.draft?.id ?? worker.attemptId ?? "active"}`} worker={worker} workers={workers} archivedDraft={archivedDraft} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} collapsible canSubmitReview={!unconfirmedPublication && !reviewDisabled && worker.draft?.headSha === changeDetail?.headSha} />) : selectedWorkers.map(worker => <WorkerCard key={worker.id} worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} showAutoReview={false} canSubmitReview={!unconfirmedPublication} />)}
           <p className="forge-prose">{item.body}</p>
           {kind === "issues" ? <>
             <div className="forge-actions">
               <ControlButton tone="primary" size="compact" disabled={busy || !!activeWorker || item.state !== "open"} onClick={() => void runAction(() => request("forge.issue.start", { repository, number: item.number, autoReview, ...placement }))}><Play size={14} /> Start work</ControlButton>
               <AutoReviewToggle enabled={autoReview} disabled={busy || (!activeWorker && item.state !== "open")} onChange={enabled => {
-                if (activeWorker) void runAction(() => request("forge.worker.autoReview", { id: activeWorker.id, enabled, ...placement }));
+                if (activeWorker) void runAction(() => request("forge.worker.autoReview", { id: activeWorker.id, enabled, ...placement }), false, activeWorker.id);
                 else setAutoReviewDrafts(drafts => ({ ...drafts, [item.number]: enabled }));
               }} />
             </div>
@@ -354,6 +375,7 @@ function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
       const postFailed = worker.status === "completed" && worker.draft?.status === "post_failed";
       return <span key={worker.id} className="forge-item-worker">
         <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.batch ? "Batch" : worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
+        {worker.activity ? <span className="forge-muted">{activityText(worker.activity)}</span> : null}
         {worker.retainedWorkspace ? <span className="forge-muted">Retained working files</span> : null}
         {worker.autoReview?.enabled ? <span className="forge-muted">Auto review · {worker.autoReview.phase}</span> : null}
         {worker.error ? <span className={worker.status === "awaiting_publication" ? "forge-muted" : "forge-item-worker-error"} title={worker.error}>{worker.error}</span> : null}
@@ -389,11 +411,34 @@ type WorkerCardProps = {
   collapsible?: boolean;
 };
 
-function WorkerCard(props: WorkerCardProps) {
+function relatedWorkers(id: string, workers: ForgeWorker[]): ForgeWorker[] {
+  const worker = workers.find(candidate => candidate.id === id);
+  if (!worker) return [];
+  const change = worker.kind === "review" ? worker.number : worker.changeNumber;
+  return workers.filter(candidate => candidate.id === id || candidate.id === worker.issueWorkerId || candidate.issueWorkerId === id ||
+    change !== undefined && (candidate.kind === "review" ? candidate.number : candidate.changeNumber) === change &&
+    candidate.repository.provider === worker.repository.provider && candidate.repository.apiUrl === worker.repository.apiUrl &&
+    candidate.repository.projectPath === worker.repository.projectPath);
+}
+
+function activityText(activity: NonNullable<ForgeWorker["activity"]>): string {
+  const duration = (milliseconds: number) => {
+    const seconds = Math.ceil(milliseconds / 1000);
+    return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  };
+  return `${activity.phase} · ${duration(activity.elapsedMs)} elapsed · Queue delay ${duration(activity.queueDelayMs)}`;
+}
+
+function WorkerCard(props: Omit<WorkerCardProps, "busy">) {
   const { worker } = props;
+  const actions = useContext(WorkerActions);
+  const related = relatedWorkers(worker.id, props.workers);
+  const busy = actions.globalBusy || related.some(member => actions.pending.has(member.id) || member.activity);
+  const runAction: RunAction = (work, interrupt) => props.runAction(work, interrupt, worker.id);
+  const scoped = { ...props, busy, runAction };
   return worker.batch && worker.status === "draft"
-    ? <BatchDraftCard key={`${worker.id}:${worker.title}:${worker.batch.issues.map(issue => issue.number).join(",")}`} {...props} />
-    : <ActiveWorkerCard {...props} />;
+    ? <BatchDraftCard key={`${worker.id}:${worker.title}:${worker.batch.issues.map(issue => issue.number).join(",")}`} {...scoped} />
+    : <ActiveWorkerCard {...scoped} />;
 }
 
 function BatchDraftCard({ worker, request, runAction, placement, busy }: WorkerCardProps) {
@@ -479,7 +524,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
   const continuationMessage = continuation.messages[worker.id] ?? "";
   const continuationBlocker = forgeWorkerContinuationBlocker(worker, workers);
   async function continueWorker() {
-    if (continuationBlocker || !continuationMessage.trim() || continuationMessage.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH) return;
+    if (busy || continuationBlocker || !continuationMessage.trim() || continuationMessage.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH) return;
     const successful = await runAction(() => request("forge.worker.continue", { id: worker.id, message: continuationMessage, ...placement }));
     if (successful) continuation.setMessage(worker.id);
   }
@@ -521,6 +566,8 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     <div className="forge-worker-heading"><strong>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
     <BatchIssues worker={worker} />
+    {!archivedDraft && worker.activity ? <p role="status" className="forge-notice">{activityText(worker.activity)}</p> : null}
+    {!archivedDraft && !worker.activity && busy ? <p role="status" className="forge-muted">Worker action pending. Waiting for Forge to report its phase.</p> : null}
     {!archivedDraft && worker.error && worker.status !== "awaiting_publication" ? <p role="alert" className="forge-notice">{worker.error}</p> : null}
     {!archivedDraft && worker.completion?.continuationRequired ? <p role="status" className="forge-notice">{worker.completion.continuationRequired} Use Continue with message to finish the implementation and submit a new handoff.</p> : null}
     {!archivedDraft && retainedFiles ? <section aria-label="Retained working files">
@@ -561,7 +608,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     </div> : null}
     {!archivedDraft && pendingPublication?.headSha ? <PublicationDiagnostics publication={pendingPublication} waiting={worker.status === "awaiting_publication"} /> : null}
     {!archivedDraft && continuing ? <form aria-label="Continue worker with a message" onSubmit={event => { event.preventDefault(); void continueWorker(); }}>
-      <p className="forge-muted">Continue this {worker.kind === "issue" ? "issue" : "review"} worker with additional instructions.</p>
+      <p className="forge-muted">Continue this {worker.kind === "issue" ? "issue" : "review"} worker with additional instructions. This starts implementation work; Resume rechecks the existing loop.</p>
       {continuationBlocker ? <p role="status" className="forge-notice">{continuationBlocker}</p> : null}
       <label className="forge-field">Message to worker
         <textarea autoFocus required rows={4} maxLength={MAX_FORGE_CONTINUATION_MESSAGE_LENGTH} value={continuationMessage} disabled={busy} onChange={event => continuation.setMessage(worker.id, event.target.value)} />

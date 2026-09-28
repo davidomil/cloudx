@@ -1039,11 +1039,14 @@ export class SessionStore {
     const dataDisposer = session.onData?.((data) => {
       const current = this.tabs.get(tabId);
       if (current) {
-        const recording = this.contextService.record(current, "terminal-output", data).catch((error) => {
-          this.reportBackgroundError(error, "record terminal output", tabId);
-        });
-        this.contextWrites.add(recording);
-        void recording.then(() => this.contextWrites.delete(recording));
+        const recording = this.contextService.record(current, "terminal-output", data);
+        if (!this.contextWrites.has(recording)) {
+          this.contextWrites.add(recording);
+          void recording.then(() => this.contextWrites.delete(recording), error => {
+            this.contextWrites.delete(recording);
+            this.reportBackgroundError(error, "record terminal output", tabId);
+          });
+        }
       }
     });
     if (dataDisposer) {

@@ -6937,3 +6937,180 @@ describe("Forge worker diagnostics", () => {
     expect(f.runtime.pause).toHaveBeenCalledWith("tab-1");
   });
 });
+
+describe("Independent Forge progress during terminal persistence", () => {
+  async function noisyCompletion() {
+    const f = fixture();
+    f.runtime.launch.mockImplementation(async input => `tab-${input.id}`);
+    f.provider.getIssue.mockImplementation(async number => ({ ...f.issue, number: number! }));
+    f.provider.getChangeRequest.mockImplementation(async (number?: number) => ({ ...f.change, number: number ?? 8 }));
+    const repository = f.deps.settings().repository;
+    const noisy = await f.service.startIssue(repository, 1, placement);
+    const paused = await f.service.startIssue(repository, 2, placement);
+    await f.service.pause(paused.id);
+    const review = await f.service.startReview(repository, 8, false, placement);
+    const report = { kind: "issue", title: "Fixed", body: "Validated", discussionReplies: [], resolvedDiscussionIds: [] };
+    f.reports.read.mockImplementation(async id => id === noisy.attemptId ? report : id === review.attemptId
+      ? { kind: "review", headSha: f.change.headSha, event: "approve", body: "Reviewed", comments: [] } : undefined);
+    const entered = deferred<void>();
+    const finish = deferred<void>();
+    f.runtime.finish.mockImplementation(async tabId => {
+      if (tabId === noisy.tabId) { entered.resolve(); await finish.promise; }
+    });
+    const poll = f.service.poll();
+    await entered.promise;
+    return { ...f, noisy, paused, review, report, finish, poll };
+  }
+
+  it.each(["continue", "resume"])("keeps an unrelated %s and review completion responsive during a held finish", async action => {
+    const f = await noisyCompletion();
+    try {
+      const dashboard = await f.service.dashboard();
+      expect(dashboard.workers.find(worker => worker.id === f.noisy.id)).toMatchObject({
+        activity: { phase: "Finishing terminal and saving context", elapsedMs: expect.any(Number), queueDelayMs: expect.any(Number) },
+        completion: { report: f.report, turn: { threadId: `thread-${f.noisy.id}`, turnId: `turn-${f.noisy.attemptId}`, status: "completed" } },
+      });
+      const hooks = new HookRegistry();
+      new ForgePlugin(() => ({ workflow: f.service, settings: {} as ForgeSettingsService })).hooks.forEach(hook => hooks.register(hook));
+      const control = hooks.call(`forge.worker.${action}`, {
+        id: f.paused.id, ...placement, ...(action === "continue" ? { message: "Fix the failed CI" } : {}),
+      }, { caller: { kind: "ui" } });
+      await expect(control).resolves.toMatchObject({ worker: { status: "running", id: f.paused.id } });
+      await vi.waitFor(() => expect(f.stored().find(worker => worker.id === f.review.id)).toMatchObject({ status: "completed", draft: { body: expect.stringContaining("Reviewed") } }));
+      await expect(f.service.resume(f.noisy.id, placement)).rejects.toThrow("Finishing terminal and saving context");
+      await expect(f.service.continueWorker(f.noisy.id, "duplicate", placement)).rejects.toThrow("already in progress");
+      void f.service.poll();
+      await Promise.resolve();
+      expect(f.runtime.finish.mock.calls.filter(([tabId]) => tabId === f.noisy.tabId)).toHaveLength(1);
+      expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    } finally { f.finish.resolve(); await f.poll; }
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect((await f.service.dashboard()).workers.every(worker => !worker.activity)).toBe(true);
+  });
+
+  it("retains native receipts and reports after context failure and drains an in-flight finish on shutdown", async () => {
+    const f = await noisyCompletion();
+    const shutdown = f.service.dispose();
+    let stopped = false;
+    void shutdown.then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    f.finish.reject(new Error("Context ownership changed"));
+    await Promise.all([f.poll, shutdown]);
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    const saved = f.stored().find(worker => worker.id === f.noisy.id)!;
+    expect(saved.completion).toMatchObject({ report: f.report, turn: { status: "completed", threadId: `thread-${f.noisy.id}`, turnId: `turn-${f.noisy.attemptId}` } });
+    expect(f.reports.remove).not.toHaveBeenCalledWith(f.noisy.attemptId);
+  });
+
+  it("rejects duplicate continuation while terminal ownership recovery is pending without blocking another worker", async () => {
+    const f = fixture();
+    f.provider.getIssue.mockImplementation(async number => ({ ...f.issue, number: number! }));
+    const repository = f.deps.settings().repository;
+    const first = await f.service.startIssue(repository, 1, placement);
+    const second = await f.service.startIssue(repository, 2, placement);
+    await f.service.pause(first.id);
+    await f.service.pause(second.id);
+    const recovery = deferred<Awaited<ReturnType<typeof f.runtime.recover>>>();
+    const entered = deferred<void>();
+    f.runtime.recover.mockImplementation(async id => {
+      if (id === first.id) { entered.resolve(); return recovery.promise; }
+      return { workspace: undefined, tabIds: [] };
+    });
+    const continuation = f.service.continueWorker(first.id, "Fix CI", placement);
+    await entered.promise;
+    try {
+      await expect(f.service.continueWorker(first.id, "Fix CI", placement)).rejects.toThrow("Recovering terminal ownership");
+      await expect(f.service.resume(first.id, placement)).rejects.toThrow("already in progress");
+      await expect(f.service.resume(second.id, placement)).resolves.toMatchObject({ status: "running" });
+    } finally { recovery.resolve({ workspace: undefined, tabIds: [] }); await continuation; }
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === first.id)).toHaveLength(2);
+  });
+
+  it("coalesces periodic polls instead of accumulating jobs behind slow provider I/O", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    const observation = deferred<typeof f.change>();
+    f.provider.getChangeRequestStatus.mockImplementation(() => observation.promise);
+    f.service.start();
+    try {
+      await vi.advanceTimersByTimeAsync(62_000);
+      expect(f.provider.getChangeRequestStatus).toHaveBeenCalledOnce();
+      expect((f.service as unknown as { pollJobs: Map<string, unknown> }).pollJobs.size).toBe(1);
+    } finally {
+      observation.resolve(f.change);
+      await f.service.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports queue delay and rejects repeated controls before a queued request starts", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = fixture();
+    const repository = f.deps.settings().repository;
+    const paused = await f.service.startIssue(repository, 1, placement);
+    await f.service.pause(paused.id);
+    await f.service.startReview(repository, 8, false, placement);
+    const observation = deferred<typeof f.change>();
+    const entered = deferred<void>();
+    f.provider.getChangeRequestStatus.mockImplementation(() => { entered.resolve(); return observation.promise; });
+    const poll = f.service.poll();
+    await entered.promise;
+    const resume = f.service.resume(paused.id, placement);
+    try {
+      vi.setSystemTime(Date.now() + 5000);
+      await expect(f.service.resume(paused.id, placement)).rejects.toThrow("already pending");
+      expect((await f.service.dashboard()).workers.find(worker => worker.id === paused.id)?.activity).toMatchObject({
+        phase: "Waiting for workflow queue: Resuming worker", queueDelayMs: 5000,
+      });
+    } finally {
+      observation.resolve(f.change);
+      await Promise.all([poll, resume]);
+      vi.useRealTimers();
+    }
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === paused.id)).toHaveLength(2);
+  });
+
+  it("cancels a held successful finish without publishing or losing its receipt and report", async () => {
+    const f = await noisyCompletion();
+    const stopped = f.service.stop(f.noisy.id);
+    // Stop waits for this worker's owned I/O while other workers remain usable.
+    await expect(f.service.resume(f.paused.id, placement)).resolves.toMatchObject({ status: "running" });
+    f.finish.resolve();
+    await Promise.all([f.poll, stopped]);
+    expect(f.stored().find(worker => worker.id === f.noisy.id)).toMatchObject({ status: "stopped", completion: {
+      report: f.report, turn: { status: "completed", threadId: `thread-${f.noisy.id}`, turnId: `turn-${f.noisy.attemptId}` },
+    } });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalledWith(f.noisy.attemptId);
+  });
+
+
+  it("preserves cancellation of a paused worker resuming while an unrelated worker persists", async () => {
+    const f = fixture();
+    f.provider.getIssue.mockImplementation(async number => ({ ...f.issue, number: number! }));
+    const repository = f.deps.settings().repository;
+    const first = await f.service.startIssue(repository, 1, placement);
+    const second = await f.service.startIssue(repository, 2, placement);
+    await f.service.pause(first.id);
+    await f.service.pause(second.id);
+    const recovery = deferred<Awaited<ReturnType<typeof f.runtime.recover>>>();
+    const entered = deferred<void>();
+    f.runtime.recover.mockImplementation(async id => {
+      if (id === first.id) { entered.resolve(); return recovery.promise; }
+      return { workspace: undefined, tabIds: [] };
+    });
+    const continuing = f.service.continueWorker(first.id, "Repair CI", placement).then(value => ({ value }), error => ({ error }));
+    await entered.promise;
+    await f.service.resume(second.id, placement);
+    const stopping = f.service.stop(first.id);
+    recovery.resolve({ workspace: undefined, tabIds: [] });
+    expect(await continuing).toMatchObject({ error: new Error("Worker stopped by user.") });
+    await stopping;
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === first.id)).toHaveLength(1);
+    expect(f.stored().find(worker => worker.id === first.id)).toMatchObject({ status: "stopped", pendingContinuation: { message: "Repair CI" } });
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+  });
+
+});

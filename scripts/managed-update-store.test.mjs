@@ -3,12 +3,80 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
-import { bundleCoordinator, hashFile, restoreSnapshot, snapshotTree, verifySnapshot, writeUpdateJson } from './managed-update-store.mjs';
+import { bundleCoordinator, hashFile, restoreSnapshot, snapshotTree, verifySnapshot, writeUpdateJson, estimateSnapshot, manifestTree, filesystemCapacity, parseQuotaCapacity } from './managed-update-store.mjs';
 
 const roots = [];
 afterEach(() => {
   vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
+
+it('reserves every hardlinked pathname for full copying, including sparse-file expansion', () => {
+  const { root, source, backup } = fixture();
+  fs.writeFileSync(path.join(source, 'dependency'), Buffer.alloc(1024 * 1024, 7));
+  fs.linkSync(path.join(source, 'dependency'), path.join(source, 'dependency-alias'));
+  fs.writeFileSync(path.join(source, 'sparse'), '');
+  fs.truncateSync(path.join(source, 'sparse'), 2 * 1024 * 1024);
+  fs.symlinkSync(root, path.join(source, 'external-link'));
+  fs.mkdirSync(path.join(source, 'terminal-runtime'));
+  fs.writeFileSync(path.join(source, 'terminal-runtime/ignored'), Buffer.alloc(1024));
+  const exclude = relative => relative === 'terminal-runtime';
+  const estimate = estimateSnapshot(source, { exclude });
+  expect(estimate.fileBytes).toBe(4 * 1024 * 1024 + Buffer.byteLength('original bytes'));
+  expect(estimate.bytes).toBeGreaterThanOrEqual(estimate.fileBytes);
+  const copy = fs.copyFileSync;
+  vi.spyOn(fs, 'copyFileSync').mockImplementation((from, to, flags) => copy(from, to, flags & ~fs.constants.COPYFILE_FICLONE));
+  const progress = [];
+  const manifest = snapshotTree(source, backup, { exclude, progress: value => progress.push(value) });
+  verifySnapshot(backup, manifest);
+  expect(fs.statSync(path.join(backup, 'dependency')).ino).not.toBe(fs.statSync(path.join(backup, 'dependency-alias')).ino);
+  expect(progress.at(-1)).toMatchObject({ files: 4, bytes: estimate.fileBytes });
+  expect(estimate.manifestBytes).toBeGreaterThan(Buffer.byteLength(JSON.stringify(manifest, null, 2)));
+  expect(fs.existsSync(path.join(backup, 'terminal-runtime'))).toBe(false);
+});
+
+it('manifests the retained release without creating another build copy', () => {
+  const { source, backup } = fixture();
+  const copy = vi.spyOn(fs, 'copyFileSync');
+  const manifest = manifestTree(source);
+  verifySnapshot(source, manifest);
+  expect(copy).not.toHaveBeenCalled();
+  expect(fs.existsSync(backup)).toBe(false);
+});
+
+it('rejects a release directory that changes while its manifest is collected', () => {
+  const { source } = fixture();
+  const read = fs.readdirSync;
+  let changed = false;
+  vi.spyOn(fs, 'readdirSync').mockImplementation((directory, ...options) => {
+    const names = read(directory, ...options);
+    if (!changed && fs.realpathSync(directory) === path.join(source, 'nested')) {
+      changed = true;
+      fs.writeFileSync(path.join(source, 'nested/unverified'), 'new bytes');
+      fs.utimesSync(path.join(source, 'nested'), new Date(), new Date(Date.now() + 1000));
+    }
+    return names;
+  });
+  expect(() => manifestTree(source)).toThrow('changed during manifesting');
+});
+
+it('limits available space and inodes by unprivileged blocks and both destination quotas', () => {
+  const { source } = fixture();
+  vi.spyOn(fs, 'statfsSync').mockReturnValue({ bsize: 4096, bavail: 100, bfree: 1000, files: 1000, ffree: 900 });
+  const quotaCommand = vi.fn((_, args) => ({ status: 0, stdout: `Disk quotas for user example:\nFilesystem blocks quota limit grace files quota limit grace\n/dev/test 10 ${args.includes('--group') ? 20 : 30} 40 0 3 20 30 0\n`, stderr: '' }));
+  const capacity = filesystemCapacity(path.join(source, 'not-created'), { quotaCommand });
+  expect(capacity).toMatchObject({ availableBytes: 10 * 1024, availableInodes: 17, quotaStatus: 'user and destination group checked' });
+  expect(quotaCommand).toHaveBeenCalledTimes(2);
+  expect(parseQuotaCapacity('/dev/test 50* 20 40 1 31* 20 30 1')).toEqual({ bytes: 0, inodes: 0 });
+  expect(() => parseQuotaCapacity('/dev/test invalid quota output')).toThrow('Cannot parse quota');
+});
+
+it('reports unavailable quota tools and fails clearly when a quota query fails', () => {
+  const { source } = fixture();
+  const read = fs.readFileSync;
+  vi.spyOn(fs, 'readFileSync').mockImplementation((file, ...args) => file === '/proc/self/mountinfo' ? '1 0 8:1 / / rw - ext4 /dev/test rw\n' : read(file, ...args));
+  expect(filesystemCapacity(source, { quotaCommand: () => ({ error: { code: 'ENOENT' } }) }).quotaStatus).toContain('not installed');
+  expect(() => filesystemCapacity(source, { quotaCommand: () => ({ status: 1, stdout: '', stderr: 'Permission denied' }) })).toThrow('Cannot inspect user quota');
 });
 
 it('snapshots and restores bytes, modes and links while preserving their external targets', () => {

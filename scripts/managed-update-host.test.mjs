@@ -62,6 +62,99 @@ function fixture() {
 }
 
 describe('managed update host with real Git and recovery files', () => {
+  it('rechecks capacity at the last safe point and resumes without losing worker data', async () => {
+    const f = fixture();
+    write(f.dataDir, 'forge-workers/retained/local.txt', 'uncommitted worker edit');
+    write(f.dataDir, 'forge-workers/retained/dependency', Buffer.alloc(1024 * 1024, 7));
+    fs.linkSync(path.join(f.dataDir, 'forge-workers/retained/dependency'), path.join(f.dataDir, 'forge-workers/retained/dependency-alias'));
+    const inspect = f.commands.inspect, run = f.commands.run;
+    let webRunning = true;
+    f.commands.inspect = (command, args, options) => {
+      const result = inspect(command, args, options);
+      return webRunning && command === 'systemctl' && args[2] === 'cloudx.service'
+        ? result.replace('ActiveState=inactive', 'ActiveState=active').replace('MainPID=0', 'MainPID=456')
+          .replace('InvocationID=', `InvocationID=${'c'.repeat(32)}`).replace('ControlGroup=', 'ControlGroup=/cloudx-fixture/web') : result;
+    };
+    f.commands.run = (command, args, options) => {
+      if (command === 'systemctl' && args[1] === 'stop' && args.includes('cloudx.service')) webRunning = false;
+      return run(command, args, options);
+    };
+    let availableBytes = 10 ** 12;
+    f.host.inspectCapacity = destination => ({ destination, device: 'test-device', mount: '/test-mount', blockSize: 4096, availableBytes, availableInodes: 10 ** 9, quotaStatus: 'test quota' });
+    const execute = checkpoint => new ManagedUpdate({ record: f.record, save: f.save, host: f.host, checkpoint }).run();
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await execute(boundary => { if (boundary === 'after:prepare') availableBytes = 1; })).toMatchObject({ state: 'failed', phase: 'quiesce', component: 'capacity' });
+    expect(f.record.run.cause).toContain('required');
+    expect(f.record.run.cause).toContain('available 1 bytes');
+    expect(f.record.run.cause).toContain('resume to reassess');
+    expect(f.record.transition.mutating).toBeUndefined();
+    expect(webRunning).toBe(true);
+    expect(f.calls.filter(([command, args]) => command === 'systemctl' && args[1] !== 'show')).toEqual([]);
+    expect(fs.readFileSync(path.join(f.dataDir, 'forge-workers/retained/local.txt'), 'utf8')).toBe('uncommitted worker edit');
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.old);
+    expect(fs.existsSync(path.join(f.host.runDir, 'prepared-evidence'))).toBe(false);
+    availableBytes = 10 ** 12;
+    vi.spyOn(f.host, 'start').mockImplementation(() => {});
+    vi.spyOn(f.host, 'verify').mockImplementation(() => {});
+    expect(await execute()).toMatchObject({ state: 'succeeded' });
+    expect(f.build).toHaveBeenCalledOnce();
+    expect(f.record.transition.capacity.stage).toBe('before-stop');
+    const snapshot = f.record.transition.snapshots[0];
+    expect(fs.readFileSync(path.join(snapshot.destination, 'forge-workers/retained/local.txt'), 'utf8')).toBe('uncommitted worker edit');
+    expect(f.record.transition.snapshotProgress).toMatchObject({ operation: 'verified', files: 4 });
+    expect(fs.statSync(path.join(snapshot.destination, 'forge-workers/retained/dependency')).ino)
+      .not.toBe(fs.statSync(path.join(snapshot.destination, 'forge-workers/retained/dependency-alias')).ino);
+  });
+
+  it('checks every destination filesystem, including a separate archive restoration quota', async () => {
+    const f = fixture();
+    const archive = path.join(f.home, 'external-archive');
+    write(archive, 'archive.db', 'retained archive');
+    fs.appendFileSync(f.envPath, `CLOUDX_DOCUMENTATION_DATA_DIR=${archive}\n`);
+    f.host.envConfig.CLOUDX_DOCUMENTATION_DATA_DIR = archive;
+    f.host.inspectCapacity = destination => ({ destination, device: destination === archive ? 'archive-device' : 'state-device', mount: destination === archive ? '/archive' : '/state',
+      blockSize: 4096, availableBytes: destination === archive ? 1 : 10 ** 12, availableInodes: 10 ** 9, quotaStatus: 'test quota' });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await new ManagedUpdate({ record: f.record, save: f.save, host: f.host }).run()).toMatchObject({ state: 'failed', component: 'capacity' });
+    expect(f.record.run.cause).toContain('/archive');
+    expect(f.record.transition.capacity.filesystems).toHaveLength(2);
+    expect(f.build).not.toHaveBeenCalled();
+    expect(f.calls.filter(([command, args]) => command === 'systemctl' && args[1] !== 'show')).toEqual([]);
+    expect(fs.readFileSync(path.join(archive, 'archive.db'), 'utf8')).toBe('retained archive');
+  });
+
+  it('reserves checkout growth from the prepared target as well as the old file', () => {
+    const f = fixture();
+    f.host.prepare(f.record);
+    write(f.record.transition.release, 'version.txt', Buffer.alloc(2 * 1024 * 1024, 7));
+    f.host.preflightCapacity(f.record, 'before-stop');
+    const reservation = f.record.transition.capacity.filesystems.flatMap(filesystem => filesystem.reservations)
+      .find(reservation => reservation.purpose === 'checkout activation and recovery');
+    expect(reservation.bytes).toBeGreaterThan(4 * 1024 * 1024);
+    expect(f.calls.filter(([command, args]) => command === 'systemctl' && args[1] !== 'show')).toEqual([]);
+  });
+
+  it('restores after a late ENOSPC even though all capacity preflights passed', async () => {
+    const f = fixture();
+    f.host.inspectCapacity = destination => ({ destination, device: 'test-device', mount: '/test-mount', blockSize: 4096, availableBytes: 10 ** 12, availableInodes: 10 ** 9, quotaStatus: 'test quota' });
+    const copy = fs.copyFileSync;
+    let injected = false;
+    vi.spyOn(fs, 'copyFileSync').mockImplementation((from, to, flags) => {
+      if (!injected && to.startsWith('/proc/self/fd/') && fs.readlinkSync(path.dirname(to)).includes('/snapshot-')) {
+        injected = true;
+        throw Object.assign(new Error('late disk exhaustion'), { code: 'ENOSPC' });
+      }
+      return copy(from, to, flags);
+    });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await new ManagedUpdate({ record: f.record, save: f.save, host: f.host }).run()).toMatchObject({ state: 'failed', phase: 'snapshot', resumable: true });
+    expect(injected).toBe(true);
+    expect(f.record.run.cause).toContain('ENOSPC');
+    expect(f.record.transition.mutating).toBe(false);
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.old);
+    expect(fs.readFileSync(path.join(f.dataDir, 'workspace.json'), 'utf8')).toBe('{"windows":[]}');
+  });
+
   it('checks Forge before building and again after preparation, then resumes into the target runtime', async () => {
     const f = fixture();
     const workerFile = `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`;
