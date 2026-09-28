@@ -1768,9 +1768,9 @@ describe("buildServer", () => {
     const disposeJiraOwner = services.jiraPolling!.dispose.bind(services.jiraPolling);
     const disposeForgeOwner = vi.fn(services.forge!.dispose.bind(services.forge));
     const disposeAutomationOwner = services.automation!.dispose.bind(services.automation);
-    const poll = vi.spyOn(services.forge!, "poll");
     const pollWriteStarted = deferred<void>();
     const releasePollWrite = deferred<void>();
+    const events: string[] = [];
     const writePluginData = services.pluginData!.write.bind(services.pluginData);
     const writes = vi.spyOn(services.pluginData!, "write").mockImplementation(async (pluginId, value) => {
       if (pluginId === "forge") {
@@ -1778,8 +1778,8 @@ describe("buildServer", () => {
         await releasePollWrite.promise;
       }
       await writePluginData(pluginId, value);
+      if (pluginId === "forge") events.push("forge:persisted");
     });
-    const events: string[] = [];
     const jiraRelease = deferred<void>();
     const forgeRelease = deferred<void>();
     const sessionRelease = deferred<void>();
@@ -1794,9 +1794,10 @@ describe("buildServer", () => {
         events.push("jira:end");
       })
     } as unknown as NonNullable<AppServices["jiraPolling"]>;
-    vi.spyOn(services.forge!, "dispose").mockImplementation(async () => {
+    const disposeForge = vi.spyOn(services.forge!, "dispose").mockImplementation(async () => {
       events.push("forge:start");
       await forgeRelease.promise;
+      await disposeForgeOwner();
       events.push("forge:end");
     });
     vi.spyOn(services.automation!, "beginShutdown").mockImplementation(() => {
@@ -1836,7 +1837,6 @@ describe("buildServer", () => {
     const cleanUpFixture = async () => {
       await app.close();
       await disposeJiraOwner();
-      await disposeForgeOwner();
       await disposeAutomationOwner();
       await fs.rm(root, { recursive: true, force: true });
     };
@@ -1852,14 +1852,14 @@ describe("buildServer", () => {
         await (cleanup ??= cleanUpFixture());
       } finally {
         writes.mockRestore();
-        poll.mockRestore();
         vi.useRealTimers();
       }
     });
 
     await vi.advanceTimersByTimeAsync(2_000);
     await pollWriteStarted.promise;
-    expect(poll).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveBeenCalledWith("forge", []);
+    expect(await services.pluginData!.read("forge")).toBeUndefined();
 
     let closed = false;
     const close = app.close().then(() => {
@@ -1872,7 +1872,17 @@ describe("buildServer", () => {
     expect(closed).toBe(false);
 
     forgeRelease.resolve(undefined);
+    await vi.waitFor(() => expect(disposeForgeOwner).toHaveBeenCalledTimes(1));
+    expect(events).not.toContain("forge:end");
+    expect(events).not.toContain("sessions:start");
+    expect(closed).toBe(false);
+    expect((await fs.stat(root)).isDirectory()).toBe(true);
+
+    releasePollWrite.resolve(undefined);
     await vi.waitFor(() => expect(events).toContain("sessions:start"));
+    expect(events.indexOf("forge:persisted")).toBeGreaterThan(events.indexOf("forge:start"));
+    expect(events.lastIndexOf("forge:persisted")).toBeLessThan(events.indexOf("forge:end"));
+    expect(await services.pluginData!.read("forge")).toEqual([]);
     expect(events.indexOf("sessions:start")).toBeGreaterThan(events.indexOf("forge:end"));
     jiraRelease.resolve(undefined);
     sessionRelease.resolve(undefined);
@@ -1894,23 +1904,17 @@ describe("buildServer", () => {
 
     await close;
     expect(closed).toBe(true);
+    expect(disposeForge).toHaveBeenCalledTimes(1);
+    expect(disposeForgeOwner).toHaveBeenCalledTimes(1);
 
     expect(events.indexOf("notifications:workspace")).toBeGreaterThan(events.indexOf("automation:dispose:end"));
     expect(events.indexOf("notifications:automation")).toBeGreaterThan(events.indexOf("automation:dispose:end"));
 
-    let cleaned = false;
-    cleanup = cleanUpFixture().then(() => { cleaned = true; });
-    await vi.waitFor(() => expect(disposeForgeOwner).toHaveBeenCalledTimes(1));
-    expect(cleaned).toBe(false);
-    expect((await fs.stat(root)).isDirectory()).toBe(true);
-
-    releasePollWrite.resolve(undefined);
-    await cleanup;
-    expect(cleaned).toBe(true);
+    await (cleanup = cleanUpFixture());
     await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(vi.getTimerCount()).toBe(0);
     const writesAfterCleanup = writes.mock.calls.length;
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(poll).toHaveBeenCalledTimes(1);
     expect(writes).toHaveBeenCalledTimes(writesAfterCleanup);
     await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
   });

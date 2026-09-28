@@ -22,6 +22,8 @@ const fileOperations: TabContextFileOperations = {
 
 describe("TabContextService", () => {
   it("bounds sustained owned terminal output to an active write and one recent UTF-8 batch", async () => {
+    const output = "🙂".repeat(1000);
+    const chunksPerRound = 400;
     const started = Array.from({ length: 4 }, () => deferred<void>());
     const releases = Array.from({ length: 4 }, () => deferred<void>());
     let opens = 0;
@@ -32,10 +34,11 @@ describe("TabContextService", () => {
         for (let round = 0; round < 3; round++) {
           await started[round]!.promise;
           recording.clear();
-          for (let chunk = 0; chunk < 4000; chunk++) {
-            recording.add(service.record(tab, "terminal-output", `${"🙂".repeat(100)}\nround-${round}-chunk-${chunk}\n`));
-            if (chunk % 1000 === 0) recording.add(service.record(tab, "plugin-action", `action-${round}-${chunk}`));
+          for (let chunk = 0; chunk < chunksPerRound; chunk++) {
+            recording.add(service.record(tab, "terminal-output", `${output}\nround-${round}-chunk-${chunk}\n`));
+            if (chunk % 100 === 0) recording.add(service.record(tab, "plugin-action", `action-${round}-${chunk}`));
           }
+          recording.add(service.record(tab, "plugin-action", `action-${round}-tail`));
           expect(recording.size).toBe(1);
           expect(opens).toBe(round + 1);
           releases[round]!.resolve();
@@ -47,10 +50,11 @@ describe("TabContextService", () => {
         const saved = await service.read(tab);
         expect(Buffer.byteLength(saved)).toBeLessThanOrEqual(64_000);
         expect(saved).toContain("Older pending context was trimmed");
-        expect(saved).toContain("round-2-chunk-3999");
+        const retainedEvents = ["round-2-chunk-398", "round-2-chunk-399", "action-2-tail"];
+        expect(retainedEvents.every(event => saved.includes(event))).toBe(true);
         expect(saved).not.toContain("round-2-chunk-0\n");
         expect(saved).not.toContain("\uFFFD");
-        expect(saved.indexOf("round-2-chunk-3998")).toBeLessThan(saved.indexOf("round-2-chunk-3999"));
+        expect(retainedEvents.map(event => saved.indexOf(event))).toEqual([...retainedEvents.map(event => saved.indexOf(event))].sort((a, b) => a - b));
         expect(service.directory(tab.contextPath)).toEqual(identity);
       } finally { releases.forEach(release => release.resolve()); }
     }, {
