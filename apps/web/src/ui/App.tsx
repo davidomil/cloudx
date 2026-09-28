@@ -767,6 +767,22 @@ export function App() {
     setCreateTargetPaneId((current) => (current === paneId ? undefined : current));
   }
 
+  async function openForge() {
+    setSettingsOpen(false);
+    setSettingsCategory("general");
+    const candidates = [...windowsRef.current].sort((a, b) => Number(b.id === activeWindowIdRef.current) - Number(a.id === activeWindowIdRef.current));
+    for (const window of candidates) {
+      for (const pane of listPanes(window.layout.root)) {
+        const tab = tabsRef.current.find(tab => tab.pluginId === "forge" && pane.tabIds.includes(tab.id));
+        if (!tab) continue;
+        if (window.id !== activeWindowIdRef.current) await handleSelectWindow(window.id);
+        await activateTab(tab.id, pane.id);
+        return;
+      }
+    }
+    await handleCreate({ pluginId: "forge" });
+  }
+
   async function handleCreate(input: Omit<CreateTabRequest, "windowId" | "paneId">) {
     setError(undefined);
     try {
@@ -1470,6 +1486,7 @@ export function App() {
           initialCategoryId={settingsCategory}
           callHook={pluginById.has("codex-settings") ? callUiHook : undefined}
           cloudxUpdate={cloudxUpdate}
+          onOpenForge={() => void openForge()}
           rulesSkillsStore={rulesSkillsStore}
           onCancel={() => { setSettingsOpen(false); setSettingsCategory("general"); }}
           onSave={handleSaveConfig}

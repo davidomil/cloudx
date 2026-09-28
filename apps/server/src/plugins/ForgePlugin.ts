@@ -227,6 +227,9 @@ export class ForgePlugin implements WorkspacePlugin {
           worker: await this.service().workflow.continueWorker(String(input.id), String(input.message), place(input)),
         }),
       ),
+      hook("worker.ownershipAvailability", "Check directory ownership recovery availability", "read", { id }, ["id"], async input => ({
+        availability: await this.service().workflow.ownershipAvailability(String(input.id)),
+      })),
       hook("worker.previewOwnership", "Inspect directory ownership recovery", "read", { id }, ["id"], async input => ({
         preview: await this.service().workflow.previewOwnership(String(input.id)),
       })),

@@ -13,6 +13,20 @@ const FORGE_STATE = `plugin-data/forge-${createHash("sha256").update("forge").di
 const WORKER_GUIDANCE = "Stop or recover the worker through CloudX first. Resolve missing ownership evidence explicitly; service restarts do not prove a worker ended. Local resources were preserved.";
 const LEGACY_RECOVERY = "Legacy workspace has no saved session identities. Its exact layout will be backed up, but in-memory tabs and terminal processes cannot be restored. Record working directories and exact Codex conversation IDs before confirming interruption. No commands or prompts will be replayed.";
 
+export class ForgeUpdateBlockedError extends Error {
+  constructor(message, worker) {
+    super(message);
+    const changeNumber = worker?.changeNumber ?? (worker?.kind === "review" ? worker.number : undefined);
+    this.component = "forge";
+    this.publicMessage = message.replace(` ${WORKER_GUIDANCE}`, "");
+    this.forgeBlocker = { kind: "forge", message: this.publicMessage, recoveryAction: WORKER_GUIDANCE,
+      ...(typeof worker?.id === "string" && worker.id.length <= 128 && SAFE_ID.test(worker.id) ? { workerId: worker.id } : {}),
+      ...(worker?.kind === "issue" && Number.isSafeInteger(worker.number) && worker.number > 0 ? { issueNumber: worker.number } : {}),
+      ...(Number.isSafeInteger(changeNumber) && changeNumber > 0 ? { changeNumber } : {}),
+    };
+  }
+}
+
 /** Run before stopping the web service; snapshotTerminalRecovery checks again after it stops. */
 export function assertTerminalMigrationSafe({ dataDir }) {
   const snapshot = new RecoverySnapshot(dataDir);
@@ -73,26 +87,35 @@ class RecoverySnapshot {
   }
 
   readForgeState() {
+    try { this.readForgeRecords(); }
+    catch (error) {
+      if (error instanceof ForgeUpdateBlockedError) throw error;
+      throw new ForgeUpdateBlockedError(`Forge recovery evidence could not be verified. ${error.message}`);
+    }
+  }
+
+  readForgeRecords() {
     if (!this.present) return;
     const workers = this.json(FORGE_STATE, true) ?? [];
-    if (!Array.isArray(workers) || workers.length > FILE_LIMIT) throw new Error(`Invalid Forge worker state. ${WORKER_GUIDANCE}`);
+    if (!Array.isArray(workers) || workers.length > FILE_LIMIT || new Set(workers.map(worker => worker?.id)).size !== workers.length)
+      throw new Error(`Invalid Forge worker state. ${WORKER_GUIDANCE}`);
     const ownership = new Map();
     for (const relative of this.stateFiles("forge-workers/workspaces")) {
       const owned = this.json(relative);
-      if (!owned || typeof owned.id !== "string" || !SAFE_ID.test(owned.id) || path.basename(relative) !== `${owned.id}.json` ||
+      if (!owned || typeof owned.id !== "string" || !SAFE_ID.test(owned.id) || ownership.has(owned.id) || path.basename(relative) !== `${owned.id}.json` ||
           typeof owned.launchPending !== "boolean" || typeof owned.gitPending !== "boolean" || typeof owned.cleaned !== "boolean")
         throw new Error(`Invalid Forge ownership: ${relative}. ${WORKER_GUIDANCE}`);
       if (owned.launchPending || owned.gitPending)
-        throw new Error(`Forge worker ${owned.id} has a pending launch or Git operation. ${WORKER_GUIDANCE}`);
+        throw new ForgeUpdateBlockedError(`Forge worker ${owned.id} has a pending launch or Git operation. ${WORKER_GUIDANCE}`, workers.find(worker => worker?.id === owned.id) ?? owned);
       ownership.set(owned.id, owned);
     }
     for (const worker of workers) {
       if (!worker || typeof worker.id !== "string" || !SAFE_ID.test(worker.id) ||
           !["paused", "awaiting_review", "stopped", "completed", "failed"].includes(worker.status) ||
           worker.pendingPublication || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState) || ["posting", "post_failed"].includes(worker.draft?.status))
-        throw new Error(`Forge worker ${worker?.id ?? "unknown"} is active or has unresolved work. ${WORKER_GUIDANCE}`);
-      if ((worker.worktreePath || worker.tabId || worker.attemptId) && !ownership.has(worker.id))
-        throw new Error(`Forge worker ${worker.id} has missing workspace ownership. ${WORKER_GUIDANCE}`);
+        throw new ForgeUpdateBlockedError(`Forge worker ${worker?.id ?? "unknown"} is active or has unresolved work. ${WORKER_GUIDANCE}`, worker);
+      if ((worker.worktreePath || worker.retainedWorkspace || worker.tabId || worker.attemptId) && !ownership.has(worker.id))
+        throw new ForgeUpdateBlockedError(`Forge worker ${worker.id} has missing workspace ownership. ${WORKER_GUIDANCE}`, worker);
     }
     const tabs = new Map();
     for (const relative of this.stateFiles("forge-workers/tabs")) {
@@ -105,11 +128,34 @@ class RecoverySnapshot {
     for (const worker of workers) {
       if (worker.tabId === undefined) continue;
       const tab = tabs.get(worker.tabId);
-      if (!tab || tab.workerId !== worker.id || tab.attemptId !== undefined && tab.attemptId !== worker.attemptId)
-        throw new Error(`Forge worker ${worker.id} has missing or conflicting terminal ownership. ${WORKER_GUIDANCE}`);
+      if (!tab || tab.workerId !== worker.id || tab.attemptId !== undefined && tab.attemptId !== worker.attemptId && !this.completedAttempt(worker, tab))
+        throw new ForgeUpdateBlockedError(`Forge worker ${worker.id} has missing or conflicting terminal ownership. ${WORKER_GUIDANCE}`, worker);
     }
     for (const directory of ["executions", "turns", "history"])
       for (const relative of this.stateFiles(`forge-workers/${directory}`)) this.capture(relative);
+  }
+
+  completedAttempt(worker, tab) {
+    const completion = worker.completion;
+    const turn = completion?.turn;
+    if (worker.attemptId !== undefined || typeof tab.attemptId !== "string" || !SAFE_ID.test(tab.attemptId) || completion?.attemptId !== tab.attemptId ||
+        turn?.status !== "completed" || turn.workerId !== worker.id || turn.attemptId !== tab.attemptId ||
+        ![turn.threadId, turn.turnId].every(value => typeof value === "string" && value.length > 0)) return false;
+    const saved = this.json(`forge-workers/turns/${worker.id}/${tab.attemptId}.json`, true);
+    if (!saved || ["workerId", "attemptId", "threadId", "turnId", "status", "error"].some(key => saved[key] !== turn[key])) return false;
+    const execution = tab.execution;
+    if (!execution || !CONVERSATION_ID.test(execution.executionId) || !CONVERSATION_ID.test(execution.bootId) ||
+        !/^pid:\[\d+\]$/u.test(execution.pidNamespace) || execution.directory !== path.join(this.dataDir, "forge-workers/executions", execution.executionId) ||
+        execution.receiptDirectory?.path !== execution.directory) return false;
+    try {
+      assertSourceIdentity({ ...execution.receiptDirectory, home: execution.directory });
+      const ready = this.json(`forge-workers/executions/${execution.executionId}/ready.json`, true);
+      const complete = this.json(`forge-workers/executions/${execution.executionId}/complete.json`, true);
+      return [ready, complete].every(receipt => receipt && ["executionId", "bootId", "pidNamespace"].every(key => receipt[key] === execution[key]) &&
+        Number.isSafeInteger(receipt.pid) && receipt.pid > 0 && typeof receipt.started === "string" && /^\d+$/u.test(receipt.started)) &&
+        complete.pid === ready.pid && complete.started === ready.started && Number.isInteger(complete.exitCode) && complete.exitCode >= 0 && complete.exitCode <= 255 &&
+        (complete.signal === undefined || complete.exitCode === 0 && Number.isInteger(complete.signal) && complete.signal > 0 && complete.signal <= 64);
+    } catch { return false; }
   }
 
   stateFiles(relative, depth = 0) {

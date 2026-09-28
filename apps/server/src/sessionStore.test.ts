@@ -2074,3 +2074,50 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<
   });
   return { promise, resolve, reject };
 }
+
+describe("workspace cleanup admission", () => {
+  it("excludes new sessions and symlink aliases throughout cleanup while unrelated sessions can open", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-cleanup-admission-"));
+    const obsolete = path.join(root, "obsolete"); const other = path.join(root, "other");
+    await fs.mkdir(obsolete); await fs.mkdir(other); await fs.symlink(obsolete, path.join(root, "alias"));
+    const registry = new PluginRegistry(); const plugin = new FakeDefaultPlugin(); registry.register(plugin);
+    const store = new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, "context")));
+    try {
+      await store.withInactiveDirectory(obsolete, async () => {
+        await expect(store.createTab({ pluginId: plugin.id, cwd: obsolete })).rejects.toThrow("being permanently deleted");
+        await expect(store.createTab({ pluginId: plugin.id, cwd: path.join(root, "alias") })).rejects.toThrow("being permanently deleted");
+        const unrelated = await store.createTab({ pluginId: plugin.id, cwd: other });
+        expect(unrelated.cwd).toBe(other);
+        await fs.rm(obsolete, { recursive: true });
+      });
+      expect(plugin.createCount).toBe(1);
+      await fs.mkdir(obsolete);
+      expect((await store.createTab({ pluginId: plugin.id, cwd: obsolete })).cwd).toBe(obsolete);
+    } finally { await store.dispose(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("protects sessions still being prepared and unpublished tabs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-cleanup-starting-"));
+    const registry = new PluginRegistry(); const plugin = new FakeDefaultPlugin(); registry.register(plugin);
+    let entered!: () => void; const enteredPromise = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void; const preparation = new Promise<void>(resolve => { release = resolve; });
+    const resolver: SessionRuntimeContextResolver = {
+      runtimeContextFor: async () => { entered(); await preparation; return {}; },
+      tabIndicatorFor: () => undefined,
+    };
+    const store = new SessionStore(registry, new PathPolicy([root]), new TabContextService(path.join(root, "context")), undefined, undefined, resolver);
+    const pending = store.prepareTab({ pluginId: plugin.id, cwd: root });
+    try {
+      await enteredPromise;
+      const remove = vi.fn();
+      await expect(store.withInactiveDirectory(root, remove)).rejects.toThrow("session is starting");
+      expect(remove).not.toHaveBeenCalled();
+      release(); const tab = await pending;
+      expect(store.listTabs()).toEqual([]);
+      await expect(store.withInactiveDirectory(root, remove)).rejects.toThrow("open or prepared session");
+      await store.discardPreparedTab(tab.id);
+      await store.withInactiveDirectory(root, remove);
+      expect(remove).toHaveBeenCalledOnce();
+    } finally { release(); await pending; await store.dispose(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+});

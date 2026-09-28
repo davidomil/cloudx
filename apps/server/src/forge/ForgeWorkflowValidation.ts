@@ -579,6 +579,61 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.placement !== undefined) {
+      const placement = object(worker.placement);
+      parsed.placement = { windowId: nonblankText(placement.windowId, "worker window", 128), paneId: nonblankText(placement.paneId, "worker pane", 128) };
+    }
+    if (worker.mergeRejectionPending !== undefined) {
+      const rejection = object(worker.mergeRejectionPending);
+      if (!worker.mergeAttempted) throw new Error("Merge rejection reconciliation requires the original attempted merge.");
+      parsed.mergeRejectionPending = { observedAt: isoTimestamp(rejection.observedAt, "merge rejection observation"), reason: text(rejection.reason, "merge rejection reason") };
+    }
+    if (worker.pendingContinuation !== undefined) {
+      const continuation = object(worker.pendingContinuation);
+      parsed.pendingContinuation = {
+        message: nonblankText(continuation.message, "pending recovery message", 20_000),
+        ...(continuation.deliveryAttemptId === undefined ? {} : { deliveryAttemptId: nonblankText(continuation.deliveryAttemptId, "recovery delivery attempt", 36) }),
+        ...(continuation.previousError === undefined ? {} : { previousError: text(continuation.previousError, "recovery error") }),
+      };
+    }
+    if (worker.recoveryContext !== undefined) {
+      const recovery = object(worker.recoveryContext);
+      const update = object(recovery.baseUpdate);
+      if (worker.kind !== "issue" || recovery.operation !== "branch_update") throw new Error("Invalid local recovery operation.");
+      parsed.recoveryContext = {
+        operation: "branch_update", reason: nonblankText(recovery.reason, "local recovery reason", 100_000),
+        baseUpdate: { expectedHeadSha: commitSha(update.expectedHeadSha, "recovery source"),
+          baseBranch: nonblankText(update.baseBranch, "recovery base branch", 1024),
+          ...(update.headSha === undefined ? {} : { headSha: commitSha(update.headSha, "recovery local head") }) },
+      };
+    }
+    if (worker.mergeQueue !== undefined) {
+      const queue = object(worker.mergeQueue);
+      if (worker.kind !== "issue" || !worker.changeNumber ||
+          !Number.isSafeInteger(queue.sequence) || Number(queue.sequence) < 1 ||
+          !Number.isSafeInteger(queue.position) || Number(queue.position) < 0 || typeof queue.active !== "boolean" ||
+          !["queued", "updating", "resolving", "reviewing", "waiting_ci", "merging", "blocked"].includes(String(queue.phase)) ||
+          queue.outcome !== undefined && !["uncertain", "merged"].includes(String(queue.outcome)) || queue.active && queue.phase === "blocked")
+        throw new Error("Invalid saved merge queue entry.");
+      parsed.mergeQueue = {
+        sequence: Number(queue.sequence), enteredAt: isoTimestamp(queue.enteredAt, "queue admission"),
+        phase: queue.phase as NonNullable<ForgeWorker["mergeQueue"]>["phase"], active: queue.active,
+        position: Number(queue.position),
+        ...(queue.activeWorkerId === undefined ? {} : { activeWorkerId: nonblankText(queue.activeWorkerId, "active merge worker", 36) }),
+        ...(queue.reason === undefined ? {} : { reason: text(queue.reason, "merge queue reason") }),
+        ...(queue.outcome === undefined ? {} : { outcome: queue.outcome as "uncertain" | "merged" }),
+      };
+      if (queue.candidate !== undefined) {
+        const candidate = object(queue.candidate);
+        if (candidate.prepared !== undefined && candidate.prepared !== true) throw new Error("Invalid prepared merge candidate.");
+        parsed.mergeQueue.candidate = {
+          ...(candidate.prepared ? { prepared: true } : {}),
+          headSha: commitSha(candidate.headSha, "merge candidate head"), targetHeadSha: commitSha(candidate.targetHeadSha, "merge candidate target"),
+          ...(candidate.reviewId === undefined ? {} : { reviewId: nonblankText(candidate.reviewId, "merge candidate review", 36) }),
+          ...(candidate.checksUrl === undefined ? {} : { checksUrl: text(candidate.checksUrl, "merge candidate checks", 4096) }),
+        };
+      }
+    }
     if (worker.batch !== undefined) {
       if (worker.kind !== "issue") throw new Error("Only issue workers can own a batch.");
       parsed.batch = parseBatch(worker.batch);

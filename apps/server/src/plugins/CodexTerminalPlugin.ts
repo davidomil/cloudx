@@ -9,8 +9,8 @@ import type {
   PluginVoiceContext,
   WorkspacePlugin
 } from "@cloudx/plugin-api";
-import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { PluginSessionMissingError, PluginSessionNotStartedError } from "@cloudx/plugin-api";
+import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type DirectoryOwnershipAvailability, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { CodexStateSources } from "./CodexStateSources.js";
@@ -291,6 +291,23 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ...input, initialInput, prepareCodexSession: undefined,
       runtimeContext: isRecord(codexRuntimeContext) ? codexRuntimeContext as WorkspaceRuntimeContext : input.runtimeContext
     }, true);
+  }
+
+  async ownershipAvailability(input: CreatePluginSessionInput): Promise<DirectoryOwnershipAvailability> {
+    if (!this.sources || !this.factory.attach) return { status: "unavailable", reason: "Codex source or process inspection is unavailable." };
+    try {
+      const terminal = await this.factory.attach(input.tab.id);
+      let ended = false;
+      const unsubscribe = terminal.onExit(() => { ended = true; });
+      // The broker replays its saved exit before the subscription's next microtask.
+      await Promise.resolve();
+      unsubscribe();
+      terminal.detach?.();
+      if (!ended) return { status: "unavailable", reason: "The Codex process is still active." };
+    } catch (error) {
+      if (!(error instanceof PluginSessionMissingError)) return { status: "unavailable", reason: "Confirm the Codex process ended before inspecting ownership." };
+    }
+    return this.sources.ownershipAvailability(input.tab.id);
   }
 
   async previewOwnership(input: CreatePluginSessionInput): Promise<DirectoryOwnershipPreview> {

@@ -64,6 +64,11 @@ interface DeleteWorktreeInput {
 }
 
 interface WorktreeStateOptions {
+  cleanupReview?: {
+    dev: string;
+    ino: string;
+    beforeDelete: () => Promise<void>;
+  };
   includeSizes?: boolean;
   signal?: AbortSignal;
 }
@@ -413,6 +418,11 @@ export class WorktreeService {
         );
       }
 
+      if (options.cleanupReview) {
+        if (worktree.authority.dev.toString() !== options.cleanupReview.dev || worktree.authority.ino.toString() !== options.cleanupReview.ino)
+          throw new Error("The reviewed worktree directory was replaced; its replacement was preserved.");
+        await options.cleanupReview.beforeDelete();
+      }
       await this.requireCurrentAuthority(worktree.authority).catch(() => {
         throw new Error(
           "Worktree destination ownership changed before removal.",

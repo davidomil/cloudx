@@ -18,6 +18,22 @@ import {
 
 const TARGET_COMMIT = "b".repeat(40);
 const temporary = [];
+
+it("reports the Forge worker before staging an update and lets a recovered worker retry", () => {
+  const f = installation();
+  const stateFile = path.join(f.options.dataDir, `plugin-data/forge-${createHash("sha256").update("forge").digest("hex")}.json`);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  const worker = { id: "worker-149", kind: "issue", number: 129, changeNumber: 131, status: "completed", mergeAttempted: true };
+  fs.writeFileSync(stateFile, JSON.stringify([worker]));
+  const forgeBlocker = { kind: "forge", workerId: worker.id, issueNumber: 129, changeNumber: 131,
+    message: expect.stringContaining("active or has unresolved work"), recoveryAction: expect.stringContaining("Stop or recover") };
+  expect(f.updater.status()).toMatchObject({ available: true, forgeBlocker });
+  expect(f.updater.start(TARGET_COMMIT)).toMatchObject({ available: true, forgeBlocker });
+  expect(f.calls.some(([command]) => command === "systemd-run")).toBe(false);
+  expect(f.host.staged).toEqual([]);
+  fs.writeFileSync(stateFile, JSON.stringify([{ ...worker, mergeAttempted: undefined }]));
+  expect(f.updater.start(TARGET_COMMIT)).toMatchObject({ available: true, run: { state: "running" } });
+});
 afterEach(() =>
   temporary
     .splice(0)

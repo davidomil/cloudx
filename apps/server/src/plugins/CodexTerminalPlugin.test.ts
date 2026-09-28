@@ -96,6 +96,30 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it.each([false, true])("checks ownership availability without changing an attached terminal when ended=%s", async ended => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ownership-availability-"));
+    const sources = new CodexStateSources(root);
+    const availability = vi.spyOn(sources, "ownershipAvailability").mockResolvedValue({ status: "available", reason: "Saved device changed." });
+    const terminal = new FakeTerminalProcess();
+    const detach = vi.fn();
+    Object.assign(terminal, { detach });
+    vi.spyOn(terminal, "onExit").mockImplementation(listener => {
+      if (ended) queueMicrotask(() => listener({ exitCode: 0 }));
+      return () => {};
+    });
+    const factory = { spawn: vi.fn(), attach: vi.fn(async () => terminal) };
+    try {
+      const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, root, sources);
+      const result = await plugin.ownershipAvailability({ tab, cwd: root, controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
+      expect(result.status).toBe(ended ? "available" : "unavailable");
+      expect(availability).toHaveBeenCalledTimes(ended ? 1 : 0);
+      expect(detach).toHaveBeenCalledOnce();
+      expect(terminal.killed).toBe(false);
+      expect(terminal.written).toBe("");
+      expect(factory.spawn).not.toHaveBeenCalled();
+    } finally { await sources.dispose(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("binds an owned native bridge to the prepared reviewer thread and attempt", async () => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");

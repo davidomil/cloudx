@@ -28,6 +28,7 @@ import type {
   PathOption,
   PluginDescriptor,
   RecoverTabRequest,
+  DirectoryOwnershipAvailability,
   DirectoryOwnershipPreview,
   DirectoryOwnershipReconciliation,
   CloudxNotification,
@@ -679,6 +680,10 @@ export async function recoverTab(tabId: string, input: RecoverTabRequest): Promi
   });
 }
 
+export async function tabOwnershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
+  return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/ownership`);
+}
+
 export async function previewTabOwnership(tabId: string): Promise<DirectoryOwnershipPreview> {
   return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/ownership/preview`, { method: "POST", body: "{}" });
 }
@@ -1050,3 +1055,5 @@ function audioFilenameForMimeType(mimeType: string): string {
   }
   return "voice.webm";
 }
+
+export { previewWorkspaceCleanup, getWorkspaceCleanup, startWorkspaceCleanup } from "./workspaceCleanupApi.js";

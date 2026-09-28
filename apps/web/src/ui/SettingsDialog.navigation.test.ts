@@ -165,7 +165,7 @@ describe("Settings navigation and search", () => {
     const dialog = container.querySelector('[role="dialog"]')!;
     expect(dialog).not.toBeNull();
     expect(dialog.getAttribute("aria-label") ?? document.getElementById(dialog.getAttribute("aria-labelledby")!)?.textContent).toBe("Settings");
-    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Logs", "Browser"]);
+    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Workspaces", "Logs", "Browser"]);
     expect(tab(container, "General").getAttribute("aria-selected")).toBe("true");
     expect(visibleFields(container)).toEqual(["Workspace title", "Default template"]);
 
@@ -180,7 +180,7 @@ describe("Settings navigation and search", () => {
 
   it("omits Browser without permission state and excludes internal settings from navigation", async () => {
     const { container } = await mount({ browserNotificationState: undefined });
-    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Logs"]);
+    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Workspaces", "Logs"]);
     expect(container.textContent).not.toMatch(/Diagnostic pipeline|Internal plugin field|Internal Only|Hidden field/);
   });
 

@@ -6,6 +6,15 @@ const run = {
 };
 
 describe("CloudX update status", () => {
+  it("validates Forge recovery identities in preflight and persisted failures", () => {
+    const forgeBlocker = { kind: "forge", workerId: "worker-1", issueNumber: 129, changeNumber: 131,
+      message: "The merge outcome needs confirmation.", recoveryAction: "Open Forge and Resume the worker." };
+    expect(parseCloudxUpdateStatus({ available: true, forgeBlocker, run: { ...run, forgeBlocker } }))
+      .toEqual({ available: true, forgeBlocker, run: { ...run, forgeBlocker } });
+    for (const invalid of [{ kind: "unknown" }, { workerId: "../worker" }, { issueNumber: 0 }, { changeNumber: "131" }, { message: "" }, { recoveryAction: null }]) {
+      expect(() => parseCloudxUpdateStatus({ available: true, forgeBlocker: { ...forgeBlocker, ...invalid } })).toThrow("Invalid Forge update blocker");
+    }
+  });
   it("projects availability and a durable run without leaking private runner fields", () => {
     expect(parseCloudxUpdateStatus({ available: true, logPath: "/private/log", run: { ...run, pid: 123 } }))
       .toEqual({ available: true, run });

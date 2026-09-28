@@ -27,3 +27,7 @@ export class WorkspaceWindowConflictError extends Error {
     this.name = "WorkspaceWindowConflictError";
   }
 }
+
+export class WorkspaceCleanupConflictError extends Error {
+  readonly statusCode = 409;
+}

@@ -4,7 +4,7 @@ import path from "node:path";
 import { expect, it, vi } from "vitest";
 import { filesystemIdentity } from "./filesystemIdentity.js";
 import { readDirectoryIdentity } from "./directoryIdentity.js";
-import { DirectoryOwnershipReconciler } from "./directoryOwnershipReconciliation.js";
+import { DirectoryOwnershipReconciler, directoryOwnershipAvailability } from "./directoryOwnershipReconciliation.js";
 
 vi.mock("./filesystemIdentity.js", () => ({ filesystemIdentity: vi.fn(async () => ({ filesystemType: "ef53", filesystemId: "f00d1234" })) }));
 
@@ -54,5 +54,21 @@ it("requires historical confirmation only for unproven records while retaining c
     await fs.rename(reconciledPath, `${reconciledPath}-retained`);
     await fs.mkdir(reconciledPath);
     await expect(reconciliation.assertCurrent()).rejects.toThrow(/ownership changed/);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+
+it("does not offer attestation on a filesystem without durable reconciliation support", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-reconcile-unsupported-"));
+  try {
+    vi.mocked(filesystemIdentity).mockResolvedValue({ filesystemType: "1021994", filesystemId: "aaaa" });
+    const saved = await readDirectoryIdentity(root);
+    const result = await directoryOwnershipAvailability(async () => {
+      const reconciliation = new DirectoryOwnershipReconciler();
+      await reconciliation.add({ path: root, ino: saved.ino, dev: "1" });
+      return reconciliation.preview({});
+    });
+    expect(result).toMatchObject({ status: "unavailable", reason: expect.stringContaining("Restore the original mount") });
+    expect(await fs.readdir(root)).toEqual([]);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });

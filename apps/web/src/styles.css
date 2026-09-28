@@ -8223,3 +8223,33 @@ a:hover svg {
       var(--shadow-neon-tertiary);
   }
 }
+
+.forge-issue-group-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 0; padding: 9px 12px; font-size: 12px; background: var(--color-muted); border-bottom: 1px solid var(--color-border); overflow-wrap: anywhere; }
+.forge-issue-group-heading span { min-width: 0; flex: 1 1 140px; }
+.forge-issue-group-heading small { color: var(--color-muted-foreground); font-weight: normal; font-size: 11px; }
+.forge-issue-group + .forge-issue-group { border-top: 1px solid var(--color-border); }
+
+.workspace-cleanup { min-width: 0; }
+.workspace-cleanup p { margin: 0.5rem 0; }
+.workspace-cleanup code, .workspace-cleanup small { display: block; overflow-wrap: anywhere; white-space: normal; }
+.workspace-cleanup-list, .workspace-cleanup-results > ul { list-style: none; padding: 0; display: grid; gap: 0.65rem; }
+.workspace-cleanup-list > li, .workspace-cleanup-results li { min-width: 0; padding: 0.7rem; border: 1px solid var(--color-border); border-radius: 6px; }
+.workspace-cleanup-choice { display: flex; align-items: start; gap: 0.5rem; }
+.workspace-cleanup-choice strong { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.workspace-cleanup-choice span { white-space: nowrap; }
+.workspace-cleanup label { display: flex; gap: 0.5rem; align-items: start; }
+.workspace-cleanup input[type="checkbox"] { flex: 0 0 auto; width: 18px; height: 18px; padding: 0; margin: 0.15rem 0 0; accent-color: var(--color-accent); }
+.workspace-cleanup-confirm { margin-top: 0.75rem; padding: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; }
+.workspace-cleanup-confirm button + button { margin-left: 0.5rem; }
+.workspace-cleanup progress { width: 100%; }
+
+.forge-merge-queues { flex: none; max-height: 28vh; overflow: auto; border-bottom: 1px solid var(--color-border); padding: 8px 12px; }
+.forge-merge-queues h3 { font-size: var(--font-size-sm); margin: 0 0 6px; overflow-wrap: anywhere; }
+.forge-merge-queues ol { list-style: none; padding: 0; margin: 0; }
+.forge-merge-queues li { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 3px 0; }
+.forge-merge-queues li .cx-button { white-space: normal; text-align: left; height: auto; overflow-wrap: anywhere; }
+.forge-merge-queue { border-left: 2px solid var(--color-accent); padding-left: 10px; margin: 10px 0; overflow-wrap: anywhere; }
+.forge-merge-queue p { margin: 4px 0; }
+
+.workspace-cleanup > .cx-button { justify-self: start; max-width: 100%; white-space: normal; }
+.workspace-cleanup small { color: var(--color-muted-foreground); font-size: var(--font-size-sm); }

@@ -4,8 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TabRecovery, WorkspaceTab } from "@cloudx/shared";
 
-import { previewTabOwnership, reconcileTabOwnership } from "../api.js";
-vi.mock("../api.js", () => ({ previewTabOwnership: vi.fn(), reconcileTabOwnership: vi.fn() }));
+import { tabOwnershipAvailability, previewTabOwnership, reconcileTabOwnership } from "../api.js";
+vi.mock("../api.js", () => ({ tabOwnershipAvailability: vi.fn(), previewTabOwnership: vi.fn(), reconcileTabOwnership: vi.fn() }));
 
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 
@@ -24,6 +24,7 @@ beforeEach(() => {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
+  vi.mocked(tabOwnershipAvailability).mockReset().mockResolvedValue({ status: "not_needed" });
   recover.mockReset().mockResolvedValue(undefined);
   retire.mockReset().mockResolvedValue(undefined);
 });
@@ -36,6 +37,7 @@ afterEach(async () => {
 describe("workspace recovery choices", () => {
   it("repairs only the inspected tab's source after explicit filesystem verification without starting a conversation", async () => {
     const preview = { fingerprint: "a".repeat(64), directories: [{ path: "/home/me/.codex", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ef53" }] };
+    vi.mocked(tabOwnershipAvailability).mockResolvedValueOnce({ status: "available", reason: "A saved directory device changed." }).mockResolvedValue({ status: "not_needed" });
     vi.mocked(previewTabOwnership).mockResolvedValue(preview);
     vi.mocked(reconcileTabOwnership).mockResolvedValue({ ...tab, pluginId: "codex-terminal" });
     await show({ state: "missing", message: "Codex source device changed.", canResume: false }, "codex-terminal");
@@ -69,7 +71,7 @@ describe("workspace recovery choices", () => {
   it("offers the recorded exact conversation and explicit selection", async () => {
     await show({ state: "missing", message: "The previous process ended.", conversationId: "recorded-session", canResume: true }, "codex-terminal");
     expect(container.textContent).toContain("recorded-session");
-    expect(buttons()).toEqual(["Resume conversation", "Inspect directory ownership", "Resume selected conversation"]);
+    expect(buttons()).toEqual(["Resume conversation", "Resume selected conversation"]);
     await click("Resume conversation");
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "resume-conversation" });
   });
@@ -88,7 +90,7 @@ describe("workspace recovery choices", () => {
   it.each(["The exact conversation ID was not recorded.", "The saved conversation transcript is unavailable."])("explains '%s' and requires explicit selection", async message => {
     await show({ state: "missing", message, canResume: false }, "codex-terminal");
     expect(container.textContent).toContain(message);
-    expect(buttons()).toEqual(["Inspect directory ownership", "Resume selected conversation"]);
+    expect(buttons()).toEqual(["Resume selected conversation"]);
     expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
     const input = container.querySelector<HTMLInputElement>("input")!;
     await act(async () => {

@@ -307,6 +307,11 @@ describe("workspace recovery across server updates", () => {
       expect(blocked.statusCode, blocked.body).toBe(500);
       expect(blocked.body).toContain("device changed");
       expect(fixture.spawn).toHaveBeenCalledTimes(2);
+      const availability = await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/ownership`, headers: { host: "localhost" } });
+      expect(availability.statusCode, availability.body).toBe(200);
+      expect(availability.json()).toMatchObject({ status: "available" });
+      expect(await fs.readFile(bindingPath, "utf8")).toBe(JSON.stringify(legacySource));
+      expect(fixture.spawn).toHaveBeenCalledTimes(2);
       const inspection = await app.inject({ method: "POST", url: `/api/tabs/${tab.id}/ownership/preview`, headers: { host: "localhost" }, payload: {} });
       expect(inspection.statusCode, inspection.body).toBe(200);
       const preview = inspection.json<DirectoryOwnershipPreview>();
@@ -316,6 +321,8 @@ describe("workspace recovery across server updates", () => {
         attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })),
       } });
       expect(repaired.statusCode, repaired.body).toBe(200);
+      const settled = await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/ownership`, headers: { host: "localhost" } });
+      expect(settled.json()).toEqual({ status: "not_needed" });
       expect(repaired.json<WorkspaceTab>()).toMatchObject({ id: tab.id, recovery: { state: "missing" } });
       expect(fixture.spawn).toHaveBeenCalledTimes(2);
       expect((await workspaceSnapshot(app)).windows).toEqual(before.windows);
@@ -325,6 +332,9 @@ describe("workspace recovery across server updates", () => {
       }
       expect((await recover()).statusCode).toBe(200);
       expect(services.sessions).toBe(sessions);
+      const activeOwnership = await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/ownership`, headers: { host: "localhost" } });
+      expect(activeOwnership.json()).toMatchObject({ status: "unavailable" });
+
       expect(fixture.spawn).toHaveBeenCalledTimes(3);
       const [, args, options] = fixture.spawn.mock.calls[2]!;
       const launch = JSON.parse(args[1]!) as { tuiArgs: string[] };

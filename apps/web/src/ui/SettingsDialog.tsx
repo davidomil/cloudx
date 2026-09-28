@@ -9,6 +9,7 @@ import { CodexSettingsEditor } from "./CodexSettingsEditor.js";
 import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";
 import { ForgeConnections } from "./ForgeConnections.js";
+import { WorkspaceCleanupPanel } from "./WorkspaceCleanupPanel.js";
 import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
@@ -39,6 +40,7 @@ export function SettingsDialog({
   browserNotificationState,
   onRequestBrowserNotifications,
   cloudxUpdate,
+  onOpenForge,
   callHook,
   initialCategoryId = "general",
   children
@@ -52,6 +54,7 @@ export function SettingsDialog({
   browserNotificationState?: BrowserNotificationPermissionState;
   onRequestBrowserNotifications?: () => Promise<void>;
   cloudxUpdate?: CloudxUpdateController;
+  onOpenForge?: () => void;
   callHook?: UiContributionRenderContext["callHook"];
   initialCategoryId?: string;
   children?: ReactNode;
@@ -178,6 +181,10 @@ export function SettingsDialog({
     });
   }
   categories.push({
+    id: "workspaces", label: "Workspaces", description: "Review and permanently delete obsolete on-disk checkouts.",
+    entries: [{ id: "cleanup", searchText: "Delete all old workspaces cleanup disk space storage retained Forge checkouts trash permanent", content: <WorkspaceCleanupPanel />, mountWhenVisible: true }]
+  });
+  categories.push({
     id: "logs",
     label: "Logs",
     description: "Inspect and download recent CloudX logs for troubleshooting.",
@@ -205,7 +212,7 @@ export function SettingsDialog({
     entries: [{
       id: "cloudx-update",
       searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout release channel cycle main changelog pull requests",
-      content: <CloudxUpdatePanel update={cloudxUpdate} />
+      content: <CloudxUpdatePanel update={cloudxUpdate} onOpenForge={onOpenForge} />
     }]
   });
 

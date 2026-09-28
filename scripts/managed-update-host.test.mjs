@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ManagedUpdate, UpdateHost } from './managed-update.mjs';
 import { writeUpdateJson, snapshotTree } from './managed-update-store.mjs';
@@ -62,6 +62,32 @@ function fixture() {
 }
 
 describe('managed update host with real Git and recovery files', () => {
+  it('checks Forge before building and again after preparation, then resumes into the target runtime', async () => {
+    const f = fixture();
+    const workerFile = `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`;
+    const unresolved = [{ id: 'worker-149', kind: 'issue', number: 129, status: 'completed', mergeAttempted: true }];
+    write(f.dataDir, workerFile, JSON.stringify(unresolved));
+    const execute = record => new ManagedUpdate({ record, save: f.save, host: f.host }).run();
+    expect(await execute(f.record)).toMatchObject({ state: 'failed', phase: 'prepare', component: 'forge', forgeBlocker: { workerId: 'worker-149' } });
+    expect(f.build).not.toHaveBeenCalled();
+    write(f.dataDir, workerFile, '[]');
+    const build = f.build.getMockImplementation();
+    f.build.mockImplementationOnce(options => { build(options); write(f.dataDir, workerFile, JSON.stringify(unresolved)); });
+    expect(await execute(f.record)).toMatchObject({ state: 'failed', phase: 'quiesce', component: 'forge' });
+    expect(f.calls.filter(([command, args]) => command === 'systemctl' && args[1] !== 'show')).toEqual([]);
+    expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.old);
+    write(f.dataDir, workerFile, '[]');
+    vi.spyOn(f.host, 'start').mockImplementation(() => {});
+    vi.spyOn(f.host, 'verify').mockImplementation(async () => {
+      expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.target);
+      const loaded = await import(path.join(f.root, 'apps/server/dist/index.js'));
+      expect(loaded.version).toBe('new');
+    });
+    const resumed = JSON.parse(fs.readFileSync(f.recordPath));
+    expect(await execute(resumed)).toMatchObject({ state: 'succeeded', phase: 'complete' });
+    expect(resumed.run.forgeBlocker).toBeUndefined();
+    expect(f.build).toHaveBeenCalledOnce();
+  });
   it.each(['clean checkout', 'unrelated local work'])('keeps Git status unchanged after artifact activation: %s', checkout => {
     const f = fixture();
     const artifacts = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/dist', 'apps/server/dist', 'apps/web/dist',

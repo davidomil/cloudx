@@ -43,7 +43,7 @@ afterEach(async () => {
 
 function reply(status: CloudxUpdateStatus | CloudxUpdatePreview, code = 200) { return new Response(JSON.stringify(status), { status: code }); }
 
-async function mount(saveWorkspace: () => Promise<void> = async () => undefined, previewFetch = async (_init?: RequestInit) => reply(mainPreview), initiallyOpen = true) {
+async function mount(saveWorkspace: () => Promise<void> = async () => undefined, previewFetch = async (_init?: RequestInit) => reply(mainPreview), initiallyOpen = true, onOpenForge?: () => void) {
   const statusFetch = globalThis.fetch;
   vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/preview") ? previewFetch(init) : statusFetch(url, init));
   const container = document.createElement("div");
@@ -54,7 +54,7 @@ async function mount(saveWorkspace: () => Promise<void> = async () => undefined,
     const update = useCloudxUpdate(open, saveWorkspace, reload);
     return createElement("div", {},
       createElement("button", { onClick: () => setOpen(value => !value) }, "Toggle settings"),
-      open ? createElement(CloudxUpdatePanel, { update }) : null
+      open ? createElement(CloudxUpdatePanel, { update, onOpenForge }) : null
     );
   }
   await act(async () => root!.render(createElement(Harness)));
@@ -78,6 +78,32 @@ async function selectChannel(channel: CloudxUpdateChannel) {
 }
 
 describe("CloudX updates", () => {
+  it("shows the affected Forge issue and keeps the explicit retry available", async () => {
+    const forgeBlocker = { kind: "forge" as const, workerId: "worker-149", issueNumber: 129, changeNumber: 131,
+      message: "Forge worker worker-149 has an uncertain merge.", recoveryAction: "Recover the worker through Forge." };
+    const fetch = vi.fn(async (_url: string, init?: RequestInit) => reply(init?.method === "POST" ? run() : { ...available, forgeBlocker }));
+    vi.stubGlobal("fetch", fetch);
+    const onOpenForge = vi.fn();
+    const container = await mount(undefined, undefined, true, onOpenForge);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Forge needs attention: issue #129");
+    expect(container.textContent).toContain(forgeBlocker.message);
+    expect(container.textContent).toContain("Resume with message");
+    await click("Open Forge recovery");
+    expect(onOpenForge).toHaveBeenCalledOnce();
+    expect(button("Update CloudX and dependencies").disabled).toBe(false);
+    await click("Update CloudX and dependencies");
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+  });
+  it("keeps a preflight Forge rejection out of update recovery polling", async () => {
+    const blocked = { ...available, forgeBlocker: { kind: "forge" as const, workerId: "worker-149",
+      message: "The worker is still running.", recoveryAction: "Pause it through Forge." } };
+    vi.stubGlobal("fetch", vi.fn(async () => reply(blocked)));
+    const container = await mount();
+    await click("Update CloudX and dependencies");
+    expect(container.textContent).toContain(blocked.forgeBlocker.message);
+    expect(sessionStorage.length).toBe(0);
+    expect(button("Update CloudX and dependencies").disabled).toBe(false);
+  });
   it("checks remote updates only while Settings is open and never during run polling", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => reply(run())));
     const previewFetch = vi.fn(async () => reply(mainPreview));

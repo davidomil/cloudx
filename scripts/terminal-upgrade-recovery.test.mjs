@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,6 +13,7 @@ import { CodexConversationRecovery } from "../apps/server/src/plugins/CodexConve
 import { CodexConversationSelection } from "../apps/server/helpers/codex-conversation-selection.mjs";
 import { assertTerminalMigrationSafe, inspectTerminalRecovery, snapshotTerminalRecovery } from "./terminal-upgrade-recovery.mjs";
 import { inspectRuntimeUpdate } from "./install-runtime.mjs";
+import { ForgeExecutionRecovery } from "../apps/server/src/forge/ForgeExecution.ts";
 
 const roots = [];
 const conversationId = "12345678-1234-1234-1234-123456789abc";
@@ -71,6 +72,23 @@ async function currentCodexFixture() {
     KillMode: "control-group", SendSIGKILL: "yes",
   }).map(([key, value]) => `${key}=${value}`).join("\n") };
   return { ...f, bindingFile, plan: () => inspectRuntimeUpdate({ paths: { dataDir: f.dataDir, repoRoot: f.dataDir }, commands, target: { kind: "standard" } }) };
+}
+
+async function completedForgeFixture(status) {
+  const f = fixture();
+  const execution = await new ForgeExecutionRecovery(f.dataDir).prepare();
+  const attemptId = randomUUID();
+  const turn = { workerId: "worker-1", attemptId, threadId: randomUUID(), turnId: randomUUID(), status: "completed" };
+  const turnFile = `forge-workers/turns/worker-1/${attemptId}.json`;
+  const worker = { id: "worker-1", kind: status === "completed" ? "review" : "issue", number: 128, status,
+    worktreePath: "/preserved/checkout", tabId: "worker-tab", completion: { attemptId, turn } };
+  f.write(forgeState, [worker]);
+  f.write(turnFile, turn);
+  f.write("forge-workers/tabs/worker-tab.json", { tabId: worker.tabId, workerId: worker.id, attemptId, closed: false, quiescent: true, execution });
+  const receipt = { executionId: execution.executionId, bootId: execution.bootId, pidNamespace: execution.pidNamespace, pid: process.pid, started: "123" };
+  f.write(path.relative(f.dataDir, path.join(execution.directory, "ready.json")), receipt);
+  f.write(path.relative(f.dataDir, path.join(execution.directory, "complete.json")), { ...receipt, exitCode: 0 });
+  return { ...f, execution, worker, turnFile };
 }
 
 async function launchViewFixture(selected = false) {
@@ -374,6 +392,19 @@ describe("controlled terminal replacement snapshots", () => {
     expect(f.read(forgeState)[0].status).toBe("paused");
   });
 
+  it("blocks a retained completed workspace with missing ownership", () => {
+    const f = fixture();
+    f.write(forgeState, [{ id: "worker-1", kind: "issue", number: 129, status: "completed", retainedWorkspace: { worktreePath: "/preserved/checkout", retainedPaths: ["notes.txt"] } }]);
+    fs.unlinkSync(path.join(f.dataDir, "forge-workers/workspaces/worker-1.json"));
+    expect(() => assertTerminalMigrationSafe(f)).toThrow("missing workspace ownership");
+  });
+  it.each(["workers", "ownership"])("blocks contradictory duplicate %s", kind => {
+    const f = fixture();
+    if (kind === "workers") f.write(forgeState, [...f.read(forgeState), ...f.read(forgeState)]);
+    else f.write("forge-workers/workspaces/nested/worker-1.json", { ...f.owned, cleaned: true });
+    expect(() => assertTerminalMigrationSafe(f)).toThrow(/Invalid Forge/);
+  });
+
   it.each([{}, { closed: false, quiescent: false }])("rejects incomplete or live worker tab ownership %#", fields => {
     const f = fixture();
     f.write("forge-workers/tabs/worker-tab.json", { tabId: "worker-tab", workerId: "worker-1", ...fields });
@@ -386,6 +417,37 @@ describe("controlled terminal replacement snapshots", () => {
     f.write("forge-workers/executions/execution-1/complete.json", { exitCode: 0 });
     const backup = snapshotTerminalRecovery(f);
     expect(fs.readFileSync(path.join(backup, "forge-workers/executions/execution-1/complete.json"), "utf8")).toBe('{"exitCode":0}\n');
+  });
+
+  it.each(["paused", "completed"])("accepts a retained %s terminal only with exact completed attempt and execution receipts", async status => {
+    const f = await completedForgeFixture(status);
+    await expect(new ForgeExecutionRecovery(f.dataDir).assertEnded(f.execution)).resolves.toBeUndefined();
+    expect(() => assertTerminalMigrationSafe(f)).not.toThrow();
+    const backup = snapshotTerminalRecovery(f);
+    expect(fs.readFileSync(path.join(backup, f.turnFile), "utf8")).toBe(fs.readFileSync(path.join(f.dataDir, f.turnFile), "utf8"));
+    expect(f.read(forgeState)).toEqual([f.worker]);
+  });
+
+  it.each(["missing completion", "wrong attempt", "wrong thread", "wrong turn", "running turn", "missing turn", "missing ready", "missing complete", "wrong execution", "wrong supervisor", "replacement directory"])("blocks a completed terminal with %s", async fault => {
+    const f = await completedForgeFixture("paused");
+    if (fault === "missing completion") delete f.worker.completion;
+    if (fault === "wrong attempt") f.worker.completion.attemptId = randomUUID();
+    if (fault === "wrong thread") f.worker.completion.turn.threadId = randomUUID();
+    if (fault === "wrong turn") f.worker.completion.turn.turnId = randomUUID();
+    if (fault === "running turn") f.worker.completion.turn.status = "running";
+    f.write(forgeState, [f.worker]);
+    if (fault === "missing turn") fs.unlinkSync(path.join(f.dataDir, f.turnFile));
+    if (fault === "missing ready") fs.unlinkSync(path.join(f.execution.directory, "ready.json"));
+    if (fault === "missing complete") fs.unlinkSync(path.join(f.execution.directory, "complete.json"));
+    if (fault === "wrong execution" || fault === "wrong supervisor") {
+      const file = path.relative(f.dataDir, path.join(f.execution.directory, "complete.json"));
+      f.write(file, { ...f.read(file), ...(fault === "wrong execution" ? { executionId: randomUUID() } : { started: "999" }) });
+    }
+    if (fault === "replacement directory") {
+      fs.renameSync(f.execution.directory, `${f.execution.directory}-original`);
+      fs.cpSync(`${f.execution.directory}-original`, f.execution.directory, { recursive: true });
+    }
+    expect(() => assertTerminalMigrationSafe(f)).toThrow("missing or conflicting terminal ownership");
   });
 
   it.each(["missing", "different worker", "different attempt"])("refuses a referenced worker tab with %s ownership", kind => {

@@ -41,7 +41,7 @@ function deferred<T>() {
 }
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-async function fixture() {
+async function fixture(updateBlocked = false) {
   let current = repository;
   let saving = false;
   let submitted: CloudxConfigResponse["values"] | undefined;
@@ -55,6 +55,10 @@ async function fixture() {
   const issue = () => ({ number: 7, title: `Issue in ${current.projectPath}`, body: "Inspect this issue before starting.", state: "open", author: "author", labels: [], comments: [], updatedAt: "2026-09-08", url: "https://example.test/issue/7" });
   const dashboardBody = () => ({ result: { configured: true, repository: current, workers: [] } });
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+    if (updateBlocked && url === "/api/system/update") return reply({ available: true, forgeBlocker: {
+      kind: "forge", workerId: "worker-149", issueNumber: 149,
+      message: "Forge has an uncertain merge.", recoveryAction: "Recover the worker through Forge.",
+    } });
     if (url === "/api/config" && init?.method === "PATCH") { saving = true; submitted = JSON.parse(String(init.body)); return save.promise; }
     if (url === "/api/hooks/forge.dashboard") return saving ? dashboard.promise : reply(dashboardBody());
     if (url === "/api/hooks/forge.issues.list") return reply({ result: { items: [issue()] } });
@@ -107,6 +111,17 @@ async function changeSetting(container: Element, label: string, value: string) {
 }
 
 describe("Forge repository settings in App", () => {
+  it("opens the existing Forge tab from an update blocker without creating another tab", async () => {
+    const f = await fixture(true);
+    await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="General"]')!.click());
+    await vi.waitFor(() => expect(f.container.textContent).toContain("Open Forge recovery"));
+    await click(f.container, "Open Forge recovery");
+    expect(f.container.querySelector(".settings-dialog")).toBeNull();
+    expect(f.container.querySelector(".forge-panel")).not.toBeNull();
+    expect(vi.mocked(fetch).mock.calls.some(([url, init]) => url === "/api/tabs" && init?.method === "POST")).toBe(false);
+  });
+
   it.each([
     { label: "Repository path", value: "cloudx/second", success: true },
     { label: "API URL", value: "https://github.enterprise.test/api/v3", success: true },

@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
 import type { RecoverTabRequest, TabRecovery, WorkspaceTab } from "@cloudx/shared";
 
-import { previewTabOwnership, reconcileTabOwnership } from "../api.js";
+import { tabOwnershipAvailability, previewTabOwnership, reconcileTabOwnership } from "../api.js";
 import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
 import { ControlButton } from "./Control.js";
 import { noSystemTextAssistProps } from "./inputAssist.js";
@@ -52,6 +52,7 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
         <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "resume-conversation" }))}>Resume conversation</ControlButton>
       </> : null}
       <DirectoryOwnershipRecovery key={tab.id} disabled={busy}
+        availability={() => tabOwnershipAvailability(tab.id)}
         preview={() => previewTabOwnership(tab.id)}
         reconcile={async input => { await reconcileTabOwnership(tab.id, input); }} />
       <form onSubmit={event => {

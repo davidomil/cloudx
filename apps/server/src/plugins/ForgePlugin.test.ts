@@ -23,6 +23,7 @@ async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "forge-plugin-"));
   roots.push(root);
   const workflow = {
+    ownershipAvailability: vi.fn(async () => ({ status: "not_needed" as const })),
     previewOwnership: vi.fn(async () => ({ fingerprint: "a".repeat(64), directories: [] })),
     reconcileOwnership: vi.fn(async () => ({ id: "worker" })),
     startIssue: vi.fn(async () => ({ id: "worker" })),
@@ -93,6 +94,9 @@ describe("Forge plugin boundary", () => {
 
   it("requires a complete ownership preview and explicit attestation at the hook boundary", async () => {
     const { hooks, workflow } = await fixture();
+    await expect(hooks.call("forge.worker.ownershipAvailability", { id: "worker" }, { caller: { kind: "ui" } })).resolves.toEqual({ availability: { status: "not_needed" } });
+    expect(workflow.previewOwnership).not.toHaveBeenCalled();
+    expect(workflow.reconcileOwnership).not.toHaveBeenCalled();
     const input = { id: "worker", fingerprint: "a".repeat(64), attestations: [{ device: "64521", filesystemId: "original-ext4", filesystemType: "ext4" }] };
     await expect(hooks.call("forge.worker.previewOwnership", { id: "worker" }, { caller: { kind: "ui" } })).resolves.toMatchObject({ preview: { fingerprint: input.fingerprint } });
     await hooks.call("forge.worker.reconcileOwnership", input, { caller: { kind: "ui" } });

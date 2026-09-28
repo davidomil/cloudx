@@ -41,6 +41,8 @@ import { ForgeSettingsService } from "./ForgeSettingsService.js";
 import { ForgeWorkflowService, type ForgeSettings, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
+// @ts-expect-error The standalone update coordinator intentionally has no built-package dependency.
+import { assertTerminalMigrationSafe } from "../../../../scripts/terminal-upgrade-recovery.mjs";
 
 const execute = promisify(execFile);
 const wallClockNow = Date.now.bind(Date);
@@ -199,6 +201,9 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.poll();
     const completed = await fixture.worker(started.id);
     expect(completed.status, completed.error).toBe(kind === "issue" ? "awaiting_review" : "completed");
+    expect(completed.attemptId).toBeUndefined();
+    expect(completed.tabId).toBe(started.tabId);
+    expect(() => assertTerminalMigrationSafe({ dataDir: fixture.dataDir })).not.toThrow();
     expect(await processIsRunning(receipt.pid)).toBe(false);
     expect(fixture.sessions.getTab(started.tabId!).status).toBe("completed");
     expect(fixture.sessions.getSession(started.tabId!).snapshot().recentOutput).toContain("FORGE_FIXTURE_FINAL_RESPONSE");
@@ -209,6 +214,11 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect((await fixture.worker(started.id)).status).toBe(kind === "issue" ? "awaiting_review" : "completed");
     expect(fixture.gitPushes).toHaveLength(kind === "issue" ? 1 : 0);
     expect(fixture.provider.submissions).toHaveLength(kind === "review" ? 1 : 0);
+    if (kind === "issue") {
+      await fixture.workflow.pause(started.id);
+      expect(await fixture.worker(started.id)).toMatchObject({ status: "paused", tabId: started.tabId });
+      expect(() => assertTerminalMigrationSafe({ dataDir: fixture.dataDir })).not.toThrow();
+    }
   }, 20_000);
 
   it("reaps an owned detached child before publishing a successfully completed turn", async () => {
@@ -313,6 +323,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(retained).toMatchObject({ status: "completed", headSha: implementation.headSha, retainedWorkspace: { worktreePath: checkout, retainedPaths: expect.arrayContaining(["README.md", "debug_tooling/diagnostics.bin", "ignored-diagnostics.bin"]) } });
     expect(retained.worktreePath).toBeUndefined();
     expect(retained.error).toBeUndefined();
+    expect(retained.mergeAttempted).toBeUndefined();
+    expect(() => assertTerminalMigrationSafe({ dataDir: fixture.dataDir })).not.toThrow();
     await expectMissing(reviewer.worktreePath!, implementation.reportPath, implementation.contextPath);
     expect(fixture.sessions.listTabs()).toEqual([]);
 
@@ -862,7 +874,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(fixture.provider.issue.state).toBe("closed");
     expect(fixture.factory.processes).toHaveLength(4);
     expect(fixture.gitPushes).toHaveLength(2);
-    expect(fixture.gitAccessRoles).toEqual(["worker", "worker", "reviewer", "worker", "reviewer"]);
+    expect(fixture.gitAccessRoles).toEqual(["worker", "worker", "reviewer", "worker", "reviewer", "worker"]);
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(secondImplementation.headSha);
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.sessions.listTabs()).toEqual([]);
@@ -1272,7 +1284,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       { event: "approve", headSha: implementation.headSha },
       { event: "approve", headSha: updatedHead },
     ]);
-    expect(merge).toHaveBeenCalledExactlyOnceWith(7, updatedHead);
+    expect(merge).toHaveBeenCalledExactlyOnceWith(7, updatedHead, targetHead);
     expect(fixture.provider.merges).toEqual([updatedHead]);
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(updatedHead);
     expect(fixture.provider.issue.state).toBe("closed");

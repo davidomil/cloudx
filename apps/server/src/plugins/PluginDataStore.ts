@@ -35,6 +35,11 @@ export class PluginDataStore {
     await writeTextFileAtomic(this.dataRoot, filePath, stringifyJsonDocument(value, "Plugin data file"), "Plugin data file");
   }
 
+  async writerLockPath(pluginId: string): Promise<string> {
+    await requireSafeDirectory(this.dataRoot, this.dataPath, { create: true, label: "Plugin data directory" });
+    return `${this.filePath(pluginId)}.writer-lock`;
+  }
+
   private filePath(pluginId: string): string {
     return path.join(this.dataPath, `${pluginDataFileStem(pluginId)}.json`);
   }
