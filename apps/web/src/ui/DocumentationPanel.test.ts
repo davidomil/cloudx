@@ -623,7 +623,8 @@ describe("DocumentationPanel", () => {
     await click(buttonByText(container, "View"));
 
     expect(calls).toContainEqual({ hookId: "documentation.documents.get", input: sourceWindowInput("doc-large-video") });
-    expect(container.textContent).toContain("2 of 3 chunks");
+    expect(container.textContent).toContain("2 of 3 chunks in viewer");
+    expect(container.textContent).toContain("Answers use selected evidence. This viewer shows the archived source.");
     expect(container.textContent).toContain("10 of 10,000 extracted artifacts");
     expect(container.textContent).toContain("Chunk preview truncated");
     expect(container.querySelectorAll(".documentation-artifact-image img")).toHaveLength(1);
@@ -652,7 +653,7 @@ describe("DocumentationPanel", () => {
       }
     });
     expect(container.textContent).toContain("Later transcript chunk loaded on demand.");
-    expect(container.textContent).toContain("3 of 3 chunks");
+    expect(container.textContent).toContain("3 of 3 chunks in viewer");
     expect(container.textContent).toContain("77 of 10,000 extracted artifacts");
 
     await unmount(root);

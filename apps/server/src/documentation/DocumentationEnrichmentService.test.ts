@@ -358,9 +358,9 @@ describe("DocumentationEnrichmentService", () => {
     expect(client.search).toHaveBeenCalledWith({ query: "How do I bake brownies?", limit: 5, mode: "hybrid" });
     expect(client.getDocument).toHaveBeenCalledWith({
       documentId: "doc-1",
-      chunkIds: [11],
-      chunkContext: 1,
-      chunkTextMaxChars: 4000,
+      chunkOffset: 0,
+      chunkLimit: 25,
+      chunkTextMaxChars: 40000,
       artifactLimit: 0,
       includeEnrichments: false,
       includeEvents: false

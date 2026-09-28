@@ -1097,7 +1097,8 @@ export function DocumentationPanel({ callHook, uploadFile = uploadDocumentationF
           <div className="documentation-source-header">
             <div>
               <h3>Source Viewer</h3>
-              <p>{selectedDocument.title ?? documentId(selectedDocument)} · {selectedDocument.source_type ?? selectedDocument.sourceType} · {sourceWindowLabel(selectedDocument.chunks?.length ?? 0, selectedDocument.chunkWindow, "chunks")}</p>
+              <p>{selectedDocument.title ?? documentId(selectedDocument)} · {selectedDocument.source_type ?? selectedDocument.sourceType} · {sourceWindowLabel(selectedDocument.chunks?.length ?? 0, selectedDocument.chunkWindow, "chunks")} in viewer</p>
+              <p>Answers use selected evidence. This viewer shows the archived source.</p>
               {selectedDocument.uri ? <p>{selectedDocument.uri}</p> : null}
               {selectedDocument.artifacts?.length || selectedDocument.artifactWindow?.total ? <p>{sourceWindowLabel(selectedDocument.artifacts?.length ?? 0, selectedDocument.artifactWindow, "extracted artifacts")} available.</p> : null}
             </div>

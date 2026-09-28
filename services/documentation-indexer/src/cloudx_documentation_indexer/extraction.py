@@ -1125,9 +1125,22 @@ def frame_count(image: Image.Image) -> int:
 
 def extract_html(content: bytes, content_type: str | None = None) -> str:
     soup = BeautifulSoup(decode_html_text(content, content_type), "html.parser")
-    for element in soup(["script", "style", "template", "noscript"]):
+    for element in soup.select(
+        'script, style, template, noscript, nav, search, [hidden], '
+        '[role~="navigation"], [role~="search"], [role~="banner"], [role~="contentinfo"]'
+    ):
         element.extract()
-    return "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
+    for selector in ('main, [role~="main"]', 'article'):
+        regions = [region for region in soup.select(selector) if region.get_text(strip=True)]
+        if regions:
+            break
+    else:
+        regions = [soup.body or soup]
+    region_ids = {id(region) for region in regions}
+    regions = [region for region in regions if not any(id(parent) in region_ids for parent in region.parents)]
+    return "\n".join(
+        line.strip() for region in regions for line in region.get_text("\n").splitlines() if line.strip()
+    )
 
 
 def decode_text(content: bytes) -> str:
