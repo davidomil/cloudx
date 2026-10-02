@@ -1,5 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
 import { RefreshCw, Save, Settings2 } from "lucide-react";
+import { DEFAULT_CODEX_MODEL } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { CodexUpdateControl } from "./CodexUpdateControl.js";
@@ -25,8 +26,8 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
         <legend>Model and behavior</legend>
         <label>
           Default model
-          <input aria-label="Default model" value={model} maxLength={128} disabled={busy !== null} aria-invalid={!validModel} autoComplete="off" autoCapitalize="none" spellCheck={false} onChange={event => { editor.setModel(event.target.value); }} />
-          <small>Leave blank to remove the global model override.</small>
+          <input aria-label="Default model" value={model} placeholder={DEFAULT_CODEX_MODEL} maxLength={128} disabled={busy !== null} aria-invalid={!validModel} autoComplete="off" autoCapitalize="none" spellCheck={false} onChange={event => { editor.setModel(event.target.value); }} />
+          <small>Leave blank to use the CloudX default: GPT-6.1 Sol ({DEFAULT_CODEX_MODEL}), unless a profile, project, or session selects another model.</small>
         </label>
         {!validModel ? <p className="codex-settings-notice" role="alert">Enter a model identifier of at most 128 letters, numbers, dots, underscores, colons, slashes, or hyphens, starting with a letter or number.</p> : null}
         <label>

@@ -75,7 +75,7 @@ describe("workspace recovery across server updates", () => {
       expect(failed.tabs.find(tab => tab.id === viewer.tab.id)).toMatchObject({ status: "running" });
       expect(fixture.spawn).toHaveBeenCalledTimes(2);
 
-      for (const payload of [{ action: "restart" }, { action: "new-shell", sessionId: "other" }, { action: "resume-conversation", sessionId: "../other" }, { action: "new-shell", extra: true }]) {
+      for (const payload of [{ action: "restart" }, { action: "new-shell", sessionId: "other" }, { action: "resume-conversation", sessionId: "../other" }, { action: "select-conversation", sessionId: "other" }, { action: "new-shell", extra: true }]) {
         const response = await restored.app.inject({
           method: "POST", url: `/api/tabs/${first.tab.id}/recover`, headers: { host: "localhost" }, payload
         });
@@ -223,7 +223,7 @@ describe("workspace recovery across server updates", () => {
     }
   }, 15_000);
 
-  it.skipIf(process.platform !== "linux").each([false, true])("retains an original Codex panel during multi-terminal broker shutdown beyond its grace period (web restored: %s)", async (restoreWeb) => {
+  it.skipIf(process.platform !== "linux").each([false, true].flatMap(restoreWeb => ["resume-conversation", "select-conversation"].map(action => ({ restoreWeb, action }))))("retains a Codex panel for $action after broker shutdown (web restored: $restoreWeb)", async ({ restoreWeb, action }) => {
     const fixture = await recoveryFixture();
     let releaseShutdown = () => {};
     let stopping: Promise<void> | undefined;
@@ -295,7 +295,7 @@ describe("workspace recovery across server updates", () => {
       await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: fixture.root } }) + "\n");
       const recover = () => app.inject({
         method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" },
-        payload: { action: "resume-conversation", sessionId: conversationId }
+        payload: action === "select-conversation" ? { action } : { action, sessionId: conversationId }
       });
       const bindingPath = path.join(fixture.config.dataDir, "codex-launches", tab.id, ".cloudx-source.json");
       const legacySource = JSON.parse(await fs.readFile(bindingPath, "utf8"));
@@ -338,7 +338,11 @@ describe("workspace recovery across server updates", () => {
       expect(fixture.spawn).toHaveBeenCalledTimes(3);
       const [, args, options] = fixture.spawn.mock.calls[2]!;
       const launch = JSON.parse(args[1]!) as { tuiArgs: string[] };
-      expect(launch.tuiArgs).toContain(conversationId);
+      if (action === "select-conversation") {
+        expect(launch.tuiArgs).toEqual(expect.arrayContaining(["resume", "--all"]));
+        expect(launch.tuiArgs).not.toContain(conversationId);
+        expect(launch).toMatchObject({ startupPicker: true });
+      } else expect(launch.tuiArgs).toContain(conversationId);
       expect(launch.tuiArgs).toContain("gpt-6-astra");
       expect(launch.tuiArgs).toContain('model_reasoning_effort="max"');
       expect(launch.tuiArgs).not.toContain("Do not repeat this work");
@@ -355,7 +359,7 @@ describe("workspace recovery across server updates", () => {
       expect(after.tabs.map(current => current.id)).toEqual(before.tabs.map(current => current.id));
       expect(after.tabs.find(current => current.pluginId === "local-web")).toEqual(before.tabs.find(current => current.pluginId === "local-web"));
       expect((await savedSessions.read())!.sessions.find(saved => saved.tab.id === tab.id)!.initialInput).toMatchObject({
-        codexRuntimeContext: originalInput!.codexRuntimeContext, resume: { mode: "session", sessionId: conversationId }, codexRecovered: true
+        codexRuntimeContext: originalInput!.codexRuntimeContext, resume: action === "select-conversation" ? { mode: "picker", all: true } : { mode: "session", sessionId: conversationId }, codexRecovered: true
       });
     } finally {
       releaseShutdown();
@@ -801,6 +805,7 @@ async function recoveryFixture() {
       const services = buildServices(config);
       const app = await buildServer(config, services);
       servers.push(app);
+      await services.pluginContributionsReady;
       return { app, services };
     },
     async close() {

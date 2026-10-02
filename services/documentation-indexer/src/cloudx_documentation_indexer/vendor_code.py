@@ -51,26 +51,26 @@ LANGUAGE_BY_SUFFIX = {
     ".tsx": "TypeScript JSX",
 }
 
+C_FAMILY_SUFFIXES = {".c", ".h", ".cpp", ".hpp"}
+C_FUNCTION_NAME_RE = re.compile(r"[A-Za-z_~][\w:~]*")
+C_DECLARATION_PREFIX_RE = re.compile(r"[A-Za-z_][\w\s:*&<>,]*")
+
 SYMBOL_PATTERNS = {
     ".c": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:typedef\s+)?(?:struct|enum)\s+([A-Za-z_]\w*)?")),
-        ("function", re.compile(r"^\s*(?:static\s+|inline\s+|extern\s+|const\s+|volatile\s+|unsigned\s+|signed\s+|long\s+|short\s+)*(?:[A-Za-z_]\w*[\w\s*]*\s+)+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".cpp": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_]\w*)")),
-        ("function", re.compile(r"^\s*(?:template\s*<[^>]+>\s*)?(?:static\s+|inline\s+|extern\s+|constexpr\s+|const\s+|volatile\s+)*(?:[A-Za-z_:~]\w*[\w\s:*&<>]*\s+)+([A-Za-z_:~]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".h": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:typedef\s+)?(?:struct|enum)\s+([A-Za-z_]\w*)?")),
-        ("function", re.compile(r"^\s*(?:static\s+|inline\s+|extern\s+|const\s+|volatile\s+|unsigned\s+|signed\s+|long\s+|short\s+)*(?:[A-Za-z_]\w*[\w\s*]*\s+)+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".hpp": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_]\w*)")),
-        ("function", re.compile(r"^\s*(?:template\s*<[^>]+>\s*)?(?:static\s+|inline\s+|extern\s+|constexpr\s+|const\s+|volatile\s+)*(?:[A-Za-z_:~]\w*[\w\s:*&<>]*\s+)+([A-Za-z_:~]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".js": [
         ("function", re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)")),
@@ -297,7 +297,40 @@ def extract_line_symbols(suffix: str, text: str) -> list[CodeSymbol]:
             if name and name not in SKIP_CALLS:
                 symbols.append(CodeSymbol(kind, name, line_number))
                 break
+        else:
+            if suffix in C_FAMILY_SUFFIXES:
+                name = extract_c_function_name(line)
+                if name:
+                    symbols.append(CodeSymbol("function", name, line_number))
     return symbols[:80]
+
+
+def extract_c_function_name(line: str) -> str | None:
+    declaration, opening, parameters = line.partition("(")
+    if not opening:
+        return None
+    declaration = declaration.rstrip()
+    name_start = len(declaration)
+    while name_start and (declaration[name_start - 1].isalnum() or declaration[name_start - 1] in "_:~"):
+        name_start -= 1
+    name = declaration[name_start:]
+    prefix = declaration[:name_start].strip()
+    if not C_FUNCTION_NAME_RE.fullmatch(name) or not C_DECLARATION_PREFIX_RE.fullmatch(prefix):
+        return None
+    if name in SKIP_CALLS or prefix.split(maxsplit=1)[0] in SKIP_CALLS:
+        return None
+
+    depth = 1
+    for offset, char in enumerate(parameters):
+        if char in ";{}":
+            return None
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return name if parameters[offset + 1:].lstrip().startswith(("{", ";")) else None
+    return None
 
 
 def extract_imports(suffix: str, lines: list[str]) -> list[str]:

@@ -66,6 +66,12 @@ vi.mock("@xterm/xterm", () => ({
       this.rows = rows;
     }
 
+    clearSelection(): void {}
+
+    onSelectionChange(): { dispose: () => void } {
+      return { dispose: () => undefined };
+    }
+
     onData(handler: (data: string) => void): { dispose: () => void } {
       this.inputHandlers.push(handler);
       return { dispose: () => undefined };

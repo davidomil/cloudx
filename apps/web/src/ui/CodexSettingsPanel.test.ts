@@ -70,6 +70,22 @@ function deferred<T>() {
 }
 
 describe("global Codex settings editor", () => {
+  it("shows the application default and saves/reloads an explicit GPT-6.1 Sol choice", async () => {
+    let saved = { ...initial, model: null } as CodexGlobalSettings;
+    const { container, calls } = await mount(saved, (hook, input) => {
+      if (hook === "codex-settings.update") saved = { ...saved, revision: "saved", model: input.model as string };
+      return saved;
+    });
+    expect(model(container).value).toBe("");
+    expect(model(container).placeholder).toBe("gpt-6.1-sol");
+    expect(container.textContent).toContain("CloudX default: GPT-6.1 Sol (gpt-6.1-sol)");
+    await fill(model(container), "gpt-6.1-sol");
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", model: "gpt-6.1-sol" });
+    await click(container, "Reload");
+    expect(model(container).value).toBe("gpt-6.1-sol");
+  });
+
   it("loads the shared settings and explains their scope", async () => {
     const { container, calls } = await mount();
     expect(calls).toEqual([{ hook: "codex-settings.read", input: {} }]);

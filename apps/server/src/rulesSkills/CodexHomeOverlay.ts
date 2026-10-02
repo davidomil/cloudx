@@ -15,9 +15,10 @@ import {
   rulesSkillsRootPath,
   type ResolvedPersonalityTemplate
 } from "./RulesSkillsCatalogService.js";
-import type { CloudxRule, CloudxSkill } from "@cloudx/shared";
+import { DEFAULT_CODEX_MODEL, type CloudxRule, type CloudxSkill } from "@cloudx/shared";
 import type { CodexStateSources, ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 import { discoverCodexDefaultSkills, readCodexLaunchPreferences } from "../plugins/CodexLaunchPreferences.js";
+import { materializeCodexSkillSurface } from "./CodexSkillSurface.js";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -229,24 +230,22 @@ async function materializeSelectedSkills(
     ...systemSkills.map((skill) => ({
       sourceDir: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)),
       targetDir: path.join(codexHome, "skills", "cloudx-system", safePathSegment(skill.id))
+    })),
+    ...defaultSkillIds.map((id) => ({
+      sourceDir: path.join(sourceCodexHome, "skills", ".system", id),
+      targetDir: path.join(codexHome, "skills", "cloudx-exceptions", id)
     }))
   ];
   const uniqueSources = dedupeSkillSources(sources);
+  // Native discovery permits 2,000 directories and 20,000 entries per root.
+  // Each surface has at most three directories and four files; reserve the group roots.
+  if (4 + uniqueSources.length * 3 > 2_000) {
+    throw new Error(`Codex skills root ${path.join(codexHome, "skills")} cannot expose ${uniqueSources.length} skills within native discovery limits. Select at most 665 skills.`);
+  }
   for (const source of uniqueSources) {
-    const sourceSkillPath = path.join(source.sourceDir, "SKILL.md");
-    if (!fs.existsSync(sourceSkillPath)) {
-      throw new Error(`Codex skill does not contain SKILL.md: ${sourceSkillPath}`);
-    }
-    await fsp.mkdir(path.dirname(source.targetDir), { recursive: true });
-    await linkOrCopyIfExists(source.sourceDir, source.targetDir);
+    await materializeCodexSkillSurface(source.sourceDir, source.targetDir);
   }
-  for (const id of defaultSkillIds) {
-    await copyRequiredSkill(path.join(sourceCodexHome, "skills", ".system", id), path.join(codexHome, "skills", "cloudx-exceptions", id), id);
-  }
-  return [
-    ...uniqueSources.map((source) => path.join(source.targetDir, "SKILL.md")),
-    ...defaultSkillIds.map((id) => path.join(codexHome, "skills", "cloudx-exceptions", id, "SKILL.md"))
-  ];
+  return uniqueSources.map((source) => path.join(source.targetDir, "SKILL.md"));
 }
 
 function prepareOverlayConfig(sourceConfig: string | undefined, sourceHome: string): TomlTable {
@@ -291,7 +290,7 @@ async function writeOverlayConfig(
   disabledSkillPaths: string[]
 ): Promise<void> {
   if (config.model === undefined) {
-    config.model = "gpt-6-astra";
+    config.model = DEFAULT_CODEX_MODEL;
   }
   const features = tomlTable(config.features, "features");
   features.apps = false;
@@ -398,15 +397,6 @@ async function discoverSkillFiles(root: string): Promise<string[]> {
     }
   }
   return skillPaths;
-}
-
-async function copyRequiredSkill(sourceDir: string, targetDir: string, skillName: string): Promise<void> {
-  const sourceSkillPath = path.join(sourceDir, "SKILL.md");
-  if (!fs.existsSync(sourceSkillPath)) {
-    throw new Error(`Required Codex ${skillName} skill is missing: ${sourceSkillPath}`);
-  }
-  await fsp.mkdir(path.dirname(targetDir), { recursive: true });
-  await fsp.cp(sourceDir, targetDir, { recursive: true });
 }
 
 async function writeOverlayInstructions(

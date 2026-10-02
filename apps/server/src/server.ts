@@ -583,7 +583,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const body = optionalRequestBody(request.body);
     if (Object.keys(body).some(key => key !== "action" && key !== "sessionId")) throwBadRequest("Unknown recovery field.");
     const action = body.action;
-    if (action !== "reconnect" && action !== "new-shell" && action !== "resume-conversation") throwBadRequest("Unknown recovery action.");
+    if (action !== "reconnect" && action !== "new-shell" && action !== "resume-conversation" && action !== "select-conversation") throwBadRequest("Unknown recovery action.");
     let sessionId: string | undefined;
     if (body.sessionId !== undefined) {
       sessionId = requiredTrimmedBodyString(body.sessionId, "sessionId");

@@ -118,10 +118,13 @@ export function saveTurnReceipt(receiptPath, value) {
 /** The enclosing terminal subreaper owns this bridge, both Codex processes, and every descendant. */
 export async function runWorkerBridge(launch) {
   const token = randomBytes(32).toString("hex");
-  let connected = false;
+  let frontend;
+  let phase = launch.startupPicker ? "picker" : "conversation";
+  let retiredBackend = Promise.resolve();
+  let handoffTimer;
   const server = new WebSocketServer({
     host: "127.0.0.1", port: 0, maxPayload: MAX_MESSAGE_BYTES,
-    verifyClient: ({ req }) => !connected && !req.headers.origin && req.headers.authorization === `Bearer ${token}`
+    verifyClient: ({ req }) => !frontend && phase !== "finishing" && !req.headers.origin && req.headers.authorization === `Bearer ${token}`
   });
   await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
   const turn = launch.binding ? new CodexWorkerTurn(launch.binding,
@@ -141,53 +144,24 @@ export async function runWorkerBridge(launch) {
     if (turn && turn.turn?.status !== "completed")
       throw new Error("Native visible client disconnected before its owned turn completed.");
     finishing = true;
+    phase = "finishing";
     setTimeout(() => fail(new Error("Native visible client disconnected without exiting.")), 5_000);
   };
   server.on("error", fail);
   server.on("connection", socket => {
-    if (connected) { socket.close(); return; }
-    connected = true;
-    // The remote TUI has initialized its local state before connecting. Start
-    // the backend here so their first SQLite migrations cannot race.
-    const native = spawn(launch.command, launch.serverArgs, { stdio: ["pipe", "pipe", "inherit"] });
-    let buffer = "";
-    native.on("error", fail);
-    native.stdin.on("error", fail);
-    native.stdout.on("error", fail);
-    native.on("exit", (code, signal) => {
-      if (!finishing) fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`));
-    });
-    native.stdout.setEncoding("utf8");
-    native.stdout.on("data", chunk => {
-      try {
-        buffer += chunk;
-        let end;
-        while ((end = buffer.indexOf("\n")) !== -1) {
-          const line = buffer.slice(0, end);
-          buffer = buffer.slice(end + 1);
-          if (!line.trim()) continue;
-          if (Buffer.byteLength(line) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
-          const message = JSON.parse(line);
-          if (socket.readyState !== WebSocket.OPEN) {
-            // Closing the socket precedes TUI process exit. A completed turn may
-            // still have auxiliary title notifications queued in the backend.
-            awaitVisibleExit();
-            continue;
-          }
-          if (socket.bufferedAmount > MAX_MESSAGE_BYTES) throw new Error("Native worker client cannot keep up with output.");
-          permissions?.fromServer(message);
-          selection?.fromServer(message);
-          turn?.fromServer(message);
-          socket.send(JSON.stringify(message));
-        }
-        if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
-      } catch (error) { fail(error); }
-    });
+    if (frontend || phase === "finishing") { socket.close(); return; }
+    frontend = socket;
+    const picker = phase === "picker";
+    if (phase === "handoff") phase = "conversation";
+    let native;
+    let retiring = false;
+    let queuedBytes = 0;
+    const queued = [];
+    const forward = line => {
+      if (native.stdin.writableLength + Buffer.byteLength(line) > MAX_MESSAGE_BYTES) throw new Error("Native worker input exceeds the size limit.");
+      native.stdin.write(line);
+    };
     socket.on("error", fail);
-    socket.on("close", () => {
-      try { awaitVisibleExit(); }
-      catch (error) { fail(error); }
-    });
     socket.on("message", data => {
       try {
         const message = JSON.parse(data.toString());
@@ -195,10 +169,71 @@ export async function runWorkerBridge(launch) {
         selection?.fromClient(message);
         turn?.fromClient(message);
         const line = `${JSON.stringify(message)}\n`;
-        if (native.stdin.writableLength + Buffer.byteLength(line) > MAX_MESSAGE_BYTES) throw new Error("Native worker input exceeds the size limit.");
-        native.stdin.write(line);
+        if (native) forward(line);
+        else {
+          queuedBytes += Buffer.byteLength(line);
+          if (queuedBytes > MAX_MESSAGE_BYTES) throw new Error("Native picker handoff input exceeds the size limit.");
+          queued.push(line);
+        }
       } catch (error) { fail(error); }
     });
+    socket.on("close", () => {
+      try {
+        if (picker && !selection?.selectedThreadId && !selection?.pending.size && !turn?.request) {
+          phase = "handoff";
+          frontend = undefined;
+          retiring = true;
+          // The picker owns this initialized stdio connection. Its successor
+          // needs a fresh initialization, after the old backend has been reaped.
+          retiredBackend = native ? new Promise(resolve => {
+            native.once("close", resolve);
+            native.stdin.end();
+          }) : Promise.resolve();
+          handoffTimer = setTimeout(() => fail(new Error("Native picker did not hand off to a conversation or exit within 5 seconds.")), 5_000);
+        } else awaitVisibleExit();
+      } catch (error) { fail(error); }
+    });
+    void retiredBackend.then(() => {
+      if (finishing || socket.readyState !== WebSocket.OPEN) return;
+      clearTimeout(handoffTimer);
+      // The remote TUI has initialized its local state before connecting. Start
+      // the backend here so their first SQLite migrations cannot race.
+      native = spawn(launch.command, launch.serverArgs, { stdio: ["pipe", "pipe", "inherit"] });
+      let buffer = "";
+      native.on("error", fail);
+      native.stdin.on("error", fail);
+      native.stdout.on("error", fail);
+      native.on("exit", (code, signal) => {
+        if (!finishing && !retiring) fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`));
+      });
+      native.stdout.setEncoding("utf8");
+      native.stdout.on("data", chunk => {
+        try {
+          buffer += chunk;
+          let end;
+          while ((end = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, end);
+            buffer = buffer.slice(end + 1);
+            if (!line.trim()) continue;
+            if (Buffer.byteLength(line) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
+            const message = JSON.parse(line);
+            if (socket.readyState !== WebSocket.OPEN) {
+              // Socket close owns the picker handoff or final-exit transition.
+              // Late backend output must not turn a pending close into shutdown.
+              continue;
+            }
+            if (socket.bufferedAmount > MAX_MESSAGE_BYTES) throw new Error("Native worker client cannot keep up with output.");
+            permissions?.fromServer(message);
+            selection?.fromServer(message);
+            turn?.fromServer(message);
+            socket.send(JSON.stringify(message));
+          }
+          if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");
+        } catch (error) { fail(error); }
+      });
+      for (const line of queued) forward(line);
+      queued.length = 0;
+    }).catch(fail);
   });
   const tui = spawn(launch.command, [
     "--remote", `ws://127.0.0.1:${server.address().port}`,

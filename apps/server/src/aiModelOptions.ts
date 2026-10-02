@@ -1,8 +1,13 @@
-import type { ConfigFieldOption } from "@cloudx/shared";
+import { DEFAULT_CODEX_MODEL, type ConfigFieldOption } from "@cloudx/shared";
 
 export const DOCUMENTATION_AI_USE_VOICE_MODEL = "__voice_model__";
 export const DEFAULT_DOCUMENTATION_IMAGE_ANALYSIS_MODEL = "gpt-5.6-luna";
 export const CODEX_MODEL_OPTIONS: ConfigFieldOption[] = [
+  {
+    label: "GPT-6.1 Sol",
+    value: DEFAULT_CODEX_MODEL,
+    description: "Default for Codex coding and review work."
+  },
   {
     label: "GPT-6-Astra",
     value: "gpt-6-astra",

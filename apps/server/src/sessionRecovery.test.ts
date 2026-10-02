@@ -203,7 +203,7 @@ describe("workspace recovery after server updates", () => {
     await after.sessions.dispose();
   });
 
-  it("requires an explicit conversation selection when the saved resume identity is unconfirmed", async () => {
+  it.each(["resume-conversation", "select-conversation"] as const)("requires explicit %s when the saved resume identity is unconfirmed", async action => {
     const { running, factory, createStore } = await fixture();
     const terminal = new StandardTerminalPlugin(factory);
     const recoverSession = vi.fn(terminal.createSession.bind(terminal));
@@ -227,10 +227,10 @@ describe("workspace recovery after server updates", () => {
     await expect(after.sessions.recoverTab(tab.id, { action: "resume-conversation" })).rejects.toThrow("Select an exact Codex conversation ID to resume.");
     expect(recoverSession).not.toHaveBeenCalled();
     expect(factory.spawn).toHaveBeenCalledOnce();
-    const recovered = await after.sessions.recoverTab(tab.id, { action: "resume-conversation", sessionId: "conversation-b" });
+    const recovered = await after.sessions.recoverTab(tab.id, action === "select-conversation" ? { action } : { action, sessionId: "conversation-b" });
     expect(recovered).toMatchObject({ id: tab.id, status: "running", recovery: undefined });
     expect(recoverSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      initialInput: { resume: { mode: "session", sessionId: "conversation-b" } }
+      initialInput: { resume: action === "select-conversation" ? { mode: "picker", all: true } : { mode: "session", sessionId: "conversation-b" } }
     }));
     expect(factory.spawn).toHaveBeenCalledTimes(2);
     await after.sessions.dispose();

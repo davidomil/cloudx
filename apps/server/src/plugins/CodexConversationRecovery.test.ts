@@ -55,6 +55,25 @@ describe("Codex conversation identity", () => {
     expect(save).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId: firstId, authority: "selected" }));
   });
 
+  it("retains foreground authority through child activity and an explicit return from the child", () => {
+    const binding = { tabId: "tab", executionId: firstId, receiptPath: recovery.receiptPath };
+    const selection = new CodexConversationSelection(binding, (value: unknown) => saveTurnReceipt(binding.receiptPath, value));
+    selection.fromClient({ id: 1, method: "thread/resume", params: { threadId: firstId } });
+    selection.fromServer({ id: 1, result: { thread: { id: firstId, cwd: home } } });
+    for (const message of [
+      { method: "thread/started", params: { thread: { id: secondId, cwd: home, source: { subAgent: { parentThreadId: firstId } } } } },
+      { method: "turn/started", params: { threadId: secondId, turn: { id: "child-turn" } } },
+      { method: "turn/completed", params: { threadId: secondId, turn: { id: "child-turn", status: "completed" } } },
+      { id: "unobserved-child-request", result: { thread: { id: secondId, cwd: home } } }
+    ]) selection.fromServer(message);
+    expect(recovery.readForExecution("tab", firstId)?.sessionId).toBe(firstId);
+    for (const [id, sessionId] of [[2, secondId], [3, firstId]] as const) {
+      selection.fromClient({ id, method: "thread/resume", params: { threadId: sessionId } });
+      selection.fromServer({ id, result: { thread: { id: sessionId, cwd: home } } });
+      expect(new CodexConversationRecovery(home).readForExecution("tab", firstId)?.sessionId).toBe(sessionId);
+    }
+  });
+
   it("refreshes the selected conversation's transcript path after native history editing", () => {
     const binding = { tabId: "tab", executionId: secondId, receiptPath: recovery.receiptPath };
     const selection = new CodexConversationSelection(binding, (value: unknown) => saveTurnReceipt(binding.receiptPath, value));

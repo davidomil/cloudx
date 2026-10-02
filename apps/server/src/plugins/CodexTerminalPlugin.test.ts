@@ -819,11 +819,11 @@ describe("CodexTerminalPlugin", () => {
     expect(overlayConfig).toContain("skills/cloudx-system/create-cloudx-skill/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx-system/documentation-search/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx-exceptions/imagegen/SKILL.md");
-    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "code-review", "SKILL.md"), "utf8")).resolves.toContain("Code review skill instructions.");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "code-review", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/code-review/SKILL.md");
     await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "create-cloudx-skill", "SKILL.md"), "utf8")).resolves.toContain("Create CloudX Skill");
-    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("Documentation search skill instructions.");
-    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "scripts", "cloudx-doc.mjs"), "utf8")).resolves.toContain("helper");
-    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-exceptions", "imagegen", "SKILL.md"), "utf8")).resolves.toContain("Image generation instructions.");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "documentation-search", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/system-skills/documentation-search/SKILL.md");
+    await expect(fs.readFile(path.join(dataDir, "rules-skills", "system-skills", "documentation-search", "scripts", "cloudx-doc.mjs"), "utf8")).resolves.toContain("helper");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-exceptions", "imagegen", "SKILL.md"), "utf8")).resolves.toContain("skills/.system/imagegen/SKILL.md");
     const overlayInstructions = await fs.readFile(path.join(factory.env!.CODEX_HOME!, "AGENTS.override.md"), "utf8");
     expect(overlayInstructions).toContain("Prefer direct answers.");
     expect(overlayInstructions).toContain("Keep local notes.");
@@ -859,7 +859,7 @@ describe("CodexTerminalPlugin", () => {
       const generated = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
       expect(generated).toMatchObject({
         ...parse(sourceConfig),
-        model: model ?? "gpt-6-astra",
+        model: model ?? "gpt-6.1-sol",
         model_reasoning_effort: "xhigh",
         features: { apps: false, memories: false, plugins: false },
       });
@@ -939,7 +939,7 @@ describe("CodexTerminalPlugin", () => {
     try {
       const launch = await materializeCodexTemplate(undefined, { CODEX_HOME: codexHome }, { dataDir: path.join(root, "data"), tabId: "empty" });
       const config = parse(await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8"));
-      expect(config.model).toBe("gpt-6-astra");
+      expect(config.model).toBe("gpt-6.1-sol");
       expect(config.model_reasoning_effort).toBeUndefined();
       if (source === undefined) {
         await expect(fs.stat(path.join(codexHome, "config.toml"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -1015,8 +1015,8 @@ describe("CodexTerminalPlugin", () => {
     expect(overlayConfig).toContain("skills/cloudx/testing/SKILL.md");
     expect(overlayConfig).not.toContain("documentation-answer");
     expect(overlayConfig).not.toContain("/stale/cloudx-system");
-    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"), "utf8")).resolves.toContain("Reviewer skill instructions.");
-    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "testing", "SKILL.md"), "utf8")).resolves.toContain("Testing skill instructions.");
+    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/reviewer/SKILL.md");
+    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "testing", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/testing/SKILL.md");
     expect(launch.env).toMatchObject({
       CUSTOM_ENV: "1",
       CLOUDX_PERSONALITY_TEMPLATE_ID: "review",
@@ -1046,7 +1046,7 @@ describe("CodexTerminalPlugin", () => {
     );
     const sessionState = path.join(first.overlay!.codexHome, "sessions", "current.jsonl");
     const firstConfig = parse(await fs.readFile(path.join(first.overlay!.codexHome, "config.toml"), "utf8"));
-    expect(firstConfig.model).toBe("gpt-6-astra");
+    expect(firstConfig.model).toBe("gpt-6.1-sol");
     expect(firstConfig.model_reasoning_effort).toBeUndefined();
     await fs.mkdir(path.dirname(sessionState), { recursive: true });
     await fs.writeFile(sessionState, "keep me\n", "utf8");
@@ -1069,7 +1069,7 @@ describe("CodexTerminalPlugin", () => {
       model_reasoning_effort: "xhigh",
       features: { apps: false, memories: false, plugins: false },
     });
-    await expect(fs.readFile(path.join(second.overlay!.codexHome, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
+    await expect(fs.readFile(path.join(second.overlay!.codexHome, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/tester/SKILL.md");
     await expect(fs.stat(path.join(second.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"))).rejects.toThrow();
     await expect(fs.readFile(path.join(second.overlay!.codexHome, "config.toml"), "utf8")).resolves.not.toContain("skills/cloudx/reviewer/SKILL.md");
   });
@@ -1191,7 +1191,7 @@ describe("CodexTerminalPlugin", () => {
     expect(factory.process!.written).toContain("$documentation-search");
     expect(factory.process!.written).toContain("before answering any factual, research, recipe, recommendation, troubleshooting, summary, or source-grounded question");
     expect(factory.process!.written.endsWith("\u001b[201~\r")).toBe(true);
-    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("Tester skill instructions.");
+    await expect(fs.readFile(path.join(factory.env!.CODEX_HOME!, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/tester/SKILL.md");
   });
 
   it("shares locked-down Codex defaults and disables non-CloudX discovered skills", async () => {
@@ -1248,7 +1248,7 @@ describe("CodexTerminalPlugin", () => {
       { path: path.join(launch.overlay!.codexHome, "skills", "cloudx-exceptions", "imagegen", "SKILL.md"), enabled: true }
     ]));
     expect(skillConfig).not.toContainEqual(expect.objectContaining({ name: "unwanted" }));
-    await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx-exceptions", "imagegen", "scripts", "image_gen.py"), "utf8")).resolves.toContain("imagegen helper");
+    await expect(fs.readFile(path.join(codexHome, "skills", ".system", "imagegen", "scripts", "image_gen.py"), "utf8")).resolves.toContain("imagegen helper");
   });
 
   it("fails clearly when the required imagegen exception is unavailable", async () => {
@@ -1878,7 +1878,7 @@ describe("Codex conversation recovery after process loss", () => {
       const recovery = await plugin.describeRecovery({ tab, cwd: root, controls, initialInput: session.restoreInput?.() });
 
       expect(recovery).toEqual({
-        message: "Codex exited before a selected conversation was confirmed. Review the terminal output and Settings → Codex, then open a new Codex tab.",
+        message: "Codex exited before a selected conversation was confirmed. Review the retained terminal output for startup or connection errors. Check Settings → Codex or select a saved session.",
         canResume: false, startupFailed: true
       });
       expect(factory.spawns).toBe(1);

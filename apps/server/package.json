@@ -25,6 +25,7 @@
     "tar": "^7.5.15",
     "toml-eslint-parser": "^1.0.3",
     "ws": "^8.21.0",
+    "yaml": "^2.9.0",
     "yauzl": "^2.10.0"
   },
   "optionalDependencies": {

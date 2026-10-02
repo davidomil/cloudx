@@ -73,7 +73,10 @@ for (const initiallyFailed of [false, true]) {
     );
     await expect(
       page.getByRole("textbox", { name: "Conversation session ID" }),
-    ).toHaveCount(0);
+    ).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Select a saved conversation" }),
+    ).toBeVisible();
     await output.locator(".xterm-helper-textarea").focus();
     await page.keyboard.type("must not resume");
     expect(input).toEqual([]);

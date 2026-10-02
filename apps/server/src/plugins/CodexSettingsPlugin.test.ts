@@ -44,7 +44,7 @@ describe("shared Codex settings", () => {
     for (const id of ["imagegen", "slides", "skill-creator"]) {
       const directory = path.join(f.home, "skills", ".system", id);
       await fs.mkdir(directory, { recursive: true });
-      await fs.writeFile(path.join(directory, "SKILL.md"), `# ${id}`);
+      await fs.writeFile(path.join(directory, "SKILL.md"), `---\nname: ${id}\ndescription: Test skill.\n---\n# ${id}\n`);
     }
     await expect(f.service.read()).resolves.toMatchObject({
       yoloMode: true, autoTrustWorkspace: false, reasoningEffort: null, webSearch: null, personality: null,
@@ -59,7 +59,7 @@ describe("shared Codex settings", () => {
     for (const id of ["imagegen", "slides"]) {
       const directory = path.join(f.home, "skills", ".system", id);
       await fs.mkdir(directory, { recursive: true });
-      await fs.writeFile(path.join(directory, "SKILL.md"), `# ${id}`);
+      await fs.writeFile(path.join(directory, "SKILL.md"), `---\nname: ${id}\ndescription: Test skill.\n---\n# ${id}\n`);
     }
     const second = f.instance("second");
     const launch = (tabId: string) => materializeCodexTemplate(undefined, { CODEX_HOME: f.home, HOME: f.root }, { dataDir: second.dataDir, sources: second.sources, tabId, cwd: f.root });
@@ -384,6 +384,15 @@ describe("shared Codex settings", () => {
     await expect(f.service.update({ expectedRevision: settings.revision, model: "chosen-model" })).rejects.toThrow();
 
     expect(await fs.readFile(f.configPath, "utf8")).toBe(oversized);
+  });
+
+  it("saves GPT-6.1 Sol and reloads it across instances while preserving explicit profile and reasoning choices", async () => {
+    const f = await fixture('model = "gpt-6-astra"\nmodel_reasoning_effort = "max"\n[profiles.review]\nmodel = "gpt-5.6-sol"\n');
+    const current = await f.service.read();
+    const saved = await f.service.update({ expectedRevision: current.revision, model: "gpt-6.1-sol" });
+    await expect(f.instance("reloaded").service.read()).resolves.toEqual(saved);
+    expect(saved).toMatchObject({ model: "gpt-6.1-sol", reasoningEffort: "max" });
+    expect(parse(await fs.readFile(f.configPath, "utf8"))).toMatchObject({ profiles: { review: { model: "gpt-5.6-sol" } } });
   });
 
   it("uses saved defaults in new launches from another CloudX instance", async () => {
