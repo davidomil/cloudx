@@ -16,16 +16,17 @@ const targetSha = "b".repeat(40);
 let directory;
 let history;
 
+const git = (...args) =>
+  execFileSync("git", args, {
+    cwd: directory,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+
 beforeAll(async () => {
   directory = await fs.mkdtemp(
     path.join(os.tmpdir(), "cloudx-lifecycle-revisions-"),
   );
-  const git = (...args) =>
-    execFileSync("git", args, {
-      cwd: directory,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    }).trim();
   git("init", "--initial-branch=main");
   git("config", "user.name", "Lifecycle test");
   git("config", "user.email", "lifecycle@example.invalid");
@@ -146,10 +147,16 @@ it("requires a forward upgrade from the supported baseline using local immutable
 
 it("records one verified revision pair and exposes the same SHAs to both CI jobs", async () => {
   const repository = fileURLToPath(new URL("../..", import.meta.url));
-  const candidate = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: repository,
-    encoding: "utf8",
-  }).trim();
+  const script = path.join(repository, "scripts/ci/lifecycle-revisions.mjs");
+  git("fetch", "--no-tags", "--depth=1", repository, SUPPORTED_BASELINE);
+  const candidate = git(
+    "commit-tree",
+    "HEAD^{tree}",
+    "-p",
+    SUPPORTED_BASELINE,
+    "-m",
+    "Supported candidate independent of the verifier snapshot HEAD",
+  );
   const eventFile = path.join(directory, "event.json");
   const evidence = path.join(directory, "revisions.json");
   const outputs = path.join(directory, "outputs");
@@ -157,21 +164,17 @@ it("records one verified revision pair and exposes the same SHAs to both CI jobs
     eventFile,
     JSON.stringify({ pull_request: { base: { sha: SUPPORTED_BASELINE } } }),
   );
-  const result = spawnSync(
-    process.execPath,
-    ["scripts/ci/lifecycle-revisions.mjs", evidence],
-    {
-      cwd: repository,
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GITHUB_EVENT_NAME: "pull_request",
-        GITHUB_EVENT_PATH: eventFile,
-        GITHUB_SHA: candidate,
-        GITHUB_OUTPUT: outputs,
-      },
+  const result = spawnSync(process.execPath, [script, evidence], {
+    cwd: directory,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_EVENT_PATH: eventFile,
+      GITHUB_SHA: candidate,
+      GITHUB_OUTPUT: outputs,
     },
-  );
+  });
   expect(result.status, result.stderr).toBe(0);
   expect(JSON.parse(await fs.readFile(evidence, "utf8"))).toMatchObject({
     sourceSha: SUPPORTED_BASELINE,
@@ -182,32 +185,43 @@ it("records one verified revision pair and exposes the same SHAs to both CI jobs
     `source-sha=${SUPPORTED_BASELINE}\ntarget-sha=${candidate}\n`,
   );
 
-  await fs.writeFile(
-    eventFile,
-    JSON.stringify({ pull_request: { base: { sha: candidate } } }),
-  );
   await fs.unlink(outputs);
-  const failed = spawnSync(
-    process.execPath,
-    ["scripts/ci/lifecycle-revisions.mjs", evidence],
-    {
-      cwd: repository,
+  for (const [source, target, failure] of [
+    [candidate, candidate, { error: "Upgrade source and target must differ." }],
+    [
+      SUPPORTED_BASELINE,
+      history.targetSha,
+      {
+        baselineSha: SUPPORTED_BASELINE,
+        sourceSha: SUPPORTED_BASELINE,
+        targetSha: history.targetSha,
+        sourceKind: "pull-request-base",
+        error: "Upgrade target must descend from the pinned source.",
+      },
+    ],
+  ]) {
+    await fs.writeFile(
+      eventFile,
+      JSON.stringify({ pull_request: { base: { sha: source } } }),
+    );
+    const failed = spawnSync(process.execPath, [script, evidence], {
+      cwd: directory,
       encoding: "utf8",
       env: {
         ...process.env,
         GITHUB_EVENT_NAME: "pull_request",
         GITHUB_EVENT_PATH: eventFile,
-        GITHUB_SHA: candidate,
+        GITHUB_SHA: target,
         GITHUB_OUTPUT: outputs,
       },
-    },
-  );
-  expect(failed.status).toBe(1);
-  expect(JSON.parse(await fs.readFile(evidence, "utf8"))).toEqual({
-    result: "failed",
-    error: "Upgrade source and target must differ.",
-  });
-  await expect(fs.access(outputs)).rejects.toThrow();
+    });
+    expect(failed.status).toBe(1);
+    expect(JSON.parse(await fs.readFile(evidence, "utf8"))).toEqual({
+      result: "failed",
+      ...failure,
+    });
+    await expect(fs.access(outputs)).rejects.toThrow();
+  }
 });
 
 it.each(["clean-install", "installed-upgrade"])(

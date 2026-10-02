@@ -6,6 +6,7 @@ scenario=${1:?install or upgrade}
 source_sha=${2:?source SHA}
 target_sha=${3:?target SHA}
 evidence=$(realpath -m "${4:?evidence directory}")
+published_evidence=$evidence
 controller=$(pwd)
 test_user="cloudx-ci-${scenario}-$$"
 test_home="/home/$test_user"
@@ -51,6 +52,9 @@ cleanup() {
   if [[ $hosts_changed == 1 ]]; then cat "$fixture/hosts" > /etc/hosts; fi
   printf '{"scenario":"%s","sourceSha":"%s","targetSha":"%s","exitCode":%d}\n' "$scenario" "$source_sha" "$target_sha" "$result" > "$evidence/host-result.json"
   chmod -R a+rX "$evidence"
+  if [[ $evidence != "$published_evidence" ]]; then
+    cp -a "$evidence/." "$published_evidence/" || result=1
+  fi
   # The disposable VM owns the remaining private home/fixture, which are never uploaded.
   exit "$result"
 }
@@ -74,12 +78,18 @@ apt-get update > "$evidence/host-setup.log" 2>&1
 apt-get install --yes dbus-user-session sudo git openssl >> "$evidence/host-setup.log" 2>&1
 fixture=$(mktemp -d /tmp/cloudx-lifecycle.XXXXXX)
 chmod 0755 "$fixture"
+bash "$controller/scripts/ci/lifecycle-stage.sh" "$controller" "$PLAYWRIGHT_BROWSERS_PATH" "$fixture/controller"
+install -d -m 0755 "$fixture/evidence"
+cp -a "$evidence/." "$fixture/evidence/"
+evidence="$fixture/evidence"
+PLAYWRIGHT_BROWSERS_PATH="$fixture/controller/browsers"
 
 # Fetch only selected immutable objects. No service ever sees the controller checkout.
 git init --bare "$fixture/origin.git" >> "$evidence/host-setup.log" 2>&1
 git -c safe.directory="$controller" -C "$fixture/origin.git" fetch "$controller" "$source_sha:refs/heads/source" "$target_sha:refs/heads/main"
 git -C "$fixture/origin.git" symbolic-ref HEAD refs/heads/main
 chmod -R a+rX "$fixture/origin.git"
+controller="$fixture/controller"
 
 [[ ! -e $test_home ]]
 useradd --create-home --shell /bin/bash "$test_user"

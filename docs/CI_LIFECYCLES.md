@@ -20,6 +20,12 @@ only the browser harness. An isolated synthetic Codex login record
 satisfies the installer’s authentication prerequisite; it is not a real
 credential and is excluded from artifacts.
 
+The runner home may be private. The host harness copies only its lifecycle
+scripts, Playwright packages and installed browsers into a readable disposable
+fixture. The application account writes evidence there; cleanup copies it back
+to the runner's upload directory on success or failure. The runner's profile
+and the application's clean installation remain separate.
+
 Readiness includes HTTPS web, ASR, documentation and production
 supervised terminal creation and cleanup. Runtime evidence must report
 the pinned commit, verified artifact digest and live process identity.
