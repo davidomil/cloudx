@@ -26,6 +26,12 @@ fixture. The application account writes evidence there; cleanup copies it back
 to the runner's upload directory on success or failure. The runner's profile
 and the application's clean installation remain separate.
 
+Before starting the application user manager, the harness temporarily removes
+the runner-specific `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` assignments from
+`/etc/environment`. A transient user service verifies its inherited home and
+runtime directory and connects to its own user manager before installation.
+Cleanup restores the original environment file after stopping that manager.
+
 Readiness includes HTTPS web, ASR, documentation and production
 supervised terminal creation and cleanup. Runtime evidence must report
 the pinned commit, verified artifact digest and live process identity.

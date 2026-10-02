@@ -56,6 +56,13 @@ lockfile so dependency upgrades cannot silently leave the offline cache incomple
 Both the TypeScript job and the isolated verifier image run the helper before
 offline execution; these cached packages do not enter the current install.
 
+After changing dependencies or fixture targets, verify the historical lockfiles
+and the verifier image's cache setup:
+
+```bash
+npm exec -- vitest run scripts/ci/cache-historical-dependencies.test.mjs scripts/ci/historical-dependencies.test.mjs
+```
+
 Forge migration cases that originated on development branches use the
 [checked-in historical fixtures](../../scripts/fixtures/forge-history/README.md).
 They preserve the prior integrator and native draft-reader state without

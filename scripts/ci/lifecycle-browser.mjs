@@ -347,15 +347,14 @@ export class LifecycleBrowserProfile {
       .click();
     await this.page.getByLabel("Plugin").selectOption("codex-terminal");
     await this.page.getByLabel("Title").fill("Lifecycle preserved Codex");
-    const creation = this.page.waitForResponse(
-      (response) =>
-        response.request().method() === "POST" &&
-        new URL(response.url()).pathname === "/api/tabs",
-    );
-    await this.page
-      .getByRole("button", { name: "Create", exact: true })
-      .click();
-    const response = await creation;
+    const [response] = await Promise.all([
+      this.page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/tabs",
+      ),
+      this.page.getByRole("button", { name: "Create", exact: true }).click(),
+    ]);
     assert.equal(response.status(), 201);
     const codex = (await response.json()).tab;
     this.seeded = {
@@ -564,30 +563,34 @@ export class LifecycleBrowserProfile {
   }
 
   async update({ targetSha, timeoutMs = 40 * 60_000 }) {
-    const previewResponse = this.page.waitForResponse(
-      (response) =>
-        new URL(response.url()).pathname === "/api/system/update/preview" &&
-        response.request().method() === "GET",
-    );
-    const panel = await this.openUpdates();
-    const preview = await (await previewResponse).json();
+    const [previewResponse, panel] = await Promise.all([
+      this.page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === "/api/system/update/preview" &&
+          response.request().method() === "GET",
+      ),
+      this.openUpdates(),
+    ]);
+    const preview = await previewResponse.json();
     assert.equal(
       preview.target?.commit,
       targetSha,
       "Settings must select the pinned candidate.",
     );
-    const launched = this.page.waitForResponse(
-      (response) =>
-        new URL(response.url()).pathname === "/api/system/update" &&
-        response.request().method() === "POST",
-    );
-    await panel
-      .getByRole("button", {
-        name: "Update CloudX and dependencies",
-        exact: true,
-      })
-      .click();
-    let status = await (await launched).json();
+    const [launched] = await Promise.all([
+      this.page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === "/api/system/update" &&
+          response.request().method() === "POST",
+      ),
+      panel
+        .getByRole("button", {
+          name: "Update CloudX and dependencies",
+          exact: true,
+        })
+        .click(),
+    ]);
+    let status = await launched.json();
     if (status.confirmation) {
       assert.equal(status.confirmation.targetCommit, targetSha);
       assert.equal(
@@ -595,23 +598,25 @@ export class LifecycleBrowserProfile {
         undefined,
         "Forward acceptance must not restore a downgrade snapshot.",
       );
-      const confirmed = this.page.waitForResponse(
-        (response) =>
-          new URL(response.url()).pathname === "/api/system/update" &&
-          response.request().method() === "POST",
-      );
       await panel
         .getByLabel(
           "I understand that affected terminal sessions and running work will be interrupted.",
         )
         .check();
-      await panel
-        .getByRole("button", {
-          name: "Confirm interruption and continue",
-          exact: true,
-        })
-        .click();
-      status = await (await confirmed).json();
+      const [confirmed] = await Promise.all([
+        this.page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/api/system/update" &&
+            response.request().method() === "POST",
+        ),
+        panel
+          .getByRole("button", {
+            name: "Confirm interruption and continue",
+            exact: true,
+          })
+          .click(),
+      ]);
+      status = await confirmed.json();
       this.interruptionConfirmed = true;
     }
     assert.equal(
@@ -646,6 +651,7 @@ export class LifecycleBrowserProfile {
             return false;
           throw error;
         }
+        if (response.status() === 503) return false;
         assert.ok(
           response.ok(),
           `Update status returned HTTP ${response.status()}.`,
@@ -812,13 +818,15 @@ export class LifecycleBrowserProfile {
     const preserved = await this.verifyPreservedProfile({
       requiresInterruption,
     });
-    const previewResponse = this.page.waitForResponse(
-      (response) =>
-        new URL(response.url()).pathname === "/api/system/update/preview" &&
-        response.request().method() === "GET",
-    );
-    const panel = await this.openUpdates();
-    const preview = await (await previewResponse).json();
+    const [previewResponse, panel] = await Promise.all([
+      this.page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === "/api/system/update/preview" &&
+          response.request().method() === "GET",
+      ),
+      this.openUpdates(),
+    ]);
+    const preview = await previewResponse.json();
     assert.equal(preview.currentCommit, targetSha);
     assert.equal(preview.target?.commit, targetSha);
     assert.equal(preview.runtime?.commit, targetSha);

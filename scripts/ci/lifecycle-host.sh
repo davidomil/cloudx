@@ -14,6 +14,7 @@ fixture=""
 user_created=0
 catalog_pid=""
 hosts_changed=0
+environment_changed=0
 install -d -m 0755 "$evidence"
 printf '{"scenario":"%s","sourceSha":"%s","targetSha":"%s","result":"setup-failed"}\n' "$scenario" "$source_sha" "$target_sha" > "$evidence/host-result.json"
 
@@ -50,6 +51,7 @@ cleanup() {
   fi
   if [[ -n $catalog_pid ]]; then kill "$catalog_pid"; wait "$catalog_pid"; fi
   if [[ $hosts_changed == 1 ]]; then cat "$fixture/hosts" > /etc/hosts; fi
+  if [[ $environment_changed == 1 ]]; then cat "$fixture/environment" > /etc/environment || result=1; fi
   printf '{"scenario":"%s","sourceSha":"%s","targetSha":"%s","exitCode":%d}\n' "$scenario" "$source_sha" "$target_sha" "$result" > "$evidence/host-result.json"
   chmod -R a+rX "$evidence"
   if [[ $evidence != "$published_evidence" ]]; then
@@ -98,10 +100,21 @@ test_uid=$(id -u "$test_user")
 chown -R "$test_user:$test_user" "$fixture/origin.git"
 printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$test_user" > "/etc/sudoers.d/$test_user"
 chmod 0440 "/etc/sudoers.d/$test_user"
+# Hosted runners put their own session paths in this system-wide file. The user
+# manager reparses it even when its caller uses env -i; restore it during cleanup.
+cp -p /etc/environment "$fixture/environment"
+environment_changed=1
+sed -i -E '/^[[:space:]]*(XDG_CONFIG_HOME|XDG_RUNTIME_DIR)=/d' /etc/environment
 loginctl enable-linger "$test_user"
 systemctl start "user@$test_uid.service"
 as_application systemctl --user show-environment > /dev/null
-as_application systemd-run --user --wait --pipe --collect /usr/bin/true > "$evidence/user-manager.txt" 2>&1
+as_application systemd-run --user --wait --pipe --collect /bin/sh -ec '
+  test "$HOME" = "$1"
+  test "${XDG_CONFIG_HOME:-$HOME/.config}" = "$HOME/.config"
+  test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
+  systemctl --user show-environment > /dev/null
+  printf "Application service home and runtime directory are isolated; nested user-manager access passes.\\n"
+' sh "$test_home" > "$evidence/user-manager.txt" 2>&1
 chown "$test_user:$test_user" "$evidence"
 as_application git clone --no-hardlinks "$fixture/origin.git" "$test_home/cloudx"
 install_sha=$target_sha
