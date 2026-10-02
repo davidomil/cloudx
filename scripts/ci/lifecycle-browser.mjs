@@ -724,6 +724,11 @@ export class LifecycleBrowserProfile {
       "Update replayed a native prompt.",
     );
     if (!this.interruptionConfirmed) {
+      assert.equal(
+        conversation.receipt.executionId,
+        this.seeded.receipt.executionId,
+        "A compatible upgrade must preserve the Codex execution.",
+      );
       for (const id of [this.seeded.shellTabId, this.seeded.codexTabId]) {
         assert.equal(
           workspace.tabs.find((tab) => tab.id === id).status,

@@ -9,12 +9,12 @@ import {
   NativeLifecycleProvider,
 } from "./lifecycle-browser.mjs";
 
-function savedConversation() {
+function savedConversation(home = "/isolated/.codex") {
   const sessionId = "12345678-1234-4234-8234-123456789abc";
   const binding = {
     version: 1,
     sourceId: "source",
-    home: "/isolated/.codex",
+    home,
     dev: "1",
     ino: "2",
   };
@@ -266,6 +266,194 @@ describe("initial native conversation selection", () => {
       }
     },
   );
+});
+
+describe("profile preservation after an update", () => {
+  const replacementExecutionId = "12345678-1234-4234-8234-123456789fed";
+
+  async function installedProfile() {
+    const dataDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-lifecycle-preserved-"),
+    );
+    const profile = new LifecycleBrowserProfile({
+      dataDir,
+      repoRoot: "/workspace",
+    });
+    const before = savedConversation(path.join(dataDir, ".codex"));
+    profile.seeded = {
+      ...before,
+      settings: { themeId: "minimalist-dark" },
+      windowId: "window",
+      layout: {
+        activePaneId: "pane",
+        root: {
+          type: "pane",
+          pane: {
+            id: "pane",
+            tabIds: ["shell", "tab"],
+            activeTabId: "tab",
+          },
+        },
+      },
+      shellTabId: "shell",
+      shellMarker: "saved-shell",
+      shellPid: 123,
+      codexTabId: "tab",
+      providerRequests: ["conversation", "title"],
+    };
+    const workspace = {
+      windows: [
+        {
+          id: "window",
+          name: "Lifecycle preserved workspace",
+          layout: profile.seeded.layout,
+        },
+      ],
+      tabs: [
+        { id: "shell", status: "running" },
+        { id: "tab", status: "running" },
+      ],
+    };
+    const view = path.join(dataDir, "codex-launches", "tab");
+    const receiptPath = path.join(view, ".cloudx-conversation.json");
+    await fs.mkdir(view, { recursive: true });
+    await fs.mkdir(path.dirname(before.receipt.transcriptPath), {
+      recursive: true,
+    });
+    await fs.writeFile(
+      path.join(view, ".cloudx-source.json"),
+      JSON.stringify(before.binding),
+    );
+    await fs.writeFile(receiptPath, JSON.stringify(before.receipt));
+    await fs.writeFile(before.receipt.transcriptPath, before.transcript);
+    await fs.writeFile(
+      path.join(dataDir, "sessions.json"),
+      JSON.stringify({
+        sessions: [
+          {
+            tab: { id: "tab" },
+            initialInput: {
+              resume: { sessionId: before.conversationId },
+            },
+          },
+        ],
+      }),
+    );
+    profile.provider = { requests: [...profile.seeded.providerRequests] };
+    profile.action = vi
+      .fn()
+      .mockResolvedValue({ result: { ready: true } });
+    profile.readTerminal = vi.fn(async (_tabId, marker) => marker);
+    profile.json = vi.fn(async (method, route, data) => {
+      if (method === "GET" && route === "/api/config")
+        return { values: { global: { ...profile.seeded.settings } } };
+      if (method === "GET" && route === "/api/workspace")
+        return workspace;
+      if (method === "POST" && route === "/api/tabs/tab/recover") {
+        expect(data).toEqual({
+          action: "resume-conversation",
+          sessionId: before.conversationId,
+        });
+        await fs.writeFile(
+          receiptPath,
+          JSON.stringify({
+            ...before.receipt,
+            executionId: replacementExecutionId,
+          }),
+        );
+        return {};
+      }
+      if (method === "POST" && route === "/api/tabs/shell/recover") {
+        expect(data).toEqual({ action: "new-shell" });
+        return {};
+      }
+      throw new Error(`Unexpected request: ${method} ${route}`);
+    });
+    return { profile, workspace, receiptPath };
+  }
+
+  it("accepts the same live Codex execution after a compatible upgrade", async () => {
+    const { profile } = await installedProfile();
+    try {
+      await expect(
+        profile.verifyPreservedProfile({
+          requiresInterruption: false,
+        }),
+      ).resolves.toMatchObject({ conversationEvidencePreserved: true });
+      expect(profile.readTerminal).toHaveBeenCalledWith("tab", "Codex");
+      expect(profile.action).toHaveBeenCalledWith(
+        "tab",
+        "wait_until_ready",
+        {
+          timeoutMs: 30_000,
+        },
+      );
+    } finally {
+      await fs.rm(profile.dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a replaced Codex execution after a compatible upgrade despite readiness and preserved conversation evidence", async () => {
+    const { profile, receiptPath } = await installedProfile();
+    try {
+      await fs.writeFile(
+        receiptPath,
+        JSON.stringify({
+          ...profile.seeded.receipt,
+          executionId: replacementExecutionId,
+        }),
+      );
+      await expect(
+        profile.verifyPreservedProfile({
+          requiresInterruption: false,
+        }),
+      ).rejects.toThrow(
+        /compatible upgrade must preserve the Codex execution/i,
+      );
+    } finally {
+      await fs.rm(profile.dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts a new Codex execution when recovering after a confirmed interruption", async () => {
+    const { profile, workspace } = await installedProfile();
+    profile.interruptionConfirmed = true;
+    for (const tab of workspace.tabs) tab.status = "exited";
+    workspace.tabs[1].recovery = {
+      canResume: true,
+      conversationId: profile.seeded.conversationId,
+    };
+    try {
+      await expect(
+        profile.verifyPreservedProfile({
+          requiresInterruption: true,
+        }),
+      ).resolves.toMatchObject({
+        conversationEvidencePreserved: true,
+        promptReplayed: false,
+      });
+      expect((await profile.readConversation()).receipt.executionId).toBe(
+        replacementExecutionId,
+      );
+      expect(profile.json).toHaveBeenCalledWith(
+        "POST",
+        "/api/tabs/tab/recover",
+        {
+          action: "resume-conversation",
+          sessionId: profile.seeded.conversationId,
+        },
+      );
+      expect(profile.action).toHaveBeenCalledWith(
+        "tab",
+        "wait_until_ready",
+        {
+          timeoutMs: 30_000,
+        },
+      );
+    } finally {
+      await fs.rm(profile.dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("interrupted native conversation recovery", () => {
