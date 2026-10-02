@@ -308,18 +308,60 @@ def extract_line_symbols(suffix: str, text: str) -> list[CodeSymbol]:
 
 
 def extract_c_function_name(line: str) -> str | None:
+    # Without C++ name lookup, '<' cannot reliably distinguish a template from
+    # comparison or shift expressions. Look for the supported declaration
+    # suffix after an ungrouped '>'; each candidate is consumed once.
+    # This line-pattern extractor may recognize a suffix in an incomplete
+    # template head; it does not validate template arguments as a compiler does.
     template_head = C_TEMPLATE_HEAD_RE.match(line)
     syntax = c_declaration_characters(line, template_head.end() if template_head else 0)
-    if template_head and not consume_c_template_head(syntax):
-        return None
+    seeking_declaration = bool(template_head)
     declaration_chars = []
+    closing_groups = []
+    name = None
     for char in syntax:
-        if char == "(":
-            break
-        declaration_chars.append(char)
-    else:
-        return None
-    declaration = "".join(declaration_chars).rstrip()
+        if name and not closing_groups:
+            if char.isspace():
+                continue
+            if char in "{;":
+                return name
+            if not template_head or char == ">":
+                return None
+            name = None
+
+        if char in ";{}":
+            return None
+        if char in "([":
+            if not closing_groups:
+                if char == "(" and not seeking_declaration:
+                    name = c_function_declaration_name("".join(declaration_chars), template_candidate=bool(template_head))
+                declaration_chars.clear()
+                seeking_declaration = bool(template_head)
+            closing_groups.append(")" if char == "(" else "]")
+        elif char in ")]":
+            if not closing_groups or closing_groups.pop() != char:
+                return None
+        elif not closing_groups:
+            if seeking_declaration:
+                if char == ">":
+                    seeking_declaration = False
+            elif not declaration_chars and (char.isspace() or template_head and char == ">"):
+                continue
+            elif (
+                char.isalpha() or char == "_"
+                or declaration_chars and (char.isalnum() or char.isspace() or char in ":~*&<>,")
+            ):
+                declaration_chars.append(char)
+            elif template_head:
+                declaration_chars.clear()
+                seeking_declaration = True
+            else:
+                return None
+    return None
+
+
+def c_function_declaration_name(declaration: str, *, template_candidate: bool) -> str | None:
+    declaration = declaration.rstrip()
     name_start = len(declaration)
     while name_start and (declaration[name_start - 1].isalnum() or declaration[name_start - 1] in "_:~"):
         name_start -= 1
@@ -327,43 +369,11 @@ def extract_c_function_name(line: str) -> str | None:
     prefix = declaration[:name_start].strip()
     if not C_FUNCTION_NAME_RE.fullmatch(name) or not C_DECLARATION_PREFIX_RE.fullmatch(prefix):
         return None
+    if template_candidate and "," in prefix and "<" not in prefix:
+        return None
     if name in SKIP_CALLS or prefix.split(maxsplit=1)[0] in SKIP_CALLS:
         return None
-
-    depth = 1
-    for char in syntax:
-        if char in ";{}":
-            return None
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-            if depth == 0:
-                terminator = next((char for char in syntax if not char.isspace()), None)
-                return name if terminator in ("{", ";") else None
-    return None
-
-
-def consume_c_template_head(syntax: Iterator[str]) -> bool:
-    depth = 1
-    grouped_depth = 0
-    for char in syntax:
-        if char in ";{}":
-            return False
-        if char in "([":
-            grouped_depth += 1
-        elif char in ")]":
-            grouped_depth -= 1
-            if grouped_depth < 0:
-                return False
-        elif not grouped_depth:
-            if char == "<":
-                depth += 1
-            elif char == ">":
-                depth -= 1
-                if depth == 0:
-                    return True
-    return False
+    return name
 
 
 def c_declaration_characters(line: str, offset: int) -> Iterator[str]:

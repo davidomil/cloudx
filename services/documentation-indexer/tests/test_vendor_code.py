@@ -20,6 +20,23 @@ CPP_TEMPLATE_DECLARATIONS = [
     ("template <template <class...> class Container, class... Args> void store(Container<Args...> values);", "store"),
     ("template <int N = (3 > 4), char C = '>'> void configure();", "configure"),
     ("template <typename T = void (*)(int)> void callback(T handler);", "callback"),
+    ("template <template<class> class C, void F()> void function_parameter();", "function_parameter"),
+]
+CPP_OPERATOR_TEMPLATE_DECLARATIONS = [
+    ("template <int N = 1 << 4> void shifted();", "shifted"),
+    ("template <bool B = 1 < 4> void compared();", "compared"),
+    ("template <int N = 2, int S = N << 1> void shifted_parameter();", "shifted_parameter"),
+    ("template <int N = 2, bool B = N < 4> void compared_parameter();", "compared_parameter"),
+    ("template <int N = 2, bool B = N <= 4> void compared_equal();", "compared_equal"),
+    ("template <int N = 2, bool B = N < 4 && 1 < 2> void compared_chain();", "compared_chain"),
+    ("template <int N = (16 >> 1)> void shifted_right();", "shifted_right"),
+    ("template <bool B = (4 >= 1)> void compared_greater();", "compared_greater"),
+    ("template <bool B = Value<1>::value < 4> void compared_member();", "compared_member"),
+    ("template <class T = Flag<1 < 4>> void compared_nested();", "compared_nested"),
+    ("template <int N = Value<1 << 4>::value> void shifted_nested();", "shifted_nested"),
+    ("template <int N = 1, bool B = N < 4, class T = Box<Box<int>>> void mixed_defaults();", "mixed_defaults"),
+    ("template <class T = Box<Box<int>>> Box<T> nested_type();", "nested_type"),
+    ("template <template<class> class C, void (*F)()> void callback_template();", "callback_template"),
 ]
 CPP_LITERAL_AND_COMMENT_DECLARATIONS = [
     ("void quote(char c = ')');", "quote"),
@@ -42,13 +59,18 @@ CPP_LITERAL_AND_COMMENT_DECLARATIONS = [
     "unsigned long " * 2_000 + "broken(void" + ")" * 2_000 + ";",
     "template <" + "typename T = " * 2_000 + "void broken();",
     "template <" + "Type<" * 2_000 + "void broken();",
+    "template <int N = " + "1 << 2 < " * 2_000 + "void broken();",
+    "template <int N = " + "Value<1>() + " * 2_000 + "void broken();",
+    "template <" + "Value<1> long ignored(int), " * 2_000 + "void broken();",
+    "template <typename T> void broken() > void accepted();",
     "void broken(const char *text = \"" + "\\\"( /* " * 2_000,
     "void broken(int value /* " + "( /* \" " * 2_000,
     'void broken(const char *text = R"tag(' + '") ( /* ' * 2_000,
     "void broken(int value // " + ") ; " * 2_000,
 ], ids=[
     "firmware-comment", "prose", "invalid-declaration", "unclosed-parameters", "unbalanced-parameters",
-    "unclosed-template", "unclosed-nested-template", "unclosed-string", "unclosed-comment",
+    "unclosed-template", "unclosed-nested-template", "unclosed-operator-template", "unclosed-template-calls", "invalid-template-candidates", "stray-template-suffix",
+    "unclosed-string", "unclosed-comment",
     "unclosed-raw-string", "line-comment-terminator",
 ])
 def test_c_family_rejects_comments_and_malformed_declarations_within_deadline(suffix, source):
@@ -69,6 +91,7 @@ assert extract_line_symbols(suffix, source) == []
 @pytest.mark.parametrize(("declaration", "name"), [
     ("static inline unsigned long read_register(void);", "read_register"),
     ("const char *device_name(void);", "device_name"),
+    ("int value, read_value(void);", "read_value"),
     ("void install_handler(void (*handler)(int, void (*done)(void)));", "install_handler"),
     ("void reset(void) { write_register(1); }", "reset"),
     ("void reset(void) { write_register(1); } // trailing (comment)", "reset"),
@@ -91,13 +114,13 @@ def test_cpp_extracts_references_templates_and_qualified_names(suffix, declarati
 
 
 @pytest.mark.parametrize("suffix", (".cpp", ".hpp"))
-@pytest.mark.parametrize(("declaration", "name"), CPP_TEMPLATE_DECLARATIONS + CPP_LITERAL_AND_COMMENT_DECLARATIONS)
+@pytest.mark.parametrize(("declaration", "name"), CPP_TEMPLATE_DECLARATIONS + CPP_OPERATOR_TEMPLATE_DECLARATIONS + CPP_LITERAL_AND_COMMENT_DECLARATIONS)
 def test_cpp_preserves_template_defaults_packs_literals_and_comments(suffix, declaration, name):
     assert extract_line_symbols(suffix, declaration) == [CodeSymbol("function", name, 1)]
 
 
 @pytest.mark.parametrize("suffix", (".cpp", ".hpp"))
-@pytest.mark.parametrize("declarations", [CPP_TEMPLATE_DECLARATIONS, CPP_LITERAL_AND_COMMENT_DECLARATIONS], ids=["templates", "literals-and-comments"])
+@pytest.mark.parametrize("declarations", [CPP_TEMPLATE_DECLARATIONS, CPP_OPERATOR_TEMPLATE_DECLARATIONS, CPP_LITERAL_AND_COMMENT_DECLARATIONS], ids=["templates", "operator-templates", "literals-and-comments"])
 def test_generated_documentation_retains_cpp_template_and_parameter_symbols(suffix, declarations):
     source = "\n".join(declaration for declaration, _ in declarations)
     generated = generate_vendor_code_documentation(

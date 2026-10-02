@@ -246,7 +246,6 @@ function subscribeTerminalSocket(view: TerminalView): void {
         if (isCurrentSocket()) fitAndResize(view);
       });
     } else if (message.type === "data" && message.data) {
-      view.selectionCopy?.preserveBeforeRedraw();
       view.terminal.write(message.data);
     }
   });
@@ -447,7 +446,6 @@ function sendTerminalInput(view: TerminalView, data: string): boolean {
 }
 
 function reportImagePasteFailure(view: TerminalView, message: string): void {
-  view.selectionCopy?.preserveBeforeRedraw();
   view.terminal.writeln(`\r\nCloudx image paste failed: ${message}`);
 }
 

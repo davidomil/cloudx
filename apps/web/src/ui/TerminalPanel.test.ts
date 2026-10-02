@@ -35,6 +35,7 @@ vi.mock("@xterm/xterm", () => ({
     readonly writelnCalls: string[] = [];
     readonly writeCalls: string[] = [];
     readonly inputHandlers: Array<(data: string) => void> = [];
+    readonly _core = { _inputHandler: { parse: (_data: string) => undefined } };
 
     constructor(options: Record<string, unknown>) {
       this.options = options;
@@ -58,10 +59,12 @@ vi.mock("@xterm/xterm", () => ({
 
     writeln(data = ""): void {
       this.writelnCalls.push(data);
+      this._core._inputHandler.parse(`${data}\r\n`);
     }
 
     write(data: string, callback?: () => void): void {
       this.writeCalls.push(data);
+      this._core._inputHandler.parse(data);
       callback?.();
     }
 

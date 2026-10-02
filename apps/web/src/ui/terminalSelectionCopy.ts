@@ -1,5 +1,6 @@
 import type { Terminal } from "@xterm/xterm";
 import { copyTextToClipboard } from "./clipboard.js";
+import { onBeforeTerminalWrite } from "./terminalWriteBoundary.js";
 
 /** Keeps the text selected by the user independent of xterm's mutable screen. */
 export class TerminalSelectionCopy {
@@ -13,8 +14,10 @@ export class TerminalSelectionCopy {
   private readonly menu = document.createElement("div");
   private readonly events = new AbortController();
   private readonly selectionListener;
+  private readonly writeListener;
 
   constructor(private readonly terminal: Terminal, private readonly container: HTMLElement) {
+    this.writeListener = onBeforeTerminalWrite(terminal, () => this.preserveBeforeRedraw());
     this.panel.className = "terminal-saved-selection";
     this.panel.setAttribute("aria-label", "Saved terminal selection");
     this.preview.readOnly = true;
@@ -66,6 +69,7 @@ export class TerminalSelectionCopy {
   dispose(): void {
     this.disposed = true;
     this.events.abort();
+    this.writeListener.dispose();
     this.selectionListener.dispose();
     this.clear();
     this.panel.remove();
