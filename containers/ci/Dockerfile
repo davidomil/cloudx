@@ -26,9 +26,10 @@ COPY apps/server/package.json apps/server/package.json
 COPY apps/web/package.json apps/web/package.json
 COPY packages/plugin-api/package.json packages/plugin-api/package.json
 COPY packages/shared/package.json packages/shared/package.json
+COPY scripts/ci/cache-historical-dependencies.mjs scripts/ci/cache-historical-dependencies.mjs
 
 RUN npm ci --ignore-scripts \
-    && npm cache add smol-toml@1.7.0 \
+    && node scripts/ci/cache-historical-dependencies.mjs \
     && npm cache verify
 
 COPY services/asr /opt/cloudx-services/asr

@@ -43,9 +43,13 @@ the initial native review-scope fixture uses
 `4083e1204ca86a84e3722248bb619a644326e34e`. These retain the tested Forge
 contracts without depending on discarded pre-rebase branch commits.
 Historical builds install their locked dependencies offline. After `npm ci`,
-run `npm cache add smol-toml@1.7.0` before these tests: CloudX 0.1.3 pins that
-version while the current lockfile pins 1.7.1. Both the TypeScript job and the
-isolated verifier image seed this extra dependency before offline execution.
+run `node scripts/ci/cache-historical-dependencies.mjs` before these tests.
+The helper caches exact versions required by the historical fixtures that the
+current install no longer downloads, including CloudX 0.1.3's smol-toml 1.7.0.
+Its regression compares every historical target's lockfile with the current
+lockfile so dependency upgrades cannot silently leave the offline cache incomplete.
+Both the TypeScript job and the isolated verifier image run the helper before
+offline execution; these cached packages do not enter the current install.
 
 Forge migration cases that originated on development branches use the
 [checked-in historical fixtures](../../scripts/fixtures/forge-history/README.md).
