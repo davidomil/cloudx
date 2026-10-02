@@ -105,14 +105,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/cloudx-lifecycle-browsers
       SOURCE_SHA: ${{ needs.lifecycle-revisions.outputs.source-sha }}
       TARGET_SHA: ${{ needs.lifecycle-revisions.outputs.target-sha }}
     steps:
-      - name: Initialize lifecycle evidence before setup
+      - name: Initialize lifecycle evidence and browser path before setup
         run: |
           mkdir -p "$RUNNER_TEMP/lifecycle-install"
           printf '{"scenario":"install","sourceSha":"%s","targetSha":"%s","result":"setup-started"}\n' "$SOURCE_SHA" "$TARGET_SHA" > "$RUNNER_TEMP/lifecycle-install/request.json"
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s/cloudx-lifecycle-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Free unused runner SDKs for lifecycle staging
         id: lifecycle-space
         timeout-minutes: 5
@@ -148,14 +148,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/cloudx-lifecycle-browsers
       SOURCE_SHA: ${{ needs.lifecycle-revisions.outputs.source-sha }}
       TARGET_SHA: ${{ needs.lifecycle-revisions.outputs.target-sha }}
     steps:
-      - name: Initialize lifecycle evidence before setup
+      - name: Initialize lifecycle evidence and browser path before setup
         run: |
           mkdir -p "$RUNNER_TEMP/lifecycle-upgrade"
           printf '{"scenario":"upgrade","sourceSha":"%s","targetSha":"%s","result":"setup-started"}\n' "$SOURCE_SHA" "$TARGET_SHA" > "$RUNNER_TEMP/lifecycle-upgrade/request.json"
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s/cloudx-lifecycle-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Free unused runner SDKs for lifecycle staging
         id: lifecycle-space
         timeout-minutes: 5
