@@ -1843,6 +1843,43 @@ describe("Codex conversation recovery after process loss", () => {
     });
   });
 
+  it.each([false, true])("clears stale recovery input when cached navigation becomes unconfirmed, including reconnect: %s", reconnect => {
+    return withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const selection = factory.bridgeLaunch().selection;
+      const stale = { ...previous.restoreInput?.(), resume: { mode: "session", sessionId: conversationId } };
+      if (reconnect) {
+        Object.assign(factory.process!, { detach: vi.fn() });
+        previous.detach?.();
+      }
+      await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "unconfirmed", reason: "cached-navigation", tabId: tab.id, executionId: selection.executionId }));
+      Object.assign(factory, { attach: vi.fn(async () => factory.process!) });
+      const session = reconnect ? await plugin.restoreSession({ tab, cwd: root, controls, initialInput: stale }) : previous;
+      await vi.waitFor(() => expect(session.restoreInput?.()).toHaveProperty("codexIdentityError", expect.stringContaining("Select a saved session")));
+      expect(session.restoreInput?.()).not.toHaveProperty("resume");
+      expect(controls.setRestoreInput).toHaveBeenLastCalledWith(session.restoreInput?.());
+      const description = await plugin.describeRecovery({ tab, cwd: root, controls, initialInput: stale });
+      expect(description).toEqual({ canResume: false, message: expect.stringContaining("Select a saved session") });
+      session.stop?.();
+    });
+  });
+
+  it("keeps the durable invalidation when restore-input persistence fails", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const setRestoreInput = vi.fn();
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput };
+      const session = await plugin.createSession({ tab, cwd: root, controls });
+      const selection = factory.bridgeLaunch().selection;
+      setRestoreInput.mockRejectedValue(new Error("Persistence unavailable"));
+      await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "unconfirmed", reason: "cached-navigation", tabId: tab.id, executionId: selection.executionId }));
+      await vi.waitFor(() => expect(session.restoreInput?.()).toHaveProperty("codexIdentityError", expect.stringContaining("Persistence unavailable")));
+      expect(session.restoreInput?.()).not.toHaveProperty("resume");
+      expect(await plugin.describeRecovery({ tab, cwd: root, controls, initialInput: session.restoreInput?.() })).toEqual({ canResume: false, message: expect.stringContaining("Select a saved session") });
+      session.stop?.();
+    });
+  });
+
   it("keeps selected identity through web reconnection without another launch or prompt", async () => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };

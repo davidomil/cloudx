@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -54,6 +55,7 @@ LANGUAGE_BY_SUFFIX = {
 C_FAMILY_SUFFIXES = {".c", ".h", ".cpp", ".hpp"}
 C_FUNCTION_NAME_RE = re.compile(r"[A-Za-z_~][\w:~]*")
 C_DECLARATION_PREFIX_RE = re.compile(r"[A-Za-z_][\w\s:*&<>,]*")
+C_TEMPLATE_HEAD_RE = re.compile(r"\s*template\s*<")
 
 SYMBOL_PATTERNS = {
     ".c": [
@@ -306,10 +308,18 @@ def extract_line_symbols(suffix: str, text: str) -> list[CodeSymbol]:
 
 
 def extract_c_function_name(line: str) -> str | None:
-    declaration, opening, parameters = line.partition("(")
-    if not opening:
+    template_head = C_TEMPLATE_HEAD_RE.match(line)
+    syntax = c_declaration_characters(line, template_head.end() if template_head else 0)
+    if template_head and not consume_c_template_head(syntax):
         return None
-    declaration = declaration.rstrip()
+    declaration_chars = []
+    for char in syntax:
+        if char == "(":
+            break
+        declaration_chars.append(char)
+    else:
+        return None
+    declaration = "".join(declaration_chars).rstrip()
     name_start = len(declaration)
     while name_start and (declaration[name_start - 1].isalnum() or declaration[name_start - 1] in "_:~"):
         name_start -= 1
@@ -321,7 +331,7 @@ def extract_c_function_name(line: str) -> str | None:
         return None
 
     depth = 1
-    for offset, char in enumerate(parameters):
+    for char in syntax:
         if char in ";{}":
             return None
         if char == "(":
@@ -329,8 +339,76 @@ def extract_c_function_name(line: str) -> str | None:
         elif char == ")":
             depth -= 1
             if depth == 0:
-                return name if parameters[offset + 1:].lstrip().startswith(("{", ";")) else None
+                terminator = next((char for char in syntax if not char.isspace()), None)
+                return name if terminator in ("{", ";") else None
     return None
+
+
+def consume_c_template_head(syntax: Iterator[str]) -> bool:
+    depth = 1
+    grouped_depth = 0
+    for char in syntax:
+        if char in ";{}":
+            return False
+        if char in "([":
+            grouped_depth += 1
+        elif char in ")]":
+            grouped_depth -= 1
+            if grouped_depth < 0:
+                return False
+        elif not grouped_depth:
+            if char == "<":
+                depth += 1
+            elif char == ">":
+                depth -= 1
+                if depth == 0:
+                    return True
+    return False
+
+
+def c_declaration_characters(line: str, offset: int) -> Iterator[str]:
+    """Scan forward once, keeping literal and comment contents out of syntax."""
+    while offset < len(line):
+        char = line[offset]
+        if line.startswith("//", offset):
+            return
+        if line.startswith("/*", offset):
+            end = line.find("*/", offset + 2)
+            if end < 0:
+                return
+            offset = end + 2
+            yield " "
+        elif line.startswith('R"', offset):
+            opening = line.find("(", offset + 2, offset + 19)
+            if opening < 0:
+                return
+            delimiter = line[offset + 2:opening]
+            if any(char.isspace() or char in "\\)" for char in delimiter):
+                return
+            closing = ")" + delimiter + '"'
+            end = line.find(closing, opening + 1)
+            if end < 0:
+                return
+            offset = end + len(closing)
+            yield "0"
+        elif char in "\"'":
+            quote = char
+            offset += 1
+            while offset < len(line) and line[offset] != quote:
+                offset += 2 if line[offset] == "\\" else 1
+            if offset >= len(line):
+                return
+            offset += 1
+            yield "0"
+        elif char in "0123456789" and (not offset or not (line[offset - 1].isalnum() or line[offset - 1] == "_")):
+            end = offset + 1
+            while end < len(line) and (line[end].isalnum() or line[end] in "_.'"):
+                end += 1
+            yield from line[offset:end]
+            offset = end
+        else:
+            yield char
+            offset += 1
 
 
 def extract_imports(suffix: str, lines: list[str]) -> list[str]:

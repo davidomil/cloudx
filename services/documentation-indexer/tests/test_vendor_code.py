@@ -4,11 +4,33 @@ import sys
 
 import pytest
 
-from cloudx_documentation_indexer.vendor_code import CodeSymbol, extract_line_symbols
+from cloudx_documentation_indexer.vendor_code import (
+    CodeSymbol,
+    VendorCodeSource,
+    extract_line_symbols,
+    generate_vendor_code_documentation,
+)
 
 
 C_SUFFIXES = (".c", ".h", ".cpp", ".hpp")
 FIRMWARE_POLICY_COMMENT = "  a policy to allow an option to force a firmware image update when the abort reason is due to the new"
+CPP_TEMPLATE_DECLARATIONS = [
+    ("template <typename T = int> T read();", "read"),
+    ("template <class... Args> void send(Args... args);", "send"),
+    ("template <template <class...> class Container, class... Args> void store(Container<Args...> values);", "store"),
+    ("template <int N = (3 > 4), char C = '>'> void configure();", "configure"),
+    ("template <typename T = void (*)(int)> void callback(T handler);", "callback"),
+]
+CPP_LITERAL_AND_COMMENT_DECLARATIONS = [
+    ("void quote(char c = ')');", "quote"),
+    ("void read(int x /* (comment */);", "read"),
+    (r"void escaped_quote(char c = '\'');", "escaped_quote"),
+    (r'void escaped_text(const char *text = "\" ) ; { // /*");', "escaped_text"),
+    (r'''void escaped_backslash(const char *text = "\\", char c = '(');''', "escaped_backslash"),
+    ('void raw_text(const char *text = R"tag(" ) ; { /*)tag");', "raw_text"),
+    ("void count(int value = 1'000);", "count"),
+    ("void documented(int value /* ) ; { \" ' */) /* ( */;", "documented"),
+]
 
 
 @pytest.mark.parametrize("suffix", C_SUFFIXES)
@@ -18,7 +40,17 @@ FIRMWARE_POLICY_COMMENT = "  a policy to allow an option to force a firmware ima
     "unsigned long " * 2_000 + "broken(void) invalid;",
     "unsigned long " * 2_000 + "broken(" + "(" * 2_000 + ";",
     "unsigned long " * 2_000 + "broken(void" + ")" * 2_000 + ";",
-], ids=["firmware-comment", "prose", "invalid-declaration", "unclosed-parameters", "unbalanced-parameters"])
+    "template <" + "typename T = " * 2_000 + "void broken();",
+    "template <" + "Type<" * 2_000 + "void broken();",
+    "void broken(const char *text = \"" + "\\\"( /* " * 2_000,
+    "void broken(int value /* " + "( /* \" " * 2_000,
+    'void broken(const char *text = R"tag(' + '") ( /* ' * 2_000,
+    "void broken(int value // " + ") ; " * 2_000,
+], ids=[
+    "firmware-comment", "prose", "invalid-declaration", "unclosed-parameters", "unbalanced-parameters",
+    "unclosed-template", "unclosed-nested-template", "unclosed-string", "unclosed-comment",
+    "unclosed-raw-string", "line-comment-terminator",
+])
 def test_c_family_rejects_comments_and_malformed_declarations_within_deadline(suffix, source):
     result = subprocess.run(
         [sys.executable, "-c", """
@@ -56,6 +88,28 @@ def test_c_family_extracts_declarations_without_scanning_bodies_or_trailing_comm
 ])
 def test_cpp_extracts_references_templates_and_qualified_names(suffix, declaration, name):
     assert extract_line_symbols(suffix, declaration) == [CodeSymbol("function", name, 1)]
+
+
+@pytest.mark.parametrize("suffix", (".cpp", ".hpp"))
+@pytest.mark.parametrize(("declaration", "name"), CPP_TEMPLATE_DECLARATIONS + CPP_LITERAL_AND_COMMENT_DECLARATIONS)
+def test_cpp_preserves_template_defaults_packs_literals_and_comments(suffix, declaration, name):
+    assert extract_line_symbols(suffix, declaration) == [CodeSymbol("function", name, 1)]
+
+
+@pytest.mark.parametrize("suffix", (".cpp", ".hpp"))
+@pytest.mark.parametrize("declarations", [CPP_TEMPLATE_DECLARATIONS, CPP_LITERAL_AND_COMMENT_DECLARATIONS], ids=["templates", "literals-and-comments"])
+def test_generated_documentation_retains_cpp_template_and_parameter_symbols(suffix, declarations):
+    source = "\n".join(declaration for declaration, _ in declarations)
+    generated = generate_vendor_code_documentation(
+        title="C++ API", uri="vendor://api",
+        sources=[VendorCodeSource(f"api{suffix}", source.encode(), f"vendor://api{suffix}")],
+    )
+    assert generated.manifest["coveredFiles"][0]["symbols"] == [
+        {"kind": "function", "name": name, "line": line}
+        for line, (_, name) in enumerate(declarations, start=1)
+    ]
+    for line, (_, name) in enumerate(declarations, start=1):
+        assert f"- function `{name}` at line {line}" in generated.content.decode()
 
 
 @pytest.mark.parametrize("suffix", C_SUFFIXES)

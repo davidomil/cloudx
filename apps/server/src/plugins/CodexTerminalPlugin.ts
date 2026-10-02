@@ -200,6 +200,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
+        delete restoredInput.resume;
+        void Promise.resolve().then(() => input.controls.setRestoreInput?.(restoredInput)).catch(error => {
+          restoredInput = { ...restoredInput, codexIdentityError: `${restoredInput.codexIdentityError} Restore-state persistence failed: ${error instanceof Error ? error.message : String(error)}` };
+        });
       }),
       applyRuntimeContext: async (runtimeContext) => {
         const nextTemplate = templateFromRuntimeContext(runtimeContext);
@@ -243,6 +247,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
+        delete restoredInput.resume;
+        void Promise.resolve().then(() => input.controls.setRestoreInput?.(restoredInput)).catch(error => {
+          restoredInput = { ...restoredInput, codexIdentityError: `${restoredInput.codexIdentityError} Restore-state persistence failed: ${error instanceof Error ? error.message : String(error)}` };
+        });
       }),
       applyRuntimeContext: async (runtimeContext) => {
         const template = templateFromRuntimeContext(runtimeContext);

@@ -240,11 +240,13 @@ function subscribeTerminalSocket(view: TerminalView): void {
       return;
     }
     if (message.type === "screen" && message.data !== undefined && message.cols && message.rows) {
+      view.selectionCopy?.preserveBeforeRedraw();
       view.terminal.resize(message.cols, message.rows);
       view.terminal.write(`${TERMINAL_RESET_SEQUENCE}${message.data}`, () => {
         if (isCurrentSocket()) fitAndResize(view);
       });
     } else if (message.type === "data" && message.data) {
+      view.selectionCopy?.preserveBeforeRedraw();
       view.terminal.write(message.data);
     }
   });
@@ -445,6 +447,7 @@ function sendTerminalInput(view: TerminalView, data: string): boolean {
 }
 
 function reportImagePasteFailure(view: TerminalView, message: string): void {
+  view.selectionCopy?.preserveBeforeRedraw();
   view.terminal.writeln(`\r\nCloudx image paste failed: ${message}`);
 }
 
@@ -454,10 +457,15 @@ function fitAndResize(view: TerminalView, focus = false): void {
   }
   const fontSize = responsiveTerminalFontSize(view.container, view.uiScale);
   if (view.terminal.options.fontSize !== fontSize) {
+    view.selectionCopy?.preserveBeforeRedraw();
     view.terminal.options.fontSize = fontSize;
   }
+  const dimensions = view.fit.proposeDimensions();
+  if (dimensions && (dimensions.cols !== view.terminal.cols || dimensions.rows !== view.terminal.rows)) {
+    view.selectionCopy?.preserveBeforeRedraw();
+  }
   view.fit.fit();
-  trimTerminalRowsToViewport(view.terminal);
+  trimTerminalRowsToViewport(view);
   if (focus) {
     view.terminal.focus();
   }
@@ -473,7 +481,8 @@ function fitAndResize(view: TerminalView, focus = false): void {
   }
 }
 
-function trimTerminalRowsToViewport(terminal: Terminal): void {
+function trimTerminalRowsToViewport(view: TerminalView): void {
+  const { terminal } = view;
   const viewport = terminal.element?.querySelector(".xterm-viewport");
   const screen = terminal.element?.querySelector(".xterm-screen");
   if (!(viewport instanceof HTMLElement) || !(screen instanceof HTMLElement)) {
@@ -481,6 +490,7 @@ function trimTerminalRowsToViewport(terminal: Terminal): void {
   }
   const nextRows = rowsFittingTerminalViewport(terminal.rows, viewport.getBoundingClientRect().height, screen.getBoundingClientRect().height);
   if (nextRows < terminal.rows) {
+    view.selectionCopy?.preserveBeforeRedraw();
     terminal.resize(terminal.cols, nextRows);
   }
 }

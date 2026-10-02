@@ -55,6 +55,9 @@ export class CodexConversationRecovery {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
     }
+    if (isRecord(value) && value.version === 2 && value.authority === "unconfirmed" && value.reason === "cached-navigation" &&
+        typeof value.tabId === "string" && value.tabId && isCodexConversationId(value.executionId))
+      throw new Error("Codex can switch cached conversations without confirming its foreground identity. Select a saved session.");
     if (!isRecord(value) || !isCodexConversationId(value.sessionId) || typeof value.cwd !== "string" || !path.isAbsolute(value.cwd) ||
         value.transcriptPath != null && (typeof value.transcriptPath !== "string" || !path.isAbsolute(value.transcriptPath))) {
       throw new Error("Saved Codex conversation identity is invalid.");

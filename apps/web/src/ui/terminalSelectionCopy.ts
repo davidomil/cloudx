@@ -38,12 +38,17 @@ export class TerminalSelectionCopy {
     container.addEventListener("copy", this.onCopy, capture);
     container.addEventListener("contextmenu", this.onContextMenu, capture);
     terminal.element!.addEventListener("mousedown", this.onMouseDown, capture);
-    // Window bubbling runs after xterm's document mouse handler updates its selection.
-    window.addEventListener("mousemove", this.onMouseMove, { signal: this.events.signal });
     window.addEventListener("mouseup", this.onMouseUp, { signal: this.events.signal });
     this.selectionListener = terminal.onSelectionChange(() => {
       if (this.selecting || !this.text) this.capture();
     });
+  }
+
+  preserveBeforeRedraw(): void {
+    if (!this.selecting) return;
+    this.capture();
+    // Once cells change, extending the live range must not replace the saved text.
+    if (this.text) this.selecting = false;
   }
 
   clear = (): void => {
@@ -98,10 +103,6 @@ export class TerminalSelectionCopy {
     this.selecting = true;
   };
 
-  private onMouseMove = (): void => {
-    if (this.selecting) this.capture();
-  };
-
   private onMouseUp = (): void => {
     if (this.selecting) this.capture();
     this.selecting = false;
@@ -119,7 +120,7 @@ export class TerminalSelectionCopy {
   };
 
   private onCopy = (event: ClipboardEvent): void => {
-    if (!this.text || !event.clipboardData) return;
+    if (!this.text || !event.clipboardData || event.target === this.preview) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     event.clipboardData.setData("text/plain", this.text);

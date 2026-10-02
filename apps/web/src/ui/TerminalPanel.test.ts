@@ -15,6 +15,10 @@ const terminalPanelMocks = vi.hoisted(() => ({
 
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class MockFitAddon {
+    proposeDimensions(): undefined {
+      return undefined;
+    }
+
     fit(): void {
       terminalPanelMocks.fitCalls.push(this);
     }

@@ -83,7 +83,7 @@ async function cells(page: Page) {
   });
 }
 
-async function select(
+async function dragSelection(
   page: Page,
   from: [number, number],
   to: [number, number],
@@ -101,8 +101,100 @@ async function select(
     size.y + (to[1] + 0.5) * size.height,
     { steps: 8 },
   );
+}
+
+async function select(
+  page: Page,
+  from: [number, number],
+  to: [number, number],
+  shift = false,
+) {
+  await dragSelection(page, from, to, shift);
   await page.mouse.up();
   if (shift) await page.keyboard.up("Shift");
+}
+
+test("continues extending a drag when layout measurement leaves the terminal unchanged", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  const original = "original /tmp/answer.ts";
+  stream.data(`\x1bc${original}`);
+  await expect(page.locator(".xterm-rows")).toContainText(original);
+  await dragSelection(page, [0, 0], [8, 0]);
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("resize"));
+    return new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+  });
+  const size = await cells(page);
+  await page.mouse.move(
+    size.x + original.length * size.cell + 1,
+    size.y + size.height / 2,
+  );
+  await page.mouse.up();
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(original);
+  expect(stream.input).toEqual([]);
+});
+
+for (const redraw of [
+  "cursor erase",
+  "alternate screen",
+  "screen replay",
+  "resize",
+]) {
+  test(`copies the original drag before mouse release across ${redraw}`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop mouse selection.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page);
+    const original = "original /tmp/answer.ts";
+    stream.data(`\x1bc${original}`);
+    await expect(page.locator(".xterm-rows")).toContainText(original);
+    await dragSelection(page, [0, 0], [original.length, 0]);
+    if (redraw === "screen replay") stream.screen("replaced /tmp/answer.ts");
+    else if (redraw === "alternate screen")
+      stream.data("\x1b[?1049h\x1b[2J\x1b[Hreplaced /tmp/answer.ts");
+    else {
+      if (redraw === "resize")
+        await page.setViewportSize({ width: 900, height: 650 });
+      stream.data("\x1b[1;1H\x1b[2Kreplaced /tmp/answer.ts");
+    }
+    await expect(page.locator(".xterm-rows")).toContainText(
+      "replaced /tmp/answer.ts",
+    );
+    await expect(
+      page.getByRole("textbox", { name: "Selected terminal text" }),
+    ).toHaveValue(original);
+    const size = await cells(page);
+    await page.mouse.move(
+      size.x + (original.length + 3) * size.cell,
+      size.y + size.height / 2,
+    );
+    await page.mouse.up();
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.press("Control+c");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(original);
+    expect(stream.input).toEqual([]);
+  });
 }
 
 for (const gesture of [
@@ -319,40 +411,78 @@ test("keeps one saved selection through bounded scrollback churn and clears it d
   await expect.poll(() => stream.input.join("")).toBe("\x03");
 });
 
-test("retains the snapshot after clipboard denial and supports the browser Copy action on saved text", async ({
-  page,
-  context,
-}, testInfo) => {
-  test.skip(
-    testInfo.project.name !== "desktop-chromium",
-    "Desktop mouse selection.",
-  );
-  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
-  const stream = await terminalStream(page);
-  stream.data("\x1bcclipboard denied");
-  await expect(page.locator(".xterm-rows")).toContainText("clipboard denied");
-  await select(page, [0, 0], [16, 0]);
-  await page.evaluate(() => {
-    navigator.clipboard.writeText = async () => {
-      throw new Error("Permission denied");
-    };
-  });
-  await page
-    .getByRole("button", { name: "Copy selection", exact: true })
-    .click();
-  await expect(page.getByRole("status")).toContainText(
-    "Copy failed: Permission denied",
-  );
-  const preview = page.getByRole("textbox", { name: "Selected terminal text" });
-  await expect(preview).toHaveValue("clipboard denied");
-  await preview.focus();
-  await page.keyboard.press("Control+a");
-  await page.keyboard.press("Control+c");
-  await expect
-    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
-    .toBe("clipboard denied");
-  expect(stream.input).toEqual([]);
-});
+for (const clipboardDenied of [false, true]) {
+  for (const gesture of ["Control+c", "browser copy"]) {
+    test(`copies only the highlighted preview word using ${gesture}, clipboard denied: ${clipboardDenied}`, async ({
+      page,
+      context,
+    }, testInfo) => {
+      test.skip(
+        testInfo.project.name !== "desktop-chromium",
+        "Desktop mouse selection.",
+      );
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const stream = await terminalStream(page);
+      const original = "please run command then inspect the output";
+      stream.data(`\x1bc${original}`);
+      await expect(page.locator(".xterm-rows")).toContainText(original);
+      await select(page, [0, 0], [original.length, 0]);
+      if (clipboardDenied) {
+        await page.evaluate(() => {
+          navigator.clipboard.writeText = async () => {
+            throw new Error("Permission denied");
+          };
+        });
+        await page
+          .getByRole("button", { name: "Copy selection", exact: true })
+          .click();
+        await expect(page.getByRole("status")).toContainText(
+          "Copy failed: Permission denied",
+        );
+      }
+      const preview = page.getByRole("textbox", {
+        name: "Selected terminal text",
+      });
+      await expect(preview).toHaveValue(original);
+      const word = await preview.evaluate((element: HTMLTextAreaElement) => {
+        const style = getComputedStyle(element);
+        const bounds = element.getBoundingClientRect();
+        const measure = document.createElement("canvas").getContext("2d")!;
+        measure.font = style.font;
+        return {
+          x:
+            bounds.x +
+            parseFloat(style.borderLeftWidth) +
+            parseFloat(style.paddingLeft) +
+            measure.measureText("please run com").width,
+          y:
+            bounds.y +
+            parseFloat(style.borderTopWidth) +
+            parseFloat(style.paddingTop) +
+            parseFloat(style.fontSize) / 2,
+        };
+      });
+      await page.mouse.dblclick(word.x, word.y);
+      await expect
+        .poll(() =>
+          preview.evaluate((element: HTMLTextAreaElement) =>
+            element.value.slice(element.selectionStart, element.selectionEnd),
+          ),
+        )
+        .toBe("command");
+      if (gesture === "browser copy")
+        expect(await page.evaluate(() => document.execCommand("copy"))).toBe(
+          true,
+        );
+      else await page.keyboard.press(gesture);
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe("command");
+      await expect(preview).toHaveValue(original);
+      expect(stream.input).toEqual([]);
+    });
+  }
+}
 
 test("copies the saved selection while a supported native Codex picker hands off and redraws", async ({
   page,
