@@ -301,6 +301,66 @@ jobs:
   });
 
   it.each([
+    "missing install",
+    "missing upgrade",
+    "container",
+    "conditional skip",
+    "ignored failure",
+    "moving target",
+    "missing evidence",
+    "missing aggregate dependency",
+    "missing aggregate result",
+    "missing revision selection",
+    "missing disk preparation",
+    "unbounded disk preparation",
+    "broad SDK deletion",
+  ])("rejects an optional or unpinned lifecycle gate: %s", (scenario) => {
+    const workflow = parseDocument(
+      fs.readFileSync(".github/workflows/ci.yml", "utf8"),
+    ).toJS();
+    const job = workflow.jobs["installed-upgrade"];
+    if (scenario === "missing install") delete workflow.jobs["clean-install"];
+    if (scenario === "missing upgrade")
+      delete workflow.jobs["installed-upgrade"];
+    if (scenario === "container") job.container = "ubuntu:24.04";
+    if (scenario === "conditional skip") job.if = "false";
+    if (scenario === "ignored failure") job["continue-on-error"] = true;
+    if (scenario === "moving target") job.env.TARGET_SHA = "main";
+    if (scenario === "missing evidence")
+      job.steps = job.steps.filter(
+        (step) => !step.uses?.startsWith("actions/upload-artifact@"),
+      );
+    if (scenario === "missing aggregate dependency")
+      workflow.jobs.aggregate.needs = workflow.jobs.aggregate.needs.filter(
+        (name) => name !== "installed-upgrade",
+      );
+    if (scenario === "missing aggregate result")
+      delete workflow.jobs.aggregate.steps[0].env.INSTALLED_UPGRADE_RESULT;
+    if (scenario === "missing revision selection")
+      delete workflow.jobs["lifecycle-revisions"];
+    if (scenario === "missing disk preparation")
+      job.steps = job.steps.filter((step) => step.id !== "lifecycle-space");
+    if (scenario === "unbounded disk preparation")
+      delete job.steps.find((step) => step.id === "lifecycle-space")[
+        "timeout-minutes"
+      ];
+    if (scenario === "broad SDK deletion") {
+      const space = job.steps.find((step) => step.id === "lifecycle-space");
+      space.run = space.run.replace(
+        "/usr/local/lib/android/sdk",
+        "/usr/local/lib",
+      );
+    }
+    const issues = [];
+    validateWorkflow(process.cwd(), "ci.yml", workflow, issues);
+    expect(issues).toContainEqual(
+      expect.stringMatching(
+        /must require clean-install|must require installed-upgrade|must select immutable supported lifecycle revisions|must reclaim only unused runner SDKs/u,
+      ),
+    );
+  });
+
+  it.each([
     "token",
     "target",
     "output",
