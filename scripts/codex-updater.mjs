@@ -488,7 +488,7 @@ export async function readCodexVersion(
   );
 }
 
-async function verifyCodexLaunch(assistantBin, options, previousAssistantBin) {
+async function verifyCodexLaunch(assistantBin, options, previousAssistantBin, allowStartupRecovery = false) {
   const verifier = fileURLToPath(
     new URL("./codex-runtime-verification.mjs", import.meta.url),
   );
@@ -496,6 +496,7 @@ async function verifyCodexLaunch(assistantBin, options, previousAssistantBin) {
   const args = [verifier, assistantBin, "--shared-state-home", stateHome];
   if (options.env.CLOUDX_DATA_DIR) args.push("--cloudx-data-dir", options.env.CLOUDX_DATA_DIR);
   if (previousAssistantBin && previousAssistantBin !== assistantBin) args.push("--previous-bin", previousAssistantBin);
+  if (allowStartupRecovery) args.push("--allow-startup-recovery", "true");
   try {
     await runCommand(process.execPath, args, {
       ...options,
@@ -640,7 +641,7 @@ export async function updateCodexInstallation({
     const installedVersion = await readCodexVersion(candidate.assistantBin, commandOptions);
     onInstalled?.(installedVersion);
     if (installedVersion !== packageVersion || installedVersion !== target) throw new CodexUpdateError("verification", "Codex reports a different version from the requested npm release. The active installation is unchanged; check the private update log.");
-    await verifyCodexLaunch(candidate.assistantBin, commandOptions, activeVersion ? activeInstallation.assistantBin : undefined);
+    await verifyCodexLaunch(candidate.assistantBin, commandOptions, activeVersion ? activeInstallation.assistantBin : undefined, !selection && Boolean(activeVersion));
     activateCodexSelection(installation.prefix, { version: installedVersion, assistantBin: candidate.assistantBin }, selection?.active ?? null, operationSignal);
     selectedVersion = installedVersion;
     return { outcome: "updated", installedVersion, activeVersion: installedVersion, previousVersion: selection?.active.version ?? null };

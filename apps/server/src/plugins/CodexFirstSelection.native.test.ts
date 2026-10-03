@@ -29,7 +29,12 @@ function completeResponse(response: ServerResponse, text: string) {
   response.end();
 }
 
-it.skipIf(!nativeBinary)("rejects a first selection whose migration breaks the existing CLI while original tabs and Forge workers finish", async () => {
+it.skipIf(!nativeBinary).each([
+  { recovery: false, keepRunning: true, title: "rejects a first selection whose migration breaks the existing CLI while original tabs and Forge workers finish" },
+  { recovery: true, keepRunning: false, title: "recovers the first selection from a CLI already failing startup without live original sessions or changes to retained state" },
+  { recovery: true, keepRunning: true, title: "rejects first-selection startup recovery while original tabs and Forge workers are still running" },
+])("$title", async ({ recovery: recovering, keepRunning }) => {
+  const shouldRecover = recovering && !keepRunning;
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-first-selection-"));
   const home = path.join(root, "home");
   const sqliteHome = path.join(root, "shared-sqlite");
@@ -40,6 +45,7 @@ it.skipIf(!nativeBinary)("rejects a first selection whose migration breaks the e
   const assistantBin = path.join(prefix, "bin/codex");
   const tools = path.join(root, "tools");
   const commandLog = path.join(root, "native-launches.jsonl");
+  const brokenOriginal = path.join(root, "broken-original");
   const sources = new CodexStateSources(data, { CODEX_HOME: home });
   const sessions: PluginSession[] = [];
   const answer = "The original native installation completed the turn.";
@@ -82,10 +88,14 @@ config = (home / "config.toml").read_text()
 match = re.search(r'^sqlite_home\\s*=\\s*(".*")\\s*$', config, re.MULTILINE)
 sqlite_home = pathlib.Path(json.loads(match.group(1))) if match else home
 databases = sorted(sqlite_home.glob("state_*.sqlite"))
-event = {"candidate": candidate, "home": str(home), "sqliteHome": str(sqlite_home), "rejected": False, "migrated": False}
+event = {"candidate": candidate, "home": str(home), "sqliteHome": str(sqlite_home), "rejected": not candidate and pathlib.Path(${JSON.stringify(brokenOriginal)}).is_file(), "migrated": False}
 for database in databases:
     with sqlite3.connect(database) as connection:
-        if candidate and (sqlite_home / "retained-identities.json").is_file():
+        if not candidate and not event["rejected"] and (sqlite_home / "retained-identities.json").is_file():
+            connection.execute("CREATE TABLE IF NOT EXISTS cloudx_original_baseline (version INTEGER)")
+        if candidate and connection.execute("SELECT 1 FROM sqlite_schema WHERE name = 'cloudx_original_baseline'").fetchone():
+            event["rejected"] = True
+        if candidate and ${recovering ? "False" : "True"} and (sqlite_home / "retained-identities.json").is_file():
             assert "cloudx-codex-state-verification-" in str(sqlite_home)
             assert (sqlite_home / "retained-identities.json").is_file()
             connection.execute("CREATE TABLE IF NOT EXISTS cloudx_incompatible_candidate (version INTEGER)")
@@ -146,21 +156,57 @@ else if (process.argv[2] === 'i') {
     await expect.poll(() => Boolean(pendingWorker), { timeout: 15_000 }).toBe(true);
     expect(readCodexSelection(prefix)).toBeNull();
 
+    const retainedDatabases = new Map<string, Buffer>();
+    if (recovering) {
+      if (!keepRunning) await Promise.all(sessions.map(session => session.terminate?.()));
+      await fs.writeFile(brokenOriginal, "The original CLI fails startup before any version selection.\n");
+      for (const file of await fs.readdir(sqliteHome)) {
+        if (/^state_.*\.sqlite(?:-wal)?$/u.test(file)) retainedDatabases.set(file, await fs.readFile(path.join(sqliteHome, file)));
+      }
+      expect(retainedDatabases.size).toBeGreaterThan(0);
+      expect(execFileSync(assistantBin, ["--version"], { encoding: "utf8", env }).trim()).toBe("codex-cli 0.0.0");
+    }
+
     let output = "";
     const result = await updateCodexInstallation({ assistantBin, prefix, targetVersion: version, env, onOutput: (text: string) => { output += text; } }).catch((error: unknown) => error);
 
-    expect(result, output).toMatchObject({ code: "runtime-verification", usableVersion: "0.0.0" });
-    expect(readCodexSelection(prefix)).toBeNull();
-    expect(resolveSelectedCodexCommand(assistantBin)).toBe(assistantBin);
+    if (shouldRecover) {
+      expect(result, output).toMatchObject({ outcome: "updated", activeVersion: version, installedVersion: version, previousVersion: null });
+      const selection = readCodexSelection(prefix)!;
+      expect(selection.active.version).toBe(version);
+      expect(selection.previous).toBeNull();
+      expect(resolveSelectedCodexCommand(assistantBin)).toBe(selection.active.assistantBin);
+      expect(output).toContain("Original Codex already fails native startup on retained state");
+      expect(output).toContain("Native compatibility verified");
+      for (const [file, content] of retainedDatabases) expect(await fs.readFile(path.join(sqliteHome, file)), file).toEqual(content);
+    } else {
+      expect(result, output).toMatchObject({ code: "runtime-verification", usableVersion: "0.0.0" });
+      expect(readCodexSelection(prefix)).toBeNull();
+      expect(resolveSelectedCodexCommand(assistantBin)).toBe(assistantBin);
+    }
     expect(await fs.readFile(entrypoint, "utf8")).toBe(originalExecutable);
     expect(await fs.readFile(manifestPath, "utf8")).toBe(originalManifest);
     expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(originalConfig);
     expect(await fs.readFile(originalTab.recovery.read()!.transcriptPath!, "utf8")).toBe(retainedTranscript);
     const launchLog = await fs.readFile(commandLog, "utf8");
     const launches = launchLog.trim().split("\n").map(line => JSON.parse(line) as { candidate: boolean; sqliteHome: string; migrated: boolean; rejected: boolean });
-    const migration = launches.find(launch => launch.migrated);
-    expect(migration).toMatchObject({ candidate: true, sqliteHome: expect.stringContaining("cloudx-codex-state-verification-") });
-    expect(launches).toContainEqual(expect.objectContaining({ candidate: false, sqliteHome: migration!.sqliteHome, rejected: true }));
+    if (recovering) {
+      const rejected = launches.findIndex(launch => !launch.candidate && launch.rejected);
+      const copiedCandidate = launches.findIndex(launch => launch.candidate && launch.sqliteHome.includes("cloudx-codex-state-verification-"));
+      expect(rejected).toBeGreaterThanOrEqual(0);
+      if (shouldRecover) {
+        expect(copiedCandidate).toBeGreaterThan(rejected);
+        expect(launches.filter(launch => launch.candidate).length).toBeGreaterThanOrEqual(8);
+      } else {
+        expect(copiedCandidate).toBe(-1);
+        expect(output).toContain("original Codex sessions are still running");
+      }
+      expect(launches.some(launch => launch.migrated)).toBe(false);
+    } else {
+      const migration = launches.find(launch => launch.migrated);
+      expect(migration).toMatchObject({ candidate: true, sqliteHome: expect.stringContaining("cloudx-codex-state-verification-") });
+      expect(launches).toContainEqual(expect.objectContaining({ candidate: false, sqliteHome: migration!.sqliteHome, rejected: true }));
+    }
     const retainedIds: string[] = JSON.parse(execFileSync(python, ["-I", "-S", "-c", `
 import json, pathlib, sqlite3, sys
 identities = []
@@ -171,6 +217,7 @@ for file in pathlib.Path(sys.argv[1]).glob("state_*.sqlite"):
 print(json.dumps(identities))
 `, sqliteHome], { encoding: "utf8" }));
     expect(retainedIds).toEqual(expect.arrayContaining([originalTab.threadId, originalWorker.threadId]));
+    if (shouldRecover) return;
     expect(originalTab.session.snapshot().status).toBe("running");
     expect(originalWorker.session.snapshot().status).toBe("running");
 

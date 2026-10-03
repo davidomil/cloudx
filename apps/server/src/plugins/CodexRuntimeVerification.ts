@@ -14,6 +14,7 @@ import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { CodexStateCompatibility } from "./CodexStateCompatibility.js";
+import { assertNoRunningCodexSessions } from "./CodexRunningSessions.js";
 import { completedVerificationTurn, readVerificationTranscript, type VerificationTranscriptEvent } from "./CodexVerificationTranscript.js";
 
 export interface CodexRuntimeVerificationOptions {
@@ -24,7 +25,10 @@ export interface CodexRuntimeVerificationOptions {
   sharedStateHome?: string;
   dataDir?: string;
   previousAssistantBin?: string;
+  allowStartupRecovery?: boolean;
 }
+
+class CodexNativeStartupError extends Error {}
 
 /** Verify the installed binary through the same isolated overlay, PTY and bridge as a new tab. */
 export async function verifyCodexRuntime(options: CodexRuntimeVerificationOptions): Promise<void> {
@@ -34,15 +38,36 @@ export async function verifyCodexRuntime(options: CodexRuntimeVerificationOption
   try {
     const compatibility = new CodexStateCompatibility(options.env ?? process.env, options.signal);
     const snapshots = await compatibility.snapshots(options.sharedStateHome, options.dataDir, path.join(directory, "snapshots"));
+    let recoveredOriginal = false;
     for (const sqliteHome of snapshots) {
+      let preserveOriginal = Boolean(options.previousAssistantBin && options.previousAssistantBin !== options.assistantBin);
+      if (preserveOriginal && options.allowStartupRecovery) {
+        const pristine = path.join(directory, "pristine");
+        await fs.cp(sqliteHome, pristine, { recursive: true, force: false, errorOnExist: true });
+        try {
+          const baselineSessionId = await verifyIsolatedCodexRuntime({ ...options, assistantBin: options.previousAssistantBin! }, sqliteHome);
+          await compatibility.verifyConversation(sqliteHome, baselineSessionId);
+        } catch (error) {
+          if (!(error instanceof CodexNativeStartupError)) throw error;
+          await assertNoRunningCodexSessions(options.previousAssistantBin!, options.signal);
+          options.onOutput?.("Original Codex already fails native startup on retained state; no original sessions are running. Verifying the requested replacement independently.\n");
+          preserveOriginal = false;
+          recoveredOriginal = true;
+        } finally {
+          // Restore at the same path so retained transcript references remain isolated and valid.
+          await fs.rm(sqliteHome, { recursive: true, force: true });
+          await fs.rename(pristine, sqliteHome);
+        }
+      }
       const sessionId = await verifyIsolatedCodexRuntime(options, sqliteHome);
       await compatibility.verifyConversation(sqliteHome, sessionId);
-      if (options.previousAssistantBin && options.previousAssistantBin !== options.assistantBin) {
-        const previousSessionId = await verifyIsolatedCodexRuntime({ ...options, assistantBin: options.previousAssistantBin }, sqliteHome);
+      if (preserveOriginal) {
+        const previousSessionId = await verifyIsolatedCodexRuntime({ ...options, assistantBin: options.previousAssistantBin! }, sqliteHome);
         await compatibility.verifyConversation(sqliteHome, previousSessionId);
         await compatibility.verifyConversation(sqliteHome, sessionId);
       }
     }
+    if (recoveredOriginal) await assertNoRunningCodexSessions(options.previousAssistantBin!, options.signal);
     options.onOutput?.(`Native compatibility verified against ${snapshots.length} distinct retained SQLite schemas using isolated copies.\n`);
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
@@ -72,12 +97,11 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
   const provider = createVerificationProvider(answer, requests);
   let session: PluginSession | undefined;
   const deadline = performance.now() + 25_000;
-  async function waitFor(description: string, predicate: () => boolean | Promise<boolean>): Promise<void> {
+  async function waitFor(description: string, predicate: () => boolean | Promise<boolean>, nativeStartup = false): Promise<void> {
     while (!(await predicate())) {
       signal?.throwIfAborted();
-      if (session?.hasExited?.() || performance.now() >= deadline) {
-        throw new Error(description);
-      }
+      if (session?.hasExited?.()) throw nativeStartup ? new CodexNativeStartupError(description) : new Error(description);
+      if (performance.now() >= deadline) throw new Error(description);
       await delay(50, undefined, { signal });
     }
   }
@@ -104,7 +128,7 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
     const plugin = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, isolatedEnv);
     session = await plugin.createSession({ tab, cwd: root, controls: { closeTab: () => undefined, setTabIndicator: () => undefined } });
     session.onData?.(text => { if (text.includes("\u001b[6n")) session!.write!("\u001b[1;1R"); });
-    await waitFor("Codex did not save a selected conversation before the first prompt", () => Boolean(recovery.read()?.selection));
+    await waitFor("Codex did not save a selected conversation before the first prompt", () => Boolean(recovery.read()?.selection), true);
     assert.deepEqual(requests, [], "A native tab must save its selection without contacting a model.");
     const identity = recovery.read()!;
     assert.equal(identity.selection!.tabId, tab.id);

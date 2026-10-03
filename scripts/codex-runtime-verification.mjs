@@ -18,6 +18,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     for (let index = 3; index < process.argv.length; index += 2) {
       const flag = process.argv[index];
       const value = process.argv[index + 1];
+      if (flag === "--allow-startup-recovery") {
+        if (value !== "true") throw new Error("Invalid native verification arguments.");
+        options.allowStartupRecovery = true;
+        continue;
+      }
       const key = { "--shared-state-home": "sharedStateHome", "--cloudx-data-dir": "dataDir", "--previous-bin": "previousAssistantBin" }[flag];
       if (!value || !key) throw new Error("Invalid native verification arguments.");
       options[key] = value;

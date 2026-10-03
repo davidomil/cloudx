@@ -240,7 +240,7 @@ describe("shared Codex update", () => {
     const cloudxData = path.join(fixture.root, "cloudx data");
     await updateCodexInstallation({ ...fixture, env: { ...fixture.env, CODEX_HOME: codexHome, CLOUDX_DATA_DIR: cloudxData } });
     const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
-    expect(verifier[1].slice(-6)).toEqual(["--shared-state-home", codexHome, "--cloudx-data-dir", cloudxData, "--previous-bin", fixture.assistantBin]);
+    expect(verifier[1].slice(-8)).toEqual(["--shared-state-home", codexHome, "--cloudx-data-dir", cloudxData, "--previous-bin", fixture.assistantBin, "--allow-startup-recovery", "true"]);
   });
 
   it("checks the verified active binary against candidate-migrated state before switching", async () => {
@@ -249,6 +249,7 @@ describe("shared Codex update", () => {
     await updateCodexInstallation({ ...fixture, targetVersion: "1.1.0" });
     const verifiers = childProcess.spawn.mock.calls.filter(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
     expect(verifiers.at(-1)[1].slice(-2)).toEqual(["--previous-bin", fixture.assistantBin]);
+    expect(verifiers.at(-1)[1]).not.toContain("--allow-startup-recovery");
   });
 
   it("checks the existing CLI on the first switch without offering an unverified return target", async () => {
@@ -259,7 +260,7 @@ describe("shared Codex update", () => {
     });
 
     const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
-    expect(verifier[1].slice(-2)).toEqual(["--previous-bin", fixture.assistantBin]);
+    expect(verifier[1].slice(-4)).toEqual(["--previous-bin", fixture.assistantBin, "--allow-startup-recovery", "true"]);
     expect(readCodexSelection(fixture.prefix).previous).toBeNull();
   });
 
@@ -293,6 +294,7 @@ describe("shared Codex update", () => {
 
     const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
     expect(verifier[1]).not.toContain("--previous-bin");
+    expect(verifier[1]).not.toContain("--allow-startup-recovery");
     expect(readCodexSelection(fixture.prefix).previous).toBeNull();
   });
 
@@ -300,7 +302,7 @@ describe("shared Codex update", () => {
     const fixture = installation();
     await updateCodexInstallation({ ...fixture, env: { ...fixture.env, HOME: fixture.root, CODEX_HOME: codexHome, CLOUDX_DATA_DIR: undefined } });
     const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
-    expect(verifier[1].slice(-4)).toEqual(["--shared-state-home", path.join(fixture.root, ".codex"), "--previous-bin", fixture.assistantBin]);
+    expect(verifier[1].slice(-6)).toEqual(["--shared-state-home", path.join(fixture.root, ".codex"), "--previous-bin", fixture.assistantBin, "--allow-startup-recovery", "true"]);
   });
 
   it("cancels candidate verification without changing the persisted active version", async () => {
