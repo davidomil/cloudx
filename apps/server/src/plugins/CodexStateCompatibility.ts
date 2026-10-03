@@ -42,10 +42,18 @@ export class CodexStateCompatibility {
       if (entries && entries.length > 10_000) throw new Error("Too many retained Codex launches to verify.");
       for (const entry of entries ?? []) if (entry.isDirectory()) directories.add(path.join(launches, entry.name));
     }
+    const input = JSON.stringify([...directories]);
+    if (Buffer.byteLength(input) > 16_777_216) throw new Error("Codex snapshot directory list exceeds the 16 MiB limit.");
     await fs.mkdir(destination, { mode: 0o700 });
-    const result: unknown = await this.run(["snapshot", JSON.stringify([...directories]), destination]);
-    if (!Array.isArray(result) || result.some(value => typeof value !== "string" || path.dirname(value) !== destination)) throw new Error("Invalid Codex state snapshot result.");
-    return result;
+    const inputFile = path.join(destination, "directories.json");
+    try {
+      await fs.writeFile(inputFile, input, { mode: 0o600, flag: "wx", signal: this.signal });
+      const result: unknown = await this.run(["snapshot", inputFile, destination]);
+      if (!Array.isArray(result) || result.some(value => typeof value !== "string" || path.dirname(value) !== destination)) throw new Error("Invalid Codex state snapshot result.");
+      return result;
+    } finally {
+      await fs.rm(inputFile, { force: true });
+    }
   }
 
   async verifyConversation(sqliteHome: string, sessionId: string): Promise<void> {

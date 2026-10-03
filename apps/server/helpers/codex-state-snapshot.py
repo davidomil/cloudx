@@ -10,6 +10,18 @@ import time
 
 DEADLINE = time.monotonic() + 20
 MAX_BYTES = 1024 * 1024 * 1024
+MAX_DIRECTORY_BYTES = 16 * 1024 * 1024
+
+
+def read_directories(file):
+    with open(file, "rb") as stream:
+        data = stream.read(MAX_DIRECTORY_BYTES + 1)
+    if len(data) > MAX_DIRECTORY_BYTES:
+        raise ValueError("Codex snapshot directory list exceeds the 16 MiB limit")
+    directories = json.loads(data)
+    if not isinstance(directories, list) or len(directories) > 10003 or any(not isinstance(directory, str) for directory in directories):
+        raise ValueError("Invalid Codex snapshot directory list")
+    return directories
 
 
 def check_progress(_status=0, _remaining=0, total=0):
@@ -142,7 +154,7 @@ def verify(directory, session_id):
 if __name__ == "__main__":
     try:
         if sys.argv[1] == "snapshot":
-            print(json.dumps(snapshot(json.loads(sys.argv[2]), sys.argv[3])))
+            print(json.dumps(snapshot(read_directories(sys.argv[2]), sys.argv[3])))
         elif sys.argv[1] == "verify":
             print(json.dumps(verify(sys.argv[2], sys.argv[3])))
         else:

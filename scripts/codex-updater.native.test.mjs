@@ -68,3 +68,74 @@ else if (process.argv[2] === 'i') {
     }
   }, 70_000);
 });
+
+it.skipIf(!nativeBinary)("rejects an incompatible original-prefix rollback after A to B and probes the exact previous binary", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-rollback-"));
+  try {
+    const versionA = "0.0.1";
+    const versionB = execFileSync(nativeBinary, ["--version"], { encoding: "utf8" }).trim().replace(/^codex-cli /u, "");
+    const prefix = path.join(root, "prefix");
+    const assistantBin = path.join(prefix, "bin/codex");
+    const packageDir = path.join(prefix, "lib/node_modules/@openai/codex");
+    const tools = path.join(root, "tools");
+    const sharedStateHome = path.join(root, "shared-state");
+    const commandLog = path.join(root, "launches");
+    const rejectA = path.join(root, "reject-original");
+    const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+    await Promise.all([path.join(packageDir, "bin"), path.dirname(assistantBin), tools, sharedStateHome].map(directory => fs.mkdir(directory, { recursive: true })));
+    const wrapper = (label, version) => [
+      "#!/bin/sh",
+      `if [ "$1" = --version ]; then printf 'codex-cli ${version}\\n'; exit; fi`,
+      `printf '${label}\\n' >> ${quote(commandLog)}`,
+      ...(label === "A" ? [`if [ -f ${quote(rejectA)} ]; then exit 86; fi`] : []),
+      `exec ${quote(nativeBinary)} "$@"`, ""
+    ].join("\n");
+    const manifest = version => JSON.stringify({ name: "@openai/codex", version, bin: { codex: "bin/codex.js" } });
+    await fs.writeFile(path.join(packageDir, "package.json"), manifest(versionA));
+    await fs.writeFile(path.join(packageDir, "bin/codex.js"), wrapper("A", versionA), { mode: 0o700 });
+    await fs.symlink(path.join(packageDir, "bin/codex.js"), assistantBin);
+    await fs.writeFile(path.join(tools, "npm"), `#!${process.execPath}
+const fs = require('node:fs');
+const path = require('node:path');
+if (process.argv[2] === 'view') console.log(JSON.stringify({versions: [${JSON.stringify(versionA)}, ${JSON.stringify(versionB)}], 'dist-tags': {latest: ${JSON.stringify(versionB)}}}));
+else if (process.argv[2] === 'i') {
+  const prefix = process.argv[process.argv.indexOf('--prefix') + 1];
+  const packageDir = path.join(prefix, 'lib/node_modules/@openai/codex');
+  fs.mkdirSync(path.join(packageDir, 'bin'), {recursive: true});
+  fs.mkdirSync(path.join(prefix, 'bin'), {recursive: true});
+  fs.writeFileSync(path.join(packageDir, 'package.json'), ${JSON.stringify(manifest(versionB))});
+  fs.writeFileSync(path.join(packageDir, 'bin/codex.js'), ${JSON.stringify(wrapper("B", versionB))}, {mode: 0o700});
+  fs.symlinkSync(path.join(packageDir, 'bin/codex.js'), path.join(prefix, 'bin/codex'));
+} else process.exit(91);
+`, { mode: 0o700 });
+    const env = { PATH: `${tools}${path.delimiter}${process.env.PATH ?? ""}`, HOME: path.join(root, "home"), CODEX_HOME: sharedStateHome, CLOUDX_DATA_DIR: path.join(root, "data") };
+    const options = { assistantBin, prefix, env };
+    await expect(updateCodexInstallation({ ...options, targetVersion: versionA })).resolves.toMatchObject({ outcome: "current", activeVersion: versionA });
+    await expect(updateCodexInstallation({ ...options, targetVersion: versionB })).resolves.toMatchObject({ outcome: "updated", activeVersion: versionB, previousVersion: versionA });
+    const selected = readCodexSelection(prefix);
+    expect(selected.previous.assistantBin).toBe(assistantBin);
+    expect((await fs.readFile(commandLog, "utf8")).trim().split("\n")).toEqual(["A", "A", "A", "A", "B", "B", "B", "B"]);
+    await fs.writeFile(rejectA, "Startup incompatibility introduced after A was originally verified.\n");
+    await fs.writeFile(commandLog, "");
+
+    await expect(updateCodexInstallation({ ...options, targetVersion: versionA })).rejects.toMatchObject({ code: "runtime-verification", usableVersion: versionB });
+
+    expect(readCodexSelection(prefix)).toEqual(selected);
+    expect(resolveSelectedCodexCommand(assistantBin)).toBe(selected.active.assistantBin);
+    const rejectedLaunches = (await fs.readFile(commandLog, "utf8")).trim().split("\n");
+    expect(rejectedLaunches.length).toBeGreaterThan(0);
+    expect(new Set(rejectedLaunches)).toEqual(new Set(["A"]));
+    await expect(fs.stat(path.join(prefix, ".cloudx-codex-update.lock"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    execFileSync("python3", ["-I", "-S", "-c", "import sqlite3, sys; sqlite3.connect(sys.argv[1]).close()", path.join(sharedStateHome, "state_5.sqlite")]);
+    await fs.writeFile(commandLog, "");
+    const { verifyCodexRuntime } = await import("./codex-runtime-verification.mjs");
+    await expect(verifyCodexRuntime({ assistantBin: selected.active.assistantBin, previousAssistantBin: assistantBin, env, sharedStateHome })).rejects.toThrow("did not save a selected conversation");
+    const compatibilityLaunches = (await fs.readFile(commandLog, "utf8")).trim().split("\n");
+    expect(compatibilityLaunches.slice(0, 8)).toEqual(Array(8).fill("B"));
+    expect(compatibilityLaunches.slice(8)).toContain("A");
+    expect(readCodexSelection(prefix)).toEqual(selected);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 70_000);

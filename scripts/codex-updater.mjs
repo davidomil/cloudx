@@ -640,7 +640,7 @@ export async function updateCodexInstallation({
     const installedVersion = await readCodexVersion(candidate.assistantBin, commandOptions);
     onInstalled?.(installedVersion);
     if (installedVersion !== packageVersion || installedVersion !== target) throw new CodexUpdateError("verification", "Codex reports a different version from the requested npm release. The active installation is unchanged; check the private update log.");
-    await verifyCodexLaunch(candidate.assistantBin, commandOptions, selection?.active.assistantBin);
+    await verifyCodexLaunch(candidate.assistantBin, commandOptions, activeVersion ? activeInstallation.assistantBin : undefined);
     activateCodexSelection(installation.prefix, { version: installedVersion, assistantBin: candidate.assistantBin }, selection?.active ?? null, operationSignal);
     selectedVersion = installedVersion;
     return { outcome: "updated", installedVersion, activeVersion: installedVersion, previousVersion: selection?.active.version ?? null };

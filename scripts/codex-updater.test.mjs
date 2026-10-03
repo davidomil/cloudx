@@ -27,6 +27,9 @@ beforeEach(() => {
       if (process.env.TEST_MODE === 'runtime') {
         console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
       }
+      if (process.env.TEST_MODE === 'previous-state-incompatible' && process.argv.includes('--previous-bin')) {
+        console.error('The existing CLI cannot read candidate-migrated state'); process.exit(1);
+      }
       if (process.env.TEST_MODE === 'runtime-timeout') {
         const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
         fs.writeFileSync(process.env.TEST_CHILD, String(child.pid));
@@ -237,7 +240,7 @@ describe("shared Codex update", () => {
     const cloudxData = path.join(fixture.root, "cloudx data");
     await updateCodexInstallation({ ...fixture, env: { ...fixture.env, CODEX_HOME: codexHome, CLOUDX_DATA_DIR: cloudxData } });
     const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
-    expect(verifier[1].slice(-4)).toEqual(["--shared-state-home", codexHome, "--cloudx-data-dir", cloudxData]);
+    expect(verifier[1].slice(-6)).toEqual(["--shared-state-home", codexHome, "--cloudx-data-dir", cloudxData, "--previous-bin", fixture.assistantBin]);
   });
 
   it("checks the verified active binary against candidate-migrated state before switching", async () => {
@@ -248,11 +251,56 @@ describe("shared Codex update", () => {
     expect(verifiers.at(-1)[1].slice(-2)).toEqual(["--previous-bin", fixture.assistantBin]);
   });
 
+  it("checks the existing CLI on the first switch without offering an unverified return target", async () => {
+    const fixture = installation();
+
+    await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({
+      outcome: "updated", activeVersion: "1.1.0", previousVersion: null,
+    });
+
+    const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifier[1].slice(-2)).toEqual(["--previous-bin", fixture.assistantBin]);
+    expect(readCodexSelection(fixture.prefix).previous).toBeNull();
+  });
+
+  it("rejects incompatible state migration on the first switch and preserves the existing CLI", async () => {
+    const fixture = installation({ mode: "previous-state-incompatible" });
+    const originalPackage = fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8");
+    const originalExecutable = fs.readFileSync(fixture.assistantBin, "utf8");
+    const output = [];
+
+    await expect(updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) })).rejects.toMatchObject({
+      code: "runtime-verification",
+      usableVersion: "1.0.0",
+      message: expect.stringContaining("The active selection is unchanged"),
+    });
+
+    expect(output.join("")).toContain("The existing CLI cannot read candidate-migrated state");
+    expect(readCodexSelection(fixture.prefix)).toBeNull();
+    expect(resolveSelectedCodexCommand(fixture.assistantBin)).toBe(fixture.assistantBin);
+    expect(fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8")).toBe(originalPackage);
+    expect(fs.readFileSync(fixture.assistantBin, "utf8")).toBe(originalExecutable);
+    await expect(readCodexVersion(fixture.assistantBin, fixture)).resolves.toBe("1.0.0");
+  });
+
+  it("verifies a first installation without an existing CLI compatibility probe", async () => {
+    const fixture = installation();
+    fs.unlinkSync(fixture.assistantBin);
+
+    await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({
+      outcome: "updated", activeVersion: "1.1.0", previousVersion: null,
+    });
+
+    const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifier[1]).not.toContain("--previous-bin");
+    expect(readCodexSelection(fixture.prefix).previous).toBeNull();
+  });
+
   it.each(["", " \t"])("uses the launch default shared state when CODEX_HOME is blank %j", async codexHome => {
     const fixture = installation();
     await updateCodexInstallation({ ...fixture, env: { ...fixture.env, HOME: fixture.root, CODEX_HOME: codexHome, CLOUDX_DATA_DIR: undefined } });
     const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
-    expect(verifier[1].slice(-2)).toEqual(["--shared-state-home", path.join(fixture.root, ".codex")]);
+    expect(verifier[1].slice(-4)).toEqual(["--shared-state-home", path.join(fixture.root, ".codex"), "--previous-bin", fixture.assistantBin]);
   });
 
   it("cancels candidate verification without changing the persisted active version", async () => {

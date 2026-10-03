@@ -54,7 +54,8 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-verification-"));
   const home = path.join(root, "home");
   const data = path.join(root, "data");
-  const isolatedEnv = { PATH: env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: assistantBin, SHELL: "/bin/sh", TERM: "xterm-256color" };
+  const verificationBin = path.join(root, "verified-codex");
+  const isolatedEnv = { PATH: env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: verificationBin, SHELL: "/bin/sh", TERM: "xterm-256color" };
   const sources = new CodexStateSources(data, isolatedEnv);
   const recovery = new CodexConversationRecovery(sources.viewPath("runtime-verification"));
   const requests: string[] = [];
@@ -82,6 +83,8 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
   }
   try {
     signal?.throwIfAborted();
+    // A prefix/bin/codex launch follows the active selection; probes must execute the requested binary instead.
+    await fs.symlink(await fs.realpath(assistantBin), verificationBin);
     await new Promise<void>((resolve, reject) => { provider.once("error", reject); provider.listen(0, "127.0.0.1", resolve); });
     const port = (provider.address() as { port: number }).port;
     await fs.mkdir(home, { mode: 0o700 });

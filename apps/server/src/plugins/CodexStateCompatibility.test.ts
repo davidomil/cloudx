@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { CodexStateCompatibility } from "./CodexStateCompatibility.js";
 
 const roots: string[] = [];
@@ -52,6 +52,25 @@ describe("isolated Codex shared-state compatibility", () => {
     expect(await f.compatibility.snapshots(f.home, data, f.destination)).toHaveLength(2);
   });
 
+  it("snapshots retained launches when their directory list exceeds the operating system argument limit", async () => {
+    const f = await fixture();
+    const data = path.join(f.root, "data");
+    const launches = Array.from({ length: 1500 }, (_, index) => path.join(data, "codex-launches", `launch-${index}-${"x".repeat(40)}`));
+    expect(launches.length).toBeLessThan(10_000);
+    expect(Buffer.byteLength(JSON.stringify([f.home, ...launches]))).toBeGreaterThan(128 * 1024);
+    await Promise.all(launches.map(directory => fs.mkdir(directory, { recursive: true })));
+    const original = path.join(launches.at(-1)!, "state_5.sqlite");
+    database(original);
+    const before = await fs.readFile(original);
+
+    const snapshots = await f.compatibility.snapshots(f.home, data, f.destination);
+
+    expect(snapshots).toHaveLength(1);
+    await expect(f.compatibility.verifyConversation(snapshots[0]!, "original")).resolves.toBeUndefined();
+    expect(await fs.readFile(original)).toEqual(before);
+    expect(await fs.readdir(f.destination)).toEqual(["0"]);
+  });
+
   it("preserves identities and distinct transcripts in every retained database generation", async () => {
     const f = await fixture();
     await fs.mkdir(path.join(f.home, "sessions"));
@@ -81,6 +100,7 @@ with sqlite3.connect(sys.argv[1]) as db: db.execute("INSERT INTO threads VALUES 
     expect(await f.compatibility.snapshots(f.home, undefined, f.destination)).toEqual([]);
     await fs.writeFile(path.join(f.home, "state_5.sqlite"), "not a database");
     await expect(f.compatibility.snapshots(f.home, undefined, `${f.destination}-corrupt`)).rejects.toThrow("shared-state compatibility verification failed");
+    expect(await fs.readdir(`${f.destination}-corrupt`)).toEqual([]);
     await fs.rm(path.join(f.home, "state_5.sqlite"));
     database(path.join(f.root, "private.sqlite"));
     await fs.symlink(path.join(f.root, "private.sqlite"), path.join(f.home, "state_5.sqlite"));
@@ -105,6 +125,53 @@ with sqlite3.connect(sys.argv[1]) as db: db.execute("INSERT INTO threads VALUES 
     const controller = new AbortController();
     controller.abort();
     await expect(new CodexStateCompatibility({ PATH: process.env.PATH }, controller.signal).snapshots(f.home, undefined, `${f.destination}-cancelled`)).rejects.toMatchObject({ name: "AbortError" });
+    expect(await fs.readdir(`${f.destination}-cancelled`)).toEqual([]);
+  });
+
+  it("keeps the directory list private and removes it when an active helper is cancelled", async () => {
+    const f = await fixture();
+    const bin = path.join(f.root, "bin");
+    const ready = path.join(f.root, "helper-ready");
+    const python = execFileSync("python3", ["-I", "-S", "-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim();
+    await fs.mkdir(bin);
+    await fs.writeFile(path.join(bin, "python3"), `#!${python}
+import json, os, pathlib, sys, time
+source = pathlib.Path(sys.argv[-2])
+assert source.stat().st_mode & 0o777 == 0o600
+assert source.parent.stat().st_mode & 0o777 == 0o700
+assert json.loads(source.read_text()) == [${JSON.stringify(f.home)}]
+pathlib.Path(${JSON.stringify(ready)}).write_text(str(os.getpid()))
+time.sleep(30)
+`, { mode: 0o700 });
+    const controller = new AbortController();
+    const compatibility = new CodexStateCompatibility({ PATH: bin }, controller.signal);
+    const cancelled = expect(compatibility.snapshots(f.home, undefined, f.destination)).rejects.toMatchObject({ name: "AbortError" });
+    try {
+      await vi.waitFor(async () => expect(await fs.readFile(ready, "utf8")).toMatch(/^\d+$/));
+    } finally {
+      controller.abort();
+    }
+    await cancelled;
+    expect(await fs.readdir(f.destination)).toEqual([]);
+    const pid = Number(await fs.readFile(ready, "utf8"));
+    await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow());
+  });
+
+  it("rejects oversized directory input before creating snapshots", async () => {
+    const f = await fixture();
+    const compatibility = new CodexStateCompatibility({ CODEX_SQLITE_HOME: `/${"x".repeat(16_777_216)}` });
+    await expect(compatibility.snapshots(f.home, undefined, f.destination)).rejects.toThrow("directory list exceeds the 16 MiB limit");
+    await expect(fs.stat(f.destination)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["oversized", "too-many", "invalid-type"])("rejects %s directory input in the Python helper", async kind => {
+    const f = await fixture();
+    const input = path.join(f.root, "directories.json");
+    await fs.writeFile(input, kind === "invalid-type" ? '[42]' : JSON.stringify(Array(10004).fill(f.home)));
+    if (kind === "oversized") await fs.truncate(input, 16_777_217);
+    const helper = fileURLToPath(new URL("../../helpers/codex-state-snapshot.py", import.meta.url));
+    expect(() => execFileSync("python3", ["-I", "-S", helper, "snapshot", input, f.destination], { stdio: "pipe" })).toThrow("Codex shared-state compatibility check failed");
+    await expect(fs.stat(f.destination)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("counts WAL pages and the actual SQLite page size against the snapshot budget", async () => {
