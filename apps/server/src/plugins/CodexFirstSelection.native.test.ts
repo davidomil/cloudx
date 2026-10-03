@@ -1,8 +1,10 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import type { PluginSession } from "@cloudx/plugin-api";
 import type { WorkspaceTab } from "@cloudx/shared";
@@ -30,10 +32,11 @@ function completeResponse(response: ServerResponse, text: string) {
 }
 
 it.skipIf(!nativeBinary).each([
-  { recovery: false, keepRunning: true, title: "rejects a first selection whose migration breaks the existing CLI while original tabs and Forge workers finish" },
-  { recovery: true, keepRunning: false, title: "recovers the first selection from a CLI already failing startup without live original sessions or changes to retained state" },
-  { recovery: true, keepRunning: true, title: "rejects first-selection startup recovery while original tabs and Forge workers are still running" },
-])("$title", async ({ recovery: recovering, keepRunning }) => {
+  { recovery: false, keepRunning: true, viewer: false, title: "rejects a first selection whose migration breaks the existing CLI while original tabs and Forge workers finish" },
+  { recovery: true, keepRunning: false, viewer: false, title: "recovers the first selection from a CLI already failing startup without live original sessions or changes to retained state" },
+  { recovery: true, keepRunning: false, viewer: true, title: "recovers the first selection while an unrelated bridge file viewer is running" },
+  { recovery: true, keepRunning: true, viewer: false, title: "rejects first-selection startup recovery while original tabs and Forge workers are still running" },
+])("$title", async ({ recovery: recovering, keepRunning, viewer: viewBridge }) => {
   const shouldRecover = recovering && !keepRunning;
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-first-selection-"));
   const home = path.join(root, "home");
@@ -46,6 +49,7 @@ it.skipIf(!nativeBinary).each([
   const tools = path.join(root, "tools");
   const commandLog = path.join(root, "native-launches.jsonl");
   const brokenOriginal = path.join(root, "broken-original");
+  let viewer: ChildProcess | undefined;
   const sources = new CodexStateSources(data, { CODEX_HOME: home });
   const sessions: PluginSession[] = [];
   const answer = "The original native installation completed the turn.";
@@ -167,10 +171,17 @@ else if (process.argv[2] === 'i') {
       expect(execFileSync(assistantBin, ["--version"], { encoding: "utf8", env }).trim()).toBe("codex-cli 0.0.0");
     }
 
+    if (viewBridge) {
+      const bridge = fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url));
+      viewer = spawn("tail", ["-f", bridge], { stdio: "ignore" });
+      await once(viewer, "spawn");
+      expect((await fs.readFile(`/proc/${viewer.pid}/cmdline`, "utf8")).split("\0")).toEqual(["tail", "-f", bridge, ""]);
+    }
     let output = "";
     const result = await updateCodexInstallation({ assistantBin, prefix, targetVersion: version, env, onOutput: (text: string) => { output += text; } }).catch((error: unknown) => error);
 
     if (shouldRecover) {
+      if (viewBridge) expect([viewer!.exitCode, viewer!.signalCode]).toEqual([null, null]);
       expect(result, output).toMatchObject({ outcome: "updated", activeVersion: version, installedVersion: version, previousVersion: null });
       const selection = readCodexSelection(prefix)!;
       expect(selection.active.version).toBe(version);
@@ -237,6 +248,11 @@ print(json.dumps(identities))
     expect(originalTab.recovery.read()!.sessionId).toBe(originalTab.threadId);
     expect(await fs.readFile(commandLog, "utf8")).toBe(launchLog);
   } finally {
+    if (viewer?.pid && viewer.exitCode === null && viewer.signalCode === null) {
+      const exited = once(viewer, "exit");
+      viewer.kill();
+      await exited;
+    }
     await Promise.all(sessions.map(session => session.terminate?.()));
     await sources.dispose();
     provider.closeAllConnections();

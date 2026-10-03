@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { buildLoginShellCommandLaunch } from "../terminal/ShellLaunch.js";
+import { terminalSupervisorSource } from "../terminal/TerminalSupervisorRuntime.js";
 import { assertNoRunningCodexSessions } from "./CodexRunningSessions.js";
 
 let root: string;
@@ -63,7 +64,7 @@ it("preserves an original launch retained in supervisor arguments before its bri
     "-I",
     "-S",
     "-c",
-    "supervisor source",
+    terminalSupervisorSource,
     "/receipt",
     "123",
     "null",
@@ -81,7 +82,7 @@ it("recognizes a direct bridge launch retained by a supervisor", async () => {
     "-I",
     "-S",
     "-c",
-    "supervisor source",
+    terminalSupervisorSource,
     "/receipt",
     "123",
     "null",
@@ -127,6 +128,124 @@ it("allows recovery when only unrelated binaries and ordinary processes are runn
   await processCommand(["node", "/cloudx/apps/server/dist/server.js"], "34");
   await expect(inspect()).resolves.toBeUndefined();
 });
+
+it.each([
+  ["editor", ["vim", bridge]],
+  ["viewer", ["tail", "-f", bridge]],
+  ["search", ["rg", bridge, "."]],
+  ["search for a launch command", ["rg", `exec node ${bridge}`, "."]],
+  ["another Node script", ["node", "search.mjs", bridge]],
+  [
+    "Node script JSON data",
+    ["node", "search.mjs", JSON.stringify({ file: bridge })],
+  ],
+  ["another Python script", ["python3", "search.py", bridge]],
+  [
+    "Python source without the supervisor contract",
+    [
+      "python3",
+      "-I",
+      "-S",
+      "-c",
+      "search source",
+      "/receipt",
+      "123",
+      "null",
+      "node",
+      bridge,
+    ],
+  ],
+  ["shell search", ["bash", "-lc", `rg '${bridge}' .`]],
+  ["shell viewer", ["bash", "-lc", `exec tail -f '${bridge}'`]],
+  [
+    "shell Node script",
+    ["zsh", "-lc", `exec node search.mjs '${bridge}' "$QUERY"`],
+  ],
+  [
+    "shell search with expansion",
+    ["bash", "-lc", `exec rg "$QUERY" '${bridge}'`],
+  ],
+  ["shell executable expansion", ["bash", "-lc", `exec "$VIEWER" '${bridge}'`]],
+])(
+  "ignores bridge filenames used as ordinary arguments by a %s",
+  async (_kind, args) => {
+    await processCommand(args);
+    await expect(inspect()).resolves.toBeUndefined();
+  },
+);
+
+it.each([
+  { command: "tail", args: ["-f", bridge] },
+  { command: "/usr/bin/node", args: ["search.mjs", bridge] },
+])(
+  "ignores a supervised $command process viewing the bridge",
+  async ({ command, args }) => {
+    for (const [index, shell] of [
+      "/bin/sh",
+      "/bin/bash",
+      "/bin/zsh",
+    ].entries()) {
+      const launch = buildLoginShellCommandLaunch(command, args, {
+        SHELL: shell,
+      });
+      await processCommand(
+        [
+          "python3",
+          "-I",
+          "-S",
+          "-c",
+          terminalSupervisorSource,
+          "/receipt",
+          "123",
+          "null",
+          launch.command,
+          ...launch.args,
+        ],
+        String(12 + index),
+      );
+    }
+    await expect(inspect()).resolves.toBeUndefined();
+  },
+);
+
+it("ignores bridge filenames inside a genuine launch's other JSON fields", async () => {
+  const other = path.join(root, "another-codex");
+  await fs.writeFile(other, "unrelated installation");
+  await processCommand([
+    "node",
+    bridge,
+    JSON.stringify({
+      command: other,
+      cwd: path.dirname(bridge),
+      description: bridge,
+    }),
+  ]);
+  await expect(inspect()).resolves.toBeUndefined();
+});
+
+it.each(["/bin/sh", "/bin/bash", "/bin/zsh"])(
+  "rejects malformed genuine bridges retained by a %s supervisor",
+  async (shell) => {
+    const launch = buildLoginShellCommandLaunch("node", [bridge, "not JSON"], {
+      SHELL: shell,
+    });
+    await processCommand([
+      "python3",
+      "-I",
+      "-S",
+      "-c",
+      terminalSupervisorSource,
+      "/receipt",
+      "123",
+      "null",
+      launch.command,
+      ...launch.args,
+    ]);
+    await expect(inspect()).rejects.toThrow(
+      "native bridge launch is malformed",
+    );
+  },
+);
 
 it("ignores processes owned by another user without reading their command lines", async () => {
   const directory = await processCommand([

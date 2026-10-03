@@ -103,22 +103,47 @@ async function readCommand(file: string, check: () => void): Promise<string[]> {
 }
 
 function bridgeExecutables(args: string[]): string[] {
-  const executables: string[] = [];
-  for (let index = 0; index < args.length; index++) {
-    const argument = args[index]!;
-    if (path.basename(argument) === BRIDGE) {
-      executables.push(bridgeExecutable(args[++index]));
-    } else if (argument.includes(BRIDGE)) {
-      if (!argument.startsWith("exec "))
-        throw new Error("A CloudX native bridge command line is malformed.");
-      const words = shellWords(argument);
-      const bridge = words.findIndex((word) => path.basename(word) === BRIDGE);
-      if (bridge < 0)
-        throw new Error("A CloudX native bridge launch is malformed.");
-      executables.push(bridgeExecutable(words[bridge + 1]));
-    }
+  let launch = args;
+  if (
+    /^python3(?:\.\d+)?$/u.test(path.basename(args[0] ?? "")) &&
+    args[1] === "-I" &&
+    args[2] === "-S" &&
+    args[3] === "-c" &&
+    /^CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"$/mu.test(
+      args[4] ?? "",
+    )
+  ) {
+    launch = args.slice(8);
   }
-  return executables;
+  if (
+    ["bash", "zsh"].includes(path.basename(launch[0] ?? "")) &&
+    launch[1] === "-lc" &&
+    launch[2]?.startsWith("exec ")
+  ) {
+    let prefix;
+    try {
+      prefix = shellWords(launch[2], 3);
+    } catch {
+      return [];
+    }
+    if (
+      !isNodeExecutable(prefix[1]) ||
+      path.basename(prefix[2] ?? "") !== BRIDGE
+    )
+      return [];
+    launch = shellWords(launch[2]).slice(1);
+  }
+  return isNodeExecutable(launch[0]) &&
+    path.basename(launch[1] ?? "") === BRIDGE
+    ? [bridgeExecutable(launch[2])]
+    : [];
+}
+
+function isNodeExecutable(command: string | undefined): boolean {
+  return (
+    command === process.execPath ||
+    ["node", "nodejs"].includes(path.basename(command ?? ""))
+  );
 }
 
 function bridgeExecutable(input: string | undefined): string {
@@ -134,7 +159,7 @@ function bridgeExecutable(input: string | undefined): string {
 }
 
 /** Decode the single-quote escaping emitted by buildLoginShellCommandLaunch. */
-function shellWords(command: string): string[] {
+function shellWords(command: string, limit = Infinity): string[] {
   const words: string[] = [];
   let word = "";
   let quoted = false;
@@ -151,6 +176,7 @@ function shellWords(command: string): string[] {
       started = true;
     } else if (!quoted && /\s/u.test(character)) {
       if (started) words.push(word);
+      if (words.length === limit) return words;
       word = "";
       started = false;
     } else {
