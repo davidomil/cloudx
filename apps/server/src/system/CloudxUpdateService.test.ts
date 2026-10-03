@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,13 +17,28 @@ const checked = (channel: CloudxUpdateChannel = "main", currentCommit = installe
 
 describe("CloudxUpdateService", () => {
   let dataDir: string;
-  beforeEach(() => { dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-service-")); });
-  afterEach(() => { fs.rmSync(dataDir, { recursive: true, force: true }); });
+  let updaterRoot: string;
+  beforeEach(() => {
+    vi.stubEnv("CLOUDX_INSTALL_ROOT", path.resolve("."));
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-service-"));
+    updaterRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-installed-updater-"));
+    fs.mkdirSync(path.join(updaterRoot, "scripts"));
+    const bytes = "export {};\n";
+    const manifest = ["settings-update.mjs", "managed-update.mjs"].map(name => {
+      fs.writeFileSync(path.join(updaterRoot, "scripts", name), bytes);
+      return { path: `scripts/${name}`, type: "file", size: Buffer.byteLength(bytes), sha256: createHash("sha256").update(bytes).digest("hex") };
+    });
+    fs.writeFileSync(path.join(updaterRoot, "bundle.json"), JSON.stringify(manifest));
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    for (const root of [dataDir, updaterRoot]) fs.rmSync(root, { recursive: true, force: true });
+  });
 
   function fixture() {
     const execute = vi.fn(async (file: string, _args: string[]) => ({ stdout: file === "git" ? installed : '{"available":true}' }));
     const catalog = { preview: vi.fn(async (channel: CloudxUpdateChannel, currentCommit: string) => checked(channel, currentCommit)) };
-    const service = new CloudxUpdateService(dataDir, execute, catalog);
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, undefined, updaterRoot);
     return { execute, catalog, service };
   }
 
@@ -30,8 +46,9 @@ describe("CloudxUpdateService", () => {
     const { service, execute, catalog } = fixture();
     expect(await service.status()).toEqual({ available: true });
     expect(execute).toHaveBeenCalledWith(process.execPath, [
-      path.resolve("scripts/settings-update.mjs"), "status", dataDir, String(process.pid),
-    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+      path.join(updaterRoot, "scripts/settings-update.mjs"), "status", dataDir, String(process.pid),
+    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8",
+      env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: path.resolve(".") }) });
     expect(catalog.preview).not.toHaveBeenCalled();
   });
 
@@ -46,7 +63,7 @@ describe("CloudxUpdateService", () => {
       if (_args[1] === "start") expect(reconciled).toBe(true);
       return { stdout: JSON.stringify({ available: true, ...(resume ? { run } : {}) }) };
     });
-    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge);
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge, updaterRoot);
     if (!resume) await service.preview();
     await service.start({ ...selection, ...(resume ? { resumeRunId: id } : {}) });
     expect(forge.reconcileCompletedMerges).toHaveBeenCalledOnce();
@@ -58,7 +75,7 @@ describe("CloudxUpdateService", () => {
     execute.mockResolvedValue({ stdout: JSON.stringify({ available: true,
       run: { id: "active", state: "running", startedAt: "2026-09-15T00:00:00Z", message: "Snapshotting" } }) });
     const forge = { reconcileCompletedMerges: vi.fn() };
-    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge);
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge, updaterRoot);
     expect((await service.start(selection)).run?.state).toBe("running");
     expect(forge.reconcileCompletedMerges).not.toHaveBeenCalled();
   });
@@ -69,7 +86,7 @@ describe("CloudxUpdateService", () => {
       message: "The saved merge outcome remains uncertain.", recoveryAction: "Open Forge and Resume the worker." } };
     execute.mockResolvedValue({ stdout: JSON.stringify(blocked) });
     const forge = { reconcileCompletedMerges: vi.fn(async () => { throw new Error("Provider unavailable"); }) };
-    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge);
+    const service = new CloudxUpdateService(dataDir, execute, catalog, undefined, forge, updaterRoot);
     expect(await service.start(selection)).toEqual(blocked);
     expect(execute.mock.calls.every(([, args]) => args[1] === "status")).toBe(true);
   });
@@ -79,8 +96,9 @@ describe("CloudxUpdateService", () => {
     try {
       const { service, execute } = fixture();
       await service.status();
-      expect(execute).toHaveBeenCalledWith(process.execPath, [path.join(dataDir, "scripts/settings-update.mjs"), "status", dataDir, String(process.pid)],
-        { cwd: dataDir, timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+      expect(execute).toHaveBeenCalledWith(process.execPath, [path.join(updaterRoot, "scripts/settings-update.mjs"), "status", dataDir, String(process.pid)],
+        { cwd: dataDir, timeout: 30_000, maxBuffer: 65536, encoding: "utf8",
+          env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: dataDir }) });
       await service.preview();
       expect(execute).toHaveBeenCalledWith("git", ["rev-parse", "HEAD"], expect.objectContaining({ cwd: dataDir }));
     } finally { vi.unstubAllEnvs(); }
@@ -92,7 +110,7 @@ describe("CloudxUpdateService", () => {
     finally { vi.unstubAllEnvs(); }
   });
 
-  it("keeps status and the next update on the independent coordinator after a downgrade", async () => {
+  it("uses the installed updater for status and new starts despite an inherited old coordinator", async () => {
     const coordinator = path.join(dataDir, "retained-coordinator");
     vi.stubEnv("CLOUDX_INSTALL_ROOT", dataDir);
     vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", coordinator);
@@ -102,22 +120,45 @@ describe("CloudxUpdateService", () => {
       await service.preview();
       await service.start({ channel: "main", targetCommit: target });
       const calls = execute.mock.calls.filter(([file]) => file === process.execPath);
-      expect(calls.every(([, args]) => args[0] === path.join(coordinator, "scripts/settings-update.mjs"))).toBe(true);
-      expect(calls.at(-1)?.[1]).toEqual([path.join(coordinator, "scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target]);
+      expect(calls.every(([, args]) => args[0] === path.join(updaterRoot, "scripts/settings-update.mjs"))).toBe(true);
+      expect(calls.at(-1)?.[1]).toEqual([path.join(updaterRoot, "scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target]);
     } finally { vi.unstubAllEnvs(); }
   });
 
-  it("rejects a relative coordinator setting", () => {
-    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", "relative/coordinator");
-    try { expect(() => fixture()).toThrow("absolute coordinator path"); }
-    finally { vi.unstubAllEnvs(); }
+  it("rejects a relative installed updater bundle", () => {
+    expect(() => new CloudxUpdateService(dataDir, undefined, undefined, undefined, undefined, "relative/updater"))
+      .toThrow("absolute bundle path");
+  });
+
+  it.each(["missing bundle", "invalid JSON", "empty inventory", "duplicate path", "escaped path", "missing entrypoint", "changed bytes", "file link", "directory link", "manifest link"])("rejects an installed updater with %s before execution", async scenario => {
+    const manifestFile = path.join(updaterRoot, "bundle.json");
+    const entries = JSON.parse(fs.readFileSync(manifestFile, "utf8"));
+    const script = path.join(updaterRoot, "scripts/settings-update.mjs");
+    if (scenario === "missing bundle") fs.rmSync(manifestFile);
+    else if (scenario === "invalid JSON") fs.writeFileSync(manifestFile, "{");
+    else if (scenario === "empty inventory") fs.writeFileSync(manifestFile, "[]");
+    else if (scenario === "duplicate path") fs.writeFileSync(manifestFile, JSON.stringify([...entries, entries[0]]));
+    else if (scenario === "escaped path") fs.writeFileSync(manifestFile, JSON.stringify([{ ...entries[0], path: "../outside.mjs" }]));
+    else if (scenario === "missing entrypoint") fs.writeFileSync(manifestFile, JSON.stringify(entries.slice(1)));
+    else if (scenario === "changed bytes") fs.writeFileSync(script, "throw new Error('altered updater');");
+    else if (scenario === "file link") { fs.rmSync(script); fs.symlinkSync(path.join(updaterRoot, "scripts/managed-update.mjs"), script); }
+    else if (scenario === "directory link") {
+      fs.renameSync(path.join(updaterRoot, "scripts"), path.join(updaterRoot, "linked-scripts"));
+      fs.symlinkSync(path.join(updaterRoot, "linked-scripts"), path.join(updaterRoot, "scripts"));
+    } else {
+      fs.renameSync(manifestFile, `${manifestFile}.original`);
+      fs.symlinkSync(`${manifestFile}.original`, manifestFile);
+    }
+    const { service, execute } = fixture();
+    await expect(service.status()).rejects.toMatchObject({ statusCode: 503 });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it("defaults to main and persists the chosen release cycle across service restarts", async () => {
     const { service, execute, catalog } = fixture();
     expect((await service.preview()).channel).toBe("main");
     expect((await service.selectChannel("releases")).channel).toBe("releases");
-    const restarted = new CloudxUpdateService(dataDir, execute, catalog);
+    const restarted = new CloudxUpdateService(dataDir, execute, catalog, undefined, undefined, updaterRoot);
     expect((await restarted.preview()).channel).toBe("releases");
     expect(fs.readdirSync(dataDir)).toEqual(["cloudx-update-channel.json"]);
   });
@@ -127,8 +168,9 @@ describe("CloudxUpdateService", () => {
     await service.selectChannel("releases");
     expect(await service.start({ channel: "releases", targetCommit: target })).toEqual({ available: true });
     expect(execute).toHaveBeenLastCalledWith(process.execPath, [
-      path.resolve("scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target,
-    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+      path.join(updaterRoot, "scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target,
+    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8",
+      env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: path.resolve("."), PATH: process.env.PATH }) });
   });
 
   it.each(["never checked", "changed target", "changed channel", "changed checkout", "unavailable"])("rejects an unsafe launch: %s", async scenario => {
@@ -294,7 +336,7 @@ describe("CloudxUpdateService", () => {
   });
 
   it.each(["invalid JSON", '{"available":"yes"}'])("rejects unverifiable runner output", async stdout => {
-    const service = new CloudxUpdateService(dataDir, async () => ({ stdout }));
+    const service = new CloudxUpdateService(dataDir, async () => ({ stdout }), undefined, undefined, undefined, updaterRoot);
     await expect(service.status()).rejects.toMatchObject({ statusCode: 503, message: expect.stringContaining("could not be verified") });
   });
 

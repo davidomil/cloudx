@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import MeasuredSequencer from "./scripts/ci/shards.mjs";
@@ -14,6 +14,7 @@ export default defineConfig({
       "apps/**/*.test.ts",
       "scripts/**/*.test.mjs",
     ],
+    exclude: [...configDefaults.exclude, "apps/server/dist/updater/**"],
     coverage: {
       reporter: ["text", "html", "json-summary"],
       include: [

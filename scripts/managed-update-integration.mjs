@@ -45,7 +45,7 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
   if (fs.existsSync(server) && !fs.existsSync(service)) {
     migrated = prepareMissingSettingsIntegration(relative => fs.readFileSync(integrationPath(release, relative), "utf8"));
     files.push(...SETTINGS_FILES.filter(file => file !== "apps/web/src/ui/SettingsDialog.navigation.test.ts"), ...MISSING_SETTINGS_FILES);
-  } else if (fs.existsSync(service) && !fs.readFileSync(service, "utf8").includes("CLOUDX_UPDATE_COORDINATOR_ROOT")) {
+  } else if (fs.existsSync(service) && !fs.readFileSync(service, "utf8").includes("installedUpdaterRoot")) {
     files.push(...SETTINGS_FILES);
     if (serverSource.includes(LEGACY_SETTINGS_CONTRACT)) {
       migrated[SERVER_FILE] = serverSource.replace(LEGACY_SETTINGS_CONTRACT, MANAGED_SETTINGS_CONTRACT);

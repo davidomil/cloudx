@@ -3,7 +3,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { parseCloudxUpdateChannel, parseCloudxUpdatePreview, parseCloudxUpdateRequest, parseCloudxUpdateStatus,
   type CloudxUpdateChannel, type CloudxUpdatePreview, type CloudxUpdateRequest, type CloudxUpdateStatus } from "@cloudx/shared";
@@ -14,12 +14,13 @@ const executeFile = promisify(execFile);
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
 
 type UpdateCommand = (file: string, args: string[], options: {
-  cwd: string; timeout: number; maxBuffer: number; encoding: "utf8";
+  cwd: string; timeout: number; maxBuffer: number; encoding: "utf8"; env?: NodeJS.ProcessEnv;
 }) => Promise<{ stdout: string }>;
 
 export class CloudxUpdateService {
+  // Already-staged coordinators recognize CLOUDX_UPDATE_COORDINATOR_ROOT as
+  // the managed Settings contract. New requests use the installed bundle.
   private readonly repoRoot = process.env.CLOUDX_INSTALL_ROOT ?? defaultRepoRoot;
-  private readonly coordinatorRoot = process.env.CLOUDX_UPDATE_COORDINATOR_ROOT ?? this.repoRoot;
   private changing = false;
   private readonly previews = new Map<string, CloudxUpdatePreview>();
   private readonly checking = new Map<string, Promise<CloudxUpdatePreview>>();
@@ -27,9 +28,10 @@ export class CloudxUpdateService {
   constructor(private readonly dataDir: string, private readonly execute: UpdateCommand = executeFile,
     private readonly catalog: Pick<CloudxUpdateCatalog, "preview"> = new CloudxUpdateCatalog(),
     private readonly runtime: Pick<RuntimeBuild, "identity"> = runtimeBuild,
-    private readonly forge?: { reconcileCompletedMerges(): Promise<void> }) {
+    private readonly forge?: { reconcileCompletedMerges(): Promise<void> },
+    private readonly installedUpdaterRoot = fileURLToPath(new URL("../updater", import.meta.url))) {
     if (!path.isAbsolute(this.repoRoot)) throw new Error("CLOUDX_INSTALL_ROOT must be an absolute checkout path.");
-    if (!path.isAbsolute(this.coordinatorRoot)) throw new Error("CLOUDX_UPDATE_COORDINATOR_ROOT must be an absolute coordinator path.");
+    if (!path.isAbsolute(this.installedUpdaterRoot)) throw new Error("The installed updater must have an absolute bundle path.");
   }
 
   status(): Promise<CloudxUpdateStatus> {
@@ -141,16 +143,46 @@ export class CloudxUpdateService {
   private async request(action: "status" | "start", request?: CloudxUpdateRequest): Promise<CloudxUpdateStatus> {
     try {
       const { stdout } = await this.execute(process.execPath, [
-        path.join(this.coordinatorRoot, "scripts/settings-update.mjs"), action, this.dataDir, String(process.pid),
+        this.updaterScript(), action, this.dataDir, String(process.pid),
         ...(request ? [request.targetCommit] : []),
         ...(request?.confirmInterruption ? ["--confirm-interruption"] : []),
         ...(request?.resumeRunId ? [`--resume=${request.resumeRunId}`] : []),
         ...(request?.restoreSnapshotRunId ? [`--restore-snapshot=${request.restoreSnapshotRunId}`] : []),
-      ], { cwd: this.repoRoot, timeout: 30_000, maxBuffer: 64 * 1024, encoding: "utf8" });
+      ], { cwd: this.repoRoot, timeout: 30_000, maxBuffer: 64 * 1024, encoding: "utf8",
+        env: { ...process.env, CLOUDX_INSTALL_ROOT: this.repoRoot } });
       return parseCloudxUpdateStatus(JSON.parse(stdout));
     } catch {
       throw Object.assign(new Error("CloudX update status could not be verified. Check the local service logs before starting another update."), { statusCode: 503 });
     }
+  }
+
+  private updaterScript(): string {
+    const root = this.installedUpdaterRoot;
+    const manifest = path.join(root, "bundle.json");
+    if (fs.realpathSync(root) !== root || !fs.lstatSync(manifest).isFile() || fs.realpathSync(manifest) !== manifest) {
+      throw new Error("The installed updater bundle must use regular files in its own directory.");
+    }
+    const entries: unknown = JSON.parse(fs.readFileSync(manifest, "utf8"));
+    if (!Array.isArray(entries) || !entries.length) throw new Error("The installed updater inventory is missing.");
+    const paths = new Set<string>();
+    for (const entry of entries) {
+      if (!entry || typeof entry.path !== "string" || path.isAbsolute(entry.path)
+        || entry.path.split(/[\\/]/).some((part: string) => !part || part === "." || part === "..")
+        || entry.type !== "file" || !Number.isSafeInteger(entry.size) || entry.size < 0
+        || typeof entry.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(entry.sha256) || paths.has(entry.path)) {
+        throw new Error("The installed updater inventory is invalid.");
+      }
+      paths.add(entry.path);
+      const file = path.join(root, entry.path);
+      if (!fs.lstatSync(file).isFile() || fs.realpathSync(file) !== file || fs.statSync(file).size !== entry.size
+        || createHash("sha256").update(fs.readFileSync(file)).digest("hex") !== entry.sha256) {
+        throw new Error("The installed updater no longer matches its bundle.");
+      }
+    }
+    if (!paths.has("scripts/settings-update.mjs") || !paths.has("scripts/managed-update.mjs")) {
+      throw new Error("The installed updater entry points are missing.");
+    }
+    return path.join(root, "scripts/settings-update.mjs");
   }
 }
 

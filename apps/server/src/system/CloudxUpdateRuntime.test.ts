@@ -22,7 +22,15 @@ describe("Settings running-build evidence", () => {
     directory = path.join(root, "apps/server/dist");
     fs.mkdirSync(directory, { recursive: true });
     vi.stubEnv("CLOUDX_INSTALL_ROOT", root);
-    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", path.join(root, "coordinator"));
+    vi.stubEnv("CLOUDX_UPDATE_COORDINATOR_ROOT", path.join(root, "old-coordinator"));
+    const updater = path.join(directory, "updater");
+    fs.mkdirSync(path.join(updater, "scripts"), { recursive: true });
+    const bytes = "export {};\n";
+    const entries = ["settings-update.mjs", "managed-update.mjs"].map(name => {
+      fs.writeFileSync(path.join(updater, "scripts", name), bytes);
+      return { path: `scripts/${name}`, type: "file", size: Buffer.byteLength(bytes), sha256: createHash("sha256").update(bytes).digest("hex") };
+    });
+    fs.writeFileSync(path.join(updater, "bundle.json"), JSON.stringify(entries));
   });
 
   afterEach(() => {
@@ -52,7 +60,7 @@ describe("Settings running-build evidence", () => {
       target: { commit: currentCommit, name: "main", url: `https://github.com/davidomil/cloudx/commit/${currentCommit}` },
       changelog: [], changelogComplete: true,
     })) };
-    return { checkout, execute, running, service: new CloudxUpdateService(path.join(root, "data"), execute, catalog, runtime) };
+    return { checkout, execute, running, service: new CloudxUpdateService(path.join(root, "data"), execute, catalog, runtime, undefined, path.join(directory, "updater")) };
   }
 
   it("keeps the older startup identity after checkout and artifacts advance, and routes same-commit repair through the coordinator", async () => {
@@ -81,7 +89,7 @@ describe("Settings running-build evidence", () => {
       expect(repair.statusCode).toBe(202);
       expect(repair.json()).toEqual(running);
       expect(execute).toHaveBeenLastCalledWith(process.execPath, [
-        path.join(root, "coordinator/scripts/settings-update.mjs"), "start", path.join(root, "data"), String(process.pid), currentCommit,
+        path.join(directory, "updater/scripts/settings-update.mjs"), "start", path.join(root, "data"), String(process.pid), currentCommit,
       ], expect.objectContaining({ cwd: root }));
     } finally { await app.close(); }
   });
