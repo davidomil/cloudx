@@ -87,6 +87,7 @@ function checkout({ includeInstaller = false } = {}) {
     for (const file of [
       "install-cloudx.mjs",
       "codex-updater.mjs",
+      "codex-selection.mjs",
       "install-update.mjs",
       "install-terminal-upgrade.mjs",
       "install-runtime.mjs",
@@ -875,6 +876,31 @@ function plannedUpdate({ service = false, modelExists = false } = {}) {
 }
 
 describe("the complete updater plan", () => {
+  it("retains the selected Codex and its dependencies during a CloudX update from a saved custom command", async () => {
+    const fixture = plannedUpdate();
+    const prefix = path.join(fixture.options.home, "custom-codex");
+    const assistantBin = path.join(prefix, ".cloudx-codex/verified/bin/codex");
+    const selectionPath = path.join(prefix, ".cloudx-codex-selection.json");
+    const selection = JSON.stringify({ schemaVersion: 1, active: { version: "0.155.1", assistantBin }, previous: null });
+    const packageDir = path.join(prefix, ".cloudx-codex/verified/lib/node_modules/@openai/codex");
+    writeFile(packageDir, "package.json", JSON.stringify({ name: "@openai/codex", version: "0.155.1", bin: { codex: "bin/codex.js" } }));
+    writeFile(packageDir, "bin/codex.js", "selected executable");
+    fs.mkdirSync(path.dirname(assistantBin), { recursive: true });
+    fs.symlinkSync(path.join(packageDir, "bin/codex.js"), assistantBin);
+    writeFile(prefix, "lib/node_modules/@openai/codex/native-dependency", "running process dependency");
+    fs.writeFileSync(selectionPath, selection);
+    fs.appendFileSync(fixture.envPath, `CLOUDX_ASSISTANT_BIN=${path.join(prefix, "bin/codex")}\n`);
+
+    await runInstaller(fixture.options);
+
+    expect(fixture.runner.commands.some(({ args }) => args.some(arg => String(arg).startsWith("@openai/codex")))).toBe(false);
+    expect(fixture.runner.commands.some(({ command, args }) => command === assistantBin && args[0] === "--version")).toBe(true);
+    expect(fixture.runner.writes.find(write => write.path === fixture.envPath)?.contents).toContain(`CLOUDX_ASSISTANT_BIN=${path.join(prefix, "bin/codex")}`);
+    expect(fs.readFileSync(selectionPath, "utf8")).toBe(selection);
+    expect(fs.readFileSync(assistantBin, "utf8")).toBe("selected executable");
+    expect(fs.readFileSync(path.join(prefix, "lib/node_modules/@openai/codex/native-dependency"), "utf8")).toBe("running process dependency");
+  });
+
   it.each(["cloudx.service", "cloudx-terminal.service"])("refuses a live unpinned %s before Git or package mutations", async service => {
     const fixture = plannedUpdate();
     fs.writeFileSync(path.join(fixture.unitDir, service), "installed service");

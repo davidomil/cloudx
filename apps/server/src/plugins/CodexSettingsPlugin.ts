@@ -68,13 +68,25 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
         execute: async () => ({ update: await updates.read() }),
       },
       {
+        id: "codex-update.releases",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "List published Codex releases",
+        description: "Read stable and prerelease versions of the fixed @openai/codex package.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async () => ({ releases: await updates.releases() }),
+      },
+      {
         id: "codex-update.start",
         owner: { kind: "plugin", pluginId: this.id },
         title: "Update Codex CLI",
-        description: "Install and verify the latest Codex npm release without restarting CloudX or running sessions.",
+        description: "Prepare, verify and pin an exact published Codex release for new launches.",
         exposures: ["ui", "http"],
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
-        execute: async () => ({ update: await updates.start() }),
+        inputSchema: {
+          type: "object", properties: { version: { type: "string", maxLength: 128, pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" } },
+          required: ["version"], additionalProperties: false,
+        },
+        execute: async input => ({ update: await updates.start(input.version as string) }),
       },
     );
   }

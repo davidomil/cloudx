@@ -1,4 +1,5 @@
 import path from "node:path";
+import { resolveSelectedCodexCommand } from "../../../../scripts/codex-selection.mjs";
 
 export interface ProcessLaunch {
   command: string;
@@ -12,13 +13,13 @@ export function resolveUserShell(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 export function resolveAssistantCommand(env: NodeJS.ProcessEnv = process.env, defaultCommand = "codex"): string {
-  return env.CLOUDX_ASSISTANT_BIN?.trim() || defaultCommand;
+  return resolveSelectedCodexCommand(env.CLOUDX_ASSISTANT_BIN?.trim() || defaultCommand);
 }
 
 export function buildToolEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const pathEntries = [
     ...splitPath(env.CLOUDX_TOOL_PATH),
-    commandDirectory(resolveAssistantCommand(env, "")),
+    commandDirectory(env.CLOUDX_ASSISTANT_BIN?.trim() || ""),
     ...splitPath(env.PATH)
   ].filter((entry): entry is string => Boolean(entry));
   return {

@@ -27,7 +27,8 @@ type HookHandler = (hook: string, input: Record<string, unknown>) => CodexGlobal
 async function mount(settings = initial, handler?: HookHandler, strict = false) {
   const calls: { hook: string; input: Record<string, unknown> }[] = [];
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
-    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
+    if (hook === "codex-update.releases") return { releases: { latestStable: "1.0.0", versions: [{ version: "1.0.0", prerelease: false }] } } as unknown as T;
+    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", activeVersion: "1.0.0", requestedVersion: null, previousVersion: null, outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
     calls.push({ hook, input });
     const result = handler ? await handler(hook, input) : settings;
     return { settings: result } as unknown as T;
@@ -178,7 +179,7 @@ describe("global Codex settings editor", () => {
     await fill(select(container, "Reasoning effort"), "high");
     await click(container, "Save Codex settings");
     await remount();
-    expect([...container.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")].every(control => control.disabled)).toBe(true);
+    expect([...container.querySelectorAll<HTMLInputElement | HTMLSelectElement>("form input, form select")].every(control => control.disabled)).toBe(true);
     expect(checkbox(container, "YOLO mode").checked).toBe(false);
     expect(checkbox(container, "Enable browser").checked).toBe(true);
     expect(select(container, "Reasoning effort").value).toBe("high");
@@ -496,7 +497,8 @@ describe("global Codex settings editor", () => {
     const editor = new CodexSettingsEditor();
     let reads = 0;
     const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string) => {
-      if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
+      if (hook === "codex-update.releases") return { releases: { latestStable: "1.0.0", versions: [{ version: "1.0.0", prerelease: false }] } } as unknown as T;
+    if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", activeVersion: "1.0.0", requestedVersion: null, previousVersion: null, outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
       const settings = ++reads === 1 ? await first.promise : { ...initial, model: "current-model" };
       return { settings } as unknown as T;
     };

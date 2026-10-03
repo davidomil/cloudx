@@ -63,6 +63,9 @@ const installedCodex: CodexUpdateStatus = {
   jobId: null,
   phase: "idle",
   installedVersion: "1.0.0",
+  activeVersion: "1.0.0",
+  requestedVersion: null,
+  previousVersion: "0.9.0",
   outcome: null,
   message: "Ready to update Codex.",
   startedAt: null,
@@ -70,6 +73,23 @@ const installedCodex: CodexUpdateStatus = {
 };
 
 test.beforeEach(async ({ page }) => {
+  await page.route("**/api/hooks/codex-update.releases", (route) =>
+    route.fulfill({
+      json: {
+        result: {
+          releases: {
+            latestStable: "1.1.0",
+            versions: [
+              { version: "1.2.0-rc.1", prerelease: true },
+              { version: "1.1.0", prerelease: false },
+              { version: "1.0.0", prerelease: false },
+              { version: "0.9.0", prerelease: false },
+            ],
+          },
+        },
+      },
+    }),
+  );
   await page.route("**/api/hooks/codex-update.read", (route) =>
     route.fulfill({ json: { result: { update: installedCodex } } }),
   );
@@ -686,7 +706,8 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
       ...installedCodex,
       jobId: "browser-update",
       phase: "updating",
-      message: "Installing the latest Codex release…",
+      requestedVersion: "1.1.0",
+      message: "Installing selected Codex 1.1.0…",
       startedAt: "2026-09-22T00:00:00.000Z",
     };
     await route.fulfill({ json: { result: { update } } });
@@ -698,7 +719,7 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   const settings = await openCodexSettings(page, isMobile);
   const control = settings.getByRole("region", { name: "Codex CLI update" });
   const button = control.getByRole("button", {
-    name: "Update Codex",
+    name: "Apply selected version",
     exact: true,
   });
   const model = settings.getByRole("textbox", { name: "Default model" });
@@ -711,11 +732,19 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
     page.getByRole("tabpanel", { name: "Codex", exact: true }),
   ).toBeFocused();
   await page.keyboard.press("Tab");
+  await expect(
+    control.getByRole("searchbox", { name: "Search published releases" }),
+  ).toBeFocused();
+  await control
+    .getByRole("button", { name: "Select latest stable", exact: true })
+    .click();
+  await expect(control).toContainText("active 1.0.0 → requested 1.1.0");
+  await button.focus();
   await expect(button).toBeFocused();
   await expect(button).toBeInViewport({ ratio: 1 });
   expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   await button.press("Enter");
-  await expect(control).toContainText("Installing the latest Codex release");
+  await expect(control).toContainText("Installing selected Codex 1.1.0");
   await expect(button).toBeDisabled();
   await navigateCodexSettings(page, "category switches");
   await expect(model).toHaveValue("unsaved-update-draft");
@@ -735,6 +764,8 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
     ...update,
     phase: "succeeded",
     installedVersion: "1.1.0",
+    activeVersion: "1.1.0",
+    previousVersion: "1.0.0",
     outcome: "updated",
     message: "Codex updated to 1.1.0.",
     finishedAt: "2026-09-22T00:00:01.000Z",
@@ -761,6 +792,15 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   await expect(page.locator(".error-banner")).toHaveText(
     "CloudX settings could not be saved.",
   );
+  await control
+    .getByRole("button", { name: "Reload releases", exact: true })
+    .click();
+  await expect(
+    control.getByRole("button", { name: "Select latest stable", exact: true }),
+  ).toBeEnabled();
+  await expect(page.locator(".error-banner")).toHaveText(
+    "CloudX settings could not be saved.",
+  );
   await page.waitForResponse(
     (response) =>
       new URL(response.url()).pathname === "/api/hooks/codex-update.read",
@@ -773,11 +813,132 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
     .click();
   await openCodexSettings(page, isMobile);
   await expect(control).toContainText("Codex updated to 1.1.0.");
-  expect(starts).toEqual([{ input: {} }]);
+  expect(starts).toEqual([{ input: { version: "1.1.0" } }]);
   const current = (await (
     await page.request.get(`${baseUrl}/api/workspace`)
   ).json()) as WorkspaceStateResponse;
   expect(current.tabs).toEqual(original.tabs);
+});
+
+test("Codex version selection searches releases, previews a downgrade, and explicitly restores the previous version", async ({
+  page,
+  isMobile,
+}) => {
+  const starts: unknown[] = [];
+  await page.route("**/api/hooks/codex-update.start", async (route) => {
+    starts.push(route.request().postDataJSON());
+    await route.fulfill({
+      json: {
+        result: {
+          update: {
+            ...installedCodex,
+            jobId: "downgrade",
+            phase: "checking",
+            requestedVersion: "0.9.0",
+            message: "Verifying selected Codex 0.9.0 before activation.",
+            startedAt: "2026-09-22T00:00:00Z",
+          },
+        },
+      },
+    });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  const apply = control.getByRole("button", { name: "Apply selected version" });
+  const exact = control.getByRole("textbox", {
+    name: "Exact version",
+    exact: true,
+  });
+  await expect(apply).toBeDisabled();
+  await control
+    .getByRole("searchbox", { name: "Search published releases" })
+    .fill("rc");
+  const releases = control.getByRole("combobox", {
+    name: "Published releases",
+    exact: true,
+  });
+  await expect(releases.locator("option")).toHaveText([
+    "Select a published release",
+    "1.2.0-rc.1 (prerelease)",
+  ]);
+  await releases.selectOption("1.2.0-rc.1");
+  await expect(exact).toHaveValue("1.2.0-rc.1");
+  await expect(control).toContainText("This is a prerelease");
+  await exact.fill("latest");
+  await expect(apply).toBeDisabled();
+  await expect(control.getByRole("alert")).toContainText(
+    "Enter an exact version",
+  );
+  await exact.fill("9.9.9");
+  await expect(apply).toBeDisabled();
+  await expect(control.getByRole("alert")).toContainText(
+    "not in the published releases",
+  );
+  await control
+    .getByRole("button", {
+      name: "Select previous verified (0.9.0)",
+      exact: true,
+    })
+    .click();
+  await expect(exact).toHaveValue("0.9.0");
+  await expect(control).toContainText("active 1.0.0 → requested 0.9.0");
+  expect(starts).toEqual([]);
+  await apply.click();
+  await expect(control).toContainText("Requested version: 0.9.0");
+  await expect(control).toContainText(
+    "Active for new tabs and Forge workers: 1.0.0",
+  );
+  expect(starts).toEqual([{ input: { version: "0.9.0" } }]);
+  await settings
+    .getByRole("textbox", { name: "Default model" })
+    .fill("version-selection-draft");
+  await expectCodexSettingsFits(page);
+});
+
+test("Codex version selection exposes registry errors and waits for explicit release reload", async ({
+  page,
+  isMobile,
+}) => {
+  let discovered = false;
+  await page.route("**/api/hooks/codex-update.releases", (route) =>
+    discovered
+      ? route.fulfill({
+          json: {
+            result: {
+              releases: {
+                latestStable: "1.1.0",
+                versions: [{ version: "1.1.0", prerelease: false }],
+              },
+            },
+          },
+        })
+      : route.fulfill({
+          status: 502,
+          json: { message: "Registry request failed" },
+        }),
+  );
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  const apply = control.getByRole("button", { name: "Apply selected version" });
+  await expect(control).toContainText("Cannot load published Codex releases");
+  await expect(apply).toBeDisabled();
+  await expect(
+    control.getByRole("button", { name: "Select latest stable", exact: true }),
+  ).toBeDisabled();
+  discovered = true;
+  await control
+    .getByRole("button", { name: "Reload releases", exact: true })
+    .click();
+  await expect(control).not.toContainText(
+    "Cannot load published Codex releases",
+  );
+  await expect(apply).toBeDisabled();
+  await control
+    .getByRole("button", { name: "Select latest stable", exact: true })
+    .click();
+  await expect(apply).toBeEnabled();
 });
 
 test("Codex update retains a rejected start's permissions guidance after unchanged idle polling", async ({
@@ -800,17 +961,20 @@ test("Codex update retains a rejected start's permissions guidance after unchang
   const settings = await openCodexSettings(page, isMobile);
   const control = settings.getByRole("region", { name: "Codex CLI update" });
   const button = control.getByRole("button", {
-    name: "Update Codex",
+    name: "Apply selected version",
     exact: true,
   });
   await expect(control).toContainText("Installed version: 1.0.0");
+  await control
+    .getByRole("button", { name: "Select latest stable", exact: true })
+    .click();
   await button.click();
   await expect(control).toContainText(message);
   await expect.poll(() => idleReadsAfterRejection).toBeGreaterThanOrEqual(2);
   await expect(button).toBeEnabled();
   await expect(control).toContainText(message);
   await expect(control).not.toContainText(installedCodex.message);
-  expect(starts).toEqual([{ input: {} }]);
+  expect(starts).toEqual([{ input: { version: "1.1.0" } }]);
 });
 
 test("Codex update keeps unreadable-status guidance visible through polling and reconnect", async ({
@@ -818,7 +982,7 @@ test("Codex update keeps unreadable-status guidance visible through polling and 
   isMobile,
 }) => {
   const message =
-    "Saved Codex update status could not be read. Check the local codex-update/status.json file before updating.";
+    "Saved Codex update status could not be read. Check the local codex-update/selection-status.json file before updating.";
   const starts: unknown[] = [];
   let connected = true;
   let readable = false;
@@ -843,7 +1007,7 @@ test("Codex update keeps unreadable-status guidance visible through polling and 
   const settings = await openCodexSettings(page, isMobile);
   const control = settings.getByRole("region", { name: "Codex CLI update" });
   const button = control.getByRole("button", {
-    name: "Update Codex",
+    name: "Apply selected version",
     exact: true,
   });
   const model = settings.getByRole("textbox", { name: "Default model" });
@@ -864,6 +1028,9 @@ test("Codex update keeps unreadable-status guidance visible through polling and 
   await expect(model).toHaveValue("unsaved-read-refusal-draft");
   expect(starts).toEqual([]);
   readable = true;
+  await control
+    .getByRole("button", { name: "Select latest stable", exact: true })
+    .click();
   await expect(control).toContainText("Installed version: 1.0.0");
   await expect(control).not.toContainText(message);
   await expect(button).toBeEnabled();
@@ -878,6 +1045,7 @@ test("Codex update displays already-current and actionable failure results on na
     ...installedCodex,
     jobId: "browser-update",
     phase: "succeeded",
+    requestedVersion: "1.0.0",
     outcome: "current",
     message: "Codex 1.0.0 is already current.",
     startedAt: "2026-09-22T00:00:00.000Z",
@@ -902,9 +1070,12 @@ test("Codex update displays already-current and actionable failure results on na
   await expect(control).toContainText("Installed version: 1.0.0");
   await expect(control).not.toContainText("already current");
   const button = control.getByRole("button", {
-    name: "Update Codex",
+    name: "Apply selected version",
     exact: true,
   });
+  await control
+    .getByRole("button", { name: "Select latest stable", exact: true })
+    .click();
   await button.scrollIntoViewIfNeeded();
   await expect(button).toBeEnabled();
   await expect(button).toBeInViewport({ ratio: 1 });

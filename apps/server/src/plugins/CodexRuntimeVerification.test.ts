@@ -31,6 +31,21 @@ it("requires an explicitly selected absolute CLI path", async () => {
   await expect(verifyCodexRuntime({ assistantBin: "codex" })).rejects.toThrow("absolute executable path");
 });
 
+it("probes the requested executable without consulting its prefix's active selection", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-verification-executable-"));
+  try {
+    const assistantBin = path.join(root, "bin/codex");
+    const launched = path.join(root, "launched");
+    await fs.mkdir(path.dirname(assistantBin));
+    await fs.writeFile(path.join(root, ".cloudx-codex-selection.json"), "invalid active selection");
+    await fs.writeFile(assistantBin, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(launched)}, 'requested executable');\nprocess.exit(86);\n`, { mode: 0o700 });
+
+    await expect(verifyCodexRuntime({ assistantBin })).rejects.toThrow("did not save a selected conversation");
+
+    expect(await fs.readFile(launched, "utf8")).toBe("requested executable");
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+}, 10_000);
+
 it("retains private bounded phase evidence after a rejected launch without inheriting credentials", async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-verification-diagnostics-"));
   const output: string[] = [];

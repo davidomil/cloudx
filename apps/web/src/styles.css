@@ -3644,8 +3644,8 @@ a:hover svg {
 .codex-settings-header h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: var(--font-size-md); }
 .codex-settings-header p, .codex-settings-form small { color: var(--color-muted-foreground); overflow-wrap: anywhere; }
 .codex-settings-form { display: flex; flex-direction: column; gap: 16px; }
-.codex-settings-form label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.codex-settings-form input:not([type="checkbox"]), .codex-settings-form select {
+.codex-settings-form label, .codex-update-control label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.codex-settings-form input:not([type="checkbox"]), .codex-settings-form select, .codex-update-control input, .codex-update-control select {
   box-sizing: border-box;
   width: 100%;
   min-width: 0;

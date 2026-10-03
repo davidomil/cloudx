@@ -6,6 +6,13 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      previous_supported_sha:
+        description: Previous supported release or documented main revision (full commit SHA)
+        required: true
+        type: string
+        default: cb70ffa1c4225c82fc408c21562f5b02094fd1f6
 permissions:
   contents: read
 concurrency:
@@ -59,6 +66,123 @@ jobs:
           name: terminal-diagnostics-${{ github.sha }}
           path: test-results/
           if-no-files-found: warn
+          retention-days: 14
+  lifecycle-revisions:
+    name: Pinned lifecycle revisions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source-sha: ${{ steps.revisions.outputs.source-sha }}
+      target-sha: ${{ steps.revisions.outputs.target-sha }}
+    steps:
+      - name: Initialize revision evidence before setup
+        run: |
+          mkdir -p "$RUNNER_TEMP/lifecycle-revisions"
+          printf '{"result":"setup-started"}\n' > "$RUNNER_TEMP/lifecycle-revisions/setup.json"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22.23.1
+      - name: Select supported source and exact candidate once
+        id: revisions
+        run: node scripts/ci/lifecycle-revisions.mjs "$RUNNER_TEMP/lifecycle-revisions/revisions.json"
+      - name: Retain revision selection evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: lifecycle-revisions-${{ github.sha }}
+          path: ${{ runner.temp }}/lifecycle-revisions/
+          if-no-files-found: error
+          retention-days: 14
+  clean-install:
+    name: Clean installation
+    needs:
+      - lifecycle-revisions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ needs.lifecycle-revisions.outputs.source-sha }}
+      TARGET_SHA: ${{ needs.lifecycle-revisions.outputs.target-sha }}
+    steps:
+      - name: Initialize lifecycle evidence and browser path before setup
+        run: |
+          mkdir -p "$RUNNER_TEMP/lifecycle-install"
+          printf '{"scenario":"install","sourceSha":"%s","targetSha":"%s","result":"setup-started"}\n' "$SOURCE_SHA" "$TARGET_SHA" > "$RUNNER_TEMP/lifecycle-install/request.json"
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s/cloudx-lifecycle-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Free unused runner SDKs for lifecycle staging
+        id: lifecycle-space
+        timeout-minutes: 5
+        run: |
+          df -B1 / > "$RUNNER_TEMP/lifecycle-install/disk-space-before.txt"
+          sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
+          df -B1 / > "$RUNNER_TEMP/lifecycle-install/disk-space-after.txt"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ needs.lifecycle-revisions.outputs.target-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Require the real install lifecycle on a fresh Ubuntu user
+        run: sudo --preserve-env=PLAYWRIGHT_BROWSERS_PATH env CLOUDX_LIFECYCLE_DISPOSABLE=1 PATH="$PATH" bash scripts/ci/lifecycle-host.sh install "$SOURCE_SHA" "$TARGET_SHA" "$RUNNER_TEMP/lifecycle-install"
+      - name: Retain installer, readiness, runtime, journal and browser evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: lifecycle-install-${{ github.sha }}
+          path: ${{ runner.temp }}/lifecycle-install/
+          if-no-files-found: error
+          retention-days: 14
+  installed-upgrade:
+    name: Installed previous-version upgrade
+    needs:
+      - lifecycle-revisions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      SOURCE_SHA: ${{ needs.lifecycle-revisions.outputs.source-sha }}
+      TARGET_SHA: ${{ needs.lifecycle-revisions.outputs.target-sha }}
+    steps:
+      - name: Initialize lifecycle evidence and browser path before setup
+        run: |
+          mkdir -p "$RUNNER_TEMP/lifecycle-upgrade"
+          printf '{"scenario":"upgrade","sourceSha":"%s","targetSha":"%s","result":"setup-started"}\n' "$SOURCE_SHA" "$TARGET_SHA" > "$RUNNER_TEMP/lifecycle-upgrade/request.json"
+          printf 'PLAYWRIGHT_BROWSERS_PATH=%s/cloudx-lifecycle-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Free unused runner SDKs for lifecycle staging
+        id: lifecycle-space
+        timeout-minutes: 5
+        run: |
+          df -B1 / > "$RUNNER_TEMP/lifecycle-upgrade/disk-space-before.txt"
+          sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
+          df -B1 / > "$RUNNER_TEMP/lifecycle-upgrade/disk-space-after.txt"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ needs.lifecycle-revisions.outputs.target-sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 22.23.1
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Require the real upgrade lifecycle on a fresh Ubuntu user
+        run: sudo --preserve-env=PLAYWRIGHT_BROWSERS_PATH env CLOUDX_LIFECYCLE_DISPOSABLE=1 PATH="$PATH" bash scripts/ci/lifecycle-host.sh upgrade "$SOURCE_SHA" "$TARGET_SHA" "$RUNNER_TEMP/lifecycle-upgrade"
+      - name: Retain installer, readiness, runtime, journal and browser evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: lifecycle-upgrade-${{ github.sha }}
+          path: ${{ runner.temp }}/lifecycle-upgrade/
+          if-no-files-found: error
           retention-days: 14
   codex-native:
     name: Codex native recovery (${{ matrix.codex }})
@@ -271,6 +395,9 @@ jobs:
       - typescript
       - codex-native
       - terminal-stress
+      - lifecycle-revisions
+      - clean-install
+      - installed-upgrade
       - python-services
       - browser
       - isolated-verifier
@@ -284,6 +411,9 @@ jobs:
           TYPESCRIPT_RESULT: ${{ needs.typescript.result }}
           CODEX_NATIVE_RESULT: ${{ needs.codex-native.result }}
           TERMINAL_STRESS_RESULT: ${{ needs.terminal-stress.result }}
+          LIFECYCLE_REVISIONS_RESULT: ${{ needs.lifecycle-revisions.result }}
+          CLEAN_INSTALL_RESULT: ${{ needs.clean-install.result }}
+          INSTALLED_UPGRADE_RESULT: ${{ needs.installed-upgrade.result }}
           PYTHON_RESULT: ${{ needs.python-services.result }}
           BROWSER_RESULT: ${{ needs.browser.result }}
           ISOLATED_VERIFIER_RESULT: ${{ needs.isolated-verifier.result }}

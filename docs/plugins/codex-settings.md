@@ -21,34 +21,45 @@ Settings affect future launches.
 
 ## Update Codex CLI
 
-The **Codex CLI** section shows the installed version. Select **Update Codex**
-to check npm and install the release tagged `latest`. Progress moves through
-checking, installation, and executable verification. CloudX reports success
-only after `--version` succeeds, or **already current** when the verified
-installation matches the release.
+The **Codex CLI** section distinguishes the version active for new tabs
+and Forge workers, the requested exact target and the last checked
+installed candidate. Search published releases or enter an exact
+version, review the preview and select **Apply selected version**. You
+can upgrade or downgrade; prereleases are labeled and require explicit
+selection.
 
-The server keeps the update running when Settings closes or the browser
-disconnects. Reopening Settings shows the same job and its retained result.
-Updating preserves unsaved settings edits, running Codex and terminal sessions,
-conversations, authentication, and configuration. Newly launched Codex processes
-use the updated executable. Explicitly closing the entire Settings dialog still
-discards its unsaved draft, as before.
+**Select latest stable** fills an exact version without applying it.
+**Select previous verified** is offered after a verified selection has
+been replaced; an installation discovered only with `--version` is not a
+verified return target. Applying the active version re-verifies it
+before reporting **already active and verified**.
 
-The button updates the npm-owned executable configured for the running server,
-including its custom npm prefix. Custom wrappers and PATH-only commands require
-their own installer or an absolute npm `CLOUDX_ASSISTANT_BIN`. A shared
-installation lock prevents simultaneous writes by Settings and the CLI installer.
-Updates require CloudX's bundled Linux process supervisor and Python 3.9 or newer
-on the service PATH so detached installer processes are stopped before unlocking.
+CloudX prepares the candidate separately, verifies real native tab
+initialization, saved conversation identity and a Forge turn, then
+checks isolated snapshots of retained shared SQLite state and
+transcripts. Incompatible candidates leave the active selection
+unchanged. These snapshots test compatibility at that moment; later
+writes by other Codex processes are outside that check.
 
-Failures show an actionable message and the usable installed version when it
-can be verified. Raw command output stays in the private, bounded
-`codex-update/update.log` under the CloudX data directory. See
-[setup and troubleshooting](../SETUP.md#update-codex-from-settings) for
-installation requirements and interrupted-update recovery.
+When a verified active selection exists, CloudX also runs that
+executable against the snapshots after any candidate migrations.
 
-**Update Codex** does not restart CloudX. A full CloudX update still installs
-its pinned Codex version and can replace a newer Codex-only update.
+The exact selection persists through browser reloads, restarts, CloudX
+updates and installer maintenance. New launches use it; running sessions
+retain their original executable and dependencies. The operation
+preserves authentication, preferences and conversation files.
+
+Closing Settings or reconnecting keeps the server-owned job and its
+retained result. Unsaved settings edits remain in the open editor;
+closing the entire Settings dialog still discards its draft.
+
+Selection requires an absolute npm-owned `CLOUDX_ASSISTANT_BIN`, Linux
+and Python 3.9 or newer on the service PATH. Settings and the installer
+share a lock, and failures retain an actionable result with requested,
+installed and active versions shown separately. Raw output stays in the
+private, bounded `codex-update/update.log`; see [setup and
+troubleshooting](../SETUP.md#update-codex-from-settings) for
+prerequisites, snapshot limits and interrupted-operation recovery.
 
 ## Use it
 
