@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, expect, it } from "vitest";
 import { parse } from "yaml";
 import { CODEX_CLI_VERSION } from "./install-cloudx.mjs";
@@ -76,4 +76,90 @@ fs.writeFileSync(process.env.NPM_COMMAND_LOG, JSON.stringify(process.argv.slice(
     "--ignore-scripts", "--no-audit", "--no-fund", `@openai/codex@${version}`
   ]);
   expect(await fs.readFile(outputs, "utf8")).toBe(`version=${version}\n`);
+});
+
+async function runNativeValidation(scenario = {}) {
+  const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-runner-"));
+  fixtures.push(fixture);
+  const preload = path.join(fixture, "native-processes.mjs");
+  const commandLog = path.join(fixture, "commands.jsonl");
+  await fs.writeFile(preload, `
+import childProcess from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+const scenario = ${JSON.stringify(scenario)};
+childProcess.spawnSync = (command, args, options) => {
+  fs.appendFileSync(${JSON.stringify(commandLog)}, JSON.stringify({ command, args, timeout: options.timeout }) + "\\n");
+  if (args[0] === "--version") return { status: 0, stdout: "codex-cli 0.157.1\\n" };
+  if (args[1] === "run") {
+    if ((scenario.durationMs ?? 60_000) > options.timeout)
+      return { error: Object.assign(new Error("Native suite deadline exceeded"), { code: "ETIMEDOUT" }), status: null, signal: "SIGTERM" };
+    const suites = args.slice(2, args.indexOf("--maxWorkers=1"));
+    const reportPath = args.find(arg => arg.startsWith("--outputFile.json=")).slice("--outputFile.json=".length);
+    const testResults = suites.map(name => ({ name: path.join(options.cwd, name), assertionResults: [{ status: "passed" }] }));
+    const report = { numTotalTests: suites.length, numPassedTests: suites.length, numPendingTests: 0, numFailedTests: 0, testResults };
+    if (scenario.result === "skipped") { report.numPendingTests = 1; report.numPassedTests--; testResults[0].assertionResults[0].status = "pending"; }
+    if (scenario.result === "failed") { report.numFailedTests = 1; report.numPassedTests--; testResults[0].assertionResults[0].status = "failed"; }
+    if (scenario.result === "missing") { report.testResults.pop(); report.numTotalTests--; report.numPassedTests--; }
+    if (scenario.result === "empty") { report.numTotalTests = 0; report.numPassedTests = 0; report.testResults = []; }
+    if (scenario.result === "unreported-skip") testResults[0].assertionResults[0].status = "pending";
+    fs.writeFileSync(reportPath, JSON.stringify(report));
+    return { status: scenario.suiteExit ?? 0 };
+  }
+  if (path.basename(args[0]) === "codex-runtime-verification.mjs") return { status: scenario.runtimeExit ?? 0 };
+  throw new Error("Unexpected native validation command: " + JSON.stringify(args));
+};
+syncBuiltinESMExports();
+`);
+  const result = spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, runner], {
+    env: { ...process.env, CLOUDX_NATIVE_CODEX: path.join(fixture, "codex"), CLOUDX_NATIVE_CODEX_VERSION: "0.157.1" },
+    encoding: "utf8", timeout: 5_000
+  });
+  const commands = (await fs.readFile(commandLog, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  const suiteCommand = commands.find(command => command.args[1] === "run");
+  const reportPath = suiteCommand.args.find(arg => arg.startsWith("--outputFile.json=")).slice("--outputFile.json=".length);
+  await expect(fs.stat(path.dirname(reportPath))).rejects.toMatchObject({ code: "ENOENT" });
+  return { ...result, commands };
+}
+
+it("lets the complete serial native suite finish beyond two minutes before checking the built verifier", async () => {
+  const result = await runNativeValidation({ durationMs: 180_000 });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.commands[1].args.slice(2, 9)).toEqual([
+    "apps/server/src/plugins/CodexConversationRecovery.native.test.ts",
+    "apps/server/src/plugins/CodexWorkerBridge.native.test.ts",
+    "apps/server/src/plugins/CodexModelDefaults.native.test.ts",
+    "apps/server/src/rulesSkills/CodexHomeOverlay.native.test.ts",
+    "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
+    "apps/server/src/plugins/CodexFirstSelection.native.test.ts",
+    "scripts/codex-updater.native.test.mjs"
+  ]);
+  expect(result.commands[1].args).toContain("--maxWorkers=1");
+  expect(result.commands[1].timeout).toBeLessThanOrEqual(300_000);
+  expect(result.commands).toHaveLength(3);
+  expect(result.commands[2]).toMatchObject({ timeout: 60_000 });
+  expect(path.basename(result.commands[2].args[0])).toBe("codex-runtime-verification.mjs");
+});
+
+it.each([
+  [{ durationMs: 310_000 }, "Native suite deadline exceeded"],
+  [{ suiteExit: 1 }, "Native Codex validation exited 1"],
+  [{ result: "skipped" }, "skipped tests are not accepted"],
+  [{ result: "failed" }, "must run every selected case successfully"],
+  [{ result: "empty" }, "must run every selected case successfully"],
+  [{ result: "unreported-skip" }, "Required native suite did not pass every case"],
+  [{ result: "missing" }, "Required native suite did not pass every case"]
+])("rejects incomplete native validation %j without running the built verifier", async (scenario, diagnostic) => {
+  const result = await runNativeValidation(scenario);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain(diagnostic);
+  expect(result.commands).toHaveLength(2);
+});
+
+it("rejects a failed built runtime verifier after the native suites pass", async () => {
+  const result = await runNativeValidation({ runtimeExit: 1 });
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("The built updater runtime verifier did not pass");
+  expect(result.commands).toHaveLength(3);
 });

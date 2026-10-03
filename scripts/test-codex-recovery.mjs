@@ -37,7 +37,7 @@ const result = spawnSync(process.execPath, [
   fileURLToPath(new URL("vitest.mjs", import.meta.resolve("vitest/package.json"))), "run",
   ...requiredSuites,
   "--maxWorkers=1", "--reporter=default", "--reporter=json", `--outputFile.json=${resultsPath}`
-], { cwd: root, env: process.env, stdio: "inherit", timeout: 120_000 });
+], { cwd: root, env: process.env, stdio: "inherit", timeout: 300_000 });
 try {
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`Native Codex validation exited ${result.status ?? result.signal}.`);
