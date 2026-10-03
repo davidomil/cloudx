@@ -144,6 +144,8 @@ it.skipIf(process.platform !== "linux")("renews the coordinator between real Set
 
   await service.preview();
   const second = await service.start({ channel: "main", targetCommit: installation.commits.next, confirmInterruption: true });
+  expect(second).toMatchObject({ available: true, run: { state: "running", targetCommit: installation.commits.next } });
+  expect(second.run.id).not.toBe(first.run.id);
   const renewed = installation.record(second.run.id);
   expect(renewed.coordinator).not.toBe(original.coordinator);
   expect(fs.readFileSync(path.join(renewed.coordinator, "scripts/terminal-upgrade-recovery.mjs"), "utf8"))
@@ -305,12 +307,13 @@ async function settingsInstallation() {
     const record = fixture.record(id);
     const { ManagedUpdate, UpdateHost } = await import(pathToFileURL(path.join(record.coordinator, "scripts/managed-update.mjs")));
     const save = value => writeUpdateJson(path.join(home, ".local/state/cloudx/settings-update", `${id}.json`), value);
-    fixture.state.ControlGroup = "/cloudx-renewal-fixture";
     const host = new UpdateHost({ repoRoot: checkout, home, dataDir, service: "renewal-fixture.service", port: 3001,
       runDir: path.dirname(record.coordinator), save, commands, prepareRelease: ({ releaseRoot }) => buildFixtureRelease(releaseRoot),
       inspectCapacity: destination => ({ device: "fixture", destination, mount: home, blockSize: 4096,
         availableBytes: fixture.capacityBytes, availableInodes: 1_000_000 }) });
     const run = await new ManagedUpdate({ record, save, host }).run();
+    // Readiness verifies the real process cgroup; later requests inspect the simulated service.
+    fixture.state.ControlGroup = "/cloudx-renewal-fixture";
     fixture.unit = { LoadState: "not-found", ActiveState: "inactive" };
     const { SettingsUpdater } = await import(pathToFileURL(path.join(record.coordinator, "scripts/settings-update.mjs")));
     new SettingsUpdater({ repoRoot: checkout, home }).publish(record);
