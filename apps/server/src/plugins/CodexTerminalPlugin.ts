@@ -231,6 +231,18 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     if (!this.factory.attach) throw new Error("Codex terminal reconnection is unavailable.");
     const terminal = await this.factory.attach(input.tab.id);
     let restoredInput = { ...input.initialInput };
+    if (this.dataDir) {
+      try {
+        await materializeCodexTemplate(templateFromRuntimeContext(input.runtimeContext), { ...this.env }, {
+          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources
+        });
+        restoredInput = { ...restoredInput, codexRuntimeContext: input.runtimeContext };
+        await input.controls.setRestoreInput?.(restoredInput);
+      } catch (error) {
+        terminal.detach?.();
+        throw error;
+      }
+    }
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
     return new CodexTerminalSession(input.tab, terminal, input.controls, {
       closeOnExit: input.initialInput?.codexRecovered !== true,
