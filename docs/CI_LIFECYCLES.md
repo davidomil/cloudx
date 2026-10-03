@@ -30,6 +30,11 @@ Before starting the application user manager, the harness temporarily removes
 the runner-specific `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` assignments from
 `/etc/environment`. A transient user service verifies its inherited home and
 runtime directory and connects to its own user manager before installation.
+The harness also replaces the global `PATH` with the controller Node directory
+and standard executable directories, and verifies that path in the service.
+Runner-private paths can turn lookup of an absent optional executable such as
+`quota` into a permission error, causing the source updater's capacity check to
+fail. The application caller and user services receive the same isolated path.
 Cleanup restores the original environment file after stopping that manager.
 
 Readiness includes HTTPS web, ASR, documentation and production

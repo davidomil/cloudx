@@ -21,7 +21,7 @@ printf '{"scenario":"%s","sourceSha":"%s","targetSha":"%s","result":"setup-faile
 as_application() {
   runuser -u "$test_user" -- env -i \
     HOME="$test_home" USER="$test_user" LOGNAME="$test_user" \
-    PATH="$controller_bin:/usr/local/bin:/usr/bin:/bin" LANG=C.UTF-8 \
+    PATH="$application_path" LANG=C.UTF-8 \
     XDG_RUNTIME_DIR="/run/user/$test_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$test_uid/bus" \
     PLAYWRIGHT_BROWSERS_PATH="$PLAYWRIGHT_BROWSERS_PATH" \
     DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "$@"
@@ -73,6 +73,7 @@ source /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 ]]
 controller_node=$(command -v node)
 controller_bin=$(dirname "$controller_node")
+application_path="$controller_bin:/usr/local/bin:/usr/bin:/bin"
 : "${PLAYWRIGHT_BROWSERS_PATH:?Install the controller Chromium browser first}"
 test -r "$controller/node_modules/@playwright/test/package.json"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
@@ -104,7 +105,8 @@ chmod 0440 "/etc/sudoers.d/$test_user"
 # manager reparses it even when its caller uses env -i; restore it during cleanup.
 cp -p /etc/environment "$fixture/environment"
 environment_changed=1
-sed -i -E '/^[[:space:]]*(XDG_CONFIG_HOME|XDG_RUNTIME_DIR)=/d' /etc/environment
+sed -i -E '/^[[:space:]]*(PATH|XDG_CONFIG_HOME|XDG_RUNTIME_DIR)=/d' /etc/environment
+printf 'PATH="%s"\n' "$application_path" >> /etc/environment
 loginctl enable-linger "$test_user"
 systemctl start "user@$test_uid.service"
 as_application systemctl --user show-environment > /dev/null
@@ -112,9 +114,10 @@ as_application systemd-run --user --wait --pipe --collect /bin/sh -ec '
   test "$HOME" = "$1"
   test "${XDG_CONFIG_HOME:-$HOME/.config}" = "$HOME/.config"
   test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
+  test "$PATH" = "$2"
   systemctl --user show-environment > /dev/null
-  printf "Application service home and runtime directory are isolated; nested user-manager access passes.\\n"
-' sh "$test_home" > "$evidence/user-manager.txt" 2>&1
+  printf "Application service home, runtime directory and PATH are isolated; nested user-manager access passes.\\n"
+' sh "$test_home" "$application_path" > "$evidence/user-manager.txt" 2>&1
 chown "$test_user:$test_user" "$evidence"
 as_application git clone --no-hardlinks "$fixture/origin.git" "$test_home/cloudx"
 install_sha=$target_sha
