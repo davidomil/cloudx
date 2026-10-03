@@ -196,7 +196,7 @@ async function settingsInstallation() {
   git(remote, "config", "user.email", "test@invalid");
   for (const relative of COORDINATOR_FILES) write(path.join(remote, relative), fs.readFileSync(path.join(sourceRoot, relative)));
   const renewalFiles = ["apps/server/src/system/CloudxUpdateService.ts", "scripts/settings-update.mjs",
-    "scripts/managed-update-integration.mjs", "scripts/managed-update.mjs"];
+    "scripts/managed-update-integration.mjs", "scripts/managed-update.mjs", "scripts/install-cloudx.mjs", "scripts/codex-updater.mjs"];
   const maintainedSources = Object.fromEntries(renewalFiles.map(relative => [relative, fs.readFileSync(path.join(remote, relative))]));
   for (const relative of renewalFiles)
     write(path.join(remote, relative), git(sourceRoot, "show", `${frozenCoordinatorCommit}:${relative}`));
