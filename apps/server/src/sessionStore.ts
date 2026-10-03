@@ -180,10 +180,11 @@ export class SessionStore {
     const tab = this.getTab(tabId);
     const plugin = this.plugins.get(tab.pluginId);
     if (tab.ownerPluginId || plugin.panelKind !== "terminal") throw new Error("This tab does not support terminal recovery.");
-    if (request.action === "new-shell" && plugin.id !== "standard-terminal" || request.action === "resume-conversation" && plugin.id !== "codex-terminal") {
+    const recoveringConversation = request.action === "resume-conversation" || request.action === "select-conversation";
+    if (request.action === "new-shell" && plugin.id !== "standard-terminal" || recoveringConversation && plugin.id !== "codex-terminal") {
       throw new Error("The recovery action does not match this terminal.");
     }
-    if (request.action === "resume-conversation" && !plugin.recoverSession) throw new Error("Conversation recovery is unavailable.");
+    if (recoveringConversation && !plugin.recoverSession) throw new Error("Conversation recovery is unavailable.");
     const previous = this.sessions.get(tabId);
     if (previous && !previous.hasExited?.() && !tab.recovery && tab.status === "running") return tab;
     const restoreInput = previous?.restoreInput?.();
@@ -215,6 +216,7 @@ export class SessionStore {
         if (!sessionId) throw new Error("Select an exact Codex conversation ID to resume.");
         input.initialInput = { ...input.initialInput, resume: { mode: "session", sessionId } };
       }
+      if (request.action === "select-conversation") input.initialInput = { ...input.initialInput, resume: { mode: "picker", all: true } };
       const session = request.action === "new-shell"
         ? await plugin.createSession(input)
         : await plugin.recoverSession!(input);

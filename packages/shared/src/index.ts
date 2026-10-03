@@ -104,7 +104,7 @@ export interface TabRecovery {
 }
 
 export interface RecoverTabRequest {
-  action: "reconnect" | "new-shell" | "resume-conversation";
+  action: "reconnect" | "new-shell" | "resume-conversation" | "select-conversation";
   sessionId?: string;
 }
 
@@ -692,6 +692,7 @@ export interface CreateTabRequest {
 
 export type CodexSessionResumeMode = "new" | "picker" | "last" | "session";
 
+export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
 export const CODEX_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
 

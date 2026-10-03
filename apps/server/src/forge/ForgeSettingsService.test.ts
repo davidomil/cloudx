@@ -231,7 +231,7 @@ async function fixture() {
       },
     },
   });
-  return { config, connections, credentials, settings };
+  return { root, plugin, config, connections, credentials, settings };
 }
 
 describe("Forge settings field contracts", () => {
@@ -270,11 +270,21 @@ describe("Forge settings field contracts", () => {
 });
 
 describe("Forge connected application settings", () => {
+  it("reloads explicit GPT-6.1 Sol and existing model choices without rewriting either", async () => {
+    const { root, plugin, config, connections, credentials } = await fixture();
+    credentials.set("worker", { kind: "token", token: "worker-private" });
+    credentials.set("reviewer", { kind: "token", token: "reviewer-private" });
+    const choices = { workerModel: "gpt-6.1-sol", workerReasoningEffort: "max", reviewModel: "gpt-6-astra", reviewReasoningEffort: "high" };
+    await config.update({ plugins: { forge: choices } });
+    const reloaded = new ForgeSettingsService(new ConfigService(root, () => [plugin.descriptor()]), connections);
+    expect(reloaded.settings()).toMatchObject(choices);
+  });
+
   it("saves independent coding and review model choices and rejects invalid selections", async () => {
     const { config, settings, credentials } = await fixture();
     credentials.set("worker", { kind: "token", token: "worker-private" });
     credentials.set("reviewer", { kind: "token", token: "reviewer-private" });
-    expect(settings.settings()).toMatchObject({ workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "max" });
+    expect(settings.settings()).toMatchObject({ workerModel: "gpt-6.1-sol", workerReasoningEffort: "xhigh", reviewModel: "gpt-6.1-sol", reviewReasoningEffort: "max" });
     const selected = { workerModel: "gpt-5.6-sol", workerReasoningEffort: "high", reviewModel: "gpt-5.6-terra", reviewReasoningEffort: "ultra" };
     await config.update({ plugins: { forge: selected } });
     expect(settings.settings()).toMatchObject(selected);
@@ -364,9 +374,9 @@ describe("Forge connected application settings", () => {
       baseBranch: "main",
       workerTemplateId: "worker",
       reviewTemplateId: "review",
-      workerModel: "gpt-6-astra",
+      workerModel: "gpt-6.1-sol",
       workerReasoningEffort: "xhigh",
-      reviewModel: "gpt-6-astra",
+      reviewModel: "gpt-6.1-sol",
       reviewReasoningEffort: "max",
       maxRunMinutes: 180,
     });

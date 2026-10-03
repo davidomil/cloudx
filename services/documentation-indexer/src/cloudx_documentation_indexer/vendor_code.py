@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
@@ -51,26 +52,27 @@ LANGUAGE_BY_SUFFIX = {
     ".tsx": "TypeScript JSX",
 }
 
+C_FAMILY_SUFFIXES = {".c", ".h", ".cpp", ".hpp"}
+C_FUNCTION_NAME_RE = re.compile(r"[A-Za-z_~][\w:~]*")
+C_DECLARATION_PREFIX_RE = re.compile(r"[A-Za-z_][\w\s:*&<>,]*")
+C_TEMPLATE_HEAD_RE = re.compile(r"\s*template\s*<")
+
 SYMBOL_PATTERNS = {
     ".c": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:typedef\s+)?(?:struct|enum)\s+([A-Za-z_]\w*)?")),
-        ("function", re.compile(r"^\s*(?:static\s+|inline\s+|extern\s+|const\s+|volatile\s+|unsigned\s+|signed\s+|long\s+|short\s+)*(?:[A-Za-z_]\w*[\w\s*]*\s+)+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".cpp": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_]\w*)")),
-        ("function", re.compile(r"^\s*(?:template\s*<[^>]+>\s*)?(?:static\s+|inline\s+|extern\s+|constexpr\s+|const\s+|volatile\s+)*(?:[A-Za-z_:~]\w*[\w\s:*&<>]*\s+)+([A-Za-z_:~]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".h": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:typedef\s+)?(?:struct|enum)\s+([A-Za-z_]\w*)?")),
-        ("function", re.compile(r"^\s*(?:static\s+|inline\s+|extern\s+|const\s+|volatile\s+|unsigned\s+|signed\s+|long\s+|short\s+)*(?:[A-Za-z_]\w*[\w\s*]*\s+)+([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".hpp": [
         ("macro", re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")),
         ("type", re.compile(r"^\s*(?:class|struct|enum)\s+([A-Za-z_]\w*)")),
-        ("function", re.compile(r"^\s*(?:template\s*<[^>]+>\s*)?(?:static\s+|inline\s+|extern\s+|constexpr\s+|const\s+|volatile\s+)*(?:[A-Za-z_:~]\w*[\w\s:*&<>]*\s+)+([A-Za-z_:~]\w*)\s*\([^;{}]*\)\s*(?:\{|;)")),
     ],
     ".js": [
         ("function", re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)")),
@@ -297,7 +299,126 @@ def extract_line_symbols(suffix: str, text: str) -> list[CodeSymbol]:
             if name and name not in SKIP_CALLS:
                 symbols.append(CodeSymbol(kind, name, line_number))
                 break
+        else:
+            if suffix in C_FAMILY_SUFFIXES:
+                name = extract_c_function_name(line)
+                if name:
+                    symbols.append(CodeSymbol("function", name, line_number))
     return symbols[:80]
+
+
+def extract_c_function_name(line: str) -> str | None:
+    # Without C++ name lookup, '<' cannot reliably distinguish a template from
+    # comparison or shift expressions. Look for the supported declaration
+    # suffix after an ungrouped '>'; each candidate is consumed once.
+    # This line-pattern extractor may recognize a suffix in an incomplete
+    # template head; it does not validate template arguments as a compiler does.
+    template_head = C_TEMPLATE_HEAD_RE.match(line)
+    syntax = c_declaration_characters(line, template_head.end() if template_head else 0)
+    seeking_declaration = bool(template_head)
+    declaration_chars = []
+    closing_groups = []
+    name = None
+    for char in syntax:
+        if name and not closing_groups:
+            if char.isspace():
+                continue
+            if char in "{;":
+                return name
+            if not template_head or char == ">":
+                return None
+            name = None
+
+        if char in ";{}":
+            return None
+        if char in "([":
+            if not closing_groups:
+                if char == "(" and not seeking_declaration:
+                    name = c_function_declaration_name("".join(declaration_chars), template_candidate=bool(template_head))
+                declaration_chars.clear()
+                seeking_declaration = bool(template_head)
+            closing_groups.append(")" if char == "(" else "]")
+        elif char in ")]":
+            if not closing_groups or closing_groups.pop() != char:
+                return None
+        elif not closing_groups:
+            if seeking_declaration:
+                if char == ">":
+                    seeking_declaration = False
+            elif not declaration_chars and (char.isspace() or template_head and char == ">"):
+                continue
+            elif (
+                char.isalpha() or char == "_"
+                or declaration_chars and (char.isalnum() or char.isspace() or char in ":~*&<>,")
+            ):
+                declaration_chars.append(char)
+            elif template_head:
+                declaration_chars.clear()
+                seeking_declaration = True
+            else:
+                return None
+    return None
+
+
+def c_function_declaration_name(declaration: str, *, template_candidate: bool) -> str | None:
+    declaration = declaration.rstrip()
+    name_start = len(declaration)
+    while name_start and (declaration[name_start - 1].isalnum() or declaration[name_start - 1] in "_:~"):
+        name_start -= 1
+    name = declaration[name_start:]
+    prefix = declaration[:name_start].strip()
+    if not C_FUNCTION_NAME_RE.fullmatch(name) or not C_DECLARATION_PREFIX_RE.fullmatch(prefix):
+        return None
+    if template_candidate and "," in prefix and "<" not in prefix:
+        return None
+    if name in SKIP_CALLS or prefix.split(maxsplit=1)[0] in SKIP_CALLS:
+        return None
+    return name
+
+
+def c_declaration_characters(line: str, offset: int) -> Iterator[str]:
+    """Scan forward once, keeping literal and comment contents out of syntax."""
+    while offset < len(line):
+        char = line[offset]
+        if line.startswith("//", offset):
+            return
+        if line.startswith("/*", offset):
+            end = line.find("*/", offset + 2)
+            if end < 0:
+                return
+            offset = end + 2
+            yield " "
+        elif line.startswith('R"', offset):
+            opening = line.find("(", offset + 2, offset + 19)
+            if opening < 0:
+                return
+            delimiter = line[offset + 2:opening]
+            if any(char.isspace() or char in "\\)" for char in delimiter):
+                return
+            closing = ")" + delimiter + '"'
+            end = line.find(closing, opening + 1)
+            if end < 0:
+                return
+            offset = end + len(closing)
+            yield "0"
+        elif char in "\"'":
+            quote = char
+            offset += 1
+            while offset < len(line) and line[offset] != quote:
+                offset += 2 if line[offset] == "\\" else 1
+            if offset >= len(line):
+                return
+            offset += 1
+            yield "0"
+        elif char in "0123456789" and (not offset or not (line[offset - 1].isalnum() or line[offset - 1] == "_")):
+            end = offset + 1
+            while end < len(line) and (line[end].isalnum() or line[end] in "_.'"):
+                end += 1
+            yield from line[offset:end]
+            offset = end
+        else:
+            yield char
+            offset += 1
 
 
 def extract_imports(suffix: str, lines: list[str]) -> list[str]:

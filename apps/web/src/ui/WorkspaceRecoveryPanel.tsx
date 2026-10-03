@@ -46,11 +46,13 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
       <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "reconnect" }))}>Check connection</ControlButton> : null}
     {recovery.state === "missing" && tab.pluginId === "standard-terminal" && onRecover ?
       <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "new-shell" }))}>Open new shell</ControlButton> : null}
-    {recovery.state === "missing" && !recovery.startupFailed && tab.pluginId === "codex-terminal" && onRecover ? <>
+    {recovery.state === "missing" && tab.pluginId === "codex-terminal" && onRecover ? <>
       {recovery.canResume && recovery.conversationId ? <>
         <p>Conversation: <code>{recovery.conversationId}</code></p>
         <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "resume-conversation" }))}>Resume conversation</ControlButton>
       </> : null}
+      <p>Browse saved conversations by title, preview, and last update in the Codex picker. Your selection confirms the exact conversation for this tab; /status shows its conversation ID.</p>
+      <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "select-conversation" }))}>Select a saved conversation</ControlButton>
       <DirectoryOwnershipRecovery key={tab.id} disabled={busy}
         availability={() => tabOwnershipAvailability(tab.id)}
         preview={() => previewTabOwnership(tab.id)}

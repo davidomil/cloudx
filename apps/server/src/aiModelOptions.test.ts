@@ -11,6 +11,7 @@ import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
 describe("Settings model choices", () => {
   it("offers only the currently supported Codex models", () => {
     expect(CODEX_MODEL_OPTIONS.map((option) => option.value)).toEqual([
+      "gpt-6.1-sol",
       "gpt-6-astra",
       "gpt-5.6-sol",
       "gpt-5.6-terra",

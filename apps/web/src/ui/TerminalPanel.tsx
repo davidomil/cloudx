@@ -9,6 +9,7 @@ import { readTerminalColorTheme } from "./theme.js";
 import { registerTerminalView, unregisterTerminalView } from "./terminalViewStore.js";
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
 import { uploadFileBrowserFile } from "../api.js";
+import { TerminalSelectionCopy } from "./terminalSelectionCopy.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 
 interface TerminalView {
@@ -29,6 +30,7 @@ interface TerminalView {
   keyboardInsetStyleValue?: string;
   releaseMobileScroll?: () => void;
   releaseImagePaste?: () => void;
+  selectionCopy?: TerminalSelectionCopy;
   uiScale: number;
   connectionError?: TerminalConnectionError;
   onConnectionError?: (error: TerminalConnectionError) => void;
@@ -144,6 +146,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   useEffect(() => {
     const view = viewRef.current;
     if (view) {
+      if (!active) view.selectionCopy?.clear();
       scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active, trigger: "activation" }));
     }
   }, [active]);
@@ -237,6 +240,7 @@ function subscribeTerminalSocket(view: TerminalView): void {
       return;
     }
     if (message.type === "screen" && message.data !== undefined && message.cols && message.rows) {
+      view.selectionCopy?.preserveBeforeRedraw();
       view.terminal.resize(message.cols, message.rows);
       view.terminal.write(`${TERMINAL_RESET_SEQUENCE}${message.data}`, () => {
         if (isCurrentSocket()) fitAndResize(view);
@@ -309,12 +313,19 @@ function attachTerminalView(view: TerminalView, container: HTMLDivElement): void
     }
     installMobileScrollForView(view, container);
     installImagePasteForView(view);
+    installSelectionCopyForView(view, container);
     return;
   }
   view.terminal.open(container);
   removeInactiveTerminalElements(container, view.terminal.element);
   installMobileScrollForView(view, container);
   installImagePasteForView(view);
+  installSelectionCopyForView(view, container);
+}
+
+function installSelectionCopyForView(view: TerminalView, container: HTMLDivElement): void {
+  view.selectionCopy?.dispose();
+  view.selectionCopy = new TerminalSelectionCopy(view.terminal, container);
 }
 
 function removeInactiveTerminalElements(container: HTMLDivElement, activeElement: HTMLElement | undefined): void {
@@ -335,6 +346,8 @@ function installMobileScrollForView(view: TerminalView, container: HTMLDivElemen
 }
 
 function releaseTerminalContainerBindings(view: TerminalView): void {
+  view.selectionCopy?.dispose();
+  view.selectionCopy = undefined;
   view.releaseMobileScroll?.();
   view.releaseMobileScroll = undefined;
   view.releaseImagePaste?.();
@@ -442,10 +455,15 @@ function fitAndResize(view: TerminalView, focus = false): void {
   }
   const fontSize = responsiveTerminalFontSize(view.container, view.uiScale);
   if (view.terminal.options.fontSize !== fontSize) {
+    view.selectionCopy?.preserveBeforeRedraw();
     view.terminal.options.fontSize = fontSize;
   }
+  const dimensions = view.fit.proposeDimensions();
+  if (dimensions && (dimensions.cols !== view.terminal.cols || dimensions.rows !== view.terminal.rows)) {
+    view.selectionCopy?.preserveBeforeRedraw();
+  }
   view.fit.fit();
-  trimTerminalRowsToViewport(view.terminal);
+  trimTerminalRowsToViewport(view);
   if (focus) {
     view.terminal.focus();
   }
@@ -461,7 +479,8 @@ function fitAndResize(view: TerminalView, focus = false): void {
   }
 }
 
-function trimTerminalRowsToViewport(terminal: Terminal): void {
+function trimTerminalRowsToViewport(view: TerminalView): void {
+  const { terminal } = view;
   const viewport = terminal.element?.querySelector(".xterm-viewport");
   const screen = terminal.element?.querySelector(".xterm-screen");
   if (!(viewport instanceof HTMLElement) || !(screen instanceof HTMLElement)) {
@@ -469,6 +488,7 @@ function trimTerminalRowsToViewport(terminal: Terminal): void {
   }
   const nextRows = rowsFittingTerminalViewport(terminal.rows, viewport.getBoundingClientRect().height, screen.getBoundingClientRect().height);
   if (nextRows < terminal.rows) {
+    view.selectionCopy?.preserveBeforeRedraw();
     terminal.resize(terminal.cols, nextRows);
   }
 }

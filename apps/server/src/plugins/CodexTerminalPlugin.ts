@@ -163,6 +163,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         JSON.stringify({
           ...(input.codexTurn ? { binding: { ...input.codexTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
+          startupPicker: resume?.mode === "picker",
           permissions: {
             yoloMode: launchTemplate.args.includes("--yolo"),
             additionalWritableRoots: launchTemplate.overlay ? [launchTemplate.overlay.rulesSkillsRoot] : []
@@ -199,6 +200,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
+        delete restoredInput.resume;
+        void Promise.resolve().then(() => input.controls.setRestoreInput?.(restoredInput)).catch(error => {
+          restoredInput = { ...restoredInput, codexIdentityError: `${restoredInput.codexIdentityError} Restore-state persistence failed: ${error instanceof Error ? error.message : String(error)}` };
+        });
       }),
       applyRuntimeContext: async (runtimeContext) => {
         const nextTemplate = templateFromRuntimeContext(runtimeContext);
@@ -242,6 +247,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
+        delete restoredInput.resume;
+        void Promise.resolve().then(() => input.controls.setRestoreInput?.(restoredInput)).catch(error => {
+          restoredInput = { ...restoredInput, codexIdentityError: `${restoredInput.codexIdentityError} Restore-state persistence failed: ${error instanceof Error ? error.message : String(error)}` };
+        });
       }),
       applyRuntimeContext: async (runtimeContext) => {
         const template = templateFromRuntimeContext(runtimeContext);
@@ -268,7 +277,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       const conversationId = identity?.sessionId ?? (resume?.mode === "session" ? resume.sessionId : undefined);
       if (!conversationId) {
         if (input.initialInput?.codexExecutionId) return {
-          message: "Codex exited before a selected conversation was confirmed. Review the terminal output and Settings → Codex, then open a new Codex tab.",
+          message: "Codex exited before a selected conversation was confirmed. Review the retained terminal output for startup or connection errors. Check Settings → Codex or select a saved session.",
           canResume: false, startupFailed: true
         };
         return { message: "The previous Codex process ended. Its exact conversation ID was not saved. Select a saved session.", canResume: false };
@@ -284,8 +293,14 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   async recoverSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const resume = codexResumeInput(input.initialInput);
-    if (resume?.mode !== "session" || !resume.sessionId) throw new Error("The exact Codex conversation ID is unavailable. Select a saved session.");
-    await this.requireConversation(input.tab.id, resume.sessionId, true);
+    if (resume?.mode === "session" && resume.sessionId) await this.requireConversation(input.tab.id, resume.sessionId, true);
+    else if (resume?.mode === "picker") {
+      if (!this.sources) throw new Error("The Codex conversation store is unavailable. Check Codex settings before selecting a saved session.");
+      const savedSource = await this.sources.readBinding(input.tab.id);
+      const source = savedSource ?? await this.sources.resolve();
+      await this.sources.assertCurrent(source);
+      if (!savedSource) await this.sources.bind(input.tab.id, source);
+    } else throw new Error("The exact Codex conversation ID is unavailable. Select a saved session.");
     const { prompt: _prompt, codexRuntimeContext, ...initialInput } = input.initialInput ?? {};
     return this.startSession({
       ...input, initialInput, prepareCodexSession: undefined,

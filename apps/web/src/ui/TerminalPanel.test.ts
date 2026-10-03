@@ -15,6 +15,10 @@ const terminalPanelMocks = vi.hoisted(() => ({
 
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: class MockFitAddon {
+    proposeDimensions(): undefined {
+      return undefined;
+    }
+
     fit(): void {
       terminalPanelMocks.fitCalls.push(this);
     }
@@ -31,6 +35,7 @@ vi.mock("@xterm/xterm", () => ({
     readonly writelnCalls: string[] = [];
     readonly writeCalls: string[] = [];
     readonly inputHandlers: Array<(data: string) => void> = [];
+    readonly _core = { _inputHandler: { parse: (_data: string) => undefined } };
 
     constructor(options: Record<string, unknown>) {
       this.options = options;
@@ -54,16 +59,24 @@ vi.mock("@xterm/xterm", () => ({
 
     writeln(data = ""): void {
       this.writelnCalls.push(data);
+      this._core._inputHandler.parse(`${data}\r\n`);
     }
 
     write(data: string, callback?: () => void): void {
       this.writeCalls.push(data);
+      this._core._inputHandler.parse(data);
       callback?.();
     }
 
     resize(cols: number, rows: number): void {
       this.cols = cols;
       this.rows = rows;
+    }
+
+    clearSelection(): void {}
+
+    onSelectionChange(): { dispose: () => void } {
+      return { dispose: () => undefined };
     }
 
     onData(handler: (data: string) => void): { dispose: () => void } {

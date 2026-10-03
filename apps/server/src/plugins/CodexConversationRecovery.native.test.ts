@@ -361,3 +361,214 @@ it.skipIf(!codexBinary).each([false, true])("verifies the updater's production t
     writeSpy?.mockRestore();
   }
 }, 35_000);
+
+it.skipIf(!codexBinary).each(["resume", "fork", "new", "cancel"])("hands the native startup %s picker to one selected conversation before a prompt", async action => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-picker-"));
+  const home = path.join(root, "home");
+  const data = path.join(root, "data");
+  const trace = path.join(root, "processes.jsonl");
+  const wrapper = path.join(root, "codex");
+  const sources = new CodexStateSources(data, { CODEX_HOME: home });
+  const tab: WorkspaceTab = { id: "picker", pluginId: "codex-terminal", title: "Picker", cwd: root, status: "failed", createdAt: "", updatedAt: "", indicator: { color: "red", label: "Exited", updatedAt: "" } };
+  const recovery = new CodexConversationRecovery(sources.viewPath(tab.id));
+  let requests = 0;
+  const provider = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      requests++;
+      const item = { type: "message", id: "msg_saved", role: "assistant", phase: "final_answer", status: "completed", content: [{ type: "output_text", text: "Saved picker conversation.", annotations: [] }] };
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        { type: "response.created", response: { id: "resp_saved", status: "in_progress", output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+        { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: "Saved picker conversation." },
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: { id: "resp_saved", status: "completed", output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+      ]) response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      response.end();
+    });
+  });
+  await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
+  let terminal: PluginSession | undefined;
+  let output = "";
+  const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: wrapper, SHELL: "/bin/sh", TERM: "xterm-256color" };
+  const production = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env);
+  const controls = { closeTab: () => undefined, setTabIndicator: () => undefined };
+  const launch = async (resume?: Record<string, unknown>) => {
+    output = "";
+    terminal = await production[resume ? "recoverSession" : "createSession"]({ tab, cwd: root, initialInput: resume ? { resume } : undefined, controls });
+    terminal.onData!(chunk => {
+      output = (output + chunk).slice(-65_536);
+      if (chunk.includes("\u001b[6n")) terminal!.write!("\u001b[1;1R");
+    });
+    return terminal.restoreInput!()!.codexExecutionId;
+  };
+  const pids = async () => (await fs.readFile(trace, "utf8")).trim().split("\n").map(line => JSON.parse(line) as { pid: number; backend: boolean });
+  const visible = () => stripVTControlCharacters(output).replace(/\s+/gu, "");
+  try {
+    await fs.mkdir(home, { mode: 0o700 });
+    // The executable records process identity before exec; only the fork case
+    // changes the native picker verb, while retaining production plugin/PTY setup.
+    await fs.writeFile(wrapper, `#!/usr/bin/env python3\nimport os,sys,json\na=sys.argv[1:]\nwith open(${JSON.stringify(trace)}, 'a') as f: f.write(json.dumps({'pid':os.getpid(),'backend':'app-server' in a})+'\\n')\nif ${action === "fork" ? "True" : "False"} and 'resume' in a: a[a.index('resume')]='fork'\nos.execv(${JSON.stringify(codexBinary)}, [${JSON.stringify(codexBinary)}]+a)\n`, { mode: 0o755 });
+    await fs.writeFile(path.join(home, "config.toml"), [
+      `# CloudX launch preferences: ${JSON.stringify({ yoloMode: true, defaultSkills: { imagegen: false } })}`,
+      'model = "cloudx-native"', 'model_provider = "cloudx-native"', 'check_for_update_on_startup = false',
+      '[features]', 'thread_title = false',
+      '[model_providers.cloudx-native]', 'name = "CloudX native picker test"',
+      `base_url = "http://127.0.0.1:${(provider.address() as { port: number }).port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
+      `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
+    ].join("\n"));
+    await launch();
+    await expect.poll(() => recovery.read()?.sessionId ?? output, { timeout: 15_000 }).toMatch(/^[a-f0-9-]{36}$/u);
+    const savedId = recovery.read()!.sessionId;
+    await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    await terminal!.handleAction("enter_text", { text: "Save the picker recovery conversation.", submit: true });
+    await expect.poll(visible, { timeout: 10_000 }).toContain("Savedpickerconversation.");
+    await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    await terminal!.terminate!();
+    terminal = undefined;
+    await recovery.requireTranscript(savedId, home);
+    const beforePicker = (await pids()).length;
+    const beforeRequests = requests;
+    const executionId = await launch({ mode: "picker", all: true });
+    await expect.poll(visible, { timeout: 10_000 }).toContain(action === "fork" ? "Forkaprevioussession" : "Resumeaprevioussession");
+    await expect.poll(visible, { timeout: 10_000 }).toContain("Savethepickerrecoveryconversation.");
+    expect(recovery.read()).toBeUndefined();
+    const pickerBackend = (await pids()).slice(beforePicker).find(process => process.backend)!.pid;
+    terminal!.write!(action === "cancel" ? "\u0003" : action === "new" ? "\u001b" : "\r");
+    if (action === "cancel") {
+      await expect.poll(() => terminal!.hasExited!(), { timeout: 10_000 }).toBe(true);
+      expect(recovery.read()).toBeUndefined();
+    } else {
+      await expect.poll(() => recovery.read()?.selection?.executionId === executionId ? recovery.read() : output, { timeout: 10_000 }).toMatchObject({ selection: { tabId: tab.id, executionId } });
+      const selected = recovery.read()!.sessionId;
+      expect(selected === savedId).toBe(action === "resume");
+      expect(terminal!.hasExited!()).toBe(false);
+      await expect.poll(() => terminal!.restoreInput!()).toMatchObject({ resume: { mode: "session", sessionId: selected } });
+      await expect(fs.access(`/proc/${pickerBackend}`)).rejects.toMatchObject({ code: "ENOENT" });
+      expect((await pids()).slice(beforePicker).filter(process => process.backend)).toHaveLength(2);
+      const freshReader = new CodexConversationRecovery(sources.viewPath(tab.id));
+      expect(freshReader.readForExecution(tab.id, executionId)).toMatchObject({ sessionId: selected });
+      await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+      await terminal!.handleAction("enter_text", { text: "/status", submit: true });
+      await expect.poll(visible).toContain(selected);
+    }
+    expect(requests).toBe(beforeRequests);
+    expect(output).not.toMatch(/401 Unauthorized|CloudX native worker bridge:/u);
+    await terminal!.terminate!();
+    terminal = undefined;
+    for (const { pid } of await pids()) await expect(fs.access(`/proc/${pid}`)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await terminal?.terminate?.();
+    provider.closeAllConnections();
+    await new Promise<void>(resolve => provider.close(() => resolve()));
+    await sources.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 45_000);
+
+it.skipIf(!codexBinary)("requires explicit recovery after cached child-to-Main navigation", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-foreground-"));
+  const home = path.join(root, "home");
+  const data = path.join(root, "data");
+  const requests: { input?: { type: string; call_id?: string; output?: string }[] }[] = [];
+  const provider = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", chunk => { body += chunk; });
+    request.on("end", () => {
+      const input = JSON.parse(body);
+      requests.push(input);
+      const text = input.text?.format?.schema?.properties?.title ? '{"title":"Native foreground recovery"}' : "The synthetic agent finished.";
+      const spawning = requests.length === 1;
+      const item = spawning ? {
+        type: "function_call", id: "fc_spawn", call_id: "call_spawn", namespace: "multi_agent_v1", name: "spawn_agent",
+        arguments: JSON.stringify({ message: "Return the synthetic child response.", fork_context: false })
+      } : {
+        type: "message", id: "msg_foreground", role: "assistant", phase: "final_answer", status: "completed",
+        content: [{ type: "output_text", text, annotations: [] }]
+      };
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        { type: "response.created", response: { id: "resp_foreground", status: "in_progress", output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+        ...(spawning ? [] : [{ type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text }]),
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: { id: "resp_foreground", status: "completed", output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+      ]) response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      response.end();
+    });
+  });
+  await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
+  const sources = new CodexStateSources(data, { CODEX_HOME: home });
+  const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: codexBinary, SHELL: "/bin/sh", TERM: "xterm-256color" };
+  const production = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env);
+  const tab: WorkspaceTab = {
+    id: "native-foreground", pluginId: "codex-terminal", title: "Native foreground", cwd: root, status: "running", createdAt: "", updatedAt: "",
+    indicator: { color: "green", label: "Running", updatedAt: "" }
+  };
+  const controls = { closeTab: () => undefined, setTabIndicator: () => undefined, setRestoreInput: vi.fn() };
+  const recovery = new CodexConversationRecovery(sources.viewPath(tab.id));
+  let terminal: PluginSession | undefined;
+  let output = "";
+  const visible = () => stripVTControlCharacters(output).replace(/\s+/gu, "");
+  const selectAgent = async (position: string, sessionId: string) => {
+    await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    output = "";
+    await terminal!.handleAction("enter_text", { text: "/subagents", submit: true });
+    await expect.poll(visible, { timeout: 10_000 }).toContain("Subagents");
+    output = "";
+    terminal!.write!(position);
+    await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    await terminal!.handleAction("enter_text", { text: "/status", submit: true });
+    await expect.poll(visible, { timeout: 10_000 }).toContain(sessionId);
+  };
+  try {
+    await fs.mkdir(home, { mode: 0o700 });
+    await fs.writeFile(path.join(home, "config.toml"), [
+      '# CloudX launch preferences: {"yoloMode":true,"defaultSkills":{"imagegen":false}}',
+      'model = "cloudx-native"', 'model_provider = "cloudx-native"', 'check_for_update_on_startup = false',
+      '[features]', 'multi_agent = true',
+      '[model_providers.cloudx-native]', 'name = "Native foreground test"',
+      `base_url = "http://127.0.0.1:${(provider.address() as { port: number }).port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
+      `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ""
+    ].join("\n"));
+    terminal = await production.createSession({ tab, cwd: root, controls });
+    terminal.onData!(chunk => {
+      output = (output + chunk).slice(-65_536);
+      if (chunk.includes("\u001b[6n")) terminal!.write!("\u001b[1;1R");
+    });
+    await expect.poll(() => recovery.read()?.sessionId ?? output, { timeout: 15_000 }).toMatch(/^[a-f0-9-]{36}$/u);
+    const parent = recovery.read()!.sessionId;
+    await terminal.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    await terminal.handleAction("enter_text", { text: "Spawn an agent for the native foreground test.", submit: true });
+    await expect.poll(visible, { timeout: 10_000 }).toContain("Thesyntheticagentfinished.");
+    const childResult = () => requests.flatMap(request => request.input ?? []).find(item => item.type === "function_call_output" && item.call_id === "call_spawn")?.output;
+    await expect.poll(childResult, { timeout: 10_000 }).toEqual(expect.any(String));
+    const child = JSON.parse(childResult()!).agent_id as string;
+    expect(child).not.toBe(parent);
+    await selectAgent("2", child);
+    await selectAgent("1", parent);
+    await expect.poll(() => terminal!.restoreInput!()).not.toHaveProperty("resume");
+    expect(controls.setRestoreInput).toHaveBeenLastCalledWith(expect.objectContaining({ codexIdentityError: expect.stringContaining("Select a saved session") }));
+    const restored = terminal.restoreInput!()!;
+    await terminal.terminate!();
+    terminal = undefined;
+
+    const afterRestart = new CodexConversationRecovery(sources.viewPath(tab.id));
+    expect(() => afterRestart.read()).toThrow("Select a saved session");
+    const plugin = new CodexTerminalPlugin({ spawn: async () => { throw new Error("Recovery description cannot launch a process."); } }, undefined, data, sources);
+    const description = await plugin.describeRecovery({ tab, cwd: root, initialInput: restored, controls });
+    expect(description).toMatchObject({ canResume: false, message: expect.stringContaining("Select a saved session") });
+    expect(description).not.toHaveProperty("conversationId");
+    expect(description).not.toHaveProperty("startupFailed");
+    await afterRestart.requireTranscript(parent, home);
+    await afterRestart.requireTranscript(child, home);
+  } finally {
+    await terminal?.terminate?.();
+    provider.closeAllConnections();
+    await new Promise<void>(resolve => provider.close(() => resolve()));
+    await sources.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 30_000);

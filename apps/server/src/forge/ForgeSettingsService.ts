@@ -1,4 +1,4 @@
-import { CODEX_REASONING_EFFORTS, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
+import { DEFAULT_CODEX_MODEL, CODEX_REASONING_EFFORTS, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
 import type { ConfigService } from "../configService.js";
 import { CODEX_MODEL_OPTIONS } from "../aiModelOptions.js";
 import type { ForgeConnectionService } from "./connections/ForgeConnectionService.js";
@@ -135,7 +135,7 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       key: "workerModel",
       label: "Coding model",
       type: "select",
-      defaultValue: "gpt-6-astra",
+      defaultValue: DEFAULT_CODEX_MODEL,
       options: CODEX_MODEL_OPTIONS,
       description: "Codex model for new coding runs and resumes.",
     },
@@ -160,7 +160,7 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       key: "reviewModel",
       label: "Review model",
       type: "select",
-      defaultValue: "gpt-6-astra",
+      defaultValue: DEFAULT_CODEX_MODEL,
       options: CODEX_MODEL_OPTIONS,
       description: "Codex model for new review runs and resumes.",
     },

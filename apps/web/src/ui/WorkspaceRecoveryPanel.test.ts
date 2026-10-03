@@ -71,26 +71,26 @@ describe("workspace recovery choices", () => {
   it("offers the recorded exact conversation and explicit selection", async () => {
     await show({ state: "missing", message: "The previous process ended.", conversationId: "recorded-session", canResume: true }, "codex-terminal");
     expect(container.textContent).toContain("recorded-session");
-    expect(buttons()).toEqual(["Resume conversation", "Resume selected conversation"]);
+    expect(buttons()).toEqual(["Resume conversation", "Select a saved conversation", "Resume selected conversation"]);
     await click("Resume conversation");
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "resume-conversation" });
   });
 
-  it("keeps startup failure guidance without asking for an uncreated conversation", async () => {
+  it("keeps startup failure guidance and offers explicit saved-conversation selection", async () => {
     const message = "Codex exited before a selected conversation was confirmed. Check Codex settings, then open a new tab.";
     await show({ state: "missing", message, canResume: false, startupFailed: true }, "codex-terminal");
 
     expect(container.textContent).toContain("Codex startup failed");
     expect(container.textContent).toContain(message);
-    expect(buttons()).toEqual([]);
-    expect(container.querySelector("input")).toBeNull();
+    expect(buttons()).toEqual(["Select a saved conversation", "Resume selected conversation"]);
+    expect(container.querySelector("input")).not.toBeNull();
     expect(recover).not.toHaveBeenCalled();
   });
 
   it.each(["The exact conversation ID was not recorded.", "The saved conversation transcript is unavailable."])("explains '%s' and requires explicit selection", async message => {
     await show({ state: "missing", message, canResume: false }, "codex-terminal");
     expect(container.textContent).toContain(message);
-    expect(buttons()).toEqual(["Resume selected conversation"]);
+    expect(buttons()).toEqual(["Select a saved conversation", "Resume selected conversation"]);
     expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
     const input = container.querySelector<HTMLInputElement>("input")!;
     await act(async () => {
@@ -100,6 +100,12 @@ describe("workspace recovery choices", () => {
     await click("Resume selected conversation");
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "resume-conversation", sessionId: "chosen-session" });
     expect(container.textContent).not.toContain("Resume last");
+  });
+
+  it("opens the saved-conversation picker without inventing a conversation ID", async () => {
+    await show({ state: "missing", message: "Selected identity is unavailable.", canResume: false }, "codex-terminal");
+    await click("Select a saved conversation");
+    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "select-conversation" });
   });
 
   it("suppresses repeated recovery while pending and displays failures in the same panel", async () => {

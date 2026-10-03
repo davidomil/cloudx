@@ -649,3 +649,101 @@ if (process.argv.includes('app-server')) {
     await expect(fs.access(`/proc/${child}`)).rejects.toMatchObject({ code: "ENOENT" });
   } finally { await terminal.terminate(); }
 }, 20_000);
+
+it.each(["selected", "oversize", "abandoned", "backend-exit"])("authenticates a single picker handoff and cleans up after %s", async outcome => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-picker-bridge-"));
+  directories.push(directory);
+  const command = path.join(directory, "codex.mjs");
+  const reportPath = path.join(directory, "report.json");
+  const processesPath = path.join(directory, "processes.jsonl");
+  const receiptPath = path.join(directory, "conversation.json");
+  const sessionId = "01a08470-d118-7b72-b1df-439e72e5c744";
+  const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+import { once } from 'node:events';
+import WebSocket from ${JSON.stringify(ws)};
+const backend = process.argv.includes('app-server');
+const previous = fs.existsSync(${JSON.stringify(processesPath)}) ? fs.readFileSync(${JSON.stringify(processesPath)}, 'utf8').trim().split('\\n').map(JSON.parse) : [];
+if (backend) for (const entry of previous.filter(entry => entry.backend)) {
+  try { process.kill(entry.pid, 0); throw new Error('Concurrent backend: ' + entry.pid); }
+  catch (error) { if (error.code !== 'ESRCH') throw error; }
+}
+fs.appendFileSync(${JSON.stringify(processesPath)}, JSON.stringify({ pid: process.pid, backend }) + '\\n');
+if (backend) {
+  const reader = readline.createInterface({ input: process.stdin });
+  reader.on('line', line => {
+    const message = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ id: message.id, result: message.method === 'thread/resume' ? { thread: { id: ${JSON.stringify(sessionId)}, cwd: ${JSON.stringify(directory)} } } : { pid: process.pid } }) + '\\n');
+    if (${JSON.stringify(outcome)} === 'backend-exit') setTimeout(() => process.exit(9), 20);
+  });
+  reader.on('close', () => setTimeout(() => process.exit(0), 75));
+} else {
+  const url = process.argv[process.argv.indexOf('--remote') + 1];
+  const authorization = 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN;
+  const connect = async headers => {
+    const socket = new WebSocket(url, { headers });
+    await once(socket, 'open');
+    return socket;
+  };
+  const reject = async headers => {
+    try { const socket = await connect(headers); socket.close(); throw new Error('Unauthorized socket accepted'); }
+    catch (error) { if (!error.message.includes('401')) throw error; }
+  };
+  const request = async (socket, message) => {
+    const reply = once(socket, 'message');
+    socket.send(JSON.stringify(message));
+    return JSON.parse((await reply)[0].toString());
+  };
+  await reject({});
+  await reject({ Authorization: 'Bearer invalid' });
+  await reject({ Authorization: authorization, Origin: 'http://localhost' });
+  const picker = await connect({ Authorization: authorization });
+  await reject({ Authorization: authorization });
+  const first = await request(picker, { id: 1, method: 'initialize' });
+  if (${JSON.stringify(outcome)} === 'backend-exit') { setInterval(() => {}, 1000); }
+  else {
+    const closed = once(picker, 'close'); picker.close(); await closed;
+    await reject({ Authorization: 'Bearer invalid' });
+    if (${JSON.stringify(outcome)} === 'abandoned') setInterval(() => {}, 1000);
+    else {
+      const selected = await connect({ Authorization: authorization });
+      await reject({ Authorization: authorization });
+      if (${JSON.stringify(outcome)} === 'oversize') {
+        selected.send('x'.repeat(8 * 1024 * 1024 + 1));
+        selected.on('error', () => {});
+        setInterval(() => {}, 1000);
+      } else {
+        const second = await request(selected, { id: 1, method: 'initialize' });
+        if (first.result.pid === second.result.pid) throw new Error('Picker backend reused with a new stdio initialization');
+        await request(selected, { id: 2, method: 'thread/resume' });
+        if (JSON.parse(fs.readFileSync(${JSON.stringify(receiptPath)}, 'utf8')).sessionId !== ${JSON.stringify(sessionId)}) throw new Error('Missing receipt before render');
+        const closed = once(selected, 'close'); selected.close(); await closed;
+        await reject({ Authorization: authorization });
+        fs.writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ authenticated: true, serialized: true, receiptBeforeRender: true }));
+        process.exit(0);
+      }
+    }
+  }
+}
+`, { mode: 0o755 });
+  const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
+    selection: { tabId: "picker", executionId: sessionId, receiptPath }, startupPicker: true,
+    command, serverArgs: ["app-server"], tuiArgs: []
+  })], { cwd: directory, env: { PATH: process.env.PATH }, cols: 100, rows: 30 });
+  let output = "";
+  terminal.onData(chunk => { output += chunk; });
+  let exited: TerminalExit | undefined;
+  terminal.onExit(event => { exited = event; });
+  try {
+    await expect.poll(() => exited, { timeout: 10_000 }).toMatchObject({ exitCode: outcome === "selected" ? 0 : 1 });
+    if (outcome === "selected") expect(JSON.parse(await fs.readFile(reportPath, "utf8"))).toEqual({ authenticated: true, serialized: true, receiptBeforeRender: true });
+    else {
+      expect(output).toContain(outcome === "oversize" ? "Max payload size exceeded" : outcome === "abandoned" ? "did not hand off" : "exited before its visible worker (9)");
+      await expect(fs.access(receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    for (const entry of (await fs.readFile(processesPath, "utf8")).trim().split("\n").map(line => JSON.parse(line)))
+      await expect(fs.access(`/proc/${entry.pid}`)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally { await terminal.terminate(); }
+}, 15_000);
