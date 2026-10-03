@@ -7,6 +7,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 import { afterEach, expect, it, vi } from "vitest";
 import { ForgeExecutionRecovery } from "../apps/server/src/forge/ForgeExecution.ts";
+import { renderCloudxService, renderEnvFile } from "./install-cloudx.mjs";
+import { SERVICE_NAMES } from "./install-update.mjs";
 import { COORDINATOR_FILES, stageInstalledUpdater } from "./update-coordinator.mjs";
 import { bundleCoordinator, verifySnapshot, writeUpdateJson } from "./managed-update-store.mjs";
 
@@ -20,6 +22,99 @@ afterEach(() => {
   vi.unstubAllEnvs();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
+
+it.skipIf(process.platform !== "linux")("starts the first standard-install Settings update through the default built service and packaged updater without root overrides", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-settings-native-"));
+  roots.push(home);
+  const checkout = path.join(home, "checkout"), dataDir = path.join(home, "profile"), bin = path.join(home, "bin");
+  const envPath = path.join(home, ".config/cloudx/cloudx.env"), systemdDir = path.join(home, ".config/systemd/user");
+  fs.mkdirSync(checkout);
+  fs.mkdirSync(dataDir);
+  fs.mkdirSync(bin);
+  fs.symlinkSync(path.join(sourceRoot, "node_modules"), path.join(home, "node_modules"));
+  for (const relative of COORDINATOR_FILES) write(path.join(checkout, relative), fs.readFileSync(path.join(sourceRoot, relative)));
+  write(path.join(checkout, "package.json"), { name: "native-settings-fixture", type: "module" });
+  write(path.join(checkout, ".gitignore"), "apps/server/dist/\n");
+  buildFixtureRelease(checkout);
+  const bundledScript = path.join(checkout, "apps/server/dist/updater/scripts/settings-update.mjs");
+  const installedScript = fs.readFileSync(bundledScript, "utf8");
+  write(path.join(checkout, "scripts/settings-update.mjs"), "throw new Error('The unpackaged source updater must not run.');\n");
+  git(checkout, "init", "-b", "main");
+  git(checkout, "-c", "user.name=Native Settings fixture", "-c", "user.email=test@invalid", "add", ".");
+  git(checkout, "-c", "user.name=Native Settings fixture", "-c", "user.email=test@invalid", "commit", "-m", "TEST: Native installation");
+  const targetCommit = git(checkout, "rev-parse", "HEAD");
+
+  const environment = renderEnvFile({ host: "127.0.0.1", port: 3001, dataDir, allowedRoots: checkout });
+  expect(environment).not.toMatch(/CLOUDX_(?:INSTALL_ROOT|UPDATE_COORDINATOR_ROOT)=/);
+  write(envPath, environment);
+  for (const name of SERVICE_NAMES) write(path.join(systemdDir, name), "[Service]\n");
+  const webUnit = renderCloudxService({ repoRoot: checkout, envPath, nodePath: process.execPath, npmPath: "/fixture/npm" });
+  expect(webUnit).toContain("ExecStart=/fixture/npm run start -w @cloudx/server");
+  write(path.join(systemdDir, "cloudx.service"), webUnit);
+
+  const fixtureFile = path.join(home, "services.json"), launchFile = path.join(home, "launch.json");
+  write(fixtureFile, { checkout, envPath, systemdDir, launchFile, names: SERVICE_NAMES });
+  write(path.join(bin, "systemctl"), `#!${process.execPath}
+import fs from "node:fs";
+import path from "node:path";
+const fixture = JSON.parse(fs.readFileSync(${JSON.stringify(fixtureFile)}, "utf8"));
+const [, action, name] = process.argv.slice(2);
+if (action !== "show") throw new Error("Only service inspection is allowed.");
+const state = fixture.names.includes(name) ? {
+  Id: name, LoadState: "loaded", ActiveState: "active", MainPID: String(process.ppid),
+  WorkingDirectory: fixture.checkout, EnvironmentFiles: fixture.envPath + " (ignore_errors=no)",
+  FragmentPath: path.join(fixture.systemdDir, name), NeedDaemonReload: "no", DropInPaths: "",
+  ControlGroup: fs.readFileSync("/proc/self/cgroup", "utf8").trim().split(":")[2],
+  InvocationID: "a".repeat(32), KillMode: "control-group", SendSIGKILL: "yes"
+} : { LoadState: "not-found", ActiveState: "inactive", MainPID: "0" };
+console.log(Object.entries(state).map(([key, value]) => key + "=" + value).join("\\n"));
+`);
+  write(path.join(bin, "systemd-run"), `#!${process.execPath}
+import fs from "node:fs";
+fs.writeFileSync(${JSON.stringify(launchFile)}, JSON.stringify(process.argv.slice(2)));
+`);
+  for (const name of ["systemctl", "systemd-run"]) fs.chmodSync(path.join(bin, name), 0o700);
+  write(path.join(bin, "package.json"), { type: "module" });
+  const runner = path.join(home, "settings-request.mjs");
+  write(runner, `
+import { CloudxUpdateService } from ${JSON.stringify(pathToFileURL(path.join(checkout, "apps/server/dist/system/CloudxUpdateService.js")).href)};
+if (process.env.CLOUDX_INSTALL_ROOT !== undefined || process.env.CLOUDX_UPDATE_COORDINATOR_ROOT !== undefined)
+  throw new Error("The native installation must start without root overrides.");
+const targetCommit = ${JSON.stringify(targetCommit)};
+const catalog = { preview: async (channel, currentCommit) => ({ channel, currentCommit, state: "available",
+  checkedAt: "2026-10-03T00:00:00Z", target: { commit: targetCommit, name: "main", url: "https://github.com/davidomil/cloudx/commits/main" },
+  changelog: [], changelogComplete: true }) };
+const service = new CloudxUpdateService(${JSON.stringify(dataDir)}, undefined, catalog);
+const status = await service.status();
+await service.preview();
+const started = await service.start({ channel: "main", targetCommit, confirmInterruption: true });
+console.log(JSON.stringify({ status, started }));
+`);
+  const cgroupAdapter = path.join(home, "service-cgroup.mjs");
+  write(cgroupAdapter, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const readFile = fs.readFileSync;
+fs.readFileSync = (file, ...args) => /^\\/proc\\/(?:self|\\d+)\\/cgroup$/.test(String(file))
+  ? "0::/cloudx-native-fixture\\n" : readFile(file, ...args);
+syncBuiltinESMExports();
+`);
+  const env = { ...process.env, HOME: home, PATH: `${bin}${path.delimiter}${process.env.PATH}`,
+    NODE_OPTIONS: `--import=${pathToFileURL(cgroupAdapter).href}` };
+  delete env.CLOUDX_INSTALL_ROOT;
+  delete env.CLOUDX_UPDATE_COORDINATOR_ROOT;
+  const result = JSON.parse(execFileSync(process.execPath, [runner], { cwd: checkout, env, encoding: "utf8", timeout: 30_000 }));
+  expect(result.status).toEqual({ available: true });
+  expect(result.started).toMatchObject({ available: true, run: { state: "running", targetCommit } });
+  const record = JSON.parse(fs.readFileSync(path.join(home, ".local/state/cloudx/settings-update", `${result.started.run.id}.json`), "utf8"));
+  expect(record.repoRoot).toBe(checkout);
+  expect(record.cli).toBe(false);
+  expect(record.service).toBeUndefined();
+  expect(fs.readFileSync(path.join(record.coordinator, "scripts/settings-update.mjs"), "utf8")).toBe(installedScript);
+  expect(JSON.parse(fs.readFileSync(path.join(record.coordinator, "bundle.json"), "utf8")))
+    .toEqual(JSON.parse(fs.readFileSync(path.join(checkout, "apps/server/dist/updater/bundle.json"), "utf8")));
+  expect(JSON.parse(fs.readFileSync(launchFile, "utf8"))).toContain(path.join(record.coordinator, "scripts/settings-update.mjs"));
+}, 30_000);
 
 it.skipIf(process.platform !== "linux")("renews the coordinator between real Settings starts while keeping completed-attempt guards, early diagnostics and capacity checks", async () => {
   const installation = await settingsInstallation();

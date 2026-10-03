@@ -14,7 +14,7 @@ const executeFile = promisify(execFile);
 const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
 
 type UpdateCommand = (file: string, args: string[], options: {
-  cwd: string; timeout: number; maxBuffer: number; encoding: "utf8";
+  cwd: string; timeout: number; maxBuffer: number; encoding: "utf8"; env?: NodeJS.ProcessEnv;
 }) => Promise<{ stdout: string }>;
 
 export class CloudxUpdateService {
@@ -148,7 +148,8 @@ export class CloudxUpdateService {
         ...(request?.confirmInterruption ? ["--confirm-interruption"] : []),
         ...(request?.resumeRunId ? [`--resume=${request.resumeRunId}`] : []),
         ...(request?.restoreSnapshotRunId ? [`--restore-snapshot=${request.restoreSnapshotRunId}`] : []),
-      ], { cwd: this.repoRoot, timeout: 30_000, maxBuffer: 64 * 1024, encoding: "utf8" });
+      ], { cwd: this.repoRoot, timeout: 30_000, maxBuffer: 64 * 1024, encoding: "utf8",
+        env: { ...process.env, CLOUDX_INSTALL_ROOT: this.repoRoot } });
       return parseCloudxUpdateStatus(JSON.parse(stdout));
     } catch {
       throw Object.assign(new Error("CloudX update status could not be verified. Check the local service logs before starting another update."), { statusCode: 503 });

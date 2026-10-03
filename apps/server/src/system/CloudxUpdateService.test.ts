@@ -47,7 +47,8 @@ describe("CloudxUpdateService", () => {
     expect(await service.status()).toEqual({ available: true });
     expect(execute).toHaveBeenCalledWith(process.execPath, [
       path.join(updaterRoot, "scripts/settings-update.mjs"), "status", dataDir, String(process.pid),
-    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8",
+      env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: path.resolve(".") }) });
     expect(catalog.preview).not.toHaveBeenCalled();
   });
 
@@ -96,7 +97,8 @@ describe("CloudxUpdateService", () => {
       const { service, execute } = fixture();
       await service.status();
       expect(execute).toHaveBeenCalledWith(process.execPath, [path.join(updaterRoot, "scripts/settings-update.mjs"), "status", dataDir, String(process.pid)],
-        { cwd: dataDir, timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+        { cwd: dataDir, timeout: 30_000, maxBuffer: 65536, encoding: "utf8",
+          env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: dataDir }) });
       await service.preview();
       expect(execute).toHaveBeenCalledWith("git", ["rev-parse", "HEAD"], expect.objectContaining({ cwd: dataDir }));
     } finally { vi.unstubAllEnvs(); }
@@ -167,7 +169,8 @@ describe("CloudxUpdateService", () => {
     expect(await service.start({ channel: "releases", targetCommit: target })).toEqual({ available: true });
     expect(execute).toHaveBeenLastCalledWith(process.execPath, [
       path.join(updaterRoot, "scripts/settings-update.mjs"), "start", dataDir, String(process.pid), target,
-    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8" });
+    ], { cwd: path.resolve("."), timeout: 30_000, maxBuffer: 65536, encoding: "utf8",
+      env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: path.resolve("."), PATH: process.env.PATH }) });
   });
 
   it.each(["never checked", "changed target", "changed channel", "changed checkout", "unavailable"])("rejects an unsafe launch: %s", async scenario => {
