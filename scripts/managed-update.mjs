@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { inspectDataCompatibility, inspectSnapshotCompatibility, inspectTargetRuntime, normalizeHistoricalForgeReviewIdentity } from './managed-update-data.mjs';
 import { MANAGED_INTEGRATION_FILES, prepareManagedIntegration } from './managed-update-integration.mjs';
 import { writeRuntimeBuild } from './write-runtime-build.mjs';
+import { stageInstalledUpdater } from './update-coordinator.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { InstallerRunner, prepareManagedRelease, activateManagedServices, waitForHealth } from './install-cloudx.mjs';
 import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePort, SERVICE_NAMES } from './install-update.mjs';
@@ -194,6 +195,7 @@ export class UpdateHost {
     this.prepareRelease({ releaseRoot: release, home: this.home, envConfig: this.envConfig, standard: this.target.kind === 'standard',
       runner: new InstallerRunner({ cwd: release, nonInteractive: true, verbose: this.runner.verbose }),
       progress: (component, message) => { record.run.component = component; record.run.message = message; this.save(record); } });
+    if (transition.integration.files.includes('apps/server/src/system/CloudxUpdateService.ts')) stageInstalledUpdater(record.coordinator, release);
     writeRuntimeBuild({ repoRoot: release, commit: record.targetCommit });
     const server = path.join(release, 'apps/server/dist/server.js');
     const source = fs.readFileSync(server, 'utf8');

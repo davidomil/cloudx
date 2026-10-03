@@ -12,6 +12,7 @@ import { parseEnvironmentFile } from "../installer-environment.mjs";
 import { prepareManagedIntegration } from "../managed-update-integration.mjs";
 import { SettingsUpdater } from "../settings-update.mjs";
 import { writeRuntimeBuild } from "../write-runtime-build.mjs";
+import { stageInstalledUpdater } from "../update-coordinator.mjs";
 import { OwnedTestFixture } from "./owned-test-fixture.mjs";
 
 const sourceRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -67,6 +68,7 @@ export function historicalTargetTest(target) {
             { cause: error },
           );
         });
+      stageInstalledUpdater(sourceRoot, releaseRoot);
       writeRuntimeBuild({ repoRoot: releaseRoot, commit });
       expect(
         fs.existsSync(
@@ -176,7 +178,7 @@ export function historicalTargetTest(target) {
         proof.updateInvocations.every(
           (call) =>
             call.script ===
-              path.join(completed.coordinator, "scripts/settings-update.mjs") &&
+              path.join(releaseRoot, "apps/server/dist/updater/scripts/settings-update.mjs") &&
             call.cwd === repoRoot,
         ),
       ).toBe(true);
@@ -203,7 +205,7 @@ const { CloudxUpdateService } = await installed('system/CloudxUpdateService.js')
 const { CloudxUpdateCatalog } = await installed('system/CloudxUpdateCatalog.js');
 const { registerCloudxUpdateRoutes } = await installed('system/CloudxUpdateRoutes.js');
 const { default: Fastify } = await import(pathToFileURL(path.join(f.releaseRoot, 'node_modules/fastify/fastify.js')));
-const { SettingsUpdater } = await coordinator('settings-update.mjs');
+const { SettingsUpdater } = await import(pathToFileURL(path.join(f.releaseRoot, 'apps/server/dist/updater/scripts/settings-update.mjs')));
 const { verifyHistoricalTerminals } = await coordinator('managed-update-readiness.mjs');
 const config = loadConfig();
 assert.equal(config.dataDir, f.dataDir);
@@ -273,7 +275,7 @@ try {
     assert.equal(options.cwd, f.repoRoot);
     if (file === 'git') return { stdout: commands.inspect(file, args, options) };
     assert.equal(file, process.execPath);
-    assert.equal(args[0], path.join(f.completed.coordinator, 'scripts/settings-update.mjs'));
+    assert.equal(args[0], path.join(f.releaseRoot, 'apps/server/dist/updater/scripts/settings-update.mjs'));
     assert.equal(args[2], f.dataDir);
     updateInvocations.push({ script: args[0], action: args[1], cwd: options.cwd });
     return { stdout: JSON.stringify(args[1] === 'status' ? updater.status() : updater.start(args[4])) };

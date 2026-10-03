@@ -31,7 +31,7 @@ it("retains managed Settings and independent terminal readiness in a historical 
 });
 
 it.each(["legacy", "current", "unknown"])("integrates a broker-era target with a %s Codex source reader", kind => {
-  const release = fixture("CLOUDX_UPDATE_COORDINATOR_ROOT", "/api/ready/terminals");
+  const release = fixture("installedUpdaterRoot", "/api/ready/terminals");
   const destination = path.join(release, CODEX_SOURCES);
   const source = kind === "current" ? fs.readFileSync(CODEX_SOURCES, "utf8") :
     git(coordinator, ["show", `a9613fafdc0ed1765fcf72ea7d9f61de08c3914a:${CODEX_SOURCES}`]);
@@ -160,9 +160,17 @@ it("rejects an unknown server contract before changing its integration", () => {
 });
 
 it("keeps a target's native managed integration and readiness when it supports those contracts", () => {
-  const release = fixture("CLOUDX_UPDATE_COORDINATOR_ROOT", "/api/ready/terminals");
+  const release = fixture("installedUpdaterRoot", "/api/ready/terminals");
   expect(prepareManagedIntegration(release, coordinator)).toEqual({ version: 1, files: [], independentReadiness: false });
   expect(git(release, ["status", "--porcelain"])).toBe("");
+});
+
+it("renews Settings integration when the target still selects a frozen environment coordinator", () => {
+  const release = fixture("CLOUDX_UPDATE_COORDINATOR_ROOT");
+  const integration = prepareManagedIntegration(release, coordinator);
+  expect(integration.files).toContain("apps/server/src/system/CloudxUpdateService.ts");
+  expect(fs.readFileSync(path.join(release, "apps/server/src/system/CloudxUpdateService.ts"), "utf8"))
+    .toContain("installedUpdaterRoot");
 });
 
 it("stops integration when it would conceal a local Settings edit", () => {
