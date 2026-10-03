@@ -98,6 +98,7 @@ controller="$fixture/controller"
 useradd --create-home --shell /bin/bash "$test_user"
 user_created=1
 test_uid=$(id -u "$test_user")
+chown "$test_user:$test_user" "$evidence"
 chown -R "$test_user:$test_user" "$fixture/origin.git"
 printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$test_user" > "/etc/sudoers.d/$test_user"
 chmod 0440 "/etc/sudoers.d/$test_user"
@@ -109,16 +110,25 @@ sed -i -E '/^[[:space:]]*(PATH|XDG_CONFIG_HOME|XDG_RUNTIME_DIR)=/d' /etc/environ
 printf 'PATH="%s"\n' "$application_path" >> /etc/environment
 loginctl enable-linger "$test_user"
 systemctl start "user@$test_uid.service"
-as_application systemctl --user show-environment > /dev/null
-as_application systemd-run --user --wait --pipe --collect /bin/sh -ec '
-  test "$HOME" = "$1"
-  test "${XDG_CONFIG_HOME:-$HOME/.config}" = "$HOME/.config"
-  test "$XDG_RUNTIME_DIR" = "/run/user/$(id -u)"
-  test "$PATH" = "$2"
+# Environment generators (including snapd) can extend PATH after reading
+# /etc/environment. A client override remains authoritative across daemon-reload.
+as_application systemctl --user set-environment "PATH=$application_path"
+as_application systemd-run --user --wait --pipe --collect --expand-environment=no /bin/sh -ec '
+  failed=0
+  check() {
+    printf "%s: actual=<%s> expected=<%s>\n" "$1" "$2" "$3"
+    if [ "$2" != "$3" ]; then failed=1; fi
+  }
+  check HOME "${HOME-<unset>}" "$1"
+  printf "XDG_CONFIG_HOME: inherited=<%s>\n" "${XDG_CONFIG_HOME-<unset>}"
+  check XDG_CONFIG_HOME "${XDG_CONFIG_HOME:-$HOME/.config}" "$1/.config"
+  check XDG_RUNTIME_DIR "${XDG_RUNTIME_DIR-<unset>}" "/run/user/$(id -u)"
+  check PATH "${PATH-<unset>}" "$2"
+  if [ "$failed" != 0 ]; then exit 1; fi
+  printf "Checking nested user-manager access.\n"
   systemctl --user show-environment > /dev/null
-  printf "Application service home, runtime directory and PATH are isolated; nested user-manager access passes.\\n"
+  printf "Application service home, runtime directory and PATH are isolated; nested user-manager access passes.\n"
 ' sh "$test_home" "$application_path" > "$evidence/user-manager.txt" 2>&1
-chown "$test_user:$test_user" "$evidence"
 as_application git clone --no-hardlinks "$fixture/origin.git" "$test_home/cloudx"
 install_sha=$target_sha
 if [[ $scenario == upgrade ]]; then install_sha=$source_sha; fi

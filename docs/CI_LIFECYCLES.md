@@ -22,7 +22,8 @@ credential and is excluded from artifacts.
 
 The runner home may be private. The host harness copies only its lifecycle
 scripts, Playwright packages and installed browsers into a readable disposable
-fixture. The application account writes evidence there; cleanup copies it back
+fixture. The application account owns the evidence directory before user-manager
+setup, so early setup failures can retain readiness responses. Cleanup copies it back
 to the runner's upload directory on success or failure. The runner's profile
 and the application's clean installation remain separate.
 
@@ -31,7 +32,11 @@ the runner-specific `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` assignments from
 `/etc/environment`. A transient user service verifies its inherited home and
 runtime directory and connects to its own user manager before installation.
 The harness also replaces the global `PATH` with the controller Node directory
-and standard executable directories, and verifies that path in the service.
+and standard executable directories, and sets that path on the user manager.
+This client override takes precedence over environment generators such as snapd's
+`/snap/bin` addition and survives the installer's unit reload. The transient
+service reports actual and expected HOME, XDG and PATH values before asserting
+them, then checks nested user-manager access.
 Runner-private paths can turn lookup of an absent optional executable such as
 `quota` into a permission error, causing the source updater's capacity check to
 fail. The application caller and user services receive the same isolated path.
