@@ -6,10 +6,12 @@ import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   acquireCodexInstallationLock,
+  listCodexReleases,
   readCodexVersion,
   resolveCodexInstallation,
   updateCodexInstallation,
 } from "./codex-updater.mjs";
+import { readCodexSelection, resolveSelectedCodexCommand, isExactCodexVersion } from "./codex-selection.mjs";
 
 vi.mock("node:child_process", async importOriginal => ({ ...await importOriginal() }));
 
@@ -24,6 +26,9 @@ beforeEach(() => {
       fs.appendFileSync(process.env.TEST_RUNTIME_LOG, process.argv[1] + '\\n');
       if (process.env.TEST_MODE === 'runtime') {
         console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
+      }
+      if (process.env.TEST_MODE === 'previous-state-incompatible' && process.argv.includes('--previous-bin')) {
+        console.error('The existing CLI cannot read candidate-migrated state'); process.exit(1);
       }
       if (process.env.TEST_MODE === 'runtime-timeout') {
         const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
@@ -69,7 +74,7 @@ function installation({ mode = "success", version = "1.0.0" } = {}) {
   fs.writeFileSync(
     path.join(packageDir, "bin/codex.js"),
     `#!${process.execPath}\nconst fs = require('node:fs');
-const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(packageDir, "package.json"))}, 'utf8'));
+const manifest = JSON.parse(fs.readFileSync(require('node:path').join(__dirname, '../package.json'), 'utf8'));
 fs.appendFileSync(process.env.TEST_VERSION_LOG, 'version\\n');
 if (process.env.TEST_MODE === 'version-escape') {
   const { spawn } = require('node:child_process');
@@ -94,7 +99,7 @@ fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(process.argv.slice(2)) + 
 const mode = process.env.TEST_MODE;
 if (process.argv[2] === 'view') {
   if (mode === 'network') { console.error('ENOTFOUND registry.invalid SECRET-TOKEN'); process.exit(1); }
-  console.log(mode === 'registry' ? 'bad json' : '"1.1.0"');
+  console.log(mode === 'registry' ? 'bad json' : JSON.stringify({versions: ['0.9.0', '1.0.0', '1.1.0', '1.2.0-rc.1'], 'dist-tags': {latest: mode === 'prerelease-latest' ? '1.2.0-rc.1' : '1.1.0'}}));
 } else if (mode === 'failure' || mode === 'permission') {
   console.error(mode === 'permission' ? 'EACCES SECRET-TOKEN' : 'unclassified error SECRET-TOKEN'); process.exit(1);
 } else if (mode === 'flood') process.stdout.write('x'.repeat(600000));
@@ -112,10 +117,16 @@ else if (['timeout', 'cancel', 'escaped-child', 'escaped-silent', 'lost-owner', 
   }
   process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);
 } else {
-  const file = ${JSON.stringify(path.join(packageDir, "package.json"))};
-  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'));
-  manifest.version = mode === 'wrong-version' ? '1.0.1' : '1.1.0';
-  fs.writeFileSync(file, JSON.stringify(manifest));
+  const path = require('node:path');
+  const prefix = process.argv[process.argv.indexOf('--prefix') + 1];
+  const packageDir = path.join(prefix, 'lib/node_modules/@openai/codex');
+  fs.mkdirSync(path.join(packageDir, 'bin'), { recursive: true });
+  fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+  const manifest = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(packageDir, "package.json"))}, 'utf8'));
+  manifest.version = mode === 'wrong-version' ? '1.0.1' : process.argv.at(-1).slice('@openai/codex@'.length);
+  fs.writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify(manifest));
+  fs.copyFileSync(${JSON.stringify(path.join(packageDir, "bin/codex.js"))}, path.join(packageDir, 'bin/codex.js'));
+  fs.symlinkSync(path.join(packageDir, 'bin/codex.js'), path.join(prefix, 'bin/codex'));
   if (mode === 'escaped-success') {
     const descendant = spawn(process.execPath, ['-e', 'const fs = require("node:fs"); fs.appendFileSync(process.env.TEST_WRITES, "x"); setInterval(() => fs.appendFileSync(process.env.TEST_WRITES, "x"), 10)'], {detached: true, stdio: 'ignore'});
     fs.writeFileSync(process.env.TEST_CHILD, String(descendant.pid));
@@ -167,6 +178,230 @@ function replaceSupervisorInterpreter(fixture, source) {
 }
 
 describe("shared Codex update", () => {
+  it("discovers published releases in version order and labels prereleases", async () => {
+    const fixture = installation();
+    await expect(listCodexReleases(fixture)).resolves.toEqual({
+      latestStable: "1.1.0",
+      versions: [
+        { version: "1.2.0-rc.1", prerelease: true },
+        { version: "1.1.0", prerelease: false },
+        { version: "1.0.0", prerelease: false },
+        { version: "0.9.0", prerelease: false },
+      ],
+    });
+    await expect(listCodexReleases({ ...fixture, env: { ...fixture.env, TEST_MODE: "prerelease-latest" } })).rejects.toMatchObject({ code: "installation" });
+  });
+
+  it.each(["^1.0.0", "1.x", "01.0.0", "1.0.0-01", "1.0.0-", "1.0.0+", "1.0.0\n", "1.0.0\r", "@other/package", "https://example.com/package", "./local", "1.0.0; echo unsafe"])("rejects a non-exact selection before invoking npm: %s", async targetVersion => {
+    const fixture = installation();
+    expect(isExactCodexVersion(targetVersion)).toBe(false);
+    await expect(updateCodexInstallation({ ...fixture, targetVersion })).rejects.toMatchObject({ code: "invalid-version" });
+    expect(fs.existsSync(fixture.env.TEST_LOG)).toBe(false);
+    expect(readCodexSelection(fixture.prefix)).toBeNull();
+  });
+
+  it("rejects an unpublished exact version before installing or activating", async () => {
+    const fixture = installation();
+    await expect(updateCodexInstallation({ ...fixture, targetVersion: "9.9.9" })).rejects.toMatchObject({ code: "unpublished-version", usableVersion: "1.0.0" });
+    expect(commands(fixture)).toHaveLength(1);
+    expect(readCodexSelection(fixture.prefix)).toBeNull();
+    expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex"))).toBe(false);
+  });
+
+  it("pins an exact downgrade, preserves both installations, and explicitly returns to the previous verified version", async () => {
+    const fixture = installation();
+    const originalPackage = fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8");
+    const targets = [], installed = [];
+    const options = { ...fixture, onTarget: version => targets.push(version), onInstalled: version => installed.push(version) };
+    await expect(updateCodexInstallation({ ...options, targetVersion: "1.0.0" })).resolves.toEqual({ outcome: "current", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVersion: null });
+    await expect(updateCodexInstallation({ ...options, targetVersion: "0.9.0" })).resolves.toEqual({ outcome: "updated", installedVersion: "0.9.0", activeVersion: "0.9.0", previousVersion: "1.0.0" });
+    const downgraded = readCodexSelection(fixture.prefix);
+    expect(resolveSelectedCodexCommand(fixture.assistantBin)).toBe(downgraded.active.assistantBin);
+    expect(downgraded.previous).toEqual({ version: "1.0.0", assistantBin: fixture.assistantBin });
+    expect(fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8")).toBe(originalPackage);
+    await expect(updateCodexInstallation({ ...options, targetVersion: "1.0.0" })).resolves.toEqual({ outcome: "updated", installedVersion: "1.0.0", activeVersion: "1.0.0", previousVersion: "0.9.0" });
+    expect(commands(fixture).filter(args => args[0] === "i")).toHaveLength(1);
+    expect(fs.existsSync(downgraded.active.assistantBin)).toBe(true);
+    expect(targets).toEqual(["1.0.0", "0.9.0", "1.0.0"]);
+    expect(installed).toEqual(targets);
+    expect(resolveSelectedCodexCommand(fixture.assistantBin)).toBe(fixture.assistantBin);
+  });
+
+  it("selects prereleases only through an exact explicit request", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.2.0-rc.1" });
+    expect(readCodexSelection(fixture.prefix).active.version).toBe("1.2.0-rc.1");
+    expect(commands(fixture).at(-1).at(-1)).toBe("@openai/codex@1.2.0-rc.1");
+  });
+
+  it("verifies shared Codex state and retained CloudX homes before activation", async () => {
+    const fixture = installation();
+    const codexHome = path.join(fixture.root, "codex state");
+    const cloudxData = path.join(fixture.root, "cloudx data");
+    await updateCodexInstallation({ ...fixture, env: { ...fixture.env, CODEX_HOME: codexHome, CLOUDX_DATA_DIR: cloudxData } });
+    const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifier[1].slice(-8)).toEqual(["--shared-state-home", codexHome, "--cloudx-data-dir", cloudxData, "--previous-bin", fixture.assistantBin, "--allow-startup-recovery", "true"]);
+  });
+
+  it("checks the verified active binary against candidate-migrated state before switching", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.1.0" });
+    const verifiers = childProcess.spawn.mock.calls.filter(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifiers.at(-1)[1].slice(-2)).toEqual(["--previous-bin", fixture.assistantBin]);
+    expect(verifiers.at(-1)[1]).not.toContain("--allow-startup-recovery");
+  });
+
+  it("checks the existing CLI on the first switch without offering an unverified return target", async () => {
+    const fixture = installation();
+
+    await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({
+      outcome: "updated", activeVersion: "1.1.0", previousVersion: null,
+    });
+
+    const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifier[1].slice(-4)).toEqual(["--previous-bin", fixture.assistantBin, "--allow-startup-recovery", "true"]);
+    expect(readCodexSelection(fixture.prefix).previous).toBeNull();
+  });
+
+  it("rejects incompatible state migration on the first switch and preserves the existing CLI", async () => {
+    const fixture = installation({ mode: "previous-state-incompatible" });
+    const originalPackage = fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8");
+    const originalExecutable = fs.readFileSync(fixture.assistantBin, "utf8");
+    const output = [];
+
+    await expect(updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) })).rejects.toMatchObject({
+      code: "runtime-verification",
+      usableVersion: "1.0.0",
+      message: expect.stringContaining("The active selection is unchanged"),
+    });
+
+    expect(output.join("")).toContain("The existing CLI cannot read candidate-migrated state");
+    expect(readCodexSelection(fixture.prefix)).toBeNull();
+    expect(resolveSelectedCodexCommand(fixture.assistantBin)).toBe(fixture.assistantBin);
+    expect(fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8")).toBe(originalPackage);
+    expect(fs.readFileSync(fixture.assistantBin, "utf8")).toBe(originalExecutable);
+    await expect(readCodexVersion(fixture.assistantBin, fixture)).resolves.toBe("1.0.0");
+  });
+
+  it("verifies a first installation without an existing CLI compatibility probe", async () => {
+    const fixture = installation();
+    fs.unlinkSync(fixture.assistantBin);
+
+    await expect(updateCodexInstallation(fixture)).resolves.toMatchObject({
+      outcome: "updated", activeVersion: "1.1.0", previousVersion: null,
+    });
+
+    const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifier[1]).not.toContain("--previous-bin");
+    expect(verifier[1]).not.toContain("--allow-startup-recovery");
+    expect(readCodexSelection(fixture.prefix).previous).toBeNull();
+  });
+
+  it.each(["", " \t"])("uses the launch default shared state when CODEX_HOME is blank %j", async codexHome => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, env: { ...fixture.env, HOME: fixture.root, CODEX_HOME: codexHome, CLOUDX_DATA_DIR: undefined } });
+    const verifier = childProcess.spawn.mock.calls.find(([, args]) => args.some(argument => String(argument).endsWith("/codex-runtime-verification.mjs")));
+    expect(verifier[1].slice(-6)).toEqual(["--shared-state-home", path.join(fixture.root, ".codex"), "--previous-bin", fixture.assistantBin, "--allow-startup-recovery", "true"]);
+  });
+
+  it("cancels candidate verification without changing the persisted active version", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const before = readCodexSelection(fixture.prefix);
+    const controller = new AbortController();
+    await expect(updateCodexInstallation({ ...fixture, signal: controller.signal, onInstalled: () => controller.abort() })).rejects.toMatchObject({ code: "cancelled", usableVersion: "1.0.0" });
+    expect(readCodexSelection(fixture.prefix)).toEqual(before);
+  });
+
+  it.each(["network", "failure", "verification", "wrong-version", "runtime"])("keeps a verified selected installation intact after candidate %s failure", async mode => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const manifestPath = path.join(fixture.prefix, ".cloudx-codex-selection.json");
+    const before = fs.readFileSync(manifestPath, "utf8");
+    const installed = [];
+    await expect(updateCodexInstallation({ ...fixture, env: { ...fixture.env, TEST_MODE: mode }, onInstalled: version => installed.push(version) })).rejects.toMatchObject({ usableVersion: "1.0.0" });
+    expect(fs.readFileSync(manifestPath, "utf8")).toBe(before);
+    expect(resolveSelectedCodexCommand(fixture.assistantBin)).toBe(fixture.assistantBin);
+    expect(installed).toEqual(mode === "runtime" ? ["1.1.0"] : mode === "wrong-version" ? ["1.0.1"] : []);
+  });
+
+  it("preserves the old atomic selection if activation cannot rename its prepared manifest", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const before = readCodexSelection(fixture.prefix);
+    const rename = fs.renameSync;
+    vi.spyOn(fs, "renameSync").mockImplementation((source, destination) => {
+      if (destination === path.join(fixture.prefix, ".cloudx-codex-selection.json")) throw Object.assign(new Error("EACCES private path"), { code: "EACCES" });
+      return rename(source, destination);
+    });
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({ code: "permission", usableVersion: "1.0.0" });
+    expect(readCodexSelection(fixture.prefix)).toEqual(before);
+    expect(fs.readdirSync(fixture.prefix).filter(name => name.endsWith(".tmp"))).toEqual([]);
+  });
+
+  it.each(["1.0.0", "1.1.0"])("reports the selected version if lock release fails after verification (original %s)", async version => {
+    const fixture = installation({ version });
+    const lock = path.join(fixture.prefix, ".cloudx-codex-update.lock");
+    const unlink = fs.unlinkSync;
+    vi.spyOn(fs, "unlinkSync").mockImplementation(file => {
+      if (file === lock) throw Object.assign(new Error("EACCES private lock path"), { code: "EACCES" });
+      return unlink(file);
+    });
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
+      code: "lock-release", usableVersion: "1.1.0",
+      message: expect.stringContaining("Codex 1.1.0 is selected for new launches"),
+    });
+    expect(readCodexSelection(fixture.prefix).active.version).toBe("1.1.0");
+    expect(await readCodexVersion(resolveSelectedCodexCommand(fixture.assistantBin), fixture)).toBe("1.1.0");
+    expect(fs.existsSync(lock)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(fixture.packageDir, "package.json"), "utf8")).version).toBe(version);
+  });
+
+  it("uses a saved selection through prefix aliases and leaves unrelated commands alone", async () => {
+    const fixture = installation();
+    await updateCodexInstallation(fixture);
+    const alias = path.join(fixture.root, "prefix-alias");
+    fs.symlinkSync(fixture.prefix, alias);
+    expect(resolveSelectedCodexCommand(path.join(alias, "bin/codex"))).toBe(readCodexSelection(fixture.prefix).active.assistantBin);
+    expect(resolveSelectedCodexCommand("codex")).toBe("codex");
+    expect(resolveSelectedCodexCommand("/opt/custom-wrapper")).toBe("/opt/custom-wrapper");
+    expect(resolveSelectedCodexCommand(path.join(fixture.root, "unrelated/bin/codex"))).toBe(path.join(fixture.root, "unrelated/bin/codex"));
+  });
+
+  it.each(["invalid-json", "version", "outside-prefix", "traversal", "missing", "symlinked-install", "symlinked-entrypoint"])("rejects a malformed or unavailable saved selection: %s", async mode => {
+    const fixture = installation();
+    await updateCodexInstallation(fixture);
+    const selection = readCodexSelection(fixture.prefix);
+    if (mode === "version") selection.active.version = "1.0.0";
+    if (mode === "outside-prefix") selection.active.assistantBin = "/tmp/other/bin/codex";
+    if (mode === "traversal") selection.active.assistantBin = path.join(fixture.prefix, ".cloudx-codex") + "/../bin/codex";
+    if (mode === "missing") fs.unlinkSync(selection.active.assistantBin);
+    if (mode === "symlinked-entrypoint") {
+      const entrypoint = fs.realpathSync(selection.active.assistantBin);
+      const outside = path.join(fixture.root, "outside-wrapper");
+      fs.renameSync(entrypoint, outside);
+      fs.symlinkSync(outside, entrypoint);
+    }
+    if (mode === "symlinked-install") {
+      const location = path.dirname(path.dirname(selection.active.assistantBin));
+      const moved = path.join(fixture.root, "moved");
+      fs.renameSync(location, moved);
+      fs.symlinkSync(moved, location);
+    }
+    fs.writeFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"), mode === "invalid-json" ? "{" : JSON.stringify(selection));
+    expect(() => resolveSelectedCodexCommand(fixture.assistantBin)).toThrow(/saved Codex selection/);
+  });
+
+  it.each(["oversized", "symlink", "directory"])("rejects an unsafe selection file before following or parsing it: %s", mode => {
+    const fixture = installation();
+    const manifestPath = path.join(fixture.prefix, ".cloudx-codex-selection.json");
+    if (mode === "oversized") fs.writeFileSync(manifestPath, " ".repeat(64 * 1024 + 1));
+    if (mode === "symlink") fs.symlinkSync(path.join(fixture.packageDir, "package.json"), manifestPath);
+    if (mode === "directory") fs.mkdirSync(manifestPath);
+    expect(() => readCodexSelection(fixture.prefix)).toThrow(/saved Codex selection/);
+  });
+
   it("acknowledges version completion before the supervisor exits and removes its receipts", async () => {
     const fixture = installation();
     const diagnostics = path.join(fixture.root, "diagnostics");
@@ -202,10 +437,10 @@ describe("shared Codex update", () => {
         usableVersion: "1.0.0",
         message: expect.stringContaining("filesystem watch limits"),
       });
-      expect(commands(fixture)).toEqual([["view", "@openai/codex@latest", "version", "--json"]]);
+      expect(commands(fixture)).toEqual([["view", "@openai/codex", "versions", "dist-tags", "--json"]]);
       expect(fs.existsSync(fixture.env.TEST_CHILD)).toBe(false);
       expect(fs.existsSync(fixture.env.TEST_WRITES)).toBe(false);
-      expect(directories).toHaveLength(4);
+      expect(directories).toHaveLength(3);
       for (const directory of directories) expect(fs.existsSync(directory)).toBe(false);
       const release = acquireCodexInstallationLock(fixture.prefix);
       release();
@@ -287,13 +522,16 @@ describe("shared Codex update", () => {
     expect(result).toEqual({
       outcome: "updated",
       installedVersion: "1.1.0",
-      previousVersion: "1.0.0",
+      activeVersion: "1.1.0",
+      previousVersion: null,
     });
     expect(stages).toEqual(["checking", "updating", "verifying"]);
-    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
+    const selected = readCodexSelection(fixture.prefix).active.assistantBin;
+    expect(selected).not.toBe(fixture.assistantBin);
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${selected}\n`);
     expect(commands(fixture)).toEqual([
-      ["view", "@openai/codex@latest", "version", "--json"],
-      ["i", "-g", "--prefix", fixture.prefix, "@openai/codex@latest"],
+      ["view", "@openai/codex", "versions", "dist-tags", "--json"],
+      ["i", "-g", "--prefix", path.dirname(path.dirname(selected)), "@openai/codex@1.1.0"],
     ]);
     expect(
       fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock")),
@@ -314,17 +552,17 @@ describe("shared Codex update", () => {
     const fixture = installation({ mode: "runtime", version });
     const output = [];
     const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
-    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: null, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: version, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
     expect(error.message).not.toContain("SECRET-TOKEN");
     expect(output.join("")).toContain("SECRET-TOKEN: selected conversation was not saved");
-    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toBe(`${fixture.assistantBin}\n`);
+    expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toContain(version === "1.1.0" ? fixture.assistantBin : ".cloudx-codex/1.1.0-");
     expect(fs.readFileSync(fixture.env.TEST_VERSION_LOG, "utf8").trim().split("\n")).toHaveLength(version === "1.1.0" ? 1 : 2);
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
   });
 
-  it("reaps runtime-verifier descendants on timeout without claiming the unverified CLI is usable", async () => {
+  it("reaps candidate verifier descendants on timeout and preserves the active CLI", async () => {
     const fixture = installation({ mode: "runtime-timeout" });
-    await expect(updateCodexInstallation({ ...fixture, timeoutMs: 800 })).rejects.toMatchObject({ code: "timeout", usableVersion: null });
+    await expect(updateCodexInstallation({ ...fixture, timeoutMs: 800 })).rejects.toMatchObject({ code: "timeout", usableVersion: "1.0.0" });
     const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
     expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
@@ -402,7 +640,7 @@ describe("shared Codex update", () => {
       const fixture = installation({ mode });
       await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({
         code: "verification",
-        usableVersion: mode === "verification" ? null : "1.0.1",
+        usableVersion: "1.0.0",
       });
     },
   );

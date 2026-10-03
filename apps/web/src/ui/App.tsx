@@ -1078,7 +1078,7 @@ export function App() {
   const callUiHook = useCallback(async <T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> => {
     const result = await callHook<T>(hookId, input, targetTabId);
     applyHookResult(result);
-    if (hookId !== "codex-update.read") setError(undefined);
+    if (hookId !== "codex-update.read" && hookId !== "codex-update.releases") setError(undefined);
     return result;
   }, []);
 

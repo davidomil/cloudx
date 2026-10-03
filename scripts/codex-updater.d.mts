@@ -22,14 +22,21 @@ export function readCodexVersion(
   assistantBin: string,
   options?: CodexProcessOptions,
 ): Promise<string>;
+export function listCodexReleases(
+  options?: CodexProcessOptions & { prefix?: string },
+): Promise<{ latestStable: string; versions: Array<{ version: string; prerelease: boolean }> }>;
 export function updateCodexInstallation(
   options: CodexProcessOptions & {
     assistantBin?: string;
     prefix: string;
+    targetVersion?: string;
+    onTarget?: (version: string) => void;
+    onInstalled?: (version: string) => void;
     onProgress?: (stage: "checking" | "updating" | "verifying") => void;
   },
 ): Promise<{
   outcome: "updated" | "current";
   installedVersion: string;
+  activeVersion: string;
   previousVersion: string | null;
 }>;
