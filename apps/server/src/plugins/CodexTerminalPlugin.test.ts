@@ -239,6 +239,10 @@ describe("CodexTerminalPlugin", () => {
       const attached = new FakeTerminalProcess();
       Object.assign(factory, { attach: async () => attached });
       const closeTab = vi.fn();
+      if (method === "restoreSession") {
+        const previous = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
+        previous.stop?.();
+      }
       const session = await plugin[method]({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
       const process = method === "createSession" ? factory.process! : attached;
       process.emitData("CloudX native worker bridge: startup failed.\r\n");
@@ -260,6 +264,10 @@ describe("CodexTerminalPlugin", () => {
       const terminal = new FakeTerminalProcess();
       Object.assign(factory, { attach: async () => terminal });
       const closeTab = vi.fn();
+      if (method === "restoreSession") {
+        const previous = await plugin.createSession({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
+        previous.stop?.();
+      }
       const session = await plugin[method]({ tab, cwd: root, controls: { setTabIndicator: vi.fn(), closeTab } });
       const process = method === "createSession" ? factory.process! : terminal;
       vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
@@ -1880,8 +1888,8 @@ describe("Codex conversation recovery after process loss", () => {
     });
   });
 
-  it("keeps selected identity through web reconnection without another launch or prompt", async () => {
-    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+  it("refreshes legacy skills through web reconnection without another launch or prompt", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
       const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
       const previous = await plugin.createSession({ tab, cwd: root, controls });
       const initialInput = structuredClone(previous.restoreInput?.());
@@ -1889,12 +1897,57 @@ describe("Codex conversation recovery after process loss", () => {
       Object.assign(factory.process!, { detach: vi.fn() });
       previous.detach?.();
       await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: conversationId, cwd: root }));
+      const legacySkill = path.join(factory.env!.CODEX_HOME!, "skills/cloudx-exceptions/imagegen");
+      await fs.rm(legacySkill, { recursive: true });
+      await fs.symlink(path.join(home, "skills/.system/imagegen"), legacySkill, "dir");
+      const runtimeContext = { activeWindowId: "restored-window" };
       Object.assign(factory, { attach: vi.fn(async () => factory.process!) });
-      const restored = await plugin.restoreSession({ tab, cwd: root, controls, initialInput });
-      expect(restored.restoreInput?.()).toMatchObject({ codexExecutionId: selection.executionId, resume: { mode: "session", sessionId: conversationId } });
+      const restored = await plugin.restoreSession({ tab, cwd: root, controls, initialInput, runtimeContext });
+      expect((await fs.lstat(legacySkill)).isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(path.join(legacySkill, "SKILL.md"), "utf8")).toContain(JSON.stringify(path.join(home, "skills/.system/imagegen/SKILL.md")));
+      expect(restored.restoreInput?.()).toMatchObject({ codexExecutionId: selection.executionId, resume: { mode: "session", sessionId: conversationId }, codexRuntimeContext: runtimeContext });
       expect(factory.spawns).toBe(1);
       expect(factory.process!.written).toBe("");
       restored.stop?.();
+    });
+  });
+
+  it.each(["missing-binding", "invalid-skill", "persistence"])("detaches without stopping the surviving process when restore refresh fails: %s", async failure => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const initialInput = structuredClone(previous.restoreInput?.());
+      const terminal = factory.process!;
+      const detach = vi.fn();
+      Object.assign(terminal, { detach });
+      previous.detach?.();
+      detach.mockClear();
+      Object.assign(factory, { attach: vi.fn(async () => terminal) });
+      const generated = factory.env!.CODEX_HOME!;
+      const originalConfig = await fs.readFile(path.join(generated, "config.toml"), "utf8");
+      let message: string;
+      if (failure === "missing-binding") {
+        await fs.unlink(path.join(generated, ".cloudx-source.json"));
+        message = "Codex launch source binding is missing or invalid.";
+      } else if (failure === "invalid-skill") {
+        await fs.writeFile(path.join(home, "skills/.system/imagegen/SKILL.md"), "Invalid skill");
+        message = "SKILL.md must have YAML frontmatter";
+      } else {
+        controls.setRestoreInput.mockRejectedValue(new Error("Restore-state persistence failed."));
+        message = "Restore-state persistence failed.";
+      }
+      const outcome = await plugin.restoreSession({ tab, cwd: root, controls, initialInput, runtimeContext: {} }).then(
+        session => { session.detach?.(); return "restored"; },
+        error => error.message
+      );
+      expect(outcome).toContain(message);
+      expect(detach).toHaveBeenCalledOnce();
+      expect(factory.spawns).toBe(1);
+      expect(terminal.killed).toBe(false);
+      expect(terminal.written).toBe("");
+      expect(controls.closeTab).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(generated, "config.toml"), "utf8")).toBe(originalConfig);
+      expect((await fs.readdir(generated)).filter(name => name.startsWith(".cloudx-generated-"))).toEqual([]);
     });
   });
 
