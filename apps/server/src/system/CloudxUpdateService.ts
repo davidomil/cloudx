@@ -112,6 +112,19 @@ export class CloudxUpdateService {
     } finally { this.changing = false; }
   }
 
+  async reassessCapacity(value: CloudxUpdateRequest): Promise<CloudxUpdateStatus> {
+    const request = parseCloudxUpdateRequest(value);
+    this.beginChange();
+    try {
+      const status = await this.status();
+      if (!request.resumeRunId || status.run?.id !== request.resumeRunId || status.run.targetCommit !== request.targetCommit
+        || !status.run.resumable || !["failed", "prepared"].includes(status.run.state)) {
+        throw conflict("The saved update changed. Check update status before reassessing capacity.");
+      }
+      return await this.request("capacity", request);
+    } finally { this.changing = false; }
+  }
+
   private channelPath(): string { return path.join(this.dataDir, "cloudx-update-channel.json"); }
 
   private channel(): CloudxUpdateChannel {
@@ -140,7 +153,7 @@ export class CloudxUpdateService {
     }
   }
 
-  private async request(action: "status" | "start", request?: CloudxUpdateRequest): Promise<CloudxUpdateStatus> {
+  private async request(action: "status" | "start" | "capacity", request?: CloudxUpdateRequest): Promise<CloudxUpdateStatus> {
     try {
       const { stdout } = await this.execute(process.execPath, [
         this.updaterScript(), action, this.dataDir, String(process.pid),

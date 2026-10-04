@@ -6,6 +6,7 @@ import type { ForgeWorkerHistory } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { readTerminalColorTheme } from "./theme.js";
 import { scaledTerminalFontSize } from "./uiScale.js";
+import { TerminalSelectionCopy } from "./terminalSelectionCopy.js";
 
 export function ForgeWorkerHistoryPanel({ history, uiScale }: { history: ForgeWorkerHistory; uiScale: number }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -27,10 +28,14 @@ export function ForgeWorkerHistoryPanel({ history, uiScale }: { history: ForgeWo
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(container);
+    const selectionCopy = new TerminalSelectionCopy(terminal, container);
     terminal.attachCustomKeyEventHandler(event => event.key !== "Escape");
     const releaseScroller = installTerminalMobileScroller(terminal, container, null);
     let disposed = false;
-    const observer = new ResizeObserver(() => fit.fit());
+    const observer = new ResizeObserver(() => {
+      selectionCopy.preserveBeforeRedraw();
+      fit.fit();
+    });
     // Saved mouse tracking must not consume scrolling or text selection.
     // Keep the hidden cursor on the last saved row so height reductions cannot discard output.
     terminal.write(`${history.screen.data}\x1b[?1000l\x1b[?25l\x1b[?6l\x1b[${history.screen.rows};1H`, () => {
@@ -45,6 +50,7 @@ export function ForgeWorkerHistoryPanel({ history, uiScale }: { history: ForgeWo
       disposed = true;
       observer.disconnect();
       releaseScroller();
+      selectionCopy.dispose();
       terminal.dispose();
     };
   }, [history, uiScale]);

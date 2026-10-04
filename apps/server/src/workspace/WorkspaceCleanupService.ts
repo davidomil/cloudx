@@ -13,6 +13,8 @@ import { WorkspaceCleanupConflictError } from "./WorkspaceErrors.js";
 import { assertWorktreeGitFile, readWorktreeGitFile, WorktreeService, type WorktreeGitFileIdentity } from "../git/WorktreeService.js";
 import type { PathPolicy } from "../pathPolicy.js";
 import type { ForgeWorkflowService } from "../forge/ForgeWorkflowService.js";
+import type { ForgeDisposableResources } from "../forge/ForgeDisposableResources.js";
+import { isGeneratedForgePath } from "../forge/ForgeGeneratedArtifacts.js";
 
 const execute = promisify(execFile);
 interface CleanupSource {
@@ -28,6 +30,7 @@ interface CleanupSource {
   worktreeHead?: string;
   worktreeBranch?: string;
   deletion?: DeletionReceipt;
+  resourceId?: string;
 }
 interface DeletionReceipt {
   path: string;
@@ -52,7 +55,8 @@ interface Snapshot {
 interface Dependencies {
   dataDir: string;
   pathPolicy: PathPolicy;
-  forge?: Pick<ForgeWorkflowService, "dashboard" | "inspectWorkspaceCleanup" | "discardCompletedWorkspace">;
+  forge?: Pick<ForgeWorkflowService, "dashboard" | "inspectWorkspaceCleanup" | "discardCompletedWorkspace"> & Partial<Pick<ForgeWorkflowService, "withCompletedWorkerResources">>;
+  resources?: ForgeDisposableResources;
   openDirectories: () => string[];
   withInactiveDirectory: (directory: string, operation: () => Promise<void>) => Promise<void>;
   protectedDirectories: string[];
@@ -81,11 +85,23 @@ export class WorkspaceCleanupService {
     const sources = await this.sources(warnings);
     const snapshots: Snapshot[] = [];
     for (const source of sources) snapshots.push(await this.inspect(source));
+    if (this.deps.resources) {
+      for (const candidate of await this.deps.resources.preview()) snapshots.push({
+        candidate, source: { path: candidate.path, kind: "resource", repository: candidate.repository, state: candidate.state, resourceId: candidate.resourceId },
+        allocations: candidate.sizeUnavailable ? new Map() : new Map([[`resource:${candidate.resourceId}`, { bytes: candidate.allocatedBytes, links: 1, count: 1 }]]),
+      });
+      warnings.push("Only recorded Forge resource creation establishes deletion authority. Existing unverified environments require an explicit ownership review; their storage is not included in this estimate.");
+    }
     const preview: WorkspaceCleanupPreview = {
       id: randomUUID(), createdAt: new Date().toISOString(), candidates: snapshots.map(item => item.candidate),
       reclaimableBytes: reclaimableBytes(snapshots.filter(item => item.candidate.eligible && !item.candidate.requiresDiscard && item.source.kind !== "trash")),
       reclaimGroups: allocationGroups(snapshots),
       availableBytes: await this.availableSpace(), warnings,
+      ...(this.deps.resources ? { resourceOutcomes: (await this.deps.resources.records()).map(resource => ({
+        id: resource.id, path: `docker:${resource.containerId ?? resource.name}`, state: resource.state, reason: resource.reason,
+        reclaimedBytes: resource.reclaimedBytes, remainingBytes: resource.state === "deleted" ? 0 : resource.allocatedBytes,
+        ...(resource.state !== "deleted" && resource.allocatedBytes === undefined ? { sizeUnavailable: true as const } : {}),
+      })) } : {}),
     };
     this.previewState = { preview, snapshots };
     return preview;
@@ -148,6 +164,24 @@ export class WorkspaceCleanupService {
         result.reason = "Revalidating ownership, working files and activity.";
         await this.journal.write(job);
         try {
+          if (item.source.resourceId) {
+            const resources = this.deps.resources!;
+            const owner = this.deps.forge?.withCompletedWorkerResources;
+            if (!owner) throw new CleanupSkipped("The Forge lifecycle owner is unavailable; resources were preserved.");
+            await owner.call(this.deps.forge, await resources.consumerIds(item.source.resourceId), async () => {
+              const outcome = await resources.remove(item.source.resourceId!);
+              result.reclaimedBytes = outcome.reclaimedBytes;
+              result.remainingBytes = outcome.state === "deleted" ? 0 : outcome.allocatedBytes;
+              if (outcome.state !== "deleted") {
+                if (outcome.state === "blocked") throw new CleanupSkipped(outcome.reason);
+                throw new Error(outcome.reason);
+              }
+              result.reason = outcome.reason;
+            });
+            result.status = "deleted";
+            await this.journal.write(job);
+            continue;
+          }
           const remove = async (directory: string, markDeleting = async () => {}) => {
             if (directory !== item.source.path) throw new Error("Workspace ownership changed after preview.");
             const current = await this.inspect(item.source, Boolean(item.source.worker), item.candidate.state === "interrupted cleanup");
@@ -357,8 +391,9 @@ export class WorkspaceCleanupService {
         hash.update(JSON.stringify({ head, status, index, worktrees, unpublishedCommits: candidate.unpublishedCommits }));
       }
       candidate.requiresDiscard = candidate.sourceChanges.length > 0 || candidate.unpublishedCommits > 0 || source.kind === "trash" || discardAlreadyStarted;
+      if (source.worker?.retainedWorkspace?.reason || source.worker?.retainedWorkspace?.retainedPaths.some(file => !isGeneratedForgePath(file))) candidate.requiresDiscard = true;
       candidate.eligible = true;
-      candidate.reason = candidate.requiresDiscard ? "Preserved by default. Explicitly include this workspace to discard its remaining contents." : "Completed and inactive. Ignored dependencies and build outputs can be deleted.";
+      candidate.reason = candidate.requiresDiscard ? source.worker?.retainedWorkspace?.reason ?? "Preserved by default. Explicitly include this workspace to discard its remaining contents." : "Completed and inactive. Ignored dependencies and build outputs can be deleted.";
       if (discardAlreadyStarted) {
         candidate.state = "interrupted cleanup";
         candidate.reason = "Permanent deletion was interrupted. Explicitly discard the reviewed remaining contents to finish cleanup.";

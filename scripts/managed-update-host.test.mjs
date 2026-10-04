@@ -166,7 +166,7 @@ describe('managed update host with real Git and recovery files', () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     expect(await execute(boundary => { if (boundary === 'after:prepare') availableBytes = 1; })).toMatchObject({ state: 'failed', phase: 'quiesce', component: 'capacity' });
     expect(f.record.run.cause).toContain('required');
-    expect(f.record.run.cause).toContain('available 1 bytes');
+    expect(f.record.run.cause).toContain('1 B available');
     expect(f.record.run.cause).toContain('resume to reassess');
     expect(f.record.transition.mutating).toBeUndefined();
     expect(webRunning).toBe(true);

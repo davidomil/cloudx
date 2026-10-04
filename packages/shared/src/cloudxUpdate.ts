@@ -1,3 +1,34 @@
+export interface CloudxUpdateCapacityFilesystem {
+  device: string;
+  mount: string;
+  destination: string;
+  requiredBytes: number;
+  availableBytes: number;
+  shortfallBytes: number;
+  headroomBytes: number;
+  requiredInodes: number;
+  availableInodes: number | null;
+  shortfallInodes: number;
+  byteLimit?: "filesystem" | "quota";
+  inodeLimit?: "filesystem" | "quota";
+  quotaStatus?: string;
+  reservations: Array<{ destination: string; purpose: string; bytes: number; inodes: number }>;
+}
+
+export interface CloudxUpdateCapacity {
+  stage: string;
+  checkedAt: string;
+  filesystems: CloudxUpdateCapacityFilesystem[];
+  error?: string;
+}
+
+export function formatCapacityBytes(bytes: number): string {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+  let value = Math.max(0, bytes), unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${unit ? value.toFixed(2) : value} ${units[unit]}`;
+}
+
 export interface CloudxUpdateForgeBlocker {
   kind: "forge";
   workerId?: string;
@@ -20,6 +51,7 @@ export interface CloudxUpdateRun {
   recoveryAction?: string;
   resumable?: boolean;
   forgeBlocker?: CloudxUpdateForgeBlocker;
+  capacity?: CloudxUpdateCapacity;
 }
 
 export interface CloudxUpdateStatus {
@@ -187,9 +219,40 @@ export function parseCloudxUpdateStatus(value: unknown): CloudxUpdateStatus {
       ...(run.recoveryAction === undefined ? {} : { recoveryAction: run.recoveryAction as string }),
       ...(run.resumable === undefined ? {} : { resumable: run.resumable as boolean }),
       ...(run.forgeBlocker === undefined ? {} : { forgeBlocker: parseForgeBlocker(run.forgeBlocker) }),
+      ...(run.capacity === undefined ? {} : { capacity: parseCloudxUpdateCapacity(run.capacity) }),
     };
   }
   return result;
+}
+
+export function parseCloudxUpdateCapacity(value: unknown): CloudxUpdateCapacity {
+  const count = (input: unknown): input is number => Number.isSafeInteger(input) && (input as number) >= 0;
+  if (!record(value) || !text(value.stage, 128) || !timestamp(value.checkedAt)
+    || !Array.isArray(value.filesystems) || value.filesystems.length > 64
+    || (value.error !== undefined && !text(value.error))) throw new Error("Invalid CloudX update capacity.");
+  const filesystems = value.filesystems.map(input => {
+    if (!record(input) || !["device", "mount", "destination"].every(key => text(input[key]))
+      || !["requiredBytes", "availableBytes", "shortfallBytes", "headroomBytes", "requiredInodes", "shortfallInodes"].every(key => count(input[key]))
+      || !(input.availableInodes === null || count(input.availableInodes))
+      || ["byteLimit", "inodeLimit"].some(key => input[key] !== undefined && input[key] !== "filesystem" && input[key] !== "quota")
+      || (input.quotaStatus !== undefined && !text(input.quotaStatus))
+      || !Array.isArray(input.reservations) || input.reservations.length > 256
+      || input.shortfallBytes !== Math.max(0, (input.requiredBytes as number) - (input.availableBytes as number))
+      || input.shortfallInodes !== (input.availableInodes === null ? 0 : Math.max(0, (input.requiredInodes as number) - (input.availableInodes as number)))) {
+      throw new Error("Invalid CloudX update capacity filesystem.");
+    }
+    const reservations = input.reservations.map(reservation => {
+      if (!record(reservation) || !text(reservation.destination) || !text(reservation.purpose)
+        || !count(reservation.bytes) || !count(reservation.inodes)) throw new Error("Invalid CloudX update capacity reservation.");
+      return { destination: reservation.destination, purpose: reservation.purpose, bytes: reservation.bytes, inodes: reservation.inodes };
+    });
+    return { device: input.device, mount: input.mount, destination: input.destination, requiredBytes: input.requiredBytes,
+      availableBytes: input.availableBytes, shortfallBytes: input.shortfallBytes, headroomBytes: input.headroomBytes,
+      requiredInodes: input.requiredInodes, availableInodes: input.availableInodes, shortfallInodes: input.shortfallInodes,
+      ...(input.byteLimit === undefined ? {} : { byteLimit: input.byteLimit }), ...(input.inodeLimit === undefined ? {} : { inodeLimit: input.inodeLimit }),
+      ...(input.quotaStatus === undefined ? {} : { quotaStatus: input.quotaStatus }), reservations } as CloudxUpdateCapacityFilesystem;
+  });
+  return { stage: value.stage, checkedAt: value.checkedAt, filesystems, ...(value.error === undefined ? {} : { error: value.error as string }) };
 }
 
 function parseForgeBlocker(value: unknown): CloudxUpdateForgeBlocker {

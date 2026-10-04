@@ -211,8 +211,8 @@ export function SettingsDialog({
     description: "Update CloudX and the tools managed by its installer.",
     entries: [{
       id: "cloudx-update",
-      searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout release channel cycle main changelog pull requests",
-      content: <CloudxUpdatePanel update={cloudxUpdate} onOpenForge={onOpenForge} />
+      searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout release channel cycle main changelog pull requests capacity disk space Forge environment trash cleanup",
+      content: <CloudxUpdatePanel update={cloudxUpdate} onOpenForge={onOpenForge} CleanupPanel={WorkspaceCleanupPanel} />
     }]
   });
 

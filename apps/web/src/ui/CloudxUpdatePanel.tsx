@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { CloudxUpdateChannel, CloudxUpdateConsent, CloudxUpdatePreview, CloudxUpdateRequest, CloudxUpdateStatus } from "@cloudx/shared";
+import { useCallback, useEffect, useRef, useState, type ComponentType } from "react";
+import { formatCapacityBytes, type CloudxUpdateCapacity, type CloudxUpdateChannel, type CloudxUpdateConsent, type CloudxUpdatePreview, type CloudxUpdateRequest, type CloudxUpdateStatus } from "@cloudx/shared";
 
-import { getCloudxUpdatePreview, getCloudxUpdateStatus, setCloudxUpdateChannel, startCloudxUpdate } from "../cloudxUpdateApi.js";
+import { getCloudxUpdatePreview, getCloudxUpdateStatus, reassessCloudxUpdateCapacity, setCloudxUpdateChannel, startCloudxUpdate } from "../cloudxUpdateApi.js";
 import { HttpError } from "../api.js";
 import { ControlButton } from "./Control.js";
 
@@ -22,11 +22,13 @@ export interface CloudxUpdateController {
   previewLoading: boolean;
   starting: boolean;
   checking: boolean;
+  reassessing: boolean;
   notice?: string;
   error?: string;
   start: (consent?: CloudxUpdateConsent) => Promise<void>;
   resume: (consent?: CloudxUpdateConsent) => Promise<void>;
   check: () => void;
+  reassessCapacity: () => Promise<void>;
   selectChannel: (channel: CloudxUpdateChannel) => void;
 }
 
@@ -38,17 +40,19 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
   const [previewError, setPreviewError] = useState<string>();
   const [starting, setStarting] = useState(false);
   const [checking, setChecking] = useState(true);
+  const [reassessing, setReassessing] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [error, setError] = useState<string>();
   const [startError, setStartError] = useState<string>();
   const [refresh, setRefresh] = useState(0);
   const startRequest = useRef<AbortController | undefined>(undefined);
   const previewRequest = useRef<AbortController | undefined>(undefined);
+  const capacityRequest = useRef<AbortController | undefined>(undefined);
   const mounted = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
-    return () => { mounted.current = false; startRequest.current?.abort(); };
+    return () => { mounted.current = false; startRequest.current?.abort(); capacityRequest.current?.abort(); };
   }, []);
 
   const readPreview = useCallback(async (selectedChannel?: CloudxUpdateChannel) => {
@@ -170,7 +174,7 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
   }
 
   async function launch(request: CloudxUpdateRequest) {
-    if (startRequest.current) return;
+    if (startRequest.current || capacityRequest.current) return;
     const controller = new AbortController();
     startRequest.current = controller;
     setStarting(true);
@@ -213,8 +217,25 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
     }
   }
 
+  async function reassessCapacity() {
+    if (!status?.run?.resumable || !status.run.targetCommit || startRequest.current || capacityRequest.current) return;
+    const controller = new AbortController();
+    capacityRequest.current = controller;
+    setReassessing(true); setError(undefined);
+    const timer = setTimeout(() => controller.abort(), previewTimeout);
+    try {
+      const next = await reassessCloudxUpdateCapacity({ channel, targetCommit: status.run.targetCommit, resumeRunId: status.run.id }, controller.signal);
+      if (mounted.current && !controller.signal.aborted) setStatus(next);
+    } catch (cause) {
+      if (mounted.current) setError(`Could not recheck update capacity: ${errorMessage(cause)}`);
+    } finally {
+      clearTimeout(timer); capacityRequest.current = undefined;
+      if (mounted.current) setReassessing(false);
+    }
+  }
+
   return {
-    status, preview, channel, previewLoading, starting, checking, notice, error: startError ?? error ?? previewError, start, resume,
+    status, preview, channel, previewLoading, starting, checking, reassessing, notice, error: startError ?? error ?? previewError, start, resume, reassessCapacity,
     check: () => { setStartError(undefined); setRefresh(value => value + 1); },
     selectChannel: selectedChannel => {
       if (startRequest.current || status?.run?.state === "running" || checking || previewRequest.current || selectedChannel === channel) return;
@@ -224,8 +245,13 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
   };
 }
 
-export function CloudxUpdatePanel({ update, onOpenForge }: { update: CloudxUpdateController; onOpenForge?: () => void }) {
-  const { status, preview, channel, previewLoading, starting, checking, notice, error } = update;
+export function CloudxUpdatePanel({ update, onOpenForge, CleanupPanel }: {
+  update: CloudxUpdateController; onOpenForge?: () => void;
+  CleanupPanel?: ComponentType<{ forgeOnly?: boolean; onComplete?: () => void; onBusyChange?: (busy: boolean) => void }>;
+}) {
+  const { status, preview, channel, previewLoading, starting, checking, reassessing, notice, error } = update;
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const running = status?.run?.state === "running";
   const prepared = status?.run?.state === "prepared";
   const needsRepair = preview?.state === "current" && (preview.runtime.verification === "unverified"
@@ -235,13 +261,13 @@ export function CloudxUpdatePanel({ update, onOpenForge }: { update: CloudxUpdat
   const selectedTargetDiffers = preview?.target?.commit !== status?.run?.targetCommit;
   const confirmingResume = canResume && status?.confirmation?.targetCommit === status.run?.targetCommit;
   const confirmation = confirmingResume || status?.confirmation?.targetCommit === preview?.target?.commit ? status?.confirmation : undefined;
-  const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || Boolean(error) || canResume && !selectedTargetDiffers;
+  const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || reassessing || cleanupBusy || Boolean(error) || canResume && !selectedTargetDiffers;
   const forgeBlocker = status?.forgeBlocker ?? status?.run?.forgeBlocker;
   return <section className="settings-section browser-notification-settings cloudx-update-settings" aria-label="CloudX updates">
     <h3>Update CloudX</h3>
     <p>Update CloudX and its application dependencies.</p>
     <label>Update channel
-      <select value={channel} onChange={event => update.selectChannel(event.target.value as CloudxUpdateChannel)} disabled={starting || running || checking || previewLoading}>
+      <select value={channel} onChange={event => update.selectChannel(event.target.value as CloudxUpdateChannel)} disabled={starting || running || checking || previewLoading || reassessing || cleanupBusy}>
         <option value="releases">Releases — published stable releases</option>
         <option value="main">Main — latest changes</option>
       </select>
@@ -254,7 +280,8 @@ export function CloudxUpdatePanel({ update, onOpenForge }: { update: CloudxUpdat
     {status?.run ? <p role={status.run.state === "failed" ? "alert" : "status"}>{status.run.message}</p> : null}
     {status?.run?.phase ? <p>Phase: {status.run.phase}</p> : null}
     {status?.run?.component ? <p>Affected component: {status.run.component}</p> : null}
-    {status?.run?.cause ? <p>Cause: {status.run.cause}</p> : null}
+    {status?.run?.cause ? status.run.component === "capacity" && status.run.capacity ? <details><summary>Capacity failure diagnostics</summary><p>{status.run.cause}</p></details> : <p>Cause: {status.run.cause}</p> : null}
+    {status?.run?.capacity ? <UpdateCapacity capacity={status.run.capacity} /> : null}
     {status?.run?.recoveryAction ? <p>Recovery: {status.run.recoveryAction}</p> : null}
     {forgeBlocker ? <div role="alert" className="cloudx-update-forge-blocker">
       <strong>Forge needs attention{forgeBlocker.issueNumber ? `: issue #${forgeBlocker.issueNumber}` : forgeBlocker.changeNumber ? `: change #${forgeBlocker.changeNumber}` : ""}</strong>
@@ -267,17 +294,37 @@ export function CloudxUpdatePanel({ update, onOpenForge }: { update: CloudxUpdat
     {notice ? <p role="status">{notice}</p> : null}
     {error ? <p role="alert">{error}</p> : null}
     {confirmation ? <UpdateConfirmation key={`${confirmation.targetCommit}:${confirmation.message}:${confirmation.restoreSnapshotRunId}:${confirmation.requiresInterruption}`} confirmation={confirmation}
-      disabled={confirmingResume ? !status?.available || starting || checking : startDisabled}
+      disabled={confirmingResume ? !status?.available || starting || checking || reassessing || cleanupBusy : startDisabled}
       continueUpdate={consent => confirmingResume ? update.resume(consent) : update.start(consent)} /> : null}
-    {canResume && !confirmation ? <ControlButton tone="primary" onClick={() => void update.resume()} disabled={!status?.available || starting || checking}>
+    {canResume && !confirmation ? <ControlButton tone="primary" onClick={() => void update.resume()} disabled={!status?.available || starting || checking || reassessing || cleanupBusy}>
       {prepared ? starting ? "Activating update…" : "Activate prepared update" : starting ? "Resuming update…" : "Resume update"}
     </ControlButton> : null}
     {!confirmation || confirmingResume && selectedTargetDiffers ? <ControlButton tone="primary" onClick={() => void update.start()} disabled={startDisabled}>
       {starting ? "Starting update…" : running ? "Updating CloudX…" : canResume ? "Start selected target" : needsRepair ? "Rebuild and activate CloudX" : "Update CloudX and dependencies"}
     </ControlButton> : null}
-    <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading}>Check update status</ControlButton>
+    <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading || reassessing || cleanupBusy}>Check update status</ControlButton>
+    {canResume ? <ControlButton size="compact" onClick={() => void update.reassessCapacity()} disabled={starting || checking || reassessing || cleanupBusy}>{reassessing ? "Rechecking capacity…" : "Recheck update capacity"}</ControlButton> : null}
+    {CleanupPanel && !running ? <ControlButton size="compact" onClick={() => setCleanupOpen(value => !value)} disabled={starting || checking || reassessing || cleanupBusy}>{cleanupOpen ? "Close Forge trash preview" : "Clean Forge environment trash"}</ControlButton> : null}
+    {CleanupPanel && cleanupOpen && !running ? <CleanupPanel forgeOnly onBusyChange={setCleanupBusy} onComplete={() => { void update.reassessCapacity(); }} /> : null}
     <small>The update starts immediately and continues if you close Settings.</small>
   </section>;
+}
+
+function UpdateCapacity({ capacity }: { capacity: CloudxUpdateCapacity }) {
+  return <div className="cloudx-update-capacity" aria-label="Update capacity">
+    <h4>Update capacity</h4>
+    <small>Measured {new Date(capacity.checkedAt).toLocaleString()} · {capacity.stage}</small>
+    {capacity.error ? <p role="alert">Capacity scan blocked: {capacity.error} Usage is unknown. Resolve the scan error before retrying.</p> : null}
+    {capacity.filesystems.map(filesystem => <div key={filesystem.device}>
+      <p>Filesystem: <code>{filesystem.mount}</code> · <code>{filesystem.destination}</code></p>
+      <p>{formatCapacityBytes(filesystem.requiredBytes)} required, {formatCapacityBytes(filesystem.availableBytes)} available, {formatCapacityBytes(filesystem.shortfallBytes)} more needed{filesystem.byteLimit === "quota" ? " under the byte quota" : ""}.</p>
+      {filesystem.shortfallInodes ? <p role="alert">{filesystem.inodeLimit === "quota" ? "Inode quota shortage" : "Inode shortage"}: {filesystem.shortfallInodes} more inodes needed ({filesystem.requiredInodes} required, {filesystem.availableInodes} available). Free file entries or increase the inode limit on this filesystem.</p> : null}
+      <p>{formatCapacityBytes(filesystem.headroomBytes)} safety margin included. Recovery copies and build staging remain reserved.</p>
+      <ul>{filesystem.reservations.map((reservation, index) => <li key={index}>{reservation.purpose}: {formatCapacityBytes(reservation.bytes)} · <code>{reservation.destination}</code></li>)}</ul>
+      {filesystem.quotaStatus ? <small>Quota inspection: {filesystem.quotaStatus}</small> : null}
+    </div>)}
+    <details><summary>Exact capacity diagnostics</summary><pre>{JSON.stringify(capacity, null, 2)}</pre></details>
+  </div>;
 }
 
 function UpdateConfirmation({ confirmation, disabled, continueUpdate }: {

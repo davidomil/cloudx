@@ -8271,3 +8271,12 @@ a:hover svg {
 
 .workspace-cleanup > .cx-button { justify-self: start; max-width: 100%; white-space: normal; }
 .workspace-cleanup small { color: var(--color-muted-foreground); font-size: var(--font-size-sm); }
+
+.cloudx-update-capacity pre {
+  max-width: 100%;
+  overflow: auto;
+}
+
+.cloudx-update-capacity code {
+  overflow-wrap: anywhere;
+}

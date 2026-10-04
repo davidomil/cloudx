@@ -52,6 +52,12 @@ function retainedPaths(value: unknown): string[] {
     throw new Error("Retained file paths must be unique.");
   return paths;
 }
+function retainedEvidencePaths(value: unknown): string[] {
+  const paths = retainedPaths(value);
+  if (paths.some(path => path.split("/").includes(".git")))
+    throw new Error("Retained evidence must not name Git metadata.");
+  return paths;
+}
 function parseIssueHandoff(value: unknown): NonNullable<ForgeIssueCompletionReport["handoff"]> {
   const input = object(value);
   if (input.status !== "ready" && input.status !== "needs_work")
@@ -60,6 +66,7 @@ function parseIssueHandoff(value: unknown): NonNullable<ForgeIssueCompletionRepo
     headSha: commitSha(input.headSha, "issue handoff commit"),
     status: input.status,
     retainedPaths: retainedPaths(input.retainedPaths),
+    ...(input.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: retainedEvidencePaths(input.retainedEvidencePaths) }),
     details: nonblankText(input.details, "issue handoff details", 100_000),
   };
 }
@@ -417,15 +424,19 @@ function parsePendingPublication(
   let handoff: NonNullable<ForgeWorker["pendingPublication"]>["handoff"];
   if (input.handoff !== undefined) {
     const saved = object(input.handoff);
-    handoff = { headSha: commitSha(saved.headSha, "publication handoff commit"), retainedPaths: retainedPaths(saved.retainedPaths) };
+    handoff = { headSha: commitSha(saved.headSha, "publication handoff commit"), retainedPaths: retainedPaths(saved.retainedPaths),
+      ...(saved.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: retainedEvidencePaths(saved.retainedEvidencePaths) }) };
     if (input.baseUpdate !== undefined || headSha !== undefined && headSha.toLowerCase() !== handoff.headSha.toLowerCase())
       throw new Error("Publication must preserve the handoff commit.");
   }
   const capturedPaths = new Set(handoff?.retainedPaths);
+  const capturedEvidence = new Set(handoff?.retainedEvidencePaths);
   if (report.handoff && (report.handoff.status !== "ready" || !handoff ||
     report.handoff.headSha.toLowerCase() !== handoff.headSha.toLowerCase() ||
     report.handoff.retainedPaths.length !== handoff.retainedPaths.length ||
-    report.handoff.retainedPaths.some(path => !capturedPaths.has(path))))
+    report.handoff.retainedPaths.some(path => !capturedPaths.has(path)) ||
+    (report.handoff.retainedEvidencePaths ?? []).length !== capturedEvidence.size ||
+    report.handoff.retainedEvidencePaths?.some(path => !capturedEvidence.has(path))))
     throw new Error("Publication handoff must match the ready issue report.");
   let baseUpdate: NonNullable<ForgeWorker["pendingPublication"]>["baseUpdate"];
   if (input.baseUpdate !== undefined) {
@@ -681,7 +692,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       const worktreePath = nonblankText(retained.worktreePath, "retained checkout path", 4096);
       if (worktreePath.includes("\0") || worker.worktreePath !== undefined && worker.worktreePath !== worktreePath)
         throw new Error("Retained checkout must match the worker checkout.");
-      parsed.retainedWorkspace = { worktreePath, retainedPaths: retainedPaths(retained.retainedPaths) };
+      parsed.retainedWorkspace = { worktreePath, retainedPaths: retainedPaths(retained.retainedPaths),
+        ...(retained.reason === undefined ? {} : { reason: nonblankText(retained.reason, "retention reason", 4096) }) };
     }
     if (worker.mergeConflict !== undefined) {
       const conflict = object(worker.mergeConflict);

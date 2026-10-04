@@ -14,7 +14,7 @@ import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePor
 import { inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
 import { assertTerminalMigrationSafe } from './terminal-upgrade-recovery.mjs';
 import { parseEnvironmentFile, updateEnvironmentFile } from './installer-environment.mjs';
-import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile, estimateSnapshot, manifestTree, filesystemCapacity } from './managed-update-store.mjs';
+import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile, estimateSnapshot, manifestTree, filesystemCapacity, capacityMessage, publicUpdateCapacity } from './managed-update-store.mjs';
 
 const GENERATED = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/dist', 'apps/server/dist', 'apps/web/dist', 'services/asr/.venv', 'services/documentation-indexer/.venv'];
 const PHASES = ['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify'];
@@ -221,6 +221,7 @@ export class UpdateHost {
   preflightCapacity(record, stage) {
     record.run.component = 'capacity';
     record.run.message = `Checking update disk capacity (${stage}). Services remain running.`;
+    delete record.run.capacity;
     this.save(record);
     try {
       const destinations = new Map(), filesystems = new Map();
@@ -232,8 +233,8 @@ export class UpdateHost {
         const capacity = inspect(destination);
         if (!filesystems.has(capacity.device)) filesystems.set(capacity.device, { ...capacity, reservations: [], requiredBytes: 0, requiredInodes: 0 });
         const required = filesystems.get(capacity.device);
-        required.availableBytes = Math.min(required.availableBytes, capacity.availableBytes);
-        required.availableInodes = Math.min(required.availableInodes, capacity.availableInodes);
+        if (capacity.availableBytes < required.availableBytes) { required.availableBytes = capacity.availableBytes; required.byteLimit = capacity.byteLimit; }
+        if (capacity.availableInodes < required.availableInodes) { required.availableInodes = capacity.availableInodes; required.inodeLimit = capacity.inodeLimit; }
         required.reservations.push({ destination, purpose, bytes, inodes });
         required.requiredBytes += bytes;
         required.requiredInodes += inodes;
@@ -288,10 +289,15 @@ export class UpdateHost {
         return check;
       });
       record.transition.capacity = { stage, checkedAt: new Date().toISOString(), filesystems: checks };
+      record.run.capacity = publicUpdateCapacity(record.transition.capacity);
       this.save(record);
       const shortfall = checks.find(check => check.requiredBytes > check.availableBytes || check.requiredInodes > check.availableInodes);
-      if (shortfall) throw new Error(`Insufficient update capacity on ${shortfall.mount} (${shortfall.destination}): required ${shortfall.requiredBytes} bytes and ${shortfall.requiredInodes} inodes, available ${shortfall.availableBytes} bytes and ${shortfall.availableInodes} inodes, including recovery and ${shortfall.headroomBytes} bytes operational headroom. Free space or increase the quota on this filesystem, then resume to reassess. Retained worker files, installed releases and recovery snapshots were not removed.`);
+      if (shortfall) throw new Error(`Insufficient update ${shortfall.requiredBytes > shortfall.availableBytes ? shortfall.byteLimit === 'quota' ? 'byte quota' : 'disk space' : shortfall.inodeLimit === 'quota' ? 'inode quota' : 'inodes'} on ${capacityMessage(shortfall)} Free space or increase the affected limit, then resume to reassess.`);
+      record.run.message = `Update capacity checked (${stage}). ${checks.map(capacityMessage).join(' ')}`;
+      this.save(record);
     } catch (error) {
+      if (!record.run.capacity) record.run.capacity = { stage, checkedAt: new Date().toISOString(), filesystems: [], error: error.message };
+      this.save(record);
       throw publicFailure('capacity', error.message, error);
     }
   }

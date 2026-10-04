@@ -23,6 +23,7 @@ describe("CloudX update HTTP boundary", () => {
   };
   const preview = vi.fn(async () => checked);
   const selectChannel = vi.fn(async () => checked);
+  const reassessCapacity = vi.fn(async () => ({ available: true }));
   const headers = { host: "localhost", origin: "http://localhost" };
 
   beforeEach(async () => {
@@ -31,11 +32,12 @@ describe("CloudX update HTTP boundary", () => {
     start.mockReset().mockResolvedValue(running);
     preview.mockClear();
     selectChannel.mockClear();
+    reassessCapacity.mockClear();
     root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-update-route-"));
     const config = loadConfig({ CLOUDX_DATA_DIR: root, CLOUDX_ALLOWED_ROOTS: root, CLOUDX_LOG_LEVEL: "silent",
       CLOUDX_TRUSTED_ORIGINS: "http://localhost", CLOUDX_DOCUMENTATION_URL: "http://127.0.0.1:9", CLOUDX_AUTOMATION_START_DISABLED: "true" });
     const services = buildServices(config);
-    services.updates = { status, start, preview, selectChannel };
+    services.updates = { status, start, preview, selectChannel, reassessCapacity };
     app = await buildServer(config, services);
   });
 
@@ -57,9 +59,22 @@ describe("CloudX update HTTP boundary", () => {
     expect(start).toHaveBeenCalledExactlyOnceWith(selection);
   });
 
+  it("rechecks a pinned saved run through the trusted capacity boundary without starting an update", async () => {
+    const request = { ...selection, resumeRunId: "11111111-1111-4111-8111-111111111111" };
+    const response = await app.inject({ method: "POST", url: "/api/system/update/capacity", headers, payload: request });
+    expect(response.statusCode).toBe(200);
+    expect(reassessCapacity).toHaveBeenCalledExactlyOnceWith(request);
+    expect(start).not.toHaveBeenCalled();
+    const untrusted = await app.inject({ method: "POST", url: "/api/system/update/capacity", headers: { host: "localhost" }, payload: request });
+    expect(untrusted.statusCode).toBe(403);
+    const malformed = await app.inject({ method: "POST", url: "/api/system/update/capacity", headers, payload: { ...request, resumeRunId: "../run" } });
+    expect(malformed.statusCode).toBe(400);
+    expect(reassessCapacity).toHaveBeenCalledOnce();
+  });
+
   it("provides startup identity when installed into a historical server without the runtime route", async () => {
     const historical = Fastify();
-    registerCloudxUpdateRoutes(historical, { status, start, preview, selectChannel }, []);
+    registerCloudxUpdateRoutes(historical, { status, start, preview, selectChannel, reassessCapacity }, []);
     try {
       const response = await historical.inject({ url: "/api/runtime" });
       expect(response.statusCode).toBe(200);

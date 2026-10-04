@@ -65,6 +65,8 @@ import { ForgeSettingsService } from "./forge/ForgeSettingsService.js";
 import { forgeLog } from "./forge/ForgeLog.js";
 import { ForgeWorkflowService } from "./forge/ForgeWorkflowService.js";
 import { ForgeRuntime } from "./forge/ForgeRuntime.js";
+import { ForgeDisposableResources } from "./forge/ForgeDisposableResources.js";
+import { registerForgeDisposableResourceRoutes } from "./forge/ForgeDisposableResourceRoutes.js";
 import { ForgeWorkflowStore, ForgeWorkerReports } from "./forge/ForgeWorkflowStore.js";
 import { ForgeConnectionService } from "./forge/connections/ForgeConnectionService.js";
 import { ForgeConnectionStore } from "./forge/connections/ForgeConnectionStore.js";
@@ -114,6 +116,7 @@ import { redactUrlSearchAndHash } from "./urlRedaction.js";
 export interface AppServices {
   logs?: CloudxLogService;
   workspaceCleanup?: WorkspaceCleanupService;
+  forgeResources?: ForgeDisposableResources;
   plugins: PluginRegistry;
   sessions: SessionStore;
   pathPolicy: PathPolicy;
@@ -137,7 +140,7 @@ export interface AppServices {
   jiraPolling?: JiraPollingService;
   forge?: ForgeWorkflowService;
   forgeConnections?: ForgeConnectionService;
-  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;
+  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   disposeRulesSkillsUpdates?: () => Promise<void>;
   codexStateSources?: CodexStateSources;
@@ -363,9 +366,13 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
   registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir, undefined, undefined, undefined, services.forge), config.trustedOrigins);
+  if (services.forge) {
+    services.forgeResources ??= new ForgeDisposableResources(config.dataDir, async () => (await services.forge!.dashboard()).workers);
+    registerForgeDisposableResourceRoutes(app, services.forgeResources, services.forge, config.trustedOrigins);
+  }
   const installationRoot = path.resolve(import.meta.dirname, "../../..");
   services.workspaceCleanup ??= new WorkspaceCleanupService({
-    dataDir: config.dataDir, pathPolicy: services.pathPolicy, forge: services.forge,
+    dataDir: config.dataDir, pathPolicy: services.pathPolicy, forge: services.forge, resources: services.forgeResources,
     openDirectories: () => services.sessions.listTabs().map(tab => tab.cwd),
     withInactiveDirectory: (directory, operation) => services.sessions.withInactiveDirectory(directory, operation),
     protectedDirectories: [
@@ -1407,6 +1414,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     forgeLog(logger, "warn", "provider_request_failed", { forgeRequest: diagnostic });
   });
   const settingsForForge: ForgeSettingsService = forgeSettings;
+  const forgeResources = new ForgeDisposableResources(config.dataDir, async () => (await forge!.dashboard()).workers);
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),
     refreshPublicationCredentials: (repository, signal) => settingsForForge.refreshPublicationCredentials(repository, signal),
@@ -1416,6 +1424,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, logger, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
+    cleanupDisposableResources: worker => forgeResources.retire(worker),
     notify: (title, body) => { notifications.send({ title, body }); }
   });
   const pendingRulesSkillsUpdates = new Set<Promise<void>>();
@@ -1469,7 +1478,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
+  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

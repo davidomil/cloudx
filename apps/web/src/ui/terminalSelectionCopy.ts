@@ -1,12 +1,23 @@
-import type { Terminal } from "@xterm/xterm";
+import type { IBufferCellPosition, IBufferRange, Terminal } from "@xterm/xterm";
 import { copyTextToClipboard } from "./clipboard.js";
-import { onBeforeTerminalWrite } from "./terminalWriteBoundary.js";
+import { TerminalSelectionSnapshot } from "./terminalSelectionSnapshot.js";
+import { onTerminalWrite } from "./terminalWriteBoundary.js";
 
 /** Keeps the text selected by the user independent of xterm's mutable screen. */
 export class TerminalSelectionCopy {
   private text = "";
   private position = "";
   private selecting = false;
+  private dragStart?: IBufferCellPosition;
+  private dragEnd?: IBufferCellPosition;
+  private clickedRange?: IBufferRange;
+  private clicks = 0;
+  private columnSelection = false;
+  private parsing = false;
+  private liveViewportY = 0;
+  private dragViewportY = 0;
+  private pointer?: Pick<MouseEvent, "clientX" | "clientY">;
+  private snapshot?: TerminalSelectionSnapshot;
   private disposed = false;
   private readonly panel = document.createElement("aside");
   private readonly preview = document.createElement("textarea");
@@ -15,9 +26,27 @@ export class TerminalSelectionCopy {
   private readonly events = new AbortController();
   private readonly selectionListener;
   private readonly writeListener;
+  private readonly scrollListener;
 
   constructor(private readonly terminal: Terminal, private readonly container: HTMLElement) {
-    this.writeListener = onBeforeTerminalWrite(terminal, () => this.preserveBeforeRedraw());
+    this.writeListener = onTerminalWrite(terminal, {
+      beforeWrite: () => {
+        this.preserveBeforeRedraw();
+        this.parsing = true;
+      },
+      afterWrite: () => {
+        this.parsing = false;
+        if (this.selecting) this.liveViewportY = terminal.buffer.active.viewportY;
+      }
+    });
+    this.scrollListener = terminal.onScroll(viewportY => {
+      if (!this.selecting) return;
+      if (!this.parsing) {
+        this.dragViewportY += viewportY - this.liveViewportY;
+        if (this.pointer) this.onMouseMove(this.pointer);
+      }
+      this.liveViewportY = viewportY;
+    });
     this.panel.className = "terminal-saved-selection";
     this.panel.setAttribute("aria-label", "Saved terminal selection");
     this.preview.readOnly = true;
@@ -41,17 +70,25 @@ export class TerminalSelectionCopy {
     container.addEventListener("copy", this.onCopy, capture);
     container.addEventListener("contextmenu", this.onContextMenu, capture);
     terminal.element!.addEventListener("mousedown", this.onMouseDown, capture);
-    window.addEventListener("mouseup", this.onMouseUp, { signal: this.events.signal });
+    terminal.element!.addEventListener("mousedown", this.captureClickedRange, { signal: this.events.signal });
+    window.addEventListener("mousemove", this.onMouseMove, capture);
+    window.addEventListener("mouseup", this.onMouseUp, capture);
     this.selectionListener = terminal.onSelectionChange(() => {
       if (this.selecting || !this.text) this.capture();
     });
   }
 
   preserveBeforeRedraw(): void {
-    if (!this.selecting) return;
+    if (!this.selecting || this.snapshot) return;
     this.capture();
-    // Once cells change, extending the live range must not replace the saved text.
-    if (this.text) this.selecting = false;
+    if (!this.dragStart || !this.dragEnd) return;
+    const range = this.terminal.getSelectionPosition();
+    if (range && !this.clickedRange) {
+      const end = this.dragEnd;
+      const distance = (point: IBufferCellPosition) => Math.abs((point.y - end.y) * this.terminal.cols + point.x - end.x);
+      this.dragStart = distance(range.end) <= distance(range.start) ? range.start : range.end;
+    }
+    this.snapshot = new TerminalSelectionSnapshot(this.terminal.buffer.active, this.terminal.cols);
   }
 
   clear = (): void => {
@@ -62,6 +99,9 @@ export class TerminalSelectionCopy {
   private resetSnapshot(): void {
     this.text = this.position = "";
     this.selecting = false;
+    this.dragStart = this.snapshot = undefined;
+    this.dragEnd = this.clickedRange = undefined;
+    this.pointer = undefined;
     this.preview.value = "";
     this.panel.hidden = this.menu.hidden = true;
   }
@@ -70,6 +110,7 @@ export class TerminalSelectionCopy {
     this.disposed = true;
     this.events.abort();
     this.writeListener.dispose();
+    this.scrollListener.dispose();
     this.selectionListener.dispose();
     this.clear();
     this.panel.remove();
@@ -86,6 +127,7 @@ export class TerminalSelectionCopy {
   }
 
   private capture(): void {
+    if (this.snapshot) return;
     const position = JSON.stringify(this.terminal.getSelectionPosition());
     if (!position || position === this.position) return;
     const text = this.terminal.getSelection();
@@ -104,12 +146,80 @@ export class TerminalSelectionCopy {
     }
     if (event.button !== 0) return;
     this.resetSnapshot();
-    this.selecting = true;
+    const mac = /Mac/u.test(navigator.platform);
+    const forcedSelection = mac ? event.altKey && Boolean(this.terminal.options.macOptionClickForcesSelection) : event.shiftKey;
+    this.selecting = this.terminal.modes.mouseTrackingMode === "none" || forcedSelection;
+    this.clicks = event.detail;
+    this.columnSelection = this.clicks === 1 && event.altKey && !(mac && this.terminal.options.macOptionClickForcesSelection);
+    if (this.selecting) {
+      this.liveViewportY = this.dragViewportY = this.terminal.buffer.active.viewportY;
+      const start = this.pointerPosition(event, this.dragViewportY);
+      if (this.clicks === 1 && this.terminal.buffer.active.getLine(start.y)?.getCell(start.x)?.getWidth() === 0) start.x++;
+      this.dragStart = this.dragEnd = start;
+    }
   };
 
-  private onMouseUp = (): void => {
+  private pointerPosition(event: Pick<MouseEvent, "clientX" | "clientY">, viewportY: number): IBufferCellPosition {
+    const screen = this.terminal.element!.querySelector(".xterm-screen")!.getBoundingClientRect();
+    const x = !this.columnSelection && event.clientY < screen.top ? 0 : !this.columnSelection && event.clientY > screen.bottom ? this.terminal.cols : Math.round((event.clientX - screen.left) / (screen.width / this.terminal.cols));
+    return {
+      x: Math.max(0, Math.min(this.terminal.cols, x)),
+      y: viewportY + Math.max(0, Math.min(this.terminal.rows - 1, Math.floor((event.clientY - screen.top) / (screen.height / this.terminal.rows))))
+    };
+  }
+
+  private captureClickedRange = (): void => {
+    if (!this.selecting || this.clicks < 2) return;
+    // xterm's earlier mousedown listener has selected the original word or line.
+    const range = this.terminal.getSelectionPosition();
+    if (!range) return;
+    this.clickedRange = range;
+    this.dragStart = range.start;
+  };
+
+  private onMouseMove = (event: Pick<MouseEvent, "clientX" | "clientY">): void => {
+    if (!this.selecting || !this.dragStart) return;
+    this.pointer = { clientX: event.clientX, clientY: event.clientY };
+    const end = this.dragEnd = this.pointerPosition(event, this.dragViewportY);
+    if (!this.snapshot) return;
+    this.updateSavedSelection(end);
+  };
+
+  private updateSavedSelection(endpoint: IBufferCellPosition): void {
+    const end = { ...endpoint };
+    const snapshot = this.snapshot!;
+    end.x = Math.min(end.x, snapshot.cols);
+    const start = this.dragStart!;
+    const forward = start.y < end.y || (start.y === end.y && start.x <= end.x);
+    const word = this.clicks === 2 ? snapshot.wordAt(end, this.terminal.options.wordSeparator!) : undefined;
+    if (this.clicks >= 3) end.x = forward ? snapshot.cols : 0;
+    const finalizedEnd = snapshot.includeWideCharacter(word ? forward ? word.end : word.start : end);
+    const range = forward ? { start, end: finalizedEnd } : { start: finalizedEnd, end: start };
+    if (this.clickedRange) {
+      if (range.start.y > this.clickedRange.start.y || (range.start.y === this.clickedRange.start.y && range.start.x > this.clickedRange.start.x)) range.start = this.clickedRange.start;
+      if (range.end.y < this.clickedRange.end.y || (range.end.y === this.clickedRange.end.y && range.end.x < this.clickedRange.end.x)) range.end = this.clickedRange.end;
+    }
+    this.text = this.preview.value = snapshot.selection(range, this.columnSelection);
+    this.panel.hidden = !this.text;
+  }
+
+  private onMouseUp = (event: MouseEvent): void => {
+    this.onMouseMove(event);
+    if (this.selecting && this.snapshot && this.dragEnd && !this.columnSelection) {
+      const screen = this.terminal.element!.querySelector(".xterm-screen")!.getBoundingClientRect();
+      const range = this.terminal.getSelectionPosition();
+      if (range && (event.clientY < screen.top || event.clientY > screen.bottom)) {
+        const live = this.pointerPosition(event, this.liveViewportY);
+        const distance = (point: IBufferCellPosition) => Math.abs((point.y - live.y) * this.terminal.cols + point.x - live.x);
+        const endpoint = distance(range.start) < distance(range.end) ? range.start : range.end;
+        this.updateSavedSelection({ x: this.dragEnd.x, y: endpoint.y + this.dragViewportY - this.liveViewportY });
+      }
+    }
     if (this.selecting) this.capture();
     this.selecting = false;
+    this.dragStart = this.snapshot = undefined;
+    this.dragEnd = this.clickedRange = undefined;
+    this.pointer = undefined;
   };
 
   private onKeyDown = (event: KeyboardEvent): void => {

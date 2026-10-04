@@ -5,7 +5,7 @@ interface InputHandler {
 }
 
 /** xterm 6.0.0 queues writes; selection must be saved before parsing mutates cells. */
-export function onBeforeTerminalWrite(terminal: Terminal, beforeWrite: () => void): { dispose(): void } {
+export function onTerminalWrite(terminal: Terminal, observer: { beforeWrite(): void; afterWrite(): void }): { dispose(): void } {
   // There is no public pre-parse event. The exact dependency pin and browser
   // regressions guard this contract, including plain text and parser resumes.
   const inputHandler = (terminal as Terminal & { _core?: { _inputHandler?: InputHandler } })._core?._inputHandler;
@@ -14,8 +14,12 @@ export function onBeforeTerminalWrite(terminal: Terminal, beforeWrite: () => voi
   }
   const parse = inputHandler.parse;
   inputHandler.parse = function (data, promiseResult) {
-    beforeWrite();
-    return parse.call(this, data, promiseResult);
+    observer.beforeWrite();
+    try {
+      return parse.call(this, data, promiseResult);
+    } finally {
+      observer.afterWrite();
+    }
   };
   return { dispose: () => { inputHandler.parse = parse; } };
 }

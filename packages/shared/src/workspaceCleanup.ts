@@ -2,8 +2,9 @@ export interface WorkspaceCleanupCandidate {
   id: string;
   path: string;
   repository: string;
-  kind: "forge" | "worktree" | "checkout" | "trash";
+  kind: "forge" | "worktree" | "checkout" | "trash" | "resource";
   workerId?: string;
+  resourceId?: string;
   changeUrl?: string;
   state: string;
   lastActivity: string;
@@ -23,6 +24,15 @@ export interface WorkspaceCleanupPreview {
   reclaimGroups: Array<{ bytes: number; candidateIds: string[] }>;
   availableBytes: number;
   warnings: string[];
+  resourceOutcomes?: Array<{
+    id: string;
+    path: string;
+    state: string;
+    reason: string;
+    reclaimedBytes: number;
+    remainingBytes?: number;
+    sizeUnavailable?: true;
+  }>;
 }
 export interface WorkspaceCleanupRequest {
   previewId: string;
@@ -36,6 +46,8 @@ export interface WorkspaceCleanupResult {
   path: string;
   status: "waiting" | "deleting" | "deleted" | "skipped" | "failed";
   reason: string;
+  reclaimedBytes?: number;
+  remainingBytes?: number;
 }
 export interface WorkspaceCleanupJob {
   id: string;

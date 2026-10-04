@@ -331,7 +331,9 @@ for (const worker of [
         .boundingBox())!;
       await page.touchscreen.tap(rail.x + rail.width / 2, rail.y + 1);
     } else {
-      await output.locator("textarea").focus();
+      await output
+        .getByRole("textbox", { name: "Terminal input", exact: true })
+        .focus();
       for (let index = 0; index < 4; index++)
         await page.keyboard.press("Shift+PageUp");
     }
@@ -346,7 +348,9 @@ for (const worker of [
     await expect(output.locator(".xterm-accessibility-tree")).toContainText(
       "Deployment check failed: missing dependency.",
     );
-    await output.locator("textarea").focus();
+    await output
+      .getByRole("textbox", { name: "Terminal input", exact: true })
+      .focus();
     await page.keyboard.type("do not run this");
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
@@ -448,6 +452,14 @@ async function scrollWorkerHistoryTo(
   } else {
     await output.hover();
     const scrollbar = output.locator(".xterm .scrollbar.vertical");
+    // xterm retains old thumb bounds after the viewport stops overflowing.
+    if (
+      await scrollbar.evaluate(
+        (element) => getComputedStyle(element).pointerEvents === "none",
+      )
+    )
+      return;
+    await scrollbar.locator(".slider").hover();
     const track = (await scrollbar.boundingBox())!;
     const thumb = await scrollbar.locator(".slider").boundingBox();
     if (!thumb) return;
@@ -526,6 +538,7 @@ for (const scenario of [
         await expect(visibleLines).toContainText(
           edge === "first" ? diagnostics[0] : diagnostics.at(-1)!,
         );
+        await expect(output.getByLabel("Selected terminal text")).toBeHidden();
       }
       if (viewport.width === 390) {
         const screenshot = testInfo.outputPath("short-worker-diagnostics.png");

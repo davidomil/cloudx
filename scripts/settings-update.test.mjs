@@ -158,6 +158,51 @@ function installation({ home, checkout = "checkout" } = {}) {
 }
 
 describe("installed Settings updater", () => {
+  it("remeasures capacity without advancing a saved failed run or changing its target", () => {
+    const { updater, host, calls } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    const saved = updater.read(started.run.id);
+    saved.transition = { capacity: { stage: 'build-staging', checkedAt: new Date().toISOString(), filesystems: [] } };
+    saved.run = { ...saved.run, state: 'failed', resumable: true, component: 'capacity', cause: 'Insufficient space' };
+    updater.save(saved);
+    host.unit = { LoadState: 'not-found', ActiveState: 'inactive' };
+    calls.length = 0;
+    let available = 0;
+    updater.capacityHost = () => ({ preflightCapacity(record, stage) {
+      expect(stage).toBe('build-staging');
+      record.run.capacity = { stage, checkedAt: new Date().toISOString(), filesystems: [] };
+      if (!available) throw new Error('Still needs 12.70 GiB');
+      record.run.message = 'Capacity checked';
+    } });
+    expect(updater.reassessCapacity(TARGET_COMMIT, saved.run.id).run).toMatchObject({ id: saved.run.id, state: 'failed', resumable: true, cause: 'Still needs 12.70 GiB' });
+    available = 1;
+    const reassessed = updater.reassessCapacity(TARGET_COMMIT, saved.run.id);
+    expect(reassessed.run).toMatchObject({ id: saved.run.id, targetCommit: TARGET_COMMIT, state: 'failed', resumable: true });
+    expect(reassessed.run.cause).toBeUndefined();
+    expect(updater.read(saved.run.id)).toEqual(saved);
+    expect(calls.some(([command]) => command === 'systemd-run')).toBe(false);
+    expect(() => updater.reassessCapacity('a'.repeat(40), saved.run.id)).toThrow('saved update changed');
+  });
+
+  it('rejects a capacity snapshot when an external update resumes during the scan without overwriting its journal', () => {
+    const { updater, host } = installation();
+    const started = updater.start(TARGET_COMMIT);
+    const saved = updater.read(started.run.id);
+    saved.run = { ...saved.run, state: 'failed', resumable: true };
+    updater.save(saved);
+    host.unit = { LoadState: 'not-found', ActiveState: 'inactive' };
+    updater.capacityHost = options => ({ preflightCapacity(record) {
+      const external = updater.read(saved.run.id);
+      external.run = { ...external.run, state: 'running', resumable: false, message: 'External CLI resumed the update' };
+      updater.save(external);
+      host.unit = { LoadState: 'loaded', ActiveState: 'active', Description: `CloudX Settings update ${saved.run.id}` };
+      record.run.message = 'Scan finished';
+      options.save(record);
+    } });
+    expect(() => updater.reassessCapacity(TARGET_COMMIT, saved.run.id)).toThrow('changed during capacity reassessment');
+    expect(updater.read(saved.run.id).run).toMatchObject({ state: 'running', resumable: false, message: 'External CLI resumed the update' });
+  });
+
   it("stages a no-start update without interruption consent and requires consent to activate its prepared run", () => {
     const { updater, host, calls } = installation();
     host.runtime.requiresInterruption = true;

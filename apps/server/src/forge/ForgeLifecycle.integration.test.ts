@@ -37,6 +37,7 @@ import { TerminalSupervisor } from "../terminal/TerminalSupervisor.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
+import { ForgeDisposableResources, type ContainerIdentity, type DisposableContainerHost, type DisposableContainerInput } from "./ForgeDisposableResources.js";
 import { ForgeSettingsService } from "./ForgeSettingsService.js";
 import { ForgeWorkflowService, type ForgeSettings, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
@@ -63,6 +64,170 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it("publishes named ignored evidence and preserves only that evidence after closure and restart", async () => {
+    const fixture = await LifecycleFixture.create();
+    const { resources, host } = await disposableEnvironments(fixture);
+    const worker = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    await resources.create(worker, { image: "fixture", name: "ignored-evidence-environment", command: [] });
+    const receipt = await fixture.completedAssistantTurn(worker);
+    const checkout = worker.worktreePath!;
+    const evidence = Buffer.from([0, 255, 10, 128]);
+    await fs.mkdir(path.join(checkout, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(checkout, ".git/info/exclude"), "\n.cache/\n");
+    await fs.mkdir(path.join(checkout, ".cache"));
+    await fs.writeFile(path.join(checkout, ".cache/evidence.log"), evidence);
+    await fs.writeFile(path.join(checkout, ".cache/generated.bin"), Buffer.alloc(128 * 1024));
+    await declareHandoff(receipt, { headSha: receipt.headSha, status: "ready", retainedPaths: [], retainedEvidencePaths: [".cache/evidence.log"], details: "Committed content validated separately; retain the ignored evidence log only." });
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "awaiting_review", headSha: receipt.headSha, completion: { report: { handoff: { retainedPaths: [], retainedEvidencePaths: [".cache/evidence.log"] } } } });
+    expect(await git(fixture.origin, "rev-parse", worker.branch!)).toBe(receipt.headSha);
+    expect(await host.allocatedBytes()).toBe(64 * 1024);
+    await fixture.restartWorkflow();
+    fixture.provider.issue.state = "closed";
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    const completed = await fixture.worker(worker.id);
+    expect(completed).toMatchObject({ status: "completed", retainedWorkspace: { worktreePath: checkout, retainedPaths: [".cache/evidence.log"], reason: expect.stringContaining('".cache/evidence.log"') } });
+    await expectMissing(path.join(checkout, ".cache/generated.bin"));
+    expect(await fs.readFile(path.join(checkout, ".cache/evidence.log"))).toEqual(evidence);
+    expect(await git(checkout, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    expect(await host.allocatedBytes()).toBe(0);
+    expect((await resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 64 * 1024 });
+    await fixture.restartWorkflow();
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "completed", retainedWorkspace: completed.retainedWorkspace });
+    expect(await fs.readFile(path.join(checkout, ".cache/evidence.log"))).toEqual(evidence);
+    expect(host.removed).toHaveLength(1);
+  }, 20_000);
+
+  it("quiesces an externally closed issue and reclaims owned environments without a request while retaining unpublished history", async () => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
+    const fixture = await LifecycleFixture.create();
+    const { resources, host } = await disposableEnvironments(fixture);
+    const worker = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(worker, false);
+    await fixture.workflow.withRunningWorkerResources(worker.id, worker.attemptId!, current => resources.create(current, { image: "fixture", name: "cloudx-128-feedback", command: [] }));
+    await resources.create(worker, { image: "fixture", name: "cloudx-128-feedback-upgrade", command: [] });
+    const generated = path.join(worker.worktreePath!, "node_modules");
+    await fs.mkdir(generated);
+    await fs.mkdir(path.join(worker.worktreePath!, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(worker.worktreePath!, ".git/info/exclude"), "\nnode_modules/\n");
+    await fs.writeFile(path.join(generated, "generated.bin"), Buffer.alloc(64 * 1024));
+    await fs.writeFile(path.join(worker.worktreePath!, "research.bin"), Buffer.from([0, 255, 128]));
+    const allocated = await host.allocatedBytes();
+    expect(allocated).toBe(128 * 1024);
+    fixture.provider.issue.state = "closed";
+    await fixture.workflow.poll();
+
+    const completed = await fixture.worker(worker.id);
+    expect(completed).toMatchObject({ status: "completed", retainedWorkspace: {
+      worktreePath: worker.worktreePath, retainedPaths: [".git", "research.bin"], reason: expect.stringContaining("unpublished Git history"),
+    } });
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(await fs.readFile(path.join(worker.worktreePath!, "research.bin"))).toEqual(Buffer.from([0, 255, 128]));
+    await expectMissing(generated);
+    expect(await host.allocatedBytes()).toBe(0);
+    expect((await resources.records()).map(resource => ({ state: resource.state, reclaimed: resource.reclaimedBytes }))).toEqual([
+      { state: "deleted", reclaimed: 64 * 1024 }, { state: "deleted", reclaimed: 64 * 1024 },
+    ]);
+    expect(fixture.provider.changes.size).toBe(0);
+    expect(fixture.gitPushes).toEqual([]);
+    expect(await fixture.workflow.workerHistory(worker.id)).toMatchObject({ tabId: worker.tabId });
+    await fixture.restartWorkflow();
+    const restartedResources = new ForgeDisposableResources(fixture.dataDir, async () => (await fixture.workflow.dashboard()).workers, host);
+    expect(await restartedResources.records()).toEqual(await resources.records());
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "completed", retainedWorkspace: completed.retainedWorkspace });
+    expect(host.removed).toHaveLength(2);
+  }, 20_000);
+
+  it("preserves a finished unmerged review environment then reclaims it on merge with linked issues still open", async () => {
+    const fixture = await LifecycleFixture.create();
+    const { resources, host } = await disposableEnvironments(fixture);
+    await fixture.seedReview();
+    const worker = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    await resources.create(worker, { image: "fixture", name: "review-environment", command: [] });
+    const receipt = await fixture.completedAssistantTurn(worker);
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "completed", worktreePath: worker.worktreePath });
+    expect((await resources.records())[0]?.state).toBe("owned");
+    expect(await host.allocatedBytes()).toBe(64 * 1024);
+    await fixture.provider.mergeExternally(7);
+    fixture.provider.issue.state = "open";
+    const issueReads = vi.spyOn(fixture.provider, "getIssue").mockRejectedValue(new Error("Issue observation unavailable"));
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    expect(issueReads).not.toHaveBeenCalled();
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    expect(await host.allocatedBytes()).toBe(0);
+    expect((await resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 64 * 1024 });
+    await expectMissing(worker.worktreePath!);
+  }, 20_000);
+
+  it("protects a shared environment until every batch member and independent consumer closes", async () => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
+    const fixture = await LifecycleFixture.create();
+    fixture.provider.issues.set(3, { ...fixture.provider.issue, number: 3, title: "Shared environment consumer" });
+    const { resources, host } = await disposableEnvironments(fixture);
+    const draft = await fixture.workflow.saveBatch(repository, "Shared inputs", [1, 2]);
+    const batch = await fixture.workflow.startBatch(draft.id, fixture.placement);
+    await fixture.completedAssistantTurn(batch, false);
+    const other = await fixture.workflow.startIssue(repository, 3, fixture.placement);
+    await fixture.completedAssistantTurn(other, false);
+    await resources.create(batch, { image: "fixture", name: "shared-batch-environment", command: [], consumers: [{ workerId: other.id, attemptId: other.attemptId! }] });
+    fixture.provider.issue.state = "closed";
+    fixture.provider.issues.get(3)!.state = "closed";
+    await fixture.workflow.poll();
+    expect(await fixture.worker(batch.id)).toMatchObject({ status: "running", batch: { issues: [{ state: "closed" }, { state: "open" }] } });
+    expect(await fixture.worker(other.id)).toMatchObject({ status: "completed", error: expect.stringContaining("shared consumer") });
+    expect((await resources.records())[0]).toMatchObject({ state: "blocked" });
+    expect(await host.allocatedBytes()).toBe(64 * 1024);
+    await fixture.restartWorkflow();
+    fixture.provider.issues.get(2)!.state = "closed";
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect((await resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 64 * 1024 });
+    expect(await host.allocatedBytes()).toBe(0);
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(batch.id)).toMatchObject({ status: "completed", retainedWorkspace: { reason: expect.stringContaining("unpublished") } });
+    expect((await fixture.worker(other.id)).error).toBeUndefined();
+    expect(host.removed).toHaveLength(1);
+  }, 30_000);
+
+  it("reclaims delayed shared resources when a closed consumer has a separate checkout cleanup failure", async () => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
+    const fixture = await LifecycleFixture.create();
+    fixture.provider.issues.set(3, { ...fixture.provider.issue, number: 3, title: "Shared consumer" });
+    const { resources, host } = await disposableEnvironments(fixture);
+    const first = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    await fixture.completedAssistantTurn(first, false);
+    const second = await fixture.workflow.startIssue(repository, 3, fixture.placement);
+    await fixture.completedAssistantTurn(second, false);
+    await resources.create(first, { image: "fixture", name: "shared-source-blocker", command: [], consumers: [{ workerId: second.id, attemptId: second.attemptId! }] });
+    const cleanup = fixture.workflowDependencies.runtime.cleanup.bind(fixture.workflowDependencies.runtime);
+    vi.spyOn(fixture.workflowDependencies.runtime, "cleanup").mockImplementation(async workspace => {
+      if (workspace.id === first.id) throw new Error("Checkout ownership changed; source files require review.");
+      return cleanup(workspace);
+    });
+    fixture.provider.issue.state = "closed";
+    await fixture.workflow.poll();
+    expect(await fixture.worker(first.id)).toMatchObject({ status: "cleanup_failed", tabId: undefined, error: expect.stringContaining("source files require review") });
+    expect((await resources.records())[0]?.state).toBe("blocked");
+    fixture.provider.issues.get(3)!.state = "closed";
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect((await resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 64 * 1024 });
+    expect(await host.allocatedBytes()).toBe(0);
+    expect((await fs.stat(first.worktreePath!)).isDirectory()).toBe(true);
+    expect((await fixture.worker(first.id)).status).toBe("cleanup_failed");
+  }, 20_000);
+
   it("persists an unstarted batch and resumes every member in the same checkout after pause and restart", async () => {
     vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
     const fixture = await LifecycleFixture.create();
@@ -2222,6 +2387,37 @@ test("retains the target behavior and issue fix", () => {
       await fs.rm(this.root, { recursive: true, force: true });
     }
   }
+}
+
+class FixtureContainerHost implements DisposableContainerHost {
+  readonly containers = new Map<string, ContainerIdentity>();
+  readonly removed: string[] = [];
+  constructor(private readonly directory: string) {}
+  async engineId() { return "lifecycle-fixture-engine"; }
+  async create(_input: DisposableContainerInput, labels: Record<string, string>) {
+    const id = `${this.containers.size + this.removed.length + 1}`.padStart(64, "0");
+    await fs.writeFile(path.join(this.directory, id), Buffer.alloc(64 * 1024));
+    this.containers.set(id, { id, created: new Date().toISOString(), labels, running: false, writableBytes: 64 * 1024 });
+    return id;
+  }
+  async find(id: string) { return [...this.containers.values()].filter(container => container.labels["cloudx.forge.resource"] === id).map(container => container.id); }
+  async inspect(id: string) { return this.containers.get(id); }
+  async stop(id: string) { this.containers.get(id)!.running = false; }
+  async remove(id: string) { await fs.rm(path.join(this.directory, id)); this.containers.delete(id); this.removed.push(id); }
+  async allocatedBytes() { return (await Promise.all((await fs.readdir(this.directory)).map(async file => (await fs.stat(path.join(this.directory, file))).size))).reduce((total, bytes) => total + bytes, 0); }
+}
+
+async function disposableEnvironments(fixture: LifecycleFixture) {
+  const directory = path.join(fixture.root, "owned-environments");
+  await fs.mkdir(directory);
+  const host = new FixtureContainerHost(directory);
+  const resources = new ForgeDisposableResources(fixture.dataDir, async () => (await fixture.workflow.dashboard()).workers, host);
+  fixture.workflowDependencies.cleanupDisposableResources = async worker => {
+    expect(worker.tabId).toBeUndefined();
+    expect((await fixture.store.read()).find(current => current.id === worker.id)?.status).toBe("completed");
+    await resources.retire(worker);
+  };
+  return { resources, host };
 }
 
 class LocalForgeProvider implements ForgeProvider {

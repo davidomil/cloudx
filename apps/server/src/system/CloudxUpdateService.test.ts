@@ -52,6 +52,21 @@ describe("CloudxUpdateService", () => {
     expect(catalog.preview).not.toHaveBeenCalled();
   });
 
+  it("reassesses only the current saved run and pinned target without starting a host update", async () => {
+    const { execute, catalog, service } = fixture();
+    const id = "11111111-1111-4111-8111-111111111111";
+    const status = { available: true, run: { id, state: "failed", targetCommit: target, resumable: true,
+      message: "Insufficient capacity", startedAt: "2026-09-15T00:00:00Z" } };
+    execute.mockResolvedValue({ stdout: JSON.stringify(status) });
+    expect(await service.reassessCapacity({ ...selection, resumeRunId: id })).toEqual(status);
+    expect(execute.mock.calls.at(-1)?.[1]).toEqual([path.join(updaterRoot, "scripts/settings-update.mjs"), "capacity", dataDir, String(process.pid), target, `--resume=${id}`]);
+    expect(catalog.preview).not.toHaveBeenCalled();
+    execute.mockClear();
+    await expect(service.reassessCapacity({ ...selection, targetCommit: installed, resumeRunId: id })).rejects.toThrow("saved update changed");
+    await expect(service.reassessCapacity(selection)).rejects.toThrow("saved update changed");
+    expect(execute.mock.calls.every(([, args]) => args[1] === "status")).toBe(true);
+  });
+
   it.each([false, true])("reconciles confirmed completed merges before %s update launch", async resume => {
     const { execute, catalog } = fixture();
     const id = "11111111-1111-4111-8111-111111111111";

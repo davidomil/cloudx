@@ -41,7 +41,7 @@ test.afterAll(async () => {
   );
 });
 
-async function terminalStream(page: Page, pausedClock = false) {
+async function terminalStream(page: Page, pausedClock = false, view = "codex") {
   let socket: WebSocketRoute;
   const input: string[] = [];
   let connections = 0;
@@ -53,7 +53,7 @@ async function terminalStream(page: Page, pausedClock = false) {
       if (event.type === "input") input.push(event.data);
     });
   });
-  await page.goto(baseUrl);
+  await page.goto(`${baseUrl}?view=${view}`);
   if (pausedClock) {
     await expect(page.locator(".xterm")).toBeVisible();
     await page.clock.runFor(50);
@@ -116,6 +116,707 @@ async function select(
   await dragSelection(page, from, to, shift);
   await page.mouse.up();
   if (shift) await page.keyboard.up("Shift");
+}
+
+for (const view of ["terminal", "codex", "forge"]) {
+  for (const gesture of [
+    "Control+c",
+    "Control+Shift+c",
+    "Meta+c",
+    "button",
+    "preview",
+  ]) {
+    test(`${view} copies the finalized extended drag across queued and streaming output using ${gesture}`, async ({
+      page,
+      context,
+    }, testInfo) => {
+      test.skip(
+        testInfo.project.name !== "desktop-chromium",
+        "Desktop mouse selection.",
+      );
+      await page.clock.install();
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const stream = await terminalStream(page, false, view);
+      await page.clock.pauseAt(
+        new Date((await page.evaluate(() => Date.now())) + 200),
+      );
+      const size = await cells(page);
+      const cols = Math.round(size.width / size.cell);
+      const original = `    const answer = "界 café";\n    /tmp/界-café.ts ${"x".repeat(cols + 8)}\n    return answer;`;
+      const initialWrites = await page.evaluate(
+        () => window.terminalWriteCount,
+      );
+      stream.data(`\x1bc${original.replaceAll("\n", "\r\n")}`);
+      await expect
+        .poll(() => page.evaluate(() => window.terminalWriteCount))
+        .toBe(initialWrites + 1);
+      await page.clock.runFor(50);
+      await expect(page.locator(".xterm-rows")).toContainText("return answer;");
+      const queuedWrites = await page.evaluate(() => window.terminalWriteCount);
+      const output = (chunk: number) =>
+        view === "terminal"
+          ? `\r\nstreamed output ${chunk}`
+          : `\x1b[H\x1b[2Kreplacement output ${chunk}\r\n\x1b[2Kreplacement middle ${chunk}`;
+      await page.evaluate(() => {
+        window.queuedTerminalOutputPaused = false;
+        window.testTerminal.parser.registerOscHandler(
+          776,
+          () =>
+            new Promise<boolean>((resolve) => {
+              window.queuedTerminalOutputPaused = true;
+              window.resumeQueuedTerminalOutput = () => resolve(true);
+            }),
+        );
+      });
+      stream.data(`\x1b]776;wait\x07${output(1)}`);
+      await expect
+        .poll(() => page.evaluate(() => window.terminalWriteCount))
+        .toBe(queuedWrites + 1);
+      await page.clock.runFor(20);
+      await expect
+        .poll(() => page.evaluate(() => window.queuedTerminalOutputPaused))
+        .toBe(true);
+      await dragSelection(page, [0, 0], [12, 0]);
+      expect(
+        await page.evaluate(() => window.testTerminal.getSelection()),
+      ).toBe("    const an");
+      await page.evaluate(() => window.resumeQueuedTerminalOutput());
+      await page.clock.runFor(20);
+      await expect(page.locator(".xterm-rows")).toContainText(
+        view === "terminal" ? "streamed output 1" : "replacement output 1",
+      );
+      for (const chunk of [2, 3]) {
+        const writes = await page.evaluate(() => window.terminalWriteCount);
+        stream.data(
+          view !== "terminal" && chunk === 2
+            ? `\x1b[?1049h\x1b[2J${output(chunk)}`
+            : output(chunk),
+        );
+        await expect
+          .poll(() => page.evaluate(() => window.terminalWriteCount))
+          .toBe(writes + 1);
+        await page.clock.runFor(20);
+      }
+      const finalSize = await cells(page);
+      await page.mouse.move(
+        finalSize.x + 18 * finalSize.cell + 1,
+        finalSize.y + 3.5 * finalSize.height,
+        { steps: 8 },
+      );
+      await page.mouse.up();
+      const preview = page.getByRole("textbox", {
+        name: "Selected terminal text",
+      });
+      await expect(preview).toHaveValue(original);
+      const writes = await page.evaluate(() => window.terminalWriteCount);
+      stream.data("\x1bcafter release redraw\r\nmore output before copy");
+      await expect
+        .poll(() => page.evaluate(() => window.terminalWriteCount))
+        .toBe(writes + 1);
+      await page.clock.runFor(30);
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "more output before copy",
+      );
+      await expect(preview).toHaveValue(original);
+      if (gesture === "button")
+        await page
+          .getByRole("button", { name: "Copy selection", exact: true })
+          .click();
+      else if (gesture === "preview") {
+        await preview.focus();
+        await preview.evaluate((element: HTMLTextAreaElement) => {
+          const start = element.value.indexOf("return");
+          element.setSelectionRange(start, start + "return answer;".length);
+        });
+        await page.keyboard.press("Control+c");
+      } else {
+        await page.locator(".xterm-helper-textarea").focus();
+        await page.keyboard.press(gesture);
+      }
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(gesture === "preview" ? "return answer;" : original);
+      expect(stream.input).toEqual([]);
+      if (gesture === "preview")
+        await page.getByRole("button", { name: "Clear selection" }).click();
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Control+c");
+      await expect.poll(() => stream.input.join("")).toBe("\x03");
+      testInfo.annotations.push({
+        type: "browser-version",
+        description: page.context().browser()!.version(),
+      });
+    });
+  }
+}
+
+test("extends a backward drag through a streamed screen reset", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  const original = "beginning\n    界 café middle\nlast line";
+  stream.data(`\x1bc${original.replaceAll("\n", "\r\n")}`);
+  await expect(page.locator(".xterm-rows")).toContainText("last line");
+  await dragSelection(page, [9, 2], [4, 2]);
+  stream.screen("replacement text");
+  await expect(page.locator(".xterm-rows")).toContainText("replacement text");
+  const size = await cells(page);
+  await page.mouse.move(size.x + 1, size.y + size.height / 2, { steps: 8 });
+  await page.mouse.up();
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(original);
+  await page
+    .getByRole("button", { name: "Copy selection", exact: true })
+    .click();
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(original);
+  expect(stream.input).toEqual([]);
+});
+
+test("extends a streamed drag into earlier history through autoscroll", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await page.clock.install();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page, false, "terminal");
+  await page.clock.pauseAt(
+    new Date((await page.evaluate(() => Date.now())) + 200),
+  );
+  const lines = Array.from(
+    { length: 100 },
+    (_, row) => `original row ${String(row).padStart(3, "0")}`,
+  );
+  const writes = await page.evaluate(() => window.terminalWriteCount);
+  stream.data(`\x1bc${lines.join("\r\n")}`);
+  await expect
+    .poll(() => page.evaluate(() => window.terminalWriteCount))
+    .toBe(writes + 1);
+  await page.clock.runFor(50);
+  await page.evaluate(() => window.testTerminal.scrollToLine(30));
+  await page.clock.runFor(30);
+  await expect(page.locator(".xterm-rows")).toContainText("original row 030");
+  await dragSelection(page, [0, 2], [7, 2]);
+  const queued = await page.evaluate(() => window.terminalWriteCount);
+  stream.data("\r\nstreaming after selection started");
+  await expect
+    .poll(() => page.evaluate(() => window.terminalWriteCount))
+    .toBe(queued + 1);
+  await page.clock.runFor(20);
+  const size = await cells(page);
+  await page.mouse.move(size.x + 1, size.y - 20, { steps: 8 });
+  await page.clock.runFor(100);
+  const viewport = await page.evaluate(
+    () => window.testTerminal.buffer.active.viewportY,
+  );
+  expect(viewport).toBeLessThan(30);
+  await page.mouse.move(size.x + 1, size.y + size.height / 2);
+  await page.mouse.up();
+  const original = `${lines.slice(viewport, 32).join("\n")}\n`;
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(original);
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(original);
+  expect(stream.input).toEqual([]);
+});
+
+test("keeps original row mapping when streamed output scrolls the viewport", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await page.clock.install();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page, false, "terminal");
+  await page.clock.pauseAt(
+    new Date((await page.evaluate(() => Date.now())) + 200),
+  );
+  const lines = Array.from(
+    { length: 100 },
+    (_, row) => `original row ${String(row).padStart(3, "0")}`,
+  );
+  const writes = await page.evaluate(() => window.terminalWriteCount);
+  stream.data(`\x1bc${lines.join("\r\n")}`);
+  await expect
+    .poll(() => page.evaluate(() => window.terminalWriteCount))
+    .toBe(writes + 1);
+  await page.clock.runFor(50);
+  const viewport = await page.evaluate(
+    () => window.testTerminal.buffer.active.viewportY,
+  );
+  await dragSelection(page, [0, 0], [7, 0]);
+  const queued = await page.evaluate(() => window.terminalWriteCount);
+  stream.data(
+    Array.from({ length: 50 }, (_, row) => `\r\nnew output ${row}`).join(""),
+  );
+  await expect
+    .poll(() => page.evaluate(() => window.terminalWriteCount))
+    .toBe(queued + 1);
+  await page.clock.runFor(50);
+  expect(
+    await page.evaluate(() => window.testTerminal.buffer.active.viewportY),
+  ).toBeGreaterThan(viewport);
+  const size = await cells(page);
+  await page.mouse.move(
+    size.x + 16 * size.cell + 1,
+    size.y + 3.5 * size.height,
+    { steps: 8 },
+  );
+  await page.mouse.up();
+  const original = lines.slice(viewport, viewport + 4).join("\n");
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(original);
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(original);
+  expect(stream.input).toEqual([]);
+});
+
+test("keeps a double-clicked word when output arrives before mouse release", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  stream.data("\x1bcbeginning command end");
+  await expect(page.locator(".xterm-rows")).toContainText(
+    "beginning command end",
+  );
+  const size = await cells(page);
+  await page.mouse.move(size.x + 12 * size.cell + 1, size.y + size.height / 2);
+  await page.mouse.click(size.x + 12 * size.cell + 1, size.y + size.height / 2);
+  await page.mouse.down({ clickCount: 2 });
+  stream.data("\x1b[H\x1b[2Kreplacement");
+  await expect(page.locator(".xterm-rows")).toContainText("replacement");
+  await page.mouse.up({ clickCount: 2 });
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue("command");
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe("command");
+  expect(stream.input).toEqual([]);
+});
+
+for (const view of ["terminal", "codex", "forge"]) {
+  for (const clicks of [2, 3]) {
+    for (const direction of ["shrink", "reverse"]) {
+      test(`${view} preserves original ${clicks === 2 ? "word" : "line"} bounds through grow-stream-${direction}`, async ({
+        page,
+        context,
+      }, testInfo) => {
+        test.skip(
+          testInfo.project.name !== "desktop-chromium",
+          "Desktop mouse selection.",
+        );
+        await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+        const stream = await terminalStream(page, false, view);
+        const line = "beforeword firstword secondword thirdword";
+        stream.data(`\x1bcbefore line\r\n${line}\r\nthird line\r\nfourth line`);
+        await expect(page.locator(".xterm-rows")).toContainText("fourth line");
+        const size = await cells(page);
+        const move = (column: number, row: number) =>
+          page.mouse.move(
+            size.x + column * size.cell + 1,
+            size.y + (row + 0.5) * size.height,
+            { steps: 8 },
+          );
+        await move(15, 1);
+        await page.mouse.click(
+          size.x + 15 * size.cell + 1,
+          size.y + 1.5 * size.height,
+          { clickCount: clicks - 1 },
+        );
+        await page.mouse.down({ clickCount: clicks });
+        await move(25, clicks === 2 ? 1 : 3);
+        const grown =
+          clicks === 2
+            ? "firstword secondword"
+            : `${line}\nthird line\nfourth line`;
+        expect(
+          await page.evaluate(() => window.testTerminal.getSelection()),
+        ).toBe(grown);
+        stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+        await expect(page.locator(".xterm-rows")).toContainText("streamed");
+        await move(
+          direction === "shrink" ? 15 : 4,
+          clicks === 2 || direction === "shrink" ? 1 : 0,
+        );
+        await page.mouse.up({ clickCount: clicks });
+        const native = await page.evaluate(() =>
+          window.testTerminal.getSelection(),
+        );
+        expect(native).toBe(
+          clicks === 2
+            ? direction === "shrink"
+              ? "firstword"
+              : "beforeword firstword"
+            : direction === "shrink"
+              ? line
+              : `before line\n${line}`,
+        );
+        await expect(
+          page.getByRole("textbox", { name: "Selected terminal text" }),
+        ).toHaveValue(native);
+        await page.locator(".xterm-helper-textarea").focus();
+        await page.keyboard.press("Control+c");
+        await expect
+          .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+          .toBe(native);
+        expect(stream.input).toEqual([]);
+      });
+    }
+  }
+}
+
+for (const clicks of [2, 3]) {
+  for (const alt of [false, true]) {
+    test(`finalizes a streamed ${clicks === 2 ? "word" : "line"} drag using the native selection boundaries${alt ? " with Alt" : ""}`, async ({
+      page,
+      context,
+    }, testInfo) => {
+      test.skip(
+        testInfo.project.name !== "desktop-chromium",
+        "Desktop mouse selection.",
+      );
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const stream = await terminalStream(page);
+      const text =
+        "firstword secondword thirdword\r\n    second line\r\n    third line";
+      stream.data(`\x1bc${text}`);
+      await expect(page.locator(".xterm-rows")).toContainText("third line");
+      const size = await cells(page);
+      const x = size.x + 4 * size.cell + 1;
+      const y = size.y + size.height / 2;
+      if (alt) await page.keyboard.down("Alt");
+      await page.mouse.click(x, y, { clickCount: clicks - 1 });
+      await page.mouse.down({ clickCount: clicks });
+      stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+      await expect(page.locator(".xterm-rows")).toContainText("streamed");
+      await page.mouse.move(
+        size.x + (alt ? 8 : 14) * size.cell + 1,
+        size.y + (clicks === 2 ? (alt ? 1.5 : 0.5) : 2.5) * size.height,
+        { steps: 8 },
+      );
+      await page.mouse.up({ clickCount: clicks });
+      if (alt) await page.keyboard.up("Alt");
+      const native = await page.evaluate(() =>
+        window.testTerminal.getSelection(),
+      );
+      expect(native).toBe(
+        clicks === 2
+          ? alt
+            ? "firstword secondword thirdword\n    second"
+            : "firstword secondword"
+          : text.replaceAll("\r\n", "\n"),
+      );
+      await expect(
+        page.getByRole("textbox", { name: "Selected terminal text" }),
+      ).toHaveValue(native);
+      const inputBeforeCopy = [...stream.input];
+      if (!alt) expect(inputBeforeCopy).toEqual([]);
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Control+c");
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(native);
+      expect(stream.input).toEqual(inputBeforeCopy);
+    });
+  }
+}
+
+test("keeps an Alt single-click drag rectangular across streaming output", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  stream.data(
+    "\x1bcfirstword secondword thirdword\r\n    second line\r\n    third line",
+  );
+  await expect(page.locator(".xterm-rows")).toContainText("third line");
+  const size = await cells(page);
+  await page.keyboard.down("Alt");
+  await page.mouse.move(size.x + 4 * size.cell + 1, size.y + size.height / 2);
+  await page.mouse.down();
+  stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+  await expect(page.locator(".xterm-rows")).toContainText("streamed");
+  await page.mouse.move(
+    size.x + 14 * size.cell + 1,
+    size.y + 2.5 * size.height,
+    { steps: 8 },
+  );
+  await page.mouse.up();
+  await page.keyboard.up("Alt");
+  const native = await page.evaluate(() => window.testTerminal.getSelection());
+  expect(native).toBe("tword seco\nsecond lin\nthird line");
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(native);
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(native);
+  expect(stream.input).toEqual([]);
+});
+
+for (const view of ["terminal", "codex", "forge"]) {
+  for (const anchor of [
+    {
+      name: "continuation forward",
+      start: 3,
+      end: 7,
+      rectangle: false,
+      text: "cde",
+    },
+    {
+      name: "continuation reverse",
+      start: 3,
+      end: 1,
+      rectangle: false,
+      text: "b界",
+    },
+    {
+      name: "leading forward",
+      start: 2,
+      end: 7,
+      rectangle: false,
+      text: "界cde",
+    },
+    {
+      name: "continuation rectangle",
+      start: 3,
+      end: 7,
+      rectangle: true,
+      text: "cde\n567",
+    },
+  ]) {
+    test(`${view} normalizes the original wide-glyph ${anchor.name} anchor before output and movement`, async ({
+      page,
+      context,
+    }, testInfo) => {
+      test.skip(
+        testInfo.project.name !== "desktop-chromium",
+        "Desktop mouse selection.",
+      );
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const stream = await terminalStream(page, false, view);
+      stream.data("\x1bcab界cdef\r\n123456789");
+      await expect(page.locator(".xterm-rows")).toContainText("123456789");
+      const size = await cells(page);
+      if (anchor.rectangle) await page.keyboard.down("Alt");
+      await page.mouse.move(
+        size.x + anchor.start * size.cell + 1,
+        size.y + 0.5 * size.height,
+      );
+      await page.mouse.down();
+      expect(
+        await page.evaluate(() => window.testTerminal.getSelectionPosition()),
+      ).toBeUndefined();
+      stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+      await expect(page.locator(".xterm-rows")).toContainText("streamed");
+      await page.mouse.move(
+        size.x + anchor.end * size.cell + 1,
+        size.y + (anchor.rectangle ? 1.5 : 0.5) * size.height,
+        { steps: 8 },
+      );
+      await page.mouse.up();
+      if (anchor.rectangle) await page.keyboard.up("Alt");
+      const native = await page.evaluate(() =>
+        window.testTerminal.getSelection(),
+      );
+      expect(native).toBe(anchor.text);
+      expect
+        .soft(
+          await page
+            .getByRole("textbox", { name: "Selected terminal text" })
+            .inputValue(),
+        )
+        .toBe(native);
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Control+c");
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(native);
+      expect(stream.input).toEqual([]);
+    });
+  }
+}
+
+for (const boundary of ["start", "end"]) {
+  test(`keeps wide-glyph ${boundary} boundary cells in a streamed rectangle`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop mouse selection.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page);
+    stream.data("\x1bc123456789\r\nab界cdef");
+    await expect(page.locator(".xterm-rows")).toContainText("ab界cdef");
+    const from: [number, number] = [boundary === "start" ? 3 : 1, 0];
+    const to: [number, number] = [boundary === "start" ? 7 : 3, 1];
+    await page.keyboard.down("Alt");
+    await dragSelection(page, from, [from[0] + 1, 0]);
+    stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+    await expect(page.locator(".xterm-rows")).toContainText("streamed");
+    const size = await cells(page);
+    await page.mouse.move(
+      size.x + to[0] * size.cell + 1,
+      size.y + 1.5 * size.height,
+      { steps: 8 },
+    );
+    await page.mouse.up();
+    await page.keyboard.up("Alt");
+    const native = await page.evaluate(() =>
+      window.testTerminal.getSelection(),
+    );
+    expect(native).toBe(boundary === "start" ? "4567\n cde" : "234\nb界");
+    await expect(
+      page.getByRole("textbox", { name: "Selected terminal text" }),
+    ).toHaveValue(native);
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.press("Control+c");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(native);
+    expect(stream.input).toEqual([]);
+  });
+}
+
+test("finalizes all rows when a streamed drag releases below the viewport", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  await page.clock.install();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page, false, "terminal");
+  await page.clock.pauseAt(
+    new Date((await page.evaluate(() => Date.now())) + 200),
+  );
+  const lines = Array.from(
+    { length: 100 },
+    (_, row) => `original row ${String(row).padStart(3, "0")}`,
+  );
+  const writes = await page.evaluate(() => window.terminalWriteCount);
+  stream.data(`\x1bc${lines.join("\r\n")}`);
+  await expect
+    .poll(() => page.evaluate(() => window.terminalWriteCount))
+    .toBe(writes + 1);
+  await page.clock.runFor(50);
+  await page.evaluate(() => window.testTerminal.scrollToLine(30));
+  await page.clock.runFor(30);
+  await dragSelection(page, [0, 2], [7, 2]);
+  const queued = await page.evaluate(() => window.terminalWriteCount);
+  stream.data("\r\nstreaming at bottom");
+  await expect
+    .poll(() => page.evaluate(() => window.terminalWriteCount))
+    .toBe(queued + 1);
+  await page.clock.runFor(20);
+  const size = await cells(page);
+  const height = await page
+    .locator(".xterm-screen")
+    .evaluate((element) => element.getBoundingClientRect().height);
+  await page.mouse.move(size.x + 4 * size.cell + 1, size.y + height + 20, {
+    steps: 8,
+  });
+  await page.clock.runFor(50);
+  await page.mouse.up();
+  const native = await page.evaluate(() => window.testTerminal.getSelection());
+  expect(native).toMatch(/^original row 032\n/u);
+  expect(native).toMatch(/original row \d{3}$/u);
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(native);
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(native);
+  expect(stream.input).toEqual([]);
+});
+
+for (const gesture of ["Control+c", "Meta+c", "button", "preview"]) {
+  test(`copies static Forge worker history using ${gesture}`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop mouse selection.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto(`${baseUrl}?view=forge-history`);
+    await page.evaluate(() => navigator.clipboard.writeText("before copy"));
+    await expect(
+      page.getByRole("region", { name: "Saved worker terminal output" }),
+    ).toBeVisible();
+    await expect(page.locator(".xterm-rows")).toContainText("last saved line");
+    await select(page, [0, 0], [19, 2]);
+    const original =
+      "    first saved line\n    界 café middle\n    last saved line";
+    const preview = page.getByRole("textbox", {
+      name: "Selected terminal text",
+    });
+    await expect(preview).toHaveValue(original);
+    if (gesture === "button")
+      await page
+        .getByRole("button", { name: "Copy selection", exact: true })
+        .click();
+    else if (gesture === "preview") {
+      await preview.focus();
+      await preview.evaluate((element: HTMLTextAreaElement) => {
+        const start = element.value.indexOf("café");
+        element.setSelectionRange(start, start + "café".length);
+      });
+      await page.keyboard.press("Control+c");
+    } else {
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press(gesture);
+    }
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(gesture === "preview" ? "café" : original);
+  });
 }
 
 test("continues extending a drag when layout measurement leaves the terminal unchanged", async ({

@@ -105,10 +105,11 @@ function fixture(issueNumber = 1) {
     finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
-    cleanup: vi.fn(async (): ReturnType<ForgeWorkflowDependencies["runtime"]["cleanup"]> => {}),
+    cleanup: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["cleanup"]>[0]): ReturnType<ForgeWorkflowDependencies["runtime"]["cleanup"]> => {}),
     preparePublication: vi.fn(async (_workspace: unknown, _attemptId: string, handoff?: Parameters<ForgeWorkflowDependencies["runtime"]["preparePublication"]>[2]) => ({
       headSha: handoff?.headSha ?? change.headSha,
       retainedPaths: handoff?.retainedPaths ?? [],
+      ...(handoff?.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: handoff.retainedEvidencePaths }),
     })),
     verifyPublishedWorkspace: vi.fn(async () => {}),
     syncPublishedBranch: vi.fn(async (_workspace: unknown, _local: string, _remote: string, _signal?: AbortSignal) => {}),
@@ -684,7 +685,7 @@ describe("Issue publication handoff", () => {
   it("pins the intended commit before publication and reuses it after restart", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
-    const handoff = { headSha: f.change.headSha, status: "ready", retainedPaths: ["diagnostics.bin", "local.ts"], details: "Diagnostics and a separate experiment; committed tests passed." };
+    const handoff = { headSha: f.change.headSha, status: "ready", retainedPaths: ["diagnostics.bin", "local.ts"], retainedEvidencePaths: [".cache/evidence.log"], details: "Diagnostics and a separate experiment; committed tests passed." };
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Committed tests passed", handoff });
     f.runtime.publishBranch.mockRejectedValueOnce(new Error("Publication interrupted"));
 
@@ -693,7 +694,7 @@ describe("Issue publication handoff", () => {
     expect(f.runtime.preparePublication).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id }), worker.attemptId, handoff, expect.any(AbortSignal));
     expect(f.runtime.finish).toHaveBeenCalledOnce();
     expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
-    expect(parseWorkers(f.stored())[0].pendingPublication?.handoff).toEqual({ headSha: handoff.headSha, retainedPaths: handoff.retainedPaths });
+    expect(parseWorkers(f.stored())[0].pendingPublication?.handoff).toEqual({ headSha: handoff.headSha, retainedPaths: handoff.retainedPaths, retainedEvidencePaths: handoff.retainedEvidencePaths });
 
     const resumed = await new ForgeWorkflowService(f.deps).resume(worker.id, placement);
     expect(resumed).toMatchObject({ status: "awaiting_review", headSha: handoff.headSha });
@@ -2181,7 +2182,7 @@ describe("Forge issue and review workflows", () => {
       { id: "c", author: "reviewer", body: "Handle the empty input" },
     ];
     await f.service.resume(worker.id, placement);
-    expect(f.provider.getIssue).toHaveBeenCalledTimes(3);
+    expect(f.provider.getIssue).toHaveBeenCalledTimes(4);
     expect(f.reports.prepare).toHaveBeenLastCalledWith(
       expect.any(String),
       expect.objectContaining({
@@ -3357,15 +3358,15 @@ describe("Forge merged request cleanup", () => {
     expect((await f.service.dashboard()).workers).toEqual([]);
   });
 
-  it.each(["open", "unknown"] as const)("retains resources when a linked issue has %s state", async state => {
+  it.each(["open", "unknown"] as const)("retires merged reviewer resources when a linked issue has %s state", async state => {
     const f = fixture();
     const worker = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
     mergeAndClose(f);
     f.change.linkedIssues = [{ id: "other:2", number: 2, title: "Related issue", state }];
     await f.service.poll();
-    expect((await f.service.dashboard()).workers[0]).toMatchObject({ id: worker.id, status: "paused", worktreePath: "/repo/work" });
-    expect(f.runtime.cleanup).not.toHaveBeenCalled();
-    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
+    expect(f.reports.remove).toHaveBeenCalledWith(worker.attemptId);
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
 
@@ -3378,14 +3379,48 @@ describe("Forge merged request cleanup", () => {
     expect(f.provider.getIssue).not.toHaveBeenCalled();
   });
 
-  it("retains a closed request that was never merged", async () => {
+  it("retires a merged reviewer while preserving an associated mismatched issue merge attempt", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const reviewer = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service.dispose();
+    await f.deps.store.write(f.stored().map(worker => worker.id === coding.id
+      ? { ...worker, mergeAttempted: true as const, headSha: "c".repeat(40) } : worker));
+    f.change.merged = true;
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect((await restarted.dashboard()).workers).toMatchObject([{ id: coding.id, mergeAttempted: true, headSha: "c".repeat(40), worktreePath: coding.worktreePath }]);
+    expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: reviewer.id }));
+    expect(f.runtime.cleanup).not.toHaveBeenCalledWith(expect.objectContaining({ id: coding.id }));
+    expect(f.deps.notify).toHaveBeenCalledWith("Forge completion check failed", expect.stringContaining("saved merge attempt"));
+  });
+
+  it("retires a closed assigned issue even when its request was never merged", async () => {
     const f = fixture();
     await publishedIssue(f);
     f.change.state = "closed";
     f.issue.state = "closed";
     await nextCompletionCheck(f);
-    expect((await f.service.dashboard()).workers[0]?.status).toBe("awaiting_review");
-    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ issueClosed: true }));
+  });
+
+  it("retries failed cleanup of an externally closed unpublished issue only on Resume", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.issue.state = "closed";
+    f.runtime.cleanup.mockRejectedValueOnce(new Error("Checkout ownership needs review"));
+    await f.service.poll();
+    expect((await f.service.dashboard()).workers[0]).toMatchObject({ id: worker.id, status: "cleanup_failed", tabId: undefined, worktreePath: worker.worktreePath });
+    await nextCompletionCheck(f);
+    expect(f.runtime.cleanup).toHaveBeenCalledOnce();
+    const completed = await f.service.resume(worker.id, placement);
+    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined });
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ id: worker.id, issueClosed: true }));
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
   });
 
   it.each(["provider", "apiUrl", "projectPath"] as const)("keeps requests with the same number but another repository %s independent", async key => {
@@ -3428,11 +3463,13 @@ describe("Forge merged request cleanup", () => {
     const f = fixture();
     const coding = await publishedIssue(f);
     const review = await f.service.startReview(f.deps.settings().repository, 7, true, placement);
-    f.runtime.cleanup.mockRejectedValueOnce(new Error("Coding checkout changed"));
+    f.runtime.cleanup.mockImplementation(async (input: Parameters<ForgeWorkflowDependencies["runtime"]["cleanup"]>[0]) => {
+      if (input.id === coding.id) throw new Error("Coding checkout changed");
+    });
     mergeAndClose(f);
     await nextCompletionCheck(f);
     expect((await f.service.dashboard()).workers).toMatchObject([{ id: coding.id, status: "cleanup_failed" }]);
-    expect(f.runtime.cleanup).toHaveBeenLastCalledWith(expect.objectContaining({ id: review.id }));
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: review.id }));
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
 
@@ -3440,8 +3477,9 @@ describe("Forge merged request cleanup", () => {
     const f = fixture();
     const coding = await publishedIssue(f);
     const write = f.deps.store.write;
-    const persist = vi.spyOn(f.deps.store, "write").mockImplementationOnce(async workers => {
-      if (!workers.length) throw new Error("State storage unavailable");
+    let removalFailed = false;
+    const persist = vi.spyOn(f.deps.store, "write").mockImplementation(async workers => {
+      if (!workers.length && !removalFailed) { removalFailed = true; throw new Error("State storage unavailable"); }
       await write(workers);
     });
     mergeAndClose(f);
@@ -3519,19 +3557,19 @@ describe("Forge merged request cleanup", () => {
     expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "cleanup_failed", attemptId: worker.attemptId });
     await nextCompletionCheck(f);
     await f.service.resume(worker.id, placement);
-    expect(f.runtime.close).toHaveBeenCalledOnce();
+    expect(f.runtime.close).toHaveBeenCalledTimes(2);
     expect((await f.service.dashboard()).workers[0]?.status).toBe("cleanup_failed");
     expect(f.reports.remove).not.toHaveBeenCalled();
   });
 
-  it.each(["headBranch", "baseBranch"] as const)("preserves resources when the merged %s differs from the coding checkout", async branch => {
+  it.each(["headBranch", "baseBranch"] as const)("retires the closed assigned issue using its own checkout when another request's %s differs", async branch => {
     const f = fixture();
     await publishedIssue(f);
     mergeAndClose(f);
     f.change[branch] = "other-branch";
     await nextCompletionCheck(f);
-    expect((await f.service.dashboard()).workers[0]).toMatchObject({ status: "cleanup_failed", worktreePath: "/repo/work", error: expect.stringMatching(/branches/) });
-    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect((await f.service.dashboard()).workers).toEqual([]);
+    expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ issueClosed: true, branch: "cloudx/forge/test" }));
   });
 
   it("throttles background provider reads independently of report polling", async () => {
@@ -3638,7 +3676,6 @@ describe("Forge publication confirmation", () => {
     return {
       status: f.provider.getChangeRequestStatus.mock.calls.length,
       change: f.provider.getChangeRequest.mock.calls.length,
-      issue: f.provider.getIssue.mock.calls.length,
       branch: f.provider.findChangeRequestByBranch.mock.calls.length,
     };
   }
@@ -3686,7 +3723,7 @@ describe("Forge publication confirmation", () => {
       expect(f.provider.resolveDiscussion).toHaveBeenCalledOnce();
     });
 
-    it.each(["exhaustion", "status error", "change error"] as const)("stops all associated provider reads after %s, including restart", async reason => {
+    it.each(["exhaustion", "status error", "change error"] as const)("stops publication request reads after %s while assigned issue closure remains observable, including restart", async reason => {
       const f = await feedbackPublication(true);
       await f.service.poll();
       f.advance(120_000);
@@ -3744,7 +3781,8 @@ describe("Forge publication confirmation", () => {
       const provider = vi.spyOn(f.deps, "provider");
       const restarted = new ForgeWorkflowService(f.deps);
       await restarted.poll();
-      expect(provider).toHaveBeenCalledExactlyOnceWith(other.repository, "reviewer", expect.any(AbortSignal), expect.objectContaining({ workerId: other.id }));
+      expect(provider).toHaveBeenCalledTimes(2);
+      expect(provider).toHaveBeenLastCalledWith(other.repository, "reviewer", expect.any(AbortSignal), expect.objectContaining({ workerId: other.id }));
       expect(providerReadCounts(f)).toEqual({ ...reads, status: reads.status + 1 });
       expect(f.provider.getChangeRequestStatus).toHaveBeenLastCalledWith(other.number);
       expect(f.stored()[0].status).toBe("awaiting_publication");
@@ -4142,8 +4180,8 @@ describe("Forge publication confirmation", () => {
     await f.service.poll();
     if (state === "open") {
       expect(f.stored()[0]).toMatchObject({ status: "paused", pendingPublication: { headSha: f.publishedHead } });
-      expect(f.runtime.cleanup).not.toHaveBeenCalled();
-      expect(f.stored()).toHaveLength(2);
+      expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: reviewer.id }));
+      expect(f.stored()).toHaveLength(1);
       const waiting = structuredClone(f.stored()[0]);
       expect(parseWorkers(f.stored())[0]).toEqual(waiting);
       let service = f.service;
@@ -4151,8 +4189,8 @@ describe("Forge publication confirmation", () => {
         await service.dispose();
         service = new ForgeWorkflowService(f.deps);
         await service.poll();
-        expect(f.stored()).toHaveLength(2);
-        expect(f.runtime.cleanup).not.toHaveBeenCalled();
+        expect(f.stored()).toHaveLength(1);
+        expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
       }
       f.issue.state = "closed";
       f.advance(30_000);
@@ -4189,7 +4227,9 @@ describe("Forge publication confirmation", () => {
     f.advance(30_000);
     await f.service.poll();
     expect(providerReadCounts(f)).toEqual(reads);
-    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalledWith(expect.objectContaining({ id: f.worker.id }));
+    if (changed.number) expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    else expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ expectedHeadSha: undefined }));
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
     expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
     expect(f.provider.replyToDiscussion).not.toHaveBeenCalled();
@@ -5318,14 +5358,14 @@ describe("Forge issue auto review", () => {
       expect(f.currentIssue().rebaseRecovery).toEqual(publication === "conflict recovery"
         ? { ...recovery, phase: "publishing", headSha: publishedHead } : undefined);
       expect(await store.read()).toEqual(f.stored());
-      expect(f.stored()).toHaveLength(2);
-      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+      expect(f.stored()).toHaveLength(1);
+      expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.oldReview.id }));
 
       await service.dispose();
       service = new ForgeWorkflowService(f.deps);
       await service.poll();
       expect(f.currentIssue().status).toBe("paused");
-      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+      expect(f.runtime.cleanup).toHaveBeenCalledTimes(1);
       f.provider.getIssue.mockResolvedValue({ ...await f.provider.getIssue(), state: "closed" });
       f.advanceTime(30_000);
       await service.poll();
@@ -5942,7 +5982,7 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
-  it("preserves the reviewer when merged-request metadata observation times out before confirming issue closure", async () => {
+  it("retires the merged reviewer while issue closure metadata observation remains unavailable", async () => {
     const f = await activeReview();
     const reviewer = f.currentReview();
     const launchSignal = f.runtime.launch.mock.calls.at(-1)![1]!;
@@ -5951,11 +5991,11 @@ describe("Forge issue auto review", () => {
     f.provider.getIssue.mockRejectedValueOnce(transientProviderFailure());
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", error: expect.stringContaining("getIssue") });
-    expect(f.currentReview()).toMatchObject({ status: "running", tabId: reviewer.tabId, attemptId: reviewer.attemptId });
-    expect(launchSignal.aborted).toBe(false);
-    expect(f.runtime.close).not.toHaveBeenCalled();
-    expect(f.runtime.cleanup).not.toHaveBeenCalled();
-    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.currentReview()).toBeUndefined();
+    expect(launchSignal.aborted).toBe(true);
+    expect(f.runtime.close).toHaveBeenCalledWith(reviewer.tabId);
+    expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: reviewer.id }));
+    expect(f.reports.remove).toHaveBeenCalledWith(reviewer.attemptId);
     f.provider.getIssue.mockResolvedValue({ ...await f.provider.getIssue(), state: "closed" });
     await f.poll();
     expect(f.stored()).toEqual([]);

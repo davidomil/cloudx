@@ -29,7 +29,7 @@ export function prepareMissingSettingsIntegration(readSource) {
 
   insertAfter(SERVER, 'import { SessionStore } from "./sessionStore.js";\n',
     'import { CloudxUpdateService } from "./system/CloudxUpdateService.js";\nimport { registerCloudxUpdateRoutes } from "./system/CloudxUpdateRoutes.js";\n');
-  insertAfter(SERVER, '  config?: ConfigService;\n', '  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;\n');
+  insertAfter(SERVER, '  config?: ConfigService;\n', '  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">;\n');
   insertAfter(SERVER, '  if (services.forgeConnections) registerForgeConnectionRoutes(app, services.forgeConnections, config.trustedOrigins);\n',
     '  registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir), config.trustedOrigins);\n');
   insertAfter(SERVER, '  app.get("/api/workspace", async () => workspaceState(services));\n', `
