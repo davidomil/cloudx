@@ -74,6 +74,7 @@ function installation() {
             ControlGroup: `/user.slice/${UPDATE_UNIT}` };
           return '';
         }
+        if (command === process.execPath && host.coordinator) return host.coordinator(args.at(-1));
         throw new Error(`Unexpected fixture command: ${command}`);
       },
     },
@@ -205,13 +206,163 @@ describe('retained update backup cleanup', () => {
     expect(fs.existsSync(protectedRun.transition.snapshots[0].destination)).toBe(true);
   });
 
-  it('protects a running update and blocks cleanup of all completed backups until it finishes', () => {
+  it.each(['active', 'activating', 'reloading', 'deactivating'])('protects a running update while its unit is %s and blocks cleanup of all completed backups', activeState => {
     const f = installation(), running = retainedRun(f, { state: 'running' }), completed = retainedRun(f);
+    f.host.unit = { ActiveState: activeState, Description: `CloudX Settings update ${running.run.id}` };
     const inventory = f.cleanup.inventory();
     expect(backupFor(inventory, running).protectionReason).toMatch(/running|resume/i);
     expect(inventory.blockedReason).toMatch(/running|update/i);
     expect(() => f.cleanup.preview()).toThrow(/running|update/i);
     for (const record of [running, completed]) expect(fs.existsSync(record.transition.snapshots[0].destination)).toBe(true);
+  });
+
+  it('cleans completed backups after a later update succeeds while retaining a request abandoned before attempt publication', () => {
+    const f = installation(), previous = retainedRun(f);
+    f.updater.publish(previous);
+    let now = new Date('2026-10-04T03:00:00.000Z');
+    f.updater.now = () => now;
+    const write = f.updater.write.bind(f.updater);
+    const interrupted = vi.spyOn(f.updater, 'write').mockImplementation((file, value) => {
+      if (file === path.join(f.updater.stateDir, 'attempt.json')) throw new Error('Requester stopped before attempt publication');
+      write(file, value);
+    });
+    expect(() => f.updater.start(TARGET_COMMIT)).toThrow('Requester stopped before attempt publication');
+    interrupted.mockRestore();
+    const orphan = f.cleanup.records().find(record => record.run.state === 'running');
+    expect(orphan.coordinator).toEqual(expect.any(String));
+    expect(f.updater.pointer('attempt')).toBeUndefined();
+    expect(f.updater.pointer('latest')).toEqual({ id: previous.run.id });
+    expect(f.host.calls.some(([command]) => command === 'systemd-run')).toBe(false);
+    const coordinator = manifestTree(orphan.coordinator);
+
+    now = new Date(now.getTime() + 30_000);
+    f.host.coordinator = file => {
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const destination = path.join(f.updater.stateDir, record.run.id, `snapshot-${randomUUID()}`, 'data-0');
+      record.transition = { sourceCommit: SOURCE_COMMIT, mutating: false,
+        snapshots: [{ root: f.dataDir, destination, manifest: snapshotTree(f.dataDir, destination) }] };
+      record.run.state = 'succeeded';
+      record.run.finishedAt = now.toISOString();
+      f.updater.save(record);
+      return '';
+    };
+    const later = f.updater.start(TARGET_COMMIT).run;
+    expect(f.updater.run(later.id).state).toBe('succeeded');
+    const completed = f.updater.read(later.id);
+    f.host.unit = { LoadState: 'not-found', ActiveState: 'inactive' };
+
+    const preview = f.cleanup.preview();
+    expect(backupFor(preview, orphan, 'coordinator')).toMatchObject({ outcome: 'failed', reclaimableBytes: 0,
+      protectionReason: expect.stringMatching(/failed|retain/i) });
+    const reconciled = f.updater.read(orphan.run.id);
+    expect(reconciled.run).toMatchObject({ state: 'failed', resumable: false, finishedAt: now.toISOString(),
+      message: expect.stringMatching(/abandoned|interrupted/i) });
+    expect(reconciled.coordinator).toBe(orphan.coordinator);
+    expect(f.updater.status().run.id).toBe(later.id);
+    const journal = f.cleanup.start({ previewId: preview.id, confirmPermanentDeletion: true });
+    const result = f.cleanup.run(journal.id);
+    expect(result.state).toBe('completed');
+    expect(result.results.find(item => item.runId === orphan.run.id).status).toBe('protected');
+    for (const record of [previous, completed]) {
+      expect(result.results.find(item => item.runId === record.run.id && item.path === record.transition.snapshots[0].destination).status).toBe('deleted');
+      expect(fs.existsSync(record.transition.snapshots[0].destination)).toBe(false);
+    }
+    expect(manifestTree(orphan.coordinator)).toEqual(coordinator);
+    expect(f.updater.read(orphan.run.id)).toEqual(reconciled);
+    f.host.unit = { LoadState: 'not-found', ActiveState: 'inactive' };
+    expect(f.createCleanup().inventory().blockedReason).toBeUndefined();
+  });
+
+  it('keeps an old request blocked while its operation owner is still alive', () => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running', coordinator: true });
+    retainedRun(f);
+    const token = f.cleanup.lock.acquire('update-start');
+    try {
+      expect(f.cleanup.inventory().blockedReason).toMatch(/update|progress/i);
+      expect(() => f.cleanup.preview()).toThrow(/update|progress/i);
+      expect(f.updater.read(orphan.run.id)).toEqual(orphan);
+    } finally { f.cleanup.lock.release(token); }
+  });
+
+  it.each(['dead', 'reused'])('reconciles an abandoned request with a %s operation owner and retains all its data', owner => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running', coordinator: true }), completed = retainedRun(f);
+    const snapshot = manifestTree(orphan.transition.snapshots[0].destination), coordinator = manifestTree(orphan.coordinator);
+    const token = f.cleanup.lock.acquire('update-start'), lock = f.cleanup.lock.read();
+    f.updater.write(path.join(f.cleanup.lock.file, `${token}.json`), {
+      ...lock, ...(owner === 'dead' ? { pid: 2147483647 } : { processIdentity: `${BigInt(lock.processIdentity) + 1n}` }),
+    });
+    const result = reviewedCleanup(f).finish();
+    expect(result.state).toBe('completed');
+    expect(result.results.filter(item => item.runId === orphan.run.id).every(item => item.status === 'protected')).toBe(true);
+    expect(result.results.find(item => item.runId === completed.run.id).status).toBe('deleted');
+    expect(f.updater.read(orphan.run.id).run).toMatchObject({ state: 'failed', resumable: false });
+    expect(manifestTree(orphan.transition.snapshots[0].destination)).toEqual(snapshot);
+    expect(manifestTree(orphan.coordinator)).toEqual(coordinator);
+    expect(f.cleanup.lock.read()).toBeNull();
+  });
+
+  it('blocks recent unpublished launches until the interruption grace expires', () => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running' });
+    retainedRun(f);
+    let now = new Date(Date.parse(orphan.run.startedAt) + 20_000);
+    f.updater.now = () => now;
+    expect(() => f.cleanup.preview()).toThrow(/running|update/i);
+    expect(f.updater.read(orphan.run.id)).toEqual(orphan);
+    now = new Date(now.getTime() + 1);
+    expect(backupFor(f.cleanup.preview(), orphan).protectionReason).toMatch(/failed|retain/i);
+    expect(f.updater.read(orphan.run.id).run.state).toBe('failed');
+  });
+
+  it('preserves resumable recovery for the current interrupted attempt while cleaning completed backups', () => {
+    const f = installation(), completed = retainedRun(f), current = retainedRun(f, { state: 'running' });
+    f.updater.publish(completed);
+    f.updater.write(path.join(f.updater.stateDir, 'attempt.json'), { id: current.run.id, previousRunId: completed.run.id });
+    expect(reviewedCleanup(f).finish().state).toBe('completed');
+    expect(f.updater.read(current.run.id).run).toMatchObject({ state: 'failed', resumable: true });
+    expect(f.updater.status().run.id).toBe(current.run.id);
+    expect(fs.existsSync(current.transition.snapshots[0].destination)).toBe(true);
+  });
+
+  it('leaves an abandoned mutating request blocked and unchanged even after a later success', () => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running', mutating: true });
+    f.updater.publish(retainedRun(f));
+    expect(() => f.cleanup.preview()).toThrow(/restor|update/i);
+    expect(f.updater.read(orphan.run.id)).toEqual(orphan);
+    expect(fs.existsSync(orphan.transition.snapshots[0].destination)).toBe(true);
+  });
+
+  it.each(['unit', 'restoration'])('rechecks pending %s after acquiring the reconciliation lock', pending => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running' });
+    f.updater.publish(retainedRun(f));
+    const acquire = f.cleanup.lock.acquire.bind(f.cleanup.lock);
+    vi.spyOn(f.cleanup.lock, 'acquire').mockImplementation((...args) => {
+      const token = acquire(...args);
+      if (pending === 'unit') f.host.unit = { ActiveState: 'activating', Description: `CloudX Settings update ${orphan.run.id}` };
+      else { orphan.transition.mutating = true; f.updater.save(orphan); }
+      return token;
+    });
+    expect(() => f.cleanup.preview()).toThrow(/running|restor|update/i);
+    expect(f.updater.read(orphan.run.id)).toEqual(orphan);
+    expect(f.cleanup.lock.read()).toBeNull();
+    expect(fs.existsSync(orphan.transition.snapshots[0].destination)).toBe(true);
+  });
+
+  it('retains abandoned requests without reconciliation when installation ownership is unavailable', () => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running' });
+    f.updater.preflight = () => 'Installed service ownership is missing';
+    expect(() => f.cleanup.preview()).toThrow('Installed service ownership is missing');
+    expect(f.updater.read(orphan.run.id)).toEqual(orphan);
+    expect(f.cleanup.lock.read()).toBeNull();
+  });
+
+  it('fails closed and releases the reconciliation lock when the abandoned status cannot be saved', () => {
+    const f = installation(), orphan = retainedRun(f, { state: 'running' }), completed = retainedRun(f);
+    vi.spyOn(f.cleanup, 'write').mockImplementation(() => { throw Object.assign(new Error('Cannot save update status'), { code: 'EACCES' }); });
+    expect(() => f.cleanup.preview()).toThrow('Cannot save update status');
+    expect(f.updater.read(orphan.run.id)).toEqual(orphan);
+    expect(f.cleanup.lock.read()).toBeNull();
+    for (const record of [orphan, completed]) expect(fs.existsSync(record.transition.snapshots[0].destination)).toBe(true);
+    expect(f.host.calls.some(([command]) => command === 'systemd-run')).toBe(false);
   });
 
   it('blocks bulk cleanup whenever a saved update is mutating the installation', () => {

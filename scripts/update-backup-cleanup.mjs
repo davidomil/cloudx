@@ -72,6 +72,31 @@ export class UpdateBackupCleanup {
     return records;
   }
 
+  reconcileAbandonedRequests(records, cleanupId) {
+    const interrupted = record => record.run.state === 'running'
+      && this.updater.now().getTime() - Date.parse(record.run.startedAt) > 20_000;
+    if (!records.some(interrupted) || records.some(record => record.transition?.mutating) || this.updater.unit().running) return records;
+    const owner = this.lock.read();
+    const ownsCleanupLock = cleanupId && owner?.cleanupId === cleanupId;
+    if (owner && !ownsCleanupLock && (owner.cleanupId || processIdentity(owner.pid) === owner.processIdentity)) return records;
+    const token = ownsCleanupLock ? null : this.lock.acquire('backup-reconcile');
+    try {
+      records = this.records();
+      const unit = this.updater.unit();
+      if (unit.running || records.some(record => record.transition?.mutating)) return records;
+      // The pointer-selected run keeps the updater's existing resume behavior.
+      this.updater.current(unit);
+      records = this.records();
+      for (const record of records.filter(interrupted)) {
+        record.run = { ...record.run, state: 'failed', resumable: false,
+          finishedAt: this.updater.now().toISOString(),
+          message: 'The abandoned update request was interrupted before becoming the current run. Its saved data is retained; start a new update to continue.' };
+        this.write(this.updater.recordPath(record.run.id), record);
+      }
+      return records;
+    } finally { if (token) this.lock.release(token); }
+  }
+
   blockedReason(records, cleanupId) {
     const unit = this.updater.unit();
     if (unit.running && unit.Description !== `${BACKUP_CLEANUP_DESCRIPTION}${cleanupId}`) return 'Wait for the running update or backup cleanup to finish.';
@@ -139,8 +164,10 @@ export class UpdateBackupCleanup {
   }
 
   inspect({ cleanupId, verifyOwnership = false } = {}) {
-    const records = this.records();
-    const blockedReason = this.updater.preflight() ?? this.blockedReason(records, cleanupId);
+    let records = this.records();
+    const unavailableReason = this.updater.preflight();
+    if (!unavailableReason) records = this.reconcileAbandonedRequests(records, cleanupId);
+    const blockedReason = unavailableReason ?? this.blockedReason(records, cleanupId);
     const references = this.referenceInspector(this.updater);
     const artifacts = this.artifacts(records);
     const existing = [];
