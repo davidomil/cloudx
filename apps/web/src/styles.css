@@ -3784,6 +3784,9 @@ a:hover svg {
   .forge-worker-overlay-terminal { margin: 8px; }
 }
 .forge-worker { margin-top: 12px; padding: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
+.forge-resource fieldset { min-width: 0; margin: 12px 0 0; border: 0; padding: 0; }
+.forge-resource .forge-resource-confirm { flex-direction: row; align-items: flex-start; margin: 12px 0; }
+.forge-resource-confirm input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; padding: 0; margin: 2px 0 0; accent-color: var(--color-accent); }
 .forge-worker-history { margin-top: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
 .forge-worker-history > summary { cursor: pointer; padding: 12px; }
 .forge-worker-history > .forge-worker { margin: 0; border: 0; border-top: 1px solid var(--color-border); border-radius: 0; }

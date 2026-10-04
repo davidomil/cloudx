@@ -141,6 +141,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   branchOwned: boolean;
   cleaned: boolean;
   cleanupHeadSha?: string;
+  cleanupRemoval?: DirectoryIdentity;
   cleanupDiscardPending?: true;
   baseCommit: string;
   prepared: boolean;
@@ -187,8 +188,13 @@ export class ForgeRuntime {
     this.history = new ForgeWorkerHistoryStore(dependencies.dataDir);
   }
 
-  workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
+  async workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
+    await this.readOwned(id);
     return this.history.read(id);
+  }
+
+  async pendingCheckoutRemoval(id: string): Promise<boolean> {
+    return Boolean((await this.readOwned(id)).cleanupRemoval);
   }
 
   isActive(tabId: string): boolean {
@@ -1072,7 +1078,7 @@ export class ForgeRuntime {
         await this.manifest(id).write(owned);
       }
       const workspace =
-        owned && !owned.cleaned
+        owned && (!owned.cleaned || owned.retainedWorkspace || owned.cleanupRemoval)
           ? {
               id,
               repositoryPath: owned.repositoryPath,
@@ -1660,13 +1666,13 @@ export class ForgeRuntime {
       const owned = await this.matchOwned(workspace);
       if (owned.launchPending)
         throw new Error("A worker launch is unresolved; cleanup is blocked.");
-      if (!owned.cleaned) await this.assertQuiescent(owned);
+      await this.assertCleanupQuiescent(owned);
       if (workspace.retainedPaths && !isRetainedPaths(workspace.retainedPaths))
         throw new Error("Invalid explicit retention paths; local files were preserved.");
       owned.explicitRetainedPaths = publicationFiles(owned.explicitRetainedPaths ?? [], [
         ...workspace.retainedPaths ?? [], ...this.publicationHandoff(owned)?.retainedEvidencePaths ?? [],
       ]);
-      if (owned.branchOwned && !owned.cleaned) {
+      if (owned.branchOwned && !owned.cleanupRemoval && (!owned.cleaned || owned.retainedWorkspace)) {
         if (!workspace.expectedHeadSha && !workspace.issueClosed)
           throw new Error("Issue cleanup requires the published head commit.");
         if (await optionalIdentity(owned.worktreePath)) {
@@ -1683,7 +1689,7 @@ export class ForgeRuntime {
           }
           if (workspace.expectedHeadSha) await this.verifyHead(owned, workspace.expectedHeadSha, signal);
         }
-        else if (owned.cleanupHeadSha !== workspace.expectedHeadSha)
+        else if (!owned.cleaned && owned.cleanupHeadSha !== workspace.expectedHeadSha)
           throw new Error(
             "Owned checkout disappeared before cleanup; ownership was preserved.",
           );
@@ -1887,22 +1893,13 @@ export class ForgeRuntime {
     expectedHeadSha?: string,
     explicitRetainedPaths?: string[],
   ): Promise<ForgeRetainedWorkspace | void> {
-    if (owned.cleaned) {
-      if (owned.retainedWorkspace) {
-        await this.assertCheckout(owned);
-        await this.assertQuiescent(owned);
-        const files = await this.filesRequiringRetention(owned, signal, explicitRetainedPaths);
-        owned.retainedWorkspace.retainedPaths = [...new Set([...owned.retainedWorkspace.retainedPaths, ...files])].sort();
-        owned.retainedWorkspace.reason ??= explicitRetentionReason(explicitRetainedPaths, files);
-        await this.manifest(owned.id).write(owned);
-        return owned.retainedWorkspace;
-      }
-      return;
-    }
+    if (owned.cleaned && !owned.retainedWorkspace && !owned.cleanupRemoval) return;
     if (owned.gitPending)
       throw new Error(
         "A worker Git operation is unresolved; its checkout was preserved.",
       );
+    await this.assertCleanupQuiescent(owned);
+    if (owned.cleanupRemoval && await this.finishCheckoutRemoval(owned, signal)) return;
     const current = await optionalIdentity(owned.worktreePath);
     if (current) {
       await this.assertIdentity(owned.worktree);
@@ -1939,21 +1936,50 @@ export class ForgeRuntime {
           ? `Unpublished Git history was preserved in ${unpublishedRefs.map(ref => JSON.stringify(ref)).join(", ").slice(0, 3800)}. Recover these refs before discarding the checkout.`
           : explicitRetentionReason(explicitRetainedPaths, retainedPaths);
         owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths, ...(reason ? { reason } : {}) };
+        owned.cleanupRemoval = undefined;
         owned.cleaned = true;
         await this.manifest(owned.id).write(owned);
         return owned.retainedWorkspace;
       }
+      owned.cleanupRemoval ??= { ...owned.worktree, path: path.join(path.dirname(owned.worktreePath), `cleanup-${owned.id}-${randomUUID()}`) };
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
+      await this.assertCleanupQuiescent(owned);
       await this.assertIdentity(owned.worktree);
-      await fs.rm(owned.worktreePath, { recursive: true });
-    } else if (owned.branchOwned && !owned.cleanupHeadSha) {
+      await fs.rename(owned.worktreePath, owned.cleanupRemoval.path);
+      await this.finishCheckoutRemoval(owned, signal);
+      return;
+    } else if (!owned.cleaned && owned.branchOwned && !owned.cleanupHeadSha) {
       throw new Error(
         "Owned checkout disappeared before cleanup; ownership was preserved.",
       );
     }
     owned.cleaned = true;
+    owned.retainedWorkspace = undefined;
     await this.manifest(owned.id).write(owned);
+  }
+
+  private async finishCheckoutRemoval(owned: OwnedWorkspace, signal?: AbortSignal): Promise<boolean> {
+    const removal = owned.cleanupRemoval!;
+    const current = await optionalIdentity(owned.worktreePath);
+    if (current) {
+      await this.assertIdentity(owned.worktree);
+      if (await optionalIdentity(removal.path))
+        throw new Error("A checkout appeared while its owned removal was pending; both directories were preserved.");
+      return false;
+    }
+    if (await optionalIdentity(removal.path)) {
+      await this.assertIdentity(removal);
+      await this.assertCleanupQuiescent(owned);
+      signal?.throwIfAborted();
+      await this.assertIdentity(removal);
+      await fs.rm(removal.path, { recursive: true });
+    }
+    owned.cleaned = true;
+    owned.retainedWorkspace = undefined;
+    owned.cleanupRemoval = undefined;
+    await this.manifest(owned.id).write(owned);
+    return true;
   }
 
   private async unpublishedGitRefs(owned: OwnedWorkspace, expectedHeadSha?: string, signal?: AbortSignal): Promise<string[]> {
@@ -2098,6 +2124,11 @@ export class ForgeRuntime {
       typeof value.gitPending !== "boolean" ||
       typeof value.branchOwned !== "boolean" ||
       typeof value.cleaned !== "boolean" ||
+      (value.cleanupRemoval !== undefined && (!isIdentity(value.cleanupRemoval) ||
+        path.dirname(value.cleanupRemoval.path) !== path.dirname(value.worktreePath) ||
+        !value.cleanupRemoval.path.startsWith(path.join(path.dirname(value.worktreePath), `cleanup-${id}-`)) ||
+        !isUuid(path.basename(value.cleanupRemoval.path).slice(`cleanup-${id}-`.length)) ||
+        value.cleanupRemoval.dev !== value.worktree?.dev || value.cleanupRemoval.ino !== value.worktree?.ino)) ||
       (value.cleanupDiscardPending !== undefined && value.cleanupDiscardPending !== true) ||
       typeof value.prepared !== "boolean" ||
       typeof value.launchPending !== "boolean" ||
@@ -2312,6 +2343,15 @@ export class ForgeRuntime {
           "Stop the worker process before publishing or removing its checkout.",
         );
     }
+  }
+
+  private async assertCleanupQuiescent(owned: OwnedWorkspace): Promise<void> {
+    await this.assertQuiescent(owned);
+    const directories = [owned.worktreePath, owned.cleanupRemoval?.path].filter((directory): directory is string => Boolean(directory));
+    if (this.dependencies.sessions.listTabs().some(tab =>
+      !["completed", "stopped", "failed"].includes(tab.status) && directories.some(directory =>
+        tab.cwd === directory || tab.cwd.startsWith(`${directory}${path.sep}`))))
+      throw new Error("An active session still uses this checkout; its files were preserved.");
   }
 
   private tabManifest(tabId: string): JsonStateFile {

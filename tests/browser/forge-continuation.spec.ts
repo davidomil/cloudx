@@ -218,6 +218,76 @@ test("shows retained checkout files without offering another worker attempt", as
   });
 });
 
+test("reviews legacy environment evidence and requires confirmation before discarding", async ({
+  page,
+}, testInfo) => {
+  const resource = {
+    id: "evidence-resource",
+    name: "completed-regression-env",
+    kind: "container",
+    engineId: "fixture-engine",
+    owner: { workerId: "issue-worker", attemptId: "earlier-attempt" },
+    consumers: [{ workerId: "issue-worker", attemptId: "earlier-attempt" }],
+    state: "blocked",
+    reason:
+      "The completed environment is stopped. Select the useful evidence before release.",
+    retentionReason: "Preserve the regression log for the validated commit.",
+    allocatedBytes: 8192,
+    reclaimedBytes: 0,
+    updatedAt: "2026-10-04",
+  };
+  const decisions: unknown[] = [];
+  await page.route("**/api/forge/resources", (route) =>
+    route.fulfill({ json: { resources: [resource] } }),
+  );
+  await page.route(
+    "**/api/forge/resources/evidence-resource/evidence-decision",
+    (route) => {
+      decisions.push(route.request().postDataJSON());
+      resource.state = "deleted";
+      resource.reclaimedBytes = 8192;
+      return route.fulfill({ json: resource });
+    },
+  );
+  await workers(page);
+  await page.getByRole("button", { name: "Environments", exact: true }).click();
+  const environment = page.getByRole("article", {
+    name: "Environment completed-regression-env",
+    exact: true,
+  });
+  await expect(environment).toContainText(resource.retentionReason);
+  const discard = environment.getByRole("button", {
+    name: "Discard evidence and release",
+    exact: true,
+  });
+  await expect(discard).toBeDisabled();
+  await environment
+    .getByRole("textbox", {
+      name: "Evidence paths for completed-regression-env",
+    })
+    .fill("/work/evidence/test.log");
+  await expect(
+    environment.getByRole("button", { name: "Export evidence and release" }),
+  ).toBeEnabled();
+  await environment
+    .getByRole("checkbox", {
+      name: "Discard this container’s evidence permanently",
+    })
+    .check();
+  const screenshot = testInfo.outputPath("environment-evidence-decision.png");
+  await page.screenshot({ path: screenshot, fullPage: true });
+  await testInfo.attach("environment-evidence-decision", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await discard.click();
+  await expect(environment).toContainText("8,192 writable bytes reclaimed");
+  await expect(environment.locator("fieldset")).toHaveCount(0);
+  expect(decisions).toEqual([
+    { action: "discard", confirmation: "Discard evidence" },
+  ]);
+});
+
 test("continues an unfinished handoff with the exact message to its issue worker", async ({
   page,
 }, testInfo) => {

@@ -782,7 +782,7 @@ describe("Issue publication handoff", () => {
     }
   });
 
-  it.each([false, true])("keeps completed retained checkouts visible across restart without repeating cleanup after rebase: %s", async rebased => {
+  it.each([false, true])("reconciles completed retained checkouts across restart while preserving evidence after rebase: %s", async rebased => {
     const f = fixture();
     const save = f.deps.store.write;
     f.deps.store.write = async workers => save(parseWorkers(workers));
@@ -802,10 +802,11 @@ describe("Issue publication handoff", () => {
     expect(f.stored()[0]).toMatchObject({ id: worker.id, status: "completed", retainedWorkspace: retained, worktreePath: undefined, branch: undefined });
     expect(parseWorkers(f.stored())[0].retainedWorkspace).toEqual(retained);
     expect(f.stored()[0].rebaseRecovery).toBeUndefined();
+    f.runtime.recover.mockResolvedValue({ workspace: { id: worker.id, repositoryPath: worker.repositoryPath!, worktreePath: worker.worktreePath!, branch: worker.branch! }, tabIds: [] });
     const restarted = new ForgeWorkflowService(f.deps);
     await restarted.poll();
     expect((await restarted.dashboard()).workers[0]).toMatchObject({ status: "completed", retainedWorkspace: retained });
-    expect(f.runtime.cleanup).toHaveBeenCalledOnce();
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
     expect(f.runtime.launch).toHaveBeenCalledOnce();
     expect(f.deps.notify).toHaveBeenCalledWith("Forge files retained", expect.stringContaining(retained.worktreePath));
   });
@@ -3336,7 +3337,7 @@ describe("Forge merged request cleanup", () => {
     expect(f.stored()).toEqual([]);
     expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: coding.id, expectedHeadSha: f.change.headSha }));
     expect(f.runtime.recover.mock.calls.map(([id]) => id)).toEqual(expect.arrayContaining([coding.id, draft.id, reviewing.id]));
-    expect(f.reports.remove).toHaveBeenCalledWith(reviewing.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(reviewing.attemptId);
     expect(f.reports.read).not.toHaveBeenCalled();
     expect(f.provider.postReview).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
@@ -3366,7 +3367,7 @@ describe("Forge merged request cleanup", () => {
     await f.service.poll();
     expect((await f.service.dashboard()).workers).toEqual([]);
     expect(f.runtime.cleanup).toHaveBeenCalledWith(expect.objectContaining({ id: worker.id }));
-    expect(f.reports.remove).toHaveBeenCalledWith(worker.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(worker.attemptId);
     expect(f.provider.postReview).not.toHaveBeenCalled();
   });
 
@@ -3452,11 +3453,11 @@ describe("Forge merged request cleanup", () => {
     expect(f.runtime.cleanup).toHaveBeenCalledOnce();
     f.runtime.cleanup.mockResolvedValue(undefined);
     const completed = await f.service.resume(coding.id, placement);
-    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined, attemptId: undefined });
+    expect(completed).toMatchObject({ status: "completed", worktreePath: undefined, attemptId: running.attemptId });
     expect((await f.service.dashboard()).workers).toEqual([]);
     expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
-    expect(f.reports.remove).toHaveBeenCalledWith(running.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(running.attemptId);
   });
 
   it("cleans other associated runners when one checkout cannot be removed", async () => {
@@ -5995,7 +5996,7 @@ describe("Forge issue auto review", () => {
     expect(launchSignal.aborted).toBe(true);
     expect(f.runtime.close).toHaveBeenCalledWith(reviewer.tabId);
     expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: reviewer.id }));
-    expect(f.reports.remove).toHaveBeenCalledWith(reviewer.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalledWith(reviewer.attemptId);
     f.provider.getIssue.mockResolvedValue({ ...await f.provider.getIssue(), state: "closed" });
     await f.poll();
     expect(f.stored()).toEqual([]);

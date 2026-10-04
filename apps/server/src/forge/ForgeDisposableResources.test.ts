@@ -20,6 +20,9 @@ class ContainerHost implements DisposableContainerHost {
   failure?: string;
   afterCreate?: () => void;
   beforeRemove?: () => void;
+  evidence = new Map<string, Buffer>();
+  evidenceFailure?: string;
+  exportCalls = 0;
   engineId = async () => this.engine;
   async create(_input: DisposableContainerInput, labels: Record<string, string>): Promise<string> {
     const id = randomUUID().replaceAll("-", "").repeat(2);
@@ -35,6 +38,11 @@ class ContainerHost implements DisposableContainerHost {
     if (this.failure === "remove") throw new Error("Docker removal denied");
     this.containers.delete(id); this.removed.push(id);
   }
+  async readEvidence(_id: string, paths: string[]) {
+    this.exportCalls++;
+    if (this.evidenceFailure) throw new Error(this.evidenceFailure);
+    return [...this.evidence].filter(([file]) => paths.some(source => file === source.slice(1) || file.startsWith(`${source.slice(1)}/`))).map(([file, data]) => ({ path: file, data }));
+  }
 }
 
 describe("Forge disposable resource ownership and lifecycle", () => {
@@ -44,6 +52,14 @@ describe("Forge disposable resource ownership and lifecycle", () => {
   let resources: ForgeDisposableResources;
   const worker = (): ForgeWorker => ({ id: randomUUID(), attemptId: randomUUID(), kind: "issue", number: 128, title: "test", repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "test/project" }, baseBranch: "main", templateId: "test", status: "running", autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
   const create = (name = "cloudx-128-feedback", extra: Partial<DisposableContainerInput> = {}) => resources.create(workers[0]!, { image: "ubuntu:24.04", name, command: ["true"], ...extra });
+  const legacy = async (name: string, retentionReason: string) => {
+    const resource = await create(name, { retentionReason, evidencePaths: ["/work/evidence"] });
+    const journalPath = path.join(directory, "forge-disposable-resources.json");
+    const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
+    delete journal.resources.find((item: { id: string }) => item.id === resource.id).evidence;
+    await fs.writeFile(journalPath, JSON.stringify(journal));
+    return { ...resource, evidence: undefined };
+  };
   const service = () => new ForgeDisposableResources(directory, async () => structuredClone(workers), host);
   beforeEach(async () => { directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-resources-")); workers = [worker()]; host = new ContainerHost(); resources = service(); });
   afterEach(async () => { await fs.rm(directory, { recursive: true, force: true }); });
@@ -110,9 +126,153 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     expect(host.removed).toEqual([]);
   });
   it("makes retained evidence an explicit visible blocker", async () => {
-    await create("evidence", { retentionReason: "Retain the failing database until its owner reviews it." }); workers[0]!.status = "completed";
+    const resource = await legacy("evidence", "Retain the failing database until its owner reviews it."); workers[0]!.status = "completed";
+    host.containers.get(resource.containerId!)!.running = true;
     await expect(resources.retire(workers[0]!)).rejects.toThrow("Explicit evidence retention");
     expect((await resources.preview())[0]!.reason).toContain("failing database"); expect(host.removed).toEqual([]);
+    expect(host.stopped).toEqual([resource.containerId]);
+  });
+  it("preserves declared validation provenance when a resumed worker still names its earlier published commit", async () => {
+    workers[0]!.headSha = "a".repeat(40);
+    host.evidence.set("work/evidence/test.log", Buffer.from("test passed\n"));
+    const resource = await create("evidence", { retentionReason: "Specific validation log", evidencePaths: ["/work/evidence/test.log"], commitSha: "b".repeat(40) });
+    host.containers.get(resource.containerId!)!.running = true;
+    workers[0]!.status = "completed";
+    await resources.retire(workers[0]!);
+    expect(host.stopped).toEqual([resource.containerId]); expect(host.removed).toEqual([resource.containerId]);
+    const saved = (await service().records())[0]!;
+    expect(saved).toMatchObject({ state: "deleted", reclaimedBytes: 1024 * 1024, evidence: { state: "verified", commitSha: "b".repeat(40), commitSource: "declared", bytes: 12 } });
+    const manifest = await service().readEvidence(resource.id);
+    expect(manifest).toMatchObject({ owner: resource.owner, consumers: resource.consumers, containerId: resource.containerId, paths: ["/work/evidence/test.log"], files: [{ path: "work/evidence/test.log", bytes: 12 }] });
+    expect((await service().evidenceFile(resource.id, manifest.files[0]!.path)).toString()).toBe("test passed\n");
+    await expect(service().evidenceFile(resource.id, "../../etc/passwd")).rejects.toThrow("Unknown evidence file");
+    await service().retire(workers[0]!); expect(host.exportCalls).toBe(1);
+  });
+  it("requires a deliberate legacy-hold decision, persists keep across restart and confirms discard", async () => {
+    const resource = await legacy("legacy-evidence", "Unselected old failure reproduction");
+    host.containers.get(resource.containerId!)!.running = true;
+    workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("requires review");
+    expect((await service().decideEvidence(resource.id, { action: "keep" })).evidence?.state).toBe("kept");
+    await expect(service().retire(workers[0]!)).rejects.toThrow("explicitly kept");
+    await expect(service().decideEvidence(resource.id, { action: "discard" })).rejects.toThrow("confirmed discard");
+    expect(host.removed).toEqual([]);
+    expect((await service().decideEvidence(resource.id, { action: "discard", confirmation: "Discard evidence" })).state).toBe("deleted");
+    expect((await service().records())[0]!.evidence?.state).toBe("discarded");
+  });
+  it("exports a reviewed legacy hold and marks request commit provenance as declared", async () => {
+    host.evidence.set("work/evidence/old.log", Buffer.from("old reproduction"));
+    const resource = await legacy("legacy-evidence", "Old logs"); workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("requires review");
+    expect((await service().decideEvidence(resource.id, { action: "export", evidencePaths: ["/work/evidence/old.log"], commitSha: "c".repeat(40) })).state).toBe("deleted");
+    expect(await service().readEvidence(resource.id)).toMatchObject({ commitSha: "c".repeat(40), commitSource: "declared" });
+  });
+  it("captures the authoritative completed worker commit when the environment was created before its first commit", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("test log"));
+    const resource = await create("evidence", { evidencePaths: ["/work/evidence/log"] });
+    expect(resource.evidence?.commitSha).toBeUndefined();
+    workers[0]!.headSha = "e".repeat(40); workers[0]!.status = "completed";
+    await resources.retire(workers[0]!);
+    expect(await service().readEvidence(resource.id)).toMatchObject({ commitSha: "e".repeat(40), commitSource: "worker" });
+  });
+  it("captures available completed-worker commit provenance when exporting an old hold", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("old test log"));
+    const resource = await legacy("legacy-evidence", "old logs");
+    workers[0]!.headSha = "f".repeat(40); workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("requires review");
+    await service().decideEvidence(resource.id, { action: "export", evidencePaths: ["/work/evidence/log"] });
+    expect(await service().readEvidence(resource.id)).toMatchObject({ commitSha: "f".repeat(40), commitSource: "worker" });
+  });
+  it("stops terminal evidence containers during export failure and resumes export after restart", async () => {
+    host.evidence.set("work/evidence/failure.log", Buffer.from("failing test")); host.evidenceFailure = "Export interrupted";
+    const resource = await create("evidence", { retentionReason: "Test failure", evidencePaths: ["/work/evidence"] });
+    host.containers.get(resource.containerId!)!.running = true; workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("Export interrupted");
+    expect(host.stopped).toEqual([resource.containerId]); expect(host.removed).toEqual([]);
+    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "exporting" } });
+    host.evidenceFailure = undefined; await service().retire(workers[0]!);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", evidence: { state: "verified" } });
+  });
+  it("recovers completed archive export interrupted before the receipt write without exporting again", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("durable log")); host.failure = "remove";
+    const resource = await create("evidence", { retentionReason: "Test log", evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("removal denied");
+    const journalPath = path.join(directory, "forge-disposable-resources.json");
+    const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
+    journal.resources[0].evidence.state = "exporting";
+    await fs.writeFile(journalPath, JSON.stringify(journal));
+    host.failure = undefined; await service().retire(workers[0]!);
+    expect(host.exportCalls).toBe(1); expect(host.removed).toEqual([resource.containerId]);
+    expect((await service().evidenceFile(resource.id, "work/evidence/log")).toString()).toBe("durable log");
+  });
+  it("verifies the saved archive again before retrying removal and preserves a corrupted archive", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("valuable")); host.failure = "remove";
+    const resource = await create("evidence", { retentionReason: "valuable log", evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("removal denied");
+    const archivePath = path.join(directory, (await service().records())[0]!.evidence!.archivePath!);
+    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")); archive.contents["work/evidence/log"] = Buffer.from("corrupted").toString("base64");
+    await fs.writeFile(archivePath, JSON.stringify(archive)); host.failure = undefined;
+    await expect(service().retire(workers[0]!)).rejects.toThrow("verification failed"); expect(host.removed).toEqual([]);
+  });
+  it("protects a shared active attempt from stop, export and hold release", async () => {
+    const shared = worker(); workers.push(shared);
+    const resource = await create("evidence", { retentionReason: "shared log", evidencePaths: ["/work/evidence"], consumers: [{ workerId: shared.id, attemptId: shared.attemptId! }] });
+    host.containers.get(resource.containerId!)!.running = true; workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("shared consumer");
+    await expect(resources.decideEvidence(resource.id, { action: "discard", confirmation: "Discard evidence" })).rejects.toThrow("shared consumer");
+    expect(host.stopped).toEqual([]); expect(host.exportCalls).toBe(0); expect(host.removed).toEqual([]);
+  });
+  it("preserves a container reactivated during evidence export and refuses to archive moving data", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("test log"));
+    const resource = await create("evidence", { evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    const readEvidence = host.readEvidence.bind(host);
+    host.readEvidence = async (...args) => { const result = await readEvidence(...args); host.containers.get(resource.containerId!)!.running = true; return result; };
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("became active during evidence export");
+    expect(host.removed).toEqual([]);
+    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "exporting" } });
+  });
+  it("keeps successfully read evidence if the stopped container disappears before the durable archive write", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("test log"));
+    const resource = await create("evidence", { evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    const readEvidence = host.readEvidence.bind(host);
+    host.readEvidence = async (...args) => { const result = await readEvidence(...args); host.containers.delete(resource.containerId!); return result; };
+    await resources.retire(workers[0]!);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", evidence: { state: "verified" } });
+    expect((await service().evidenceFile(resource.id, "work/evidence/log")).toString()).toBe("test log");
+  });
+  it("reports unavailable evidence and converges after export failed and the environment is already absent", async () => {
+    host.evidenceFailure = "Interrupted copy";
+    const resource = await create("evidence", { evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("Interrupted copy");
+    host.containers.delete(resource.containerId!);
+    await service().retire(workers[0]!);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", evidence: { state: "missing" } });
+    expect(await service().preview()).toEqual([]);
+  });
+  it("preserves owned identity changes after export and reconciles absent environments with their evidence", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("log"));
+    const resource = await create("evidence", { retentionReason: "log", evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    const readEvidence = host.readEvidence.bind(host);
+    host.readEvidence = async (...args) => { const contents = await readEvidence(...args); host.engine = "replacement"; return contents; };
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("engine identity changed"); expect(host.removed).toEqual([]);
+    host.engine = "test-engine"; host.readEvidence = readEvidence; host.failure = "remove";
+    await expect(service().retire(workers[0]!)).rejects.toThrow("removal denied");
+    host.containers.delete(resource.containerId!); host.failure = undefined;
+    await service().retire(workers[0]!);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 1024 * 1024, evidence: { state: "verified" } });
+    expect((await service().evidenceFile(resource.id, "work/evidence/log")).toString()).toBe("log");
+  });
+  it("records already-absent legacy evidence truthfully without stale pending cleanup", async () => {
+    const resource = await legacy("legacy", "old unknown files"); workers[0]!.status = "completed";
+    host.containers.delete(resource.containerId!); await resources.retire(workers[0]!);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", evidence: { state: "missing" }, reason: expect.stringContaining("without claiming an export") });
+    expect(await service().preview()).toEqual([]);
+  });
+  it.each(["/", "/work/node_modules", "/work/evidence/../secret", "/work/evidence/", "/work/.git", "/work/cache.tsbuildinfo"])("rejects non-specific or generated evidence path %s", source => {
+    expect(() => validateContainerInput({ image: "node:22", name: "evidence", command: [], evidencePaths: [source] })).toThrow("arbitrary Docker options");
+  });
+  it("requires specific evidence declarations on new creation instead of accepting a text-only indefinite hold", () => {
+    expect(() => validateContainerInput({ image: "node:22", name: "evidence", command: [], retentionReason: "Keep everything indefinitely" })).toThrow("Evidence retention requires specific evidencePaths");
   });
   it("does not convert a failed storage scan into zero usage", async () => {
     await create(); host.failure = "inspect";
