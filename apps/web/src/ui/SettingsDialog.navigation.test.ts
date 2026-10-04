@@ -143,6 +143,12 @@ async function pressKey(target: HTMLElement, key: string, shiftKey = false) {
 
 describe("Settings navigation and search", () => {
   it("finds the Updates action by the tools and dependencies it updates", async () => {
+    const fetch = vi.fn(async (url: string) => {
+      if (url.endsWith("/api/system/update/backups")) return Response.json({ backups: [] });
+      if (url.endsWith("/api/system/update/backups/cleanup")) return Response.json(null);
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
     const start = vi.fn(async () => undefined);
     const { container } = await mount({ cloudxUpdate: {
       status: { available: true }, channel: "main", previewLoading: false, starting: false, checking: false, reassessing: false, reassessCapacity: vi.fn(), start, resume: vi.fn(), check: vi.fn(), selectChannel: vi.fn(),
@@ -154,7 +160,10 @@ describe("Settings navigation and search", () => {
     } });
     await search(container, "Codex dependencies");
     expect(tab(container, "Updates").getAttribute("aria-selected")).toBe("true");
-    await click(button(activePanel(container), "Update CloudX and dependencies"));
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/system/update/backups", "/api/system/update/backups/cleanup"]);
+    const update = button(activePanel(container), "Update CloudX and dependencies");
+    expect(update.disabled).toBe(false);
+    await click(update);
     expect(start).toHaveBeenCalledOnce();
     await search(container, "release channel");
     expect(tab(container, "Updates").getAttribute("aria-selected")).toBe("true");
