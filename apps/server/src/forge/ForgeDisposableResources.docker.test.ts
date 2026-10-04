@@ -6,7 +6,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { expect, it, vi } from "vitest";
 import type { ForgeWorker } from "@cloudx/shared";
-import { DockerDisposableContainerHost, ForgeDisposableResources } from "./ForgeDisposableResources.js";
+import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableResources } from "./ForgeDisposableResources.js";
 import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 
 const execute = promisify(execFile);
@@ -53,6 +53,36 @@ it.skipIf(process.env.CLOUDX_RESOURCE_DOCKER_TEST !== "1")("reclaims the two own
     for (const resource of await service.records()) if (resource.containerId && await host.inspect(resource.containerId)) {
       const identity = await host.inspect(resource.containerId);
       if (identity?.labels["cloudx.forge.resource"] === resource.id) { if (identity.running) await host.stop(resource.containerId); await host.remove(resource.containerId); }
+    }
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(process.env.CLOUDX_RESOURCE_DOCKER_TEST !== "1")("reconciles a real Docker name conflict as absent after restart while preserving the conflicting container", async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-resources-rejected-"));
+  const worker: ForgeWorker = { id: randomUUID(), attemptId: randomUUID(), kind: "issue", number: 173, title: "rejected creation fixture", repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" }, baseBranch: "main", templateId: "fixture", status: "running", autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const host = new DockerDisposableContainerHost();
+  const input = { image: "ubuntu:24.04", name: `cloudx-rejected-fixture-${worker.id}`, command: ["true"] };
+  const fixtureLabels = { "cloudx.test.fixture": worker.id };
+  let conflicting: string | undefined;
+  try {
+    conflicting = await host.create(input, fixtureLabels);
+    const identity = await host.inspect(conflicting);
+    const service = new ForgeDisposableResources(directory, async () => [worker], host);
+    await expect(service.create(worker, input)).rejects.toBeInstanceOf(ContainerCreationRejectedError);
+    expect((await service.records())[0]).toMatchObject({ state: "creating", creationRejected: true });
+    const reopened = new ForgeDisposableResources(directory, async () => [worker], host);
+    expect(await reopened.preview()).toEqual([]);
+    expect((await reopened.records())[0]).toMatchObject({ state: "deleted", allocatedBytes: 0, reclaimedBytes: 0, reason: expect.stringContaining("confirmed absent") });
+    worker.status = "completed";
+    await reopened.retire(worker);
+    await new ForgeDisposableResources(directory, async () => [worker], host).retire(worker);
+    expect(await host.inspect(conflicting)).toEqual(identity);
+    console.info("Rejected name-conflict intent reconciled as absent after restart; exact conflicting fixture identity remained unchanged through repeated retirement.");
+  } finally {
+    if (conflicting) {
+      const identity = await host.inspect(conflicting);
+      if (identity?.labels["cloudx.test.fixture"] === worker.id) await host.remove(conflicting);
     }
     await fs.rm(directory, { recursive: true, force: true });
   }

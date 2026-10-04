@@ -426,6 +426,77 @@ test("keeps a double-clicked word when output arrives before mouse release", asy
   expect(stream.input).toEqual([]);
 });
 
+for (const view of ["terminal", "codex", "forge"]) {
+  for (const clicks of [2, 3]) {
+    for (const direction of ["shrink", "reverse"]) {
+      test(`${view} preserves original ${clicks === 2 ? "word" : "line"} bounds through grow-stream-${direction}`, async ({
+        page,
+        context,
+      }, testInfo) => {
+        test.skip(
+          testInfo.project.name !== "desktop-chromium",
+          "Desktop mouse selection.",
+        );
+        await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+        const stream = await terminalStream(page, false, view);
+        const line = "beforeword firstword secondword thirdword";
+        stream.data(`\x1bcbefore line\r\n${line}\r\nthird line\r\nfourth line`);
+        await expect(page.locator(".xterm-rows")).toContainText("fourth line");
+        const size = await cells(page);
+        const move = (column: number, row: number) =>
+          page.mouse.move(
+            size.x + column * size.cell + 1,
+            size.y + (row + 0.5) * size.height,
+            { steps: 8 },
+          );
+        await move(15, 1);
+        await page.mouse.click(
+          size.x + 15 * size.cell + 1,
+          size.y + 1.5 * size.height,
+          { clickCount: clicks - 1 },
+        );
+        await page.mouse.down({ clickCount: clicks });
+        await move(25, clicks === 2 ? 1 : 3);
+        const grown =
+          clicks === 2
+            ? "firstword secondword"
+            : `${line}\nthird line\nfourth line`;
+        expect(
+          await page.evaluate(() => window.testTerminal.getSelection()),
+        ).toBe(grown);
+        stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+        await expect(page.locator(".xterm-rows")).toContainText("streamed");
+        await move(
+          direction === "shrink" ? 15 : 4,
+          clicks === 2 || direction === "shrink" ? 1 : 0,
+        );
+        await page.mouse.up({ clickCount: clicks });
+        const native = await page.evaluate(() =>
+          window.testTerminal.getSelection(),
+        );
+        expect(native).toBe(
+          clicks === 2
+            ? direction === "shrink"
+              ? "firstword"
+              : "beforeword firstword"
+            : direction === "shrink"
+              ? line
+              : `before line\n${line}`,
+        );
+        await expect(
+          page.getByRole("textbox", { name: "Selected terminal text" }),
+        ).toHaveValue(native);
+        await page.locator(".xterm-helper-textarea").focus();
+        await page.keyboard.press("Control+c");
+        await expect
+          .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+          .toBe(native);
+        expect(stream.input).toEqual([]);
+      });
+    }
+  }
+}
+
 for (const clicks of [2, 3]) {
   for (const alt of [false, true]) {
     test(`finalizes a streamed ${clicks === 2 ? "word" : "line"} drag using the native selection boundaries${alt ? " with Alt" : ""}`, async ({
@@ -521,6 +592,49 @@ test("keeps an Alt single-click drag rectangular across streaming output", async
     .toBe(native);
   expect(stream.input).toEqual([]);
 });
+
+for (const boundary of ["start", "end"]) {
+  test(`keeps wide-glyph ${boundary} boundary cells in a streamed rectangle`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop mouse selection.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page);
+    stream.data("\x1bc123456789\r\nab界cdef");
+    await expect(page.locator(".xterm-rows")).toContainText("ab界cdef");
+    const from: [number, number] = [boundary === "start" ? 3 : 1, 0];
+    const to: [number, number] = [boundary === "start" ? 7 : 3, 1];
+    await page.keyboard.down("Alt");
+    await dragSelection(page, from, [from[0] + 1, 0]);
+    stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+    await expect(page.locator(".xterm-rows")).toContainText("streamed");
+    const size = await cells(page);
+    await page.mouse.move(
+      size.x + to[0] * size.cell + 1,
+      size.y + 1.5 * size.height,
+      { steps: 8 },
+    );
+    await page.mouse.up();
+    await page.keyboard.up("Alt");
+    const native = await page.evaluate(() =>
+      window.testTerminal.getSelection(),
+    );
+    expect(native).toBe(boundary === "start" ? "4567\n cde" : "234\nb界");
+    await expect(
+      page.getByRole("textbox", { name: "Selected terminal text" }),
+    ).toHaveValue(native);
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.press("Control+c");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(native);
+    expect(stream.input).toEqual([]);
+  });
+}
 
 test("finalizes all rows when a streamed drag releases below the viewport", async ({
   page,

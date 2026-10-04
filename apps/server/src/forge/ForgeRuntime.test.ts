@@ -1676,6 +1676,134 @@ describe("ForgeRuntime publication handoff", () => {
     expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(unpublished);
   });
 
+  it.each(["stash", "alternate branch", "alternate tag"] as const)("preserves unpublished %s at a clean base head through issue closure and restart while reclaiming generated siblings", async history => {
+    const workspace = await prepare();
+    let retainedRef: string;
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Unpublished experiment\n");
+    if (history === "stash") {
+      await git(workspace.worktreePath, "stash", "push", "-m", "Saved unpublished experiment");
+      retainedRef = "refs/stash";
+    } else {
+      await git(workspace.worktreePath, "switch", "-c", "experiment");
+      await git(workspace.worktreePath, "add", "README.md");
+      await git(workspace.worktreePath, "commit", "-m", "TEST: unpublished experiment");
+      retainedRef = "refs/heads/experiment";
+      if (history === "alternate tag") {
+        await git(workspace.worktreePath, "tag", "saved-experiment");
+        retainedRef = "refs/tags/saved-experiment";
+      }
+      await git(workspace.worktreePath, "switch", workspace.branch);
+      if (history === "alternate tag") await git(workspace.worktreePath, "branch", "-D", "experiment");
+    }
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+    expect(await git(workspace.worktreePath, "status", "--porcelain=v1")).toBe("");
+    const unpublished = await git(workspace.worktreePath, "rev-parse", retainedRef);
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\n.cache/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, ".cache"));
+    await fs.writeFile(path.join(workspace.worktreePath, ".cache/generated.bin"), Buffer.alloc(128 * 1024));
+
+    const retained = await runtime.cleanup({ ...workspace, issueClosed: true });
+    expect(retained).toMatchObject({ retainedPaths: [".git"], reason: expect.stringContaining(retainedRef) });
+    await expect(fs.lstat(path.join(workspace.worktreePath, ".cache/generated.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(workspace.worktreePath, "rev-parse", retainedRef)).toBe(unpublished);
+    expect(await git(workspace.worktreePath, "show", `${retainedRef}:README.md`)).toBe("Unpublished experiment");
+
+    await fs.mkdir(path.join(workspace.worktreePath, ".cache"));
+    await fs.writeFile(path.join(workspace.worktreePath, ".cache/later.bin"), Buffer.alloc(128 * 1024));
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.cleanup({ ...workspace, issueClosed: true })).toEqual(retained);
+    await expect(fs.lstat(path.join(workspace.worktreePath, ".cache/later.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(workspace.worktreePath, "rev-parse", retainedRef)).toBe(unpublished);
+    expect(await git(workspace.worktreePath, "show", `${retainedRef}:README.md`)).toBe("Unpublished experiment");
+  });
+
+  it("removes a closed checkout when alternate refs only name recorded published history", async () => {
+    const workspace = await prepare();
+    await git(workspace.worktreePath, "branch", "published-alias");
+    await git(workspace.worktreePath, "tag", "published-tag");
+    await git(workspace.worktreePath, "tag", "-a", "published-annotated-tag", "-m", "Published history");
+    expect(await runtime.cleanup({ ...workspace, issueClosed: true })).toBeUndefined();
+    await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves alternate unpublished refs when retiring the recorded published head", async () => {
+    const workspace = await prepare();
+    await git(workspace.worktreePath, "switch", "-c", "experiment");
+    await git(workspace.worktreePath, "commit", "--allow-empty", "-m", "TEST: unpublished alternative");
+    const unpublished = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await git(workspace.worktreePath, "switch", workspace.branch);
+    await runtime.preparePublication(workspace, "attempt", ready(headSha, []));
+    await runtime.publishBranch(workspace);
+    const retained = await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    expect(retained).toMatchObject({ retainedPaths: [".git"], reason: expect.stringContaining("refs/heads/experiment") });
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).toEqual(retained);
+    expect(await git(workspace.worktreePath, "rev-parse", "refs/heads/experiment")).toBe(unpublished);
+  });
+
+  it("preserves an unpublished ignored bare repository through issue closure and restart while reclaiming generated siblings", async () => {
+    const workspace = await prepare();
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\n.cache/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, ".cache"));
+    const barePath = path.join(workspace.worktreePath, ".cache/local.git");
+    await git(workspace.worktreePath, "init", "--bare", barePath);
+    await git(workspace.worktreePath, "switch", "-c", "experiment");
+    await fs.writeFile(path.join(workspace.worktreePath, "README.md"), "Unpublished bare history\n");
+    await git(workspace.worktreePath, "add", "README.md");
+    await git(workspace.worktreePath, "commit", "-m", "TEST: unpublished bare history");
+    const unpublished = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await git(workspace.worktreePath, "push", barePath, "HEAD:refs/heads/saved-experiment");
+    await git(workspace.worktreePath, "switch", workspace.branch);
+    await git(workspace.worktreePath, "branch", "-D", "experiment");
+    await fs.writeFile(path.join(workspace.worktreePath, ".cache/generated.bin"), Buffer.alloc(128 * 1024));
+
+    const retained = await runtime.cleanup({ ...workspace, issueClosed: true });
+    expect(retained).toMatchObject({ retainedPaths: [".cache/local.git"], reason: expect.stringContaining('".cache/local.git"') });
+    await expect(fs.lstat(path.join(workspace.worktreePath, ".cache/generated.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(barePath, "rev-parse", "refs/heads/saved-experiment")).toBe(unpublished);
+    expect(await git(barePath, "show", "refs/heads/saved-experiment:README.md")).toBe("Unpublished bare history");
+
+    await fs.writeFile(path.join(workspace.worktreePath, ".cache/later.bin"), Buffer.alloc(128 * 1024));
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.cleanup({ ...workspace, issueClosed: true })).toEqual(retained);
+    await expect(fs.lstat(path.join(workspace.worktreePath, ".cache/later.bin"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await git(barePath, "rev-parse", "refs/heads/saved-experiment")).toBe(unpublished);
+    expect(await git(barePath, "show", "refs/heads/saved-experiment:README.md")).toBe("Unpublished bare history");
+  });
+
+  it("preserves a bare repository and outside data when an ignored parent is replaced after its scan", async () => {
+    const deps = dependencies();
+    const runGit = deps.git!;
+    let workspace: ForgeWorkspace;
+    const moved = path.join(root, "moved-cache");
+    const outside = path.join(root, "outside");
+    deps.git = async (cwd, args, signal, environment) => {
+      const result = await runGit(cwd, args, signal, environment);
+      if (workspace && args[0] === "ls-files" && args.at(-1) === "packages/app/.cache") {
+        await fs.rename(path.join(workspace.worktreePath, "packages/app"), moved);
+        await fs.symlink(outside, path.join(workspace.worktreePath, "packages/app"));
+      }
+      return result;
+    };
+    runtime = new ForgeRuntime(deps);
+    workspace = await prepare();
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\npackages/app/.cache/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, "packages/app/.cache"), { recursive: true });
+    await git(workspace.worktreePath, "init", "--bare", path.join(workspace.worktreePath, "packages/app/.cache/local.git"));
+    await fs.writeFile(path.join(workspace.worktreePath, "packages/app/.cache/generated.bin"), "Original generated data\n");
+    await fs.mkdir(path.join(outside, ".cache"), { recursive: true });
+    await fs.writeFile(path.join(outside, ".cache/valuable.bin"), "Outside valuable data\n");
+
+    await expect(runtime.cleanup({ ...workspace, issueClosed: true })).rejects.toThrow("parent changed");
+    expect(await fs.readlink(path.join(workspace.worktreePath, "packages/app"))).toBe(outside);
+    expect(await fs.readFile(path.join(outside, ".cache/valuable.bin"), "utf8")).toBe("Outside valuable data\n");
+    expect(await git(path.join(moved, ".cache/local.git"), "rev-parse", "--is-bare-repository")).toBe("true");
+    expect(await fs.readFile(path.join(moved, ".cache/generated.bin"), "utf8")).toBe("Original generated data\n");
+  });
+
   it("preserves retained files during base synchronization and still rejects replaced checkout ownership", async () => {
     const workspace = await prepare();
     await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Retained work\n");

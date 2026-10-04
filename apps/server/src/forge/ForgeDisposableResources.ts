@@ -22,6 +22,7 @@ export interface DisposableResource {
   engineId: string;
   containerId?: string;
   created?: string;
+  creationRejected?: true;
   name: string;
   owner: Consumer;
   consumers: Consumer[];
@@ -51,6 +52,8 @@ interface ResourceJournal {
   resources: DisposableResource[];
   terminalWorkers: Consumer[];
 }
+
+export class ContainerCreationRejectedError extends Error {}
 
 /** Only creation receipts grant authority; names and discovered labels alone never do. */
 export class ForgeDisposableResources {
@@ -86,7 +89,11 @@ export class ForgeDisposableResources {
         resource.state = "owned";
         resource.reason = "Disposable container and shared consumers recorded.";
       } catch (error) {
-        resource.reason = `Creation interrupted: ${message(error)}. Reconciliation will inspect the recorded creation intent.`;
+        if (!resource.containerId && error instanceof ContainerCreationRejectedError) {
+          resource.creationRejected = true;
+          resource.reason = `Creation rejected: ${message(error)}. Reconciliation will confirm absence on the recorded engine.`;
+        } else resource.reason = `Creation interrupted: ${message(error)}. Reconciliation will inspect the recorded creation intent.`;
+        resource.updatedAt = now();
         await this.journal.write(state);
         throw error;
       }
@@ -105,7 +112,7 @@ export class ForgeDisposableResources {
       for (const resource of state.resources.filter(item => item.state !== "deleted")) {
         let reason: string | undefined;
         try {
-          await this.recoverCreation(resource);
+          if (await this.recoverCreation(resource) === "deleted") continue;
           const identity = await this.currentIdentity(resource);
           if (identity) resource.allocatedBytes = identity.writableBytes;
           else resource.allocatedBytes = 0;
@@ -159,7 +166,7 @@ export class ForgeDisposableResources {
   private async removeRecorded(resource: DisposableResource, state: ResourceJournal): Promise<void> {
     if (resource.state === "deleted") return;
     try {
-      await this.recoverCreation(resource);
+      if (await this.recoverCreation(resource) === "deleted") return;
       const protection = await this.protection(resource, state);
       if (protection) { resource.state = "blocked"; resource.reason = protection; return; }
       let identity = await this.currentIdentity(resource);
@@ -213,10 +220,18 @@ export class ForgeDisposableResources {
     if (identity) assertIdentity(resource, identity);
     return identity;
   }
-  private async recoverCreation(resource: DisposableResource): Promise<void> {
-    if (resource.containerId && resource.created) return;
+  private async recoverCreation(resource: DisposableResource): Promise<DisposableResource["state"]> {
+    if (resource.containerId && resource.created) return resource.state;
     if (await this.host.engineId() !== resource.engineId) throw new Error("Docker engine identity changed; creation receipt cannot be reconciled.");
     const ids = resource.containerId ? [resource.containerId] : await this.host.find(resource.id);
+    if (!ids.length && !resource.containerId && resource.creationRejected) {
+      if (await this.host.engineId() !== resource.engineId) throw new Error("Docker engine identity changed during the absence scan; creation receipt cannot be reconciled.");
+      resource.state = "deleted";
+      resource.allocatedBytes = resource.reclaimedBytes = 0;
+      resource.reason = "Docker rejected creation; the recorded resource is confirmed absent on its original engine.";
+      resource.updatedAt = now();
+      return resource.state;
+    }
     if (ids.length !== 1) throw new Error(`Recorded creation has ${ids.length} matching resources; explicit ownership review is required.`);
     const identity = await this.host.inspect(ids[0]!);
     if (!identity) throw new Error("Recorded creation container is unavailable; explicit ownership review is required.");
@@ -224,6 +239,7 @@ export class ForgeDisposableResources {
     resource.containerId = identity.id;
     resource.created = identity.created;
     resource.allocatedBytes = identity.writableBytes;
+    return resource.state;
   }
   private async read(): Promise<ResourceJournal> {
     const value = await this.journal.read<ResourceJournal>();
@@ -248,7 +264,14 @@ export class DockerDisposableContainerHost implements DisposableContainerHost {
   }
   async create(input: DisposableContainerInput, labels: Record<string, string>): Promise<string> {
     const args = ["create", "--name", input.name, ...Object.entries(labels).flatMap(([key, value]) => ["--label", `${key}=${value}`]), input.image, ...input.command];
-    const id = (await docker(args)).trim();
+    let id: string;
+    try { id = (await docker(args)).trim(); }
+    catch (error) {
+      const failure = error as { code?: unknown; killed?: boolean; signal?: string; stderr?: string };
+      if (!failure.killed && !failure.signal && typeof failure.code === "number" && /^Error response from daemon:/mu.test(failure.stderr ?? ""))
+        throw new ContainerCreationRejectedError(message(error), { cause: error });
+      throw error;
+    }
     if (!/^[a-f0-9]{64}$/u.test(id)) throw new Error("Docker returned an invalid container identity.");
     return id;
   }
@@ -290,6 +313,7 @@ function validConsumer(value: unknown): value is Consumer {
 function validResource(item: DisposableResource): boolean {
   return Boolean(item && /^[a-f0-9-]{36}$/u.test(item.id) && item.kind === "container" && typeof item.engineId === "string" && item.engineId &&
     (item.containerId === undefined || /^[a-f0-9]{64}$/u.test(item.containerId)) && (item.created === undefined || Number.isFinite(Date.parse(item.created))) &&
+    (item.creationRejected === undefined || item.creationRejected === true) &&
     typeof item.name === "string" && validConsumer(item.owner) && Array.isArray(item.consumers) && item.consumers.length > 0 && item.consumers.every(validConsumer) && item.consumers.some(consumer => sameConsumer(consumer, item.owner)) &&
     ["creating", "owned", "deleting", "deleted", "blocked", "failed"].includes(item.state) && typeof item.reason === "string" &&
     Number.isSafeInteger(item.reclaimedBytes) && item.reclaimedBytes >= 0 && (item.allocatedBytes === undefined || Number.isSafeInteger(item.allocatedBytes) && item.allocatedBytes >= 0) &&

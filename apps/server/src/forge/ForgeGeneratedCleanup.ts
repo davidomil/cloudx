@@ -45,7 +45,8 @@ export async function cleanupIgnoredForgePath(identity: DirectoryIdentity, relat
     checks.push(directory.check);
     try {
       const children = await fs.readdir(`/proc/self/fd/${directory.handle.fd}`);
-      if (children.includes(".git")) return { paths: [file], unknown: true };
+      if (children.includes(".git") || ["HEAD", "objects", "refs"].every(name => children.includes(name)))
+        return { paths: [file], unknown: true };
       const retained: string[] = [];
       let unknown = false;
       for (const child of children.sort()) {

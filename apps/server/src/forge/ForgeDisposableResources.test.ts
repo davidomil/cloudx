@@ -5,7 +5,7 @@ import path from "node:path";
 import Fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ForgeWorker } from "@cloudx/shared";
-import { ForgeDisposableResources, validateContainerInput, type ContainerIdentity, type DisposableContainerHost, type DisposableContainerInput } from "./ForgeDisposableResources.js";
+import { ContainerCreationRejectedError, ForgeDisposableResources, validateContainerInput, type ContainerIdentity, type DisposableContainerHost, type DisposableContainerInput } from "./ForgeDisposableResources.js";
 import { registerForgeDisposableResourceRoutes } from "./ForgeDisposableResourceRoutes.js";
 import type { ForgeWorkflowService } from "./ForgeWorkflowService.js";
 import { PathPolicy } from "../pathPolicy.js";
@@ -137,6 +137,73 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     const journal = JSON.parse(await fs.readFile(journalPath, "utf8")); delete journal.resources[0].containerId;
     await fs.writeFile(journalPath, JSON.stringify(journal)); workers[0]!.status = "completed";
     await service().retire(workers[0]!); expect(host.removed).toHaveLength(1);
+  });
+  it("reconciles a rejected creation as absent across restart without adopting its name-conflicting container", async () => {
+    const conflict = "f".repeat(64);
+    host.containers.set(conflict, { id: conflict, created: new Date().toISOString(), labels: {}, running: true, writableBytes: 4096 });
+    vi.spyOn(host, "create").mockRejectedValue(new ContainerCreationRejectedError("The container name is already in use."));
+    await expect(create("conflicting-name")).rejects.toThrow("already in use");
+    expect(await service().preview()).toEqual([]);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", allocatedBytes: 0, reclaimedBytes: 0, reason: expect.stringContaining("confirmed absent") });
+    workers[0]!.status = "completed";
+    await service().retire(workers[0]!);
+    await service().retire(workers[0]!);
+    expect(host.containers.has(conflict)).toBe(true);
+    expect(host.stopped).toEqual([]); expect(host.removed).toEqual([]);
+  });
+  it("keeps an interrupted creation without a receipt blocked even when its scan finds nothing", async () => {
+    vi.spyOn(host, "create").mockRejectedValue(new Error("Creation response interrupted"));
+    await expect(create()).rejects.toThrow("interrupted");
+    workers[0]!.status = "completed";
+    await expect(service().retire(workers[0]!)).rejects.toThrow("0 matching resources");
+    expect((await service().preview())[0]).toMatchObject({ eligible: false, sizeUnavailable: true });
+    expect(host.removed).toEqual([]);
+  });
+  it("preserves a rejected creation when the absence scan fails, then reconciles its confirmed absence", async () => {
+    vi.spyOn(host, "create").mockRejectedValue(new ContainerCreationRejectedError("Docker rejected creation"));
+    await expect(create()).rejects.toThrow("rejected");
+    const scan = vi.spyOn(host, "find").mockRejectedValue(new Error("Docker scan unavailable"));
+    workers[0]!.status = "completed";
+    await expect(service().retire(workers[0]!)).rejects.toThrow("scan unavailable");
+    expect((await service().preview())[0]).toMatchObject({ eligible: false, sizeUnavailable: true });
+    scan.mockRestore();
+    await service().retire(workers[0]!);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", allocatedBytes: 0, reclaimedBytes: 0 });
+    expect(host.removed).toEqual([]);
+  });
+  it("keeps ambiguous rejected creation matches and engine changes blocked", async () => {
+    vi.spyOn(host, "create").mockRejectedValue(new ContainerCreationRejectedError("Docker rejected creation"));
+    await expect(create()).rejects.toThrow("rejected");
+    vi.spyOn(host, "find").mockResolvedValue(["a".repeat(64), "b".repeat(64)]);
+    workers[0]!.status = "completed";
+    await expect(service().retire(workers[0]!)).rejects.toThrow("2 matching resources");
+    host.engine = "replacement-engine";
+    await expect(service().retire(workers[0]!)).rejects.toThrow("engine identity changed");
+    expect(host.removed).toEqual([]);
+  });
+  it("preserves a rejected intent when the Docker engine changes during its absence scan", async () => {
+    vi.spyOn(host, "create").mockRejectedValue(new ContainerCreationRejectedError("Docker rejected creation"));
+    await expect(create()).rejects.toThrow("rejected");
+    vi.spyOn(host, "find").mockImplementation(async () => { host.engine = "replacement-engine"; return []; });
+    workers[0]!.status = "completed";
+    await expect(service().retire(workers[0]!)).rejects.toThrow("engine identity changed during the absence scan");
+    expect((await service().records())[0]).toMatchObject({ state: "failed", reclaimedBytes: 0 });
+    expect((await service().preview())[0]).toMatchObject({ eligible: false, sizeUnavailable: true });
+    expect(host.removed).toEqual([]);
+  });
+  it("reconciles a matching creation receipt instead of absence and protects its active consumer", async () => {
+    const actualCreate = host.create.bind(host);
+    vi.spyOn(host, "create").mockImplementation(async (input, labels) => {
+      await actualCreate(input, labels);
+      throw new ContainerCreationRejectedError("Docker rejected the response");
+    });
+    await expect(create()).rejects.toThrow("rejected");
+    expect((await service().preview())[0]).toMatchObject({ eligible: false, allocatedBytes: 1024 * 1024, reason: expect.stringContaining("Active or unfinished") });
+    expect(host.removed).toEqual([]);
+    workers[0]!.status = "completed";
+    await service().retire(workers[0]!);
+    expect(host.removed).toHaveLength(1);
+    expect((await service().records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 1024 * 1024 });
   });
   it("requires explicit ownership review for ambiguous creation and never adopts legacy name matches", async () => {
     await create(); const journalPath = path.join(directory, "forge-disposable-resources.json");

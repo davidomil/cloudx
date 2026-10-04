@@ -34,11 +34,18 @@ export class TerminalSelectionSnapshot {
       if (!line) break;
       const start = columnSelection ? Math.min(range.start.x, range.end.x) : row === range.start.y ? range.start.x : 0;
       const end = columnSelection ? Math.max(range.start.x, range.end.x) : row === range.end.y ? range.end.x : this.cols;
-      const text = line.text.slice(line.columns[start], line.columns[end]);
+      const continuation = start < end && line.columns[start] === line.columns[start + 1] ? " " : "";
+      const text = continuation + line.text.slice(line.columns[start], line.columns[end]);
       if (!columnSelection && line.wrapped && result.length) result[result.length - 1] += text;
       else result.push(text);
     }
     return result.join(/Win/u.test(navigator.platform) ? "\r\n" : "\n").replaceAll("\u00a0", " ");
+  }
+
+  includeWideCharacter(point: IBufferCellPosition): IBufferCellPosition {
+    const line = this.lines[point.y];
+    const continuation = line && point.x < this.cols && line.columns[point.x] === line.columns[point.x + 1];
+    return { x: point.x + (continuation ? 1 : 0), y: point.y };
   }
 
   wordAt(point: IBufferCellPosition, separators: string, above = true, below = true): IBufferRange | undefined {

@@ -1931,8 +1931,13 @@ export class ForgeRuntime {
         await this.verifyHead(owned, expectedHeadSha, signal);
       owned.cleanupHeadSha = expectedHeadSha;
       const retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal, explicitRetainedPaths) : [];
+      const unpublishedRefs = owned.prepared && owned.branchOwned
+        ? await this.unpublishedGitRefs(owned, expectedHeadSha, signal) : [];
+      if (unpublishedRefs.length) { retainedPaths.push(".git"); retainedPaths.sort(); }
       if (retainedPaths.length) {
-        const reason = explicitRetentionReason(explicitRetainedPaths, retainedPaths);
+        const reason = unpublishedRefs.length
+          ? `Unpublished Git history was preserved in ${unpublishedRefs.map(ref => JSON.stringify(ref)).join(", ").slice(0, 3800)}. Recover these refs before discarding the checkout.`
+          : explicitRetentionReason(explicitRetainedPaths, retainedPaths);
         owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths, ...(reason ? { reason } : {}) };
         owned.cleaned = true;
         await this.manifest(owned.id).write(owned);
@@ -1949,6 +1954,31 @@ export class ForgeRuntime {
     }
     owned.cleaned = true;
     await this.manifest(owned.id).write(owned);
+  }
+
+  private async unpublishedGitRefs(owned: OwnedWorkspace, expectedHeadSha?: string, signal?: AbortSignal): Promise<string[]> {
+    await this.assertCheckout(owned);
+    const publishedHeads = [...new Set([
+      owned.baseCommit, expectedHeadSha,
+      owned.branchPublication?.confirmed ? owned.branchPublication.headSha : undefined,
+      owned.issueRebase?.publication?.confirmed ? owned.issueRebase.publication.headSha : undefined,
+      owned.publishedSync?.confirmed ? owned.publishedSync.expectedRemoteHeadSha : undefined,
+    ].filter((head): head is string => Boolean(head)))];
+    const refs = (await this.runGit(owned.worktreePath, ["for-each-ref", "--format=%(refname)%09%(objecttype)%09%(*objecttype)"], signal))
+      .trim().split("\n").filter(Boolean).map(line => {
+        const [ref, type, peeledType] = line.split("\t");
+        if (!ref?.startsWith("refs/") || !type || /[\0\r\n]/u.test(ref))
+          throw new Error("Git returned an invalid ref inventory. Local history was preserved.");
+        return { ref, type: type === "tag" ? peeledType : type };
+      });
+    const unpublished = new Set(refs.filter(({ ref, type }) => ref === "refs/stash" || type !== "commit").map(({ ref }) => ref));
+    const unreachable = await this.runGit(owned.worktreePath, ["for-each-ref", "--format=%(refname)", ...publishedHeads.map(head => `--no-merged=${head}`)], signal);
+    for (const ref of unreachable.trim().split("\n").filter(Boolean)) {
+      if (!refs.some(candidate => candidate.ref === ref))
+        throw new Error("Git refs changed during cleanup. Local history was preserved.");
+      unpublished.add(ref);
+    }
+    return [...unpublished].sort();
   }
 
   private async recoverPreparation(owned: OwnedWorkspace): Promise<void> {

@@ -64,6 +64,51 @@ describe("terminal selection snapshot", () => {
     expect(snapshot.wordAt({ x: 0, y: 9 }, " ")).toBeUndefined();
   });
 
+  it("matches native rectangular text at wide-glyph leading and continuation boundaries", async () => {
+    const terminal = await buffer("123456789\r\nab界cdef");
+    const snapshot = new TerminalSelectionSnapshot(
+      terminal.buffer.active,
+      terminal.cols,
+    );
+    for (const [start, end, expected] of [
+      [3, 7, "4567\n cde"],
+      [1, 3, "23\nb界"],
+      [3, 4, "4\n "],
+      [2, 3, "3\n界"],
+    ] as const) {
+      const native = [0, 1]
+        .map((row) =>
+          terminal.buffer.active
+            .getLine(row)!
+            .translateToString(true, start, end),
+        )
+        .join("\n");
+      expect(native).toBe(expected);
+      expect(
+        snapshot.selection(
+          { start: { x: start, y: 0 }, end: { x: end, y: 1 } },
+          true,
+        ),
+      ).toBe(native);
+    }
+    expect(snapshot.includeWideCharacter({ x: 3, y: 1 })).toEqual({
+      x: 4,
+      y: 1,
+    });
+    expect(snapshot.includeWideCharacter({ x: 2, y: 1 })).toEqual({
+      x: 2,
+      y: 1,
+    });
+    expect(snapshot.includeWideCharacter({ x: terminal.cols, y: 1 })).toEqual({
+      x: terminal.cols,
+      y: 1,
+    });
+    expect(snapshot.includeWideCharacter({ x: 3, y: 9 })).toEqual({
+      x: 3,
+      y: 9,
+    });
+  });
+
   it("keeps whitespace groups distinct and respects custom separators", async () => {
     const terminal = await buffer("one   two/end");
     const snapshot = new TerminalSelectionSnapshot(terminal.buffer.active, terminal.cols);

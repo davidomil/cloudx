@@ -10,7 +10,7 @@ export class TerminalSelectionCopy {
   private selecting = false;
   private dragStart?: IBufferCellPosition;
   private dragEnd?: IBufferCellPosition;
-  private initialRange?: IBufferRange;
+  private clickedRange?: IBufferRange;
   private clicks = 0;
   private columnSelection = false;
   private parsing = false;
@@ -70,6 +70,7 @@ export class TerminalSelectionCopy {
     container.addEventListener("copy", this.onCopy, capture);
     container.addEventListener("contextmenu", this.onContextMenu, capture);
     terminal.element!.addEventListener("mousedown", this.onMouseDown, capture);
+    terminal.element!.addEventListener("mousedown", this.captureClickedRange, { signal: this.events.signal });
     window.addEventListener("mousemove", this.onMouseMove, capture);
     window.addEventListener("mouseup", this.onMouseUp, capture);
     this.selectionListener = terminal.onSelectionChange(() => {
@@ -82,11 +83,10 @@ export class TerminalSelectionCopy {
     this.capture();
     if (!this.dragStart || !this.dragEnd) return;
     const range = this.terminal.getSelectionPosition();
-    if (range) {
+    if (range && !this.clickedRange) {
       const end = this.dragEnd;
       const distance = (point: IBufferCellPosition) => Math.abs((point.y - end.y) * this.terminal.cols + point.x - end.x);
       this.dragStart = distance(range.end) <= distance(range.start) ? range.start : range.end;
-      if (this.clicks > 1) this.initialRange = range;
     }
     this.snapshot = new TerminalSelectionSnapshot(this.terminal.buffer.active, this.terminal.cols);
   }
@@ -100,7 +100,7 @@ export class TerminalSelectionCopy {
     this.text = this.position = "";
     this.selecting = false;
     this.dragStart = this.snapshot = undefined;
-    this.dragEnd = this.initialRange = undefined;
+    this.dragEnd = this.clickedRange = undefined;
     this.pointer = undefined;
     this.preview.value = "";
     this.panel.hidden = this.menu.hidden = true;
@@ -166,6 +166,15 @@ export class TerminalSelectionCopy {
     };
   }
 
+  private captureClickedRange = (): void => {
+    if (!this.selecting || this.clicks < 2) return;
+    // xterm's earlier mousedown listener has selected the original word or line.
+    const range = this.terminal.getSelectionPosition();
+    if (!range) return;
+    this.clickedRange = range;
+    this.dragStart = range.start;
+  };
+
   private onMouseMove = (event: Pick<MouseEvent, "clientX" | "clientY">): void => {
     if (!this.selecting || !this.dragStart) return;
     this.pointer = { clientX: event.clientX, clientY: event.clientY };
@@ -182,11 +191,11 @@ export class TerminalSelectionCopy {
     const forward = start.y < end.y || (start.y === end.y && start.x <= end.x);
     const word = this.clicks === 2 ? snapshot.wordAt(end, this.terminal.options.wordSeparator!) : undefined;
     if (this.clicks >= 3) end.x = forward ? snapshot.cols : 0;
-    const finalizedEnd = word ? forward ? word.end : word.start : end;
+    const finalizedEnd = snapshot.includeWideCharacter(word ? forward ? word.end : word.start : end);
     const range = forward ? { start, end: finalizedEnd } : { start: finalizedEnd, end: start };
-    if (this.initialRange) {
-      if (range.start.y > this.initialRange.start.y || (range.start.y === this.initialRange.start.y && range.start.x > this.initialRange.start.x)) range.start = this.initialRange.start;
-      if (range.end.y < this.initialRange.end.y || (range.end.y === this.initialRange.end.y && range.end.x < this.initialRange.end.x)) range.end = this.initialRange.end;
+    if (this.clickedRange) {
+      if (range.start.y > this.clickedRange.start.y || (range.start.y === this.clickedRange.start.y && range.start.x > this.clickedRange.start.x)) range.start = this.clickedRange.start;
+      if (range.end.y < this.clickedRange.end.y || (range.end.y === this.clickedRange.end.y && range.end.x < this.clickedRange.end.x)) range.end = this.clickedRange.end;
     }
     this.text = this.preview.value = snapshot.selection(range, this.columnSelection);
     this.panel.hidden = !this.text;
@@ -207,7 +216,7 @@ export class TerminalSelectionCopy {
     if (this.selecting) this.capture();
     this.selecting = false;
     this.dragStart = this.snapshot = undefined;
-    this.dragEnd = this.initialRange = undefined;
+    this.dragEnd = this.clickedRange = undefined;
     this.pointer = undefined;
   };
 
