@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -17,6 +18,9 @@ import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
 import { TabContextService } from "../apps/server/src/context/TabContextService.ts";
 import { StandardTerminalPlugin } from "../apps/server/src/plugins/StandardTerminalPlugin.ts";
 import { parseTerminalProbeArguments, probeTerminalAttachments } from "./managed-update-terminals.mjs";
+import { snapshotTree } from "./managed-update-store.mjs";
+import { SettingsUpdater, UPDATE_UNIT } from "./settings-update.mjs";
+import { UpdateBackupCleanup } from "./update-backup-cleanup.mjs";
 
 const cleanups = [];
 const releaseRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -117,6 +121,55 @@ it.skipIf(process.platform !== "linux")("reattaches through a real broker withou
   const attached = await f.factory.attach("preserved-shell");
   await attached.terminate();
   await expect(probeTerminalAttachments({ mode: "verify", ...captured }, dependencies)).rejects.toThrow("saved session preserved-shell");
+}, 15_000);
+
+it.skipIf(process.platform !== "linux")("keeps saved tabs and a live broker terminal usable while permanently removing an isolated update snapshot", async () => {
+  const f = await liveTerminal({ respondToInput: true });
+  const sessions = new SessionStateStore(f.root), savedProfile = await sessions.read();
+  const sessionsFile = path.join(f.root, "sessions.json"), savedBytes = fs.readFileSync(sessionsFile);
+  const dependencies = { factory: f.factory, readSessions: () => sessions.read(),
+    isMissingSession: error => error instanceof PluginSessionMissingError };
+  const captured = await probeTerminalAttachments({ mode: "capture" }, dependencies);
+  expect(captured).toEqual({ sessionIds: ["preserved-shell"] });
+
+  const home = directory(), repoRoot = path.join(home, "installation");
+  fs.mkdirSync(repoRoot);
+  let unit = { LoadState: "not-found", ActiveState: "inactive" };
+  const updater = new SettingsUpdater({ home, repoRoot, dataDir: f.root, cli: true, serverPid: process.pid,
+    commands: { inspect(command, args) {
+      if (command === "systemctl" && args[2] === UPDATE_UNIT) return Object.entries(unit).map(([key, value]) => `${key}=${value}`).join("\n");
+      if (command === "systemd-run") {
+        unit = { LoadState: "loaded", ActiveState: "active", Description: args.find(arg => arg.startsWith("--description=")).slice(14) };
+        return "";
+      }
+      throw new Error(`Unexpected fixture host command: ${command}`);
+    } },
+  });
+  updater.preflight = () => undefined;
+  const id = randomUUID(), snapshot = path.join(updater.stateDir, id, `snapshot-${randomUUID()}`, "data-0");
+  const manifest = snapshotTree(f.root, snapshot), targetCommit = "b".repeat(40);
+  updater.save({ home, repoRoot, dataDir: f.root, targetCommit,
+    run: { id, state: "succeeded", startedAt: "2026-10-04T03:00:00.000Z", finishedAt: "2026-10-04T03:02:00.000Z", message: "Completed update" },
+    transition: { sourceCommit: "a".repeat(40), snapshots: [{ root: f.root, destination: snapshot, manifest }] },
+  });
+  const cleanup = new UpdateBackupCleanup({ updater, referenceInspector: () => ({ paths: [] }) });
+  const preview = cleanup.preview(), job = cleanup.start({ previewId: preview.id, confirmPermanentDeletion: true });
+  expect(cleanup.run(job.id, { verifyService: false })).toMatchObject({ state: "completed", results: [{ path: snapshot, status: "deleted" }] });
+  expect(fs.existsSync(snapshot)).toBe(false);
+  expect(fs.readFileSync(sessionsFile)).toEqual(savedBytes);
+  expect(await sessions.read()).toEqual(savedProfile);
+  expect(await probeTerminalAttachments({ mode: "verify", ...captured }, dependencies)).toEqual(captured);
+  f.assertUntouched();
+
+  const attached = await f.factory.attach("preserved-shell");
+  let output = "";
+  const unsubscribe = attached.onData(data => { output += data; });
+  try {
+    attached.write("INPUT_AFTER_BACKUP_CLEANUP\n");
+    await vi.waitFor(() => expect(output).toContain("ACK:INPUT_AFTER_BACKUP_CLEANUP"));
+    expect(fs.readFileSync(sessionsFile)).toEqual(savedBytes);
+    expect(await sessions.read()).toEqual(savedProfile);
+  } finally { unsubscribe(); attached.detach(); }
 }, 15_000);
 
 it.skipIf(process.platform !== "linux")("preserves a live shell while startup retires its already-exited neighbor into saved-tab recovery", async () => {
@@ -226,7 +279,7 @@ async function fragmentedBroker(socketPath) {
   return { messages, factory: new DurableTerminalProcessFactory(proxyPath, { spawn() { throw new Error("The attachment proxy cannot create terminals."); } }) };
 }
 
-async function liveTerminal({ exitedShell = false } = {}) {
+async function liveTerminal({ exitedShell = false, respondToInput = false } = {}) {
   const root = directory();
   const socket = terminalSocketPath(root);
   cleanups.push(() => fs.rmSync(path.dirname(socket), { recursive: true, force: true }));
@@ -245,7 +298,9 @@ async function liveTerminal({ exitedShell = false } = {}) {
   const launches = path.join(root, "launches");
   const script = path.join(root, "terminal.mjs");
   fs.writeFileSync(script, `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(launches)}, 'launched\\n');
-    fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.stdout.write('PRIVATE_TERMINAL_OUTPUT\\n'); setInterval(() => {}, 1000);`);
+    fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.stdout.write('PRIVATE_TERMINAL_OUTPUT\\n');
+    ${respondToInput ? "process.stdin.on('data', bytes => process.stdout.write('ACK:' + bytes.toString())); process.stdin.resume();" : ""}
+    setInterval(() => {}, 1000);`);
   const terminal = await factory.spawn(process.execPath, [script], { cwd: root, env: process.env, cols: 100, rows: 30, sessionId: "preserved-shell" });
   let output = "";
   terminal.onData(data => { output += data; });

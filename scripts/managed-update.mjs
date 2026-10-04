@@ -364,7 +364,8 @@ export class UpdateHost {
     for (const name of candidates) {
       const candidate = readJson(path.join(path.dirname(this.runDir), name));
       if (candidate?.repoRoot !== record.repoRoot || candidate?.dataDir !== record.dataDir ||
-          candidate?.transition?.sourceCommit !== record.targetCommit || !candidate.transition.snapshots?.length) continue;
+          candidate?.transition?.sourceCommit !== record.targetCommit || candidate.backupCleanup?.snapshotsUnavailable ||
+          !candidate.transition.snapshots?.length || candidate.transition.snapshots.some(snapshot => snapshot.backupCleanup)) continue;
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(candidate.run?.id ?? '') || name !== `${candidate.run.id}.json`)
         throw new Error('Invalid historical snapshot record identity.');
       if (candidate.run.id === record.run.id || record.restoreSnapshotRunId && candidate.run.id !== record.restoreSnapshotRunId) continue;

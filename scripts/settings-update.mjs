@@ -18,6 +18,9 @@ import { CURRENT_TERMINAL_CONTRACT, UpdateHost } from "./managed-update.mjs";
 import { parseEnvironmentFile } from "./installer-environment.mjs";
 import { assertTerminalMigrationSafe } from "./terminal-upgrade-recovery.mjs";
 
+import { UpdateBackupCleanup } from "./update-backup-cleanup.mjs";
+import { UpdateOperationLock } from "./update-operation-lock.mjs";
+
 export const UPDATE_UNIT = "cloudx-settings-update.service";
 export const UPDATE_TIMEOUT_MS = 60 * 60 * 1000;
 const ROOT = process.env.CLOUDX_INSTALL_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -358,6 +361,14 @@ export class SettingsUpdater {
   }
 
   reassessCapacity(targetCommit, resumeRunId) {
+    new UpdateBackupCleanup({ updater: this }).status();
+    const lock = new UpdateOperationLock(this.stateDir);
+    const token = lock.acquire("capacity");
+    try { return this.reassessCapacityLocked(targetCommit, resumeRunId); }
+    finally { lock.release(token); }
+  }
+
+  reassessCapacityLocked(targetCommit, resumeRunId) {
     updateCommit(targetCommit);
     if (!RUN_ID.test(resumeRunId ?? '')) throw new Error('A saved update is required for capacity reassessment.');
     const status = this.status();
@@ -387,7 +398,16 @@ export class SettingsUpdater {
     return { ...current, run: record.run };
   }
 
-  start(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId, verbose = false, noStart } = {}) {
+  start(targetCommit, options = {}) {
+    updateCommit(targetCommit);
+    new UpdateBackupCleanup({ updater: this }).status();
+    const lock = new UpdateOperationLock(this.stateDir);
+    const token = lock.acquire("update-start");
+    try { return this.startLocked(targetCommit, options); }
+    finally { lock.release(token); }
+  }
+
+  startLocked(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId, verbose = false, noStart } = {}) {
     updateCommit(targetCommit);
     if (noStart !== undefined && typeof noStart !== "boolean") throw new Error("Invalid no-start option.");
     if (restoreSnapshotRunId && !RUN_ID.test(restoreSnapshotRunId)) throw new Error("Invalid snapshot identifier.");
@@ -574,6 +594,24 @@ function main() {
     if (!["succeeded", "prepared"].includes(run.state)) process.exitCode = 1;
     return;
   }
+  if (["backups", "backup-preview", "backup-cleanup-status", "backup-cleanup"].includes(action)) {
+    if (!dataDir || !/^\d+$/.test(serverPid ?? "")) throw new Error("Invalid backup cleanup invocation.");
+    const options = [targetCommit, ...flags].filter(value => value !== undefined);
+    if (action !== "backup-cleanup" && options.length || action === "backup-cleanup" && (options.length !== 2
+      || !options.includes("--confirm-permanent-deletion") || !options.some(value => /^--preview=[0-9a-f-]{36}$/.test(value)))) throw new Error("Invalid backup cleanup options.");
+    const updater = new SettingsUpdater({ dataDir, serverPid });
+    const cleanup = new UpdateBackupCleanup({ updater });
+    const unavailableReason = updater.preflight();
+    if (unavailableReason && action !== "backup-cleanup-status") {
+      if (action === "backups") { console.log(JSON.stringify({ backups: [], blockedReason: unavailableReason })); return; }
+      throw Object.assign(new Error(unavailableReason), { statusCode: 409 });
+    }
+    const result = action === "backups" ? cleanup.inventory() : action === "backup-preview" ? cleanup.preview()
+      : action === "backup-cleanup-status" ? cleanup.status() : cleanup.start({
+        previewId: options.find(value => value.startsWith("--preview="))?.slice(10), confirmPermanentDeletion: true });
+    console.log(JSON.stringify(result));
+    return;
+  }
   if (!["status", "start", "capacity"].includes(action) || !dataDir || !/^\d+$/.test(serverPid ?? "") ||
       action === "status" && (targetCommit !== undefined || flags.length) || action !== "status" && !targetCommit ||
       flags.some(flag => flag !== "--confirm-interruption" && !/^--(?:resume|restore-snapshot)=[0-9a-f-]{36}$/.test(flag))) throw new Error("Invalid updater invocation.");
@@ -586,12 +624,14 @@ function main() {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     main();
-  } catch {
-    console.log(
+  } catch (error) {
+    if (process.argv[2]?.startsWith("backup")) {
+      console.log(JSON.stringify({ error: error.statusCode === 409 ? error.message : "Update backup state or ownership could not be verified. Inspect the private update records before cleanup.", statusCode: error.statusCode === 409 ? 409 : 503 }));
+    } else console.log(
       JSON.stringify({
         available: false,
         unavailableReason:
-          "The installed updater could not verify its status. Run the installer manually in a terminal.",
+          error.statusCode === 409 ? error.message : "The installed updater could not verify its status. Run the installer manually in a terminal.",
       }),
     );
     process.exitCode = process.argv[2] === "run" ? 1 : 0;

@@ -25,10 +25,11 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const integration = prepareManagedIntegration(release, coordinator);
   expect(integration).toEqual({ version: 1, files: [...MANAGED_INTEGRATION_FILES.filter(file =>
     ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES, ...FORGE_INTEGRATION_FILES].includes(file) && file !== "apps/server/src/terminal/TerminalReadiness.ts"),
-    "apps/server/src/server.ts", "apps/server/src/terminal/TerminalReadiness.ts"], independentReadiness: true });
+    "apps/server/src/server.ts", "packages/shared/src/index.ts", "apps/server/src/terminal/TerminalReadiness.ts"], independentReadiness: true });
   expect(integration.files).toContain("apps/web/src/ui/CloudxUpdatePanel.test.ts");
-  for (const relative of integration.files.filter(file => file !== "apps/server/src/server.ts")) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
-  expect(fs.readFileSync(path.join(release, "apps/server/src/server.ts"), "utf8")).toContain('"reassessCapacity"');
+  for (const relative of integration.files.filter(file => !["apps/server/src/server.ts", "packages/shared/src/index.ts"].includes(file))) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
+  expect(fs.readFileSync(path.join(release, "apps/server/src/server.ts"), "utf8")).toContain("CloudxUpdateApi");
+  expect(fs.readFileSync(path.join(release, "packages/shared/src/index.ts"), "utf8")).toContain("cloudxUpdateBackups.js");
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
 });
 
@@ -143,7 +144,7 @@ it("upgrades the pre-channel server contract while preserving its unrelated sour
   expect(integration.files).toContain("apps/server/src/server.ts");
   expect(integration.files).toContain("apps/server/src/system/CloudxUpdateCatalog.ts");
   expect(fs.readFileSync(path.join(release, "apps/server/src/server.ts"), "utf8"))
-    .toBe('const historicalBehavior = true;\nupdates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">;');
+    .toBe('const historicalBehavior = true;\nupdates?: CloudxUpdateApi;');
 });
 
 it("checks the entire migration before overwriting files when the legacy server has local edits", () => {
@@ -341,7 +342,7 @@ function fixture(service = "historical Settings", server = 'updates?: Pick<Cloud
   git(root, ["init"]);
   git(root, ["config", "user.name", "CloudX Test"]);
   git(root, ["config", "user.email", "test@invalid"]);
-  for (const [relative, content] of [[MANAGED_INTEGRATION_FILES[0], service], ["apps/server/src/server.ts", server], ["apps/server/src/terminal/TerminalProcess.ts", terminal]]) {
+  for (const [relative, content] of [["packages/shared/src/index.ts", 'export * from "./cloudxUpdate.js";\n'], [MANAGED_INTEGRATION_FILES[0], service], ["apps/server/src/server.ts", server], ["apps/server/src/terminal/TerminalProcess.ts", terminal]]) {
     fs.mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
     fs.writeFileSync(path.join(root, relative), content);
   }

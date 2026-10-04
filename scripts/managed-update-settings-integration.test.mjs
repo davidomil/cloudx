@@ -32,9 +32,12 @@ describe.each(historicalTargets)("managed integration with %s", (_name, commit) 
     expect(Object.keys(changes)).toEqual(MISSING_SETTINGS_FILES);
     for (const [file, source] of Object.entries(changes)) javascript(file, source);
     expect(changes["apps/server/src/server.ts"]).toContain("registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir), config.trustedOrigins)");
+    expect(changes["apps/server/src/server.ts"]).toContain('import { registerCloudxUpdateRoutes, type CloudxUpdateApi }');
+    expect(changes["apps/server/src/server.ts"]).toContain("updates?: CloudxUpdateApi");
     expect(changes["apps/server/src/server.ts"]).toContain("await services.workspace!.persistDurably()");
     expect(changes["apps/server/src/workspace/WorkspaceLayoutStore.ts"]).toContain("return this.serializeWorkspaceAccess(() => this.persist(true))");
     expect(changes["packages/shared/src/index.ts"]).toContain('export * from "./cloudxUpdate.js"');
+    expect(changes["packages/shared/src/index.ts"]).toContain('export * from "./cloudxUpdateBackups.js"');
     expect(changes["apps/web/src/ui/App.tsx"]).toContain("workspaceWrites.flushDurably(persistWorkspace)");
     expect(changes["apps/web/src/ui/App.tsx"]).toContain("useCloudxUpdate(settingsOpen, saveWorkspace)");
     expect(changes["apps/web/src/ui/App.tsx"]).toContain("cloudxUpdate={cloudxUpdate}");

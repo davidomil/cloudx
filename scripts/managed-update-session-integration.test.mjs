@@ -30,7 +30,8 @@ function historicalRuntime(commit) {
   const modules = new Map();
   function load(file, overrides = {}, cache = modules) {
     if (cache.has(file)) return cache.get(file).exports;
-    const source = overrides[file] ?? migrated[file] ?? settings[file] ?? copied[file] ?? (file === "packages/shared/src/cloudxUpdate.ts" ? fs.readFileSync(file, "utf8") : historical(file));
+    const source = overrides[file] ?? migrated[file] ?? settings[file] ?? copied[file]
+      ?? (["packages/shared/src/cloudxUpdate.ts", "packages/shared/src/cloudxUpdateBackups.ts"].includes(file) ? fs.readFileSync(file, "utf8") : historical(file));
     const compiled = ts.transpileModule(source, { fileName: file, reportDiagnostics: true,
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, esModuleInterop: true } });
     expect(compiled.diagnostics).toEqual([]);

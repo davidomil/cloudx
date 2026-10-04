@@ -3,12 +3,20 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CloudxUpdateChannel, CloudxUpdatePreview } from "@cloudx/shared";
+import type { CloudxUpdateChannel, CloudxUpdatePreview, CloudxUpdateBackupCleanup } from "@cloudx/shared";
 import { CloudxUpdateService } from "./CloudxUpdateService.js";
 
 const installed = "a".repeat(40);
 const target = "b".repeat(40);
 const selection = { channel: "main" as const, targetCommit: target };
+const backupId = "11111111-1111-4111-8111-111111111111";
+const retained = { backups: [{ id: `${backupId}:snapshot`, runId: backupId, kind: "snapshot", sourceCommit: installed,
+  targetCommit: target, createdAt: "2026-10-04T03:02:05Z", outcome: "succeeded", path: `/state/settings-update/${backupId}/snapshot`,
+  logicalBytes: 8192, allocatedBytes: 8192, reclaimableBytes: 4096 }] };
+const reviewed = { ...retained, id: backupId, createdAt: "2026-10-04T04:00:00Z", reclaimableBytes: 4096, estimateNote: "Shared allocation can retain bytes." };
+const cleaning: CloudxUpdateBackupCleanup = { id: backupId, state: "running", startedAt: reviewed.createdAt,
+  results: [{ id: retained.backups[0]!.id, runId: backupId, path: retained.backups[0]!.path, status: "pending", deletedLogicalBytes: 0 }],
+  freeSpace: [{ path: "/state", availableBytesBefore: 1024, availableBytesAfter: null }] };
 const checked = (channel: CloudxUpdateChannel = "main", currentCommit = installed): Omit<CloudxUpdatePreview, "runtime"> => ({
   channel, currentCommit, checkedAt: "2026-09-15T00:00:00Z", state: "available",
   target: { commit: target, name: "main", url: `https://github.com/davidomil/cloudx/commit/${target}` },
@@ -372,5 +380,98 @@ describe("CloudxUpdateService", () => {
     await expect(service.start(selection)).rejects.toMatchObject({ statusCode: 503, message: expect.not.stringContaining("secret") });
     expect(execute.mock.calls.filter(([, args]) => args[1] === "start")).toHaveLength(1);
     expect(await service.status()).toEqual({ available: true });
+  });
+
+  it("uses verified installed updater commands for backup inventory, preview, progress and confirmed deletion", async () => {
+    const { service, execute, catalog } = fixture();
+    execute.mockImplementation(async (_file, args) => ({ stdout: JSON.stringify({
+      backups: retained, "backup-preview": reviewed, "backup-cleanup-status": cleaning, "backup-cleanup": cleaning,
+    }[args[1] as "backups" | "backup-preview" | "backup-cleanup-status" | "backup-cleanup"]) }));
+    expect(await service.backups()).toEqual(retained);
+    expect(await service.previewBackupCleanup()).toEqual(reviewed);
+    expect(await service.backupCleanupStatus()).toEqual(cleaning);
+    expect(await service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true })).toEqual(cleaning);
+    const script = path.join(updaterRoot, "scripts/settings-update.mjs");
+    expect(execute.mock.calls.map(([, args]) => args)).toEqual([
+      [script, "backups", dataDir, String(process.pid)],
+      [script, "backup-preview", dataDir, String(process.pid)],
+      [script, "backup-cleanup-status", dataDir, String(process.pid)],
+      [script, "backup-cleanup", dataDir, String(process.pid), `--preview=${backupId}`, "--confirm-permanent-deletion"],
+    ]);
+    expect(execute).toHaveBeenCalledWith(process.execPath, expect.any(Array), expect.objectContaining({
+      cwd: path.resolve("."), timeout: 120_000, maxBuffer: 8 * 1024 * 1024,
+      env: expect.objectContaining({ CLOUDX_INSTALL_ROOT: path.resolve(".") }),
+    }));
+    expect(catalog.preview).not.toHaveBeenCalled();
+  });
+
+  it("preserves absent and terminal cleanup outcomes across server restarts", async () => {
+    const { service, execute, catalog } = fixture();
+    execute.mockResolvedValueOnce({ stdout: "null" });
+    expect(await service.backupCleanupStatus()).toBeNull();
+    const completed = { ...cleaning, state: "completed", finishedAt: "2026-10-04T04:01:00Z",
+      results: [{ ...cleaning.results[0]!, status: "failed", reason: "Permission denied; remaining data preserved.", deletedLogicalBytes: 1024 }],
+      freeSpace: [{ path: "/state", availableBytesBefore: 1024, availableBytesAfter: 1024 }] };
+    execute.mockResolvedValue({ stdout: JSON.stringify(completed) });
+    const restarted = new CloudxUpdateService(dataDir, execute, catalog, undefined, undefined, updaterRoot);
+    expect(await restarted.backupCleanupStatus()).toEqual(completed);
+  });
+
+  it.each(["backups", "previewBackupCleanup", "backupCleanupStatus", "cleanBackups"] as const)("rejects invalid installed output from %s", async method => {
+    const { service, execute } = fixture();
+    for (const stdout of ["invalid JSON", '{"backups":"everything"}']) {
+      execute.mockResolvedValue({ stdout });
+      await expect(service[method]({ previewId: backupId, confirmPermanentDeletion: true })).rejects.toMatchObject({ statusCode: 503 });
+    }
+  });
+
+  it.each([false, true])("preserves structured stale-preview errors from a runner that exits unsuccessfully: %s", async unsuccessfulExit => {
+    const { service, execute } = fixture();
+    const stdout = JSON.stringify({ error: "The reviewed snapshot changed. Review a new preview.", statusCode: 409 });
+    if (unsuccessfulExit) execute.mockRejectedValueOnce(Object.assign(new Error("process failed"), { stdout, stderr: "private diagnostic" }));
+    else execute.mockResolvedValueOnce({ stdout });
+    await expect(service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true })).rejects.toMatchObject({
+      statusCode: 409, message: "The reviewed snapshot changed. Review a new preview.",
+    });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("does not expose unstructured subprocess output or retry uncertain deletion", async () => {
+    const { service, execute } = fixture();
+    execute.mockRejectedValueOnce(Object.assign(new Error("private diagnostic"), { stdout: "unexpected output", stderr: "private diagnostic" }));
+    await expect(service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true })).rejects.toMatchObject({
+      statusCode: 503, message: expect.not.stringContaining("private"),
+    });
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("does not claim a cleanup started when the durable operation is absent", async () => {
+    const { service, execute } = fixture();
+    execute.mockResolvedValueOnce({ stdout: "null" });
+    await expect(service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true })).rejects.toMatchObject({ statusCode: 503 });
+  });
+
+  it("prevents update mutations and duplicate cleanup submissions while a cleanup launch is pending", async () => {
+    const { service, execute } = fixture();
+    let finish!: (value: { stdout: string }) => void;
+    execute.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true });
+    await expect(service.start(selection)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.selectChannel("releases")).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.previewBackupCleanup()).rejects.toMatchObject({ statusCode: 409 });
+    await expect(service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true })).rejects.toMatchObject({ statusCode: 409 });
+    finish({ stdout: JSON.stringify(cleaning) });
+    expect(await first).toEqual(cleaning);
+    execute.mockResolvedValueOnce({ stdout: JSON.stringify(reviewed) });
+    expect(await service.previewBackupCleanup()).toEqual(reviewed);
+  });
+
+  it("rejects unconfirmed cleanup input and modified installed coordinator code before host execution", async () => {
+    const { service, execute } = fixture();
+    await expect(service.cleanBackups({ previewId: "../snapshot", confirmPermanentDeletion: true })).rejects.toThrow("explicitly confirm permanent deletion");
+    fs.writeFileSync(path.join(updaterRoot, "scripts/managed-update.mjs"), "modified coordinator");
+    await expect(service.backups()).rejects.toMatchObject({ statusCode: 503 });
+    await expect(service.cleanBackups({ previewId: backupId, confirmPermanentDeletion: true })).rejects.toMatchObject({ statusCode: 503 });
+    expect(execute).not.toHaveBeenCalled();
   });
 });
