@@ -28,8 +28,8 @@ export function prepareMissingSettingsIntegration(readSource) {
   }
 
   insertAfter(SERVER, 'import { SessionStore } from "./sessionStore.js";\n',
-    'import { CloudxUpdateService } from "./system/CloudxUpdateService.js";\nimport { registerCloudxUpdateRoutes } from "./system/CloudxUpdateRoutes.js";\n');
-  insertAfter(SERVER, '  config?: ConfigService;\n', '  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">;\n');
+    'import { CloudxUpdateService } from "./system/CloudxUpdateService.js";\nimport { registerCloudxUpdateRoutes, type CloudxUpdateApi } from "./system/CloudxUpdateRoutes.js";\n');
+  insertAfter(SERVER, '  config?: ConfigService;\n', '  updates?: CloudxUpdateApi;\n');
   insertAfter(SERVER, '  if (services.forgeConnections) registerForgeConnectionRoutes(app, services.forgeConnections, config.trustedOrigins);\n',
     '  registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir), config.trustedOrigins);\n');
   insertAfter(SERVER, '  app.get("/api/workspace", async () => workspaceState(services));\n', `
@@ -46,7 +46,7 @@ export function prepareMissingSettingsIntegration(readSource) {
   // These are the existing serialized persistence and capacity-error contracts.
   requireAnchor(WORKSPACE, '  private async persist(requireDurable = false, state: WorkspacePersistenceState = this.persistenceState()): Promise<void> {');
   requireAnchor(WORKSPACE, '        if (requireDurable) {\n          throw error;\n        }');
-  insertAfter(SHARED, 'export * from "./forgeConnections.js";\n', 'export * from "./cloudxUpdate.js";\n');
+  insertAfter(SHARED, 'export * from "./forgeConnections.js";\n', 'export * from "./cloudxUpdate.js";\nexport * from "./cloudxUpdateBackups.js";\n');
 
   insertAfter(APP, 'import { SettingsDialog } from "./SettingsDialog.js";\n', 'import { useCloudxUpdate } from "./CloudxUpdatePanel.js";\n');
   insertAfter(APP, '  getWorkspace,\n', '  persistWorkspace,\n  persistWindowLayout,\n');

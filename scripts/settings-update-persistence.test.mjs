@@ -54,6 +54,8 @@ describe("Settings update workspace durability", () => {
       status: async () => current,
       preview: async () => preview,
       selectChannel: async channel => ({ ...preview, channel }),
+      backups: async () => ({ backups: [] }),
+      backupCleanupStatus: async () => null,
       start,
     };
     app = await buildServer(config, services);

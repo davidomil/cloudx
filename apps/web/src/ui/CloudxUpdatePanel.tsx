@@ -4,6 +4,7 @@ import { formatCapacityBytes, type CloudxUpdateCapacity, type CloudxUpdateChanne
 import { getCloudxUpdatePreview, getCloudxUpdateStatus, reassessCloudxUpdateCapacity, setCloudxUpdateChannel, startCloudxUpdate } from "../cloudxUpdateApi.js";
 import { HttpError } from "../api.js";
 import { ControlButton } from "./Control.js";
+import { CloudxUpdateBackupsPanel } from "./CloudxUpdateBackupsPanel.js";
 
 const pendingRunKey = "cloudx.update.pendingRun";
 const previousRunKey = "cloudx.update.previousRun";
@@ -252,6 +253,7 @@ export function CloudxUpdatePanel({ update, onOpenForge, CleanupPanel }: {
   const { status, preview, channel, previewLoading, starting, checking, reassessing, notice, error } = update;
   const [cleanupOpen, setCleanupOpen] = useState(false);
   const [cleanupBusy, setCleanupBusy] = useState(false);
+  const [backupCleanupBusy, setBackupCleanupBusy] = useState(true);
   const running = status?.run?.state === "running";
   const prepared = status?.run?.state === "prepared";
   const needsRepair = preview?.state === "current" && (preview.runtime.verification === "unverified"
@@ -261,13 +263,14 @@ export function CloudxUpdatePanel({ update, onOpenForge, CleanupPanel }: {
   const selectedTargetDiffers = preview?.target?.commit !== status?.run?.targetCommit;
   const confirmingResume = canResume && status?.confirmation?.targetCommit === status.run?.targetCommit;
   const confirmation = confirmingResume || status?.confirmation?.targetCommit === preview?.target?.commit ? status?.confirmation : undefined;
-  const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || reassessing || cleanupBusy || Boolean(error) || canResume && !selectedTargetDiffers;
+  const cleanupActive = cleanupBusy || backupCleanupBusy;
+  const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || reassessing || cleanupActive || Boolean(error) || canResume && !selectedTargetDiffers;
   const forgeBlocker = status?.forgeBlocker ?? status?.run?.forgeBlocker;
   return <section className="settings-section browser-notification-settings cloudx-update-settings" aria-label="CloudX updates">
     <h3>Update CloudX</h3>
     <p>Update CloudX and its application dependencies.</p>
     <label>Update channel
-      <select value={channel} onChange={event => update.selectChannel(event.target.value as CloudxUpdateChannel)} disabled={starting || running || checking || previewLoading || reassessing || cleanupBusy}>
+      <select value={channel} onChange={event => update.selectChannel(event.target.value as CloudxUpdateChannel)} disabled={starting || running || checking || previewLoading || reassessing || cleanupActive}>
         <option value="releases">Releases — published stable releases</option>
         <option value="main">Main — latest changes</option>
       </select>
@@ -294,19 +297,20 @@ export function CloudxUpdatePanel({ update, onOpenForge, CleanupPanel }: {
     {notice ? <p role="status">{notice}</p> : null}
     {error ? <p role="alert">{error}</p> : null}
     {confirmation ? <UpdateConfirmation key={`${confirmation.targetCommit}:${confirmation.message}:${confirmation.restoreSnapshotRunId}:${confirmation.requiresInterruption}`} confirmation={confirmation}
-      disabled={confirmingResume ? !status?.available || starting || checking || reassessing || cleanupBusy : startDisabled}
+      disabled={confirmingResume ? !status?.available || starting || checking || reassessing || cleanupActive : startDisabled}
       continueUpdate={consent => confirmingResume ? update.resume(consent) : update.start(consent)} /> : null}
-    {canResume && !confirmation ? <ControlButton tone="primary" onClick={() => void update.resume()} disabled={!status?.available || starting || checking || reassessing || cleanupBusy}>
+    {canResume && !confirmation ? <ControlButton tone="primary" onClick={() => void update.resume()} disabled={!status?.available || starting || checking || reassessing || cleanupActive}>
       {prepared ? starting ? "Activating update…" : "Activate prepared update" : starting ? "Resuming update…" : "Resume update"}
     </ControlButton> : null}
     {!confirmation || confirmingResume && selectedTargetDiffers ? <ControlButton tone="primary" onClick={() => void update.start()} disabled={startDisabled}>
       {starting ? "Starting update…" : running ? "Updating CloudX…" : canResume ? "Start selected target" : needsRepair ? "Rebuild and activate CloudX" : "Update CloudX and dependencies"}
     </ControlButton> : null}
-    <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading || reassessing || cleanupBusy}>Check update status</ControlButton>
-    {canResume ? <ControlButton size="compact" onClick={() => void update.reassessCapacity()} disabled={starting || checking || reassessing || cleanupBusy}>{reassessing ? "Rechecking capacity…" : "Recheck update capacity"}</ControlButton> : null}
-    {CleanupPanel && !running ? <ControlButton size="compact" onClick={() => setCleanupOpen(value => !value)} disabled={starting || checking || reassessing || cleanupBusy}>{cleanupOpen ? "Close Forge trash preview" : "Clean Forge environment trash"}</ControlButton> : null}
+    <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading || reassessing || cleanupActive}>Check update status</ControlButton>
+    {canResume ? <ControlButton size="compact" onClick={() => void update.reassessCapacity()} disabled={starting || checking || reassessing || cleanupActive}>{reassessing ? "Rechecking capacity…" : "Recheck update capacity"}</ControlButton> : null}
+    {CleanupPanel && !running ? <ControlButton size="compact" onClick={() => setCleanupOpen(value => !value)} disabled={starting || checking || reassessing || cleanupActive}>{cleanupOpen ? "Close Forge trash preview" : "Clean Forge environment trash"}</ControlButton> : null}
     {CleanupPanel && cleanupOpen && !running ? <CleanupPanel forgeOnly onBusyChange={setCleanupBusy} onComplete={() => { void update.reassessCapacity(); }} /> : null}
     <small>The update starts immediately and continues if you close Settings.</small>
+    <CloudxUpdateBackupsPanel updateActive={starting || running || checking || reassessing || cleanupBusy} onBusyChange={setBackupCleanupBusy} onComplete={update.check} />
   </section>;
 }
 

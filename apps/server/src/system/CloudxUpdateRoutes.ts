@@ -1,9 +1,12 @@
 import type { FastifyInstance } from "fastify";
-import { parseCloudxUpdateChannel, parseCloudxUpdateRequest } from "@cloudx/shared";
+import { parseCloudxUpdateChannel, parseCloudxUpdateRequest, parseCloudxUpdateBackupCleanupRequest } from "@cloudx/shared";
 import type { CloudxUpdateService } from "./CloudxUpdateService.js";
 import { runtimeBuild } from "./RuntimeBuild.js";
 
-export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">, trustedOrigins: string[]): void {
+export type CloudxUpdateApi = Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity"
+  | "backups" | "previewBackupCleanup" | "backupCleanupStatus" | "cleanBackups">;
+
+export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: CloudxUpdateApi, trustedOrigins: string[]): void {
   // The maintained updater integration also attests historical server builds.
   if (!app.hasRoute({ method: "GET", url: "/api/runtime" })) {
     app.get("/api/runtime", async (_request, reply) => {
@@ -19,6 +22,41 @@ export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: Pick<C
   app.get("/api/system/update/preview", async (_request, reply) => {
     reply.header("cache-control", "no-store");
     return updates.preview();
+  });
+
+  app.get("/api/system/update/backups", async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    return updates.backups();
+  });
+
+  app.post("/api/system/update/backups/preview", { bodyLimit: 1024 }, async (request, reply) => {
+    reply.header("cache-control", "no-store");
+    if (!request.headers.origin || !trustedOrigins.includes(request.headers.origin)) {
+      return reply.code(403).send({ error: "Review update backups from a trusted CloudX browser origin." });
+    }
+    const body = request.body;
+    if (body !== undefined && (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 0)) {
+      return reply.code(400).send({ error: "A backup preview request must contain no deletion options." });
+    }
+    return updates.previewBackupCleanup();
+  });
+
+  app.get("/api/system/update/backups/cleanup", async (_request, reply) => {
+    reply.header("cache-control", "no-store");
+    return updates.backupCleanupStatus();
+  });
+
+  app.post("/api/system/update/backups/cleanup", { bodyLimit: 1024 }, async (request, reply) => {
+    reply.header("cache-control", "no-store");
+    if (!request.headers.origin || !trustedOrigins.includes(request.headers.origin)) {
+      return reply.code(403).send({ error: "Delete update backups from a trusted CloudX browser origin." });
+    }
+    let selection;
+    try { selection = parseCloudxUpdateBackupCleanupRequest(request.body); }
+    catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
+    const cleanup = await updates.cleanBackups(selection);
+    reply.code(cleanup.state === "running" ? 202 : 200);
+    return cleanup;
   });
 
   app.post("/api/system/update/capacity", { bodyLimit: 1024 }, async (request, reply) => {

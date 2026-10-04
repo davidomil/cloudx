@@ -319,6 +319,8 @@ async function startCloudx(root, onCreated) {
   });
   const services = buildServices(config);
   services.updates = {
+    backups: async () => ({ backups: [] }),
+    backupCleanupStatus: async () => null,
     status: async () => ({
       available: false,
       unavailableReason: "Updates are disabled in the screenshot demo.",

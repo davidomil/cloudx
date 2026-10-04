@@ -14,6 +14,10 @@ const SETTINGS_FILES = [
   "apps/server/src/system/CloudxUpdateRoutes.ts",
   "apps/server/src/system/RuntimeBuild.ts",
   "packages/shared/src/cloudxUpdate.ts",
+  "packages/shared/src/cloudxUpdateBackups.ts",
+  "apps/web/src/ui/CloudxUpdateBackupsPanel.tsx",
+  "apps/web/src/ui/CloudxUpdateBackupsPanel.test.ts",
+  "apps/web/src/cloudxUpdateBackupsApi.ts",
   "apps/web/src/ui/CloudxUpdatePanel.tsx",
   // Historical builds typecheck these fixtures with the maintained contracts.
   "apps/server/src/system/CloudxUpdateService.test.ts",
@@ -28,7 +32,7 @@ const TERMINAL_CONTRACT_FILE = "apps/server/src/terminal/TerminalProcess.ts";
 const SERVER_FILE = "apps/server/src/server.ts";
 const LEGACY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start">';
 const MANAGED_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">';
-const CAPACITY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">';
+const BACKUP_SETTINGS_CONTRACT = 'CloudxUpdateApi';
 export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE, LEGACY_READINESS_SOURCE,
   "scripts/managed-update-settings-integration.mjs", "scripts/managed-update-session-integration.mjs", ...SESSION_PERSISTENCE_FILES,
   ...FORGE_INTEGRATION_SOURCE_FILES];
@@ -49,13 +53,24 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
   } else if (fs.existsSync(service) && !fs.readFileSync(service, "utf8").includes("installedUpdaterRoot")) {
     files.push(...SETTINGS_FILES);
     if (serverSource.includes(LEGACY_SETTINGS_CONTRACT)) {
-      migrated[SERVER_FILE] = serverSource.replace(LEGACY_SETTINGS_CONTRACT, CAPACITY_SETTINGS_CONTRACT);
+      migrated[SERVER_FILE] = serverSource.replace(LEGACY_SETTINGS_CONTRACT, BACKUP_SETTINGS_CONTRACT);
       files.push(SERVER_FILE);
     } else if (serverSource.includes(MANAGED_SETTINGS_CONTRACT)) {
-      migrated[SERVER_FILE] = serverSource.replace(MANAGED_SETTINGS_CONTRACT, CAPACITY_SETTINGS_CONTRACT);
+      migrated[SERVER_FILE] = serverSource.replace(MANAGED_SETTINGS_CONTRACT, BACKUP_SETTINGS_CONTRACT);
       files.push(SERVER_FILE);
     } else {
       throw new Error("Managed updater integration does not recognize the target server's Settings contract.");
+    }
+  }
+  if (files.includes(SERVER_FILE)) {
+    migrated[SERVER_FILE] = migrated[SERVER_FILE].replace('import { registerCloudxUpdateRoutes }', 'import { registerCloudxUpdateRoutes, type CloudxUpdateApi }');
+  }
+  if (files.includes("packages/shared/src/cloudxUpdateBackups.ts")) {
+    const indexFile = "packages/shared/src/index.ts";
+    const source = migrated[indexFile] ?? fs.readFileSync(integrationPath(release, indexFile), "utf8");
+    if (!source.includes("cloudxUpdateBackups.js")) {
+      migrated[indexFile] = `${source}\nexport * from "./cloudxUpdateBackups.js";\n`;
+      files.push(indexFile);
     }
   }
   const independentReadiness = fs.existsSync(server) && !serverSource.includes("/api/ready/terminals");
