@@ -1,6 +1,6 @@
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { statSync } from "node:fs";
+import { mkdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +13,7 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeReviewRevision, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
+import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { WorkspaceCleanupService } from "../workspace/WorkspaceCleanupService.js";
 import * as filesystemEvidence from "../filesystemIdentity.js";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
@@ -22,7 +23,8 @@ import type { ForgeLogger } from "./ForgeLog.js";
 import type { ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import { ForgeSettingsService } from "./ForgeSettingsService.js";
 import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
-import { ForgeWorkerReports } from "./ForgeWorkflowStore.js";
+import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import {
   ForgeRuntime,
   ForgeBranchConflictError,
@@ -46,10 +48,15 @@ const expectedRepository = {
 };
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
+  return gitWithEnvironment(cwd, args);
+}
+
+async function gitWithEnvironment(cwd: string, args: string[], environment?: NodeJS.ProcessEnv): Promise<string> {
   const { stdout } = await execute("git", args, {
       cwd,
       env: {
         ...process.env,
+        ...environment,
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: "/dev/null",
       },
@@ -65,15 +72,16 @@ function dependencies({ trustRepository = true } = {}): ForgeRuntimeDependencies
       cloneUrl: "https://github.com/cloudx/test.git",
       authorization: "Basic fixture-secret",
     })),
-    git: async (cwd, args) =>
-      git(
+    git: async (cwd, args, _signal, environment) =>
+      gitWithEnvironment(
         cwd,
-        ...args.map((argument) =>
+        args.map((argument) =>
           argument === "https://github.com/cloudx/test.git" &&
           ["fetch", "push", "ls-remote"].includes(args[0]!)
             ? origin
             : argument,
         ),
+        environment,
       ),
     dataDir: path.join(root, "data"),
     pathPolicy: new PathPolicy([root]),
@@ -1164,6 +1172,7 @@ describe("ForgeRuntime remote checkouts", () => {
     expect(await runtime.recover(workspace.id)).toEqual({
       workspace: undefined,
       tabIds: [],
+      cleanupComplete: true,
     });
   });
 
@@ -1297,7 +1306,7 @@ describe("ForgeRuntime publication handoff", () => {
 
     runtime = new ForgeRuntime(dependencies());
     expect(await runtime.recover(workspace.id)).toEqual({
-      workspace: outcome.status === "rejected" ? workspace : undefined,
+      workspace,
       tabIds: [],
     });
     if (outcome.status === "rejected") await expect(cleanup()).rejects.toThrow(refusal);
@@ -1356,7 +1365,7 @@ describe("ForgeRuntime publication handoff", () => {
     expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual(retained);
     runtime = new ForgeRuntime(dependencies());
     expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toEqual(retained);
-    expect(await runtime.recover(workspace.id)).toEqual({ workspace: undefined, tabIds: [] });
+    expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
     await expect(prepare(workspace.id)).rejects.toThrow("contains retained files");
     expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"))).toEqual(edits);
     expect(await fs.readFile(path.join(workspace.worktreePath, notes))).toEqual(edits);
@@ -3896,6 +3905,7 @@ describe("ForgeRuntime Codex tabs", () => {
     } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
     vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
     vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.sessions.discardPreparedTab).mockImplementation(async () => { vi.mocked(deps.sessions.listTabs).mockReturnValue([]); });
     const request = {
       id: workspace.id,
       worktreePath: workspace.worktreePath,
@@ -3960,6 +3970,7 @@ describe("ForgeRuntime Codex tabs", () => {
     } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>);
     vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
     vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.sessions.discardPreparedTab).mockImplementation(async () => { vi.mocked(deps.sessions.listTabs).mockReturnValue([]); });
     const controller = new AbortController();
     vi.mocked(deps.workspaceCommands.createTab).mockImplementation(async () => {
       controller.abort(new Error("cancelled"));
@@ -4673,5 +4684,329 @@ describe("Forge permanent workspace cleanup", () => {
     await fs.mkdir(workspace.worktreePath); await fs.writeFile(path.join(workspace.worktreePath, "new-work"), "preserve");
     await expect(runtime.discardWorkspace(workspace.id, remove)).rejects.toThrow(/ownership changed/);
     expect(await fs.readFile(path.join(workspace.worktreePath, "new-work"), "utf8")).toBe("preserve");
+  });
+});
+
+describe("Forge completed retained checkout reconciliation", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  async function legacyRetention(workspace: ForgeWorkspace, retainedPaths: string[], explicitRetainedPaths?: string[]) {
+    const manifest = path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`);
+    const owned = JSON.parse(await fs.readFile(manifest, "utf8"));
+    Object.assign(owned, { cleaned: true, cleanupHeadSha: headSha, retainedWorkspace: { worktreePath: workspace.worktreePath, retainedPaths }, explicitRetainedPaths });
+    await fs.writeFile(manifest, JSON.stringify(owned));
+    return { manifest, owned };
+  }
+
+  async function completedWorkflow(workspace: ForgeWorkspace, retainedPaths: string[], review = false) {
+    const dataDir = path.join(root, "data");
+    const store = new ForgeWorkflowStore(new PluginDataStore(dataDir));
+    const reports = new ForgeWorkerReports(dataDir);
+    const attemptId = randomUUID();
+    const report = { kind: "issue", title: "Completed fixture", body: "Validation evidence survives cleanup" };
+    const prepared = await reports.prepare(attemptId, { issue: 178 });
+    await fs.writeFile(prepared.reportPath, JSON.stringify(report));
+    const history = { tabId: "saved-tab", capturedAt: new Date().toISOString(), screen: { data: "Saved validation", cols: 80, rows: 24 } };
+    await new ForgeWorkerHistoryStore(dataDir).write(workspace.id, history);
+    const worker: ForgeWorker = { id: workspace.id, kind: review ? "review" : "issue", number: review ? 7 : 178,
+      title: "Preexisting retained checkout", repository: expectedRepository, repositoryPath: workspace.repositoryPath,
+      baseBranch: "main", templateId: "worker", status: "completed", headSha, attemptId,
+      retainedWorkspace: { worktreePath: workspace.worktreePath, retainedPaths }, autoPost: false,
+      startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    await store.write([worker]);
+    const provider = { getIssue: vi.fn(async (number: number) => ({ number, state: "closed" })),
+      getChangeRequestStatus: vi.fn(async (number: number) => ({ number, state: "merged", merged: true, headSha,
+        headBranch: workspace.branch, baseBranch: "main", linkedIssues: [] })) };
+    const deps: ForgeWorkflowDependencies = {
+      settings: () => ({ repository: expectedRepository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "worker", workerModel: "gpt-6-astra", workerReasoningEffort: "xhigh", reviewModel: "gpt-6-astra", reviewReasoningEffort: "xhigh", maxRunMinutes: 60 }),
+      refreshPublicationCredentials: async () => {}, runtime, store, reports, notify: vi.fn(),
+      provider: () => provider as unknown as ReturnType<ForgeWorkflowDependencies["provider"]>,
+    };
+    return { service: new ForgeWorkflowService(deps), deps, store, reports, provider, attemptId, report, history };
+  }
+
+  it.each([false, true])("loads and removes a completed generated-only checkout through authoritative closure (review: %s)", async review => {
+    const workspace = await prepare(randomUUID(), review);
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\nnode_modules/\ndist/\n*.tsbuildinfo\n");
+    for (const directory of ["node_modules", "dist"]) {
+      await fs.mkdir(path.join(workspace.worktreePath, directory));
+      await fs.writeFile(path.join(workspace.worktreePath, directory, "generated.bin"), Buffer.alloc(4096));
+    }
+    await fs.writeFile(path.join(workspace.worktreePath, "tsconfig.tsbuildinfo"), JSON.stringify({ fileNames: ["./README.md"], fileInfos: ["fixture-hash"], version: "6.0.3" }));
+    const { manifest } = await legacyRetention(workspace, ["dist", "node_modules", "tsconfig.tsbuildinfo", "already-missing"]);
+    const f = await completedWorkflow(workspace, ["dist", "node_modules", "tsconfig.tsbuildinfo", "already-missing"], review);
+    try {
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(JSON.parse(await fs.readFile(manifest, "utf8"))).toMatchObject({ cleaned: true });
+      expect(JSON.parse(await fs.readFile(manifest, "utf8")).retainedWorkspace).toBeUndefined();
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      expect(await new ForgeWorkerHistoryStore(path.join(root, "data")).read(workspace.id)).toEqual(f.history);
+      expect(await f.service.workerHistory(workspace.id)).toEqual(f.history);
+      expect(review ? f.provider.getChangeRequestStatus : f.provider.getIssue).toHaveBeenCalledOnce();
+      await f.service.dispose();
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+    } finally { await f.service.dispose(); }
+  });
+
+  it("recomputes named evidence and stale protections while pruning generated siblings under generic report directories", async () => {
+    const workspace = await prepare(randomUUID());
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\n.cloudx/\ntest-results/\n*.tsbuildinfo\n");
+    for (const directory of [".cloudx/node_modules", "test-results/dist"]) {
+      await fs.mkdir(path.join(workspace.worktreePath, directory), { recursive: true });
+      await fs.writeFile(path.join(workspace.worktreePath, directory, "generated.bin"), Buffer.alloc(4096));
+    }
+    await fs.writeFile(path.join(workspace.worktreePath, ".cloudx/evidence.log"), "Named durable validation");
+    await fs.writeFile(path.join(workspace.worktreePath, "test-results/reproduction.txt"), "Useful reproduction");
+    await fs.writeFile(path.join(workspace.worktreePath, "research.tsbuildinfo"), "Human investigation, not a compiler cache");
+    const { manifest } = await legacyRetention(workspace, [".cloudx", "test-results", "obsolete"], [".cloudx/evidence.log", "missing.log"]);
+    const f = await completedWorkflow(workspace, [".cloudx", "test-results", "obsolete"]);
+    try {
+      await f.service.poll();
+      const retained = (await f.store.read())[0]!.retainedWorkspace!;
+      expect(retained.retainedPaths).toEqual([".cloudx/evidence.log", "research.tsbuildinfo", "test-results"]);
+      expect(retained.reason).toContain(".cloudx/evidence.log");
+      expect(retained.reason).not.toContain("missing.log");
+      for (const directory of [".cloudx/node_modules", "test-results/dist"]) await expect(fs.lstat(path.join(workspace.worktreePath, directory))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(path.join(workspace.worktreePath, "test-results/reproduction.txt"), "utf8")).toBe("Useful reproduction");
+      await fs.rm(path.join(workspace.worktreePath, ".cloudx/evidence.log"));
+      await fs.rm(path.join(workspace.worktreePath, "test-results"), { recursive: true });
+      await fs.rm(path.join(workspace.worktreePath, "research.tsbuildinfo"));
+      await f.service.dispose();
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+      expect(JSON.parse(await fs.readFile(manifest, "utf8")).retainedWorkspace).toBeUndefined();
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await f.service.dispose(); }
+  });
+
+  it("keeps retention status checks from changing the index authorized for removal", async () => {
+    const deps = dependencies();
+    const executeGit = deps.git!;
+    const inspections: NodeJS.ProcessEnv[] = [];
+    deps.git = async (cwd, args, signal, environment) => {
+      if (args[0] === "status") inspections.push(environment!);
+      return executeGit(cwd, args, signal, environment);
+    };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare(randomUUID());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).resolves.toBeUndefined();
+    expect(inspections.length).toBeGreaterThan(0);
+    expect(inspections.every(environment => environment.GIT_OPTIONAL_LOCKS === "0")).toBe(true);
+    await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("clears a legacy retained receipt when the entire already-cleaned checkout is missing", async () => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["already-missing"]);
+    await fs.rm(workspace.worktreePath, { recursive: true });
+    runtime = new ForgeRuntime(dependencies());
+    expect(await runtime.recover(workspace.id)).toMatchObject({ workspace });
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).resolves.toBeUndefined();
+    expect(JSON.parse(await fs.readFile(manifest, "utf8")).retainedWorkspace).toBeUndefined();
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).resolves.toBeUndefined();
+  });
+
+  it("resumes partial owned removal after restart without requiring already-deleted Git metadata", async () => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) {
+        await remove(path.join(String(target), ".git"), { recursive: true });
+        throw new Error("Interrupted after partial checkout deletion");
+      }
+      return remove(target, options);
+    });
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Interrupted after partial");
+    interruption.mockRestore();
+    const pending = JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval;
+    expect(pending.path).toContain(`cleanup-${workspace.id}-`);
+    await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(pending.path, "README.md"), "utf8")).toBe("Initial content\n");
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).resolves.toBeUndefined();
+    await expect(fs.lstat(pending.path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toBeUndefined();
+    expect(JSON.parse(await fs.readFile(manifest, "utf8")).retainedWorkspace).toBeUndefined();
+  });
+
+  it("reconciles a failed partial removal through authoritative completion after workflow and runtime restart", async () => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const f = await completedWorkflow(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) {
+        await remove(path.join(String(target), ".git"), { recursive: true });
+        throw new Error("Interrupted removal needs restart reconciliation");
+      }
+      return remove(target, options);
+    });
+    try {
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: "Interrupted removal needs restart reconciliation" });
+      interruption.mockRestore();
+      await f.service.dispose();
+      f.deps.runtime = new ForgeRuntime(dependencies());
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+      expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toBeUndefined();
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      expect(await f.service.workerHistory(workspace.id)).toEqual(f.history);
+    } finally { interruption.mockRestore(); await f.service.dispose(); }
+  });
+
+  it.each(["added", "modified"] as const)("preserves %s surviving files after a partial removal and workflow restart", async changed => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const f = await completedWorkflow(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) {
+        await remove(path.join(String(target), ".git"), { recursive: true });
+        throw new Error("Interrupted after partial checkout deletion");
+      }
+      return remove(target, options);
+    });
+    try {
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed" });
+      interruption.mockRestore();
+      const pending = JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval;
+      const file = changed === "added" ? "recovered-investigation.txt" : "README.md";
+      await fs.writeFile(path.join(pending.path, file), "Recovered investigation must survive restart\n");
+      await f.service.dispose();
+      f.deps.runtime = new ForgeRuntime(dependencies());
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining(file) });
+      expect(await fs.readFile(path.join(pending.path, file), "utf8")).toBe("Recovered investigation must survive restart\n");
+      expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toEqual(pending);
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      expect(await f.service.workerHistory(workspace.id)).toEqual(f.history);
+      await f.service.poll();
+      expect(await fs.readFile(path.join(pending.path, file), "utf8")).toBe("Recovered investigation must survive restart\n");
+    } finally { interruption.mockRestore(); await f.service.dispose(); }
+  });
+
+  it.each(["canonical", "staged"] as const)("preserves a changed %s directory identity after removal interruption", async changed => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) throw new Error("Stopped before recursive removal");
+      return remove(target, options);
+    });
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Stopped before");
+    interruption.mockRestore();
+    const pending = JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval;
+    const target = changed === "canonical" ? workspace.worktreePath : pending.path;
+    if (changed === "staged") await fs.rename(target, `${target}-original`);
+    await fs.mkdir(target);
+    await fs.writeFile(path.join(target, "new-source.txt"), "Preserve unrelated work");
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("ownership changed");
+    expect(await fs.readFile(path.join(target, "new-source.txt"), "utf8")).toBe("Preserve unrelated work");
+    expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toEqual(pending);
+  });
+
+  it.each(["missing", "invalid"] as const)("preserves interrupted removal with %s contents authorization", async authorization => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) {
+        await remove(path.join(String(target), ".git"), { recursive: true });
+        throw new Error("Stop partial removal");
+      }
+      return remove(target, options);
+    });
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Stop partial removal");
+    interruption.mockRestore();
+    const owned = JSON.parse(await fs.readFile(manifest, "utf8"));
+    if (authorization === "missing") delete owned.cleanupRemovalContents;
+    else owned.cleanupRemovalContents = [{ path: "../escape", fingerprint: "a".repeat(64) }];
+    await fs.writeFile(manifest, JSON.stringify(owned));
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow(authorization === "missing" ? "no authorized contents inventory" : "ownership record is missing or invalid");
+    expect(await fs.readFile(path.join(owned.cleanupRemoval.path, "README.md"), "utf8")).toBe("Initial content\n");
+    expect(JSON.parse(await fs.readFile(manifest, "utf8"))).toEqual(owned);
+  });
+
+  it("revalidates staged ownership after the final asynchronous quiescence check", async () => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) throw new Error("Stop staged removal");
+      return remove(target, options);
+    });
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Stop staged removal");
+    interruption.mockRestore();
+    const pending = JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval;
+    const deps = dependencies();
+    let checks = 0;
+    vi.mocked(deps.sessions.listTabs).mockImplementation(() => {
+      if (++checks === 3) {
+        renameSync(pending.path, `${pending.path}-original`);
+        mkdirSync(pending.path);
+        writeFileSync(path.join(pending.path, "new-source.txt"), "Preserve replacement during quiescence");
+      }
+      return [];
+    });
+    runtime = new ForgeRuntime(deps);
+    const cleanup = runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
+    await expect(cleanup).rejects.toThrow("ownership changed");
+    expect(await fs.readFile(path.join(pending.path, "new-source.txt"), "utf8")).toBe("Preserve replacement during quiescence");
+    expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toEqual(pending);
+  });
+
+  it("preserves an already-retained checkout while a worker process remains active", async () => {
+    const workspace = await prepare(randomUUID());
+    await legacyRetention(workspace, ["obsolete"]);
+    const tabDirectory = path.join(root, "data", "forge-workers", "tabs");
+    await fs.mkdir(tabDirectory, { recursive: true });
+    await fs.writeFile(path.join(tabDirectory, "active-tab.json"), JSON.stringify({ workerId: workspace.id, tabId: "active-tab", closed: false, quiescent: false }));
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Stop the worker process");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Initial content\n");
+  });
+
+  it("preserves retained contents used by an unrelated active session", async () => {
+    const workspace = await prepare(randomUUID());
+    await legacyRetention(workspace, ["obsolete"]);
+    const deps = dependencies();
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([{ ...workerTab(workspace), ownerPluginId: "other-plugin", pluginMetadata: {} }]);
+    runtime = new ForgeRuntime(deps);
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("An active session still uses");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8")).toBe("Initial content\n");
+  });
+
+  it("preserves tracked build-info source and symbolic links named as standalone build-info", async () => {
+    const workspace = await prepare(randomUUID());
+    const compilerCache = JSON.stringify({ root: ["./README.md"], version: "6.0.3" });
+    await fs.writeFile(path.join(workspace.worktreePath, "tracked.tsbuildinfo"), compilerCache);
+    await git(workspace.worktreePath, "add", "tracked.tsbuildinfo");
+    await git(workspace.worktreePath, "-c", "user.name=Forge Test", "-c", "user.email=forge-test@example.invalid", "commit", "-m", "TEST: source fixture");
+    const intended = await git(workspace.worktreePath, "rev-parse", "HEAD");
+    await fs.writeFile(path.join(workspace.worktreePath, "tracked.tsbuildinfo"), "Tracked source investigation");
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\n*.tsbuildinfo\n");
+    const outside = path.join(root, "outside.tsbuildinfo");
+    await fs.writeFile(outside, compilerCache);
+    await fs.symlink(outside, path.join(workspace.worktreePath, "linked.tsbuildinfo"));
+    await legacyRetention(workspace, ["tracked.tsbuildinfo", "linked.tsbuildinfo"]);
+    expect(await runtime.cleanup({ ...workspace, expectedHeadSha: intended })).toMatchObject({ retainedPaths: ["linked.tsbuildinfo", "tracked.tsbuildinfo"] });
+    expect(await fs.readFile(path.join(workspace.worktreePath, "tracked.tsbuildinfo"), "utf8")).toBe("Tracked source investigation");
+    expect(await fs.readlink(path.join(workspace.worktreePath, "linked.tsbuildinfo"))).toBe(outside);
+    expect(await fs.readFile(outside, "utf8")).toBe(compilerCache);
   });
 });

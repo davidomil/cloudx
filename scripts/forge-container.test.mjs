@@ -23,6 +23,12 @@ describe('Forge container creation client', () => {
     await expect(createForgeContainer({ ...input, attemptId: 'old' }, request)).rejects.toThrow('attempt IDs');
     expect(request).toHaveBeenCalledTimes(1);
   });
+  it('forwards specifically named evidence and its tested commit to the lifecycle owner', async () => {
+    const specification = { ...input.specification, retentionReason: 'Regression log', evidencePaths: ['/work/evidence/test.log'], commitSha: 'c'.repeat(40) };
+    const request = vi.fn(async () => ({ ok: true, json: async () => ({ id: 'resource' }) }));
+    await createForgeContainer({ ...input, specification }, request);
+    expect(JSON.parse(request.mock.calls[0][1].body)).toEqual({ ...specification, attemptId: input.attemptId });
+  });
   it('uses the configured loopback HTTPS installation and its self-signed certificate', async () => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cloudx-container-https-'));
     const key = path.join(directory, 'key.pem'), certificate = path.join(directory, 'certificate.pem');

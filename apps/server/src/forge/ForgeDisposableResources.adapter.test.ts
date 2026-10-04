@@ -5,8 +5,17 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ForgeWorker } from "@cloudx/shared";
 import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableResources } from "./ForgeDisposableResources.js";
+import { Header } from "tar";
 
 const execute = vi.hoisted(() => vi.fn());
+function evidenceTar(entries: { path: string; data: string }[]): Buffer {
+  return Buffer.concat([...entries.flatMap(entry => {
+    const data = Buffer.from(entry.data);
+    const header = new Header({ path: entry.path, type: "File", size: data.length, mode: 0o600 });
+    header.encode();
+    return [header.block!, data, Buffer.alloc((512 - data.length % 512) % 512)];
+  }), Buffer.alloc(1024)]);
+}
 vi.mock("node:child_process", async importOriginal => {
   const original = await importOriginal<typeof import("node:child_process")>();
   const { promisify } = await import("node:util");
@@ -77,5 +86,41 @@ describe("Docker creation rejection receipts", () => {
       expect((await reopen().preview())[0]).toMatchObject({ eligible: false, sizeUnavailable: true });
     }
     expect(execute.mock.calls.filter(([, args]) => args[0] === "container").every(([, args]) => args[1] === "ls")).toBe(true);
+  });
+
+  it("uses the production Docker adapter to stop, safely export, verify and remove an exact completed environment", async () => {
+    const id = "a".repeat(64);
+    let labels: Record<string, string> = {};
+    let running = true;
+    let removed = false;
+    const created = new Date().toISOString();
+    execute.mockImplementation(async (_command: string, args: string[], options: { encoding?: string }) => {
+      if (args[0] === "info") return { stdout: "same-engine\n" };
+      if (args[0] === "create") {
+        labels = Object.fromEntries(args.flatMap((arg, index) => arg === "--label" ? [args[index + 1]!.split("=")] : []));
+        return { stdout: `${id}\n` };
+      }
+      if (args[1] === "inspect") {
+        if (removed) throw Object.assign(new Error("absent"), { stderr: `Error: No such container: ${id}` });
+        return { stdout: JSON.stringify([{ Id: id, Created: created, Config: { Labels: labels }, State: { Running: running }, SizeRw: 2_048 }]) };
+      }
+      if (args[1] === "stop") { running = false; return { stdout: id }; }
+      if (args[1] === "cp") {
+        expect(args).toEqual(["container", "cp", `${id}:/work/evidence`, "-"]);
+        expect(options.encoding).toBe("buffer");
+        return { stdout: evidenceTar([{ path: "evidence/result.log", data: "test passed" }, { path: "evidence/node_modules/disposable", data: "dependency" }]) };
+      }
+      if (args[1] === "rm") { expect(running).toBe(false); expect(args).toEqual(["container", "rm", id]); removed = true; return { stdout: id }; }
+      throw new Error(`Unexpected Docker operation: ${args.join(" ")}`);
+    });
+    worker.headSha = "b".repeat(40);
+    const resource = await reopen().create(worker, { ...input, image: "node:22", retentionReason: "Specific test log", evidencePaths: ["/work/evidence"] });
+    worker.status = "completed";
+    await reopen().retire(worker);
+    expect((await reopen().records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 2048, evidence: { state: "verified", bytes: 11 } });
+    const manifest = await reopen().readEvidence(resource.id);
+    expect(manifest).toMatchObject({ owner: resource.owner, commitSha: worker.headSha, commitSource: "worker", files: [{ path: "work/evidence/result.log", bytes: 11 }] });
+    expect((await reopen().evidenceFile(resource.id, "work/evidence/result.log")).toString()).toBe("test passed");
+    expect(execute.mock.calls.some(([, args]) => args.includes("prune") || args.includes("--volumes") || args.includes("-v"))).toBe(false);
   });
 });

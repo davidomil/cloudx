@@ -1,38 +1,16 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import type { ForgeWorker, WorkspaceCleanupCandidate } from "@cloudx/shared";
+import type { ForgeWorker, WorkspaceCleanupCandidate, DisposableContainerInput, DisposableResource, ForgeResourceConsumer as Consumer, EvidenceDecision, ForgeEvidenceManifest } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
+import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, type ContainerEvidenceContent } from "./ForgeContainerEvidence.js";
+
+export type { DisposableContainerInput, DisposableResource, EvidenceDecision } from "@cloudx/shared";
 
 const execute = promisify(execFile);
 const resourceLabel = "cloudx.forge.resource";
 const ownerLabel = "cloudx.forge.worker";
 const attemptLabel = "cloudx.forge.attempt";
-interface Consumer { workerId: string; attemptId: string }
-export interface DisposableContainerInput {
-  image: string;
-  name: string;
-  command: string[];
-  consumers?: Consumer[];
-  retentionReason?: string;
-}
-export interface DisposableResource {
-  id: string;
-  kind: "container";
-  engineId: string;
-  containerId?: string;
-  created?: string;
-  creationRejected?: true;
-  name: string;
-  owner: Consumer;
-  consumers: Consumer[];
-  retentionReason?: string;
-  state: "creating" | "owned" | "deleting" | "deleted" | "blocked" | "failed";
-  reason: string;
-  allocatedBytes?: number;
-  reclaimedBytes: number;
-  updatedAt: string;
-}
 export interface ContainerIdentity {
   id: string;
   created: string;
@@ -47,6 +25,7 @@ export interface DisposableContainerHost {
   inspect(id: string): Promise<ContainerIdentity | undefined>;
   stop(id: string): Promise<void>;
   remove(id: string): Promise<void>;
+  readEvidence?(id: string, paths: string[]): Promise<ContainerEvidenceContent[]>;
 }
 interface ResourceJournal {
   resources: DisposableResource[];
@@ -58,15 +37,18 @@ export class ContainerCreationRejectedError extends Error {}
 /** Only creation receipts grant authority; names and discovered labels alone never do. */
 export class ForgeDisposableResources {
   private readonly journal: JsonStateFile;
+  private readonly evidenceArchive: ForgeContainerEvidence;
   private tail = Promise.resolve();
   constructor(dataDir: string, private readonly workers: () => Promise<ForgeWorker[]>, private readonly host: DisposableContainerHost = new DockerDisposableContainerHost()) {
     this.journal = new JsonStateFile(dataDir, "forge-disposable-resources.json", "Forge disposable resources", 0o600);
+    this.evidenceArchive = new ForgeContainerEvidence(dataDir);
   }
 
   create(worker: ForgeWorker, input: DisposableContainerInput): Promise<DisposableResource> {
     return this.serial(async () => {
       validateContainerInput(input);
       if (!worker.attemptId || !["running", "starting"].includes(worker.status)) throw new Error("A current running worker attempt must own resource creation.");
+      if (worker.headSha && !validCommit(worker.headSha)) throw new Error("Worker commit provenance must be a full Git object identity.");
       const owner = { workerId: worker.id, attemptId: worker.attemptId };
       const consumers = [owner, ...(input.consumers ?? []).filter(item => !sameConsumer(item, owner))];
       const workers = await this.workers();
@@ -75,7 +57,10 @@ export class ForgeDisposableResources {
       const state = await this.read();
       const resource: DisposableResource = {
         id: randomUUID(), kind: "container", engineId: await this.host.engineId(), name: input.name,
-        owner, consumers, retentionReason: input.retentionReason, state: "creating", reason: "Creation intent recorded before Docker creation.", reclaimedBytes: 0, updatedAt: now(),
+        owner, consumers, retentionReason: input.retentionReason,
+        ...((input.retentionReason || input.evidencePaths) ? { evidence: { state: "pending" as const, paths: input.evidencePaths ?? [],
+          ...(input.commitSha ? { commitSha: input.commitSha, commitSource: "declared" as const } : worker.headSha ? { commitSha: worker.headSha, commitSource: "worker" as const } : {}) } } : {}),
+        state: "creating", reason: "Creation intent recorded before Docker creation.", reclaimedBytes: 0, updatedAt: now(),
       };
       state.resources.push(resource);
       await this.journal.write(state);
@@ -104,6 +89,52 @@ export class ForgeDisposableResources {
   }
 
   async records(): Promise<DisposableResource[]> { return structuredClone((await this.read()).resources); }
+
+  decideEvidence(resourceId: string, decision: EvidenceDecision): Promise<DisposableResource> {
+    return this.serial(async () => {
+      validateEvidenceDecision(decision);
+      const state = await this.read();
+      const resource = state.resources.find(item => item.id === resourceId);
+      if (!resource) throw new Error("Unknown disposable resource.");
+      const blocker = await this.consumerProtection(resource, state);
+      if (blocker) throw new Error(blocker);
+      if (resource.state === "deleted") throw new Error("The disposable environment has already been removed.");
+      if (!resource.retentionReason && !resource.evidence) throw new Error("This disposable environment has no evidence hold to review.");
+      if (resource.evidence?.state === "verified") {
+        if (decision.action !== "export" || decision.evidencePaths !== undefined || decision.commitSha !== undefined) throw new Error("Verified evidence is immutable; retry export without changing its provenance to complete cleanup.");
+        await this.removeRecorded(resource, state);
+        return structuredClone(resource);
+      }
+      resource.evidence ??= { state: "pending", paths: [] };
+      if (decision.action === "discard") resource.evidence.state = "discarded";
+      else {
+        if (decision.evidencePaths) resource.evidence.paths = decision.evidencePaths;
+        if (decision.commitSha) { resource.evidence.commitSha = decision.commitSha; resource.evidence.commitSource = "declared"; }
+        if (decision.action === "export" && !validEvidencePaths(resource.evidence.paths)) throw new Error("Select specific absolute evidence paths before releasing this hold.");
+        resource.evidence.state = decision.action === "keep" ? "kept" : "pending";
+      }
+      if (decision.action === "export") await this.recordEvidenceCommit(resource);
+      resource.reason = `Evidence decision recorded: ${decision.action}.`;
+      resource.updatedAt = now();
+      await this.journal.write(state);
+      await this.removeRecorded(resource, state);
+      return structuredClone(resource);
+    });
+  }
+
+  async readEvidence(resourceId: string): Promise<ForgeEvidenceManifest> {
+    const resource = (await this.read()).resources.find(item => item.id === resourceId);
+    if (!resource) throw new Error("Unknown disposable resource.");
+    return structuredClone((await this.evidenceArchive.read(resource)).manifest);
+  }
+
+  async evidenceFile(resourceId: string, filePath: string): Promise<Buffer> {
+    const resource = (await this.read()).resources.find(item => item.id === resourceId);
+    if (!resource) throw new Error("Unknown disposable resource.");
+    const archive = await this.evidenceArchive.read(resource);
+    if (!archive.manifest.files.some(item => item.path === filePath)) throw new Error("Unknown evidence file.");
+    return Buffer.from(archive.contents[filePath]!, "base64");
+  }
 
   preview(): Promise<WorkspaceCleanupCandidate[]> {
     return this.serial(async () => {
@@ -167,18 +198,33 @@ export class ForgeDisposableResources {
     if (resource.state === "deleted") return;
     try {
       if (await this.recoverCreation(resource) === "deleted") return;
-      const protection = await this.protection(resource, state);
+      const protection = await this.consumerProtection(resource, state);
       if (protection) { resource.state = "blocked"; resource.reason = protection; return; }
       let identity = await this.currentIdentity(resource);
-      if (!identity) { resource.state = "deleted"; resource.reason = "Recorded container is already absent; cleanup reconciled."; return; }
+      if (!identity) {
+        if (resource.evidence?.state === "exporting") resource.evidence = await this.evidenceArchive.recover(resource) ?? { ...resource.evidence, state: "missing" };
+        if (resource.evidence?.state === "verified") await this.evidenceArchive.read(resource);
+        else if ((resource.retentionReason || resource.evidence) && resource.evidence?.state !== "discarded") resource.evidence = { ...resource.evidence, paths: resource.evidence?.paths ?? [], state: "missing" };
+        if (resource.removalStartedAt) resource.reclaimedBytes = resource.allocatedBytes ?? 0;
+        resource.state = "deleted"; resource.allocatedBytes = 0;
+        resource.reason = resource.evidence?.state === "missing" ? "Recorded container is already absent; unexported evidence is unavailable. Cleanup reconciled without claiming an export." : "Recorded container is already absent; cleanup reconciled."; return;
+      }
       resource.allocatedBytes = identity.writableBytes;
-      resource.state = "deleting";
-      resource.reason = "Deletion intent saved; revalidating identity and consumers.";
+      resource.reason = "Quiescence intent saved; revalidating identity and consumers.";
       await this.journal.write(state);
       if (identity.running) {
-        await this.assertRemovable(resource, state);
+        await this.assertQuiescentConsumers(resource, state);
         await this.host.stop(identity.id);
       }
+      identity = await this.assertQuiescentConsumers(resource, state);
+      if (identity?.running) throw new Error("The owned container became active during cleanup; it was preserved.");
+      await this.preserveEvidence(resource, state, Boolean(identity));
+      const evidenceProtection = this.evidenceProtection(resource);
+      if (evidenceProtection) { resource.state = "blocked"; resource.reason = evidenceProtection; return; }
+      resource.state = "deleting";
+      resource.removalStartedAt ??= now();
+      resource.reason = "Evidence release and deletion intent saved; revalidating identity and consumers.";
+      await this.journal.write(state);
       identity = await this.assertRemovable(resource, state);
       if (identity?.running) throw new Error("The owned container became active during cleanup; it was preserved.");
       if (identity) await this.host.remove(identity.id);
@@ -202,7 +248,50 @@ export class ForgeDisposableResources {
     return identity;
   }
   private async protection(resource: DisposableResource, state: ResourceJournal): Promise<string | undefined> {
-    if (resource.retentionReason) return `Explicit evidence retention: ${resource.retentionReason}`;
+    const blocker = await this.consumerProtection(resource, state);
+    if (blocker) return blocker;
+    if (resource.evidence?.state === "verified") await this.evidenceArchive.read(resource);
+    return this.evidenceProtection(resource);
+  }
+  private evidenceProtection(resource: DisposableResource): string | undefined {
+    if (!resource.retentionReason && !resource.evidence) return undefined;
+    if (resource.evidence?.state === "verified" || resource.evidence?.state === "discarded" || resource.evidence?.state === "missing") return undefined;
+    if (resource.evidence?.state === "kept") return `Evidence hold explicitly kept for review: ${resource.retentionReason ?? resource.evidence.paths.join(", ")}. Idle container is stopped; export or confirm discard to release it.`;
+    if (!resource.evidence?.paths.length) return `Explicit evidence retention requires review: ${resource.retentionReason}. Select specific paths to export, keep the hold or confirm discard. Idle container is stopped after all consumers close.`;
+    return `Specific evidence export pending: ${resource.evidence.paths.join(", ")}. ${resource.retentionReason ?? ""}`;
+  }
+  private async assertQuiescentConsumers(resource: DisposableResource, state: ResourceJournal): Promise<ContainerIdentity | undefined> {
+    const identity = await this.currentIdentity(resource);
+    const blocker = await this.consumerProtection(resource, state);
+    if (blocker) throw new Error(blocker);
+    return identity;
+  }
+  private async preserveEvidence(resource: DisposableResource, state: ResourceJournal, present: boolean): Promise<void> {
+    if (!resource.evidence || ["kept", "discarded", "missing"].includes(resource.evidence.state)) return;
+    if (resource.evidence.state === "verified") { await this.evidenceArchive.read(resource); return; }
+    if (!validEvidencePaths(resource.evidence.paths)) return;
+    await this.recordEvidenceCommit(resource);
+    const recovered = await this.evidenceArchive.recover(resource);
+    if (recovered) { resource.evidence = recovered; await this.journal.write(state); return; }
+    if (!present) throw new Error("The container disappeared before evidence export; required evidence is unavailable.");
+    if (!this.host.readEvidence) throw new Error("The container host does not support evidence export.");
+    resource.evidence.state = "exporting";
+    resource.reason = `Evidence export intent saved: ${resource.evidence.paths.join(", ")}.`;
+    await this.journal.write(state);
+    const identity = await this.assertQuiescentConsumers(resource, state);
+    if (!identity || identity.running) throw new Error("Evidence export requires the exact stopped owned container.");
+    const contents = await this.host.readEvidence(identity.id, resource.evidence.paths);
+    const afterExport = await this.assertQuiescentConsumers(resource, state);
+    if (afterExport?.running) throw new Error("The container became active during evidence export; it was preserved.");
+    resource.evidence = await this.evidenceArchive.export(resource, contents, async receipt => { resource.evidence = receipt; await this.journal.write(state); });
+    await this.journal.write(state);
+  }
+  private async recordEvidenceCommit(resource: DisposableResource): Promise<void> {
+    if (!resource.evidence || resource.evidence.commitSha || resource.evidence.manifestSha256) return;
+    const owner = (await this.workers()).find(worker => worker.id === resource.owner.workerId);
+    if (validCommit(owner?.headSha)) { resource.evidence.commitSha = owner.headSha; resource.evidence.commitSource = "worker"; }
+  }
+  private async consumerProtection(resource: DisposableResource, state: ResourceJournal): Promise<string | undefined> {
     const workers = await this.workers();
     for (const consumer of resource.consumers) {
       const worker = workers.find(item => item.id === consumer.workerId);
@@ -218,6 +307,7 @@ export class ForgeDisposableResources {
     if (!resource.containerId) throw new Error("Container creation identity is unresolved. An explicit ownership review is required.");
     const identity = await this.host.inspect(resource.containerId);
     if (identity) assertIdentity(resource, identity);
+    if (await this.host.engineId() !== resource.engineId) throw new Error("Docker engine identity changed during inspection. The resource was preserved.");
     return identity;
   }
   private async recoverCreation(resource: DisposableResource): Promise<DisposableResource["state"]> {
@@ -297,18 +387,43 @@ export class DockerDisposableContainerHost implements DisposableContainerHost {
   }
   async stop(id: string): Promise<void> { await docker(["container", "stop", "--time", "10", id]); }
   async remove(id: string): Promise<void> { await docker(["container", "rm", id]); }
+  async readEvidence(id: string, paths: string[]): Promise<ContainerEvidenceContent[]> {
+    if (!/^[a-f0-9]{64}$/u.test(id) || !validEvidencePaths(paths)) throw new Error("Evidence export requires an exact container identity and specific absolute paths.");
+    const contents: ContainerEvidenceContent[] = [];
+    for (const source of paths) {
+      const result = await execute("docker", ["container", "cp", `${id}:${source}`, "-"], { timeout: 60_000, maxBuffer: 32 * 1024 * 1024, encoding: "buffer" });
+      const files = await readContainerEvidenceTar(source, result.stdout);
+      if (!files.length) throw new Error(`Evidence source ${source} has no exportable regular files; select specific valuable data.`);
+      contents.push(...files);
+      if (contents.length > 512 || contents.reduce((bytes, item) => bytes + item.data.length, 0) > 16 * 1024 * 1024) throw new Error("Evidence exceeds the compact archive limit (16 MiB / 512 files); select narrower paths.");
+    }
+    return contents;
+  }
 }
 
 export function validateContainerInput(value: unknown): asserts value is DisposableContainerInput {
   const input = value as DisposableContainerInput;
-  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => !["image", "name", "command", "consumers", "retentionReason"].includes(key)) ||
+  if (!input || typeof input !== "object" || Array.isArray(input) || Object.keys(input).some(key => !["image", "name", "command", "consumers", "retentionReason", "evidencePaths", "commitSha"].includes(key)) ||
     typeof input.image !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{0,511}$/u.test(input.image) ||
     typeof input.name !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/u.test(input.name) ||
     !Array.isArray(input.command) || input.command.length > 128 || !input.command.every(item => typeof item === "string" && item.length <= 16_384 && !item.includes("\0")) ||
     (input.consumers !== undefined && (!Array.isArray(input.consumers) || input.consumers.length > 50 || !input.consumers.every(validConsumer))) ||
-    (input.retentionReason !== undefined && (typeof input.retentionReason !== "string" || !input.retentionReason.trim() || input.retentionReason.length > 2000)))
-    throw new Error("A disposable environment requires image, name, command and verified consumers; arbitrary Docker options are not accepted.");
+    (input.retentionReason !== undefined && (typeof input.retentionReason !== "string" || !input.retentionReason.trim() || input.retentionReason.length > 2000)) ||
+    (input.retentionReason !== undefined && input.evidencePaths === undefined) ||
+    (input.evidencePaths !== undefined && !validEvidencePaths(input.evidencePaths)) ||
+    (input.commitSha !== undefined && !validCommit(input.commitSha)))
+    throw new Error("A disposable environment requires image, name, command and verified consumers; arbitrary Docker options are not accepted. Evidence retention requires specific evidencePaths.");
 }
+export function validateEvidenceDecision(value: unknown): asserts value is EvidenceDecision {
+  const decision = value as EvidenceDecision;
+  if (!decision || typeof decision !== "object" || Array.isArray(decision) || Object.keys(decision).some(key => !["action", "evidencePaths", "commitSha", "confirmation"].includes(key)) ||
+    !["keep", "export", "discard"].includes(decision.action) ||
+    (decision.evidencePaths !== undefined && !validEvidencePaths(decision.evidencePaths)) ||
+    (decision.commitSha !== undefined && !validCommit(decision.commitSha)) ||
+    (decision.action === "discard" ? decision.confirmation !== "Discard evidence" || decision.evidencePaths !== undefined || decision.commitSha !== undefined : decision.confirmation !== undefined))
+    throw new Error("Evidence requires an explicit keep/export decision or confirmed discard; use specific absolute paths and a full commit SHA.");
+}
+function validCommit(value: unknown): value is string { return typeof value === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(value); }
 function validConsumer(value: unknown): value is Consumer {
   const consumer = value as Consumer;
   return Boolean(consumer && typeof consumer === "object" && [consumer.workerId, consumer.attemptId].every(item => typeof item === "string" && /^[a-f0-9-]{36}$/u.test(item)));
@@ -320,7 +435,20 @@ function validResource(item: DisposableResource): boolean {
     typeof item.name === "string" && validConsumer(item.owner) && Array.isArray(item.consumers) && item.consumers.length > 0 && item.consumers.every(validConsumer) && item.consumers.some(consumer => sameConsumer(consumer, item.owner)) &&
     ["creating", "owned", "deleting", "deleted", "blocked", "failed"].includes(item.state) && typeof item.reason === "string" &&
     Number.isSafeInteger(item.reclaimedBytes) && item.reclaimedBytes >= 0 && (item.allocatedBytes === undefined || Number.isSafeInteger(item.allocatedBytes) && item.allocatedBytes >= 0) &&
-    (item.retentionReason === undefined || typeof item.retentionReason === "string" && item.retentionReason.trim()) && Number.isFinite(Date.parse(item.updatedAt)));
+    (item.retentionReason === undefined || typeof item.retentionReason === "string" && item.retentionReason.trim()) &&
+    (item.evidence === undefined || validEvidence(item.evidence)) &&
+    (item.removalStartedAt === undefined || Number.isFinite(Date.parse(item.removalStartedAt))) && Number.isFinite(Date.parse(item.updatedAt)));
+}
+function validEvidence(value: DisposableResource["evidence"]): boolean {
+  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing"].includes(value.state) && validEvidencePaths(value.paths, true) &&
+    (value.commitSha === undefined || validCommit(value.commitSha)) &&
+    (value.commitSource === undefined || ["worker", "declared"].includes(value.commitSource)) &&
+    (value.archivePath === undefined || typeof value.archivePath === "string" && /^forge-evidence\/[a-f0-9-]{36}\.json$/u.test(value.archivePath)) &&
+    (value.manifestSha256 === undefined || typeof value.manifestSha256 === "string" && /^[a-f0-9]{64}$/u.test(value.manifestSha256)) &&
+    (value.bytes === undefined || Number.isSafeInteger(value.bytes) && value.bytes >= 0) &&
+    (value.exportedAt === undefined || Number.isFinite(Date.parse(value.exportedAt))) &&
+    (value.files === undefined || Array.isArray(value.files) && value.files.every(file => typeof file.path === "string" && validEvidencePaths([`/${file.path}`]) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && /^[a-f0-9]{64}$/u.test(file.sha256))) &&
+    (value.state !== "verified" || value.archivePath && value.manifestSha256 && value.files?.length && value.bytes !== undefined && value.exportedAt));
 }
 function labelsFor(resource: DisposableResource): Record<string, string> { return { [resourceLabel]: resource.id, [ownerLabel]: resource.owner.workerId, [attemptLabel]: resource.owner.attemptId }; }
 function assertIdentity(resource: DisposableResource, identity: ContainerIdentity): void {

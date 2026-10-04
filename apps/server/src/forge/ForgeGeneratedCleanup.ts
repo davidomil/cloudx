@@ -3,7 +3,7 @@ import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { DirectoryIdentity } from "../directoryIdentity.js";
 import { openOwnedDirectoryNoFollow } from "../jsonStateFile.js";
-import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
+import { isGeneratedForgePath, isTypeScriptBuildInfo } from "./ForgeGeneratedArtifacts.js";
 
 /** Remove generated contents through owned directory descriptors, preserving named evidence. */
 export async function cleanupIgnoredForgePath(identity: DirectoryIdentity, relative: string, protectedPaths: string[], signal?: AbortSignal): Promise<string[]> {
@@ -37,6 +37,19 @@ export async function cleanupIgnoredForgePath(identity: DirectoryIdentity, relat
     const stat = await fs.lstat(target);
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       if (!generated) return { paths: [file], unknown: true };
+      if (file.endsWith(".tsbuildinfo") && !isGeneratedForgePath(path.dirname(file))) {
+        if (!stat.isFile() || stat.size > 64 * 1024 * 1024) return { paths: [file], unknown: true };
+        const handle = await fs.open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          const opened = await handle.stat();
+          if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino)
+            throw new Error("Build-info file changed; its replacement was preserved.");
+          if (!isTypeScriptBuildInfo(await handle.readFile("utf8"))) return { paths: [file], unknown: true };
+          const current = await fs.lstat(target);
+          if (current.dev !== opened.dev || current.ino !== opened.ino || current.size !== opened.size || current.mtimeMs !== opened.mtimeMs)
+            throw new Error("Build-info file changed; its replacement was preserved.");
+        } finally { await handle.close(); }
+      }
       await assertParents();
       await fs.unlink(target);
       return { paths: [], unknown: false };

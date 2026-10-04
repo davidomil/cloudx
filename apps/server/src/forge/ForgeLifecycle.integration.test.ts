@@ -1756,9 +1756,10 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await processIsRunning(codingReceipt.pid)).toBe(false);
     await expectMissing(coding.worktreePath!, review.worktreePath!);
     for (const receipt of [codingReceipt, reviewReceipt]) {
-      await fixture.expectFinishedAttempt(receipt);
+      await fixture.expectFinishedAttempt(receipt, { retainReport: receipt === reviewReceipt });
       await expectMissing(path.dirname(receipt.tabContextPath));
     }
+    expect(await fixture.workflow.workerHistory(review.id)).toMatchObject({ tabId: review.tabId });
     expect(fixture.sessions.listTabs().map(tab => tab.id)).toEqual([unrelatedTab.id]);
     expect(await fs.readFile(path.join(unrelatedDirectory, "keep.txt"), "utf8")).toBe("Unrelated work\n");
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(coding.headSha);
@@ -1785,7 +1786,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(retired.error).toBeUndefined();
     expect(await processIsRunning(receipt.pid)).toBe(false);
     expect(await fs.readFile(localEdit, "utf8")).toBe("Keep this local edit\n");
-    await expectMissing(receipt.reportPath, receipt.contextPath, receipt.codexHome, path.dirname(receipt.tabContextPath));
+    await fixture.expectFinishedAttempt(receipt, { retainReport: true });
+    await expectMissing(path.dirname(receipt.tabContextPath));
 
     await fixture.restartWorkflow();
     fixture.advanceCleanupInterval();
@@ -2077,9 +2079,9 @@ class LifecycleFixture {
         this.gitAccessRoles.push(role);
         return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
       },
-      git: async (cwd, args) => {
+      git: async (cwd, args, _signal, environment) => {
         if (args[0] === "push") this.gitPushes.push([...args]);
-        return git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push", "ls-remote"].includes(args[0]!) ? this.origin : argument));
+        return executeGit(cwd, args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push", "ls-remote"].includes(args[0]!) ? this.origin : argument), environment);
       },
     };
     const runtime = new ForgeRuntime(this.runtimeDependencies);
@@ -2352,8 +2354,11 @@ test("retains the target behavior and issue fix", () => {
     return JSON.parse(await fs.readFile(path.join(this.dataDir, "forge-workers", "workspaces", `${id}.json`), "utf8"));
   }
 
-  async expectFinishedAttempt(receipt: AssistantReceipt): Promise<void> {
-    await expectMissing(receipt.reportPath, receipt.contextPath);
+  async expectFinishedAttempt(receipt: AssistantReceipt, { retainReport = false } = {}): Promise<void> {
+    if (retainReport) {
+      expect(await this.reports.read(path.basename(receipt.reportPath, ".json"))).toBeDefined();
+      expect(JSON.parse(await fs.readFile(receipt.contextPath, "utf8"))).toEqual(receipt.context);
+    } else await expectMissing(receipt.reportPath, receipt.contextPath);
     const tab = this.sessions.listTabs().find(tab => tab.contextPath === receipt.tabContextPath);
     if (tab) {
       expect(tab.status).toBe("completed");
@@ -2525,7 +2530,11 @@ class LocalForgeProvider implements ForgeProvider {
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } });
+  return executeGit(cwd, args);
+}
+
+async function executeGit(cwd: string, args: string[], environment?: NodeJS.ProcessEnv): Promise<string> {
+  const { stdout } = await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, ...environment, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } });
   return args.includes("-z") ? stdout : stdout.trim();
 }
 
