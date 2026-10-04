@@ -8248,6 +8248,9 @@ a:hover svg {
 .forge-issue-group + .forge-issue-group { border-top: 1px solid var(--color-border); }
 
 .workspace-cleanup { min-width: 0; }
+.cloudx-update-backups-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
+.cloudx-update-backups-heading h4 { margin: 0; }
+.cloudx-update-backups-heading .cx-button { max-width: 100%; white-space: normal; }
 .workspace-cleanup p { margin: 0.5rem 0; }
 .workspace-cleanup code, .workspace-cleanup small { display: block; overflow-wrap: anywhere; white-space: normal; }
 .workspace-cleanup-list, .workspace-cleanup-results > ul { list-style: none; padding: 0; display: grid; gap: 0.65rem; }

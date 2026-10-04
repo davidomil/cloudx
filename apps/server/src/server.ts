@@ -81,7 +81,7 @@ import { JiraDashboardFilterStore } from "./jira/JiraDashboardFilterStore.js";
 import { JiraPollingService } from "./jira/JiraPollingService.js";
 import { SessionStore } from "./sessionStore.js";
 import { CloudxUpdateService } from "./system/CloudxUpdateService.js";
-import { registerCloudxUpdateRoutes } from "./system/CloudxUpdateRoutes.js";
+import { registerCloudxUpdateRoutes, type CloudxUpdateApi } from "./system/CloudxUpdateRoutes.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 import { WorkspaceCommandService } from "./workspace/WorkspaceCommandService.js";
 import { RulesSkillsCatalogService } from "./rulesSkills/RulesSkillsCatalogService.js";
@@ -140,7 +140,7 @@ export interface AppServices {
   jiraPolling?: JiraPollingService;
   forge?: ForgeWorkflowService;
   forgeConnections?: ForgeConnectionService;
-  updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">;
+  updates?: CloudxUpdateApi;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   disposeRulesSkillsUpdates?: () => Promise<void>;
   codexStateSources?: CodexStateSources;

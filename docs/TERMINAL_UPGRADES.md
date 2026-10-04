@@ -161,12 +161,45 @@ ownership and the retained bundle before starting the coordinator. Later
 update phases may require network access to prepare dependencies.
 
 Run records and private logs live under
-`~/.local/state/cloudx/settings-update`. Each update directory retains
-its coordinator, prepared release and data snapshots; previous generated
-artifacts stay beside their original paths with a
-`.cloudx-previous-<id>` suffix so activation works across filesystem
-boundaries. Keep these directories: active service launchers or rollback
-dependencies may still reference them.
+`~/.local/state/cloudx/settings-update`. Update directories retain their
+coordinators, prepared releases and data snapshots until reviewed
+cleanup. Previous generated artifacts stay beside their original paths
+with a `.cloudx-previous-<id>` suffix so activation works across
+filesystem boundaries.
+
+Use **Settings \> Updates \> Clean all update backups** beside the
+retained-backup list to review cleanup. The list shows previous and
+target commits, creation dates, run outcomes, measured storage and
+protection reasons.
+
+The preview includes every eligible successful-run data snapshot and
+obsolete previous generated artifact, with excluded items shown
+explicitly. Staged releases and coordinators are eligible only after
+their recorded ownership and lack of live or installed-service
+references are verified.
+
+The active installation, installed service launchers and live
+broker/Codex runtime dependencies remain protected. Failed or prepared
+update data and snapshots selected for restoration remain protected too.
+Cleanup is blocked while an update runs or installation restoration is
+pending.
+
+Tick the permanent-deletion acknowledgement and choose **Delete all
+eligible backups permanently** to confirm. Deleted data snapshots become
+unavailable for recovery or downgrade restoration. **Cancel** preserves
+the backups.
+
+Results show progress and deleted, protected, skipped and failed items
+with reasons; run status and private logs remain readable. The preview
+estimates reclaimable allocation, counting shared hard links once and
+excluding links retained elsewhere. Measured free space afterward can
+differ because filesystem snapshots, reflinks or open files may retain
+allocation.
+
+An interrupted cleanup records its outcome durably. Review a new preview
+and confirm again to remove the remaining owned files; completed
+deletions stay permanent. Snapshots touched by partial deletion are
+unavailable for restoration.
 
 A failed or interrupted mutation is restored before activation is
 attempted again. When target startup has changed data, restoration first

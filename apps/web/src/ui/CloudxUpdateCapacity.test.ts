@@ -38,7 +38,10 @@ function reply(status: CloudxUpdateStatus | CloudxUpdatePreview, code = 200) { r
 
 async function mount() {
   const statusFetch = globalThis.fetch;
-  vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/api/system/update/preview") ? Promise.resolve(reply(mainPreview)) : statusFetch(url, init));
+  vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/api/system/update/preview") ? Promise.resolve(reply(mainPreview))
+    : url.endsWith("/api/system/update/backups") ? Response.json({ backups: [] })
+    : url.endsWith("/api/system/update/backups/cleanup") ? Response.json(null)
+    : statusFetch(url, init));
   const container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);

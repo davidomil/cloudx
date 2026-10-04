@@ -490,6 +490,17 @@ describe("installed Settings updater", () => {
     expect(new SettingsUpdater(options).start(TARGET_COMMIT).run.id).toBe(first.run.id);
   });
 
+  it("rejects another modern start while the winning launch owns the operation lock", () => {
+    const { updater, options, host } = installation();
+    host.launch = (args) => {
+      expect(() => new SettingsUpdater(options).start(TARGET_COMMIT)).toThrow("operation is in progress");
+      host.unit = { LoadState: "loaded", ActiveState: "active", Description: `CloudX Settings update ${args.at(-1)}`,
+        ControlGroup: "/user.slice/cloudx-settings-update.service" };
+      return "";
+    };
+    expect(updater.start(TARGET_COMMIT).run.state).toBe("running");
+  });
+
   it("keeps the winner after it completes while a concurrent launch fails", () => {
     const { updater, options, host } = installation();
     let winnerId;
@@ -516,7 +527,8 @@ describe("installed Settings updater", () => {
       let inspections = 0;
       concurrent.unit = () =>
         inspections++ === 0 ? { running: false } : inspectUnit();
-      loser = concurrent.start(TARGET_COMMIT);
+      // A retained older launcher does not participate in the newer operation lock.
+      loser = concurrent.startLocked(TARGET_COMMIT);
       return "";
     };
     expect(updater.start(TARGET_COMMIT).run).toMatchObject({

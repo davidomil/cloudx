@@ -33,6 +33,7 @@ function historicalDowngrade({ originalWeb = 'inactive', directoryBoundary = fal
     '.gitignore': 'node_modules/\n**/dist/\n', 'package.json': '{"type":"module"}', 'package-lock.json': '{"lockfileVersion":3}',
     'local.txt': 'unchanged tracked file\n', 'unstaged.txt': 'original tracked work\n',
     [serviceFile]: historicalSource,
+    'packages/shared/src/index.ts': 'export * from "./cloudxUpdate.js";\n',
     'apps/server/src/server.ts': 'updates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">; // /api/ready/terminals\n',
     'apps/web/src/ui/fixture.txt': 'historical Settings files are supplied by the managed integration\n',
     'apps/server/src/workspace/SessionStateStore.ts': 'if (value.version !== 1) throw new Error();',

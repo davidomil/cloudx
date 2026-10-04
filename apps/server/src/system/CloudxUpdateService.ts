@@ -6,7 +6,9 @@ import fs from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 
 import { parseCloudxUpdateChannel, parseCloudxUpdatePreview, parseCloudxUpdateRequest, parseCloudxUpdateStatus,
-  type CloudxUpdateChannel, type CloudxUpdatePreview, type CloudxUpdateRequest, type CloudxUpdateStatus } from "@cloudx/shared";
+  parseCloudxUpdateBackups, parseCloudxUpdateBackupPreview, parseCloudxUpdateBackupCleanup, parseCloudxUpdateBackupCleanupRequest,
+  type CloudxUpdateChannel, type CloudxUpdatePreview, type CloudxUpdateRequest, type CloudxUpdateStatus,
+  type CloudxUpdateBackups, type CloudxUpdateBackupPreview, type CloudxUpdateBackupCleanup, type CloudxUpdateBackupCleanupRequest } from "@cloudx/shared";
 import { CloudxUpdateCatalog } from "./CloudxUpdateCatalog.js";
 import { runtimeBuild, type RuntimeBuild } from "./RuntimeBuild.js";
 
@@ -36,6 +38,31 @@ export class CloudxUpdateService {
 
   status(): Promise<CloudxUpdateStatus> {
     return this.request("status");
+  }
+
+  backups(): Promise<CloudxUpdateBackups> {
+    return this.backupRequest("backups", parseCloudxUpdateBackups);
+  }
+
+  async previewBackupCleanup(): Promise<CloudxUpdateBackupPreview> {
+    this.beginChange();
+    try { return await this.backupRequest("backup-preview", parseCloudxUpdateBackupPreview); }
+    finally { this.changing = false; }
+  }
+
+  backupCleanupStatus(): Promise<CloudxUpdateBackupCleanup | null> {
+    return this.backupRequest("backup-cleanup-status", parseCloudxUpdateBackupCleanup);
+  }
+
+  async cleanBackups(value: CloudxUpdateBackupCleanupRequest): Promise<CloudxUpdateBackupCleanup> {
+    const request = parseCloudxUpdateBackupCleanupRequest(value);
+    this.beginChange();
+    try {
+      const cleanup = await this.backupRequest("backup-cleanup", parseCloudxUpdateBackupCleanup,
+        [`--preview=${request.previewId}`, "--confirm-permanent-deletion"]);
+      if (!cleanup) throw Object.assign(new Error("The backup cleanup did not return its durable operation."), { statusCode: 503 });
+      return cleanup;
+    } finally { this.changing = false; }
   }
 
   async preview(): Promise<CloudxUpdatePreview> {
@@ -169,6 +196,24 @@ export class CloudxUpdateService {
     }
   }
 
+  private async backupRequest<T>(action: "backups" | "backup-preview" | "backup-cleanup-status" | "backup-cleanup",
+    parse: (value: unknown) => T, options: string[] = []): Promise<T> {
+    const unavailable = () => Object.assign(new Error("CloudX update backups could not be verified. Check the local service logs before deleting backups."), { statusCode: 503 });
+    let stdout: string;
+    try {
+      ({ stdout } = await this.execute(process.execPath, [this.updaterScript(), action, this.dataDir, String(process.pid), ...options],
+        { cwd: this.repoRoot, timeout: ["backups", "backup-preview"].includes(action) ? 120_000 : 30_000,
+          maxBuffer: 8 * 1024 * 1024, encoding: "utf8", env: { ...process.env, CLOUDX_INSTALL_ROOT: this.repoRoot } }));
+    } catch (error) {
+      const output = (error as { stdout?: unknown })?.stdout;
+      if (typeof output === "string") throwBackupError(output);
+      throw unavailable();
+    }
+    throwBackupError(stdout);
+    try { return parse(JSON.parse(stdout)); }
+    catch { throw unavailable(); }
+  }
+
   private updaterScript(): string {
     const root = this.installedUpdaterRoot;
     const manifest = path.join(root, "bundle.json");
@@ -200,3 +245,14 @@ export class CloudxUpdateService {
 }
 
 function conflict(message: string): Error { return Object.assign(new Error(message), { statusCode: 409 }); }
+
+function throwBackupError(stdout: string): void {
+  let value;
+  try { value = JSON.parse(stdout); }
+  catch { return; }
+  if (value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 2
+    && typeof value.error === "string" && value.error.length > 0 && value.error.length <= 4096
+    && [409, 503].includes(value.statusCode)) {
+    throw Object.assign(new Error(value.error), { statusCode: value.statusCode });
+  }
+}
