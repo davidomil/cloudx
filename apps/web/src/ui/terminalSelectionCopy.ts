@@ -153,7 +153,9 @@ export class TerminalSelectionCopy {
     this.columnSelection = this.clicks === 1 && event.altKey && !(mac && this.terminal.options.macOptionClickForcesSelection);
     if (this.selecting) {
       this.liveViewportY = this.dragViewportY = this.terminal.buffer.active.viewportY;
-      this.dragStart = this.dragEnd = this.pointerPosition(event, this.dragViewportY);
+      const start = this.pointerPosition(event, this.dragViewportY);
+      if (this.clicks === 1 && this.terminal.buffer.active.getLine(start.y)?.getCell(start.x)?.getWidth() === 0) start.x++;
+      this.dragStart = this.dragEnd = start;
     }
   };
 

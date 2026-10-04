@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -84,6 +85,64 @@ it.skipIf(process.env.CLOUDX_RESOURCE_DOCKER_TEST !== "1")("reconciles a real Do
       const identity = await host.inspect(conflicting);
       if (identity?.labels["cloudx.test.fixture"] === worker.id) await host.remove(conflicting);
     }
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(process.env.CLOUDX_RESOURCE_DOCKER_TEST !== "1").each([
+  ["uppercase repository", "UPPERCASE:latest", "invalid reference format: repository name (library/UPPERCASE) must be lowercase"],
+  ["invalid tag syntax", "ubuntu:.", "invalid reference format"],
+  ["repository name length", "a".repeat(256), "repository name must not be more than 255 characters"],
+  ["invalid digest format", `ubuntu@sha256:${"A".repeat(64)}`, "invalid checksum digest format"],
+  ["invalid digest length", `ubuntu@sha256:${"a".repeat(32)}`, "invalid checksum digest length"],
+  ["unsupported digest algorithm", `ubuntu@unknown:${"a".repeat(64)}`, "unsupported digest algorithm"],
+])("reconciles actual Docker local reference rejection (%s) across restart without sending a container-create request", async (scenario, image, rejection) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-resources-local-rejected-"));
+  const worker: ForgeWorker = { id: randomUUID(), attemptId: randomUUID(), kind: "issue", number: 173, title: "local rejected creation fixture", repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" }, baseBranch: "main", templateId: "fixture", status: "running", autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(`${request.method} ${request.url}`);
+    request.resume();
+    response.setHeader("Content-Type", "application/json");
+    if (request.url === "/_ping") {
+      response.setHeader("API-Version", "1.54"); response.setHeader("OSType", "linux");
+      response.end("OK");
+    } else if (/^\/v[\d.]+\/info$/u.test(request.url ?? "")) response.end(JSON.stringify({ ID: "controlled-local-rejection-engine" }));
+    else if (/^\/v[\d.]+\/containers\/json\?/u.test(request.url ?? "")) response.end("[]");
+    else { response.statusCode = 500; response.end(JSON.stringify({ message: "Unexpected Docker operation" })); }
+  });
+  try {
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Controlled Docker endpoint is unavailable.");
+    vi.stubEnv("DOCKER_HOST", `tcp://127.0.0.1:${address.port}`);
+    vi.stubEnv("DOCKER_CONTEXT", ""); vi.stubEnv("DOCKER_TLS_VERIFY", ""); vi.stubEnv("DOCKER_CERT_PATH", ""); vi.stubEnv("DOCKER_API_VERSION", ""); vi.stubEnv("DOCKER_CONFIG", directory);
+    const version = (await execute("docker", ["--version"])).stdout.trim();
+    const host = new DockerDisposableContainerHost();
+    const input = { image, name: `local-rejected-${worker.id}`, command: ["true"] };
+    await expect(host.create(input, {})).rejects.toThrow(rejection);
+    expect(requests.length).toBeGreaterThan(0);
+    expect([...new Set(requests)]).toEqual(["HEAD /_ping"]);
+    const reopen = () => new ForgeDisposableResources(directory, async () => [worker], host);
+    await expect(reopen().create(worker, input)).rejects.toThrow(rejection);
+    const initial = (await reopen().records())[0];
+    worker.status = "completed";
+    const failures: string[] = [];
+    const previews = [];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { await reopen().retire(worker); } catch (error) { failures.push(String(error)); }
+      previews.push(await reopen().preview());
+    }
+    expect(requests.some(request => request.startsWith("POST "))).toBe(false);
+    expect(failures).toEqual([]);
+    expect(previews).toEqual([[], []]);
+    expect(initial).toMatchObject({ creationRejected: true, state: "creating" });
+    expect((await reopen().records())[0]).toMatchObject({ state: "deleted", allocatedBytes: 0, reclaimedBytes: 0, reason: expect.stringContaining("confirmed absent") });
+    console.info(`${version}: ${scenario} sent only HEAD /_ping before local rejection; recorded same-engine empty scan and two restart/retire cycles persisted zero owned/reclaimed bytes. No container-create or mutation request was sent.`);
+  } finally {
+    vi.unstubAllEnvs();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await fs.rm(directory, { recursive: true, force: true });
   }
 }, 60_000);

@@ -268,7 +268,10 @@ export class DockerDisposableContainerHost implements DisposableContainerHost {
     try { id = (await docker(args)).trim(); }
     catch (error) {
       const failure = error as { code?: unknown; killed?: boolean; signal?: string; stderr?: string };
-      if (!failure.killed && !failure.signal && typeof failure.code === "number" && /^Error response from daemon:/mu.test(failure.stderr ?? ""))
+      const stderr = (failure.stderr ?? "").trim();
+      const localReferenceRejection = ["invalid reference format", "repository name must not be more than 255 characters", "invalid checksum digest format", "invalid checksum digest length", "unsupported digest algorithm"].includes(stderr) ||
+        /^invalid reference format: repository name \([^()\r\n]+\) must be lowercase$/u.test(stderr);
+      if (!failure.killed && !failure.signal && typeof failure.code === "number" && (localReferenceRejection || /^Error response from daemon:/mu.test(stderr)))
         throw new ContainerCreationRejectedError(message(error), { cause: error });
       throw error;
     }

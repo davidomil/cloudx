@@ -593,6 +593,89 @@ test("keeps an Alt single-click drag rectangular across streaming output", async
   expect(stream.input).toEqual([]);
 });
 
+for (const view of ["terminal", "codex", "forge"]) {
+  for (const anchor of [
+    {
+      name: "continuation forward",
+      start: 3,
+      end: 7,
+      rectangle: false,
+      text: "cde",
+    },
+    {
+      name: "continuation reverse",
+      start: 3,
+      end: 1,
+      rectangle: false,
+      text: "b界",
+    },
+    {
+      name: "leading forward",
+      start: 2,
+      end: 7,
+      rectangle: false,
+      text: "界cde",
+    },
+    {
+      name: "continuation rectangle",
+      start: 3,
+      end: 7,
+      rectangle: true,
+      text: "cde\n567",
+    },
+  ]) {
+    test(`${view} normalizes the original wide-glyph ${anchor.name} anchor before output and movement`, async ({
+      page,
+      context,
+    }, testInfo) => {
+      test.skip(
+        testInfo.project.name !== "desktop-chromium",
+        "Desktop mouse selection.",
+      );
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      const stream = await terminalStream(page, false, view);
+      stream.data("\x1bcab界cdef\r\n123456789");
+      await expect(page.locator(".xterm-rows")).toContainText("123456789");
+      const size = await cells(page);
+      if (anchor.rectangle) await page.keyboard.down("Alt");
+      await page.mouse.move(
+        size.x + anchor.start * size.cell + 1,
+        size.y + 0.5 * size.height,
+      );
+      await page.mouse.down();
+      expect(
+        await page.evaluate(() => window.testTerminal.getSelectionPosition()),
+      ).toBeUndefined();
+      stream.data("\x1b[24;1Hstreamed\x1b[1;1H");
+      await expect(page.locator(".xterm-rows")).toContainText("streamed");
+      await page.mouse.move(
+        size.x + anchor.end * size.cell + 1,
+        size.y + (anchor.rectangle ? 1.5 : 0.5) * size.height,
+        { steps: 8 },
+      );
+      await page.mouse.up();
+      if (anchor.rectangle) await page.keyboard.up("Alt");
+      const native = await page.evaluate(() =>
+        window.testTerminal.getSelection(),
+      );
+      expect(native).toBe(anchor.text);
+      expect
+        .soft(
+          await page
+            .getByRole("textbox", { name: "Selected terminal text" })
+            .inputValue(),
+        )
+        .toBe(native);
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Control+c");
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(native);
+      expect(stream.input).toEqual([]);
+    });
+  }
+}
+
 for (const boundary of ["start", "end"]) {
   test(`keeps wide-glyph ${boundary} boundary cells in a streamed rectangle`, async ({
     page,
