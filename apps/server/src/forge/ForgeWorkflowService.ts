@@ -70,6 +70,7 @@ interface Runtime {
     };
     tabIds: string[];
     executionEnded?: boolean;
+    cleanupComplete?: true;
   }>;
   prepareWorkspace(
     input: {
@@ -2885,6 +2886,7 @@ export class ForgeWorkflowService {
     for (const tabId of recovered.tabIds)
       await this.waitForWorkerIO(worker, "Closing recovered terminal and saving context", () => this.deps.runtime.close(tabId));
     if (recovered.tabIds.includes(worker.tabId ?? "")) worker.tabId = undefined;
+    if (recovered.cleanupComplete) worker.retainedWorkspace = undefined;
     return recovered;
   }
   private async quiesce(worker: ForgeWorker, { closeTab = true, retainReport = false, successful = false }: { closeTab?: boolean; retainReport?: boolean; successful?: boolean } = {}): Promise<void> {

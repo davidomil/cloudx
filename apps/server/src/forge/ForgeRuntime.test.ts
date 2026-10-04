@@ -48,10 +48,15 @@ const expectedRepository = {
 };
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
+  return gitWithEnvironment(cwd, args);
+}
+
+async function gitWithEnvironment(cwd: string, args: string[], environment?: NodeJS.ProcessEnv): Promise<string> {
   const { stdout } = await execute("git", args, {
       cwd,
       env: {
         ...process.env,
+        ...environment,
         GIT_CONFIG_NOSYSTEM: "1",
         GIT_CONFIG_GLOBAL: "/dev/null",
       },
@@ -67,15 +72,16 @@ function dependencies({ trustRepository = true } = {}): ForgeRuntimeDependencies
       cloneUrl: "https://github.com/cloudx/test.git",
       authorization: "Basic fixture-secret",
     })),
-    git: async (cwd, args) =>
-      git(
+    git: async (cwd, args, _signal, environment) =>
+      gitWithEnvironment(
         cwd,
-        ...args.map((argument) =>
+        args.map((argument) =>
           argument === "https://github.com/cloudx/test.git" &&
           ["fetch", "push", "ls-remote"].includes(args[0]!)
             ? origin
             : argument,
         ),
+        environment,
       ),
     dataDir: path.join(root, "data"),
     pathPolicy: new PathPolicy([root]),
@@ -1166,6 +1172,7 @@ describe("ForgeRuntime remote checkouts", () => {
     expect(await runtime.recover(workspace.id)).toEqual({
       workspace: undefined,
       tabIds: [],
+      cleanupComplete: true,
     });
   });
 
@@ -4779,6 +4786,22 @@ describe("Forge completed retained checkout reconciliation", () => {
     } finally { await f.service.dispose(); }
   });
 
+  it("keeps retention status checks from changing the index authorized for removal", async () => {
+    const deps = dependencies();
+    const executeGit = deps.git!;
+    const inspections: NodeJS.ProcessEnv[] = [];
+    deps.git = async (cwd, args, signal, environment) => {
+      if (args[0] === "status") inspections.push(environment!);
+      return executeGit(cwd, args, signal, environment);
+    };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare(randomUUID());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).resolves.toBeUndefined();
+    expect(inspections.length).toBeGreaterThan(0);
+    expect(inspections.every(environment => environment.GIT_OPTIONAL_LOCKS === "0")).toBe(true);
+    await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("clears a legacy retained receipt when the entire already-cleaned checkout is missing", async () => {
     const workspace = await prepare(randomUUID());
     const { manifest } = await legacyRetention(workspace, ["already-missing"]);
@@ -4841,6 +4864,39 @@ describe("Forge completed retained checkout reconciliation", () => {
     } finally { interruption.mockRestore(); await f.service.dispose(); }
   });
 
+  it.each(["added", "modified"] as const)("preserves %s surviving files after a partial removal and workflow restart", async changed => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const f = await completedWorkflow(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) {
+        await remove(path.join(String(target), ".git"), { recursive: true });
+        throw new Error("Interrupted after partial checkout deletion");
+      }
+      return remove(target, options);
+    });
+    try {
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed" });
+      interruption.mockRestore();
+      const pending = JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval;
+      const file = changed === "added" ? "recovered-investigation.txt" : "README.md";
+      await fs.writeFile(path.join(pending.path, file), "Recovered investigation must survive restart\n");
+      await f.service.dispose();
+      f.deps.runtime = new ForgeRuntime(dependencies());
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining(file) });
+      expect(await fs.readFile(path.join(pending.path, file), "utf8")).toBe("Recovered investigation must survive restart\n");
+      expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toEqual(pending);
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      expect(await f.service.workerHistory(workspace.id)).toEqual(f.history);
+      await f.service.poll();
+      expect(await fs.readFile(path.join(pending.path, file), "utf8")).toBe("Recovered investigation must survive restart\n");
+    } finally { interruption.mockRestore(); await f.service.dispose(); }
+  });
+
   it.each(["canonical", "staged"] as const)("preserves a changed %s directory identity after removal interruption", async changed => {
     const workspace = await prepare(randomUUID());
     const { manifest } = await legacyRetention(workspace, ["obsolete"]);
@@ -4860,6 +4916,29 @@ describe("Forge completed retained checkout reconciliation", () => {
     await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("ownership changed");
     expect(await fs.readFile(path.join(target, "new-source.txt"), "utf8")).toBe("Preserve unrelated work");
     expect(JSON.parse(await fs.readFile(manifest, "utf8")).cleanupRemoval).toEqual(pending);
+  });
+
+  it.each(["missing", "invalid"] as const)("preserves interrupted removal with %s contents authorization", async authorization => {
+    const workspace = await prepare(randomUUID());
+    const { manifest } = await legacyRetention(workspace, ["obsolete"]);
+    const remove = fs.rm.bind(fs);
+    const interruption = vi.spyOn(fs, "rm").mockImplementation(async (target, options) => {
+      if (path.basename(String(target)).startsWith(`cleanup-${workspace.id}-`)) {
+        await remove(path.join(String(target), ".git"), { recursive: true });
+        throw new Error("Stop partial removal");
+      }
+      return remove(target, options);
+    });
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow("Stop partial removal");
+    interruption.mockRestore();
+    const owned = JSON.parse(await fs.readFile(manifest, "utf8"));
+    if (authorization === "missing") delete owned.cleanupRemovalContents;
+    else owned.cleanupRemovalContents = [{ path: "../escape", fingerprint: "a".repeat(64) }];
+    await fs.writeFile(manifest, JSON.stringify(owned));
+    runtime = new ForgeRuntime(dependencies());
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha })).rejects.toThrow(authorization === "missing" ? "no authorized contents inventory" : "ownership record is missing or invalid");
+    expect(await fs.readFile(path.join(owned.cleanupRemoval.path, "README.md"), "utf8")).toBe("Initial content\n");
+    expect(JSON.parse(await fs.readFile(manifest, "utf8"))).toEqual(owned);
   });
 
   it("revalidates staged ownership after the final asynchronous quiescence check", async () => {

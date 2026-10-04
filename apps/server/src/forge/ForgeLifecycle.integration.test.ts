@@ -2079,9 +2079,9 @@ class LifecycleFixture {
         this.gitAccessRoles.push(role);
         return { cloneUrl: "https://github.com/fixture/cloudx.git", authorization: `Basic fixture-${role}-secret` };
       },
-      git: async (cwd, args) => {
+      git: async (cwd, args, _signal, environment) => {
         if (args[0] === "push") this.gitPushes.push([...args]);
-        return git(cwd, ...args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push", "ls-remote"].includes(args[0]!) ? this.origin : argument));
+        return executeGit(cwd, args.map((argument) => argument === "https://github.com/fixture/cloudx.git" && ["fetch", "push", "ls-remote"].includes(args[0]!) ? this.origin : argument), environment);
       },
     };
     const runtime = new ForgeRuntime(this.runtimeDependencies);
@@ -2530,7 +2530,11 @@ class LocalForgeProvider implements ForgeProvider {
 }
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } });
+  return executeGit(cwd, args);
+}
+
+async function executeGit(cwd: string, args: string[], environment?: NodeJS.ProcessEnv): Promise<string> {
+  const { stdout } = await execute("git", args, { cwd, timeout: 10_000, env: { ...process.env, ...environment, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0" } });
   return args.includes("-z") ? stdout : stdout.trim();
 }
 

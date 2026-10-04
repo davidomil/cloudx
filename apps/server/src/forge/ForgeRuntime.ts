@@ -40,6 +40,7 @@ import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecuti
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { cleanupIgnoredForgePath } from "./ForgeGeneratedCleanup.js";
 import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
+import { captureForgeRemovalContents, assertForgeRemovalContents, isForgeRemovalContents, type ForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -142,6 +143,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   cleaned: boolean;
   cleanupHeadSha?: string;
   cleanupRemoval?: DirectoryIdentity;
+  cleanupRemovalContents?: ForgeRemovalContents[];
   cleanupDiscardPending?: true;
   baseCommit: string;
   prepared: boolean;
@@ -1006,7 +1008,7 @@ export class ForgeRuntime {
 
   recover(
     id: string,
-  ): Promise<{ workspace?: ForgeWorkspace; tabIds: string[]; executionEnded?: boolean }> {
+  ): Promise<{ workspace?: ForgeWorkspace; tabIds: string[]; executionEnded?: boolean; cleanupComplete?: true }> {
     return this.serialize(id, "recover", undefined, async () => {
       const stored = await this.manifest(id).read<OwnedWorkspace>();
       const owned = stored ? await this.readOwned(id) : undefined;
@@ -1086,7 +1088,8 @@ export class ForgeRuntime {
               branch: owned.branch,
             }
           : undefined;
-      return { workspace, tabIds: [...tabIds], ...(executionEnded ? { executionEnded } : {}) };
+      return { workspace, tabIds: [...tabIds], ...(executionEnded ? { executionEnded } : {}),
+        ...(owned?.cleaned && !owned.retainedWorkspace && !owned.cleanupRemoval && !owned.cleanupDiscardPending ? { cleanupComplete: true as const } : {}) };
     });
   }
 
@@ -1927,21 +1930,30 @@ export class ForgeRuntime {
       if (expectedHeadSha && owned.branchOwned)
         await this.verifyHead(owned, expectedHeadSha, signal);
       owned.cleanupHeadSha = expectedHeadSha;
-      const retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal, explicitRetainedPaths) : [];
-      const unpublishedRefs = owned.prepared && owned.branchOwned
+      let retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal, explicitRetainedPaths) : [];
+      let unpublishedRefs = owned.prepared && owned.branchOwned
         ? await this.unpublishedGitRefs(owned, expectedHeadSha, signal) : [];
       if (unpublishedRefs.length) { retainedPaths.push(".git"); retainedPaths.sort(); }
+      const removalContents = retainedPaths.length ? undefined : await captureForgeRemovalContents(owned.worktree, signal);
+      if (removalContents && owned.prepared) {
+        // Every captured survivor must also pass the retention decision before removal.
+        retainedPaths = await this.filesRequiringRetention(owned, signal, explicitRetainedPaths);
+        unpublishedRefs = owned.branchOwned ? await this.unpublishedGitRefs(owned, expectedHeadSha, signal) : [];
+        if (unpublishedRefs.length) { retainedPaths.push(".git"); retainedPaths.sort(); }
+      }
       if (retainedPaths.length) {
         const reason = unpublishedRefs.length
           ? `Unpublished Git history was preserved in ${unpublishedRefs.map(ref => JSON.stringify(ref)).join(", ").slice(0, 3800)}. Recover these refs before discarding the checkout.`
           : explicitRetentionReason(explicitRetainedPaths, retainedPaths);
         owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths, ...(reason ? { reason } : {}) };
         owned.cleanupRemoval = undefined;
+        owned.cleanupRemovalContents = undefined;
         owned.cleaned = true;
         await this.manifest(owned.id).write(owned);
         return owned.retainedWorkspace;
       }
       owned.cleanupRemoval ??= { ...owned.worktree, path: path.join(path.dirname(owned.worktreePath), `cleanup-${owned.id}-${randomUUID()}`) };
+      owned.cleanupRemovalContents = removalContents!;
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
       await this.assertCleanupQuiescent(owned);
@@ -1973,11 +1985,15 @@ export class ForgeRuntime {
       await this.assertCleanupQuiescent(owned);
       signal?.throwIfAborted();
       await this.assertIdentity(removal);
+      await assertForgeRemovalContents(removal, owned.cleanupRemovalContents, signal);
+      signal?.throwIfAborted();
+      await this.assertIdentity(removal);
       await fs.rm(removal.path, { recursive: true });
     }
     owned.cleaned = true;
     owned.retainedWorkspace = undefined;
     owned.cleanupRemoval = undefined;
+    owned.cleanupRemovalContents = undefined;
     await this.manifest(owned.id).write(owned);
     return true;
   }
@@ -2130,6 +2146,7 @@ export class ForgeRuntime {
         !isUuid(path.basename(value.cleanupRemoval.path).slice(`cleanup-${id}-`.length)) ||
         value.cleanupRemoval.dev !== value.worktree?.dev || value.cleanupRemoval.ino !== value.worktree?.ino)) ||
       (value.cleanupDiscardPending !== undefined && value.cleanupDiscardPending !== true) ||
+      (value.cleanupRemovalContents !== undefined && (!value.cleanupRemoval || !isForgeRemovalContents(value.cleanupRemovalContents))) ||
       typeof value.prepared !== "boolean" ||
       typeof value.launchPending !== "boolean" ||
       (value.launchBootId !== undefined && !isUuid(value.launchBootId)) ||
@@ -2208,6 +2225,7 @@ export class ForgeRuntime {
     signal?: AbortSignal,
     environment?: NodeJS.ProcessEnv,
   ): Promise<string> {
+    if (args[0] === "status") environment = { ...environment, GIT_OPTIONAL_LOCKS: "0" };
     const fields = { ...ForgeRuntime.logContext.getStore(), command: args[0] };
     const started = performance.now();
     const diagnostic: GitDiagnostic = {};
