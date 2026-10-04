@@ -1499,9 +1499,11 @@ test("Codex recovery keeps conversation controls and offers ownership repair onl
   await page
     .getByRole("textbox", { name: "Conversation session ID" })
     .fill("selected-conversation");
+  const resumeResponse = page.waitForResponse("**/fixture-recover");
   await page
     .getByRole("button", { name: "Resume selected conversation" })
     .click();
+  await resumeResponse;
   expect(resumes).toEqual([
     { action: "resume-conversation", sessionId: "selected-conversation" },
   ]);
