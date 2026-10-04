@@ -306,7 +306,29 @@ export function filesystemCapacity(destination, { quotaCommand = spawnSync } = {
   if (/(?:^|,)(?:prjquota|pquota)(?:=|,|$)/u.test(mount.options)) quotaStatus += '; project quota unavailable to this probe';
   return { device: String(stat.dev), destination, mount: mount.root, blockSize: capacity.bsize,
     availableBytes: Math.min(Math.max(0, capacity.bavail) * capacity.bsize, quota.bytes),
-    availableInodes: Math.min(capacity.files > 0 ? capacity.ffree : Infinity, quota.inodes), quotaStatus };
+    availableInodes: Math.min(capacity.files > 0 ? capacity.ffree : Infinity, quota.inodes), quotaStatus,
+    byteLimit: quota.bytes < Math.max(0, capacity.bavail) * capacity.bsize ? 'quota' : 'filesystem',
+    inodeLimit: quota.inodes < (capacity.files > 0 ? capacity.ffree : Infinity) ? 'quota' : 'filesystem' };
+}
+
+export function formatCapacityBytes(bytes) {
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let value = Math.max(0, bytes), unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${unit ? value.toFixed(2) : value} ${units[unit]}`;
+}
+
+export function capacityMessage(check) {
+  const bytes = `${formatCapacityBytes(check.requiredBytes)} required, ${formatCapacityBytes(check.availableBytes)} available, ${formatCapacityBytes(Math.max(0, check.requiredBytes - check.availableBytes))} more needed`;
+  const inodes = check.requiredInodes > check.availableInodes ? ` ${check.requiredInodes - check.availableInodes} more inodes needed (${check.requiredInodes} required, ${check.availableInodes} available${check.inodeLimit === 'quota' ? '; inode quota' : ''}).` : '';
+  return `${check.mount} (${check.destination}): ${bytes}${check.byteLimit === 'quota' ? ' under the quota' : ''}.${inodes} Includes recovery/build reservations and ${formatCapacityBytes(check.headroomBytes)} safety margin.`;
+}
+
+export function publicUpdateCapacity(capacity) {
+  return { ...capacity, filesystems: capacity.filesystems.map(({ blockSize, ...check }) => ({ ...check,
+    availableInodes: Number.isFinite(check.availableInodes) ? check.availableInodes : null,
+    shortfallBytes: Math.max(0, check.requiredBytes - check.availableBytes),
+    shortfallInodes: check.availableInodes === null ? 0 : Math.max(0, check.requiredInodes - check.availableInodes) })) };
 }
 
 export function restoreSnapshot(source, target, manifest) {

@@ -38,6 +38,8 @@ import { validateRepository } from "./providers/ForgeCredentials.js";
 import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecution } from "./ForgeExecution.js";
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
+import { cleanupIgnoredForgePath } from "./ForgeGeneratedCleanup.js";
+import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -45,6 +47,8 @@ export interface ForgeWorkspace {
   worktreePath: string;
   branch: string;
   expectedHeadSha?: string;
+  issueClosed?: true;
+  retainedPaths?: string[];
 }
 
 export interface ForgeRuntimeDependencies {
@@ -126,6 +130,7 @@ export class ForgeHandoffError extends Error {
 
 interface OwnedWorkspace extends ForgeWorkspace {
   repository: DirectoryIdentity;
+  explicitRetainedPaths?: string[];
   worktree: DirectoryIdentity;
   origin: string;
   expectedRepository: ForgeRepository;
@@ -1107,18 +1112,22 @@ export class ForgeRuntime {
         throw new ForgeHandoffError("The completion handoff must name the exact current commit and every remaining changed or untracked path.");
       if (!handoff && files.length)
         throw new ForgeHandoffError("Remaining working files need an explicit publication handoff.");
-      const fingerprint = await this.workingFingerprint(owned, files, signal);
-      if (previous && (previous.headSha !== headSha || previous.fingerprint !== fingerprint || !samePaths(previous.retainedPaths, files)))
+      const evidence = await this.retainedEvidenceFiles(owned, handoff?.retainedEvidencePaths ?? [], signal);
+      const fingerprint = await this.workingFingerprint(owned, publicationFiles(files, evidence), signal);
+      if (previous && (previous.headSha !== headSha || previous.fingerprint !== fingerprint || !samePaths(previous.retainedPaths, files) ||
+          !samePaths(previous.retainedEvidencePaths ?? [], evidence)))
         throw new ForgeHandoffError("The intended commit or retained working files changed after this completion handoff was recorded.");
       await this.verifyHead(owned, headSha, signal);
-      if (!samePaths(files, await this.workingFiles(owned, signal)))
+      if (!samePaths(files, await this.workingFiles(owned, signal)) || !samePaths(evidence, await this.retainedEvidenceFiles(owned, evidence, signal)))
         throw new ForgeHandoffError("Working files changed while recording the completion handoff.");
-      const recorded = previous ?? { headSha, retainedPaths: files, fingerprint };
+      const recorded = previous ?? { headSha, retainedPaths: files,
+        ...(handoff?.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: evidence }), fingerprint };
       owned.publicationHandoffs ??= {};
       owned.publicationHandoffs[attemptId] = recorded;
       owned.publicationAttemptId = attemptId;
       await this.manifest(owned.id).write(owned);
-      return { headSha: recorded.headSha, retainedPaths: [...recorded.retainedPaths] };
+      return { headSha: recorded.headSha, retainedPaths: [...recorded.retainedPaths],
+        ...(recorded.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: [...recorded.retainedEvidencePaths] }) };
     });
   }
 
@@ -1333,7 +1342,8 @@ export class ForgeRuntime {
       const handoff = this.publicationHandoff(owned);
       if (handoff?.headSha === expectedHeadSha) {
         const files = await this.workingFiles(owned);
-        if (!samePaths(handoff.retainedPaths, files) || handoff.fingerprint !== await this.workingFingerprint(owned, files))
+        const evidence = await this.retainedEvidenceFiles(owned, handoff.retainedEvidencePaths ?? []);
+        if (!samePaths(handoff.retainedPaths, files) || handoff.fingerprint !== await this.workingFingerprint(owned, publicationFiles(files, evidence)))
           throw new ForgeHandoffError("Retained files changed during the branch update. Resume with a message to inspect the preserved work.");
         handoff.headSha = headSha;
       } else if ((await this.workingFiles(owned)).length) {
@@ -1651,17 +1661,34 @@ export class ForgeRuntime {
       if (owned.launchPending)
         throw new Error("A worker launch is unresolved; cleanup is blocked.");
       if (!owned.cleaned) await this.assertQuiescent(owned);
+      if (workspace.retainedPaths && !isRetainedPaths(workspace.retainedPaths))
+        throw new Error("Invalid explicit retention paths; local files were preserved.");
+      owned.explicitRetainedPaths = publicationFiles(owned.explicitRetainedPaths ?? [], [
+        ...workspace.retainedPaths ?? [], ...this.publicationHandoff(owned)?.retainedEvidencePaths ?? [],
+      ]);
       if (owned.branchOwned && !owned.cleaned) {
-        if (!workspace.expectedHeadSha)
+        if (!workspace.expectedHeadSha && !workspace.issueClosed)
           throw new Error("Issue cleanup requires the published head commit.");
-        if (await optionalIdentity(owned.worktreePath))
-          await this.verifyHead(owned, workspace.expectedHeadSha, signal);
+        if (await optionalIdentity(owned.worktreePath)) {
+          await this.assertCheckout(owned);
+          const headSha = await this.requireBranchHead(owned, signal);
+          if (workspace.issueClosed && headSha !== (workspace.expectedHeadSha ?? owned.baseCommit)) {
+            await this.assertCheckout(owned);
+            const retainedPaths = [...new Set([".git", ...await this.filesRequiringRetention(owned, signal, owned.explicitRetainedPaths)])].sort();
+            owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths,
+              reason: "The assigned issue closed before these commits were published. Recover the unpublished Git history before discarding this checkout." };
+            owned.cleaned = true;
+            await this.manifest(owned.id).write(owned);
+            return owned.retainedWorkspace;
+          }
+          if (workspace.expectedHeadSha) await this.verifyHead(owned, workspace.expectedHeadSha, signal);
+        }
         else if (owned.cleanupHeadSha !== workspace.expectedHeadSha)
           throw new Error(
             "Owned checkout disappeared before cleanup; ownership was preserved.",
           );
       }
-      return this.cleanupOwned(owned, signal, workspace.expectedHeadSha);
+      return this.cleanupOwned(owned, signal, workspace.expectedHeadSha ?? (workspace.issueClosed ? owned.baseCommit : undefined), owned.explicitRetainedPaths);
     });
   }
 
@@ -1707,7 +1734,8 @@ export class ForgeRuntime {
       const files = await this.workingFiles(owned, signal);
       const handoff = this.publicationHandoff(owned);
       if (handoff?.headSha === expectedHeadSha) {
-        if (!samePaths(handoff.retainedPaths, files) || handoff.fingerprint !== await this.workingFingerprint(owned, files, signal))
+        const evidence = await this.retainedEvidenceFiles(owned, handoff.retainedEvidencePaths ?? [], signal);
+        if (!samePaths(handoff.retainedPaths, files) || handoff.fingerprint !== await this.workingFingerprint(owned, publicationFiles(files, evidence), signal))
           throw new ForgeHandoffError("Retained working files changed after the publication handoff.");
       } else if (files.length) {
         throw new ForgeHandoffError("Remaining working files need an explicit publication handoff for this commit.");
@@ -1742,8 +1770,39 @@ export class ForgeRuntime {
     return files;
   }
 
-  private async filesRequiringRetention(owned: OwnedWorkspace, signal?: AbortSignal): Promise<string[]> {
+  private async retainedEvidenceFiles(owned: OwnedWorkspace, evidence: string[], signal?: AbortSignal): Promise<string[]> {
+    if (!isRetainedEvidencePaths(evidence)) throw new ForgeHandoffError("Ignored evidence paths must be unique repository-relative paths without Git metadata.");
+    if (!evidence.length) return [];
+    const ignored = (await this.runGit(owned.worktreePath, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", "--ignored=matching"], signal))
+      .split("\0").filter(entry => entry.startsWith("!! ")).map(entry => entry.slice(3).replace(/\/$/u, ""));
+    for (const file of evidence) {
+      signal?.throwIfAborted();
+      if (!ignored.some(parent => parent === file || file.startsWith(`${parent}/`)))
+        throw new ForgeHandoffError(`Retained evidence ${JSON.stringify(file)} must be ignored by Git and exist in this checkout.`);
+      const absolute = path.join(owned.worktreePath, file);
+      try {
+        if (!await requireSafeDirectory(owned.worktreePath, path.dirname(absolute), { create: false, label: "Ignored evidence parent" }))
+          throw new Error("The parent does not exist.");
+        const stat = await fs.lstat(absolute);
+        if (!stat.isFile() && !stat.isDirectory()) throw new Error("Expected a regular file or directory.");
+      } catch {
+        throw new ForgeHandoffError(`Retained evidence ${JSON.stringify(file)} must be an existing regular file or directory without symbolic-link parents.`);
+      }
+    }
+    return [...evidence].sort();
+  }
+
+  private async filesRequiringRetention(owned: OwnedWorkspace, signal?: AbortSignal, explicitRetainedPaths: string[] = []): Promise<string[]> {
     const files = new Set(await this.workingFiles(owned, signal, true));
+    const status = await this.runGit(owned.worktreePath, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", "--ignored=matching"], signal);
+    for (const entry of status.split("\0").filter(entry => entry.startsWith("!! "))) {
+      const file = entry.slice(3).replace(/\/$/u, "");
+      if ((await this.runGit(owned.worktreePath, ["ls-files", "-z", "--", file], signal)).length) continue;
+      signal?.throwIfAborted();
+      const remaining = await cleanupIgnoredForgePath(owned.worktree, file, explicitRetainedPaths, signal);
+      files.delete(file);
+      for (const retained of remaining) files.add(retained);
+    }
     const index = await this.runGit(owned.worktreePath, ["ls-files", "--stage", "-v", "-z"], signal);
     for (const entry of index.split("\0").filter(Boolean)) {
       signal?.throwIfAborted();
@@ -1826,10 +1885,16 @@ export class ForgeRuntime {
     owned: OwnedWorkspace,
     signal?: AbortSignal,
     expectedHeadSha?: string,
+    explicitRetainedPaths?: string[],
   ): Promise<ForgeRetainedWorkspace | void> {
     if (owned.cleaned) {
       if (owned.retainedWorkspace) {
         await this.assertCheckout(owned);
+        await this.assertQuiescent(owned);
+        const files = await this.filesRequiringRetention(owned, signal, explicitRetainedPaths);
+        owned.retainedWorkspace.retainedPaths = [...new Set([...owned.retainedWorkspace.retainedPaths, ...files])].sort();
+        owned.retainedWorkspace.reason ??= explicitRetentionReason(explicitRetainedPaths, files);
+        await this.manifest(owned.id).write(owned);
         return owned.retainedWorkspace;
       }
       return;
@@ -1865,9 +1930,10 @@ export class ForgeRuntime {
       if (expectedHeadSha && owned.branchOwned)
         await this.verifyHead(owned, expectedHeadSha, signal);
       owned.cleanupHeadSha = expectedHeadSha;
-      const retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal) : [];
+      const retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal, explicitRetainedPaths) : [];
       if (retainedPaths.length) {
-        owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths };
+        const reason = explicitRetentionReason(explicitRetainedPaths, retainedPaths);
+        owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths, ...(reason ? { reason } : {}) };
         owned.cleaned = true;
         await this.manifest(owned.id).write(owned);
         return owned.retainedWorkspace;
@@ -2041,11 +2107,13 @@ export class ForgeRuntime {
       (value.batchConversation !== undefined &&
         (value.role !== "worker" || !isReviewConversationBinding(value.batchConversation))) ||
       !isPublicationOwnership(value) ||
+      (value.explicitRetainedPaths !== undefined && !isRetainedPaths(value.explicitRetainedPaths)) ||
       (value.branchPublication !== undefined &&
         (value.role !== "worker" || !value.branchPublication || !isCommitSha(value.branchPublication.headSha) ||
           typeof value.branchPublication.confirmed !== "boolean")) ||
       (value.retainedWorkspace !== undefined &&
         (!value.cleaned || !value.retainedWorkspace || value.retainedWorkspace.worktreePath !== value.worktreePath ||
+          (value.retainedWorkspace.reason !== undefined && (typeof value.retainedWorkspace.reason !== "string" || !value.retainedWorkspace.reason.trim() || value.retainedWorkspace.reason.length > 4096)) ||
           !isRetainedPaths(value.retainedWorkspace.retainedPaths) || !value.retainedWorkspace.retainedPaths.length)) ||
       (value.branch !== "" && value.branch !== `cloudx/forge/${id}`)
     )
@@ -2419,6 +2487,21 @@ function samePaths(left: string[], right: string[]): boolean {
   return left.length === right.length && [...left].sort().every((file, index) => file === expected[index]);
 }
 
+function isRetainedEvidencePaths(value: unknown): value is string[] {
+  return isRetainedPaths(value) && value.every(file => !file.split("/").includes(".git"));
+}
+
+function publicationFiles(files: string[], evidence: string[]): string[] {
+  return [...new Set([...files, ...evidence])].sort();
+}
+
+function explicitRetentionReason(explicitPaths: string[] = [], retainedPaths: string[]): string | undefined {
+  const retained = explicitPaths.filter(file => retainedPaths.some(retained => file === retained || file.startsWith(`${retained}/`) || retained.startsWith(`${file}/`)));
+  if (retained.length) return `Explicitly retained evidence (${retained.length} paths): ${retained.map(file => JSON.stringify(file)).join(", ").slice(0, 3800)}. Recover this evidence before discarding the checkout.`;
+  const generatedSource = retainedPaths.filter(isGeneratedForgePath);
+  if (generatedSource.length) return `Local source and repository state was preserved: ${generatedSource.map(file => JSON.stringify(file)).join(", ").slice(0, 3800)}. Recover this evidence before discarding the checkout.`;
+}
+
 function isPublicationOwnership(value: OwnedWorkspace): boolean {
   if (value.publicationAttemptId === undefined && value.publicationHandoffs === undefined) return true;
   if (value.role !== "worker" || typeof value.publicationAttemptId !== "string" ||
@@ -2427,6 +2510,7 @@ function isPublicationOwnership(value: OwnedWorkspace): boolean {
   return Object.entries(value.publicationHandoffs).every(([attemptId, handoff]) =>
     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(attemptId) && handoff && typeof handoff === "object" &&
     isCommitSha(handoff.headSha) && isRetainedPaths(handoff.retainedPaths) &&
+    (handoff.retainedEvidencePaths === undefined || isRetainedEvidencePaths(handoff.retainedEvidencePaths)) &&
     typeof handoff.fingerprint === "string" && /^[a-f0-9]{64}$/u.test(handoff.fingerprint));
 }
 

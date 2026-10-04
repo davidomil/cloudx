@@ -1,9 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { parseCloudxUpdateStatus, parseCloudxUpdatePreview, parseCloudxUpdateRequest } from "./cloudxUpdate.js";
+import { formatCapacityBytes, parseCloudxUpdateCapacity, parseCloudxUpdateStatus, parseCloudxUpdatePreview, parseCloudxUpdateRequest } from "./cloudxUpdate.js";
 
 const run = {
   id: "update-1", state: "running", message: "Updating CloudX.", startedAt: "2026-09-15T00:00:00.000Z"
 };
+
+describe("readable update capacity", () => {
+  const filesystem = { device: "1", mount: "/recovery", destination: "/recovery/run", requiredBytes: 40859257735,
+    availableBytes: 27225911296, shortfallBytes: 13633346439, headroomBytes: 3714477976,
+    requiredInodes: 2048, availableInodes: null, shortfallInodes: 0,
+    reservations: [{ destination: "/recovery/run", purpose: "snapshot and failed-start recovery", bytes: 1024, inodes: 3 }] };
+  const capacity = { stage: "build-staging", checkedAt: "2026-10-03T22:35:00Z", filesystems: [filesystem] };
+  it.each([[0, "0 B"], [-1, "0 B"], [1023, "1023 B"], [1024, "1.00 KiB"], [1024 ** 2, "1.00 MiB"],
+    [40859257735, "38.05 GiB"], [27225911296, "25.36 GiB"], [13633346439, "12.70 GiB"], [3714477976, "3.46 GiB"],
+    [Number.MAX_SAFE_INTEGER, "8.00 PiB"]])("formats %s bytes as %s", (bytes, expected) => {
+    expect(formatCapacityBytes(bytes as number)).toBe(expected);
+  });
+  it("keeps exact bytes and separate filesystem measurements in the public run", () => {
+    const measured = { ...capacity, filesystems: [filesystem, { ...filesystem, device: "2", mount: "/installation",
+      requiredBytes: 5, availableBytes: 10, shortfallBytes: 0, availableInodes: 10, requiredInodes: 12, shortfallInodes: 2, inodeLimit: "quota" }] };
+    expect(parseCloudxUpdateStatus({ available: true, run: { ...run, capacity: measured } }).run?.capacity).toEqual(measured);
+  });
+  it.each([{ availableBytes: -1 }, { requiredBytes: Number.MAX_SAFE_INTEGER + 1 }, { shortfallBytes: -1 },
+    { shortfallBytes: 0 }, { shortfallInodes: 1 }, { availableInodes: -1 }, { byteLimit: "unknown" }, { reservations: [{}] }])("rejects incorrect capacity measurements: %j", changes => {
+    expect(() => parseCloudxUpdateCapacity({ ...capacity, filesystems: [{ ...filesystem, ...changes }] })).toThrow();
+  });
+  it("keeps a blocked scan distinct from measured zero usage", () => {
+    const blocked = { stage: "build-staging", checkedAt: capacity.checkedAt, filesystems: [], error: "Quota inspection failed." };
+    expect(parseCloudxUpdateCapacity(blocked)).toEqual(blocked);
+  });
+});
 
 describe("CloudX update status", () => {
   it("validates Forge recovery identities in preflight and persisted failures", () => {

@@ -3,7 +3,7 @@ import { parseCloudxUpdateChannel, parseCloudxUpdateRequest } from "@cloudx/shar
 import type { CloudxUpdateService } from "./CloudxUpdateService.js";
 import { runtimeBuild } from "./RuntimeBuild.js";
 
-export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">, trustedOrigins: string[]): void {
+export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">, trustedOrigins: string[]): void {
   // The maintained updater integration also attests historical server builds.
   if (!app.hasRoute({ method: "GET", url: "/api/runtime" })) {
     app.get("/api/runtime", async (_request, reply) => {
@@ -19,6 +19,17 @@ export function registerCloudxUpdateRoutes(app: FastifyInstance, updates: Pick<C
   app.get("/api/system/update/preview", async (_request, reply) => {
     reply.header("cache-control", "no-store");
     return updates.preview();
+  });
+
+  app.post("/api/system/update/capacity", { bodyLimit: 1024 }, async (request, reply) => {
+    reply.header("cache-control", "no-store");
+    if (!request.headers.origin || !trustedOrigins.includes(request.headers.origin)) {
+      return reply.code(403).send({ error: "Recheck capacity from a trusted CloudX browser origin." });
+    }
+    let selection;
+    try { selection = parseCloudxUpdateRequest(request.body); }
+    catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
+    return updates.reassessCapacity(selection);
   });
 
   app.put("/api/system/update/preview", { bodyLimit: 1024 }, async (request, reply) => {

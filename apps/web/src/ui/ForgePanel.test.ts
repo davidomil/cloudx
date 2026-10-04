@@ -480,13 +480,14 @@ describe("ForgePanel", () => {
   });
 
   it.each(["completed", "cleanup_failed"] as const)("shows a %s retained checkout and recovery instructions in every view", async status => {
-    const retainedWorkspace = { worktreePath: "/owned/forge/worker-checkout", retainedPaths: ["debug_tooling/notes.txt", "src/experiment.ts"] };
+    const retainedWorkspace = { worktreePath: "/owned/forge/worker-checkout", retainedPaths: ["debug_tooling/notes.txt", "src/experiment.ts"], reason: "The issue closed with unpublished commits. Recover this work before discarding the checkout." };
     const panel = await renderPanel(fixture({ workers: [{ ...worker, status, changeNumber: change.number, tabId: undefined, retainedWorkspace }] }));
     for (const section of ["Issues", "Pull requests", "Workers (1)"]) {
       await click(panel, section);
       const recovery = panel.querySelector('[aria-label="Retained working files"]')!;
       expect(recovery).not.toBeNull();
       expect(recovery.querySelector("code")?.textContent).toBe(retainedWorkspace.worktreePath);
+      expect(recovery.textContent).toContain(retainedWorkspace.reason);
       expect(recovery.textContent).toContain("Copy the files you need from this checkout.");
       expect(recovery.textContent).toContain("Git index remains intact, including staged edits");
       expect(recovery.textContent).toContain("Forge keeps this checkout available for recovery.");

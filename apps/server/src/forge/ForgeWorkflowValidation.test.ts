@@ -174,6 +174,19 @@ describe("Issue working-file handoffs", () => {
     }
   });
 
+  it("persists ignored evidence separately from the exact working-file inventory", () => {
+    const completed = { ...report, handoff: { ...handoff, retainedEvidencePaths: [".cache/evidence.log", "dist/research"] } };
+    const pendingPublication = { report: completed, handoff: { headSha, retainedPaths: handoff.retainedPaths, retainedEvidencePaths: ["dist/research", ".cache/evidence.log"] }, repliedDiscussionIds: [] };
+    expect(parseWorkerReport(completed)).toEqual(completed);
+    expect(parseWorkers([{ ...worker, pendingPublication }])[0].pendingPublication).toEqual(pendingPublication);
+    for (const retainedEvidencePaths of [undefined, [], [".cache/evidence.log"], ["dist/other"]])
+      expect(() => parseWorkers([{ ...worker, pendingPublication: { ...pendingPublication, handoff: { ...pendingPublication.handoff, retainedEvidencePaths } } }])).toThrow(/handoff/);
+  });
+
+  it.each([null, {}, ["same", "same"], [1], [""], ["/absolute"], ["../parent"], ["a/../b"], ["a/./b"], ["a//b"], ["a/"], ["a\\b"], ["a\0b"], ["C:/outside"], [".git"], ["a/.git/config"], ["p".repeat(4097)]])("rejects malformed ignored evidence %#", retainedEvidencePaths => {
+    expect(() => parseWorkerReport({ ...report, handoff: { ...handoff, retainedEvidencePaths } })).toThrow();
+  });
+
   it.each([
     null, {}, [],
     { ...handoff, status: "done" }, { ...handoff, status: ["ready"] },
@@ -229,8 +242,14 @@ describe("Saved retained checkouts", () => {
     null, {}, { ...retainedWorkspace, worktreePath: " " }, { ...retainedWorkspace, worktreePath: "bad\0path" },
     { ...retainedWorkspace, worktreePath: "p".repeat(4097) }, { ...retainedWorkspace, retainedPaths: ["../outside"] },
     { ...retainedWorkspace, retainedPaths: ["same", "same"] },
+    { ...retainedWorkspace, reason: " " }, { ...retainedWorkspace, reason: 42 }, { ...retainedWorkspace, reason: "x".repeat(4097) },
   ])("rejects malformed recovery information %#", retainedWorkspace => {
     expect(() => parseWorkers([{ ...worker, retainedWorkspace }])).toThrow();
+  });
+
+  it("persists a specific unpublished-work retention reason", () => {
+    const retained = { ...retainedWorkspace, retainedPaths: [".git"], reason: "Unpublished commits need recovery." };
+    expect(parseWorkers([{ ...worker, status: "completed", retainedWorkspace: retained }])[0].retainedWorkspace).toEqual(retained);
   });
 
   it("requires any still-owned checkout to match the retained location", () => {

@@ -11,10 +11,10 @@ import {
   SERVICE_NAMES,
   updateCommit,
 } from "./install-update.mjs";
-import { bundleCoordinator, syncDirectory, verifySnapshot, writeUpdateJson } from "./managed-update-store.mjs";
+import { bundleCoordinator, syncDirectory, verifySnapshot, writeUpdateJson, publicUpdateCapacity } from "./managed-update-store.mjs";
 import { inspectRuntimeUpdate } from "./install-runtime.mjs";
 import { COORDINATOR_FILES } from "./update-coordinator.mjs";
-import { CURRENT_TERMINAL_CONTRACT } from "./managed-update.mjs";
+import { CURRENT_TERMINAL_CONTRACT, UpdateHost } from "./managed-update.mjs";
 import { parseEnvironmentFile } from "./installer-environment.mjs";
 import { assertTerminalMigrationSafe } from "./terminal-upgrade-recovery.mjs";
 
@@ -86,6 +86,7 @@ export class SettingsUpdater {
     now = () => new Date(),
     runtimeInspector = inspectRuntimeUpdate,
     stageCoordinator,
+    capacityHost = options => new UpdateHost(options),
     cli = false,
     service, port, host,
   } = {}) {
@@ -98,6 +99,7 @@ export class SettingsUpdater {
     this.home = home;
     this.runtimeInspector = runtimeInspector;
     this.stageCoordinator = stageCoordinator;
+    this.capacityHost = capacityHost;
     this.cli = cli;
     this.serviceName = service;
     this.port = port;
@@ -337,7 +339,7 @@ export class SettingsUpdater {
       throw new Error("Could not inspect the update service.");
     }
     const record = this.current(unit);
-    const run = record?.run;
+    const run = record?.run && { ...record.run, ...(record.run.capacity ? {} : record.transition?.capacity ? { capacity: publicUpdateCapacity(record.transition.capacity) } : {}) };
     const unavailableReason = record?.transition?.mutating && run?.resumable
       ? this.recoveryPreflight(record) : this.preflight();
     const confirmation = this.pointer("confirmation");
@@ -353,6 +355,36 @@ export class SettingsUpdater {
       ...(forgeBlocker ? { forgeBlocker } : {}),
       ...(confirmation?.repoRoot === this.repoRoot ? { confirmation: { targetCommit: confirmation.targetCommit, message: confirmation.message, ...(confirmation.restoreSnapshotRunId ? { restoreSnapshotRunId: confirmation.restoreSnapshotRunId, requiresInterruption: confirmation.requiresInterruption } : {}) } } : {}),
     };
+  }
+
+  reassessCapacity(targetCommit, resumeRunId) {
+    updateCommit(targetCommit);
+    if (!RUN_ID.test(resumeRunId ?? '')) throw new Error('A saved update is required for capacity reassessment.');
+    const status = this.status();
+    if (!status.available || status.run?.state === 'running') return status;
+    const record = this.read(resumeRunId);
+    this.selectSavedInstallation(record);
+    if (status.run?.id !== resumeRunId || record.targetCommit !== targetCommit || !record.run.resumable
+      || !['failed', 'prepared'].includes(record.run.state) || record.transition?.mutating)
+      throw new Error('The saved update changed or requires restoration. Check its status before cleanup.');
+    const original = JSON.stringify(record);
+    const previous = { component: record.run.component, message: record.run.message };
+    record.transition ??= { completed: [] };
+    const host = this.capacityHost({ repoRoot: record.repoRoot, home: record.home, dataDir: record.dataDir,
+      service: record.service, port: record.port, host: record.host, runDir: path.join(this.stateDir, resumeRunId),
+      commands: this.commands, save: () => {} });
+    try {
+      host.preflightCapacity(record, record.transition.capacity?.stage ?? 'build-staging');
+      if (previous.component !== 'capacity') Object.assign(record.run, previous);
+      else delete record.run.cause;
+    } catch (error) {
+      record.run.component = 'capacity';
+      record.run.cause = error.publicMessage ?? error.message;
+    }
+    const current = this.status();
+    if (current.run?.id !== resumeRunId || current.run.state === 'running' || JSON.stringify(this.read(resumeRunId)) !== original)
+      throw new Error('The saved update changed during capacity reassessment. Check update status before continuing.');
+    return { ...current, run: record.run };
   }
 
   start(targetCommit, { confirmInterruption = false, resumeRunId, restoreSnapshotRunId, verbose = false, noStart } = {}) {
@@ -542,13 +574,13 @@ function main() {
     if (!["succeeded", "prepared"].includes(run.state)) process.exitCode = 1;
     return;
   }
-  if (!["status", "start"].includes(action) || !dataDir || !/^\d+$/.test(serverPid ?? "") ||
-      action === "status" && (targetCommit !== undefined || flags.length) || action === "start" && !targetCommit ||
+  if (!["status", "start", "capacity"].includes(action) || !dataDir || !/^\d+$/.test(serverPid ?? "") ||
+      action === "status" && (targetCommit !== undefined || flags.length) || action !== "status" && !targetCommit ||
       flags.some(flag => flag !== "--confirm-interruption" && !/^--(?:resume|restore-snapshot)=[0-9a-f-]{36}$/.test(flag))) throw new Error("Invalid updater invocation.");
   const updater = new SettingsUpdater({ dataDir, serverPid });
   const options = { confirmInterruption: flags.includes("--confirm-interruption"), resumeRunId: flags.find(flag => flag.startsWith("--resume="))?.slice(9), restoreSnapshotRunId: flags.find(flag => flag.startsWith("--restore-snapshot="))?.slice(19) };
   if (options.resumeRunId && !RUN_ID.test(options.resumeRunId)) throw new Error("Invalid resume identifier.");
-  console.log(JSON.stringify(action === "status" ? updater.status() : updater.start(targetCommit, options)));
+  console.log(JSON.stringify(action === "status" ? updater.status() : action === "capacity" ? updater.reassessCapacity(targetCommit, options.resumeRunId) : updater.start(targetCommit, options)));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

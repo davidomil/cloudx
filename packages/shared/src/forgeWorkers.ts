@@ -48,15 +48,18 @@ export interface ForgeIssueHandoff {
   headSha: string;
   status: "ready" | "needs_work";
   retainedPaths: string[];
+  retainedEvidencePaths?: string[];
   details: string;
 }
 export interface ForgePublicationHandoff {
   headSha: string;
   retainedPaths: string[];
+  retainedEvidencePaths?: string[];
 }
 export interface ForgeRetainedWorkspace {
   worktreePath: string;
   retainedPaths: string[];
+  reason?: string;
 }
 export interface ForgeWorkerHistory {
   tabId: string;

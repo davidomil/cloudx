@@ -28,6 +28,7 @@ const TERMINAL_CONTRACT_FILE = "apps/server/src/terminal/TerminalProcess.ts";
 const SERVER_FILE = "apps/server/src/server.ts";
 const LEGACY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start">';
 const MANAGED_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">';
+const CAPACITY_SETTINGS_CONTRACT = 'Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">';
 export const MANAGED_INTEGRATION_SOURCE_FILES = [...SETTINGS_FILES, READINESS_FILE, LEGACY_READINESS_SOURCE,
   "scripts/managed-update-settings-integration.mjs", "scripts/managed-update-session-integration.mjs", ...SESSION_PERSISTENCE_FILES,
   ...FORGE_INTEGRATION_SOURCE_FILES];
@@ -48,9 +49,12 @@ export function prepareManagedIntegration(release, coordinator = path.resolve(pa
   } else if (fs.existsSync(service) && !fs.readFileSync(service, "utf8").includes("installedUpdaterRoot")) {
     files.push(...SETTINGS_FILES);
     if (serverSource.includes(LEGACY_SETTINGS_CONTRACT)) {
-      migrated[SERVER_FILE] = serverSource.replace(LEGACY_SETTINGS_CONTRACT, MANAGED_SETTINGS_CONTRACT);
+      migrated[SERVER_FILE] = serverSource.replace(LEGACY_SETTINGS_CONTRACT, CAPACITY_SETTINGS_CONTRACT);
       files.push(SERVER_FILE);
-    } else if (!serverSource.includes(MANAGED_SETTINGS_CONTRACT)) {
+    } else if (serverSource.includes(MANAGED_SETTINGS_CONTRACT)) {
+      migrated[SERVER_FILE] = serverSource.replace(MANAGED_SETTINGS_CONTRACT, CAPACITY_SETTINGS_CONTRACT);
+      files.push(SERVER_FILE);
+    } else {
       throw new Error("Managed updater integration does not recognize the target server's Settings contract.");
     }
   }

@@ -572,6 +572,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     {!archivedDraft && worker.completion?.continuationRequired ? <p role="status" className="forge-notice">{worker.completion.continuationRequired} Use Continue with message to finish the implementation and submit a new handoff.</p> : null}
     {!archivedDraft && retainedFiles ? <section aria-label="Retained working files">
       <p>{worker.retainedWorkspace ? "Forge kept the checkout and its uncommitted files at" : "Working files remain at"} <code>{retainedFiles.worktreePath}</code>.</p>
+      {worker.retainedWorkspace?.reason ? <p role="status">{worker.retainedWorkspace.reason}</p> : null}
       {worker.retainedWorkspace ? <p>Copy the files you need from this checkout. Its Git index remains intact, including staged edits; Forge keeps this checkout available for recovery.</p>
         : <p>Copy any files you need from this checkout; staged edits are held in its Git index.</p>}
       <details><summary>Retained paths ({retainedFiles.retainedPaths.length})</summary><ul>{retainedFiles.retainedPaths.map(path => <li key={path}><code>{path}</code></li>)}</ul></details>

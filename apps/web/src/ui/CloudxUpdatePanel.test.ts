@@ -45,7 +45,7 @@ function reply(status: CloudxUpdateStatus | CloudxUpdatePreview, code = 200) { r
 
 async function mount(saveWorkspace: () => Promise<void> = async () => undefined, previewFetch = async (_init?: RequestInit) => reply(mainPreview), initiallyOpen = true, onOpenForge?: () => void) {
   const statusFetch = globalThis.fetch;
-  vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/preview") ? previewFetch(init) : statusFetch(url, init));
+  vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/api/system/update/preview") ? previewFetch(init) : statusFetch(url, init));
   const container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);

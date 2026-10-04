@@ -19,3 +19,7 @@ export async function startCloudxUpdate(request: CloudxUpdateRequest, signal?: A
   if (!response.ok && response.status !== 409) throw new HttpError(response.status, errorMessageFromResponse(await response.text(), response.status));
   return parseCloudxUpdateStatus(await response.json());
 }
+
+export async function reassessCloudxUpdateCapacity(request: CloudxUpdateRequest, signal?: AbortSignal): Promise<CloudxUpdateStatus> {
+  return parseCloudxUpdateStatus(await fetchJson<unknown>("/api/system/update/capacity", { method: "POST", body: JSON.stringify(request), signal }));
+}

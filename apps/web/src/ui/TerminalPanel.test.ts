@@ -79,6 +79,10 @@ vi.mock("@xterm/xterm", () => ({
       return { dispose: () => undefined };
     }
 
+    onScroll(): { dispose: () => void } {
+      return { dispose: () => undefined };
+    }
+
     onData(handler: (data: string) => void): { dispose: () => void } {
       this.inputHandlers.push(handler);
       return { dispose: () => undefined };

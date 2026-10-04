@@ -23,10 +23,12 @@ it("retains managed Settings and independent terminal readiness in a historical 
   const release = fixture();
   const head = git(release, ["rev-parse", "HEAD"]);
   const integration = prepareManagedIntegration(release, coordinator);
-  expect(integration).toEqual({ version: 1, files: MANAGED_INTEGRATION_FILES.filter(file =>
-    ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES, ...FORGE_INTEGRATION_FILES].includes(file)), independentReadiness: true });
+  expect(integration).toEqual({ version: 1, files: [...MANAGED_INTEGRATION_FILES.filter(file =>
+    ![...MISSING_SETTINGS_FILES, ...SESSION_INTEGRATION_FILES, ...SESSION_PERSISTENCE_FILES, ...FORGE_INTEGRATION_FILES].includes(file) && file !== "apps/server/src/terminal/TerminalReadiness.ts"),
+    "apps/server/src/server.ts", "apps/server/src/terminal/TerminalReadiness.ts"], independentReadiness: true });
   expect(integration.files).toContain("apps/web/src/ui/CloudxUpdatePanel.test.ts");
-  for (const relative of integration.files) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
+  for (const relative of integration.files.filter(file => file !== "apps/server/src/server.ts")) expect(fs.readFileSync(path.join(release, relative))).toEqual(fs.readFileSync(path.join(coordinator, relative)));
+  expect(fs.readFileSync(path.join(release, "apps/server/src/server.ts"), "utf8")).toContain('"reassessCapacity"');
   expect(git(release, ["rev-parse", "HEAD"])).toBe(head);
 });
 
@@ -141,7 +143,7 @@ it("upgrades the pre-channel server contract while preserving its unrelated sour
   expect(integration.files).toContain("apps/server/src/server.ts");
   expect(integration.files).toContain("apps/server/src/system/CloudxUpdateCatalog.ts");
   expect(fs.readFileSync(path.join(release, "apps/server/src/server.ts"), "utf8"))
-    .toBe('const historicalBehavior = true;\nupdates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel">;');
+    .toBe('const historicalBehavior = true;\nupdates?: Pick<CloudxUpdateService, "status" | "start" | "preview" | "selectChannel" | "reassessCapacity">;');
 });
 
 it("checks the entire migration before overwriting files when the legacy server has local edits", () => {
