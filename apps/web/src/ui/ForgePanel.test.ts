@@ -20,7 +20,7 @@ vi.mock("./ForgeWorkerHistoryPanel.js", () => ({
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const cleanup: WorkspaceCleanupController = {
-  preview: undefined, job: null, selected: [], discard: [], emptyTrash: false, confirming: false, filter: "all", error: "", running: false, scanning: false, operationBusy: false, busy: false,
+  preview: undefined, job: null, selected: [], discard: [], emptyTrash: false, confirming: false, filter: "all", error: "", running: false, scanning: false, operationBusy: false, busy: false, statusError: undefined, checkingJob: false, reconnectStatus: () => {},
   scan: async () => {}, remove: async () => {}, perform: async work => { await work(); }, setConfirming: () => {}, setFilter: () => {}, select: () => {}, discardSource: () => {}, setEmptyTrash: () => {},
 };
 const roots: Root[] = [];

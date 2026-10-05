@@ -31,14 +31,14 @@ function service() {
 function observedService(processActivity?: WorkspaceProcessActivity) {
   return new WorkspaceCleanupService({ dataDir, pathPolicy: new PathPolicy([root]), forge, openDirectories: () => open, withInactiveDirectory: async (_directory, operation) => operation(), processActivity, protectedDirectories: [], trashDirectory: path.join(root, "trash") });
 }
-async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; cwd?: string; files?: string[]; group?: string; managerPid?: string } = {}) {
+async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; state?: string; threads?: number | null; cwd?: string; files?: string[]; group?: string; managerPid?: string } = {}) {
   const procDirectory = path.join(root, "proc");
   const pid = options.pid ?? "273";
   const directory = path.join(procDirectory, pid);
   await fs.mkdir(path.join(directory, "fd"), { recursive: true });
-  await fs.writeFile(path.join(directory, "stat"), `${pid} (${options.name ?? "systemd"}) S ${options.parent ?? "1"} ${Array(17).fill("0").join(" ")} 1234\n`);
+  await fs.writeFile(path.join(directory, "stat"), `${pid} (${options.name ?? "systemd"}) ${options.state ?? "S"} ${options.parent ?? "1"} ${Array(17).fill("0").join(" ")} 1234\n`);
   const uid = options.uid ?? 1000;
-  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\n`);
+  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\n${options.threads === null ? "" : `Threads:\t${options.threads ?? 1}\n`}`);
   await fs.writeFile(path.join(directory, "cgroup"), options.group ?? "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n");
   await fs.symlink(options.cwd ?? root, path.join(directory, "cwd"));
   for (const [fd, file] of (options.files ?? []).entries()) await fs.symlink(file, path.join(directory, "fd", String(fd)));
@@ -402,6 +402,113 @@ describe("reviewed workspace cleanup", () => {
     } finally {
       const stopped = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGTERM"); await stopped;
     }
+  });
+  it.each(["cwd and open file", "open file only"])("protects preview and deletion while a zombie leader has a surviving thread using the %s", async activity => {
+    const directory = await checkout("surviving-thread");
+    const observed = observedService();
+    const reviewed = await observed.preview();
+    expect(reviewed.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true });
+    const executable = path.join(root, "surviving-thread");
+    await execute("cc", ["-Wall", "-Wextra", "-Werror", "-pthread", path.join(import.meta.dirname, "fixtures/surviving-thread.c"), "-o", executable]);
+    const child = spawn(executable, [activity === "cwd and open file" ? directory : root, path.join(directory, "source.ts")], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
+    const stopped = new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => code === 0 || signal === "SIGTERM" ? resolve() : reject(new Error(`pthread fixture exited ${code ?? signal}`)));
+    });
+    try {
+      const ready = await new Promise<string>((resolve, reject) => { child.stdout.once("data", data => resolve(String(data).trim())); child.once("error", reject); });
+      const [tid, descriptor] = ready.split(" ");
+      const procDirectory = `/proc/${child.pid}`;
+      await expect.poll(async () => (await fs.readFile(path.join(procDirectory, "stat"), "utf8")).split(") ")[1]!.split(" ")[0]).toBe("Z");
+      expect(await fs.readFile(path.join(procDirectory, "status"), "utf8")).toMatch(/^Threads:\s+2$/mu);
+      expect(await fs.readlink(`/proc/${tid}/cwd`)).toBe(activity === "cwd and open file" ? directory : root);
+      expect(await fs.readlink(`/proc/${tid}/fd/${descriptor}`)).toBe(path.join(directory, "source.ts"));
+      const inspecting = observedService();
+      const protectedPreview = await inspecting.preview();
+      const candidate = protectedPreview.candidates.find(item => item.path === directory)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain(`PID ${child.pid}`);
+      await expect(inspecting.start({ ...selection(protectedPreview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+      await observed.start(selection(reviewed)); await observed.settled();
+      expect((await observed.status())?.results.find(item => item.path === directory)).toMatchObject({ status: "skipped" });
+      expect(await fs.readFile(path.join(directory, "source.ts"), "utf8")).toBe("original\n");
+      child.stdin.write("x");
+      await stopped;
+      const inactive = await observed.preview();
+      expect(inactive.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+      await observed.start(selection(inactive)); await observed.settled();
+      expect((await observed.status())?.results.find(item => item.path === directory)).toMatchObject({ status: "deleted" });
+      await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await stopped;
+    }
+  });
+  it.each([{ state: "Z", threads: 2 }, { state: "X", threads: 2 }, { state: "x", threads: 2 }, { state: "Z", threads: null }, { state: "Z", threads: 0 }])("preserves unresolved thread-group activity even when the leader's paths appear inactive: %j", async options => {
+    const completed = await checkout("unresolved-thread-group");
+    const { observed } = await processFixture({ name: "node", ...options });
+    const preview = await observed.preview();
+    const candidate = preview.candidates.find(item => item.path === completed)!;
+    expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+    expect(candidate.reason).toContain("Thread group exit is unconfirmed");
+    await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+    expect(await fs.stat(completed)).toBeTruthy();
+  });
+  it.each(["Z", "X", "x"])("allows cleanup only after confirming the %s leader has no surviving threads", async state => {
+    const completed = await checkout("exited-thread-group");
+    const { observed } = await processFixture({ name: "node", state, threads: 1 });
+    const preview = await observed.preview();
+    expect(preview.candidates.find(item => item.path === completed)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+    await observed.start(selection(preview)); await observed.settled();
+    expect((await observed.status())?.results.find(item => item.path === completed)).toMatchObject({ status: "deleted" });
+  });
+  it.each([1, 2])("rechecks whole-group exit when the leader terminates during path inspection with %i threads", async threads => {
+    const completed = await checkout("leader-exits-during-inspection");
+    const { observed, directory } = await processFixture({ name: "node", threads });
+    const readlink = fs.readlink;
+    const exit = vi.spyOn(fs, "readlink").mockImplementation(async (...args: Parameters<typeof fs.readlink>) => {
+      if (String(args[0]) === path.join(directory, "cwd")) {
+        const stat = await fs.readFile(path.join(directory, "stat"), "utf8");
+        await fs.writeFile(path.join(directory, "stat"), stat.replace(") S ", ") Z "));
+      }
+      return readlink(...args);
+    });
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate.eligible).toBe(threads === 1);
+      if (threads === 2) expect(candidate.reason).toContain("Thread group exit is unconfirmed");
+    } finally { exit.mockRestore(); }
+  });
+  it("preserves an exited leader whose thread-group status cannot be read", async () => {
+    const completed = await checkout("unreadable-thread-group");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 1 });
+    const readFile = fs.readFile;
+    const denied = vi.spyOn(fs, "readFile").mockImplementation((...args: Parameters<typeof fs.readFile>) => {
+      if (String(args[0]) === path.join(directory, "status")) return Promise.reject(Object.assign(new Error("EACCES: thread-group status unavailable"), { code: "EACCES" }));
+      return readFile(...args);
+    });
+    try {
+      const preview = await observed.preview();
+      const candidate = preview.candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain("thread-group status unavailable");
+      await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+    } finally { denied.mockRestore(); }
+  });
+  it("preserves a PID replaced during whole-thread-group exit verification", async () => {
+    const completed = await checkout("replaced-exited-leader");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 1 });
+    const readFile = fs.readFile;
+    let reads = 0;
+    const replaced = vi.spyOn(fs, "readFile").mockImplementation((...args: Parameters<typeof fs.readFile>) => {
+      if (String(args[0]) === path.join(directory, "stat") && ++reads > 1) return readFile(...args).then(stat => String(stat).replace(/1234\n$/u, "5678\n"));
+      return readFile(...args);
+    });
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain("Process identity changed");
+    } finally { replaced.mockRestore(); }
   });
   it.each(["cwd", "fd/0"])("reviews and deletes an inactive checkout despite an unreadable verified system user-manager %s", async unreadable => {
     const completed = await checkout("inactive-system-manager");

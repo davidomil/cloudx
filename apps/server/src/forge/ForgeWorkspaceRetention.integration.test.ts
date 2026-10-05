@@ -107,6 +107,55 @@ describe("Forge workflow retention after completed workspace discard", () => {
     expect((await new ForgeCheckoutEvidence(fixture.dataDir).list())[0]).toMatchObject({ bytes: 20, commitSha: fixture.worker.headSha });
   });
 
+  it("keeps named checkout reports across restart until the renamed evidence archive directory is durable", async () => {
+    const fixture = await RetentionFixture.create();
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    const reportPath = ".cloudx/validation/run.log";
+    await fixture.nameEvidence(reportPath, 20);
+    const namespace = path.join(fixture.dataDir, "forge-checkout-evidence");
+    const originalOpen = fs.open.bind(fs);
+    const failures: ReturnType<typeof vi.spyOn>[] = [];
+    let syncAttempts = 0;
+    let deviceAvailable = false;
+    const intercept = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === namespace) {
+        const sync = handle.sync.bind(handle);
+        failures.push(vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncAttempts++;
+          if (!deviceAvailable) throw new Error("Checkout archive directory sync failed");
+          await sync();
+        }));
+      }
+      return handle;
+    });
+    try {
+      await fixture.service.poll();
+      expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: "Checkout archive directory sync failed" });
+      const [archiveId] = await fs.readdir(namespace);
+      expect(await fs.readFile(path.join(namespace, archiveId!, "manifest.json"), "utf8")).toContain(fixture.worker.id);
+      expect(await fs.readFile(path.join(fixture.workspace.worktreePath, reportPath), "utf8")).toBe("v".repeat(20));
+      const failedAttempts = syncAttempts;
+      await fixture.restart();
+      await fixture.service.resume(fixture.worker.id, { windowId: "main", paneId: "pane-1" });
+      expect((await fixture.store.read())[0]?.status).toBe("cleanup_failed");
+      expect(await fs.readFile(path.join(fixture.workspace.worktreePath, reportPath), "utf8")).toBe("v".repeat(20));
+      expect(syncAttempts).toBeGreaterThan(failedAttempts);
+
+      deviceAvailable = true;
+      await fixture.service.resume(fixture.worker.id, { windowId: "main", paneId: "pane-1" });
+      expect(await fixture.store.read()).toEqual([]);
+      await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      await fixture.restart();
+      const archive = new ForgeCheckoutEvidence(fixture.dataDir);
+      const [manifest] = await archive.list();
+      expect(manifest?.archiveId).toBe(archiveId);
+      const chunks: Buffer[] = [];
+      for await (const chunk of await archive.fileStream(archiveId!, reportPath)) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe("v".repeat(20));
+    } finally { intercept.mockRestore(); for (const failure of failures) failure.mockRestore(); }
+  });
+
   it("retires a restored checkout containing only verified Playwright last-run metadata", async () => {
     const fixture = await RetentionFixture.create();
     await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));

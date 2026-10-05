@@ -33,13 +33,7 @@ export async function syncEvidenceReceipt(file: JsonStateFile): Promise<void> {
     if (!(await handle.stat()).isFile()) throw new Error("Evidence receipt must be a regular file.");
     await handle.sync();
   } finally { await handle.close(); }
-  let directory = parent;
-  for (;;) {
-    await syncDirectory(directory);
-    const ancestor = path.dirname(directory);
-    if (ancestor === directory) return;
-    directory = ancestor;
-  }
+  await syncDirectoryAndParents(parent);
 }
 
 /** Private flat storage keeps source paths in the manifest, never in host paths. */
@@ -87,6 +81,8 @@ export class ForgeEvidenceFiles {
         if (bytes !== file.bytes || hash.digest("hex") !== file.sha256) throw new Error("Durable evidence checksum verification failed.");
       } finally { await handle.close(); }
     }
+    // Recovery must establish durability even when a previous rename was visible but its directory sync failed.
+    await syncDirectoryAndParents(directory);
   }
 
   async fileStream(namespace: string, id: string, filePath: string) {
@@ -123,7 +119,7 @@ export class ForgeEvidenceFiles {
 export class ForgeEvidenceWriter {
   readonly files: ForgeEvidenceFile[] = [];
   bytes = 0;
-  private committed = false;
+  private published = false;
   constructor(private readonly stage: string, private readonly destination: string, private readonly parent: string) {}
 
   async add(filePath: string, source: AsyncIterable<Uint8Array> | Iterable<Uint8Array>, expectedBytes?: number): Promise<void> {
@@ -156,11 +152,11 @@ export class ForgeEvidenceWriter {
     await syncDirectory(this.stage);
     await recordIntent();
     await fs.rename(this.stage, this.destination);
-    this.committed = true;
+    this.published = true;
     await syncDirectory(this.parent);
   }
 
-  async abort(): Promise<void> { if (!this.committed) await fs.rm(this.stage, { recursive: true, force: true }); }
+  async abort(): Promise<void> { if (!this.published) await fs.rm(this.stage, { recursive: true, force: true }); }
 }
 
 function validateFiles(files: ForgeEvidenceFile[]): void {
@@ -173,3 +169,11 @@ function safeId(value: string): string { if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$
 function blobName(value: string): string { if (!safeKey(value)) throw new Error("Invalid evidence file path."); return `${createHash("sha256").update(value).digest("hex")}.data`; }
 async function optionalStat(value: string) { return fs.lstat(value).catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }); }
 async function syncDirectory(value: string): Promise<void> { const handle = await fs.open(value, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW); try { await handle.sync(); } finally { await handle.close(); } }
+async function syncDirectoryAndParents(directory: string): Promise<void> {
+  for (;;) {
+    await syncDirectory(directory);
+    const parent = path.dirname(directory);
+    if (parent === directory) return;
+    directory = parent;
+  }
+}

@@ -16,6 +16,8 @@ export function useWorkspaceCleanup({ blocked = false, onComplete }: { blocked?:
   const [operationBusy, setOperationBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [checkingJob, setCheckingJob] = useState(true);
+  const [statusError, setStatusError] = useState<string>();
+  const [statusConnection, setStatusConnection] = useState(0);
   const [error, setError] = useState("");
   const operation = useRef(false);
   const startedJob = useRef<string | undefined>(undefined);
@@ -37,16 +39,16 @@ export function useWorkspaceCleanup({ blocked = false, onComplete }: { blocked?:
     async function refresh() {
       try {
         const current = await getWorkspaceCleanup();
-        if (!disposed) { observe(current); if (current?.state === "running") timer = setTimeout(() => void refresh(), 500); }
-      } catch (failure) { if (!disposed) setError(message(failure)); }
+        if (!disposed) { setStatusError(undefined); observe(current); if (current?.state === "running") timer = setTimeout(() => void refresh(), 500); }
+      } catch (failure) { if (!disposed) setStatusError(message(failure)); }
       finally { if (!disposed) setCheckingJob(false); }
     }
     void refresh();
     return () => { disposed = true; clearTimeout(timer); };
-  }, [job?.id]);
+  }, [job?.id, statusConnection]);
 
   async function perform(work: () => Promise<void>) {
-    if (operation.current || running || blocked) throw new Error("Wait for the active cleanup or update to finish.");
+    if (operation.current || running || blocked || checkingJob || statusError !== undefined) throw new Error("Wait for cleanup status and the active cleanup or update to finish.");
     operation.current = true;
     setOperationBusy(true);
     try { await work(); }
@@ -81,10 +83,15 @@ export function useWorkspaceCleanup({ blocked = false, onComplete }: { blocked?:
   }
 
   return {
-    preview, job, selected, scanning, discard, emptyTrash, confirming, filter, error, running,
-    operationBusy: operationBusy || checkingJob || blocked,
-    busy: operationBusy || checkingJob || running || confirming,
+    preview, job, selected, scanning, discard, emptyTrash, confirming, filter, error, running, statusError, checkingJob,
+    operationBusy: operationBusy || checkingJob || statusError !== undefined || blocked,
+    busy: operationBusy || checkingJob || statusError !== undefined || running || confirming,
     scan, remove, perform,
+    reconnectStatus() {
+      if (checkingJob) return;
+      setCheckingJob(true);
+      setStatusConnection(current => current + 1);
+    },
     setConfirming,
     setFilter(value: WorkspaceCleanupFilter) { setConfirming(false); updateFilter(value); },
     select(id: string, checked: boolean) { setConfirming(false); setSelected(current => checked ? [...current, id] : current.filter(value => value !== id)); },

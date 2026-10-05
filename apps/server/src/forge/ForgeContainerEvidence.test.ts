@@ -58,6 +58,27 @@ describe("specific bounded Docker evidence archive parsing", () => {
   it("rejects oversized evidence before buffering its entry body", async () => {
     await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: "evidence/large", size: 256 * 1024 * 1024 + 1 }]))).rejects.toThrow("bounded storage limit");
   });
+  it.each([false, true])("rejects interrupted input with the original error when delayed sink startup is %s", async delayedSink => {
+    const failure = new Error("Docker stdout interrupted during report copy");
+    const header = new Header({ path: "evidence/report.json", type: "File", size: 128 * 1024, mode: 0o600 }); header.encode();
+    let sinkStarted = false;
+    async function* interruptedTar() {
+      yield header.block!;
+      yield Buffer.alloc(64 * 1024, 0x61);
+      if (!delayedSink) await setImmediate();
+      throw failure;
+    }
+    const operation = streamEvidenceTar("/work/evidence", interruptedTar(), async (_filePath, stream) => {
+      sinkStarted = true;
+      if (delayedSink) await setImmediate();
+      for await (const _chunk of stream) { /* Consume the selected report without buffering it. */ }
+    });
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const stalled = new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(new Error("Interrupted export did not settle")), 2000); });
+    try { await expect(Promise.race([operation, stalled])).rejects.toBe(failure); }
+    finally { clearTimeout(deadline); }
+    expect(sinkStarted).toBe(true);
+  });
   it.each([16 * 1024 * 1024 + 1, 23_754_142, 32 * 1024 * 1024 + 1, 34_048_143])("streams a %i-byte Docker tar report to disk under backpressure", async bytes => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-tar-stream-"));
     onTestFinished(() => fs.rm(directory, { recursive: true, force: true }));

@@ -11,6 +11,7 @@ interface ProcessIdentity {
   state: string;
   started: string;
   uids: number[];
+  threads?: number;
 }
 interface SystemUserManager {
   pid: string;
@@ -42,7 +43,8 @@ export class WorkspaceProcessActivity {
       let before: ProcessIdentity | undefined;
       try {
         before = await this.identity(pid);
-        if (!before.uids.includes(this.uid) || exited(before)) continue;
+        if (!before.uids.includes(this.uid)) continue;
+        if (exited(before)) { await this.assertThreadGroupExited(pid, before); continue; }
         const open: string[] = [];
         const uncertainty: string[] = [];
         try { open.push(await fs.readlink(this.procPath(pid, "cwd"))); }
@@ -58,8 +60,8 @@ export class WorkspaceProcessActivity {
           }
         } catch (error) { uncertainty.push(`open files: ${message(error)}`); }
         const after = await this.identity(pid);
-        if (exited(after)) continue;
         if (!sameProcess(before, after)) throw new Error("Process identity changed during inspection. Scan again.");
+        if (exited(after)) { await this.assertThreadGroupExited(pid, after); continue; }
         const active = open.find(file => [file, file.replace(/ \(deleted\)$/u, "")].some(openPath => isSameOrChildPath(resolved, path.resolve(openPath))));
         if (active) throw new ActiveWorkspaceProcess(`A running process (PID ${pid}) still uses this workspace: ${active}`);
         if (uncertainty.length) {
@@ -72,7 +74,10 @@ export class WorkspaceProcessActivity {
         if (error instanceof ActiveWorkspaceProcess) throw error;
         if (vanished(error)) {
           // A missing cwd/fd is not proof that the PID vanished (the main thread may have exited).
-          try { if (exited(await this.identity(pid))) continue; }
+          try {
+            const current = await this.identity(pid);
+            if (exited(current)) { await this.assertThreadGroupExited(pid, current); continue; }
+          }
           catch (current) { if (vanished(current)) continue; }
         }
         throw new Error(`Process activity for ${resolved} is uncertain: PID ${pid}${before ? ` (${before.name})` : ""}: ${message(error)}`);
@@ -82,15 +87,23 @@ export class WorkspaceProcessActivity {
 
   private procPath(pid: string, file: string): string { return path.join(this.procDirectory, pid, file); }
 
+  private async assertThreadGroupExited(pid: string, leader: ProcessIdentity): Promise<void> {
+    const current = await this.identity(pid);
+    if (!sameProcess(leader, current)) throw new Error("Process identity changed during inspection. Scan again.");
+    if (!exited(current) || current.threads !== 1)
+      throw new Error(`Thread group exit is unconfirmed: leader state ${current.state}; ${current.threads === undefined ? "thread count is unavailable" : `${current.threads} threads remain`}.`);
+  }
+
   private async identity(pid: string): Promise<ProcessIdentity> {
     const stat = await fs.readFile(this.procPath(pid, "stat"), "utf8");
     const name = /^\d+ \((.*)\) /su.exec(stat);
     const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
     const status = await fs.readFile(this.procPath(pid, "status"), "utf8");
     const uids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/mu.exec(status);
+    const threads = /^Threads:\s+(\d+)\s*$/mu.exec(status);
     if (!name || !/^\d+$/u.test(fields[1] ?? "") || !/^\d+$/u.test(fields[19] ?? "") || !uids)
       throw new Error("Process ownership or start-time identity is unavailable.");
-    return { name: name[1]!, parent: fields[1]!, state: fields[0]!, started: fields[19]!, uids: uids.slice(1).map(Number) };
+    return { name: name[1]!, parent: fields[1]!, state: fields[0]!, started: fields[19]!, uids: uids.slice(1).map(Number), ...(threads ? { threads: Number(threads[1]) } : {}) };
   }
 
   private async isSystemUserInfrastructure(pid: string, identity: ProcessIdentity, directory: string): Promise<boolean> {

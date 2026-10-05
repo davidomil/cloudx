@@ -15,6 +15,7 @@ export function WorkspaceCleanupPanel({ cleanup }: { cleanup: WorkspaceCleanupCo
     <p>Review ordinary checkouts and worktrees, retained Forge directories, workspace trash and owned containers. Active work, shared resources, unpublished source and update recovery data are protected.</p>
     <label>Workspace filter<select aria-label="Workspace filter" value={filter} disabled={busy || running || confirming} onChange={event => cleanup.setFilter(event.target.value as WorkspaceCleanupFilter)}><option value="all">All workspaces and environments</option><option value="forge">Forge directories, trash and containers</option></select></label>
     <ControlButton disabled={busy || running} onClick={() => void scan()}>{scanning ? "Scanning…" : "Scan workspaces and environments"}</ControlButton>
+    {cleanup.statusError !== undefined && <div><p role="alert">Cleanup status unavailable: {cleanup.statusError} Cleanup and updates stay blocked until status is reconnected.</p><ControlButton disabled={cleanup.checkingJob} onClick={cleanup.reconnectStatus}>{cleanup.checkingJob ? "Checking cleanup status…" : "Reconnect cleanup status"}</ControlButton></div>}
     {error && <p role="alert">{error}</p>}
     {preview && <>
       <p><strong>{size(workspaceCleanupReclaimableBytes(preview, visibleSelected))}</strong> estimated reclaimable from the selection · {size(preview.availableBytes)} available.</p>

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { Parser } from "tar";
+import { Parser, type ReadEntry } from "tar";
 import type { DisposableResource, ForgeEvidenceManifest, ForgeResourceEvidence } from "@cloudx/shared";
 import { JsonStateFile, requireSafeDirectory } from "../jsonStateFile.js";
 import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
@@ -32,6 +32,7 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
   let entries = 0;
   const root = path.posix.basename(source);
   const parser = new Parser({ strict: true });
+  const pendingEntries = new Set<ReadEntry>();
   let tail = Promise.resolve();
   const destination = new Writable({
     write(chunk: Buffer, _encoding, callback) {
@@ -64,11 +65,23 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
       fail("Evidence exceeds the bounded storage limit (256 MiB / 512 files); select narrower paths."); return;
     }
     keys.add(filePath); bytes += entry.size;
-    tail = tail.then(() => write(filePath, entry, entry.size));
+    pendingEntries.add(entry);
+    entry.on("error", (error: Error) => parser.abort(error));
+    tail = tail.then(async () => {
+      await write(filePath, entry, entry.size);
+      pendingEntries.delete(entry);
+    });
     tail.catch(error => parser.abort(error instanceof Error ? error : new Error(String(error))));
   });
   try { await pipeline(Readable.from(tar), destination); await completion; }
-  catch (error) { parser.abort(error instanceof Error ? error : new Error(String(error))); await tail.catch(() => undefined); throw error; }
+  catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    parser.abort(failure);
+    // Parser.abort() leaves entries open; settle their consumers before removing staging.
+    for (const entry of pendingEntries) entry.destroy(failure);
+    await tail.catch(() => undefined);
+    throw error;
+  }
   if (!keys.size) throw new Error(`Evidence source ${source} has no exportable regular files; select specific valuable data.`);
 }
 

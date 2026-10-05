@@ -194,6 +194,51 @@ describe("Completed Forge evidence lifecycle", () => {
     expect(fixture.host.removed).toEqual([resource.containerId]);
   });
 
+  it("keeps the container and worker across restart until the renamed evidence archive directory is durable", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    const namespace = path.join(fixture.directory, "forge-evidence");
+    const originalOpen = fs.open.bind(fs);
+    const failures: ReturnType<typeof vi.spyOn>[] = [];
+    let syncAttempts = 0;
+    let deviceAvailable = false;
+    const intercept = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]) === namespace) {
+        const sync = handle.sync.bind(handle);
+        failures.push(vi.spyOn(handle, "sync").mockImplementation(async () => {
+          syncAttempts++;
+          if (!deviceAvailable) throw new Error("Container archive directory sync failed");
+          await sync();
+        }));
+      }
+      return handle;
+    });
+    try {
+      await fixture.workflow.poll();
+      expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "exporting" }, reason: "Container archive directory sync failed" });
+      expect(await fs.readFile(path.join(namespace, resource.id, "manifest.json"), "utf8")).toContain(resource.id);
+      expect(fixture.host.removed).toEqual([]);
+      const failedAttempts = syncAttempts;
+      await fixture.restart();
+      await fixture.workflow.poll();
+      expect((await fixture.store.read())[0]?.id).toBe(owner.id);
+      expect((await fixture.resources.records())[0]?.state).toBe("failed");
+      expect(fixture.host.removed).toEqual([]);
+      expect(syncAttempts).toBeGreaterThan(failedAttempts);
+      expect(fixture.host.exports).toHaveLength(1);
+
+      deviceAvailable = true;
+      await fixture.workflow.reconcileResourceCleanup();
+      expect(await fixture.store.read()).toEqual([]);
+      expect(fixture.host.removed).toEqual([resource.containerId]);
+      expect(fixture.host.exports).toHaveLength(1);
+      await fixture.restart();
+      expect(await buffer(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
+    } finally { intercept.mockRestore(); for (const failure of failures) failure.mockRestore(); }
+  });
+
   it.each([16 * 1024 * 1024 + 1, 23_754_142, 32 * 1024 * 1024 + 1, 34_048_143])("streams a %i-byte report through completion and keeps its verified provenance after restart", async bytes => {
     const owner = completedWorker();
     const resource = savedEnvironment(owner, true);

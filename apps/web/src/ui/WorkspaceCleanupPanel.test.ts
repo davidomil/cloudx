@@ -26,13 +26,15 @@ let job: WorkspaceCleanupJob | null;
 let requests: WorkspaceCleanupRequest[];
 let scanFailure: boolean;
 let removalFailure: boolean;
+let statusFailure: boolean;
+let statusResponse: Promise<Response> | undefined;
 let evidenceFinish: (() => void) | undefined;
 const completed = vi.fn();
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.useFakeTimers();
-  scanFailure = false; removalFailure = false;
+  scanFailure = false; removalFailure = false; statusFailure = false; statusResponse = undefined;
   job = null; requests = []; evidenceFinish = undefined; completed.mockClear();
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
     if (url === "/api/forge/checkout-evidence") return Response.json({ archives: [] });
@@ -48,6 +50,10 @@ beforeEach(() => {
         const request = JSON.parse(init.body as string) as WorkspaceCleanupRequest;
         requests.push(request);
         job = { id: id(20), state: "running", startedAt: "2026-10-05", availableBytesBefore: 8192, results: request.candidateIds.map(candidateId => ({ id: candidateId, path: entries.find(item => item.id === candidateId)!.path, status: "waiting", reason: "Queued" })) };
+      }
+      else {
+        if (statusFailure) throw new Error("Cleanup status connection lost.");
+        if (statusResponse) return statusResponse;
       }
       return Response.json(job);
     }
@@ -143,6 +149,76 @@ describe("Canonical workspace and container cleanup", () => {
     expect(requests).toEqual([]);
     expect(vi.mocked(fetch).mock.calls.filter(([url, init]) => url === "/api/system/workspace-cleanup" && init?.method === "POST")).toHaveLength(1);
     await click("Cancel"); expect(button("Resume update").disabled).toBe(false);
+  });
+
+  it("keeps cleanup and updates blocked after an initial status failure until explicit reconnection succeeds", async () => {
+    statusFailure = true; await mount();
+    expect(button("Scan workspaces and environments").disabled).toBe(true);
+    expect(button("Resume update").disabled).toBe(true);
+    expect(button("Reconnect cleanup status").disabled).toBe(false);
+    const statusCalls = () => vi.mocked(fetch).mock.calls.filter(([url, init]) => url === "/api/system/workspace-cleanup" && !init?.method).length;
+    expect(statusCalls()).toBe(1);
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    await click("Hide environments"); await click("Open environments");
+    expect(statusCalls()).toBe(1);
+    await click("Reconnect cleanup status");
+    expect(statusCalls()).toBe(2);
+    expect(button("Resume update").disabled).toBe(true);
+    statusFailure = false;
+    await click("Reconnect cleanup status");
+    expect(statusCalls()).toBe(3);
+    expect(container.textContent).not.toContain("Cleanup status unavailable");
+    expect(button("Scan workspaces and environments").disabled).toBe(false);
+    expect(button("Resume update").disabled).toBe(false);
+    expect(completed).not.toHaveBeenCalled();
+  });
+
+  it("reconnects a failed running-job poll after navigation and releases gates only when authoritative completion arrives", async () => {
+    await mount(); await click("Scan workspaces and environments");
+    await click("Review deletion of 4 workspaces"); await click("Delete permanently");
+    statusFailure = true;
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(container.textContent).toContain("Cleanup status unavailable: Cleanup status connection lost.");
+    const statusCalls = () => vi.mocked(fetch).mock.calls.filter(([url, init]) => url === "/api/system/workspace-cleanup" && !init?.method).length;
+    const callsWhenDisconnected = statusCalls();
+    job = { ...job!, state: "completed", availableBytesAfter: 16384, results: job!.results.map(item => ({ ...item, status: "deleted", reason: "Deleted" })) };
+    statusFailure = false;
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    await click("Hide environments"); await click("Open environments"); await click("Refresh environments");
+    expect(statusCalls()).toBe(callsWhenDisconnected);
+    expect(container.textContent).toContain("Cleanup in progress");
+    expect(button("Scan workspaces and environments").disabled).toBe(true);
+    expect(button("Resume update").disabled).toBe(true);
+    expect(completed).not.toHaveBeenCalled();
+    let finish!: (response: Response) => void;
+    statusResponse = new Promise(resolve => { finish = resolve; });
+    await click("Reconnect cleanup status");
+    expect(button("Checking cleanup status…").disabled).toBe(true);
+    expect(button("Scan workspaces and environments").disabled).toBe(true);
+    expect(button("Resume update").disabled).toBe(true);
+    await act(async () => finish(Response.json(job)));
+    expect(completed).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("16.00 KiB available after cleanup");
+    expect(container.textContent).not.toContain("Cleanup status unavailable");
+    expect(button("Scan workspaces and environments").disabled).toBe(false);
+    expect(button("Resume update").disabled).toBe(false);
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(completed).toHaveBeenCalledOnce();
+  });
+
+  it("resumes polling after an explicit reconnect establishes that cleanup is still running", async () => {
+    await mount(); await click("Scan workspaces and environments");
+    await click("Review deletion of 4 workspaces"); await click("Delete permanently");
+    statusFailure = true;
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    statusFailure = false; await click("Reconnect cleanup status");
+    expect(container.textContent).not.toContain("Cleanup status unavailable");
+    expect(button("Scan workspaces and environments").disabled).toBe(true);
+    expect(button("Resume update").disabled).toBe(true);
+    job = { ...job!, state: "completed", availableBytesAfter: 16384, results: job!.results.map(item => ({ ...item, status: "deleted", reason: "Deleted" })) };
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    expect(completed).toHaveBeenCalledOnce();
+    expect(button("Resume update").disabled).toBe(false);
   });
 
   it("shares evidence-decision busy state with cleanup and updater while preserving evidence confirmation", async () => {

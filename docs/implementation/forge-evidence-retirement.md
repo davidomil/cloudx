@@ -8,9 +8,11 @@ types. Settings → Updates opens the Forge, trash and container filter.
 Retained update backups remain in Updates.
 
 The application shares selection, cleanup jobs and busy state across
-navigation. Returning to Updates refreshes capacity. Ordinary checkouts
-and worktrees remain explicitly labelled. Source discard and permanent
-deletion require separate confirmations.
+navigation. Returning to Updates refreshes capacity. A failed
+cleanup-status request blocks cleanup and updates until the user
+reconnects status in Environments. Ordinary checkouts and worktrees
+remain explicitly labelled. Source discard and permanent deletion
+require separate confirmations.
 
 ## Evidence handoff
 
@@ -21,8 +23,10 @@ selected paths, byte counts and SHA-256 checksums.
 
 Exports stream to private files, flush their content and receipt, then
 publish the archive directory atomically. Content, size, inventory and
-provenance are verified before source removal. A failed or changed
-export keeps the disposable resource protected.
+provenance are verified before source removal. Verification synchronizes
+the archive directory and its parents again after restart. A failed
+directory sync keeps the disposable resource protected even when the
+archive is visible.
 
 Checkout archives live under `forge-checkout-evidence/<archiveId>`;
 container archives live under `forge-evidence/<resourceId>`. Each
@@ -63,4 +67,6 @@ Filesystem cleanup still revalidates session activity, process activity,
 directory identity and source protections. Unreadable same-user
 processes stay uncertain unless they are the authoritative systemd user
 manager or its verified PAM keeper in the exact `init.scope`. Readable
-active cwd and open files always protect the candidate.
+active cwd and open files always protect the candidate. An exited
+process leader is skipped only after whole-group exit is established;
+surviving or unknown threads keep the candidate protected.
