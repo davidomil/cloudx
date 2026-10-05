@@ -36,7 +36,9 @@ it.skipIf(!fs.existsSync(path.join(sourceRoot, "apps/server/dist/config.js"))).e
   fs.writeFileSync(path.join(dataDir, "sessions.json"), JSON.stringify(saved));
   fs.cpSync(path.join(sourceRoot, "apps/server/dist"), path.join(releaseRoot, "apps/server/dist"), { recursive: true });
   fs.mkdirSync(path.join(releaseRoot, "scripts"));
-  fs.copyFileSync(path.join(sourceRoot, "scripts/codex-selection.mjs"), path.join(releaseRoot, "scripts/codex-selection.mjs"));
+  for (const file of ["codex-selection.mjs", "codex-updater.mjs"]) {
+    fs.copyFileSync(path.join(sourceRoot, "scripts", file), path.join(releaseRoot, "scripts", file));
+  }
   fs.writeFileSync(path.join(releaseRoot, "package.json"), '{"type":"module"}');
   fs.symlinkSync(path.join(sourceRoot, "node_modules"), path.join(releaseRoot, "node_modules"));
   fs.mkdirSync(path.join(repoRoot, "apps/server"), { recursive: true });

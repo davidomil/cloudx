@@ -49,6 +49,7 @@ import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import { CodexSettingsPlugin } from "./plugins/CodexSettingsPlugin.js";
 import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
+import { CodexConfigRepairService } from "./plugins/CodexConfigRepairService.js";
 import { CodexUpdateService } from "./plugins/CodexUpdateService.js";
 import { FileBrowserPlugin } from "./plugins/FileBrowserPlugin.js";
 import { LocalWebPlugin } from "./plugins/LocalWebPlugin.js";
@@ -1357,7 +1358,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources));
-  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates));
+  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates, new CodexConfigRepairService(codexStateSources)));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());

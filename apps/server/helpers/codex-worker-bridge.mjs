@@ -117,6 +117,7 @@ export function saveTurnReceipt(receiptPath, value) {
 
 /** The enclosing terminal subreaper owns this bridge, both Codex processes, and every descendant. */
 export async function runWorkerBridge(launch) {
+  if (launch.configurationNotice) process.stderr.write(`${launch.configurationNotice}\n`);
   const token = randomBytes(32).toString("hex");
   let frontend;
   let phase = launch.startupPicker ? "picker" : "conversation";

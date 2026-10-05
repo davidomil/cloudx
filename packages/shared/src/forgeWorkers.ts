@@ -182,6 +182,8 @@ export interface ForgeWorker {
   reviewHistory?: ForgeReviewDraft[];
   reviewBaseline?: { reviewId: string; revision: ForgeReviewRevision };
   error?: string;
+  /** Last announced disposable-cleanup blocker; persisted independently of the visible error. */
+  resourceCleanupNotificationDigest?: string;
   providerRetryAt?: string;
   startedAt: string;
   updatedAt: string;

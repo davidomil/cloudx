@@ -8,6 +8,7 @@ import type { CodexGlobalSettingsUpdate } from "@cloudx/shared";
 
 import type { CodexSettingsService } from "./CodexSettingsService.js";
 import type { CodexUpdateService } from "./CodexUpdateService.js";
+import type { CodexConfigRepairService } from "./CodexConfigRepairService.js";
 
 export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly id = "codex-settings";
@@ -21,7 +22,7 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly actions = [];
   readonly hooks: HookDefinition[];
 
-  constructor(settings: CodexSettingsService, updates: CodexUpdateService) {
+  constructor(settings: CodexSettingsService, updates: CodexUpdateService, repairs: CodexConfigRepairService) {
     this.hooks = [
       {
         id: "codex-settings.read",
@@ -58,6 +59,27 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
       },
     ];
     this.hooks.push(
+      {
+        id: "codex-config-repair.read",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Review shared Codex configuration correction",
+        description: "Identify the selected source, executable version and exact reviewed correction without changing configuration.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async (_input, context) => ({ repair: await repairs.read(context.signal) }),
+      },
+      {
+        id: "codex-config-repair.apply",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Apply reviewed shared Codex configuration correction",
+        description: "Apply only the reviewed correction, rejecting changed source configuration or selected executable.",
+        exposures: ["ui", "http"],
+        inputSchema: {
+          type: "object", properties: { expectedRevision: { type: "string", pattern: "^[a-f0-9]{64}$" } },
+          required: ["expectedRevision"], additionalProperties: false,
+        },
+        execute: async (input, context) => ({ repair: await repairs.apply(input.expectedRevision as string, context.signal) }),
+      },
       {
         id: "codex-update.read",
         owner: { kind: "plugin", pluginId: this.id },

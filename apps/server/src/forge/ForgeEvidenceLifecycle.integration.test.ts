@@ -6,6 +6,7 @@ import { describe, expect, it, onTestFinished, vi } from "vitest";
 import type { DisposableResource, ForgeWorker } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
+import { NotificationsPlugin } from "../plugins/NotificationsPlugin.js";
 import { ForgeDisposableResources, type ContainerIdentity, type DisposableContainerHost } from "./ForgeDisposableResources.js";
 import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
@@ -17,6 +18,88 @@ const evidenceBytes = Buffer.from("validation passed\n");
 const writableBytes = 4 * 1024 * 1024;
 
 describe("Completed Forge evidence lifecycle", () => {
+  it.each(["issue", "review"] as const)("announces an unchanged %s cleanup hold once across forced checks, dismissal, timed checks and restart", async kind => {
+    const owner = completedWorker(kind);
+    const resource = savedEnvironment(owner);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource], true);
+    onTestFinished(() => { vi.useRealTimers(); });
+    await fixture.workflow.poll();
+
+    const [notification] = fixture.notifications.list();
+    expect(notification).toMatchObject({ title: "Forge disposable cleanup needs attention", body: expect.stringContaining("requires review") });
+    expect(fixture.notifications.list()).toHaveLength(1);
+    const announced = (await fixture.store.read())[0]!.resourceCleanupNotificationDigest;
+    expect(announced).toMatch(/^[a-f0-9]{64}$/u);
+    fixture.notifications.dismiss(notification!.id);
+
+    await fixture.workflow.reconcileResourceCleanup();
+    vi.setSystemTime(Date.now() + 31_000);
+    await fixture.workflow.poll();
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect(fixture.cleanupResources).toHaveBeenCalledTimes(4);
+    expect(fixture.notifications.list()).toEqual([]);
+    expect((await fixture.workflow.dashboard()).workers[0]).toMatchObject({ status: "completed", error: expect.stringContaining("requires review"),
+      resourceCleanupNotificationDigest: announced });
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "blocked" });
+    expect(fixture.host.containers.get(resource.containerId!)?.running).toBe(false);
+    expect(fixture.host.removed).toEqual([]);
+  });
+
+  it("announces a materially changed cleanup blocker once and still converges after evidence release", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource], true);
+    await fixture.workflow.poll();
+    const originalDigest = (await fixture.store.read())[0]!.resourceCleanupNotificationDigest;
+    fixture.notifications.dismissAll();
+
+    fixture.host.engine = "changed-engine";
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(fixture.notifications.list()).toHaveLength(1);
+    expect(fixture.notifications.list()[0]?.body).toContain("engine identity changed");
+    const changedDigest = (await fixture.store.read())[0]!.resourceCleanupNotificationDigest;
+    expect(changedDigest).not.toBe(originalDigest);
+    fixture.notifications.dismissAll();
+    await fixture.workflow.reconcileResourceCleanup();
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect(fixture.notifications.list()).toEqual([]);
+    expect((await fixture.store.read())[0]?.resourceCleanupNotificationDigest).toBe(changedDigest);
+    expect(fixture.host.removed).toEqual([]);
+
+    fixture.host.engine = "fixture-engine";
+    await fixture.workflow.withCompletedWorkerResources([owner.id], () => fixture.resources.decideEvidence(resource.id,
+      { action: "export", evidencePaths: [evidencePath], commitSha: committedHead }));
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+    expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    expect(fixture.notifications.list()).toEqual([]);
+  });
+
+  it("clears the announced blocker after resource release even when working files retain the completed worker", async () => {
+    const owner = { ...completedWorker(), retainedWorkspace: { worktreePath: "/owned/checkout", retainedPaths: ["notes.txt"] } };
+    const resource = savedEnvironment(owner);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource], true);
+    await fixture.workflow.poll();
+    expect((await fixture.store.read())[0]?.resourceCleanupNotificationDigest).toMatch(/^[a-f0-9]{64}$/u);
+    fixture.notifications.dismissAll();
+
+    await fixture.workflow.withCompletedWorkerResources([owner.id], () => fixture.resources.decideEvidence(resource.id,
+      { action: "export", evidencePaths: [evidencePath], commitSha: committedHead }));
+    await fixture.workflow.reconcileResourceCleanup();
+    const [retained] = await fixture.store.read();
+    expect(retained).toMatchObject({ status: "completed", retainedWorkspace: owner.retainedWorkspace });
+    expect(retained?.error).toBeUndefined();
+    expect(retained?.resourceCleanupNotificationDigest).toBeUndefined();
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect((await fixture.store.read())[0]?.resourceCleanupNotificationDigest).toBeUndefined();
+    expect(fixture.notifications.list()).toEqual([]);
+  });
+
   it.each(["issue", "review"] as const)("reconciles a saved completed %s worker's earlier attempts and preserves durable evidence after removal", async kind => {
     const owner = completedWorker(kind);
     const first = savedEnvironment(owner, true);
@@ -54,12 +137,18 @@ describe("Completed Forge evidence lifecycle", () => {
     expect((await fixture.resources.records())[0]).toMatchObject({ state: "blocked", reason: expect.stringContaining("requires review") });
     expect(fixture.host.containers.get(resource.containerId!)?.running).toBe(false);
     expect(fixture.host.removed).toEqual([]);
+    expect(fixture.notifications.list()).toHaveLength(1);
+    const announced = (await fixture.store.read())[0]!.resourceCleanupNotificationDigest;
+    fixture.notifications.dismissAll();
 
     await fixture.workflow.withCompletedWorkerResources([owner.id], () => fixture.resources.decideEvidence(resource.id, { action: "keep" }));
     await fixture.restart();
     await fixture.workflow.reconcileResourceCleanup();
     expect((await fixture.resources.records())[0]).toMatchObject({ evidence: { state: "kept" }, reason: expect.stringContaining("explicitly kept") });
     expect((await fixture.store.read())[0]?.error).toContain("explicitly kept");
+    expect((await fixture.store.read())[0]?.resourceCleanupNotificationDigest).toBe(announced);
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(fixture.notifications.list()).toEqual([]);
     await fixture.workflow.withCompletedWorkerResources([owner.id], () => fixture.resources.decideEvidence(resource.id,
       action === "export" ? { action, evidencePaths: [evidencePath], commitSha: committedHead } : { action, confirmation: "Discard evidence" }));
 
@@ -69,6 +158,7 @@ describe("Completed Forge evidence lifecycle", () => {
     expect((await fixture.resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: writableBytes,
       evidence: { state: action === "export" ? "verified" : "discarded" } });
     expect(fixture.host.removed).toEqual([resource.containerId]);
+    expect(fixture.notifications.list()).toEqual([]);
     if (action === "export") {
       expect(await fixture.resources.readEvidence(resource.id)).toMatchObject({ commitSha: committedHead, commitSource: "declared" });
       expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
@@ -156,7 +246,8 @@ class SavedContainerHost implements DisposableContainerHost {
   readonly exports: string[] = [];
   readonly events: string[] = [];
   failure?: "export" | "remove";
-  engineId = async () => "fixture-engine";
+  engine = "fixture-engine";
+  engineId = async () => this.engine;
   create = async (): Promise<string> => { throw new Error("This fixture loads existing containers; creation is forbidden."); };
   find = async (resourceId: string) => [...this.containers.values()].filter(item => item.labels["cloudx.forge.resource"] === resourceId).map(item => item.id);
   inspect = async (id: string) => structuredClone(this.containers.get(id));
@@ -175,6 +266,8 @@ class SavedContainerHost implements DisposableContainerHost {
 
 class EvidenceLifecycleFixture {
   readonly host = new SavedContainerHost();
+  readonly notifications = new NotificationsPlugin();
+  readonly cleanupResources = vi.fn((worker: ForgeWorker) => this.resources.retire(worker));
   readonly reports: ForgeWorkerReports;
   readonly issueStates = new Map<number, "open" | "closed">();
   readonly activeTabs = new Set<string>();
@@ -212,8 +305,9 @@ class EvidenceLifecycleFixture {
       settings: () => ({ repository, baseBranch: "main", workerTemplateId: "worker", reviewTemplateId: "review", maxRunMinutes: 60 }),
       runtime: { recover: async () => ({ tabIds: [] }), isActive: (tabId: string) => this.activeTabs.has(tabId),
         close: async (tabId: string) => { this.host.events.push(`close:${tabId}`); this.activeTabs.delete(tabId); } },
-      cleanupDisposableResources: (worker: ForgeWorker) => this.resources.retire(worker),
-      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }, notify: vi.fn(),
+      cleanupDisposableResources: this.cleanupResources,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      notify: (title: string, body: string) => this.notifications.send({ title, body }),
     } as unknown as ForgeWorkflowDependencies);
   }
 }

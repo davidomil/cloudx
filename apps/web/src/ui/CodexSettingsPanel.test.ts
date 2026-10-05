@@ -22,6 +22,7 @@ const initial: CodexGlobalSettings = {
   defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: false, available: true }],
   reasoningEffort: null, webSearch: null, personality: null
 };
+const cleanRepair = { revision: "a".repeat(64), sourceConfigPath: "/codex/config.toml", selectedCommand: "/bin/codex", selectedVersion: "1.0.0", changes: [], canApply: false, blockedReason: null };
 type HookHandler = (hook: string, input: Record<string, unknown>) => CodexGlobalSettings | Promise<CodexGlobalSettings>;
 
 async function mount(settings = initial, handler?: HookHandler, strict = false) {
@@ -29,6 +30,7 @@ async function mount(settings = initial, handler?: HookHandler, strict = false) 
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
     if (hook === "codex-update.releases") return { releases: { latestStable: "1.0.0", versions: [{ version: "1.0.0", prerelease: false }] } } as unknown as T;
     if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", activeVersion: "1.0.0", requestedVersion: null, previousVersion: null, outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
+    if (hook === "codex-config-repair.read") return { repair: cleanRepair } as unknown as T;
     calls.push({ hook, input });
     const result = handler ? await handler(hook, input) : settings;
     return { settings: result } as unknown as T;
@@ -499,6 +501,7 @@ describe("global Codex settings editor", () => {
     const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string) => {
       if (hook === "codex-update.releases") return { releases: { latestStable: "1.0.0", versions: [{ version: "1.0.0", prerelease: false }] } } as unknown as T;
     if (hook === "codex-update.read") return { update: { jobId: null, phase: "idle", installedVersion: "1.0.0", activeVersion: "1.0.0", requestedVersion: null, previousVersion: null, outcome: null, message: "Ready to update Codex.", startedAt: null, finishedAt: null } } as unknown as T;
+      if (hook === "codex-config-repair.read") return { repair: cleanRepair } as unknown as T;
       const settings = ++reads === 1 ? await first.promise : { ...initial, model: "current-model" };
       return { settings } as unknown as T;
     };
