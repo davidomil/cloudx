@@ -33,6 +33,7 @@ import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { directoryOwnershipAvailability } from "../directoryOwnershipReconciliation.js";
 import { ForgeWorkQueue } from "./ForgeWorkQueue.js";
 import { ForgeMergeQueue } from "./ForgeMergeQueue.js";
+import { ForgeDisposableCleanupError } from "./ForgeDisposableResources.js";
 import { reviewScopeInstructions } from "./ForgeReviewScope.js";
 import { rejectQuickActions, validateRequestText, validateReview } from "./providers/reviewValidation.js";
 import { forgeErrorFields, forgeLog, forgeWorkerContext, type ForgeLogger, type ForgeWorkerLogContext } from "./ForgeLog.js";
@@ -2835,12 +2836,18 @@ export class ForgeWorkflowService {
       this.mergeQueue.complete(worker);
       await this.persist();
       let resourceCleanupError: string | undefined;
-      try { await this.deps.cleanupDisposableResources?.(structuredClone(worker)); }
+      try {
+        await this.deps.cleanupDisposableResources?.(structuredClone(worker));
+        worker.resourceCleanupNotificationDigest = undefined;
+      }
       catch (error) {
         resourceCleanupError = `Disposable resource cleanup pending: ${message(error)}`;
         worker.error = resourceCleanupError;
+        const digest = createHash("sha256").update(error instanceof ForgeDisposableCleanupError ? error.blockerIdentity : message(error)).digest("hex");
+        const newlyEncountered = worker.resourceCleanupNotificationDigest !== digest;
+        worker.resourceCleanupNotificationDigest = digest;
         await this.persist();
-        this.deps.notify("Forge disposable cleanup needs attention", `${worker.title}: ${worker.error}`);
+        if (newlyEncountered) this.deps.notify("Forge disposable cleanup needs attention", `${worker.title}: ${worker.error}`);
       }
       const completedHeadSha = change?.headSha ?? worker.pendingPublication?.headSha ?? worker.headSha;
       await this.cleanup(worker, completedHeadSha, !change && worker.kind === "issue");

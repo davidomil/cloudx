@@ -4,6 +4,7 @@ import { DEFAULT_CODEX_MODEL } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { CodexUpdateControl } from "./CodexUpdateControl.js";
+import { CodexConfigRepairControl } from "./CodexConfigRepairControl.js";
 import { CodexSettingsEditor, personalities, reasoningEfforts, serviceTiers, webSearchModes } from "./CodexSettingsEditor.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -19,6 +20,7 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
       <p>Changes apply to new sessions. Profiles, project settings, and session overrides may take precedence. Running sessions keep their current settings.</p>
     </header>
     <CodexUpdateControl callHook={callHook} />
+    <CodexConfigRepairControl callHook={callHook} />
     {error ? <p className="codex-settings-notice" role="alert">{error}</p> : null}
     {busy === "loading" ? <p role="status">Loading global Codex settings…</p> : null}
     {settings ? <form className="codex-settings-form" onSubmit={event => { event.preventDefault(); void editor.save(); }}>

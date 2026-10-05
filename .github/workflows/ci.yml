@@ -229,6 +229,11 @@ jobs:
           path: test-results/codex-verification/
           if-no-files-found: warn
           retention-days: 14
+      - name: Require reviewed source configuration repair on Codex 0.160.0
+        if: matrix.codex == 'installer'
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/codex-config-repair" --ignore-scripts --no-audit --no-fund @openai/codex@0.160.0
+          CLOUDX_NATIVE_CODEX_CONFIG_REPAIR="$RUNNER_TEMP/codex-config-repair/bin/codex" npx vitest run apps/server/src/plugins/CodexConfigRepair.native.test.ts
   terminal-stress:
     name: Terminal stress (Node 22, 2 CPUs, 7 GiB)
     runs-on: ubuntu-24.04

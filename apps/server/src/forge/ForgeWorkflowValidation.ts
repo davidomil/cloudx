@@ -590,6 +590,9 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     ))
       throw new Error("A saved merge attempt requires an issue worker with a published request and commit.");
     const parsed = structuredClone(worker) as unknown as ForgeWorker;
+    if (worker.resourceCleanupNotificationDigest !== undefined &&
+        (typeof worker.resourceCleanupNotificationDigest !== "string" || !/^[a-f0-9]{64}$/u.test(worker.resourceCleanupNotificationDigest)))
+      throw new Error("Invalid disposable cleanup notification digest.");
     if (worker.placement !== undefined) {
       const placement = object(worker.placement);
       parsed.placement = { windowId: nonblankText(placement.windowId, "worker window", 128), paneId: nonblankText(placement.paneId, "worker pane", 128) };
@@ -655,7 +658,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     if (worker.status === "draft" && (!parsed.batch || [
       "repositoryPath", "worktreePath", "branch", "tabId", "attemptId", "completion", "retainedWorkspace",
       "publicationState", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
-      "mergeConflict", "rebaseRecovery", "issueWorkerId", "providerRetryAt",
+      "mergeConflict", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest",
     ].some(key => worker[key] !== undefined) || parsed.batch.results !== undefined))
       throw new Error("A draft batch cannot own execution or publication state.");
     if (worker.completion !== undefined) {

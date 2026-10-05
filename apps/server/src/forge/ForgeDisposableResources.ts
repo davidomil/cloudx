@@ -33,6 +33,9 @@ interface ResourceJournal {
 }
 
 export class ContainerCreationRejectedError extends Error {}
+export class ForgeDisposableCleanupError extends Error {
+  constructor(reason: string, readonly blockerIdentity: string) { super(reason); }
+}
 
 /** Only creation receipts grant authority; names and discovered labels alone never do. */
 export class ForgeDisposableResources {
@@ -169,13 +172,21 @@ export class ForgeDisposableResources {
       const consumers = state.resources.flatMap(item => item.consumers).filter(item => item.workerId === worker.id);
       for (const consumer of consumers) if (!state.terminalWorkers.some(item => sameConsumer(item, consumer))) state.terminalWorkers.push(consumer);
       await this.journal.write(state);
-      const failures: string[] = [];
+      const failures: DisposableResource[] = [];
       for (const resource of state.resources.filter(item => item.state !== "deleted" && item.consumers.some(consumer => consumer.workerId === worker.id))) {
         await this.removeRecorded(resource, state);
-        if (resource.state !== "deleted") failures.push(`${resource.name}: ${resource.reason}`);
+        if (resource.state !== "deleted") failures.push(resource);
       }
-      if (failures.length) throw new Error(failures.join("; "));
+      if (failures.length) throw new ForgeDisposableCleanupError(failures.map(resource => `${resource.name}: ${resource.reason}`).join("; "),
+        this.cleanupBlockerIdentity(failures));
     });
+  }
+
+  private cleanupBlockerIdentity(resources: DisposableResource[]): string {
+    return JSON.stringify(resources.sort((a, b) => a.id.localeCompare(b.id)).map(resource => ({ id: resource.id, name: resource.name,
+      blocker: resource.reason === this.evidenceProtection(resource)
+        ? { retentionReason: resource.retentionReason, paths: [...(resource.evidence?.paths ?? [])].sort(), commitSha: resource.evidence?.commitSha }
+        : resource.reason })));
   }
 
   async consumerIds(resourceId: string): Promise<string[]> {

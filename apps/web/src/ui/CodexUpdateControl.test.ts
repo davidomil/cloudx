@@ -54,6 +54,7 @@ async function mount(read: () => Promise<CodexUpdateStatus> = async () => instal
   const callHook: NonNullable<UiContributionRenderContext["callHook"]> = async <T extends Record<string, unknown>>(hook: string, input: Record<string, unknown> = {}) => {
     if (hook !== "codex-update.start") expect(input).toEqual({});
     if (hook === "codex-settings.read") return { settings } as unknown as T;
+    if (hook === "codex-config-repair.read") return { repair: { revision: "a".repeat(64), sourceConfigPath: "/codex/config.toml", selectedCommand: "/bin/codex", selectedVersion: "1.0.0", changes: [], canApply: false, blockedReason: null } } as unknown as T;
     if (hook === "codex-update.read") return { update: await reads() } as unknown as T;
     if (hook === "codex-update.releases") return { releases: await discoveries() } as unknown as T;
     if (hook === "codex-update.start") return { update: await starts(input.version as string) } as unknown as T;

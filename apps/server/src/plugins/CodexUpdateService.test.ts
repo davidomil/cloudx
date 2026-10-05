@@ -15,6 +15,7 @@ import { HookRegistry } from "../hooks/HookRegistry.js";
 import { buildServer, buildServices } from "../server.js";
 import { CodexSettingsPlugin } from "./CodexSettingsPlugin.js";
 import { CodexSettingsService } from "./CodexSettingsService.js";
+import { CodexConfigRepairService } from "./CodexConfigRepairService.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexUpdateService } from "./CodexUpdateService.js";
 
@@ -603,7 +604,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
     const sources = new CodexStateSources(f.dataDir, f.env);
     disposers.push(() => sources.dispose());
     const hooks = new HookRegistry();
-    new CodexSettingsPlugin(new CodexSettingsService(sources), updates).hooks.forEach(hook => hooks.register(hook));
+    new CodexSettingsPlugin(new CodexSettingsService(sources), updates, new CodexConfigRepairService(sources)).hooks.forEach(hook => hooks.register(hook));
     const controller = new AbortController();
     const started = await hooks.call("codex-update.start", { version: "1.1.0" }, { caller: { kind: "http" }, signal: controller.signal });
     await f.waitForInstall();

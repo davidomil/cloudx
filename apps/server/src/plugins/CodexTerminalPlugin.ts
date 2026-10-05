@@ -13,6 +13,8 @@ import { PluginSessionMissingError, PluginSessionNotStartedError } from "@cloudx
 import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type DirectoryOwnershipAvailability, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
+import { legacyCodexConfigKeys } from "./CodexConfigRepairService.js";
+import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import fs from "node:fs/promises";
@@ -169,6 +171,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
             additionalWritableRoots: launchTemplate.overlay ? [launchTemplate.overlay.rulesSkillsRoot] : []
           },
           command,
+          configurationNotice: launchTemplate.configurationNotice,
           serverArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS, "app-server", "--listen", "stdio://"],
           tuiArgs: launchArgs
         })
@@ -484,6 +487,7 @@ export interface MaterializedCodexTemplate {
   overlay?: CodexHomeOverlay;
   voiceSummary: string;
   templateName?: string;
+  configurationNotice?: string;
 }
 
 export interface MaterializeCodexTemplateOptions extends PluginSessionLaunchOptions {
@@ -508,6 +512,12 @@ export async function materializeCodexTemplate(
   const bound = sources && options.tabId ? await sources.readBinding(options.tabId) : undefined;
   if (options.resetOverlay === false && sources && !bound) throw new Error("Codex launch source binding is missing.");
   const source = sources ? bound ?? await sources.resolve() : undefined;
+  const command = resolveAssistantCommand(env, "codex");
+  const sourceConfig = sources && source ? await sources.readConfig(source) : undefined;
+  const legacyKeys = sourceConfig ? legacyCodexConfigKeys(sourceConfig) : [];
+  const configurationNotice = legacyKeys.length
+    ? `CloudX: ${path.join(source!.home, "config.toml")} contains legacy settings (${legacyKeys.join(", ")}). Selected executable: ${command}; Codex ${await readCodexVersion(command, { env })}. Review the source correction in Settings → Codex; this tab's generated config is rebuilt from that source.`
+    : undefined;
   if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
     ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
@@ -528,12 +538,13 @@ export async function materializeCodexTemplate(
   }
   if (sources && source) await sources.assertCurrent(source);
   return {
-    command: resolveAssistantCommand(env, "codex"),
+    command,
     args,
     env,
     overlay,
     voiceSummary: resolved?.template.name ? `Interactive Codex CLI terminal using the ${resolved.template.name} template.` : "Interactive Codex CLI terminal. Send natural-language coding instructions here.",
-    templateName: resolved?.template.name
+    templateName: resolved?.template.name,
+    configurationNotice,
   };
 }
 

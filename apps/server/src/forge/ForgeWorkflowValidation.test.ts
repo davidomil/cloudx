@@ -228,6 +228,17 @@ describe("Issue working-file handoffs", () => {
   });
 });
 
+describe("Saved cleanup notifications", () => {
+  it("preserves the announced blocker independently of the current error", () => {
+    const saved = { ...worker, status: "completed" as const, resourceCleanupNotificationDigest: "a".repeat(64) };
+    expect(parseWorkers([saved])[0]).toEqual(saved);
+  });
+
+  it.each([null, 42, "", "a".repeat(63), "a".repeat(65), "x".repeat(64)])("rejects a malformed announced blocker %#", resourceCleanupNotificationDigest => {
+    expect(() => parseWorkers([{ ...worker, resourceCleanupNotificationDigest }])).toThrow("Invalid disposable cleanup notification digest.");
+  });
+});
+
 describe("Saved retained checkouts", () => {
   const retainedWorkspace = { worktreePath: "/owned/checkout", retainedPaths: ["notes.txt", "src/experiment.ts"] };
 
