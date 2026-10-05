@@ -201,3 +201,43 @@ The isolated verifier under `containers/ci/` separates candidate execution from
 trusted evidence. Changes to that boundary warrant its supervisor tests and
 candidate-isolation probes. Ordinary guidance edits do not need to recreate a
 publication evidence bundle or change real CI requirements.
+
+## Reproduce CI Locally
+
+`npm run test:ci-local` runs CI's verification on this machine. The steps
+come from `.github/workflows/ci.yml`, so a passing local run uses the same
+commands, sandbox flags and lanes as CI.
+
+- `policy` runs on the host with the Node.js release CI pins. Install it
+  once with `nvm install 22.23.1`.
+- Every `isolated-lanes` lane runs in the CI verifier image with no network,
+  a read-only source mount and two CPUs. Lanes run in parallel, two CPUs
+  each.
+- `coverage-merge` and `isolated-verifier` then merge coverage and check that
+  every lane passed.
+
+```bash
+npm run test:ci-local
+npm run test:ci-local -- --jobs isolated-lanes --lanes coverage-1,static
+```
+
+Logs, job workspaces and lane evidence are written to `test-results/local-ci/`.
+Each job works on a copy of the working tree's tracked and unignored files, so
+uncommitted changes are tested and ignored files such as `node_modules` are
+not.
+
+It needs Docker. The lifecycle, systemd, native CLI, terminal stress and
+identity jobs need a disposable host, GitHub identity or pinned CLI
+releases, and are listed as not reproduced.
+
+Running `npm test` directly on the host also needs enough inotify watches,
+because terminal supervision and the Codex updater watch files. Set
+`fs.inotify.max_user_watches=524288` and `fs.inotify.max_user_instances=1024`
+in `/etc/sysctl.d/`. The isolated lanes run as a separate user and are not
+affected by the host's watch count.
+
+The workspace cleanup tests that scan the real `/proc` see every process of
+the host user. A same-user process that disables its own tracing, such as an
+`sftp-server` behind an sshfs mount, has an unreadable cwd and makes those
+checkouts uncertain, so these tests fail on that host. The isolated lanes
+run in their own process namespace and do not see host processes.

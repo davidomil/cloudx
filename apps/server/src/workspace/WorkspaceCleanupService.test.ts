@@ -31,14 +31,14 @@ function service() {
 function observedService(processActivity?: WorkspaceProcessActivity) {
   return new WorkspaceCleanupService({ dataDir, pathPolicy: new PathPolicy([root]), forge, openDirectories: () => open, withInactiveDirectory: async (_directory, operation) => operation(), processActivity, protectedDirectories: [], trashDirectory: path.join(root, "trash") });
 }
-async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; state?: string; threads?: number | null; cwd?: string; files?: string[]; group?: string; managerPid?: string } = {}) {
+async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; effectiveUid?: number; savedGid?: number; state?: string; threads?: number | null; cwd?: string; files?: string[]; group?: string; managerPid?: string } = {}) {
   const procDirectory = path.join(root, "proc");
   const pid = options.pid ?? "273";
   const directory = path.join(procDirectory, pid);
   await fs.mkdir(path.join(directory, "fd"), { recursive: true });
   await fs.writeFile(path.join(directory, "stat"), `${pid} (${options.name ?? "systemd"}) ${options.state ?? "S"} ${options.parent ?? "1"} ${Array(17).fill("0").join(" ")} 1234\n`);
   const uid = options.uid ?? 1000;
-  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\n${options.threads === null ? "" : `Threads:\t${options.threads ?? 1}\n`}`);
+  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${options.effectiveUid ?? uid}\t${options.effectiveUid ?? uid}\t${options.effectiveUid ?? uid}\nGid:\t1000\t1000\t${options.savedGid ?? 1000}\t1000\n${options.threads === null ? "" : `Threads:\t${options.threads ?? 1}\n`}`);
   await fs.writeFile(path.join(directory, "cgroup"), options.group ?? "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n");
   await fs.symlink(options.cwd ?? root, path.join(directory, "cwd"));
   for (const [fd, file] of (options.files ?? []).entries()) await fs.symlink(file, path.join(directory, "fd", String(fd)));
@@ -552,6 +552,22 @@ describe("reviewed workspace cleanup", () => {
       expect(preview.reclaimableBytes).toBe(0);
       await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
       expect(await fs.stat(completed)).toBeTruthy();
+    } finally { denied.mockRestore(); }
+  });
+  it.each([
+    { code: "EACCES", effectiveUid: 0, eligible: true },
+    { code: "EPERM", effectiveUid: 0, eligible: true },
+    { code: "EACCES", savedGid: 112, eligible: true },
+    { code: "EIO", effectiveUid: 0, eligible: false },
+    { code: "EACCES", eligible: false }
+  ])("skips only set-id helpers whose files the kernel denies to this user: %j", async ({ code, effectiveUid, savedGid, eligible }) => {
+    const completed = await checkout(`set-id-helper-${code}-${effectiveUid}-${savedGid}`);
+    const { observed, directory } = await processFixture({ name: "helper", parent: "999", effectiveUid, savedGid });
+    const denied = denyProcessAccess(path.join(directory, "cwd"), code);
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate.eligible).toBe(eligible);
+      if (!eligible) expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273`);
     } finally { denied.mockRestore(); }
   });
   it.each(["fd/0", "fd directory"])("protects unknown same-user open-file activity when the %s cannot be read", async unreadable => {

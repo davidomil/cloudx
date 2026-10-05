@@ -209,7 +209,7 @@ export function SettingsDialog({
     description: "Claude Code defaults and how CloudX launches Claude tabs.",
     entries: [{
       id: "global-defaults",
-      searchText: "Claude Code CLI update version release channel Default model opus sonnet haiku effort extended thinking fast mode output style language permission mode bypass YOLO accept edits plan automatically trust workspace warning",
+      searchText: "Claude Code CLI update version update channel latest stable Default model opus sonnet haiku effort extended thinking fast mode output style language permission mode bypass YOLO accept edits plan automatically trust workspace warning",
       content: <ClaudeSettingsPanel callHook={callHook} />,
       mountWhenVisible: true
     }]
