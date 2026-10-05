@@ -98,6 +98,12 @@ test.beforeEach(async ({ page }) => {
   );
   serverLogs = "";
   testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-"));
+  const codex = path.join(testRoot, "codex");
+  await fs.writeFile(
+    codex,
+    '#!/bin/sh\n[ "$1" = "--version" ] || exit 1\nprintf "codex-cli 0.160.0\\n"\n',
+    { mode: 0o755 },
+  );
   const codexHome = path.join(testRoot, "codex-home");
   const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
   await fs.mkdir(imagegen, { recursive: true });
@@ -123,6 +129,7 @@ test.beforeEach(async ({ page }) => {
         ...process.env,
         CLOUDX_ALLOWED_ROOTS: testRoot,
         CLOUDX_APP_SERVER_ENABLED: "false",
+        CLOUDX_ASSISTANT_BIN: codex,
         CLOUDX_ASR_URL: "http://127.0.0.1:9",
         CLOUDX_AUTOMATION_START_DISABLED: "true",
         CLOUDX_DATA_DIR: path.join(testRoot, "data"),
@@ -819,6 +826,85 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   ).json()) as WorkspaceStateResponse;
   expect(current.tabs).toEqual(original.tabs);
 });
+
+for (const sourceChanged of [false, true]) {
+  test(`Codex configuration repair ${sourceChanged ? "requires a new review when the source changes" : "applies only after an explicit review"}`, async ({
+    page,
+    isMobile,
+  }, testInfo) => {
+    const configPath = path.join(testRoot, "codex-home", "config.toml");
+    const original =
+      '# Keep this comment and model.\nmodel = "original-model"\nhide_full_access_warning = true\n[features]\nghost_commit = true\nstreamable_shell = false\nfast_mode = true\n';
+    await fs.writeFile(configPath, original);
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    const settings = await openCodexSettings(page, isMobile);
+    const control = settings.getByRole("region", {
+      name: "Shared Codex configuration repair",
+      exact: true,
+    });
+    const repair = control.getByRole("button", {
+      name: "Repair shared config",
+      exact: true,
+    });
+    await expect(control).toContainText(configPath);
+    await expect(control).toContainText("Selected CLI version: 0.160.0");
+    await expect(control.getByRole("listitem")).toHaveText([
+      "Remove unsupported features.ghost_commit.",
+      "Remove unsupported features.streamable_shell.",
+      "Move hide_full_access_warning to notice.hide_full_access_warning, preserving its boolean value.",
+    ]);
+    await expect(repair).toBeEnabled();
+    expect(await fs.readFile(configPath, "utf8")).toBe(original);
+    const model = settings.getByRole("textbox", { name: "Default model" });
+    await model.fill("unsaved-repair-draft");
+    await repair.scrollIntoViewIfNeeded();
+    await repair.focus();
+    await expect(repair).toBeFocused();
+    await expect(repair).toBeInViewport({ ratio: 1 });
+    expect((await repair.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    await captureSample(page, testInfo, "codex-config-repair-review");
+
+    const reviewedSource = sourceChanged
+      ? original.replace("original-model", "external-model")
+      : original;
+    if (sourceChanged) await fs.writeFile(configPath, reviewedSource);
+    const applied = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname ===
+        "/api/hooks/codex-config-repair.apply",
+    );
+    await repair.press("Enter");
+    expect((await applied).status()).toBe(sourceChanged ? 409 : 200);
+    if (sourceChanged) {
+      await expect(control.getByRole("alert")).toHaveText(
+        "Shared configuration or the selected CLI changed. Reload configuration to review the current repair before applying.",
+      );
+      await expect(repair).toBeDisabled();
+      expect(await fs.readFile(configPath, "utf8")).toBe(reviewedSource);
+      await control
+        .getByRole("button", { name: "Reload configuration", exact: true })
+        .click();
+      await expect(control.getByRole("alert")).toHaveCount(0);
+      await expect(repair).toBeEnabled();
+      await repair.click();
+    }
+    await expect(control.getByRole("status")).toHaveText(
+      "Shared Codex configuration repaired.",
+    );
+    await expect(repair).toBeDisabled();
+    const repaired = await fs.readFile(configPath, "utf8");
+    expect(parse(repaired)).toEqual({
+      model: sourceChanged ? "external-model" : "original-model",
+      notice: { hide_full_access_warning: true },
+      features: { fast_mode: true },
+    });
+    expect(repaired).toContain("# Keep this comment and model.");
+    await expect(model).toHaveValue("unsaved-repair-draft");
+    await expectCodexSettingsFits(page);
+    await control.scrollIntoViewIfNeeded();
+    await captureSample(page, testInfo, "codex-config-repair-applied");
+  });
+}
 
 test("Codex version selection searches releases, previews a downgrade, and explicitly restores the previous version", async ({
   page,

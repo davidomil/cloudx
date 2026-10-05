@@ -25,7 +25,7 @@ export class CodexConfigRepairService {
   async apply(expectedRevision: string, signal?: AbortSignal): Promise<CodexConfigRepairPreview> {
     if (typeof expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(expectedRevision)) throw new Error("Invalid Codex configuration repair revision.");
     const { preview, source, original, replacement } = await this.review(signal);
-    if (preview.revision !== expectedRevision) throw new Error("Codex source configuration or selected executable changed. Reload the repair before applying it.");
+    if (preview.revision !== expectedRevision) throw Object.assign(new Error("Codex source configuration or selected executable changed. Reload the repair before applying it."), { statusCode: 409 });
     if (!preview.canApply || replacement === undefined) throw new Error(preview.blockedReason ?? "No reviewed Codex configuration repair is available.");
     await this.sources.replaceConfig(source, original, replacement, signal);
     return this.read(signal);

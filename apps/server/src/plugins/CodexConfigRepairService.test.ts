@@ -154,7 +154,7 @@ describe("reviewed shared Codex configuration repair", () => {
     if (changed === "source") await fs.appendFile(f.configPath, '# externally edited\n');
     else await f.setVersion("0.157.1");
     const before = await fs.readFile(f.configPath, "utf8");
-    await expect(f.service.apply(preview.revision)).rejects.toThrow(/changed/);
+    await expect(f.service.apply(preview.revision)).rejects.toMatchObject({ message: expect.stringMatching(/changed/), statusCode: 409 });
     expect(await fs.readFile(f.configPath, "utf8")).toBe(before);
   });
 

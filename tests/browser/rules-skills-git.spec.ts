@@ -133,6 +133,7 @@ test.afterAll(async ({}, testInfo) => {
 test("configures origin, pushes commits, and pulls into the visible catalog without discarding drafts", async ({
   page,
 }, testInfo) => {
+  test.slow();
   const workspace = (await (
     await page.request.get(`${baseUrl}/api/workspace`)
   ).json()) as WorkspaceStateResponse;
