@@ -187,7 +187,7 @@ class NativeModelSession {
     const env = { PATH: process.env.PATH, HOME: this.home, CODEX_HOME: this.home, CLOUDX_ASSISTANT_BIN: codex, SHELL: "/bin/sh", TERM: "xterm-256color" };
     this.session = await new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, this.data, this.sources, env).createSession({
       tab, cwd: this.root, initialInput,
-      ...(forge ? { codexTurn: { workerId: "native-model", attemptId: "native-model-attempt", receiptPath: this.receiptPath } } : {}),
+      ...(forge ? { agentTurn: { workerId: "native-model", attemptId: "native-model-attempt", receiptPath: this.receiptPath } } : {}),
       controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
     });
     this.session.onData!(chunk => {

@@ -16,10 +16,15 @@ export function resolveAssistantCommand(env: NodeJS.ProcessEnv = process.env, de
   return resolveSelectedCodexCommand(env.CLOUDX_ASSISTANT_BIN?.trim() || defaultCommand);
 }
 
+export function resolveClaudeCommand(env: NodeJS.ProcessEnv = process.env): string {
+  return env.CLOUDX_CLAUDE_BIN?.trim() || "claude";
+}
+
 export function buildToolEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const pathEntries = [
     ...splitPath(env.CLOUDX_TOOL_PATH),
     commandDirectory(env.CLOUDX_ASSISTANT_BIN?.trim() || ""),
+    commandDirectory(env.CLOUDX_CLAUDE_BIN?.trim() || ""),
     ...splitPath(env.PATH)
   ].filter((entry): entry is string => Boolean(entry));
   return {

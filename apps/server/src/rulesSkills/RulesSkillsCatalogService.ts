@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   RULES_SKILLS_PLUGIN_ID,
+  isAgentTab,
   isRecord,
   type CloudxRule,
   type CloudxSkill,
@@ -335,7 +336,7 @@ export class RulesSkillsCatalogService {
   }
 
   async resolveFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<ResolvedPersonalityTemplate | undefined> {
-    if (tab.pluginId !== "codex-terminal") {
+    if (!isAgentTab(tab)) {
       return undefined;
     }
     const store = await this.list();

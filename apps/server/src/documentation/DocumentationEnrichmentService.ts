@@ -116,13 +116,14 @@ interface PendingDocumentEnrichment {
 export class CodexDocumentationEnrichmentRunner implements DocumentationEnrichmentRunner {
   constructor(
     readonly model: string,
-    private readonly timeoutMs = DEFAULT_DOCUMENTATION_TIMEOUT_MS
+    private readonly timeoutMs = DEFAULT_DOCUMENTATION_TIMEOUT_MS,
+    private readonly exec: typeof runCodexExec = runCodexExec
   ) {}
 
   async run(prompt: string, options: DocumentationRunnerOptions = {}): Promise<unknown> {
     const model = options.model ?? this.model;
     return JSON.parse(
-      await runCodexExec(model, prompt, {
+      await this.exec(model, prompt, {
         schemaPath: options.schemaPath ?? ENRICHMENT_SCHEMA_PATH,
         outputPrefix: options.outputPrefix ?? "cloudx-doc-enrich-",
         timeoutMs: options.timeoutMs ?? this.timeoutMs,

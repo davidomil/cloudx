@@ -1,5 +1,6 @@
 import {
   UI_RENDERER_STATUS_DOT,
+  type AgentSwitchRequest,
   type ConfigFieldDescriptor,
   type ConfigValue,
   type DirectoryOwnershipAvailability,
@@ -171,9 +172,9 @@ export type PluginRuleContribution = Omit<CloudxRule, "scope"> & {
 
 export interface PluginSessionLaunchOptions {
   authorizeProjectTrust?: () => Promise<string>;
-  prepareCodexSession?: (launch: PreparedCodexLaunch) => Promise<string>;
+  prepareAgentSession?: (launch: PreparedAgentLaunch) => Promise<string>;
   prepareTerminalExecution?: (tabId: string) => Promise<TerminalExecutionBinding>;
-  codexTurn?: { workerId: string; attemptId: string; receiptPath: string };
+  agentTurn?: { workerId: string; attemptId: string; receiptPath: string };
   ownerPluginId?: PluginId;
 }
 
@@ -184,7 +185,7 @@ export interface TerminalExecutionBinding {
   pidNamespace: string;
 }
 
-export interface PreparedCodexLaunch {
+export interface PreparedAgentLaunch {
   tabId: string;
   cwd: string;
   command: string;
@@ -257,6 +258,12 @@ export interface WorkspacePlugin {
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  /**
+   * Returns the startup input that relaunches this tab on another agent
+   * provider or account. `input.initialInput` is the tab's current restore
+   * input. The session store stops the current process and starts the new one.
+   */
+  prepareAgentSwitch?(input: CreatePluginSessionInput, request: AgentSwitchRequest): Promise<Record<string, unknown>>;
   ownershipAvailability?(input: CreatePluginSessionInput): Promise<DirectoryOwnershipAvailability>;
   previewOwnership?(input: CreatePluginSessionInput): Promise<DirectoryOwnershipPreview>;
   reconcileOwnership?(input: CreatePluginSessionInput, request: DirectoryOwnershipReconciliation): Promise<void>;

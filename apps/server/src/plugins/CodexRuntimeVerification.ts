@@ -165,7 +165,7 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
     await session.terminate!();
     const binding = { workerId: "runtime-verification", attemptId: "resumed-attempt", receiptPath };
     session = await plugin.createSession({
-      tab: { ...tab, ownerPluginId: "forge" }, cwd: root, codexTurn: binding,
+      tab: { ...tab, ownerPluginId: "forge" }, cwd: root, agentTurn: binding,
       initialInput: { resume: { mode: "session", sessionId: identity.sessionId }, prompt: "Verify this resumed Forge turn." },
       controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
     });

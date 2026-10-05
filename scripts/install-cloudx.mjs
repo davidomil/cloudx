@@ -33,6 +33,7 @@ import {
 
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
 export const CODEX_CLI_VERSION = "0.157.1";
+export const CLAUDE_CODE_VERSION = "2.1.289";
 export const UV_VERSION = "0.11.28";
 export { SERVICE_NAMES };
 export const LEGACY_SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];
@@ -204,7 +205,7 @@ export function helpText() {
     "Cloudx installer wizard",
     "",
     "The shell bootstrap installs Ubuntu packages, Quarto/Pandoc/TeX PDF rendering, and Node.js/npm when needed.",
-    "This Node wizard then installs Cloudx dependencies, Codex CLI, ASR,",
+    "This Node wizard then installs Cloudx dependencies, Codex CLI, optional Claude Code, ASR,",
     "the documentation archive indexer, the Faster Whisper model, optional",
     "whisper.cpp documentation ASR, config files, and optional systemd user services.",
     "",
@@ -220,7 +221,7 @@ export function helpText() {
     "  --migrate-terminals  Back up recovery state and interrupt terminals for a standard-service update.",
     "  --checkout <path>  Run a staged updater against this absolute installed checkout path; requires --update.",
     "  --target-commit <sha>  Update to this exact commit from origin; requires --update.",
-    "  --non-interactive  Update without password or login prompts; requires existing non-interactive sudo and Codex authentication.",
+    "  --non-interactive  Update without password or login prompts; requires existing non-interactive sudo. Agent sign-in happens in Settings.",
     "  --update-codex     Update only Codex CLI to the latest npm release; leave Cloudx and services unchanged.",
     "  --service <unit>   Update only an existing custom web service; preserve its definition and shared dependencies.",
     "  --port <number>    HTTPS readiness port for the selected custom web service.",
@@ -453,6 +454,7 @@ export function buildEnvLines(config) {
     `CLOUDX_ALLOWED_ROOTS=${config.allowedRoots}`,
     `CLOUDX_DATA_DIR=${config.dataDir}`,
     `CLOUDX_ASSISTANT_BIN=${config.assistantBin}`,
+    ...(config.claudeBin ? [`CLOUDX_CLAUDE_BIN=${config.claudeBin}`] : []),
     `CLOUDX_TOOL_PATH=${config.toolPath}`,
     `CLOUDX_ASR_URL=http://127.0.0.1:7810`,
     `CLOUDX_ASR_MODEL_PATH=${config.modelDir}`,
@@ -1200,8 +1202,9 @@ export async function runInstaller(options = {}) {
       );
     }
 
-    section("2/10 Verify Codex CLI");
+    section("2/10 Verify agent CLIs");
     const assistantBin = await ensureCodex(commands, prompt, paths, env);
+    const claudeBin = await ensureClaude(commands, prompt, paths, env);
     const toolPath = toolPathFor(assistantBin, paths.npmGlobalDir, env.PATH);
 
     section("3/10 Collect install choices");
@@ -1369,6 +1372,7 @@ export async function runInstaller(options = {}) {
       allowedRoots,
       dataDir: paths.dataDir,
       assistantBin,
+      claudeBin,
       toolPath,
       modelDir: paths.modelDir,
       ...defaultDocumentationConfig(paths),
@@ -2306,11 +2310,44 @@ async function verifyCodex(commands, prompt, assistantBin, paths, env) {
         throw new Error("Codex login did not complete successfully.");
       }
     } else {
-      throw new Error(
-        "Codex must be authenticated before Cloudx voice control and Codex tabs can work.",
+      // Accounts are managed in CloudX. A Claude-only install needs no Codex login.
+      console.log(
+        "Codex is not signed in. Add Codex or Claude accounts later in Settings > Agents & accounts.",
       );
     }
   }
+}
+
+export function claudeCliBin(paths) {
+  return path.join(paths.npmGlobalDir, "bin", "claude");
+}
+
+// Claude Code is optional. An existing installation is reused; otherwise the
+// installer offers to add it next to Codex in the CloudX npm prefix.
+async function ensureClaude(commands, prompt, paths, env) {
+  const savedEnv = fs.existsSync(paths.envPath) ? parseEnvironmentFile(fs.readFileSync(paths.envPath, "utf8")) : {};
+  const candidates = [savedEnv.CLOUDX_CLAUDE_BIN, env.CLOUDX_CLAUDE_BIN, claudeCliBin(paths)].filter(candidate => candidate && path.isAbsolute(candidate));
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate) && commands.statusOk(candidate, ["--version"], { env })) return candidate;
+  }
+  let onPath = "";
+  try { onPath = commands.capture("sh", ["-c", "command -v claude"], { env }).trim(); } catch { /* not on PATH */ }
+  if (path.isAbsolute(onPath)) {
+    console.log(`Using Claude Code at ${onPath}.`);
+    return onPath;
+  }
+  const install = await prompt.boolean(
+    "installClaudeCode",
+    "Install Claude Code so CloudX can run Claude accounts? Codex keeps working without it.",
+    false,
+  );
+  if (!install) return undefined;
+  commands.mkdir(paths.npmGlobalDir);
+  commands.run("npm", ["i", "-g", "--prefix", paths.npmGlobalDir, `@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}`], { env: codexNpmEnv(paths, env) });
+  const claudeBin = claudeCliBin(paths);
+  commands.run(claudeBin, ["--version"], { env: codexNpmEnv(paths, env) });
+  console.log("Claude Code installed. Sign in from Settings > Agents & accounts.");
+  return claudeBin;
 }
 
 async function ensureCodex(commands, prompt, paths, env) {

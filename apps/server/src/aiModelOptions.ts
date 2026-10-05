@@ -35,11 +35,23 @@ export const CODEX_MODEL_OPTIONS: ConfigFieldOption[] = [
   }
 ];
 
+// Claude models offered wherever a model is chosen per run: voice planning,
+// documentation enrichment and Forge. Choosing one routes the run to Claude
+// Code with the configured Claude account.
+export const CLAUDE_EXEC_MODEL_OPTIONS: ConfigFieldOption[] = [
+  { label: "Claude Opus 5.5", value: "claude-opus-5-5", description: "Most capable model for complex coding and review work." },
+  { label: "Claude Sonnet 5.5", value: "claude-sonnet-5-5", description: "Balanced model for everyday coding work." },
+  { label: "Claude Fable 5.1", value: "claude-fable-5-1", description: "Fast model for routine coding tasks." },
+  { label: "Claude Haiku 4.5", value: "claude-haiku-4-5-20251001", description: "Fastest and most affordable model." }
+];
+export const AGENT_EXEC_MODEL_OPTIONS: ConfigFieldOption[] = [...CODEX_MODEL_OPTIONS, ...CLAUDE_EXEC_MODEL_OPTIONS];
+
 export const DOCUMENTATION_AI_MODEL_OPTIONS: ConfigFieldOption[] = [
   {
     label: "Same as voice control",
     value: DOCUMENTATION_AI_USE_VOICE_MODEL,
-    description: "Use the current CloudX voice-control Codex model."
+    description: "Use the current CloudX voice-control model."
   },
-  ...CODEX_MODEL_OPTIONS
+  ...AGENT_EXEC_MODEL_OPTIONS
 ];
+

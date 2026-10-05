@@ -1,7 +1,7 @@
 import { CLOUDX_THEME_OPTIONS, DEFAULT_CLOUDX_THEME_ID, DEFAULT_VOICE_MODEL } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, PluginDescriptor, PluginId } from "@cloudx/shared";
 
-import { CODEX_MODEL_OPTIONS } from "./aiModelOptions.js";
+import { AGENT_EXEC_MODEL_OPTIONS } from "./aiModelOptions.js";
 import { ConfigSecretStore, type ConfigSecretPatch } from "./configSecretStore.js";
 import { JsonStateFile } from "./jsonStateFile.js";
 
@@ -31,9 +31,9 @@ export const GLOBAL_CONFIG_FIELDS: ConfigFieldDescriptor[] = [
     key: "voiceModel",
     label: "Voice model",
     type: "select",
-    description: "Codex model used for voice command planning.",
+    description: "Model used for voice command planning. A Claude model runs on the default Claude account.",
     defaultValue: DEFAULT_VOICE_MODEL,
-    options: CODEX_MODEL_OPTIONS
+    options: AGENT_EXEC_MODEL_OPTIONS
   },
   {
     key: "themeId",

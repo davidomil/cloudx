@@ -26,11 +26,13 @@ tab list.
 | [Automation](automation.md)                | New tab                   | Connect triggers, hooks and execution steps in a graph.         |
 | [Rules & Skills](rules-skills.md)          | New tab / window settings | Manage reusable Codex instructions and templates.               |
 | [Codex Settings](codex-settings.md)        | Settings \> Codex         | Set shared model and service-tier defaults for future sessions. |
+| [Agents & accounts](agent-accounts.md)     | Settings \> Agents        | Sign in Codex and Claude accounts and switch a tab's runner.    |
+| [Claude Settings](claude-settings.md)      | Settings \> Claude        | Set Claude Code defaults and how CloudX launches Claude tabs.   |
 | [Workspace Controls](workspace-control.md) | AI command surface        | Switch windows/tabs and create or split panes by command.       |
 | [Audio AI](audio-ai.md)                    | Toolbar / command console | Use optional typed commands and microphone control.             |
 | [Notifications](notifications.md)          | Toolbar bell / Automation | Show local workflow messages and optional browser alerts.       |
 
-Ten tab plugins and four supporting plugins.
+Ten tab plugins and six supporting plugins.
 
 ## Combine plugins
 

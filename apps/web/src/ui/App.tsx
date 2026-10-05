@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { DEFAULT_WORKSPACE_MAX_PANES, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { AGENT_ACCOUNTS_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, DEFAULT_WORKSPACE_MAX_PANES, combineAgentUsage, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -80,6 +80,8 @@ import { browserNotificationPermissionState, NOTIFICATION_TOAST_MS, requestBrows
 import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
+import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
 import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
   PLUGIN_WEBVIEW_RENDERER,
@@ -396,6 +398,9 @@ export function App() {
 
   const tabById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
   const pluginById = useMemo(() => new Map(plugins.map((plugin) => [plugin.id, plugin])), [plugins]);
+  const agentSwitch = useAgentSwitchMenu(pluginById.has(AGENT_ACCOUNTS_PLUGIN_ID));
+  const usageHover = useUsageHover();
+  const usageAvailable = pluginById.has(AGENT_USAGE_PLUGIN_ID);
   const panes = useMemo(() => listPanes(layout.root), [layout.root]);
   const activePaneId = layout.activePaneId;
   const splitDisabledReason = panes.length >= DEFAULT_WORKSPACE_MAX_PANES
@@ -1280,7 +1285,7 @@ export function App() {
       const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
       if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
       return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
-        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} />
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} showUsage={usageAvailable} />
       </Suspense>;
     },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
@@ -1392,6 +1397,7 @@ export function App() {
             onUpdate={handleRenameWindow}
             onDelete={handleDeleteWindow}
             onContextSearch={handleContextSearch}
+            callHook={usageAvailable ? callUiHook : undefined}
           />
           <div className="mobile-action-menu" ref={mobileActionsRef}>
             <ControlButton className="icon-button" iconOnly pressed={mobileActionsOpen} onClick={() => setMobileActionsOpen((open) => !open)} title="Workspace actions" aria-label="Workspace actions" aria-expanded={mobileActionsOpen} aria-haspopup="menu">
@@ -1489,6 +1495,12 @@ export function App() {
           callHook={pluginById.has("codex-settings") ? callUiHook : undefined}
           cloudxUpdate={cloudxUpdate}
           onOpenForge={() => void openForge()}
+          availablePluginIds={plugins.map(plugin => plugin.id)}
+          onOpenAgentLogin={async tab => {
+            setSettingsOpen(false);
+            setSettingsCategory("general");
+            await handleCreate({ pluginId: tab.pluginId, title: tab.title, initialInput: tab.initialInput });
+          }}
           rulesSkillsStore={rulesSkillsStore}
           onCancel={() => { setSettingsOpen(false); setSettingsCategory("general"); }}
           onSave={handleSaveConfig}
@@ -1509,6 +1521,18 @@ export function App() {
           uiContributionRegistry={uiContributionRegistry}
           callHook={callUiHook}
           onClose={() => setTabSettings(undefined)}
+        />
+      ) : null}
+      {usageHover.target ? <UsageHoverCard target={usageHover.target} callHook={callUiHook} /> : null}
+      {agentSwitch.position && tabById.has(agentSwitch.position.tabId) ? (
+        <AgentSwitchMenu
+          tab={tabById.get(agentSwitch.position.tabId)!}
+          x={agentSwitch.position.x}
+          y={agentSwitch.position.y}
+          callHook={callUiHook}
+          onSwitched={tab => setTabs(current => current.map(currentTab => currentTab.id === tab.id ? tab : currentTab))}
+          onOpenAccounts={() => { setSettingsCategory("agents"); setSettingsOpen(true); }}
+          onClose={agentSwitch.close}
         />
       ) : null}
     </main>
@@ -1584,10 +1608,12 @@ export function App() {
                 onClick={(event) => {
                   event.stopPropagation();
                 }}
+                {...agentSwitch.tabHandlers(tab)}
               >
                 <button
                   type="button"
                   className="tab-activation"
+                  {...(usageAvailable && isAgentTab(tab) ? usageHover.handlers(tab.title, { tabIds: [tab.id] }) : {})}
                   onClick={(event) => {
                     event.stopPropagation();
                     void activateTab(tabId, pane.id);
@@ -1711,7 +1737,8 @@ export function WindowSwitcher({
   onCreate,
   onUpdate,
   onDelete,
-  onContextSearch
+  onContextSearch,
+  callHook
 }: {
   windows: WorkspaceWindow[];
   tabs: WorkspaceTab[];
@@ -1724,6 +1751,8 @@ export function WindowSwitcher({
   onUpdate: (windowId: string, name: string, defaultCwd: string, templateId?: string) => Promise<void>;
   onDelete: (windowId: string) => Promise<void>;
   onContextSearch: (query: string) => Promise<{ matches: Array<{ window: WorkspaceWindow; score: number; reasons: string[] }> }>;
+  // Present when agent usage is available; the list then shows each window's usage.
+  callHook?: UiContributionRenderContext["callHook"];
 }) {
   const [query, setQuery] = useState("");
   const [contextMode, setContextMode] = useState(false);
@@ -1739,6 +1768,10 @@ export function WindowSwitcher({
   const [error, setError] = useState<string | undefined>();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const tabsById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
+  const agentTabIds = useMemo(() => tabs.filter(isAgentTab).map(tab => tab.id), [tabs]);
+  const usage = useAgentUsage(callHook, open && agentTabIds.length ? { tabIds: agentTabIds } : undefined);
+  const usageHover = useUsageHover();
+  const windowAgentTabIds = (window: WorkspaceWindow) => windowTabIds(window, tabsById).filter(tabId => isAgentTab(tabsById.get(tabId)!));
 
   useOutsidePointerDismiss(open, rootRef, () => onOpenChange(false));
 
@@ -1859,11 +1892,13 @@ export function WindowSwitcher({
           <div className="window-list">
             {visibleWindows.map((window) => {
               const tabCount = tabCountForWindow(window, tabsById);
+              const agentIds = windowAgentTabIds(window);
               return (
                 <div key={window.id} className={`window-menu-row ${window.id === activeWindow?.id ? "selected" : ""}`}>
-                  <button type="button" className="window-row-main" onClick={() => void onSelect(window.id)}>
+                  <button type="button" className="window-row-main" onClick={() => void onSelect(window.id)}
+                    {...(usage ? usageHover.handlers(window.name, { tabIds: agentIds }) : {})}>
                     <span>{window.name}</span>
-                    <small>{tabCount} tabs · {window.defaultCwd}</small>
+                    <small>{tabCount} tabs{windowUsageText(agentIds, usage)} · {window.defaultCwd}</small>
                   </button>
                   <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => openEditDialog(window)} title={`Edit ${window.name}`} aria-label={`Edit ${window.name}`}>
                     <Wrench size={14} />
@@ -1924,12 +1959,23 @@ export function WindowSwitcher({
           {error ? <div className="window-menu-error">{error}</div> : null}
         </div>
       ) : null}
+      {open && callHook && usageHover.target ? <UsageHoverCard target={usageHover.target} callHook={callHook} /> : null}
     </div>
   );
 }
 
+function windowTabIds(window: WorkspaceWindow, tabsById: Map<string, WorkspaceTab>): string[] {
+  return listPanes(window.layout.root).flatMap(pane => pane.tabIds.filter(tabId => tabsById.has(tabId)));
+}
+
 function tabCountForWindow(window: WorkspaceWindow, tabsById: Map<string, WorkspaceTab>): number {
-  return listPanes(window.layout.root).reduce((count, pane) => count + pane.tabIds.filter((tabId) => tabsById.has(tabId)).length, 0);
+  return windowTabIds(window, tabsById).length;
+}
+
+function windowUsageText(tabIds: string[], usage: AgentUsageReadResult | undefined): string {
+  const summaries = tabIds.map(tabId => usage?.tabs[tabId]).filter(summary => summary !== undefined);
+  const total = combineAgentUsage(summaries);
+  return total.totals.requests ? ` · ${usageLine(total)}` : "";
 }
 
 function WindowDeleteWarning({ window, tabCount, onCancel, onConfirm }: { window: WorkspaceWindow; tabCount: number; onCancel: () => void; onConfirm: () => void }) {
@@ -2405,6 +2451,7 @@ export async function requestAudioInputEnumerationAccess(): Promise<void> {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
   stream.getTracks().forEach((track) => track.stop());
 }
+
 
 function upsertTab(tabs: WorkspaceTab[], tab: WorkspaceTab): WorkspaceTab[] {
   const existingIndex = tabs.findIndex((candidate) => candidate.id === tab.id);

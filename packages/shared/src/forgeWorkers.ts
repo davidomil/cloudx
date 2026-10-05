@@ -1,6 +1,8 @@
 import type { ForgeRepository, ForgeReviewComment, ForgeReviewPublication, ForgeReviewSubmission } from "./forge.js";
 
 export const FORGE_PLUGIN_ID = "forge";
+// Plugin metadata key on a tab that runs a Forge worker; holds { workerId }.
+export const FORGE_WORKER_METADATA_KEY = "forge-workers";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
 export const MAX_FORGE_BATCH_ISSUES = 50;

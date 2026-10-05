@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-import { terminalInputMessages, type RecoverTabRequest, type TabRecovery, type WorkspaceTab } from "@cloudx/shared";
+import { isAgentTab, terminalInputMessages, type RecoverTabRequest, type TabRecovery, type WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 import { readTerminalColorTheme } from "./theme.js";
@@ -52,7 +52,6 @@ const TERMINAL_SOCKET_RECONNECT_MAX_MS = 5_000;
 const TERMINAL_RESET_SEQUENCE = "\x1bc";
 const TERMINAL_KEYBOARD_INSET_PROPERTY = "--terminal-mobile-keyboard-inset";
 const TERMINAL_VISIBILITY_MARGIN_PX = 14;
-const CODEX_TERMINAL_PLUGIN_ID = "codex-terminal";
 const CODEX_PASTED_IMAGE_DIRECTORY = ".cloudx/pasted-images";
 const CODEX_PASTED_IMAGE_EXTENSIONS = new Map([
   ["image/png", "png"],
@@ -78,7 +77,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     state: "unavailable",
     message: connectionError ?? tab.statusMessage ?? "The terminal could not be restored. Check its connection to determine whether its process is still running."
   } : undefined) : undefined;
-  const preserveOutput = Boolean(recovery && tab.pluginId === CODEX_TERMINAL_PLUGIN_ID && tab.status === "failed" && (recovery.startupFailed || terminalViews.has(tab.id)));
+  const preserveOutput = Boolean(recovery && isAgentTab(tab) && tab.status === "failed" && (recovery.startupFailed || terminalViews.has(tab.id)));
   const needsRecovery = Boolean(recovery) && !preserveOutput;
   const recoveryEnabled = Boolean(onRecover);
 
@@ -358,7 +357,7 @@ function releaseTerminalContainerBindings(view: TerminalView): void {
 function installImagePasteForView(view: TerminalView): void {
   view.releaseImagePaste?.();
   view.releaseImagePaste = undefined;
-  if (view.pluginId !== CODEX_TERMINAL_PLUGIN_ID || !view.terminal.element) {
+  if (!isAgentTab(view) || !view.terminal.element) {
     return;
   }
   const terminalElement = view.terminal.element;

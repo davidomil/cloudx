@@ -10,13 +10,13 @@ import type {
   WorkspacePlugin
 } from "@cloudx/plugin-api";
 import { PluginSessionMissingError, PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import { CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, type CodexTerminalInitialInput, type DirectoryOwnershipAvailability, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { AGENT_TERMINAL_PLUGIN_ID, MODEL_ID_PATTERN, CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, readAgentSelection, type AgentSelection, type AgentSwitchRequest, type DirectoryOwnershipAvailability, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 import { legacyCodexConfigKeys } from "./CodexConfigRepairService.js";
 import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { CodexStateSources } from "./CodexStateSources.js";
-import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
+import { CodexConversationRecovery, findCodexTranscript } from "./CodexConversationRecovery.js";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -26,6 +26,20 @@ import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxS
 import type { TerminalProcess, TerminalProcessFactory, TerminalProducer } from "../terminal/TerminalProcess.js";
 import { TerminalScreen } from "../terminal/TerminalScreen.js";
 import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
+import type { AgentAccountStore } from "../agents/AgentAccountStore.js";
+import { prepareAgentSwitch } from "../agents/AgentSwitch.js";
+import { agentTurnReceiptPath, readAgentTurnState, type AgentTurnState } from "../agents/agentTurn.js";
+import { codexResumeInput } from "../agents/resumeInput.js";
+import { ClaudeTerminal } from "../agents/claude/ClaudeTerminal.js";
+import type { ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
+import type { AgentUsageRecorder } from "../agents/usage/AgentUsageRecorder.js";
+
+// Provider services the agent terminal needs beyond the Codex state sources.
+export interface AgentTerminalProviders {
+  accounts: AgentAccountStore;
+  claudeSettings: Pick<ClaudeSettingsService, "read">;
+  usage?: AgentUsageRecorder;
+}
 
 export const DEFAULT_TERMINAL_REPLAY_BYTES = 1_048_576;
 export const CODEX_SUBMIT_DELAY_MS = 25;
@@ -70,7 +84,7 @@ export const CODEX_TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions(
 });
 
 export class CodexTerminalPlugin implements WorkspacePlugin {
-  readonly id = "codex-terminal";
+  readonly id = AGENT_TERMINAL_PLUGIN_ID;
   readonly acronym = "CDX";
   readonly displayName = "Codex Terminal";
   readonly description = "Runs an interactive Codex CLI session in a PTY-backed web terminal.";
@@ -85,8 +99,15 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     private readonly replayBytes = DEFAULT_TERMINAL_REPLAY_BYTES,
     private readonly dataDir?: string,
     private readonly sources = dataDir ? new CodexStateSources(dataDir) : undefined,
-    private readonly env: NodeJS.ProcessEnv = process.env
-  ) {}
+    private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly providers?: AgentTerminalProviders
+  ) {
+    this.claude = providers && dataDir ? new ClaudeTerminal({
+      factory, dataDir, accounts: providers.accounts, settings: providers.claudeSettings, usage: providers.usage, replayBytes, env
+    }) : undefined;
+  }
+
+  private readonly claude: ClaudeTerminal | undefined;
 
   descriptor() {
     return {
@@ -121,25 +142,31 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   private async startSession(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
+    const agent = readAgentSelection(input.initialInput?.agent);
+    if (agent?.providerId === "claude") return this.requireClaude().start(input, recovering, agent);
     const template = templateFromRuntimeContext(input.runtimeContext);
     const baseEnv = { ...this.env };
     let launchTemplate: MaterializedCodexTemplate;
     let initialArgs: string[];
+    let authHome: string | undefined;
+    let codexAgent: AgentSelection | undefined;
     try {
+      ({ authHome, agent: codexAgent } = await this.codexAccount(agent));
       initialArgs = buildCodexLaunchArgs([], input.initialInput);
       launchTemplate = await materializeCodexTemplate(template, baseEnv, {
         dataDir: this.dataDir,
         tabId: input.tab.id,
         cwd: input.cwd,
         authorizeProjectTrust: input.authorizeProjectTrust,
-        sources: this.sources
+        sources: this.sources,
+        authHome
       });
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
-    let restoredInput: Record<string, unknown> = { ...input.initialInput, codexRuntimeContext: input.runtimeContext, codexRecovered: recovering };
-    if (input.prepareCodexSession) {
-      const sessionId = await input.prepareCodexSession({
+    let restoredInput: Record<string, unknown> = { ...input.initialInput, ...(codexAgent ? { agent: codexAgent } : {}), codexRuntimeContext: input.runtimeContext, codexRecovered: recovering };
+    if (input.prepareAgentSession) {
+      const sessionId = await input.prepareAgentSession({
         tabId: input.tab.id,
         cwd: input.cwd,
         command: launchTemplate.command,
@@ -153,9 +180,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const selection = conversation ? { tabId: input.tab.id, executionId: randomUUID(), receiptPath: conversation.receiptPath } : undefined;
     restoredInput = { ...restoredInput, codexExecutionId: selection?.executionId };
     await conversation?.reset();
+    if (launchTemplate.overlay) await fs.rm(agentTurnReceiptPath(launchTemplate.overlay.codexHome), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
     const command = launchTemplate.command;
-    const useBridge = Boolean(input.codexTurn || selection);
+    const useBridge = Boolean(input.agentTurn || selection);
     const sessionArgs = [...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
     const launchArgs = useBridge ? buildCodexRemoteTuiArgs(launchTemplate.args, sessionArgs) : [...launchTemplate.args, ...sessionArgs];
     const resume = codexResumeInput(restoredInput);
@@ -163,8 +191,9 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ? buildLoginShellCommandLaunch(process.execPath, [
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
         JSON.stringify({
-          ...(input.codexTurn ? { binding: { ...input.codexTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
+          ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
+          ...(launchTemplate.overlay ? { activity: { receiptPath: agentTurnReceiptPath(launchTemplate.overlay.codexHome) } } : {}),
           startupPicker: resume?.mode === "picker",
           permissions: {
             yoloMode: launchTemplate.args.includes("--yolo"),
@@ -194,12 +223,15 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceKind: "codex-terminal",
       voiceSummary: launchTemplate.voiceSummary,
       templateName: launchTemplate.templateName,
-      nativeTurn: input.codexTurn,
+      turnState: launchTemplate.overlay ? () => readAgentTurnState(agentTurnReceiptPath(launchTemplate.overlay!.codexHome)) : undefined,
+      nativeTurn: input.agentTurn,
       restoreInput: () => restoredInput,
+      onEnded: () => this.providers?.usage?.ended(input.tab.id),
       observeConversation: () => conversation?.observe(identity => {
         if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
           throw new Error("Codex conversation identity belongs to a different tab or execution.");
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
+        this.providers?.usage?.conversationStarted(input.tab, "codex", readAgentSelection(restoredInput.agent)?.accountId, identity.sessionId);
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
@@ -216,7 +248,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           cwd: input.cwd,
           authorizeProjectTrust: input.authorizeProjectTrust,
           resetOverlay: false,
-          sources: this.sources
+          sources: this.sources,
+          authHome
         });
         restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext };
         await input.controls.setRestoreInput?.(restoredInput);
@@ -232,12 +265,16 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   async restoreSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     if (!this.factory.attach) throw new Error("Codex terminal reconnection is unavailable.");
+    const agent = readAgentSelection(input.initialInput?.agent);
+    if (agent?.providerId === "claude") return this.requireClaude().restore(input);
     const terminal = await this.factory.attach(input.tab.id);
     let restoredInput = { ...input.initialInput };
+    let authHome: string | undefined;
     if (this.dataDir) {
       try {
+        ({ authHome } = await this.codexAccount(agent));
         await materializeCodexTemplate(templateFromRuntimeContext(input.runtimeContext), { ...this.env }, {
-          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources
+          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources, authHome
         });
         restoredInput = { ...restoredInput, codexRuntimeContext: input.runtimeContext };
         await input.controls.setRestoreInput?.(restoredInput);
@@ -254,11 +291,14 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
       voiceSummary: "Existing interactive Codex CLI session.",
+      turnState: this.sources ? () => readAgentTurnState(agentTurnReceiptPath(this.sources!.viewPath(input.tab.id))) : undefined,
       restoreInput: () => restoredInput,
+      onEnded: () => this.providers?.usage?.ended(input.tab.id),
       observeConversation: () => conversation?.observe(identity => {
         if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
           throw new Error("Codex conversation identity belongs to a different tab or execution.");
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
+        this.providers?.usage?.conversationStarted(input.tab, "codex", readAgentSelection(restoredInput.agent)?.accountId, identity.sessionId);
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
@@ -270,7 +310,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       applyRuntimeContext: async (runtimeContext) => {
         const template = templateFromRuntimeContext(runtimeContext);
         const launch = await materializeCodexTemplate(template, { ...this.env }, {
-          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources
+          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources, authHome
         });
         restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext };
         await input.controls.setRestoreInput?.(restoredInput);
@@ -285,6 +325,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   async describeRecovery(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume: boolean; startupFailed?: boolean }> {
+    if (readAgentSelection(input.initialInput?.agent)?.providerId === "claude")
+      return this.claude?.describeRecovery(input) ?? { message: "Claude conversation recovery is unavailable.", canResume: false };
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
     try {
       const resume = codexResumeInput(input.initialInput);
@@ -308,7 +350,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
 
   async recoverSession(input: CreatePluginSessionInput): Promise<PluginSession> {
     const resume = codexResumeInput(input.initialInput);
-    if (resume?.mode === "session" && resume.sessionId) await this.requireConversation(input.tab.id, resume.sessionId, true);
+    if (readAgentSelection(input.initialInput?.agent)?.providerId === "claude") await this.requireClaude().assertRecoverable(input);
+    else if (resume?.mode === "session" && resume.sessionId) await this.requireConversation(input.tab.id, resume.sessionId, true);
     else if (resume?.mode === "picker") {
       if (!this.sources) throw new Error("The Codex conversation store is unavailable. Check Codex settings before selecting a saved session.");
       const savedSource = await this.sources.readBinding(input.tab.id);
@@ -318,7 +361,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     } else throw new Error("The exact Codex conversation ID is unavailable. Select a saved session.");
     const { prompt: _prompt, codexRuntimeContext, ...initialInput } = input.initialInput ?? {};
     return this.startSession({
-      ...input, initialInput, prepareCodexSession: undefined,
+      ...input, initialInput, prepareAgentSession: undefined,
       runtimeContext: isRecord(codexRuntimeContext) ? codexRuntimeContext as WorkspaceRuntimeContext : input.runtimeContext
     }, true);
   }
@@ -350,6 +393,36 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     await this.sources.reconcileOwnership(input.tab.id, request);
   }
 
+  async prepareAgentSwitch(input: CreatePluginSessionInput, request: AgentSwitchRequest): Promise<Record<string, unknown>> {
+    if (!this.providers) throw new Error("Agent accounts are unavailable in this CloudX instance.");
+    return prepareAgentSwitch({
+      cwd: input.cwd,
+      initialInput: input.initialInput,
+      accounts: this.providers.accounts,
+      transcriptPath: (providerId, sessionId) => providerId === "claude" ? this.requireClaude().transcriptPath(sessionId) : this.codexTranscriptPath(input.tab.id, sessionId)
+    }, request);
+  }
+
+  private async codexTranscriptPath(tabId: string, sessionId: string): Promise<string> {
+    if (!this.sources) throw new Error("The Codex conversation store is unavailable.");
+    const source = await this.sources.readBinding(tabId) ?? await this.sources.resolve();
+    return findCodexTranscript(sessionId, source.home);
+  }
+
+  private requireClaude(): ClaudeTerminal {
+    if (!this.claude) throw new Error("Claude tabs need the CloudX data directory and account store.");
+    return this.claude;
+  }
+
+  // Codex tabs use the selected account, else the default Codex account, else
+  // the shared Codex home as before accounts existed.
+  private async codexAccount(agent: AgentSelection | undefined): Promise<{ authHome?: string; agent?: AgentSelection }> {
+    if (!this.providers) return {};
+    if (!agent?.accountId && !await this.providers.accounts.hasAccount("codex")) return {};
+    const account = await this.providers.accounts.resolve("codex", agent?.accountId);
+    return { authHome: this.providers.accounts.home(account), agent: { providerId: "codex", accountId: account.id } };
+  }
+
   private async requireConversation(tabId: string, conversationId: string, bindExplicitSelection = false): Promise<void> {
     if (!this.sources) throw new Error("The Codex conversation store is unavailable. Select a saved session after checking Codex settings.");
     const savedSource = await this.sources.readBinding(tabId);
@@ -377,7 +450,7 @@ export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<s
   const prompt = initialInput?.prompt;
   const model = initialInput?.model;
   const reasoningEffort = initialInput?.reasoningEffort;
-  if (model !== undefined && (typeof model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model))) throw new Error("Codex model must be a nonempty model identifier of at most 128 characters.");
+  if (model !== undefined && (typeof model !== "string" || !MODEL_ID_PATTERN.test(model))) throw new Error("Codex model must be a nonempty model identifier of at most 128 characters.");
   if (reasoningEffort !== undefined && !CODEX_REASONING_EFFORTS.some(effort => effort === reasoningEffort)) throw new Error(`Codex reasoning effort must be one of: ${CODEX_REASONING_EFFORTS.join(", ")}.`);
   if (prompt !== undefined && (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0"))) throw new Error("Codex initial prompt must be a non-empty string without null bytes.");
   if (prompt !== undefined && resume && resume.mode !== "session") throw new Error("An initial prompt with resume requires an exact session id.");
@@ -404,37 +477,6 @@ export function buildCodexLaunchArgs(baseArgs: string[], initialInput?: Record<s
   return args;
 }
 
-export function codexResumeInput(initialInput: Record<string, unknown> | undefined): Required<CodexTerminalInitialInput>["resume"] | undefined {
-  if (!isRecord(initialInput) || !isRecord(initialInput.resume)) {
-    return undefined;
-  }
-  if ("sourceId" in initialInput.resume) throw new Error("Codex session source selection is no longer supported; resume uses shared sessions.");
-  const mode = initialInput.resume.mode;
-  if (mode !== "picker" && mode !== "last" && mode !== "session") {
-    return undefined;
-  }
-  const sessionId = typeof initialInput.resume.sessionId === "string" ? initialInput.resume.sessionId.trim() : "";
-  if (mode === "session" && !sessionId) {
-    throw new Error("Codex resume session id is required.");
-  }
-  return {
-    mode,
-    sessionId: mode === "session" ? sessionId : undefined,
-    all: optionalResumeBoolean(initialInput.resume.all, "all") ?? false,
-    includeNonInteractive: optionalResumeBoolean(initialInput.resume.includeNonInteractive, "includeNonInteractive") ?? false
-  };
-}
-
-function optionalResumeBoolean(value: unknown, name: string): boolean | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  if (typeof value !== "boolean") {
-    throw new Error(`Codex resume ${name} must be a boolean.`);
-  }
-  return value;
-}
-
 function shortSessionLabel(sessionId: string | undefined): string {
   const value = sessionId?.trim();
   if (!value) {
@@ -443,7 +485,7 @@ function shortSessionLabel(sessionId: string | undefined): string {
   return value.length > 12 ? `${value.slice(0, 8)}...` : value;
 }
 
-function templateFromRuntimeContext(runtimeContext: WorkspaceRuntimeContext | undefined): ResolvedPersonalityTemplate | undefined {
+export function templateFromRuntimeContext(runtimeContext: WorkspaceRuntimeContext | undefined): ResolvedPersonalityTemplate | undefined {
   const rulesSkillsRuntime = runtimeContext?.pluginRuntime?.[RULES_SKILLS_PLUGIN_ID];
   const personalityTemplate = rulesSkillsRuntime?.personalityTemplate;
   if (!isResolvedPersonalityTemplate(personalityTemplate)) {
@@ -496,6 +538,7 @@ export interface MaterializeCodexTemplateOptions extends PluginSessionLaunchOpti
   cwd?: string;
   resetOverlay?: boolean;
   sources?: CodexStateSources;
+  authHome?: string;
 }
 
 export async function materializeCodexTemplate(
@@ -520,7 +563,7 @@ export async function materializeCodexTemplate(
     : undefined;
   if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source! })
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source!, authHome: options.authHome })
     : undefined;
   if (overlay) {
     if (!overlay.yoloMode) args.splice(args.indexOf("--yolo"), 1);
@@ -720,7 +763,15 @@ interface TerminalSessionOptions {
   voiceKind?: "codex-terminal" | "standard-terminal" | "terminal";
   voiceSummary?: string;
   templateName?: string;
-  nativeTurn?: PluginSessionLaunchOptions["codexTurn"];
+  nativeTurn?: PluginSessionLaunchOptions["agentTurn"];
+  // Command that leaves the agent's TUI after a finished Forge turn, and the
+  // agent name shown with its final response. Both default to Codex.
+  exitCommand?: string;
+  agentLabel?: string;
+  // Reports whether the agent is working on a turn, from its turn receipt.
+  turnState?(): AgentTurnState | undefined;
+  // Called once when the agent process has ended or was stopped.
+  onEnded?(): void;
   restoreInput?(): Record<string, unknown>;
   observeConversation?(): (() => void) | undefined;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
@@ -967,14 +1018,14 @@ export class CodexTerminalSession implements PluginSession {
           else reject(new Error(`Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`} during completion.`));
         });
         // Leave through the native TUI before releasing its supervised process tree.
-        this.terminalProcess.write("\u0015\u001b[200~/quit\u001b[201~");
+        this.terminalProcess.write(`\u0015\u001b[200~${this.options.exitCommand ?? "/quit"}\u001b[201~`);
         this.submit();
       });
     }
     await this.terminalProcess.terminate();
     const final = await readNativeTurnArtifact(`${binding.receiptPath}.final.json`);
     if (isRecord(final) && final.workerId === receipt.workerId && final.attemptId === receipt.attemptId && final.threadId === receipt.threadId && final.turnId === receipt.turnId && typeof final.text === "string") {
-      const output = `\r\nCodex final response:\r\n${final.text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").replace(/\n/g, "\r\n")}\r\n`;
+      const output = `\r\n${this.options.agentLabel ?? "Codex"} final response:\r\n${final.text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "").replace(/\n/g, "\r\n")}\r\n`;
       this.recentOutput = trimRecentOutput(this.recentOutput + output, this.replayBytes);
       this.writeScreen(output);
     }
@@ -1034,7 +1085,7 @@ export class CodexTerminalSession implements PluginSession {
       status: this.status,
       statusMessage: this.statusMessage,
       recentOutput: this.recentOutput,
-      state: { readiness: this.readinessSnapshot() }
+      state: { readiness: this.readinessSnapshot(), turn: this.options.turnState?.() }
     };
   }
 
@@ -1154,7 +1205,9 @@ export class CodexTerminalSession implements PluginSession {
     if (this.readiness.state === state && this.readiness.reason === reason) {
       return;
     }
+    const ending = state === "closed" && this.readiness.state !== "closed";
     this.readiness = { state, reason, changedAt: Date.now() };
+    if (ending) this.options.onEnded?.();
     for (const listener of this.readinessListeners) {
       listener();
     }

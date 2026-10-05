@@ -9,7 +9,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
-import { isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState } from "@cloudx/shared";
+import { AGENT_ACCOUNT_ID_PATTERN, isAgentProviderId, isAgentTab, isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState } from "@cloudx/shared";
 import type { HookCallContext } from "@cloudx/plugin-api";
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
@@ -48,6 +48,17 @@ import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeEr
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
 import { CodexSettingsPlugin } from "./plugins/CodexSettingsPlugin.js";
+import { AgentAccountsPlugin } from "./plugins/AgentAccountsPlugin.js";
+import { AgentAccountStore } from "./agents/AgentAccountStore.js";
+import { ClaudeSettingsService } from "./agents/claude/ClaudeSettingsService.js";
+import { ClaudeSettingsPlugin } from "./plugins/ClaudeSettingsPlugin.js";
+import { AgentUsagePlugin } from "./plugins/AgentUsagePlugin.js";
+import { AgentUsageLedger } from "./agents/usage/AgentUsageLedger.js";
+import { AgentUsageRecorder } from "./agents/usage/AgentUsageRecorder.js";
+import { AgentUsageService } from "./agents/usage/AgentUsageService.js";
+import { ClaudeUsageReader } from "./agents/usage/ClaudeUsageReader.js";
+import { CodexUsageReader } from "./agents/usage/CodexUsageReader.js";
+import { AgentPricing } from "./agents/usage/pricing.js";
 import { CodexSettingsService } from "./plugins/CodexSettingsService.js";
 import { CodexConfigRepairService } from "./plugins/CodexConfigRepairService.js";
 import { CodexUpdateService } from "./plugins/CodexUpdateService.js";
@@ -94,7 +105,8 @@ import { TerminalReadiness } from "./terminal/TerminalReadiness.js";
 import { MAX_TERMINAL_SCREEN_BYTES } from "./terminal/TerminalScreen.js";
 import { SessionStateStore } from "./workspace/SessionStateStore.js";
 import { VoiceController } from "./voice/VoiceController.js";
-import { CodexExecVoicePlanner } from "./voice/VoicePlanner.js";
+import { CodexExecVoicePlanner, runCodexExec } from "./voice/VoicePlanner.js";
+import { createAgentExec } from "./agents/AgentExec.js";
 import { AudioChunkQueue } from "./voice/AudioChunkQueue.js";
 import { TabContextService } from "./context/TabContextService.js";
 import { AppServerClient } from "./appServer/AppServerClient.js";
@@ -118,6 +130,7 @@ import { redactUrlSearchAndHash } from "./urlRedaction.js";
 
 export interface AppServices {
   logs?: CloudxLogService;
+  agentAccounts?: AgentAccountStore;
   workspaceCleanup?: WorkspaceCleanupService;
   forgeResources?: ForgeDisposableResources;
   plugins: PluginRegistry;
@@ -515,7 +528,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       await services.sessions.refreshRuntimeIndicators(request.params.windowId);
       const windowTabIds = new Set(services.workspace!.tabIdsForWindow(request.params.windowId));
       await services.sessions.applyRuntimeContexts(
-        (tab) => tab.pluginId === "codex-terminal" && windowTabIds.has(tab.id),
+        (tab) => isAgentTab(tab) && windowTabIds.has(tab.id),
         "Applying window rules/skills template changes."
       );
     }
@@ -602,6 +615,16 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       if (action !== "resume-conversation" || !/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) throwBadRequest("sessionId must be an exact conversation ID for resume-conversation.");
     }
     return services.sessions.recoverTab(request.params.tabId, { action, sessionId });
+  });
+
+  app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/switch-agent", async (request) => {
+    const body = optionalRequestBody(request.body);
+    if (Object.keys(body).some(key => key !== "providerId" && key !== "accountId" && key !== "model")) throwBadRequest("Unknown agent switch field.");
+    if (!isAgentProviderId(body.providerId)) throwBadRequest("providerId must be codex or claude.");
+    const accountId = requiredTrimmedBodyString(body.accountId, "accountId");
+    if (!AGENT_ACCOUNT_ID_PATTERN.test(accountId)) throwBadRequest("accountId is invalid.");
+    const model = body.model === undefined ? undefined : requiredTrimmedBodyString(body.model, "model");
+    return services.sessions.switchAgent(request.params.tabId, { providerId: body.providerId, accountId, ...(model ? { model } : {}) });
   });
 
   app.get<{ Params: { tabId: string } }>("/api/tabs/:tabId/ownership", async request =>
@@ -1361,7 +1384,23 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
-  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources));
+  const agentAccounts = new AgentAccountStore(config.dataDir);
+  const agentExec = createAgentExec(agentAccounts, runCodexExec);
+  const claudeSettings = new ClaudeSettingsService(config.dataDir, () => agentAccounts.providerHome("claude"));
+  const usageLedger = new AgentUsageLedger(config.dataDir);
+  const usagePricing = new AgentPricing(config.dataDir);
+  const agentUsage = new AgentUsageService(usageLedger, usagePricing, {
+    codex: new CodexUsageReader(() => agentAccounts.providerHome("codex")),
+    claude: new ClaudeUsageReader(() => agentAccounts.providerHome("claude"))
+  });
+  plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources, process.env, {
+    accounts: agentAccounts,
+    claudeSettings,
+    usage: new AgentUsageRecorder(usageLedger, agentAccounts, error => logger?.warn({ err: error }, "Agent usage could not be recorded."))
+  }));
+  plugins.register(new AgentUsagePlugin(agentUsage, usageLedger, usagePricing, () => sessions?.listTabs().map(tab => tab.id) ?? []));
+  plugins.register(new AgentAccountsPlugin(agentAccounts, terminalFactory, config.terminalReplayBytes));
+  plugins.register(new ClaudeSettingsPlugin(claudeSettings));
   plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates, new CodexConfigRepairService(codexStateSources)));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
@@ -1389,7 +1428,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     }
     await sessions.refreshRuntimeIndicators();
     return {
-      tabs: await sessions.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting saved rules/skills template changes.")
+      tabs: await sessions.applyRuntimeContexts(isAgentTab, "Injecting saved rules/skills template changes.")
     };
   }));
   const notifications = new NotificationsPlugin();
@@ -1445,7 +1484,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     await Promise.all(pendingRulesSkillsUpdates);
   };
   const pluginContributionsReady = syncPluginContributions(plugins.values(), rulesSkills, logger).then(async (store) => {
-    await sessions?.applyRuntimeContexts((tab) => tab.pluginId === "codex-terminal", "Injecting plugin-contributed system rules and skills.");
+    await sessions?.applyRuntimeContexts(isAgentTab, "Injecting plugin-contributed system rules and skills.");
     return store;
   });
   void pluginContributionsReady.catch((error) => {
@@ -1456,7 +1495,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     client: documentation,
     config: configService,
     rulesSkills,
-    runner: new CodexDocumentationEnrichmentRunner(config.voiceModel, config.documentationTimeoutMs),
+    runner: new CodexDocumentationEnrichmentRunner(config.voiceModel, config.documentationTimeoutMs, agentExec),
     asr,
     pluginContributionsReady: () => pluginContributionsReady
   });
@@ -1469,7 +1508,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }, () => configService.isVoiceCommandsEnabled()));
   voice = new VoiceController(
     sessions,
-    new CodexExecVoicePlanner(() => configService.getVoiceModel(), logger, { includeText: config.voiceDebugTranscripts ?? false }),
+    new CodexExecVoicePlanner(() => configService.getVoiceModel(), logger, { includeText: config.voiceDebugTranscripts ?? false }, agentExec),
     new AppServerContextProvider(sessions, config.appServerEnabled ? () => new AppServerClient() : undefined),
     logger,
     { includeText: config.voiceDebugTranscripts ?? false }
@@ -1483,7 +1522,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
+  return { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {
@@ -1638,7 +1677,7 @@ function createAutomationService(repository: AutomationRepository, services: App
   return new AutomationService(repository, services.triggers!, services.hooks!, catalog, new AutomationCompiler(typeService), new AutomationExecutor(), {
     logger,
     startDisabled: config?.automationStartDisabled,
-    executorOptions: { allowedRoots: automationAllowedRoots(services.pathPolicy) },
+    executorOptions: { allowedRoots: automationAllowedRoots(services.pathPolicy), agentAccounts: services.agentAccounts },
     layoutEffects: services.workspace
   });
 }

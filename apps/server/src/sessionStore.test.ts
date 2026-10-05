@@ -215,17 +215,17 @@ describe("SessionStore voice actions", () => {
   it.each(["discard", "close", "restart", "dispose"] as const)("preserves unresolved session context through %s", async action => {
     const { store, root, plugin } = await createStore();
     const failure = new PluginSessionOwnershipError("Conversation process shutdown is unconfirmed.");
-    const prepareCodexSession = vi.fn(async () => { throw failure; });
+    const prepareAgentSession = vi.fn(async () => { throw failure; });
     let tab!: WorkspaceTab;
     plugin.createSession = async input => {
       tab = input.tab;
-      await input.prepareCodexSession!({ tabId: tab.id, cwd: input.cwd, command: "codex", configurationArgs: [], env: {} });
+      await input.prepareAgentSession!({ tabId: tab.id, cwd: input.cwd, command: "codex", configurationArgs: [], env: {} });
       throw new Error("The unresolved conversation must not start a session.");
     };
     try {
       await expect(store.prepareTab({ pluginId: plugin.id, cwd: root }, undefined, {
         ownerPluginId: plugin.id,
-        prepareCodexSession,
+        prepareAgentSession,
       })).rejects.toBe(failure);
       const context = store.getContextDirectory(tab.id)!;
       const original = await fs.readFile(tab.contextPath!, "utf8");
@@ -237,7 +237,7 @@ describe("SessionStore voice actions", () => {
       else if (action === "close") expect(() => store.closeTab(tab.id)).toThrow(failure);
       else if (action === "restart") await expect(store.restartTab(tab.id)).rejects.toBe(failure);
       else await expect(store.dispose()).rejects.toMatchObject({ name: "AggregateError", errors: [failure] });
-      expect(prepareCodexSession).toHaveBeenCalledOnce();
+      expect(prepareAgentSession).toHaveBeenCalledOnce();
       expect(store.getContextDirectory(tab.id)).toEqual(context);
       expect(await fs.readFile(tab.contextPath!, "utf8")).toBe(original);
       expect((await fs.stat(context.path, { bigint: true })).ino.toString()).toBe(context.ino);
@@ -255,13 +255,13 @@ describe("SessionStore voice actions", () => {
     plugin.createSession = async input => {
       tab = input.tab;
       expect((await fs.stat(tab.contextPath!)).isFile()).toBe(true);
-      await input.prepareCodexSession!({ tabId: tab.id, cwd: input.cwd, command: "codex", configurationArgs: [], env: {} });
+      await input.prepareAgentSession!({ tabId: tab.id, cwd: input.cwd, command: "codex", configurationArgs: [], env: {} });
       throw new Error("The cancelled conversation must not start a session.");
     };
     try {
       await expect(store.prepareTab({ pluginId: plugin.id, cwd: root }, undefined, {
         ownerPluginId: plugin.id,
-        prepareCodexSession: async () => { throw failure; },
+        prepareAgentSession: async () => { throw failure; },
       })).rejects.toBe(failure);
       expect(store.listTabs()).toEqual([]);
       expect(() => store.getTab(tab.id)).toThrow(/Unknown tab/);
@@ -389,25 +389,25 @@ describe("SessionStore voice actions", () => {
     const { store, root, workspace, workspaceCommands, plugin } = await createStore({ withWorkspace: true });
     const window = workspace!.getActiveWindow();
     const authorizeProjectTrust = vi.fn(async () => root);
-    const prepareCodexSession = vi.fn(async () => "01a08470-d118-7b72-b1df-439e72e5c744");
-    const codexTurn = { workerId: "worker", attemptId: "attempt", receiptPath: path.join(root, "turn.json") };
+    const prepareAgentSession = vi.fn(async () => "01a08470-d118-7b72-b1df-439e72e5c744");
+    const agentTurn = { workerId: "worker", attemptId: "attempt", receiptPath: path.join(root, "turn.json") };
     try {
-      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust, prepareCodexSession, codexTurn });
+      const { tab } = await workspaceCommands!.createTab({ pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId }, { authorizeProjectTrust, prepareAgentSession, agentTurn });
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
-      expect(plugin.lastInput?.prepareCodexSession).toBe(prepareCodexSession);
-      expect(plugin.lastInput?.codexTurn).toEqual(codexTurn);
-      expect(JSON.stringify(tab)).not.toContain("codexTurn");
+      expect(plugin.lastInput?.prepareAgentSession).toBe(prepareAgentSession);
+      expect(plugin.lastInput?.agentTurn).toEqual(agentTurn);
+      expect(JSON.stringify(tab)).not.toContain("agentTurn");
       expect(JSON.stringify(tab)).not.toContain("authorizeProjectTrust");
-      expect(JSON.stringify(tab)).not.toContain("prepareCodexSession");
+      expect(JSON.stringify(tab)).not.toContain("prepareAgentSession");
       await store.restartTab(tab.id);
-      expect(plugin.lastInput?.codexTurn).toEqual(codexTurn);
+      expect(plugin.lastInput?.agentTurn).toEqual(agentTurn);
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
-      expect(plugin.lastInput?.prepareCodexSession).toBe(prepareCodexSession);
+      expect(plugin.lastInput?.prepareAgentSession).toBe(prepareAgentSession);
       await store.discardPreparedTab(tab.id);
       await store.createTab({ pluginId: plugin.id, cwd: root });
       expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
-      expect(plugin.lastInput?.prepareCodexSession).toBeUndefined();
-      expect(plugin.lastInput?.codexTurn).toBeUndefined();
+      expect(plugin.lastInput?.prepareAgentSession).toBeUndefined();
+      expect(plugin.lastInput?.agentTurn).toBeUndefined();
     } finally {
       await store.dispose();
       await fs.rm(root, { recursive: true, force: true });
@@ -420,12 +420,12 @@ describe("SessionStore voice actions", () => {
     try {
       await workspaceCommands!.createTab({
         pluginId: plugin.id, cwd: root, windowId: window.id, paneId: window.layout.activePaneId,
-        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root, prepareCodexSession: "spoofed-thread", codexTurn: { receiptPath: "/spoofed" } },
-        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root, prepareCodexSession: "spoofed-thread", codexTurn: { receiptPath: "/spoofed" } } }
+        initialInput: { authorizeProjectTrust: root, trustedProjectPath: root, prepareAgentSession: "spoofed-thread", agentTurn: { receiptPath: "/spoofed" } },
+        pluginMetadata: { "forge-workers": { workerId: "spoofed", trustedProjectPath: root, prepareAgentSession: "spoofed-thread", agentTurn: { receiptPath: "/spoofed" } } }
       });
       expect(plugin.lastInput?.authorizeProjectTrust).toBeUndefined();
-      expect(plugin.lastInput?.prepareCodexSession).toBeUndefined();
-      expect(plugin.lastInput?.codexTurn).toBeUndefined();
+      expect(plugin.lastInput?.prepareAgentSession).toBeUndefined();
+      expect(plugin.lastInput?.agentTurn).toBeUndefined();
     } finally {
       await store.dispose();
       await fs.rm(root, { recursive: true, force: true });

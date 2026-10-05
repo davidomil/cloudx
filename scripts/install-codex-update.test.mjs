@@ -385,18 +385,24 @@ describe("full installer coordination with Codex-only updates", () => {
     const selection = JSON.stringify({ schemaVersion: 1, active: { version: "0.155.1", assistantBin }, previous: null });
     fs.writeFileSync(path.join(prefix, ".cloudx-codex-selection.json"), selection);
     const runner = new InstallerRunner({ cwd: root, log: () => {} });
-    vi.spyOn(runner, "run").mockReturnValue("");
+    // The optional Claude Code install is the first step after Codex; failing
+    // it stops the installer right after Codex maintenance.
+    vi.spyOn(runner, "run").mockImplementation((command, args) => {
+      if (command === "npm" && args.some(arg => arg.startsWith("@anthropic-ai/claude-code@"))) throw new Error("Stop after Codex maintenance.");
+      return "";
+    });
     vi.spyOn(runner, "capture").mockReturnValue("git version 2.50.0");
     vi.spyOn(runner, "statusOk").mockReturnValue(false);
     await expect(runInstaller({
-      repoRoot: root, home, runner, yes: true, answers: { runCodexLogin: false },
+      repoRoot: root, home, runner, yes: true, answers: { runCodexLogin: false, installClaudeCode: true },
       env: { CLOUDX_INSTALL_BOOTSTRAPPED: "1", PATH: "/usr/bin" },
       osRelease: { ID: "ubuntu", VERSION_ID: "24.04" },
       gpuDetected: false, intelGpuDetected: false, cudaRuntimeReady: false,
-    })).rejects.toThrow("Codex must be authenticated");
-    expect(runner.run.mock.calls.map(([command, args]) => [command, ...args])).toEqual([
+    })).rejects.toThrow("Stop after Codex maintenance.");
+    expect(runner.run.mock.calls.map(([command, args]) => [command, ...args]).slice(0, 3)).toEqual([
       ["node", "-v"], ["npm", "-v"], [assistantBin, "--version"]
     ]);
+    expect(runner.run.mock.calls.some(([, args]) => args[0] === "login")).toBe(false);
     expect(fs.readFileSync(path.join(prefix, ".cloudx-codex-selection.json"), "utf8")).toBe(selection);
     expect(fs.readFileSync(assistantBin, "utf8")).toBe("pinned executable");
     expect(fs.readFileSync(path.join(prefix, "lib/node_modules/@openai/codex/running-dependency"), "utf8")).toBe("original dependencies");

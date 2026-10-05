@@ -7,8 +7,11 @@ import safeRegex from "safe-regex2";
 import type { HookRegistry } from "../hooks/HookRegistry.js";
 import { isSameOrChildPath } from "../pathBoundary.js";
 import type { AutomationCatalogResponse, AutomationEdge, AutomationGroup, AutomationNode, AutomationNodeCatalogEntry, AutomationRunSummary, AutomationRunTraceEntry, TriggerEvent } from "@cloudx/shared";
-import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames, automationSafetyAllowed } from "@cloudx/shared";
+import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames, automationSafetyAllowed, isRecord } from "@cloudx/shared";
 import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
+import type { AgentAccountStore } from "../agents/AgentAccountStore.js";
+import { agentCommand, runAgentCli } from "../agents/agentCli.js";
+import { isClaudeModel } from "../agents/claude/ClaudeLaunch.js";
 
 export interface AutomationExecutorOptions {
   runId?: string;
@@ -17,6 +20,8 @@ export interface AutomationExecutorOptions {
   maxDurationMs?: number;
   maxTraceEntries?: number;
   allowedRoots?: string[];
+  // Runs codex.exec nodes whose model is a Claude model on Claude Code.
+  agentAccounts?: AgentAccountStore;
   signal?: AbortSignal;
   effectSink?: AutomationEffectSink;
   onRunStarted?: (run: AutomationRunSummary) => Promise<void> | void;
@@ -49,6 +54,7 @@ const AUTOMATION_BASH_DEFAULT_TIMEOUT_MS = 30_000;
 const AUTOMATION_CODEX_PROMPT_MAX_CHARS = 100_000;
 const AUTOMATION_CODEX_STDIN_MAX_BYTES = 1024 * 1024;
 const AUTOMATION_CODEX_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
+const AUTOMATION_CLAUDE_MAX_OUTPUT_BYTES = AUTOMATION_CODEX_OUTPUT_MAX_BYTES;
 const AUTOMATION_CODEX_TIMEOUT_MAX_MS = 60 * 60 * 1000;
 const AUTOMATION_CODEX_DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const AUTOMATION_PROCESS_TERMINATION_GRACE_MS = 250;
@@ -381,10 +387,12 @@ class AutomationRuntime {
       const json = booleanValue(await this.optionalInputValue(node, "json") ?? false, node, "json");
       const skipGitRepoCheck = booleanValue(await this.optionalInputValue(node, "skipGitRepoCheck") ?? false, node, "skipGitRepoCheck");
       this.trace("info", "Starting Codex exec process.", node.id, { cwd, timeoutMs, sandbox, approvalPolicy, json });
-      const result = await runCodexExec({ prompt, stdin, cwd, timeoutMs, profile, model, sandbox, approvalPolicy, ephemeral, json, skipGitRepoCheck, signal: this.options.signal });
+      const execInput = { prompt, stdin, cwd, timeoutMs, profile, model, sandbox, approvalPolicy, ephemeral, json, skipGitRepoCheck, signal: this.options.signal };
+      const claude = isClaudeModel(model);
+      const result = claude ? await runClaudeAutomationExec(execInput, this.options.agentAccounts) : await runCodexExec(execInput);
       this.assertNotCancelled();
-      const jsonEvents = json ? parseCodexJsonLines(result.stdout, node) : undefined;
-      const finalMessage = jsonEvents ? finalMessageFromCodexEvents(jsonEvents) : result.stdout.trimEnd();
+      const jsonEvents = json ? (claude ? parseClaudeJsonResult(result.stdout, node) : parseCodexJsonLines(result.stdout, node)) : undefined;
+      const finalMessage = jsonEvents ? (claude ? claudeFinalMessage(jsonEvents) : finalMessageFromCodexEvents(jsonEvents)) : result.stdout.trimEnd();
       const outputs: Record<string, unknown> = { finalMessage, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
       if (jsonEvents) {
         outputs.jsonEvents = jsonEvents;
@@ -1242,6 +1250,45 @@ interface CodexExecResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+}
+
+// Codex sandbox levels mapped onto Claude Code permissions. Print mode cannot
+// ask, so anything a level does not allow is denied.
+const CLAUDE_SANDBOX_ARGS: Record<CodexExecInput["sandbox"], string[]> = {
+  "read-only": ["--tools", "Read,Grep,Glob", "--permission-mode", "dontAsk"],
+  "workspace-write": ["--permission-mode", "acceptEdits"],
+  "danger-full-access": ["--dangerously-skip-permissions"]
+};
+
+async function runClaudeAutomationExec(input: CodexExecInput, accounts: AgentAccountStore | undefined): Promise<CodexExecResult> {
+  if (!accounts) throw new Error("Claude automation runs need the agent account store.");
+  if (input.profile) throw new Error("Codex profiles do not apply to Claude models. Remove the profile input.");
+  const env = await accounts.defaultClaudeEnv(process.env);
+  const args = [
+    "-p",
+    "--output-format", input.json ? "json" : "text",
+    "--model", input.model!,
+    ...CLAUDE_SANDBOX_ARGS[input.sandbox],
+    ...(input.ephemeral ? ["--no-session-persistence"] : []),
+    "--", input.prompt
+  ];
+  const result = await runAgentCli(agentCommand("claude", env), args, {
+    env, cwd: input.cwd, stdin: input.stdin, timeoutMs: input.timeoutMs, signal: input.signal, maxOutputBytes: AUTOMATION_CLAUDE_MAX_OUTPUT_BYTES
+  });
+  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.code ?? 1 };
+}
+
+function parseClaudeJsonResult(stdout: string, node: AutomationNode): Record<string, unknown>[] {
+  let parsed: unknown;
+  try { parsed = JSON.parse(stdout); }
+  catch { throw new Error(`Node ${node.id} Claude output is not valid JSON.`); }
+  if (!isRecord(parsed)) throw new Error(`Node ${node.id} Claude output is not a JSON object.`);
+  return [parsed];
+}
+
+function claudeFinalMessage(events: Record<string, unknown>[]): string {
+  const result = events[0];
+  return isRecord(result) && typeof result.result === "string" ? result.result : "";
 }
 
 async function resolveAutomationProcessCwd(cwdValue: unknown, allowedRoots: string[] | undefined, processName: string): Promise<string> {

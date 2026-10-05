@@ -279,10 +279,10 @@ describe("exact Codex transcript recovery", () => {
   it("checks the requested conversation even when a newer conversation shares its directory", async () => {
     await transcript(firstId);
     await transcript(secondId);
-    await expect(recovery.requireTranscript(firstId, home)).resolves.toBeUndefined();
+    await expect(recovery.requireTranscript(firstId, home)).resolves.toBe(path.join(home, "sessions", `rollout-${firstId}.jsonl`));
     await fs.rm(path.join(home, "sessions", `rollout-${firstId}.jsonl`));
     await expect(recovery.requireTranscript(firstId, home)).rejects.toThrow(`transcript for Codex conversation ${firstId} is unavailable`);
-    await expect(recovery.requireTranscript(secondId, home)).resolves.toBeUndefined();
+    await expect(recovery.requireTranscript(secondId, home)).resolves.toBe(path.join(home, "sessions", `rollout-${secondId}.jsonl`));
   });
 
   it("rejects a transcript with a different recorded identity and reports corrupt metadata", async () => {
@@ -302,7 +302,7 @@ describe("exact Codex transcript recovery", () => {
     const file = await transcript(firstId);
     const metadata = { type: "session_meta", payload: { id: firstId, base_instructions: { text: "x".repeat(80_000) } } };
     await fs.writeFile(file, JSON.stringify(metadata) + "\n" + "x".repeat(2_000_000));
-    await expect(recovery.requireTranscript(firstId, home)).resolves.toBeUndefined();
+    await expect(recovery.requireTranscript(firstId, home)).resolves.toBe(file);
     metadata.payload.base_instructions.text = "x".repeat(1_048_577);
     await fs.writeFile(file, JSON.stringify(metadata) + "\n");
     await expect(recovery.requireTranscript(firstId, home)).rejects.toThrow("header for Codex conversation");
