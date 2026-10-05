@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 
-import { act, createElement } from "react";
+import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CloudxUpdateCapacity, CloudxUpdatePreview, CloudxUpdateStatus, WorkspaceCleanupJob, WorkspaceCleanupPreview, WorkspaceCleanupRequest } from "@cloudx/shared";
 
 import { WorkspaceCleanupPanel } from "./WorkspaceCleanupPanel.js";
+import { useWorkspaceCleanup } from "./workspaceCleanupSession.js";
 import { CloudxUpdatePanel, useCloudxUpdate } from "./CloudxUpdatePanel.js";
 
 let root: Root | undefined;
@@ -48,7 +49,12 @@ async function mount() {
   const saveWorkspace = async () => {};
   function Harness() {
     const update = useCloudxUpdate(true, saveWorkspace, reload);
-    return createElement(CloudxUpdatePanel, { update, CleanupPanel: WorkspaceCleanupPanel });
+    const [cleanupOpen, setCleanupOpen] = useState(false);
+    const cleanup = useWorkspaceCleanup({ onComplete: () => { void update.reassessCapacity(); } });
+    return createElement("div", null,
+      createElement(CloudxUpdatePanel, { update, cleanupBusy: cleanup.busy, onOpenEnvironments: () => { cleanup.setFilter("forge"); setCleanupOpen(true); } }),
+      cleanupOpen ? createElement(WorkspaceCleanupPanel, { cleanup }) : null);
+
   }
   await act(async () => root!.render(createElement(Harness)));
   return container;
@@ -129,8 +135,8 @@ describe("Update capacity recovery", () => {
     });
     vi.stubGlobal("fetch", fetch);
     const container = await mount();
-    await click("Clean Forge environment trash");
-    await click("Preview Forge environment trash");
+    await click("Manage Forge environments");
+    await click("Scan workspaces and environments");
     expect(container.textContent).toContain("16.00 GiB");
     expect(container.textContent).toContain("1.00 GiB Docker writable-layer bytes removed · 0 B remaining");
     expect(container.textContent).toContain("Ownership needs review");

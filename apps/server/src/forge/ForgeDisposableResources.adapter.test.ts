@@ -1,3 +1,6 @@
+import { EventEmitter } from "node:events";
+import { PassThrough, Readable } from "node:stream";
+import { text } from "node:stream/consumers";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -8,6 +11,7 @@ import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDis
 import { Header } from "tar";
 
 const execute = vi.hoisted(() => vi.fn());
+const spawn = vi.hoisted(() => vi.fn());
 function evidenceTar(entries: { path: string; data: string }[]): Buffer {
   return Buffer.concat([...entries.flatMap(entry => {
     const data = Buffer.from(entry.data);
@@ -20,7 +24,7 @@ vi.mock("node:child_process", async importOriginal => {
   const original = await importOriginal<typeof import("node:child_process")>();
   const { promisify } = await import("node:util");
   const execFile = Object.assign(vi.fn(), { [promisify.custom]: execute });
-  return { ...original, execFile };
+  return { ...original, execFile, spawn };
 });
 
 describe("Docker creation rejection receipts", () => {
@@ -34,7 +38,7 @@ describe("Docker creation rejection receipts", () => {
   beforeEach(async () => {
     directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-docker-rejection-"));
     worker = { id: randomUUID(), attemptId: randomUUID(), kind: "issue", number: 173, title: "local rejection", repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" }, baseBranch: "main", templateId: "fixture", status: "running", autoPost: false, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    execute.mockReset();
+    execute.mockReset(); spawn.mockReset();
   });
   afterEach(async () => { await fs.rm(directory, { recursive: true, force: true }); });
 
@@ -94,7 +98,7 @@ describe("Docker creation rejection receipts", () => {
     let running = true;
     let removed = false;
     const created = new Date().toISOString();
-    execute.mockImplementation(async (_command: string, args: string[], options: { encoding?: string }) => {
+    execute.mockImplementation(async (_command: string, args: string[]) => {
       if (args[0] === "info") return { stdout: "same-engine\n" };
       if (args[0] === "create") {
         labels = Object.fromEntries(args.flatMap((arg, index) => arg === "--label" ? [args[index + 1]!.split("=")] : []));
@@ -105,13 +109,13 @@ describe("Docker creation rejection receipts", () => {
         return { stdout: JSON.stringify([{ Id: id, Created: created, Config: { Labels: labels }, State: { Running: running }, SizeRw: 2_048 }]) };
       }
       if (args[1] === "stop") { running = false; return { stdout: id }; }
-      if (args[1] === "cp") {
-        expect(args).toEqual(["container", "cp", `${id}:/work/evidence`, "-"]);
-        expect(options.encoding).toBe("buffer");
-        return { stdout: evidenceTar([{ path: "evidence/result.log", data: "test passed" }, { path: "evidence/node_modules/disposable", data: "dependency" }]) };
-      }
       if (args[1] === "rm") { expect(running).toBe(false); expect(args).toEqual(["container", "rm", id]); removed = true; return { stdout: id }; }
       throw new Error(`Unexpected Docker operation: ${args.join(" ")}`);
+    });
+    spawn.mockImplementation((_command: string, args: string[], options: unknown) => {
+      expect(args).toEqual(["container", "cp", `${id}:/work/evidence`, "-"]);
+      expect(options).toMatchObject({ stdio: ["ignore", "pipe", "pipe"] });
+      return dockerChild(Readable.from([evidenceTar([{ path: "evidence/result.log", data: "test passed" }, { path: "evidence/node_modules/disposable", data: "dependency" }])]));
     });
     worker.headSha = "b".repeat(40);
     const resource = await reopen().create(worker, { ...input, image: "node:22", retentionReason: "Specific test log", evidencePaths: ["/work/evidence"] });
@@ -120,7 +124,32 @@ describe("Docker creation rejection receipts", () => {
     expect((await reopen().records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 2048, evidence: { state: "verified", bytes: 11 } });
     const manifest = await reopen().readEvidence(resource.id);
     expect(manifest).toMatchObject({ owner: resource.owner, commitSha: worker.headSha, commitSource: "worker", files: [{ path: "work/evidence/result.log", bytes: 11 }] });
-    expect((await reopen().evidenceFile(resource.id, "work/evidence/result.log")).toString()).toBe("test passed");
+    expect(await text(await reopen().evidenceFile(resource.id, "work/evidence/result.log"))).toBe("test passed");
     expect(execute.mock.calls.some(([, args]) => args.includes("prune") || args.includes("--volumes") || args.includes("-v"))).toBe(false);
   });
+  it("rejects nonzero Docker export after streaming its stdout without accepting a durable archive", async () => {
+    const child = dockerChild(Readable.from([evidenceTar([{ path: "evidence/report.log", data: "partial result" }])]), 1);
+    spawn.mockReturnValue(child);
+    queueMicrotask(() => child.stderr.end("Error response from daemon: evidence copy denied"));
+    const files: string[] = [];
+    await expect(host.readEvidence("a".repeat(64), ["/work/evidence"], async (filePath, stream) => {
+      await text(Readable.from(stream)); files.push(filePath);
+    })).rejects.toThrow("evidence copy denied");
+    expect(files).toEqual(["work/evidence/report.log"]);
+  });
+
+  it("preserves Docker's missing-source diagnostic when its tar output is empty", async () => {
+    const child = dockerChild(Readable.from([]), 1);
+    spawn.mockReturnValue(child);
+    queueMicrotask(() => child.stderr.end("Could not find the file /work/evidence in container"));
+    await expect(host.readEvidence("a".repeat(64), ["/work/evidence"], async () => {})).rejects.toThrow("Could not find the file");
+  });
+
 });
+
+function dockerChild(stdout: Readable, exitCode = 0) {
+  const child = Object.assign(new EventEmitter(), { stdout, stderr: new PassThrough(), kill: vi.fn(() => { stdout.destroy(new Error("process killed")); return true; }) });
+  stdout.on("end", () => { setImmediate(() => child.emit("close", exitCode, null)); });
+  stdout.on("error", () => { setImmediate(() => child.emit("close", 1, "SIGKILL")); });
+  return child;
+}

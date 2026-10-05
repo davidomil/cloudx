@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
+import { buffer } from "node:stream/consumers";
+import type { EvidenceSink } from "./ForgeContainerEvidence.js";
+import { randomUUID, createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -74,7 +77,7 @@ describe("Completed Forge evidence lifecycle", () => {
     await fixture.workflow.reconcileResourceCleanup();
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.host.removed).toEqual([resource.containerId]);
-    expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    expect(await buffer(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
     expect(fixture.notifications.list()).toEqual([]);
   });
 
@@ -116,14 +119,14 @@ describe("Completed Forge evidence lifecycle", () => {
     expect(manifest).toMatchObject({ owner: first.owner, consumers: first.consumers, engineId: first.engineId,
       containerId: first.containerId, created: first.created, commitSha: committedHead, commitSource: "worker",
       paths: [evidencePath], bytes: evidenceBytes.length, files: [{ path: evidencePath.slice(1), bytes: evidenceBytes.length }] });
-    expect(await fixture.resources.evidenceFile(first.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    expect(await buffer(await fixture.resources.evidenceFile(first.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
     expect(await fixture.reports.read(owner.attemptId!)).toMatchObject({ title: owner.title, body: "Saved validation report" });
     expect(fixture.provider.getIssue).toHaveBeenCalledTimes(kind === "issue" ? 1 : 0);
 
     await fixture.restart();
     await fixture.workflow.reconcileResourceCleanup();
     expect((await fixture.workflow.dashboard()).workers).toEqual([]);
-    expect(await fixture.resources.evidenceFile(first.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    expect(await buffer(await fixture.resources.evidenceFile(first.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
     expect(fixture.host.exports).toHaveLength(2);
     expect(fixture.host.removed).toHaveLength(2);
   });
@@ -161,7 +164,7 @@ describe("Completed Forge evidence lifecycle", () => {
     expect(fixture.notifications.list()).toEqual([]);
     if (action === "export") {
       expect(await fixture.resources.readEvidence(resource.id)).toMatchObject({ commitSha: committedHead, commitSource: "declared" });
-      expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+      expect(await buffer(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
     } else {
       await expect(fixture.resources.readEvidence(resource.id)).rejects.toThrow("No verified durable evidence");
       expect(fixture.host.exports).toEqual([]);
@@ -176,19 +179,74 @@ describe("Completed Forge evidence lifecycle", () => {
     await fixture.workflow.poll();
 
     expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", error: expect.stringContaining(`${failure} interrupted`) });
-    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: failure === "export" ? "exporting" : "verified" } });
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: failure === "export" ? "pending" : "verified" } });
     expect(fixture.host.containers.get(resource.containerId!)?.running).toBe(false);
     expect(fixture.host.removed).toEqual([]);
-    if (failure === "remove") expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    if (failure === "remove") expect(await buffer(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
 
     fixture.host.failure = undefined;
     await fixture.restart();
     await fixture.workflow.reconcileResourceCleanup();
     expect(await fixture.store.read()).toEqual([]);
     expect((await fixture.resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: writableBytes, evidence: { state: "verified" } });
-    expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    expect(await buffer(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
     expect(fixture.host.exports).toHaveLength(failure === "export" ? 2 : 1);
     expect(fixture.host.removed).toEqual([resource.containerId]);
+  });
+
+  it.each([16 * 1024 * 1024 + 1, 23_754_142, 32 * 1024 * 1024 + 1, 34_048_143])("streams a %i-byte report through completion and keeps its verified provenance after restart", async bytes => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.reportBytes = bytes;
+    await fixture.workflow.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+    const manifest = await fixture.resources.readEvidence(resource.id);
+    expect(manifest).toMatchObject({ owner: resource.owner, consumers: resource.consumers, commitSha: committedHead, bytes,
+      files: [{ path: evidencePath.slice(1), bytes }] });
+    await fixture.restart();
+    let downloaded = 0;
+    const hash = createHash("sha256");
+    for await (const chunk of await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))) { downloaded += chunk.length; hash.update(chunk); }
+    expect(downloaded).toBe(bytes);
+    expect(hash.digest("hex")).toBe(manifest.files[0]!.sha256);
+    await fixture.workflow.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.exports).toHaveLength(1);
+  });
+
+  it("protects partial reports without recording a false export intent and retries successfully after restart", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.reportBytes = 34_048_143;
+    fixture.host.partialExport = true;
+    await fixture.workflow.poll();
+    expect((await fixture.store.read())[0]?.error).toContain("report stream interrupted");
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "pending" } });
+    expect((await fixture.resources.records())[0]?.evidence?.manifestSha256).toBeUndefined();
+    expect(fixture.host.removed).toEqual([]);
+    expect(await fs.readdir(path.join(fixture.directory, "forge-evidence"))).toEqual([]);
+    fixture.host.partialExport = false;
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(await fixture.resources.readEvidence(resource.id)).toMatchObject({ bytes: 34_048_143 });
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+  });
+
+  it("rejects an unexportable selection before its export intent is accepted", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.reportBytes = 256 * 1024 * 1024 + 1;
+    await fixture.workflow.poll();
+    expect((await fixture.store.read())[0]?.error).toContain("bounded storage limit");
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "pending" } });
+    expect((await fixture.resources.records())[0]?.evidence?.manifestSha256).toBeUndefined();
+    expect(fixture.host.removed).toEqual([]);
+    expect(await fs.readdir(path.join(fixture.directory, "forge-evidence"))).toEqual([]);
   });
 
   it("preserves a shared environment until every batch issue closes and its active tab quiesces", async () => {
@@ -219,7 +277,7 @@ describe("Completed Forge evidence lifecycle", () => {
     expect(fixture.activeTabs.size).toBe(0);
     expect(fixture.host.events.indexOf("close:batch-tab")).toBeLessThan(fixture.host.events.indexOf(`stop:${resource.containerId}`));
     expect(fixture.host.removed).toEqual([resource.containerId]);
-    expect(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1))).toEqual(evidenceBytes);
+    expect(await buffer(await fixture.resources.evidenceFile(resource.id, evidencePath.slice(1)))).toEqual(evidenceBytes);
   });
 });
 
@@ -246,6 +304,17 @@ class SavedContainerHost implements DisposableContainerHost {
   readonly exports: string[] = [];
   readonly events: string[] = [];
   failure?: "export" | "remove";
+  reportBytes?: number;
+  partialExport = false;
+  async *reportStream() {
+    let remaining = this.reportBytes!;
+    while (remaining) {
+      const chunk = Buffer.alloc(Math.min(64 * 1024, remaining), 0x61);
+      remaining -= chunk.length;
+      yield chunk;
+      if (this.partialExport) throw new Error("report stream interrupted");
+    }
+  }
   engine = "fixture-engine";
   engineId = async () => this.engine;
   create = async (): Promise<string> => { throw new Error("This fixture loads existing containers; creation is forbidden."); };
@@ -257,10 +326,11 @@ class SavedContainerHost implements DisposableContainerHost {
     if (this.failure === "remove") throw new Error("remove interrupted");
     this.containers.delete(id); this.removed.push(id);
   }
-  async readEvidence(id: string, paths: string[]) {
+  async readEvidence(id: string, paths: string[], write: EvidenceSink) {
     this.events.push(`export:${id}`); this.exports.push(id);
     if (this.failure === "export") throw new Error("export interrupted");
-    return paths.includes(evidencePath) ? [{ path: evidencePath.slice(1), data: evidenceBytes }] : [];
+    if (this.reportBytes !== undefined) await write(paths[0]!.slice(1), this.reportStream(), this.reportBytes);
+    else if (paths.includes(evidencePath)) await write(evidencePath.slice(1), Readable.from([evidenceBytes]), evidenceBytes.length);
   }
 }
 

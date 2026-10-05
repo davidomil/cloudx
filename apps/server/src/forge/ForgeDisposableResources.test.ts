@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
+import { text } from "node:stream/consumers";
+import type { EvidenceSink } from "./ForgeContainerEvidence.js";
+import { randomUUID, createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -38,10 +41,10 @@ class ContainerHost implements DisposableContainerHost {
     if (this.failure === "remove") throw new Error("Docker removal denied");
     this.containers.delete(id); this.removed.push(id);
   }
-  async readEvidence(_id: string, paths: string[]) {
+  async readEvidence(_id: string, paths: string[], write: EvidenceSink) {
     this.exportCalls++;
     if (this.evidenceFailure) throw new Error(this.evidenceFailure);
-    return [...this.evidence].filter(([file]) => paths.some(source => file === source.slice(1) || file.startsWith(`${source.slice(1)}/`))).map(([file, data]) => ({ path: file, data }));
+    for (const [file, data] of this.evidence) if (paths.some(source => file === source.slice(1) || file.startsWith(`${source.slice(1)}/`))) await write(file, Readable.from([data]), data.length);
   }
 }
 
@@ -144,7 +147,7 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     expect(saved).toMatchObject({ state: "deleted", reclaimedBytes: 1024 * 1024, evidence: { state: "verified", commitSha: "b".repeat(40), commitSource: "declared", bytes: 12 } });
     const manifest = await service().readEvidence(resource.id);
     expect(manifest).toMatchObject({ owner: resource.owner, consumers: resource.consumers, containerId: resource.containerId, paths: ["/work/evidence/test.log"], files: [{ path: "work/evidence/test.log", bytes: 12 }] });
-    expect((await service().evidenceFile(resource.id, manifest.files[0]!.path)).toString()).toBe("test passed\n");
+    expect(await text(await service().evidenceFile(resource.id, manifest.files[0]!.path))).toBe("test passed\n");
     await expect(service().evidenceFile(resource.id, "../../etc/passwd")).rejects.toThrow("Unknown evidence file");
     await service().retire(workers[0]!); expect(host.exportCalls).toBe(1);
   });
@@ -189,9 +192,29 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     host.containers.get(resource.containerId!)!.running = true; workers[0]!.status = "completed";
     await expect(resources.retire(workers[0]!)).rejects.toThrow("Export interrupted");
     expect(host.stopped).toEqual([resource.containerId]); expect(host.removed).toEqual([]);
-    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "exporting" } });
+    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "pending" } });
     host.evidenceFailure = undefined; await service().retire(workers[0]!);
     expect((await service().records())[0]).toMatchObject({ state: "deleted", evidence: { state: "verified" } });
+  });
+  it("protects the source when its durable export receipt cannot be synced and succeeds after restart", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("must survive receipt failure"));
+    const resource = await create("receipt-failure", { evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    const open = fs.open.bind(fs);
+    const syncFailures: ReturnType<typeof vi.spyOn>[] = [];
+    const intercept = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (String(args[0]).endsWith("forge-disposable-resources.json")) syncFailures.push(vi.spyOn(handle, "sync").mockRejectedValue(new Error("receipt sync denied")));
+      return handle;
+    });
+    try { await expect(resources.retire(workers[0]!)).rejects.toThrow("receipt sync denied"); }
+    finally { intercept.mockRestore(); for (const spy of syncFailures) spy.mockRestore(); }
+    expect(host.removed).toEqual([]);
+    expect(host.containers.has(resource.containerId!)).toBe(true);
+    expect(await fs.readdir(path.join(directory, "forge-evidence"))).toEqual([]);
+    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "exporting" } });
+    await service().retire(workers[0]!);
+    expect(host.removed).toEqual([resource.containerId]);
+    expect(await text(await service().evidenceFile(resource.id, "work/evidence/log"))).toBe("must survive receipt failure");
   });
   it("recovers completed archive export interrupted before the receipt write without exporting again", async () => {
     host.evidence.set("work/evidence/log", Buffer.from("durable log")); host.failure = "remove";
@@ -203,16 +226,35 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     await fs.writeFile(journalPath, JSON.stringify(journal));
     host.failure = undefined; await service().retire(workers[0]!);
     expect(host.exportCalls).toBe(1); expect(host.removed).toEqual([resource.containerId]);
-    expect((await service().evidenceFile(resource.id, "work/evidence/log")).toString()).toBe("durable log");
+    expect(await text(await service().evidenceFile(resource.id, "work/evidence/log"))).toBe("durable log");
   });
   it("verifies the saved archive again before retrying removal and preserves a corrupted archive", async () => {
     host.evidence.set("work/evidence/log", Buffer.from("valuable")); host.failure = "remove";
     const resource = await create("evidence", { retentionReason: "valuable log", evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
     await expect(resources.retire(workers[0]!)).rejects.toThrow("removal denied");
     const archivePath = path.join(directory, (await service().records())[0]!.evidence!.archivePath!);
-    const archive = JSON.parse(await fs.readFile(archivePath, "utf8")); archive.contents["work/evidence/log"] = Buffer.from("corrupted").toString("base64");
-    await fs.writeFile(archivePath, JSON.stringify(archive)); host.failure = undefined;
+    const blob = createHash("sha256").update("work/evidence/log").digest("hex") + ".data";
+    await fs.writeFile(path.join(path.dirname(archivePath), blob), "corrupted"); host.failure = undefined;
     await expect(service().retire(workers[0]!)).rejects.toThrow("verification failed"); expect(host.removed).toEqual([]);
+  });
+  it("preserves downloads from existing verified compact archives while finishing their reviewed retirement", async () => {
+    host.evidence.set("work/evidence/log", Buffer.from("existing report")); host.failure = "remove";
+    const resource = await create("existing-evidence", { evidencePaths: ["/work/evidence/log"] }); workers[0]!.status = "completed";
+    await expect(resources.retire(workers[0]!)).rejects.toThrow("removal denied");
+    const saved = (await service().records())[0]!;
+    const manifest = await service().readEvidence(resource.id);
+    const legacyPath = `forge-evidence/${resource.id}.json`;
+    await fs.writeFile(path.join(directory, legacyPath), JSON.stringify({ manifest, contents: { "work/evidence/log": Buffer.from("existing report").toString("base64") } }));
+    const journalPath = path.join(directory, "forge-disposable-resources.json");
+    const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
+    journal.resources[0].evidence.archivePath = legacyPath;
+    await fs.writeFile(journalPath, JSON.stringify(journal));
+    host.failure = undefined;
+    await service().retire(workers[0]!);
+    expect((await service().records())[0]?.evidence?.manifestSha256).toBe(saved.evidence?.manifestSha256);
+    expect(await text(await service().evidenceFile(resource.id, "work/evidence/log"))).toBe("existing report");
+    expect(host.exportCalls).toBe(1);
+    expect(host.removed).toEqual([resource.containerId]);
   });
   it("protects a shared active attempt from stop, export and hold release", async () => {
     const shared = worker(); workers.push(shared);
@@ -229,7 +271,7 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     host.readEvidence = async (...args) => { const result = await readEvidence(...args); host.containers.get(resource.containerId!)!.running = true; return result; };
     await expect(resources.retire(workers[0]!)).rejects.toThrow("became active during evidence export");
     expect(host.removed).toEqual([]);
-    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "exporting" } });
+    expect((await service().records())[0]).toMatchObject({ state: "failed", evidence: { state: "pending" } });
   });
   it("keeps successfully read evidence if the stopped container disappears before the durable archive write", async () => {
     host.evidence.set("work/evidence/log", Buffer.from("test log"));
@@ -238,7 +280,7 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     host.readEvidence = async (...args) => { const result = await readEvidence(...args); host.containers.delete(resource.containerId!); return result; };
     await resources.retire(workers[0]!);
     expect((await service().records())[0]).toMatchObject({ state: "deleted", evidence: { state: "verified" } });
-    expect((await service().evidenceFile(resource.id, "work/evidence/log")).toString()).toBe("test log");
+    expect(await text(await service().evidenceFile(resource.id, "work/evidence/log"))).toBe("test log");
   });
   it("reports unavailable evidence and converges after export failed and the environment is already absent", async () => {
     host.evidenceFailure = "Interrupted copy";
@@ -260,7 +302,7 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     host.containers.delete(resource.containerId!); host.failure = undefined;
     await service().retire(workers[0]!);
     expect((await service().records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 1024 * 1024, evidence: { state: "verified" } });
-    expect((await service().evidenceFile(resource.id, "work/evidence/log")).toString()).toBe("log");
+    expect(await text(await service().evidenceFile(resource.id, "work/evidence/log"))).toBe("log");
   });
   it("records already-absent legacy evidence truthfully without stale pending cleanup", async () => {
     const resource = await legacy("legacy", "old unknown files"); workers[0]!.status = "completed";

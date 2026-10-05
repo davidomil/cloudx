@@ -41,13 +41,15 @@ function deferred<T>() {
 }
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-async function fixture(updateBlocked = false, splitWindow = false) {
+async function fixture(updateBlocked = false, splitWindow = false, capacityRecovery = false) {
   let current = repository;
   let saving = false;
   let submitted: CloudxConfigResponse["values"] | undefined;
   const save = deferred<Response>();
   const dashboard = deferred<Response>();
   const mutations: Record<string, unknown>[] = [];
+  const capacityChecks: unknown[] = [];
+  const updateStatus = { available: true, ...(capacityRecovery ? { run: { id: "11111111-1111-4111-8111-111111111111", state: "failed", resumable: true, targetCommit: "b".repeat(40), message: "Capacity shortage", startedAt: "2026-10-05" } } : {}) };
   const config: CloudxConfigResponse = {
     globalFields: [], plugins: [{ pluginId: "forge", displayName: "Forge", fields: plugin.configFields }],
     values: { global: { microphoneEnabled: false, voiceCommandsEnabled: false, aiControlEnabled: false }, plugins: { forge: { ...repository, workerModel: "gpt-6" } } },
@@ -61,6 +63,7 @@ async function fixture(updateBlocked = false, splitWindow = false) {
       kind: "forge", workerId: "worker-149", issueNumber: 149,
       message: "Forge has an uncertain merge.", recoveryAction: "Recover the worker through Forge.",
     } });
+    if (url === "/api/system/update/capacity") { capacityChecks.push(JSON.parse(String(init?.body))); return reply(updateStatus); }
     if (url === "/api/config" && init?.method === "PATCH") { saving = true; submitted = JSON.parse(String(init.body)); return save.promise; }
     if (url === "/api/hooks/forge.dashboard") return saving ? dashboard.promise : reply(dashboardBody());
     if (url === "/api/hooks/forge.issues.list") return reply({ result: { items: [issue()] } });
@@ -70,6 +73,17 @@ async function fixture(updateBlocked = false, splitWindow = false) {
       "/api/plugins": { plugins: [plugin] },
       "/api/workspace": { tabs: [tab], activeTabId: tab.id, activeWindowId: "window", templates: [], windows: [{ id: "window", name: "Test", defaultCwd: "/unused", createdAt: "2026-09-08", updatedAt: "2026-09-08", layout: { root: splitWindow ? { type: "split", id: "split", direction: "horizontal", sizes: [50, 50], children: [{ type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, { type: "pane", pane: { id: "pane-2", tabIds: [] } }] } : { type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, activePaneId: "pane-1" } }] },
       "/api/config": config,
+      "/api/system/workspace-cleanup": null,
+      "/api/forge/resources": { resources: [] },
+      "/api/forge/checkout-evidence": { archives: [] },
+      "/api/system/update": updateStatus,
+      "/api/system/update/backups": { backups: [] },
+      "/api/system/update/backups/cleanup": null,
+      "/api/system/update/preview": {
+        runtime: { verification: "verified", commit: "a".repeat(40), builtAt: "2026-10-05", sourceDirty: false },
+        channel: "main", currentCommit: "a".repeat(40), checkedAt: "2026-10-05", state: "available", changelog: [], changelogComplete: true,
+        target: { commit: "b".repeat(40), name: "main", url: "https://github.com/davidomil/cloudx/tree/main" },
+      },
       "/api/hooks/rules-skills.catalog.list": { result: {} },
       "/api/automation/catalog": { nodes: [] },
       "/api/automation/groups": { groups: [] },
@@ -87,7 +101,7 @@ async function fixture(updateBlocked = false, splitWindow = false) {
   await act(async () => { root.render(createElement(App)); await import("./ForgePanel.js"); });
   await vi.waitFor(() => expect(container.querySelector(".forge-items"), container.textContent ?? "").not.toBeNull());
   return {
-    container, mutations,
+    container, mutations, capacityChecks,
     async completeSave(success: boolean) {
       if (success) current = { provider: submitted!.plugins.forge.provider, apiUrl: submitted!.plugins.forge.apiUrl, projectPath: submitted!.plugins.forge.projectPath } as ForgeRepository;
       await act(async () => { save.resolve(success ? reply({ ...config, values: submitted }) : reply({ message: "Settings could not be saved." }, 500)); });
@@ -113,6 +127,29 @@ async function changeSetting(container: Element, label: string, value: string) {
 }
 
 describe("Forge repository settings in App", () => {
+  it("opens canonical cleanup with Settings filters and refreshes update capacity on returning", async () => {
+    const f = await fixture(false, false, true);
+    await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Workspaces"]')!.click());
+    expect(f.container.querySelector('.settings-dialog [aria-label="Workspace cleanup"]')).toBeNull();
+    await click(f.container, "Open workspace management");
+    await vi.waitFor(() => expect(f.container.querySelector('[aria-label="Workspace cleanup"]')).not.toBeNull());
+    expect(f.container.querySelector<HTMLSelectElement>('[aria-label="Workspace filter"]')!.value).toBe("all");
+    expect(f.container.querySelectorAll(".forge-panel")).toHaveLength(1);
+    await click(f.container.querySelector(".forge-panel")!, "Issues");
+    await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
+    await click(f.container, "Manage Forge environments");
+    await vi.waitFor(() => expect(f.container.querySelector('[aria-label="Workspace cleanup"]')).not.toBeNull());
+    expect(f.container.querySelector<HTMLSelectElement>('[aria-label="Workspace filter"]')!.value).toBe("forge");
+    expect(f.capacityChecks).toHaveLength(0);
+    await click(f.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
+    await vi.waitFor(() => expect(f.capacityChecks).toEqual([{ channel: "main", targetCommit: "b".repeat(40), resumeRunId: "11111111-1111-4111-8111-111111111111" }]));
+    expect(f.container.querySelector('.settings-dialog [aria-label="Workspace cleanup"]')).toBeNull();
+    expect(f.container.querySelectorAll(".forge-panel")).toHaveLength(1);
+  });
+
   it("opens the existing Forge tab from an update blocker without creating another tab", async () => {
     const f = await fixture(true);
     await click(f.container.querySelector(".forge-panel")!, "Settings");

@@ -98,6 +98,12 @@ async function workers(
     requested = resolve;
   });
 
+  await page.route("**/api/system/workspace-cleanup", (route) =>
+    route.fulfill({ json: null }),
+  );
+  await page.route("**/api/forge/checkout-evidence", (route) =>
+    route.fulfill({ json: { archives: [] } }),
+  );
   await page.route("**/fixture-hooks/**", async (route) => {
     const hook = new URL(route.request().url()).pathname.split("/").pop();
     const body = route.request().postDataJSON();

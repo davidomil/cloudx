@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeDashboard, ForgeIssueDetail, ForgeRepository, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 import { MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import { ForgePanel } from "./ForgePanel.js";
+import type { WorkspaceCleanupController } from "./workspaceCleanupSession.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 vi.mock("./TerminalPanel.js", () => ({
@@ -18,6 +19,10 @@ vi.mock("./ForgeWorkerHistoryPanel.js", () => ({
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
+const cleanup: WorkspaceCleanupController = {
+  preview: undefined, job: null, selected: [], discard: [], emptyTrash: false, confirming: false, filter: "all", error: "", running: false, scanning: false, operationBusy: false, busy: false,
+  scan: async () => {}, remove: async () => {}, perform: async work => { await work(); }, setConfirming: () => {}, setFilter: () => {}, select: () => {}, discardSource: () => {}, setEmptyTrash: () => {},
+};
 const roots: Root[] = [];
 const dialogMethods = ["showModal", "close"] as const;
 const nativeDialogMethods = dialogMethods.map(method => Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method));
@@ -116,7 +121,7 @@ async function renderPanel(testFixture: ReturnType<typeof fixture>, extra: Parti
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false, ...extra })); });
+  await act(async () => { root.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false, ...extra })); });
   return container;
 }
 
@@ -776,7 +781,7 @@ describe("ForgePanel", () => {
     const extra = { repositorySettingsKey: "repository-a:0", repositoryChangePending: false, workerTabs: [workerTab] };
     const panel = await renderPanel(testFixture, extra);
     const root = roots.at(-1)!;
-    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", active: true, uiScale: 100, ...extra })); }); };
+    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", active: true, uiScale: 100, ...extra })); }); };
     await click(panel, "View worker");
     const overlay = panel.querySelector("dialog");
     extra.repositorySettingsKey = "repository-a:1";
@@ -807,7 +812,7 @@ describe("ForgePanel", () => {
     const extra = { repositorySettingsKey: "repository-a:0", repositoryChangePending: false };
     const panel = await renderPanel(testFixture, extra);
     const root = roots.at(-1)!;
-    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); }); };
+    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); }); };
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
     extra.repositorySettingsKey = "repository-b:1";
     await render();
@@ -847,7 +852,7 @@ describe("ForgePanel", () => {
     const extra = { repositorySettingsKey: "repository-a:0", repositoryChangePending: false };
     const panel = await renderPanel(testFixture, extra);
     const root = roots.at(-1)!;
-    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); }); };
+    const render = async () => { await act(async () => { root.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [], active: true, uiScale: 100, ...extra })); }); };
     await click(panel, "Start work");
     const nextRepository = { ...repository, projectPath: "another/repository" };
     testFixture.dashboard.repository = nextRepository;
@@ -2354,7 +2359,7 @@ describe("ForgePanel", () => {
     document.body.append(panel);
     const root = createRoot(panel);
     roots.push(root);
-    await act(async () => root.render(createElement(StrictMode, {}, createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false }))));
+    await act(async () => root.render(createElement(StrictMode, {}, createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false }))));
     await click(panel, "View worker");
     expect(panel.querySelector("dialog")?.open).toBe(true);
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
@@ -2423,7 +2428,7 @@ describe("ForgePanel", () => {
     await click(panel, "View worker");
     testFixture.dashboard.workers = [worker];
     await click(panel, "Refresh Forge");
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     await act(async () => pending.resolve({ history: { tabId: "old-terminal", capturedAt: "2026-09-21T12:00:00.000Z", screen: { data: "Old run output", cols: 100, rows: 30 } } }));
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
     expect(panel.querySelector('[aria-label="Saved worker terminal output"]')).toBeNull();
@@ -2443,10 +2448,10 @@ describe("ForgePanel", () => {
     await click(panel, "View worker");
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
     expect(panel.querySelector("dialog")).toBeNull();
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     expect(panel.querySelector('[data-terminal-tab="codex-worker"]')?.getAttribute("data-active")).toBe("true");
     expect(button(panel, "Resume")).toBeDefined();
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: false, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab], active: false, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     expect(panel.querySelector("dialog")).toBeNull();
     expect(panel.querySelector("[data-terminal-tab]")).toBeNull();
   });
@@ -2513,7 +2518,7 @@ describe("ForgePanel", () => {
     expect(panel.querySelector("dialog")).toBeNull();
     await click(panel.querySelector('[role="tabpanel"]:not([hidden])')!, "View worker");
     expect(panel.querySelector("dialog")?.textContent).toContain("The worker terminal is unavailable.");
-    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
+    await act(async () => roots.at(-1)!.render(createElement(ForgePanel, { cleanup, callHook: testFixture.callHook, tab, windowId: "window-1", paneId: "pane-2", workerTabs: [workerTab, { ...secondTab, id: "resumed-terminal" }], active: true, uiScale: 100, repositorySettingsKey: "repository:0", repositoryChangePending: false })));
     expect(panel.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Issue #8");
     expect(panel.querySelector('[data-terminal-tab="resumed-terminal"]')).not.toBeNull();
     expect(panel.querySelector('[data-terminal-tab="second-terminal"]')).toBeNull();

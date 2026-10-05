@@ -72,6 +72,7 @@ import {
 import { shouldSubmitVoiceConsoleKey } from "./keyboard.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 import { useCloudxUpdate } from "./CloudxUpdatePanel.js";
+import { useWorkspaceCleanup, type WorkspaceCleanupFilter } from "./workspaceCleanupSession.js";
 import { clearFocusedAttention, isTabFocused, updateAttentionTabs } from "./tabAttention.js";
 import { applyTerminalColorTheme, applyTerminalUiScale, disposeTerminalView, disposeTerminalViewsExcept } from "./terminalViewStore.js";
 import { applyCloudxTheme, readTerminalColorTheme } from "./theme.js";
@@ -257,6 +258,15 @@ export function App() {
   const workspaceWrites = workspaceWritesRef.current;
   const saveWorkspace = useCallback(() => workspaceWrites.flushDurably(persistWorkspace), [workspaceWrites]);
   const cloudxUpdate = useCloudxUpdate(settingsOpen, saveWorkspace);
+  const cleanup = useWorkspaceCleanup({ blocked: cloudxUpdate.starting || cloudxUpdate.status?.run?.state === "running", onComplete: () => { void cloudxUpdate.reassessCapacity(); } });
+  const [environmentsRequest, setEnvironmentsRequest] = useState<{ id: number; tabId?: string }>({ id: 0 });
+  const [capacityRefreshPending, setCapacityRefreshPending] = useState(false);
+  useEffect(() => {
+    if (capacityRefreshPending && settingsOpen && settingsCategory === "updates" && !cleanup.busy) {
+      setCapacityRefreshPending(false);
+      void cloudxUpdate.reassessCapacity();
+    }
+  }, [capacityRefreshPending, settingsOpen, settingsCategory, cleanup.busy, cloudxUpdate.reassessCapacity]);
   const audioSessionRef = useRef<VoiceAudioStreamSession | undefined>(undefined);
   const notificationToastTimersRef = useRef<Map<string, number>>(new Map());
   const topbarMicControlRef = useRef<HTMLDivElement | null>(null);
@@ -765,6 +775,14 @@ export function App() {
       createTargetPaneIdRef.current = undefined;
     }
     setCreateTargetPaneId((current) => (current === paneId ? undefined : current));
+  }
+
+  async function openEnvironments(filter: WorkspaceCleanupFilter) {
+    cleanup.setFilter(filter);
+    if (settingsCategory === "updates") setCapacityRefreshPending(true);
+    await openForge();
+    const target = tabsRef.current.find(tab => tab.id === activeTabIdRef.current && tab.pluginId === "forge");
+    if (target) setEnvironmentsRequest(value => ({ id: value.id + 1, tabId: target.id }));
   }
 
   async function openForge() {
@@ -1280,7 +1298,7 @@ export function App() {
       const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
       if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
       return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
-        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} />
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} cleanup={cleanup} environmentsRequest={environmentsRequest.tabId === context.tab.id ? environmentsRequest.id : undefined} onOpenSettings={() => setSettingsOpen(true)} />
       </Suspense>;
     },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
@@ -1485,9 +1503,12 @@ export function App() {
         <SettingsDialog
           config={config}
           initialCategoryId={settingsCategory}
+          onCategoryChange={setSettingsCategory}
           callHook={pluginById.has("codex-settings") ? callUiHook : undefined}
           cloudxUpdate={cloudxUpdate}
           onOpenForge={() => void openForge()}
+          onOpenEnvironments={filter => void openEnvironments(filter)}
+          cleanupBusy={cleanup.busy}
           rulesSkillsStore={rulesSkillsStore}
           onCancel={() => { setSettingsOpen(false); setSettingsCategory("general"); }}
           onSave={handleSaveConfig}

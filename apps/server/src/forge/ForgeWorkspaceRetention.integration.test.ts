@@ -13,6 +13,9 @@ import { ForgeRuntime, type ForgeRuntimeDependencies, type ForgeWorkspace } from
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { ForgeCheckoutEvidence } from "./ForgeCheckoutEvidence.js";
+import { createHash } from "node:crypto";
+import type { ForgeIssueCompletionReport } from "@cloudx/shared";
 
 const execute = promisify(execFile);
 const repository: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "cloudx/test" };
@@ -24,6 +27,122 @@ afterEach(async () => {
 });
 
 describe("Forge workflow retention after completed workspace discard", () => {
+  it.each([16 * 1024 * 1024 + 1, 32 * 1024 * 1024 + 1, 34_048_143])("hands off a named %i-byte checkout report before retiring the worker, and serves it after restart", async bytes => {
+    const fixture = await RetentionFixture.create();
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    const reportPath = ".cloudx/validation/coverage.json";
+    await fixture.nameEvidence(reportPath, bytes);
+    await fixture.service.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const archive = new ForgeCheckoutEvidence(fixture.dataDir);
+    const [manifest] = await archive.list();
+    expect(manifest).toMatchObject({ workerId: fixture.worker.id, attemptId: fixture.worker.attemptId,
+      commitSha: fixture.worker.headSha, bytes, paths: [reportPath], files: [{ path: reportPath, bytes }] });
+    const hash = createHash("sha256");
+    let read = 0;
+    for await (const chunk of await archive.fileStream(manifest!.archiveId, reportPath)) { hash.update(chunk); read += chunk.length; }
+    expect(read).toBe(bytes);
+    expect(hash.digest("hex")).toBe(manifest!.files[0]!.sha256);
+    await fixture.restart();
+    await fixture.service.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(await new ForgeCheckoutEvidence(fixture.dataDir).read(manifest!.archiveId)).toEqual(manifest);
+    expect(await fixture.service.workerHistory(fixture.worker.id)).toEqual(fixture.history);
+  });
+
+  it("hands off verified last-run metadata without deleting unnamed reproduction/source files", async () => {
+    const fixture = await RetentionFixture.create();
+    await fs.appendFile(path.join(fixture.workspace.worktreePath, ".git/info/exclude"), "\ntest-results/\n");
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, "test-results/dist"), { recursive: true });
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "test-results/.last-run.json"), JSON.stringify({ status: "passed", failedTests: [] }));
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "test-results/reproduction.ts"), "Preserve handwritten source");
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "test-results/dist/generated.bin"), "Reproducible build");
+    await fixture.service.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: { retainedPaths: ["research.txt", "test-results"] } });
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, "test-results/reproduction.ts"), "utf8")).toBe("Preserve handwritten source");
+    await expect(fs.lstat(path.join(fixture.workspace.worktreePath, "test-results/dist"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await new ForgeCheckoutEvidence(fixture.dataDir).list())[0]?.files.map(file => file.path)).toEqual(["test-results/.last-run.json"]);
+  });
+
+  it("retires a named report directory after handoff while excluding its generated siblings", async () => {
+    const fixture = await RetentionFixture.create();
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    await fixture.nameEvidence(".cloudx/validation/run.log", 20);
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, ".cloudx/validation/node_modules"));
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, ".cloudx/validation/node_modules/generated.bin"), "Reproducible dependency");
+    const report = fixture.worker.completion!.report!;
+    if (report.kind !== "issue") throw new Error("Expected issue report");
+    report.handoff!.retainedEvidencePaths = [".cloudx/validation"];
+    await fixture.store.write([fixture.worker]);
+    await fixture.restart();
+    await fixture.service.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const [manifest] = await new ForgeCheckoutEvidence(fixture.dataDir).list();
+    expect(manifest?.files.map(file => file.path)).toEqual([".cloudx/validation/run.log"]);
+  });
+
+  it("preserves a completed checkout when its durable receipt fails, then retires it after explicit retry", async () => {
+    const fixture = await RetentionFixture.create();
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    await fixture.nameEvidence(".cloudx/validation/run.log", 20);
+    const originalOpen = fs.open.bind(fs);
+    const failures: ReturnType<typeof vi.spyOn>[] = [];
+    const intercept = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const handle = await originalOpen(...args);
+      if (String(args[0]).includes("/forge-workers/workspaces/") && String(args[0]).endsWith(".evidence.tmp"))
+        failures.push(vi.spyOn(handle, "sync").mockRejectedValue(new Error("Checkout receipt device sync failed")));
+      return handle;
+    });
+    try { await fixture.service.poll(); }
+    finally { intercept.mockRestore(); for (const failure of failures) failure.mockRestore(); }
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: "Checkout receipt device sync failed" });
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, ".cloudx/validation/run.log"), "utf8")).toBe("v".repeat(20));
+    expect(await new ForgeCheckoutEvidence(fixture.dataDir).list()).toEqual([]);
+    await fixture.restart();
+    await fixture.service.resume(fixture.worker.id, { windowId: "main", paneId: "pane-1" });
+    expect(await fixture.store.read()).toEqual([]);
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await new ForgeCheckoutEvidence(fixture.dataDir).list())[0]).toMatchObject({ bytes: 20, commitSha: fixture.worker.headSha });
+  });
+
+  it("retires a restored checkout containing only verified Playwright last-run metadata", async () => {
+    const fixture = await RetentionFixture.create();
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    await fs.appendFile(path.join(fixture.workspace.worktreePath, ".git/info/exclude"), "\ntest-results/\n");
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, "test-results"));
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "test-results/.last-run.json"), JSON.stringify({ status: "failed", failedTests: ["test-id"] }));
+    await fixture.restart();
+    await fixture.service.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await new ForgeCheckoutEvidence(fixture.dataDir).list())[0]).toMatchObject({ paths: ["test-results/.last-run.json"] });
+  });
+
+  it("preserves tracked last-run metadata even when it has the recognized report shape", async () => {
+    const fixture = await RetentionFixture.create("issue", true);
+    await fs.appendFile(path.join(fixture.workspace.worktreePath, ".git/info/exclude"), "\ntest-results/\n");
+    await fixture.service.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: { retainedPaths: ["research.txt"] } });
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, "test-results/.last-run.json"), "utf8")).toBe('{"status":"passed","failedTests":[]}');
+    expect(await new ForgeCheckoutEvidence(fixture.dataDir).list()).toEqual([]);
+    expect(await git(fixture.workspace.worktreePath, ["status", "--porcelain=v1", "--", "test-results/.last-run.json"])).toBe("");
+  });
+
+  it("keeps unknown last-run contents and unpublished Git refs protected", async () => {
+    const fixture = await RetentionFixture.create();
+    await fixture.nameEvidence(".cloudx/validation/run.log", 20);
+    await fs.appendFile(path.join(fixture.workspace.worktreePath, ".git/info/exclude"), "\ntest-results/\n");
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, "test-results"));
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "test-results/.last-run.json"), '{"source":"Unpublished investigation"}');
+    await git(fixture.workspace.worktreePath, ["branch", "unpublished-ref"]);
+    await git(fixture.workspace.worktreePath, ["update-ref", "refs/stash", fixture.worker.headSha!]);
+    await fixture.service.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: { retainedPaths: [".git", "research.txt", "test-results"], reason: expect.stringContaining("Unpublished Git history") } });
+    expect(await git(fixture.workspace.worktreePath, ["rev-parse", "refs/stash"])).toBe(fixture.worker.headSha);
+    expect((await new ForgeCheckoutEvidence(fixture.dataDir).list())[0]?.paths).toEqual([".cloudx/validation/run.log"]);
+  });
   it.each(["issue", "review"] as const)("retires a stale retained %s after runtime discard completed before the workflow save", async kind => {
     const fixture = await RetentionFixture.create(kind);
     await fixture.discardWithoutWorkflowSave();
@@ -148,7 +267,7 @@ class RetentionFixture {
     this.service = new ForgeWorkflowService(this.workflowDependencies);
   }
 
-  static async create(kind: ForgeWorker["kind"] = "issue"): Promise<RetentionFixture> {
+  static async create(kind: ForgeWorker["kind"] = "issue", trackedLastRun = false): Promise<RetentionFixture> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-forge-retention-"));
     const source = path.join(root, "source");
     const origin = path.join(root, "origin.git");
@@ -159,6 +278,11 @@ class RetentionFixture {
     await git(source, ["config", "user.email", "forge-test@example.invalid"]);
     await fs.writeFile(path.join(source, "README.md"), "Initial content\n");
     await git(source, ["add", "README.md"]);
+    if (trackedLastRun) {
+      await fs.mkdir(path.join(source, "test-results"));
+      await fs.writeFile(path.join(source, "test-results/.last-run.json"), '{"status":"passed","failedTests":[]}');
+      await git(source, ["add", "test-results/.last-run.json"]);
+    }
     await git(source, ["commit", "-m", "TEST: initial commit"]);
     await git(source, ["remote", "add", "origin", origin]);
     await git(source, ["push", "origin", "main"]);
@@ -179,6 +303,7 @@ class RetentionFixture {
     const review = kind === "review";
     const workspace = { id, ...await runtime.prepareWorkspace({ id, expectedRepository: repository, baseBranch: "main", review,
       ...(review ? { headSha, baseSha: headSha } : {}) }) };
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
     await fs.writeFile(path.join(workspace.worktreePath, "research.txt"), "Useful investigation\n");
     const retainedWorkspace = await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
     expect(retainedWorkspace).toMatchObject({ retainedPaths: ["research.txt"] });
@@ -208,6 +333,21 @@ class RetentionFixture {
 
   receipt(): Promise<Record<string, unknown>> {
     return fs.readFile(this.manifestPath, "utf8").then(content => JSON.parse(content));
+  }
+
+  async nameEvidence(relative: string, bytes: number): Promise<void> {
+    await fs.appendFile(path.join(this.workspace.worktreePath, ".git/info/exclude"), "\n.cloudx/\n");
+    await fs.mkdir(path.dirname(path.join(this.workspace.worktreePath, relative)), { recursive: true });
+    const file = await fs.open(path.join(this.workspace.worktreePath, relative), "w");
+    try {
+      const chunk = Buffer.alloc(Math.min(64 * 1024, bytes), "v");
+      for (let remaining = bytes; remaining > 0; remaining -= Math.min(remaining, chunk.length)) await file.write(chunk.subarray(0, Math.min(remaining, chunk.length)));
+    } finally { await file.close(); }
+    const report: ForgeIssueCompletionReport = { ...this.report, kind: "issue", discussionReplies: [], resolvedDiscussionIds: [],
+      handoff: { headSha: this.worker.headSha!, status: "ready", retainedPaths: [], retainedEvidencePaths: [relative], details: "Preserve this specific validation report." } };
+    this.worker.completion = { attemptId: this.worker.attemptId!, deadlineAt: new Date().toISOString(), report };
+    await this.store.write([this.worker]);
+    await this.restart();
   }
 
   async restart(): Promise<void> {

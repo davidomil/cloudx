@@ -4,8 +4,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DisposableResource } from "@cloudx/shared";
 import { ForgeResourcesPanel } from "./ForgeResourcesPanel.js";
+import { useWorkspaceCleanup } from "./workspaceCleanupSession.js";
+import { getWorkspaceCleanup } from "../workspaceCleanupApi.js";
 import { getForgeResources, decideForgeEvidence } from "../forgeResourcesApi.js";
 
+vi.mock("../workspaceCleanupApi.js", () => ({ getWorkspaceCleanup: vi.fn(), previewWorkspaceCleanup: vi.fn(), startWorkspaceCleanup: vi.fn() }));
+vi.mock("./ForgeCheckoutEvidencePanel.js", () => ({ ForgeCheckoutEvidencePanel: () => null }));
 vi.mock("../forgeResourcesApi.js", () => ({
   getForgeResources: vi.fn(), decideForgeEvidence: vi.fn(),
   forgeEvidenceFileUrl: (id: string, path: string) => `/api/forge/resources/${id}/evidence-file?${new URLSearchParams({ path })}`,
@@ -16,7 +20,8 @@ let root: Root;
 let container: HTMLDivElement;
 async function render() {
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
-  await act(async () => { root.render(createElement(ForgeResourcesPanel)); });
+  function Harness() { return createElement(ForgeResourcesPanel, { cleanup: useWorkspaceCleanup() }); }
+  await act(async () => { root.render(createElement(Harness)); });
   return container;
 }
 function button(label: string) { return [...container.querySelectorAll("button")].find(item => item.textContent === label)!; }
@@ -28,7 +33,7 @@ async function paths(value: string) {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
-beforeEach(() => { vi.mocked(getForgeResources).mockResolvedValue([structuredClone(held)]); vi.mocked(decideForgeEvidence).mockResolvedValue(held); });
+beforeEach(() => { vi.mocked(getWorkspaceCleanup).mockResolvedValue(null); vi.mocked(getForgeResources).mockResolvedValue([structuredClone(held)]); vi.mocked(decideForgeEvidence).mockResolvedValue(held); });
 afterEach(async () => { if (root) await act(async () => root.unmount()); document.body.replaceChildren(); vi.resetAllMocks(); });
 
 describe("Forge evidence decisions", () => {
