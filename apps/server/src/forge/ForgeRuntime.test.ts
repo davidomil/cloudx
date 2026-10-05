@@ -1559,15 +1559,40 @@ describe("ForgeRuntime publication handoff", () => {
     expect(await fs.readFile(path.join(workspace.worktreePath, ".cache/evidence.log"))).toEqual(Buffer.from([0, 255]));
   });
 
-  it("retains a deliberately declared ignored directory with a visible reason", async () => {
+  it("requires a specific evidence file instead of a generated tree, and retains it until authoritative retirement", async () => {
     const workspace = await prepare();
     await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
     await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\ndist/\n");
     await fs.mkdir(path.join(workspace.worktreePath, "dist"));
     await fs.writeFile(path.join(workspace.worktreePath, "dist/research.bin"), Buffer.from([0, 255]));
-    await runtime.preparePublication(workspace, "directory-evidence", { ...ready(headSha, []), retainedEvidencePaths: ["dist"] });
-    expect(await runtime.cleanup({ ...workspace, issueClosed: true, expectedHeadSha: headSha })).toMatchObject({ retainedPaths: ["dist"], reason: expect.stringContaining('"dist"') });
+    await expect(runtime.preparePublication(workspace, "directory-evidence", { ...ready(headSha, []), retainedEvidencePaths: ["dist"] })).rejects.toThrow("specific evidence files");
+    await runtime.preparePublication(workspace, "directory-evidence", { ...ready(headSha, []), retainedEvidencePaths: ["dist/research.bin"] });
+    expect(await runtime.cleanup({ ...workspace, issueClosed: true, expectedHeadSha: headSha })).toMatchObject({ retainedPaths: ["dist/research.bin"], reason: expect.stringContaining('"dist/research.bin"') });
     expect(await fs.readFile(path.join(workspace.worktreePath, "dist/research.bin"))).toEqual(Buffer.from([0, 255]));
+  });
+
+  it("rejects a report above the storage bound through the production publication handoff", async () => {
+    const workspace = await prepare();
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\nreports/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, "reports"));
+    const file = await fs.open(path.join(workspace.worktreePath, "reports/coverage.json"), "w");
+    await file.truncate(256 * 1024 * 1024 + 1); await file.close();
+    await expect(runtime.preparePublication(workspace, "oversized-evidence", { ...ready(headSha, []), retainedEvidencePaths: ["reports"] })).rejects.toThrow(/256 MiB/);
+    expect((await fs.stat(path.join(workspace.worktreePath, "reports/coverage.json"))).size).toBe(256 * 1024 * 1024 + 1);
+    await expect(git(origin, "rev-parse", workspace.branch)).rejects.toThrow();
+  });
+
+  it("preserves named reports changed after the validated handoff during authoritative retirement", async () => {
+    const workspace = await prepare();
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\nreports/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, "reports"));
+    await fs.writeFile(path.join(workspace.worktreePath, "reports/run.log"), "Validated evidence");
+    await runtime.preparePublication(workspace, "named-evidence", { ...ready(headSha, []), retainedEvidencePaths: ["reports/run.log"] });
+    await fs.writeFile(path.join(workspace.worktreePath, "reports/run.log"), "Later unpublished investigation");
+    await expect(runtime.cleanup({ ...workspace, expectedHeadSha: headSha, retireEvidence: { attemptId: "named-evidence", commitSha: headSha, paths: [] } })).rejects.toThrow(/changed after the validated/);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "reports/run.log"), "utf8")).toBe("Later unpublished investigation");
   });
 
   it.each(["bytes", "removed", "no longer ignored", "new file in evidence directory"] as const)("protects declared ignored evidence from a %s change before publication after restart", async changed => {

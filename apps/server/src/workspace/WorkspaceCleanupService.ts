@@ -15,6 +15,7 @@ import type { PathPolicy } from "../pathPolicy.js";
 import type { ForgeWorkflowService } from "../forge/ForgeWorkflowService.js";
 import type { ForgeDisposableResources } from "../forge/ForgeDisposableResources.js";
 import { isGeneratedForgePath } from "../forge/ForgeGeneratedArtifacts.js";
+import { WorkspaceProcessActivity } from "./WorkspaceProcessActivity.js";
 
 const execute = promisify(execFile);
 interface CleanupSource {
@@ -62,6 +63,7 @@ interface Dependencies {
   protectedDirectories: string[];
   trashDirectory?: string;
   processDirectories?: () => Promise<string[]>;
+  processActivity?: Pick<WorkspaceProcessActivity, "assertInactive">;
 }
 
 /** A preview grants no deletion authority: every item is inspected again inside its lifecycle owner. */
@@ -73,8 +75,10 @@ export class WorkspaceCleanupService {
   private readonly journal: JsonStateFile;
   private readonly deletions: JsonStateFile;
   private readonly worktrees: WorktreeService;
+  private readonly processActivity: Pick<WorkspaceProcessActivity, "assertInactive">;
   constructor(private readonly deps: Dependencies) {
     this.worktrees = new WorktreeService(deps.pathPolicy);
+    this.processActivity = deps.processActivity ?? new WorkspaceProcessActivity();
     this.journal = new JsonStateFile(deps.dataDir, "workspace-cleanup.json", "Workspace cleanup", 0o600);
     this.deletions = new JsonStateFile(deps.dataDir, "workspace-cleanup-deletions.json", "Workspace deletion receipts", 0o600);
   }
@@ -452,8 +456,9 @@ export class WorkspaceCleanupService {
         throw new Error("The live installation or required CloudX recovery data is protected.");
     }
     if (this.deps.openDirectories().some(open => isSameOrChildPath(resolved, path.resolve(open)))) throw new Error("An open session still uses this workspace.");
-    const active = await (this.deps.processDirectories ?? processDirectories)();
-    if (active.some(open => isSameOrChildPath(resolved, path.resolve(open)))) throw new Error("A running process still uses this workspace.");
+    if (this.deps.processDirectories) {
+      if ((await this.deps.processDirectories()).some(open => isSameOrChildPath(resolved, path.resolve(open)))) throw new Error("A running process still uses this workspace.");
+    } else await this.processActivity.assertInactive(resolved);
   }
   private async availableSpace(): Promise<number> {
     const stat = await fs.statfs(this.deps.dataDir);
@@ -539,23 +544,6 @@ function allocationGroups(items: Snapshot[]): WorkspaceCleanupPreview["reclaimGr
 }
 function reclaimableBytes(items: Snapshot[]): number {
   return allocationGroups(items).reduce((total, group) => total + group.bytes, 0);
-}
-
-async function processDirectories(): Promise<string[]> {
-  if (process.platform !== "linux") throw new Error("Process activity inspection requires Linux; workspaces were preserved.");
-  const directories: string[] = [];
-  for (const pid of await fs.readdir("/proc")) {
-    if (!/^\d+$/u.test(pid)) continue;
-    try {
-      if ((await fs.stat(`/proc/${pid}`)).uid !== process.getuid!()) continue;
-      directories.push(await fs.readlink(`/proc/${pid}/cwd`));
-      for (const fd of await fs.readdir(`/proc/${pid}/fd`)) {
-        try { const file = await fs.readlink(`/proc/${pid}/fd/${fd}`); if (file.startsWith("/")) directories.push(file); }
-        catch (error) { if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
-      }
-    } catch (error) { if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw new Error(`Cannot establish process inactivity: ${message(error)}`); }
-  }
-  return directories;
 }
 
 async function removeOwnedTree(identity: DirectoryIdentity): Promise<void> {

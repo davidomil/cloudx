@@ -1,3 +1,5 @@
+import { Readable } from "node:stream";
+import { text } from "node:stream/consumers";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -31,7 +33,7 @@ describe("Forge evidence review routes", () => {
       inspect: async () => structuredClone(container),
       stop: async () => { container!.running = false; },
       remove: async () => { container = undefined; },
-      readEvidence: async () => [{ path: "work/evidence/test.log", data: Buffer.from("regression passes\n") }],
+      readEvidence: async (_id, _paths, write) => { const data = Buffer.from("regression passes\n"); await write("work/evidence/test.log", Readable.from([data]), data.length); },
     };
     resources = new ForgeDisposableResources(root, async () => [worker], host);
     guard = vi.fn(async (_ids: string[], operation: () => Promise<unknown>) => operation());
@@ -68,7 +70,7 @@ describe("Forge evidence review routes", () => {
     expect(file.headers["content-type"]).toBe("application/octet-stream");
     expect(file.headers["x-content-type-options"]).toBe("nosniff");
     const restarted = new ForgeDisposableResources(root, async () => []);
-    expect((await restarted.evidenceFile(resource.id, "work/evidence/test.log")).toString()).toBe(file.body);
+    expect(await text(await restarted.evidenceFile(resource.id, "work/evidence/test.log"))).toBe(file.body);
     expect(container).toBeUndefined();
   });
   it("keeps an explicit stopped hold and requires confirmation to discard", async () => {
@@ -103,8 +105,18 @@ describe("Forge evidence review routes", () => {
     await decision(resource.id, { action: "export", evidencePaths: ["/work/evidence/test.log"] });
     expect((await app.inject(`/api/forge/resources/${resource.id}/evidence-file`)).statusCode).toBe(400);
     expect((await app.inject(`/api/forge/resources/${resource.id}/evidence-file?path=..%2F..%2Fsecret`)).statusCode).toBe(409);
-    await fs.writeFile(path.join(root, "forge-evidence", `${resource.id}.json`), "damaged");
+    await fs.writeFile(path.join(root, "forge-evidence", resource.id, "manifest.json"), "damaged");
     expect((await app.inject(`/api/forge/resources/${resource.id}/evidence`)).statusCode).toBe(409);
     expect((await decision(randomUUID(), { action: "keep" })).statusCode).toBe(404);
+  });
+  it("rejects an unexportable reviewed selection without accepting an export receipt", async () => {
+    const resource = await held();
+    const response = await decision(resource.id, { action: "export", evidencePaths: ["/work/missing.log"] });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toContain("outside its declared selection");
+    expect((await resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "pending", paths: ["/work/missing.log"] } });
+    expect((await resources.records())[0]?.evidence?.manifestSha256).toBeUndefined();
+    expect(container?.running).toBe(false);
+    expect(reconcile).not.toHaveBeenCalled();
   });
 });

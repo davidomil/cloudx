@@ -3682,6 +3682,12 @@ a:hover svg {
   background: var(--color-card);
 }
 
+.forge-environments { flex: 1; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; overflow-wrap: anywhere; }
+.forge-environments :is(button, input, textarea, select, a, summary) { scroll-margin-block: 12px; }
+.forge-header, .forge-tabs { flex-shrink: 0; }
+.forge-environments .workspace-cleanup label { flex-direction: row; }
+.forge-environments .workspace-cleanup > label:has(select) { flex-direction: column; }
+
 .forge-header, .forge-actions, .forge-tabs, .forge-detail-heading, .forge-worker-heading, .forge-pagination {
   display: flex;
   align-items: center;

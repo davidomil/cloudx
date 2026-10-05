@@ -11,6 +11,7 @@ import type { ForgeWorker, WorkspaceCleanupPreview, WorkspaceCleanupRequest } fr
 import { PathPolicy } from "../pathPolicy.js";
 import { WorktreeService } from "../git/WorktreeService.js";
 import { WorkspaceCleanupService } from "./WorkspaceCleanupService.js";
+import { WorkspaceProcessActivity } from "./WorkspaceProcessActivity.js";
 import { registerWorkspaceCleanupRoutes } from "./WorkspaceCleanupRoutes.js";
 
 const execute = promisify(execFile);
@@ -26,6 +27,31 @@ async function git(cwd: string, ...args: string[]) {
 }
 function service() {
   return new WorkspaceCleanupService({ dataDir, pathPolicy: new PathPolicy([root]), forge, openDirectories: () => open, withInactiveDirectory: async (_directory, operation) => operation(), processDirectories: async () => active, protectedDirectories: [path.join(root, "live")], trashDirectory: path.join(root, "Trash") });
+}
+function observedService(processActivity?: WorkspaceProcessActivity) {
+  return new WorkspaceCleanupService({ dataDir, pathPolicy: new PathPolicy([root]), forge, openDirectories: () => open, withInactiveDirectory: async (_directory, operation) => operation(), processActivity, protectedDirectories: [], trashDirectory: path.join(root, "trash") });
+}
+async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; state?: string; threads?: number | null; cwd?: string; files?: string[]; group?: string; managerPid?: string } = {}) {
+  const procDirectory = path.join(root, "proc");
+  const pid = options.pid ?? "273";
+  const directory = path.join(procDirectory, pid);
+  await fs.mkdir(path.join(directory, "fd"), { recursive: true });
+  await fs.writeFile(path.join(directory, "stat"), `${pid} (${options.name ?? "systemd"}) ${options.state ?? "S"} ${options.parent ?? "1"} ${Array(17).fill("0").join(" ")} 1234\n`);
+  const uid = options.uid ?? 1000;
+  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\n${options.threads === null ? "" : `Threads:\t${options.threads ?? 1}\n`}`);
+  await fs.writeFile(path.join(directory, "cgroup"), options.group ?? "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n");
+  await fs.symlink(options.cwd ?? root, path.join(directory, "cwd"));
+  for (const [fd, file] of (options.files ?? []).entries()) await fs.symlink(file, path.join(directory, "fd", String(fd)));
+  const systemUserManager = vi.fn(async () => ({ pid: options.managerPid ?? pid, controlGroup: "/user.slice/user-1000.slice/user@1000.service", workingDirectory: "", rootDirectory: "", rootImage: "" }));
+  const observed = observedService(new WorkspaceProcessActivity({ procDirectory, uid: 1000, systemUserManager }));
+  return { observed, directory, systemUserManager };
+}
+function denyProcessAccess(file: string, code = "EACCES") {
+  const readlink = fs.readlink;
+  return vi.spyOn(fs, "readlink").mockImplementation((...args: Parameters<typeof fs.readlink>) => {
+    if (String(args[0]) === file) return Promise.reject(Object.assign(new Error(`${code}: permission denied, readlink '${file}'`), { code }));
+    return readlink(...args);
+  });
 }
 async function checkout(name: string, status: ForgeWorker["status"] = "completed") {
   const directory = path.join(dataDir, "forge-workers", "checkouts", name);
@@ -339,15 +365,296 @@ describe("reviewed workspace cleanup", () => {
     const directory = await checkout("external-process");
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: directory, stdio: "ignore" });
     await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
-    const observed = new WorkspaceCleanupService({ dataDir, pathPolicy: new PathPolicy([root]), forge, openDirectories: () => [], withInactiveDirectory: async (_directory, operation) => operation(), protectedDirectories: [], trashDirectory: path.join(root, "trash") });
+    const observed = observedService();
     try {
       const candidate = (await observed.preview()).candidates.find(item => item.path === directory)!;
       expect(candidate.eligible).toBe(false);
-      expect(candidate.reason).toMatch(/running process|Cannot establish process inactivity/);
+      expect(candidate.reason).toContain(`A running process (PID ${child.pid})`);
       expect(await fs.stat(directory)).toBeTruthy();
     } finally {
       const stopped = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGTERM"); await stopped;
     }
+  });
+  it("reviews an inactive completed checkout through the real trusted-origin route and Linux process policy", async () => {
+    const completed = await checkout("production-inactive");
+    const app = Fastify();
+    registerWorkspaceCleanupRoutes(app, observedService(), ["http://localhost:5173"]);
+    try {
+      const response = await app.inject({ method: "POST", url: "/api/system/workspace-cleanup/preview", headers: { origin: "http://localhost:5173" } });
+      expect(response.statusCode).toBe(200);
+      const preview = response.json() as WorkspaceCleanupPreview;
+      const candidate = preview.candidates.find(item => item.path === completed)!;
+      expect(candidate, candidate.reason).toMatchObject({ eligible: true });
+      expect(candidate.sizeUnavailable).toBeUndefined();
+      expect(preview.reclaimableBytes).toBeGreaterThan(0);
+      expect(await fs.stat(completed)).toBeTruthy();
+    } finally { await app.close(); }
+  });
+  it("observes an external process holding an open file with cwd outside the checkout", async () => {
+    const used = await checkout("production-open-file");
+    const child = spawn(process.execPath, ["-e", "require('node:fs').openSync(process.argv[1], 'r'); console.log('ready'); setInterval(() => {}, 1000)", path.join(used, "source.ts")], { cwd: root, stdio: ["ignore", "pipe", "ignore"] });
+    await new Promise<void>((resolve, reject) => { child.stdout.once("data", () => resolve()); child.once("error", reject); });
+    try {
+      const candidate = (await observedService().preview()).candidates.find(item => item.path === used)!;
+      expect(candidate.reason).toContain(`A running process (PID ${child.pid})`);
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(await fs.stat(used)).toBeTruthy();
+    } finally {
+      const stopped = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGTERM"); await stopped;
+    }
+  });
+  it.each(["cwd and open file", "open file only"])("protects preview and deletion while a zombie leader has a surviving thread using the %s", async activity => {
+    const directory = await checkout("surviving-thread");
+    const observed = observedService();
+    const reviewed = await observed.preview();
+    expect(reviewed.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true });
+    const executable = path.join(root, "surviving-thread");
+    await execute("cc", ["-Wall", "-Wextra", "-Werror", "-pthread", path.join(import.meta.dirname, "fixtures/surviving-thread.c"), "-o", executable]);
+    const child = spawn(executable, [activity === "cwd and open file" ? directory : root, path.join(directory, "source.ts")], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
+    const stopped = new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => code === 0 || signal === "SIGTERM" ? resolve() : reject(new Error(`pthread fixture exited ${code ?? signal}`)));
+    });
+    try {
+      const ready = await new Promise<string>((resolve, reject) => { child.stdout.once("data", data => resolve(String(data).trim())); child.once("error", reject); });
+      const [tid, descriptor] = ready.split(" ");
+      const procDirectory = `/proc/${child.pid}`;
+      await expect.poll(async () => (await fs.readFile(path.join(procDirectory, "stat"), "utf8")).split(") ")[1]!.split(" ")[0]).toBe("Z");
+      expect(await fs.readFile(path.join(procDirectory, "status"), "utf8")).toMatch(/^Threads:\s+2$/mu);
+      expect(await fs.readlink(`/proc/${tid}/cwd`)).toBe(activity === "cwd and open file" ? directory : root);
+      expect(await fs.readlink(`/proc/${tid}/fd/${descriptor}`)).toBe(path.join(directory, "source.ts"));
+      const inspecting = observedService();
+      const protectedPreview = await inspecting.preview();
+      const candidate = protectedPreview.candidates.find(item => item.path === directory)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain(`PID ${child.pid}`);
+      await expect(inspecting.start({ ...selection(protectedPreview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+      await observed.start(selection(reviewed)); await observed.settled();
+      expect((await observed.status())?.results.find(item => item.path === directory)).toMatchObject({ status: "skipped" });
+      expect(await fs.readFile(path.join(directory, "source.ts"), "utf8")).toBe("original\n");
+      child.stdin.write("x");
+      await stopped;
+      const inactive = await observed.preview();
+      expect(inactive.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+      await observed.start(selection(inactive)); await observed.settled();
+      expect((await observed.status())?.results.find(item => item.path === directory)).toMatchObject({ status: "deleted" });
+      await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+      await stopped;
+    }
+  });
+  it.each([{ state: "Z", threads: 2 }, { state: "X", threads: 2 }, { state: "x", threads: 2 }, { state: "Z", threads: null }, { state: "Z", threads: 0 }])("preserves unresolved thread-group activity even when the leader's paths appear inactive: %j", async options => {
+    const completed = await checkout("unresolved-thread-group");
+    const { observed } = await processFixture({ name: "node", ...options });
+    const preview = await observed.preview();
+    const candidate = preview.candidates.find(item => item.path === completed)!;
+    expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+    expect(candidate.reason).toContain("Thread group exit is unconfirmed");
+    await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+    expect(await fs.stat(completed)).toBeTruthy();
+  });
+  it.each(["Z", "X", "x"])("allows cleanup only after confirming the %s leader has no surviving threads", async state => {
+    const completed = await checkout("exited-thread-group");
+    const { observed } = await processFixture({ name: "node", state, threads: 1 });
+    const preview = await observed.preview();
+    expect(preview.candidates.find(item => item.path === completed)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+    await observed.start(selection(preview)); await observed.settled();
+    expect((await observed.status())?.results.find(item => item.path === completed)).toMatchObject({ status: "deleted" });
+  });
+  it.each([1, 2])("rechecks whole-group exit when the leader terminates during path inspection with %i threads", async threads => {
+    const completed = await checkout("leader-exits-during-inspection");
+    const { observed, directory } = await processFixture({ name: "node", threads });
+    const readlink = fs.readlink;
+    const exit = vi.spyOn(fs, "readlink").mockImplementation(async (...args: Parameters<typeof fs.readlink>) => {
+      if (String(args[0]) === path.join(directory, "cwd")) {
+        const stat = await fs.readFile(path.join(directory, "stat"), "utf8");
+        await fs.writeFile(path.join(directory, "stat"), stat.replace(") S ", ") Z "));
+      }
+      return readlink(...args);
+    });
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate.eligible).toBe(threads === 1);
+      if (threads === 2) expect(candidate.reason).toContain("Thread group exit is unconfirmed");
+    } finally { exit.mockRestore(); }
+  });
+  it("preserves an exited leader whose thread-group status cannot be read", async () => {
+    const completed = await checkout("unreadable-thread-group");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 1 });
+    const readFile = fs.readFile;
+    const denied = vi.spyOn(fs, "readFile").mockImplementation((...args: Parameters<typeof fs.readFile>) => {
+      if (String(args[0]) === path.join(directory, "status")) return Promise.reject(Object.assign(new Error("EACCES: thread-group status unavailable"), { code: "EACCES" }));
+      return readFile(...args);
+    });
+    try {
+      const preview = await observed.preview();
+      const candidate = preview.candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain("thread-group status unavailable");
+      await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+    } finally { denied.mockRestore(); }
+  });
+  it("preserves a PID replaced during whole-thread-group exit verification", async () => {
+    const completed = await checkout("replaced-exited-leader");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 1 });
+    const readFile = fs.readFile;
+    let reads = 0;
+    const replaced = vi.spyOn(fs, "readFile").mockImplementation((...args: Parameters<typeof fs.readFile>) => {
+      if (String(args[0]) === path.join(directory, "stat") && ++reads > 1) return readFile(...args).then(stat => String(stat).replace(/1234\n$/u, "5678\n"));
+      return readFile(...args);
+    });
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain("Process identity changed");
+    } finally { replaced.mockRestore(); }
+  });
+  it.each(["cwd", "fd/0"])("reviews and deletes an inactive checkout despite an unreadable verified system user-manager %s", async unreadable => {
+    const completed = await checkout("inactive-system-manager");
+    const { observed, directory, systemUserManager } = await processFixture({ files: [root] });
+    const denied = denyProcessAccess(path.join(directory, unreadable));
+    try {
+      const preview = await observed.preview();
+      expect(preview.candidates.find(item => item.path === completed)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+      expect(preview.reclaimableBytes).toBeGreaterThan(0);
+      expect(systemUserManager).toHaveBeenCalledWith(1000);
+      await observed.start(selection(preview)); await observed.settled();
+      expect((await observed.status())?.results.find(item => item.path === completed)).toMatchObject({ status: "deleted" });
+      await expect(fs.stat(completed)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { denied.mockRestore(); }
+  });
+  it("reviews an inactive checkout despite the verified user manager's unreadable PAM session keeper", async () => {
+    const completed = await checkout("pam-system-manager");
+    await processFixture();
+    const { observed, directory } = await processFixture({ pid: "277", name: "(sd-pam)", parent: "273", managerPid: "273" });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === completed)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+    } finally { denied.mockRestore(); }
+  });
+  it.each([
+    { name: "ordinary", managerPid: "273" },
+    { name: "systemd", managerPid: "999" },
+    { name: "systemd", parent: "42" },
+    { name: "systemd", group: "0::/user.slice/user-1000.slice/user@1000.service/app.slice/worker.service\n" },
+    { name: "(sd-pam)", parent: "999" },
+  ])("preserves unreadable unverified processes rather than trusting their names: %j", async options => {
+    const completed = await checkout("uncertain-process");
+    const { observed, directory } = await processFixture(options);
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      const preview = await observed.preview();
+      const candidate = preview.candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, allocatedBytes: 0, sizeUnavailable: true });
+      expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273`);
+      expect(candidate.reason).toContain("cwd:");
+      expect(preview.reclaimableBytes).toBe(0);
+      await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+      expect(await fs.stat(completed)).toBeTruthy();
+    } finally { denied.mockRestore(); }
+  });
+  it.each(["fd/0", "fd directory"])("protects unknown same-user open-file activity when the %s cannot be read", async unreadable => {
+    const completed = await checkout("uncertain-file");
+    const { observed, directory } = await processFixture({ name: "node", files: [root] });
+    const readdir = fs.readdir;
+    const denied = unreadable === "fd/0" ? denyProcessAccess(path.join(directory, unreadable), "EPERM") :
+      vi.spyOn(fs, "readdir").mockImplementation((...args: Parameters<typeof fs.readdir>) => {
+        if (String(args[0]) === path.join(directory, "fd")) return Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }));
+        return readdir(...args);
+      });
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273 (node)`);
+      expect(candidate.reason).toContain("open file");
+    } finally { denied.mockRestore(); }
+  });
+  it.each(["cwd", "open file"])("protects only the candidate with a readable active %s, including the system manager", async activeKind => {
+    const used = await checkout("used"); const inactive = await checkout("inactive");
+    const { observed } = await processFixture(activeKind === "cwd" ? { cwd: used } : { files: [path.join(used, "source.ts")] });
+    const preview = await observed.preview();
+    expect(preview.candidates.find(item => item.path === used)).toMatchObject({ eligible: false, reason: expect.stringContaining("A running process (PID 273)") });
+    expect(preview.candidates.find(item => item.path === inactive)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+  });
+  it("checks readable open files even when the process cwd is unreadable", async () => {
+    const used = await checkout("cwd-denied-file-active");
+    const { observed, directory, systemUserManager } = await processFixture({ files: [path.join(used, "source.ts")] });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === used)).toMatchObject({ eligible: false, reason: expect.stringContaining("A running process (PID 273)") });
+      expect(systemUserManager).not.toHaveBeenCalled();
+    } finally { denied.mockRestore(); }
+  });
+  it("ignores a vanished PID while keeping a missing cwd on a live unknown PID uncertain", async () => {
+    const completed = await checkout("vanished-process");
+    const { observed, directory } = await processFixture({ name: "node" });
+    await fs.unlink(path.join(directory, "cwd"));
+    let preview = await observed.preview();
+    expect(preview.candidates.find(item => item.path === completed)).toMatchObject({ eligible: false, sizeUnavailable: true });
+    const readFile = fs.readFile;
+    const vanished = vi.spyOn(fs, "readFile").mockImplementation((...args: Parameters<typeof fs.readFile>) => {
+      if (String(args[0]) === path.join(directory, "stat")) return Promise.reject(Object.assign(new Error("ESRCH: process vanished"), { code: "ESRCH" }));
+      return readFile(...args);
+    });
+    try {
+      preview = await observed.preview();
+      expect(preview.candidates.find(item => item.path === completed)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+    } finally { vanished.mockRestore(); }
+  });
+  it("preserves the candidate when the system manager PID is reused during authority verification", async () => {
+    const completed = await checkout("reused-manager");
+    const { observed, directory, systemUserManager } = await processFixture();
+    systemUserManager.mockImplementation(async () => {
+      const stat = await fs.readFile(path.join(directory, "stat"), "utf8");
+      await fs.writeFile(path.join(directory, "stat"), stat.replace(/1234\n$/u, "5678\n"));
+      return { pid: "273", controlGroup: "/user.slice/user-1000.slice/user@1000.service", workingDirectory: "", rootDirectory: "", rootImage: "" };
+    });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === completed)).toMatchObject({ eligible: false, reason: expect.stringContaining("identity changed") });
+    } finally { denied.mockRestore(); }
+  });
+  it.each(["candidate working directory", "candidate working directory symlink", "candidate root directory", "private root image", "unavailable system service record"])("preserves unresolved system-manager activity with %s", async uncertainty => {
+    const completed = await checkout("system-manager-owned-path");
+    const { observed, directory, systemUserManager } = await processFixture();
+    const linked = path.join(root, "manager-working-directory");
+    if (uncertainty === "candidate working directory symlink") await fs.symlink(completed, linked);
+    systemUserManager.mockImplementation(async () => {
+      if (uncertainty === "unavailable system service record") throw new Error("System service record is unavailable.");
+      return { pid: "273", controlGroup: "/user.slice/user-1000.slice/user@1000.service", workingDirectory: uncertainty === "candidate working directory" ? completed : uncertainty === "candidate working directory symlink" ? linked : "",
+        rootDirectory: uncertainty === "candidate root directory" ? completed : "", rootImage: uncertainty === "private root image" ? path.join(root, "root.img") : "" };
+    });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
+      expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain`);
+      expect(candidate.reason).toContain("cwd:");
+      expect(await fs.stat(completed)).toBeTruthy();
+    } finally { denied.mockRestore(); }
+  });
+  it("skips foreign-user processes without inspecting their cwd or open files", async () => {
+    const completed = await checkout("foreign-user");
+    const { observed, directory, systemUserManager } = await processFixture({ uid: 2000 });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === completed)).toMatchObject({ eligible: true });
+      expect(denied).not.toHaveBeenCalledWith(path.join(directory, "cwd"));
+      expect(systemUserManager).not.toHaveBeenCalled();
+    } finally { denied.mockRestore(); }
+  });
+  it("ignores a descriptor closed during scanning while continuing to protect a live open descriptor", async () => {
+    const completed = await checkout("closed-descriptor");
+    const { observed, directory } = await processFixture({ name: "node", files: [root, path.join(completed, "source.ts")] });
+    const readlink = fs.readlink;
+    const closed = vi.spyOn(fs, "readlink").mockImplementation((...args: Parameters<typeof fs.readlink>) => {
+      if (String(args[0]) === path.join(directory, "fd/0")) return Promise.reject(Object.assign(new Error("ENOENT: descriptor closed"), { code: "ENOENT" }));
+      return readlink(...args);
+    });
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === completed)).toMatchObject({ eligible: false, reason: expect.stringContaining("A running process (PID 273)") });
+    } finally { closed.mockRestore(); }
   });
   it("skips changed files and newly active workspaces while completing other selected items", async () => {
     const changed = await checkout("changed"); const newlyActive = await checkout("active"); await checkout("safe");

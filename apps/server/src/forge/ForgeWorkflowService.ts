@@ -124,6 +124,7 @@ interface Runtime {
     expectedHeadSha?: string;
     issueClosed?: true;
     retainedPaths?: string[];
+    retireEvidence?: { attemptId: string; commitSha: string; paths: string[] };
   }): Promise<ForgeRetainedWorkspace | void>;
   preparePublication(
     workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
@@ -2924,6 +2925,10 @@ export class ForgeWorkflowService {
           expectedHeadSha: worker.kind === "issue" ? expectedHeadSha : undefined,
           ...(issueClosed ? { issueClosed: true as const } : {}),
           ...(retainedPaths.length ? { retainedPaths } : {}),
+          ...(worker.status === "completed" && worker.attemptId && expectedHeadSha ? { retireEvidence: {
+            attemptId: worker.attemptId, commitSha: worker.kind === "review" ? worker.headSha ?? expectedHeadSha : expectedHeadSha,
+            paths: report?.handoff?.retainedEvidencePaths ?? [],
+          } } : {}),
         }));
         worker.retainedWorkspace = retained || undefined;
       }

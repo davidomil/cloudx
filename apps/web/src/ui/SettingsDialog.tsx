@@ -9,7 +9,7 @@ import { CodexSettingsEditor } from "./CodexSettingsEditor.js";
 import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";
 import { ForgeConnections } from "./ForgeConnections.js";
-import { WorkspaceCleanupPanel } from "./WorkspaceCleanupPanel.js";
+import type { WorkspaceCleanupFilter } from "./workspaceCleanupSession.js";
 import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
@@ -41,8 +41,11 @@ export function SettingsDialog({
   onRequestBrowserNotifications,
   cloudxUpdate,
   onOpenForge,
+  onOpenEnvironments,
+  cleanupBusy = false,
   callHook,
   initialCategoryId = "general",
+  onCategoryChange,
   children
 }: {
   config: CloudxConfigResponse;
@@ -55,8 +58,11 @@ export function SettingsDialog({
   onRequestBrowserNotifications?: () => Promise<void>;
   cloudxUpdate?: CloudxUpdateController;
   onOpenForge?: () => void;
+  onOpenEnvironments?: (filter: WorkspaceCleanupFilter) => void;
+  cleanupBusy?: boolean;
   callHook?: UiContributionRenderContext["callHook"];
   initialCategoryId?: string;
+  onCategoryChange?: (categoryId: string) => void;
   children?: ReactNode;
 }) {
   const [values, setValues] = useState<CloudxConfigValues>(() => structuredClone(config.values));
@@ -64,6 +70,7 @@ export function SettingsDialog({
   const [busy, setBusy] = useState(false);
   const [query, setQuery] = useState("");
   const [activeCategoryId, setActiveCategoryId] = useState(initialCategoryId);
+  useEffect(() => { onCategoryChange?.(activeCategoryId); }, [activeCategoryId, onCategoryChange]);
   const [horizontalTabs, setHorizontalTabs] = useState(false);
   const [codexSettingsEditor] = useState(() => new CodexSettingsEditor());
   const dialogRef = useRef<HTMLDivElement | null>(null);
@@ -182,7 +189,7 @@ export function SettingsDialog({
   }
   categories.push({
     id: "workspaces", label: "Workspaces", description: "Review and permanently delete obsolete on-disk checkouts.",
-    entries: [{ id: "cleanup", searchText: "Delete all old workspaces cleanup disk space storage retained Forge checkouts trash permanent", content: <WorkspaceCleanupPanel />, mountWhenVisible: true }]
+    entries: [{ id: "cleanup", searchText: "Delete all old workspaces cleanup disk space storage retained Forge checkouts trash permanent", content: <section className="settings-section" aria-label="Workspace management"><h3>Manage workspaces in Forge Environments</h3><p>Review ordinary checkouts and worktrees, retained Forge directories, trash, and owned containers in one cleanup view.</p><ControlButton disabled={!onOpenEnvironments} onClick={() => onOpenEnvironments?.("all")}>Open workspace management</ControlButton></section> }]
   });
   categories.push({
     id: "logs",
@@ -212,7 +219,7 @@ export function SettingsDialog({
     entries: [{
       id: "cloudx-update",
       searchText: "Updates CloudX Codex dependencies installer upgrade restart sessions layout release channel cycle main changelog pull requests capacity disk space Forge environment trash cleanup",
-      content: <CloudxUpdatePanel update={cloudxUpdate} onOpenForge={onOpenForge} CleanupPanel={WorkspaceCleanupPanel} />
+      content: <CloudxUpdatePanel update={cloudxUpdate} onOpenForge={onOpenForge} onOpenEnvironments={onOpenEnvironments ? () => onOpenEnvironments("forge") : undefined} cleanupBusy={cleanupBusy} />
     }]
   });
 

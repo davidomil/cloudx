@@ -8,6 +8,7 @@ import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
 import { ForgeWorkerTerminalOverlay } from "./ForgeWorkerTerminalOverlay.js";
 import { ForgeResourcesPanel } from "./ForgeResourcesPanel.js";
+import type { WorkspaceCleanupController } from "./workspaceCleanupSession.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
@@ -22,7 +23,9 @@ const WorkerContinuations = createContext<{
   setMessage: (workerId: string, message?: string) => void;
 } | null>(null);
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending }: {
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, cleanup, environmentsRequest }: {
+  cleanup: WorkspaceCleanupController;
+  environmentsRequest?: number;
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
@@ -43,6 +46,12 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
     return (await request<{ history?: ForgeWorkerHistory }>("forge.worker.history", { id })).history;
   }, [request]);
   const [view, setView] = useState<View>("issues");
+  const handledEnvironmentsRequest = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (active && environmentsRequest && environmentsRequest !== handledEnvironmentsRequest.current) {
+      handledEnvironmentsRequest.current = environmentsRequest; setView("environments");
+    }
+  }, [active, environmentsRequest]);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>();
   const [terminalWorkerId, setTerminalWorkerId] = useState<string>();
   const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
@@ -162,7 +171,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
         </ControlButton>)}
       </nav>
       {view === "workers" ? <MergeQueues workers={workers} onSelect={setSelectedWorkerId} /> : null}
-      {view === "environments" ? <ForgeResourcesPanel /> : null}
+      {view === "environments" ? <ForgeResourcesPanel cleanup={cleanup} /> : null}
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
         {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : (view === "issues" || view === "changes") && dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}

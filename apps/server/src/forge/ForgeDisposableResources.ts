@@ -1,9 +1,10 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { ForgeWorker, WorkspaceCleanupCandidate, DisposableContainerInput, DisposableResource, ForgeResourceConsumer as Consumer, EvidenceDecision, ForgeEvidenceManifest } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
-import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, type ContainerEvidenceContent } from "./ForgeContainerEvidence.js";
+import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, type EvidenceSink } from "./ForgeContainerEvidence.js";
+import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 
 export type { DisposableContainerInput, DisposableResource, EvidenceDecision } from "@cloudx/shared";
 
@@ -25,7 +26,7 @@ export interface DisposableContainerHost {
   inspect(id: string): Promise<ContainerIdentity | undefined>;
   stop(id: string): Promise<void>;
   remove(id: string): Promise<void>;
-  readEvidence?(id: string, paths: string[]): Promise<ContainerEvidenceContent[]>;
+  readEvidence?(id: string, paths: string[], write: EvidenceSink): Promise<void>;
 }
 interface ResourceJournal {
   resources: DisposableResource[];
@@ -66,7 +67,7 @@ export class ForgeDisposableResources {
         state: "creating", reason: "Creation intent recorded before Docker creation.", reclaimedBytes: 0, updatedAt: now(),
       };
       state.resources.push(resource);
-      await this.journal.write(state);
+      await this.write(state);
       try {
         resource.containerId = await this.host.create(input, labelsFor(resource));
         const identity = await this.host.inspect(resource.containerId);
@@ -82,11 +83,11 @@ export class ForgeDisposableResources {
           resource.reason = `Creation rejected: ${message(error)}. Reconciliation will confirm absence on the recorded engine.`;
         } else resource.reason = `Creation interrupted: ${message(error)}. Reconciliation will inspect the recorded creation intent.`;
         resource.updatedAt = now();
-        await this.journal.write(state);
+        await this.write(state);
         throw error;
       }
       resource.updatedAt = now();
-      await this.journal.write(state);
+      await this.write(state);
       return structuredClone(resource);
     });
   }
@@ -106,6 +107,7 @@ export class ForgeDisposableResources {
       if (resource.evidence?.state === "verified") {
         if (decision.action !== "export" || decision.evidencePaths !== undefined || decision.commitSha !== undefined) throw new Error("Verified evidence is immutable; retry export without changing its provenance to complete cleanup.");
         await this.removeRecorded(resource, state);
+        if (resource.state === "failed") throw new Error(resource.reason);
         return structuredClone(resource);
       }
       resource.evidence ??= { state: "pending", paths: [] };
@@ -119,8 +121,9 @@ export class ForgeDisposableResources {
       if (decision.action === "export") await this.recordEvidenceCommit(resource);
       resource.reason = `Evidence decision recorded: ${decision.action}.`;
       resource.updatedAt = now();
-      await this.journal.write(state);
+      await this.write(state);
       await this.removeRecorded(resource, state);
+      if (decision.action === "export" && resource.state === "failed") throw new Error(resource.reason);
       return structuredClone(resource);
     });
   }
@@ -131,12 +134,10 @@ export class ForgeDisposableResources {
     return structuredClone((await this.evidenceArchive.read(resource)).manifest);
   }
 
-  async evidenceFile(resourceId: string, filePath: string): Promise<Buffer> {
+  async evidenceFile(resourceId: string, filePath: string) {
     const resource = (await this.read()).resources.find(item => item.id === resourceId);
     if (!resource) throw new Error("Unknown disposable resource.");
-    const archive = await this.evidenceArchive.read(resource);
-    if (!archive.manifest.files.some(item => item.path === filePath)) throw new Error("Unknown evidence file.");
-    return Buffer.from(archive.contents[filePath]!, "base64");
+    return this.evidenceArchive.fileStream(resource, filePath);
   }
 
   preview(): Promise<WorkspaceCleanupCandidate[]> {
@@ -158,7 +159,7 @@ export class ForgeDisposableResources {
           eligible: !reason, reason: reason ?? "All recorded consumers are terminal. Exact owned container can be reclaimed; volumes stay preserved.",
           sourceChanges: [], unpublishedCommits: 0, requiresDiscard: false });
       }
-      await this.journal.write(state);
+      await this.write(state);
       return candidates;
     });
   }
@@ -171,7 +172,7 @@ export class ForgeDisposableResources {
       // All earlier attempts belonging to this worker end with its authoritative lifecycle.
       const consumers = state.resources.flatMap(item => item.consumers).filter(item => item.workerId === worker.id);
       for (const consumer of consumers) if (!state.terminalWorkers.some(item => sameConsumer(item, consumer))) state.terminalWorkers.push(consumer);
-      await this.journal.write(state);
+      await this.write(state);
       const failures: DisposableResource[] = [];
       for (const resource of state.resources.filter(item => item.state !== "deleted" && item.consumers.some(consumer => consumer.workerId === worker.id))) {
         await this.removeRecorded(resource, state);
@@ -222,7 +223,7 @@ export class ForgeDisposableResources {
       }
       resource.allocatedBytes = identity.writableBytes;
       resource.reason = "Quiescence intent saved; revalidating identity and consumers.";
-      await this.journal.write(state);
+      await this.write(state);
       if (identity.running) {
         await this.assertQuiescentConsumers(resource, state);
         await this.host.stop(identity.id);
@@ -235,7 +236,7 @@ export class ForgeDisposableResources {
       resource.state = "deleting";
       resource.removalStartedAt ??= now();
       resource.reason = "Evidence release and deletion intent saved; revalidating identity and consumers.";
-      await this.journal.write(state);
+      await this.write(state);
       identity = await this.assertRemovable(resource, state);
       if (identity?.running) throw new Error("The owned container became active during cleanup; it was preserved.");
       if (identity) await this.host.remove(identity.id);
@@ -248,7 +249,7 @@ export class ForgeDisposableResources {
       resource.reason = message(error);
     } finally {
       resource.updatedAt = now();
-      await this.journal.write(state);
+      await this.write(state);
     }
   }
 
@@ -283,19 +284,17 @@ export class ForgeDisposableResources {
     if (!validEvidencePaths(resource.evidence.paths)) return;
     await this.recordEvidenceCommit(resource);
     const recovered = await this.evidenceArchive.recover(resource);
-    if (recovered) { resource.evidence = recovered; await this.journal.write(state); return; }
+    if (recovered) { resource.evidence = recovered; await this.write(state); return; }
     if (!present) throw new Error("The container disappeared before evidence export; required evidence is unavailable.");
     if (!this.host.readEvidence) throw new Error("The container host does not support evidence export.");
-    resource.evidence.state = "exporting";
-    resource.reason = `Evidence export intent saved: ${resource.evidence.paths.join(", ")}.`;
-    await this.journal.write(state);
     const identity = await this.assertQuiescentConsumers(resource, state);
     if (!identity || identity.running) throw new Error("Evidence export requires the exact stopped owned container.");
-    const contents = await this.host.readEvidence(identity.id, resource.evidence.paths);
-    const afterExport = await this.assertQuiescentConsumers(resource, state);
-    if (afterExport?.running) throw new Error("The container became active during evidence export; it was preserved.");
-    resource.evidence = await this.evidenceArchive.export(resource, contents, async receipt => { resource.evidence = receipt; await this.journal.write(state); });
-    await this.journal.write(state);
+    resource.evidence = await this.evidenceArchive.export(resource, async write => {
+      await this.host.readEvidence!(identity.id, resource.evidence!.paths, write);
+      const afterExport = await this.assertQuiescentConsumers(resource, state);
+      if (afterExport?.running) throw new Error("The container became active during evidence export; it was preserved.");
+    }, async receipt => { resource.evidence = receipt; await this.write(state); });
+    await this.write(state);
   }
   private async recordEvidenceCommit(resource: DisposableResource): Promise<void> {
     if (!resource.evidence || resource.evidence.commitSha || resource.evidence.manifestSha256) return;
@@ -341,6 +340,10 @@ export class ForgeDisposableResources {
     resource.created = identity.created;
     resource.allocatedBytes = identity.writableBytes;
     return resource.state;
+  }
+  private async write(state: ResourceJournal): Promise<void> {
+    if (state.resources.some(resource => resource.evidence?.manifestSha256)) await writeEvidenceReceipt(this.journal, state);
+    else await this.journal.write(state);
   }
   private async read(): Promise<ResourceJournal> {
     const value = await this.journal.read<ResourceJournal>();
@@ -398,18 +401,11 @@ export class DockerDisposableContainerHost implements DisposableContainerHost {
   }
   async stop(id: string): Promise<void> { await docker(["container", "stop", "--time", "10", id]); }
   async remove(id: string): Promise<void> { await docker(["container", "rm", id]); }
-  async readEvidence(id: string, paths: string[]): Promise<ContainerEvidenceContent[]> {
+  async readEvidence(id: string, paths: string[], write: EvidenceSink): Promise<void> {
     if (!/^[a-f0-9]{64}$/u.test(id) || !validEvidencePaths(paths)) throw new Error("Evidence export requires an exact container identity and specific absolute paths.");
-    const contents: ContainerEvidenceContent[] = [];
-    for (const source of paths) {
-      const result = await execute("docker", ["container", "cp", `${id}:${source}`, "-"], { timeout: 60_000, maxBuffer: 32 * 1024 * 1024, encoding: "buffer" });
-      const files = await readContainerEvidenceTar(source, result.stdout);
-      if (!files.length) throw new Error(`Evidence source ${source} has no exportable regular files; select specific valuable data.`);
-      contents.push(...files);
-      if (contents.length > 512 || contents.reduce((bytes, item) => bytes + item.data.length, 0) > 16 * 1024 * 1024) throw new Error("Evidence exceeds the compact archive limit (16 MiB / 512 files); select narrower paths.");
-    }
-    return contents;
+    for (const source of paths) await streamDockerEvidence(id, source, write);
   }
+
 }
 
 export function validateContainerInput(value: unknown): asserts value is DisposableContainerInput {
@@ -454,7 +450,7 @@ function validEvidence(value: DisposableResource["evidence"]): boolean {
   return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing"].includes(value.state) && validEvidencePaths(value.paths, true) &&
     (value.commitSha === undefined || validCommit(value.commitSha)) &&
     (value.commitSource === undefined || ["worker", "declared"].includes(value.commitSource)) &&
-    (value.archivePath === undefined || typeof value.archivePath === "string" && /^forge-evidence\/[a-f0-9-]{36}\.json$/u.test(value.archivePath)) &&
+    (value.archivePath === undefined || typeof value.archivePath === "string" && /^forge-evidence\/[a-f0-9-]{36}(?:\.json|\/manifest\.json)$/u.test(value.archivePath)) &&
     (value.manifestSha256 === undefined || typeof value.manifestSha256 === "string" && /^[a-f0-9]{64}$/u.test(value.manifestSha256)) &&
     (value.bytes === undefined || Number.isSafeInteger(value.bytes) && value.bytes >= 0) &&
     (value.exportedAt === undefined || Number.isFinite(Date.parse(value.exportedAt))) &&
@@ -470,3 +466,32 @@ function sameConsumer(left: Consumer, right: Consumer): boolean { return left.wo
 function now(): string { return new Date().toISOString(); }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 async function docker(args: string[]): Promise<string> { return (await execute("docker", args, { timeout: 60_000, maxBuffer: 2_000_000 })).stdout; }
+
+async function streamDockerEvidence(id: string, source: string, write: EvidenceSink): Promise<void> {
+  const child = spawn("docker", ["container", "cp", `${id}:${source}`, "-"], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  let failure: Error | undefined;
+  const fail = (error: Error) => { failure ??= error; child.kill("SIGKILL"); };
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (Buffer.byteLength(stderr) + chunk.length > 64 * 1024) fail(new Error("Docker evidence export exceeded the diagnostic output limit."));
+    else stderr += chunk.toString();
+  });
+  const completion = new Promise<void>((resolve, reject) => {
+    child.on("error", error => { failure ??= error; });
+    child.on("close", (code, signal) => {
+      if (failure) reject(failure);
+      else if (code !== 0) reject(new Error(`Docker evidence export failed (${signal ?? code}): ${stderr.trim()}`));
+      else resolve();
+    });
+  });
+  completion.catch(() => undefined);
+  const timeout = setTimeout(() => fail(new Error("Docker evidence export timed out after 60 seconds.")), 60_000);
+  try { await readContainerEvidenceTar(source, child.stdout, write); await completion; }
+  catch (error) {
+    fail(error instanceof Error ? error : new Error(String(error)));
+    await completion.catch(() => undefined);
+    if (stderr.trim()) throw new Error(`${message(error)} Docker evidence export: ${stderr.trim()}`, { cause: error });
+    throw error;
+  }
+  finally { clearTimeout(timeout); }
+}

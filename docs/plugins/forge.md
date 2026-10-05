@@ -101,3 +101,7 @@ Use the [worker guide](../implementation/forge-workers.md) for
 conflicts, permissions, restart recovery, and cleanup behavior. [Forge
 diagnostics](../SETUP.md#forge-diagnostics) explains the logs. [Plugin
 guide index](README.md).
+
+**Environments** is the shared workspace and container cleanup view.
+The [cleanup and evidence guide](../implementation/forge-evidence-retirement.md)
+describes retention decisions, durable report downloads and export limits.

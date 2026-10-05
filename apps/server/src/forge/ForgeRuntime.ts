@@ -19,6 +19,7 @@ import {
   type ForgeIssueHandoff,
   type ForgePublicationHandoff,
   type ForgeRetainedWorkspace,
+  type ForgeCheckoutEvidenceReceipt,
   type WorkspaceTab,
   type DirectoryOwnershipPreview,
   type DirectoryOwnershipReconciliation,
@@ -40,6 +41,8 @@ import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecuti
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { cleanupIgnoredForgePath } from "./ForgeGeneratedCleanup.js";
 import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
+import { ForgeCheckoutEvidence, isCheckoutEvidenceReceipt, playwrightLastRunEvidence } from "./ForgeCheckoutEvidence.js";
+import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 import { captureForgeRemovalContents, assertForgeRemovalContents, isForgeRemovalContents, type ForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 
 export interface ForgeWorkspace {
@@ -50,6 +53,7 @@ export interface ForgeWorkspace {
   expectedHeadSha?: string;
   issueClosed?: true;
   retainedPaths?: string[];
+  retireEvidence?: { attemptId: string; commitSha: string; paths: string[] };
 }
 
 export interface ForgeRuntimeDependencies {
@@ -120,6 +124,7 @@ interface OwnedReviewRefresh {
 
 interface OwnedPublicationHandoff extends ForgePublicationHandoff {
   fingerprint: string;
+  evidenceFingerprint?: string;
 }
 
 export class ForgeHandoffError extends Error {
@@ -132,6 +137,8 @@ export class ForgeHandoffError extends Error {
 interface OwnedWorkspace extends ForgeWorkspace {
   repository: DirectoryIdentity;
   explicitRetainedPaths?: string[];
+  evidenceRetirement?: { attemptId: string; commitSha: string; paths: string[] };
+  checkoutEvidence?: ForgeCheckoutEvidenceReceipt;
   worktree: DirectoryIdentity;
   origin: string;
   expectedRepository: ForgeRepository;
@@ -1130,7 +1137,8 @@ export class ForgeRuntime {
       if (!samePaths(files, await this.workingFiles(owned, signal)) || !samePaths(evidence, await this.retainedEvidenceFiles(owned, evidence, signal)))
         throw new ForgeHandoffError("Working files changed while recording the completion handoff.");
       const recorded = previous ?? { headSha, retainedPaths: files,
-        ...(handoff?.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: evidence }), fingerprint };
+        ...(handoff?.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: evidence }), fingerprint,
+        ...(evidence.length ? { evidenceFingerprint: await this.workingFingerprint(owned, evidence, signal) } : {}) };
       owned.publicationHandoffs ??= {};
       owned.publicationHandoffs[attemptId] = recorded;
       owned.publicationAttemptId = attemptId;
@@ -1675,6 +1683,15 @@ export class ForgeRuntime {
       owned.explicitRetainedPaths = publicationFiles(owned.explicitRetainedPaths ?? [], [
         ...workspace.retainedPaths ?? [], ...this.publicationHandoff(owned)?.retainedEvidencePaths ?? [],
       ]);
+      if (workspace.retireEvidence) {
+        const retirement = workspace.retireEvidence;
+        safeId(retirement.attemptId);
+        if (!isCommitSha(retirement.commitSha) || !isRetainedEvidencePaths(retirement.paths) ||
+          owned.branchOwned && retirement.commitSha !== workspace.expectedHeadSha)
+          throw new Error("Checkout evidence retirement requires the authoritative completed commit and attempt.");
+        owned.evidenceRetirement = retirement;
+        await this.manifest(owned.id).write(owned);
+      }
       if (owned.branchOwned && !owned.cleanupRemoval && (!owned.cleaned || owned.retainedWorkspace)) {
         if (!workspace.expectedHeadSha && !workspace.issueClosed)
           throw new Error("Issue cleanup requires the published head commit.");
@@ -1786,7 +1803,8 @@ export class ForgeRuntime {
       .split("\0").filter(entry => entry.startsWith("!! ")).map(entry => entry.slice(3).replace(/\/$/u, ""));
     for (const file of evidence) {
       signal?.throwIfAborted();
-      if (!ignored.some(parent => parent === file || file.startsWith(`${parent}/`)))
+      if (!ignored.some(parent => parent === file || file.startsWith(`${parent}/`)) ||
+        (await this.runGit(owned.worktreePath, ["ls-files", "-z", "--", file], signal)).length)
         throw new ForgeHandoffError(`Retained evidence ${JSON.stringify(file)} must be ignored by Git and exist in this checkout.`);
       const absolute = path.join(owned.worktreePath, file);
       try {
@@ -1797,6 +1815,10 @@ export class ForgeRuntime {
       } catch {
         throw new ForgeHandoffError(`Retained evidence ${JSON.stringify(file)} must be an existing regular file or directory without symbolic-link parents.`);
       }
+    }
+    if (evidence.length) {
+      try { await new ForgeCheckoutEvidence(this.dependencies.dataDir).validateSelection(owned.worktree, evidence, signal); }
+      catch (error) { throw new ForgeHandoffError(`Invalid ignored evidence selection: ${error instanceof Error ? error.message : String(error)}`); }
     }
     return [...evidence].sort();
   }
@@ -1929,7 +1951,14 @@ export class ForgeRuntime {
       }
       if (expectedHeadSha && owned.branchOwned)
         await this.verifyHead(owned, expectedHeadSha, signal);
+      if (owned.evidenceRetirement && !owned.branchOwned &&
+        (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim() !== owned.evidenceRetirement.commitSha)
+        throw new Error("Review checkout differs from its evidence commit; its files were preserved.");
       owned.cleanupHeadSha = expectedHeadSha;
+      if (owned.prepared && owned.evidenceRetirement) {
+        await this.handoffCheckoutEvidence(owned, signal);
+        explicitRetainedPaths = owned.explicitRetainedPaths;
+      }
       let retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal, explicitRetainedPaths) : [];
       let unpublishedRefs = owned.prepared && owned.branchOwned
         ? await this.unpublishedGitRefs(owned, expectedHeadSha, signal) : [];
@@ -1971,8 +2000,40 @@ export class ForgeRuntime {
     await this.manifest(owned.id).write(owned);
   }
 
+  private async handoffCheckoutEvidence(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
+    const retirement = owned.evidenceRetirement!;
+    const archive = new ForgeCheckoutEvidence(this.dependencies.dataDir);
+    if (!owned.checkoutEvidence) {
+      const requested = publicationFiles(retirement.paths, this.publicationHandoff(owned)?.retainedEvidencePaths ?? []);
+      const ignoredLastRun = await this.runGit(owned.worktreePath, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "test-results/.last-run.json"], signal);
+      const paths = publicationFiles(requested, ignoredLastRun === "test-results/.last-run.json\0" ? await playwrightLastRunEvidence(owned.worktree) : []);
+      if (!paths.length) return;
+      // A named selection is a durable promise, so missing evidence blocks retirement.
+      const named = await this.retainedEvidenceFiles(owned, requested, signal);
+      if (!samePaths(requested, named)) throw new Error("Named checkout evidence changed before retirement.");
+      const handoff = this.publicationHandoff(owned);
+      if (handoff?.retainedEvidencePaths?.length &&
+        (handoff.evidenceFingerprint
+          ? handoff.evidenceFingerprint !== await this.workingFingerprint(owned, handoff.retainedEvidencePaths, signal)
+          : handoff.fingerprint !== await this.workingFingerprint(owned, publicationFiles(handoff.retainedPaths, handoff.retainedEvidencePaths), signal)))
+        throw new Error("Named checkout evidence changed after the validated publication handoff; its source was preserved.");
+      owned.checkoutEvidence = { archiveId: randomUUID(), attemptId: retirement.attemptId, commitSha: retirement.commitSha, paths };
+      await this.manifest(owned.id).write(owned);
+    }
+    const manifest = await archive.export(owned.id, owned.worktree, owned.checkoutEvidence, async receipt => {
+      owned.checkoutEvidence = receipt;
+      await this.manifest(owned.id).write(owned);
+    }, signal);
+    await this.assertCleanupQuiescent(owned);
+    await archive.removeExported(owned.worktree, manifest, signal);
+    owned.explicitRetainedPaths = owned.explicitRetainedPaths?.filter(file =>
+      !manifest.paths.some(exported => file === exported || file.startsWith(`${exported}/`)));
+    await this.manifest(owned.id).write(owned);
+  }
+
   private async finishCheckoutRemoval(owned: OwnedWorkspace, signal?: AbortSignal): Promise<boolean> {
     const removal = owned.cleanupRemoval!;
+    if (owned.checkoutEvidence) await new ForgeCheckoutEvidence(this.dependencies.dataDir).read(owned.checkoutEvidence.archiveId);
     const current = await optionalIdentity(owned.worktreePath);
     if (current) {
       await this.assertIdentity(owned.worktree);
@@ -2185,6 +2246,10 @@ export class ForgeRuntime {
       (value.batchConversation !== undefined &&
         (value.role !== "worker" || !isReviewConversationBinding(value.batchConversation))) ||
       !isPublicationOwnership(value) ||
+      (value.checkoutEvidence !== undefined && !isCheckoutEvidenceReceipt(value.checkoutEvidence)) ||
+      (value.evidenceRetirement !== undefined && (!value.evidenceRetirement ||
+        typeof value.evidenceRetirement.attemptId !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(value.evidenceRetirement.attemptId) ||
+        !isCommitSha(value.evidenceRetirement.commitSha) || !isRetainedEvidencePaths(value.evidenceRetirement.paths))) ||
       (value.explicitRetainedPaths !== undefined && !isRetainedPaths(value.explicitRetainedPaths)) ||
       (value.branchPublication !== undefined &&
         (value.role !== "worker" || !value.branchPublication || !isCommitSha(value.branchPublication.headSha) ||
@@ -2212,7 +2277,7 @@ export class ForgeRuntime {
   }
 
   private manifest(id: string): JsonStateFile {
-    return new JsonStateFile(
+    return new ForgeWorkspaceEvidenceState(
       this.dependencies.dataDir,
       `forge-workers/workspaces/${safeId(id)}.json`,
       "Forge workspace ownership",
@@ -2553,6 +2618,13 @@ export class ForgeRuntime {
   }
 }
 
+class ForgeWorkspaceEvidenceState extends JsonStateFile {
+  override async write(value: unknown): Promise<void> {
+    if ((value as Partial<OwnedWorkspace>)?.checkoutEvidence?.manifestSha256) await writeEvidenceReceipt(this, value);
+    else await super.write(value);
+  }
+}
+
 function safeId(id: string): string {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(id))
     throw new Error("Invalid Forge worker id.");
@@ -2599,6 +2671,7 @@ function isPublicationOwnership(value: OwnedWorkspace): boolean {
     /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(attemptId) && handoff && typeof handoff === "object" &&
     isCommitSha(handoff.headSha) && isRetainedPaths(handoff.retainedPaths) &&
     (handoff.retainedEvidencePaths === undefined || isRetainedEvidencePaths(handoff.retainedEvidencePaths)) &&
+    (handoff.evidenceFingerprint === undefined || typeof handoff.evidenceFingerprint === "string" && /^[a-f0-9]{64}$/u.test(handoff.evidenceFingerprint)) &&
     typeof handoff.fingerprint === "string" && /^[a-f0-9]{64}$/u.test(handoff.fingerprint));
 }
 

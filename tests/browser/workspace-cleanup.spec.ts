@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import type {
   WorkspaceCleanupJob,
   WorkspaceCleanupPreview,
@@ -76,6 +76,32 @@ test.beforeEach(async ({ page }) => {
       { timeout: 10_000 },
     )
     .toBe(true);
+  const repository = {
+    provider: "github",
+    apiUrl: "https://api.github.com",
+    projectPath: "cloudx/cleanup-fixture",
+  };
+  await page.route("**/api/hooks/forge.dashboard", (route) =>
+    route.fulfill({
+      json: { result: { configured: true, repository, workers: [] } },
+    }),
+  );
+  for (const hook of ["forge.issues.list", "forge.changes.list"])
+    await page.route(`**/api/hooks/${hook}`, (route) =>
+      route.fulfill({ json: { result: { items: [] } } }),
+    );
+  await page.route("**/api/forge/resources", (route) =>
+    route.fulfill({ json: { resources: [] } }),
+  );
+  await page.route("**/api/forge/checkout-evidence", (route) =>
+    route.fulfill({ json: { archives: [] } }),
+  );
+  await page.route("**/api/system/update/backups", (route) =>
+    route.fulfill({ json: { backups: [] } }),
+  );
+  await page.route("**/api/system/update/backups/cleanup", (route) =>
+    route.fulfill({ json: null }),
+  );
 });
 
 test.afterEach(async ({}, testInfo) => {
@@ -100,7 +126,7 @@ test.afterEach(async ({}, testInfo) => {
   if (testRoot) await fs.rm(testRoot, { recursive: true, force: true });
 });
 
-test("Settings previews, confirms and reports permanent workspace cleanup at every viewport", async ({
+test("Settings opens canonical Environments cleanup and retains its deletion job across Forge sections at every viewport", async ({
   page,
   isMobile,
 }, testInfo) => {
@@ -215,9 +241,23 @@ test("Settings previews, confirms and reports permanent workspace cleanup at eve
   await dialog
     .getByRole("searchbox", { name: "Search settings" })
     .fill("old workspaces");
-  const cleanup = dialog.getByRole("region", { name: "Workspace cleanup" });
+  await expect(
+    dialog.getByRole("region", { name: "Workspace cleanup" }),
+  ).toHaveCount(0);
+  await dialog
+    .getByRole("button", { name: "Open workspace management", exact: true })
+    .click();
+  await expect(dialog).toHaveCount(0);
+  const forge = page.getByRole("region", { name: "Forge", exact: true });
+  const cleanup = forge.getByRole("region", {
+    name: "Workspace cleanup",
+    exact: true,
+  });
+  await expect(
+    cleanup.getByRole("combobox", { name: "Workspace filter" }),
+  ).toHaveValue("all");
   await cleanup
-    .getByRole("button", { name: "Delete all old workspaces" })
+    .getByRole("button", { name: "Scan workspaces and environments" })
     .click();
   await expect(
     cleanup.getByRole("checkbox", {
@@ -276,6 +316,14 @@ test("Settings previews, confirms and reports permanent workspace cleanup at eve
     path: testInfo.outputPath("workspace-cleanup-progress.png"),
     fullPage: true,
   });
+  await forge.getByRole("button", { name: "Issues", exact: true }).click();
+  await expect(cleanup).toHaveCount(0);
+  await forge
+    .getByRole("button", { name: "Environments", exact: true })
+    .click();
+  await expect(
+    cleanup.getByRole("progressbar", { name: "Workspace cleanup progress" }),
+  ).toBeVisible();
   finish = true;
   await expect(
     cleanup.getByRole("heading", { name: "Cleanup results" }),
@@ -293,10 +341,11 @@ test("Settings previews, confirms and reports permanent workspace cleanup at eve
   ).toBe(true);
 });
 
-test("Update capacity recovery reviews Forge trash and resumes the same saved target", async ({
-  page,
-  isMobile,
-}, testInfo) => {
+async function updateCapacityRecovery(
+  { page, isMobile }: { page: Page; isMobile: boolean },
+  testInfo: TestInfo,
+  disconnectCleanupStatus = false,
+) {
   const target = "c".repeat(40);
   const runId = "11111111-1111-4111-8111-111111111111";
   const candidateId = "22222222-2222-4222-8222-222222222222";
@@ -305,6 +354,9 @@ test("Update capacity recovery reviews Forge trash and resumes the same saved ta
   let availableBytes = 27225911296;
   let cleanup: WorkspaceCleanupJob | null = null;
   let finishCleanup = false;
+  let cleanupStatusReads = 0;
+  let runningStatusReads = 0;
+  let statusDisconnected = false;
   let capacityChecks = 0;
   let resume: Record<string, unknown> | undefined;
   const updateStatus = () => ({
@@ -351,6 +403,20 @@ test("Update capacity recovery reviews Forge trash and resumes the same saved ta
       },
     },
   });
+  const completeCleanup = () => {
+    if (!cleanup) return;
+    availableBytes = 50 * 1024 ** 3;
+    cleanup = {
+      ...cleanup,
+      state: "completed",
+      availableBytesAfter: availableBytes,
+      results: cleanup.results.map((item) => ({
+        ...item,
+        status: "deleted",
+        reason: "Permanently deleted",
+      })),
+    };
+  };
   await page.route("**/api/system/update/preview", (route) =>
     route.fulfill({
       json: {
@@ -481,19 +547,20 @@ test("Update capacity recovery reviews Forge trash and resumes the same saved ta
       };
       return route.fulfill({ status: 202, json: cleanup });
     }
-    if (finishCleanup && cleanup) {
-      availableBytes = 50 * 1024 ** 3;
-      cleanup = {
-        ...cleanup,
-        state: "completed",
-        availableBytesAfter: availableBytes,
-        results: cleanup.results.map((item) => ({
-          ...item,
-          status: "deleted",
-          reason: "Permanently deleted",
-        })),
-      };
+    cleanupStatusReads++;
+    if (
+      disconnectCleanupStatus &&
+      cleanup?.state === "running" &&
+      !statusDisconnected &&
+      ++runningStatusReads === 2
+    ) {
+      statusDisconnected = true;
+      return route.fulfill({
+        status: 503,
+        json: { message: "Cleanup status connection lost." },
+      });
     }
+    if (finishCleanup) completeCleanup();
     return route.fulfill({ json: cleanup });
   });
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
@@ -516,54 +583,132 @@ test("Update capacity recovery reviews Forge trash and resumes the same saved ta
   );
   await expect(updates).toContainText("3.46 GiB safety margin");
   await updates
-    .getByRole("button", { name: "Clean Forge environment trash", exact: true })
+    .getByRole("button", { name: "Manage Forge environments", exact: true })
     .click();
-  await updates
+  await expect(dialog).toHaveCount(0);
+  const forge = page.getByRole("region", { name: "Forge", exact: true });
+  const environments = forge.getByRole("region", {
+    name: "Workspace cleanup",
+    exact: true,
+  });
+  await expect(
+    environments.getByRole("combobox", { name: "Workspace filter" }),
+  ).toHaveValue("forge");
+  await environments
     .getByRole("button", {
-      name: "Preview Forge environment trash",
+      name: "Scan workspaces and environments",
       exact: true,
     })
     .click();
   await expect(
-    updates.getByRole("checkbox", {
+    environments.getByRole("checkbox", {
       name: "Select /work/active-forge",
       exact: true,
     }),
   ).toBeDisabled();
   await expect(
-    updates.getByRole("checkbox", {
+    environments.getByRole("checkbox", {
       name: "Select /work/unpublished",
       exact: true,
     }),
   ).toBeDisabled();
-  await expect(updates).toContainText("16.00 GiB");
-  await updates
+  await expect(environments).toContainText("16.00 GiB");
+  await environments
     .getByRole("button", {
       name: "Review deletion of 1 workspace",
       exact: true,
     })
     .click();
+
+  await forge.getByRole("button", { name: "Settings", exact: true }).click();
+  await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
   await expect(
     updates.getByRole("button", { name: "Resume update", exact: true }),
   ).toBeDisabled();
-  await updates.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(
+    dialog.getByRole("region", { name: "Workspace cleanup" }),
+  ).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await environments
+    .getByRole("button", { name: "Cancel", exact: true })
+    .click();
   expect(cleanup).toBeNull();
-  await updates
+  await environments
     .getByRole("button", {
       name: "Review deletion of 1 workspace",
       exact: true,
     })
     .click();
-  await updates
+  await environments
     .getByRole("button", { name: "Delete permanently", exact: true })
     .click();
   await expect(
-    updates.getByRole("progressbar", { name: "Workspace cleanup progress" }),
+    environments.getByRole("progressbar", {
+      name: "Workspace cleanup progress",
+    }),
   ).toBeVisible();
+  if (disconnectCleanupStatus) {
+    await expect(environments.getByRole("alert")).toContainText(
+      "Cleanup status unavailable: Cleanup status connection lost.",
+    );
+    const disconnectedReads = cleanupStatusReads;
+    finishCleanup = true;
+    completeCleanup();
+    await forge.getByRole("button", { name: "Issues", exact: true }).click();
+    await expect(environments).toHaveCount(0);
+    await forge
+      .getByRole("button", { name: "Environments", exact: true })
+      .click();
+    await environments
+      .getByRole("button", { name: "Reconnect cleanup status", exact: true })
+      .waitFor();
+    await forge
+      .getByRole("button", { name: "Refresh environments", exact: true })
+      .click();
+    await expect(
+      environments.getByRole("button", {
+        name: "Scan workspaces and environments",
+        exact: true,
+      }),
+    ).toBeDisabled();
+    await forge.getByRole("button", { name: "Settings", exact: true }).click();
+    await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
+    await expect(
+      updates.getByRole("button", { name: "Resume update", exact: true }),
+    ).toBeDisabled();
+    expect(capacityChecks).toBe(0);
+    await updates
+      .getByRole("button", { name: "Manage Forge environments", exact: true })
+      .click();
+    await expect(
+      environments.getByRole("heading", {
+        name: "Cleanup in progress",
+        exact: true,
+      }),
+    ).toBeVisible();
+    expect(cleanupStatusReads).toBe(disconnectedReads);
+    await environments
+      .getByRole("button", { name: "Reconnect cleanup status", exact: true })
+      .click();
+    await expect(environments.getByRole("alert")).toHaveCount(0);
+    await expect(
+      environments.getByRole("button", {
+        name: "Scan workspaces and environments",
+        exact: true,
+      }),
+    ).toBeEnabled();
+    expect(cleanupStatusReads).toBe(disconnectedReads + 1);
+  }
   finishCleanup = true;
-  await expect(updates).toContainText("50.00 GiB available after cleanup");
+  await expect(environments).toContainText("50.00 GiB available after cleanup");
+  await expect.poll(() => capacityChecks).toBeGreaterThan(0);
+
+  await forge.getByRole("button", { name: "Settings", exact: true }).click();
+  await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
   await expect(updates).toContainText("0 B more needed");
-  expect(capacityChecks).toBe(1);
+  await expect(
+    updates.getByRole("button", { name: "Resume update", exact: true }),
+  ).toBeEnabled();
   await page.screenshot({
     path: testInfo.outputPath("update-capacity-recovered.png"),
     fullPage: true,
@@ -583,4 +728,14 @@ test("Update capacity recovery reviews Forge trash and resumes the same saved ta
       targetCommit: target,
       resumeRunId: runId,
     });
-});
+}
+
+test(
+  "Update capacity recovery reviews Forge trash and resumes the same saved target",
+  updateCapacityRecovery,
+);
+
+test("Update capacity recovery reconnects unavailable cleanup status across navigation before resuming", ({
+  page,
+  isMobile,
+}, testInfo) => updateCapacityRecovery({ page, isMobile }, testInfo, true));
