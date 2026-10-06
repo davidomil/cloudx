@@ -11,7 +11,8 @@ const PLUGINS = "packages/plugin-api/src/index.ts";
 export const SESSION_INTEGRATION_FILES = [STORE, SERVER, SHARED, PANEL, API, CODEX, PLUGINS, CODEX_SOURCES];
 export const SESSION_PERSISTENCE_FILES = ["apps/server/src/workspace/SessionStateStore.ts", "apps/server/src/jsonStateFile.ts",
   ...CODEX_IDENTITY_FILES,
-  "apps/server/src/plugins/CodexConversationRecovery.ts", "apps/server/helpers/codex-conversation-hook.mjs"];
+  "apps/server/src/plugins/CodexConversationRecovery.ts", "apps/server/src/agents/missingTranscript.ts",
+  "apps/server/helpers/codex-conversation-hook.mjs"];
 
 // Give the recognized in-memory release one session authority, using the same
 // saved format as the source and next release. Terminal creation stays explicit.

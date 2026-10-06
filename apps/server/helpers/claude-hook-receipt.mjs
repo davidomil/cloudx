@@ -10,7 +10,7 @@
 // Claude runs Stop hooks in parallel, and another hook can block the stop and
 // continue the same prompt. So Stop only records a pending stop and starts
 // `claude-hook-receipt.mjs --settle <configDir> <stopId>`, which completes the
-// turn once the transcript shows the Stop hooks finished without continuing.
+// turn once the transcript shows that Stop's hooks ended it.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fsyncSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
@@ -25,6 +25,8 @@ const CONVERSATION_RECEIPT = ".cloudx-conversation.json";
 const TURN_RECEIPT = ".cloudx-turn.json";
 const FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
 const PENDING_STOP = ".cloudx-turn-stop.json";
+// Where the current turn's records start in the transcript, and how many Stops it had.
+const TURN_STOPS = ".cloudx-turn-stops.json";
 const MAX_INPUT_BYTES = 1_048_576;
 const MAX_FINAL_TEXT_BYTES = 1024 * 1024;
 const SETTLE_POLL_MS = 200;
@@ -35,6 +37,10 @@ const SETTLE_TIMEOUT_MS = 15 * 60_000;
 const STOP_FEEDBACK_PREFIX = "Stop hook feedback";
 // Attachments Claude Code writes when Stop hook output continues the turn.
 const CONTINUING_ATTACHMENTS = new Set(["hook_additional_context", "hook_blocking_error"]);
+// Claude Code ends the turn anyway once Stop hooks continue it more than
+// this many consecutive times (CLAUDE_CODE_STOP_HOOK_BLOCK_CAP, default 8; 0 or
+// less disables the cap).
+const DEFAULT_STOP_CONTINUATION_CAP = 8;
 
 export function receiptsForEvent(event, payload, binding) {
   if (!payload || typeof payload !== "object" || !CONVERSATION_ID.test(String(payload.session_id ?? ""))) return [];
@@ -128,19 +134,32 @@ function applyEvent(configDir, binding, event, payload, { tab = true } = {}) {
   if (forge) for (const receipt of forgeReceiptsForEvent(event, payload, forge, readJson(forge.receiptPath))) writeAtomicFile(receipt.path, receipt.value);
 }
 
-// Reads what the transcript gained after a Stop: "continued" when a Stop hook
-// blocked or added context, "settled" when the Stop hooks finished without
-// either, else undefined.
-export function stopOutcome(appended) {
-  for (const line of appended.split("\n")) {
+// Reads the turn's transcript records for its stopIndex-th Stop (from 1).
+// "continued" when that Stop's hooks blocked or added context within the cap,
+// "settled" when they ended the turn, else undefined while its summary is
+// missing. `followed` tells whether Claude wrote a response after it.
+export function stopOutcome(turnRecords, stopIndex, cap) {
+  let index = 0;
+  let continued = false;
+  let outcome;
+  let followed = false;
+  for (const line of turnRecords.split("\n")) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
-    if (record?.type === "user" && messageText(record).startsWith(STOP_FEEDBACK_PREFIX)) return "continued";
-    if (record?.type === "attachment" && CONTINUING_ATTACHMENTS.has(record.attachment?.type)) return "continued";
-    if (record?.type === "system" && record.subtype === "stop_hook_summary")
-      return Array.isArray(record.hookAdditionalContext) && record.hookAdditionalContext.length ? "continued" : "settled";
+    if (outcome) {
+      if (record?.type === "assistant") { followed = true; break; }
+      continue;
+    }
+    if (record?.type === "user" && messageText(record).startsWith(STOP_FEEDBACK_PREFIX)) continued = true;
+    if (record?.type === "attachment" && CONTINUING_ATTACHMENTS.has(record.attachment?.type)) continued = true;
+    if (record?.type === "system" && record.subtype === "stop_hook_summary") {
+      index += 1;
+      if (Array.isArray(record.hookAdditionalContext) && record.hookAdditionalContext.length) continued = true;
+      if (index === stopIndex) outcome = continued && !(cap > 0 && stopIndex > cap) ? "continued" : "settled";
+      continued = false;
+    }
   }
-  return undefined;
+  return outcome ? { outcome, followed } : undefined;
 }
 
 function messageText(record) {
@@ -161,19 +180,46 @@ function readFrom(file, offset) {
   finally { closeSync(descriptor); }
 }
 
-// The turn stays running until the settle process sees the Stop hooks finish.
-// A transcript that does not exist yet is read from its start once it does;
-// without any transcript path, only the settle timeout completes the turn.
+function transcriptSize(transcriptPath) {
+  try { return transcriptPath ? statSync(transcriptPath).size : 0; }
+  catch (error) { if (error.code === "ENOENT") return 0; throw error; }
+}
+
+function transcriptPathOf(payload) {
+  return typeof payload?.transcript_path === "string" && path.isAbsolute(payload.transcript_path) ? payload.transcript_path : undefined;
+}
+
+// A prompt starts a turn: its records follow the transcript's current end.
+function recordPrompt(configDir, payload) {
+  if (!CONVERSATION_ID.test(String(payload?.session_id ?? ""))) return;
+  writeAtomicFile(path.join(configDir, TURN_STOPS), {
+    sessionId: payload.session_id, turnId: payload.prompt_id, offset: transcriptSize(transcriptPathOf(payload)), stops: 0
+  });
+}
+
+// The turn stays running until the settle process sees this Stop's hooks
+// finish. Each Stop is matched to its own summary by its position in the turn.
 function recordStop(configDir, binding, payload) {
-  const transcriptPath = typeof payload?.transcript_path === "string" && path.isAbsolute(payload.transcript_path) ? payload.transcript_path : undefined;
-  let offset = 0;
-  try { if (transcriptPath) offset = statSync(transcriptPath).size; }
-  catch (error) { if (error.code !== "ENOENT") throw error; }
+  const transcriptPath = transcriptPathOf(payload);
+  const turnPath = path.join(configDir, TURN_STOPS);
+  const known = readJson(turnPath);
+  const turn = known?.sessionId === payload?.session_id && known?.turnId === payload?.prompt_id
+    ? known
+    // Without the turn's prompt, this Stop's summary is the first after now.
+    : { sessionId: payload?.session_id, turnId: payload?.prompt_id, offset: transcriptSize(transcriptPath), stops: 0 };
+  const stopIndex = turn.stops + 1;
+  writeAtomicFile(turnPath, { ...turn, stops: stopIndex });
+  const cap = Number(process.env.CLAUDE_CODE_STOP_HOOK_BLOCK_CAP ?? DEFAULT_STOP_CONTINUATION_CAP);
   const stopId = randomUUID();
-  writeAtomicFile(path.join(configDir, PENDING_STOP), { stopId, binding, transcriptPath, offset, payload });
+  writeAtomicFile(path.join(configDir, PENDING_STOP), {
+    stopId, binding, transcriptPath, offset: turn.offset, stopIndex, cap: Number.isFinite(cap) ? cap : DEFAULT_STOP_CONTINUATION_CAP, payload
+  });
   spawn(process.execPath, [fileURLToPath(import.meta.url), "--settle", configDir, stopId], { detached: true, stdio: "ignore" }).unref();
 }
 
+// Completes the turn once its Stop settled. A continued Stop leaves the turn
+// to the next Stop; if Claude writes no response after it before the
+// timeout, Claude ended the turn after all, and this Stop completes it.
 async function settle(configDir, stopId) {
   const pendingPath = path.join(configDir, PENDING_STOP);
   const deadline = Date.now() + SETTLE_TIMEOUT_MS;
@@ -181,10 +227,10 @@ async function settle(configDir, stopId) {
     const pending = readJson(pendingPath);
     // A later Stop owns the turn now.
     if (pending?.stopId !== stopId) return;
-    const outcome = stopOutcome(readFrom(pending.transcriptPath, pending.offset));
-    if (outcome || Date.now() > deadline) {
+    const result = stopOutcome(readFrom(pending.transcriptPath, pending.offset), pending.stopIndex, pending.cap);
+    if (result?.outcome === "continued" && result.followed) return;
+    if (result?.outcome === "settled" || Date.now() > deadline) {
       rmSync(pendingPath, { force: true });
-      if (outcome === "continued") return;
       // When a newer prompt already replaced the tab's turn, only the Forge
       // attempt, which tracks its own first turn, still completes.
       const current = readJson(path.join(configDir, TURN_RECEIPT));
@@ -206,6 +252,7 @@ async function main() {
   if (!configDir || !path.isAbsolute(configDir) || !tabId || !CONVERSATION_ID.test(executionId ?? "") || !event) return;
   const payload = JSON.parse(await readStdin());
   if (event === "Stop") return recordStop(configDir, { tabId, executionId }, payload);
+  if (event === "UserPromptSubmit") recordPrompt(configDir, payload);
   applyEvent(configDir, { tabId, executionId }, event, payload);
 }
 

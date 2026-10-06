@@ -131,10 +131,26 @@ describe("Claude overlay and hook receipts", () => {
 });
 
 describe("Claude Forge turn receipts", () => {
-  async function hook(configDir: string, event: string, payload: Record<string, unknown>) {
+  async function hook(configDir: string, event: string, payload: Record<string, unknown>, env: NodeJS.ProcessEnv = {}) {
     const input = JSON.stringify(payload).replaceAll("'", "'\\''");
-    await run("sh", ["-c", `printf '%s' '${input}' | ${process.execPath} ${HELPER} ${configDir} tab-1 ${EXECUTION} ${event}`]);
+    await run("sh", ["-c", `printf '%s' '${input}' | ${process.execPath} ${HELPER} ${configDir} tab-1 ${EXECUTION} ${event}`], { env: { ...process.env, ...env } });
   }
+  async function forgeAttempt() {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
+    const receiptPath = path.join(root, "attempt-1.json");
+    const transcript = path.join(root, "t.jsonl");
+    await fs.writeFile(path.join(root, ".cloudx-forge-turn.json"), JSON.stringify({ workerId: "issue-1", attemptId: "attempt-1", receiptPath, expectedThreadId: SESSION }));
+    return {
+      root, receiptPath, transcript,
+      base: { session_id: SESSION, cwd: root, transcript_path: transcript, prompt_id: "p1" },
+      record: (value: unknown) => `${JSON.stringify(value)}\n`,
+      receipt: async () => JSON.parse(await fs.readFile(receiptPath, "utf8")),
+      final: async () => JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))
+    };
+  }
+  const feedback = { type: "user", message: { role: "user", content: "Stop hook feedback:\n[check] Run the tests first." } };
+  const summary = (context: string[] = []) => ({ type: "system", subtype: "stop_hook_summary", hookCount: 2, hookAdditionalContext: context });
+  const response = (text: string) => ({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
 
   it("records the first turn of an attempt and its final response", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
@@ -202,6 +218,31 @@ describe("Claude Forge turn receipts", () => {
     await append({ type: "system", subtype: "stop_hook_summary", hookCount: 1, hookAdditionalContext: [] });
     await vi.waitFor(async () => expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ status: "completed" }), { timeout: 5_000 });
     expect(JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))).toMatchObject({ text: "Final response." });
+  });
+
+  it("matches each Stop to its own summary when the transcript appears only after both", async () => {
+    const { root, transcript, base, record, receipt, final } = await forgeAttempt();
+    await hook(root, "UserPromptSubmit", base);
+    // Two quick responses; Claude flushes the transcript only afterwards.
+    await hook(root, "Stop", { ...base, last_assistant_message: "Interim." });
+    await hook(root, "Stop", { ...base, last_assistant_message: "Final." });
+    await fs.writeFile(transcript, record(response("Interim.")) + record(feedback) + record(summary()) + record(response("Final.")) + record(summary()));
+    await vi.waitFor(async () => expect(await receipt()).toMatchObject({ status: "completed" }), { timeout: 5_000 });
+    expect(await final()).toMatchObject({ text: "Final." });
+  });
+
+  it("completes when Claude ends the turn at its Stop continuation cap", async () => {
+    const { root, transcript, base, record, receipt, final } = await forgeAttempt();
+    const cap = { CLAUDE_CODE_STOP_HOOK_BLOCK_CAP: "1" };
+    await fs.writeFile(transcript, "");
+    await hook(root, "UserPromptSubmit", base);
+    await hook(root, "Stop", { ...base, last_assistant_message: "First." }, cap);
+    await fs.appendFile(transcript, record(feedback) + record(summary()) + record(response("Second.")));
+    // The second block exceeds the cap of one, so Claude ends the turn.
+    await hook(root, "Stop", { ...base, last_assistant_message: "Second." }, cap);
+    await fs.appendFile(transcript, record(feedback) + record(summary()));
+    await vi.waitFor(async () => expect(await receipt()).toMatchObject({ status: "completed" }), { timeout: 5_000 });
+    expect(await final()).toMatchObject({ text: "Second." });
   });
 
   it("ignores another conversation and records API failures", async () => {
