@@ -55,22 +55,23 @@ describe("claudeLaunchEnv", () => {
 });
 
 describe("Claude overlay and hook receipts", () => {
-  it("overrides credential variables the shared settings env sets with the selected account's", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-shared-env-"));
+  it("overrides every account variable with the launch environment's, whatever settings file sets it", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-account-env-"));
     const providerHome = path.join(root, "home", ".claude");
     const accountHome = path.join(root, "account");
-    await Promise.all([providerHome, accountHome].map(directory => fs.mkdir(directory, { recursive: true })));
-    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "shared", ANTHROPIC_BASE_URL: "https://proxy.invalid", DISABLE_TELEMETRY: "1" } }));
+    await Promise.all([providerHome, accountHome, path.join(root, ".claude")].map(directory => fs.mkdir(directory, { recursive: true })));
+    // The user's settings are empty; a trusted project sets a key of its own.
+    await fs.writeFile(path.join(providerHome, "settings.json"), "{}");
+    await fs.writeFile(path.join(root, ".claude", "settings.local.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "project" } }));
     const options = { dataDir: path.join(root, "data"), tabId: "tab-1", accountHome, providerHome, executionId: EXECUTION, cwd: root };
+    const env = async (launchEnv: NodeJS.ProcessEnv) => JSON.parse(await fs.readFile((await materializeClaudeHomeOverlay({ ...options, launchEnv })).settingsPath, "utf8")).env;
 
-    const subscription = await materializeClaudeHomeOverlay(options);
-    expect(JSON.parse(await fs.readFile(subscription.settingsPath, "utf8")).env).toEqual({ ANTHROPIC_API_KEY: "", ANTHROPIC_BASE_URL: "" });
-    const apiKey = await materializeClaudeHomeOverlay({ ...options, accountEnv: { ANTHROPIC_API_KEY: "selected" } });
-    expect(JSON.parse(await fs.readFile(apiKey.settingsPath, "utf8")).env).toEqual({ ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "" });
-    expect((await fs.stat(apiKey.settingsPath)).mode & 0o777).toBe(0o600);
-
-    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { DISABLE_TELEMETRY: "1" } }));
-    expect(JSON.parse(await fs.readFile((await materializeClaudeHomeOverlay(options)).settingsPath, "utf8")).env).toBeUndefined();
+    const configDir = path.join(root, "data", "claude-launches", "tab-1");
+    const cleared = { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "", CLAUDE_CODE_OAUTH_TOKEN: "", ANTHROPIC_BASE_URL: "", CLAUDE_CODE_USE_BEDROCK: "", CLAUDE_CODE_USE_VERTEX: "", CLAUDE_CODE_USE_FOUNDRY: "", CLAUDE_CONFIG_DIR: configDir };
+    expect(await env({ PATH: "/bin" })).toEqual(cleared);
+    // A selected API key, and an endpoint the CloudX process itself runs with, are kept.
+    expect(await env({ ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "https://gateway.example" })).toEqual({ ...cleared, ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "https://gateway.example" });
+    expect((await fs.stat(path.join(configDir, ".cloudx-settings.json"))).mode & 0o777).toBe(0o600);
   });
 
   it("links account credentials and the shared session store, and records hook receipts", async () => {
@@ -149,7 +150,10 @@ describe("Claude Forge turn receipts", () => {
     expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ turnId: "p1", status: "running" });
 
     await hook(root, "Stop", { ...base, prompt_id: "p1", last_assistant_message: "Done. Report written." });
-    expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ turnId: "p1", status: "completed" });
+    // The transcript did not exist at the Stop; its summary still settles the turn.
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ turnId: "p1", status: "running" });
+    await fs.writeFile(base.transcript_path, `${JSON.stringify({ type: "system", subtype: "stop_hook_summary", hookCount: 1, hookAdditionalContext: [] })}\n`);
+    await vi.waitFor(async () => expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ turnId: "p1", status: "completed" }), { timeout: 5_000 });
     expect(JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))).toMatchObject({ turnId: "p1", status: "completed", text: "Done. Report written." });
   });
 
@@ -176,6 +180,28 @@ describe("Claude Forge turn receipts", () => {
     await append({ type: "system", subtype: "stop_hook_summary", hookCount: 2 });
     await vi.waitFor(async () => expect(await receipt()).toMatchObject({ status: "completed" }), { timeout: 5_000 });
     expect(JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))).toMatchObject({ text: "Tests pass. Done." });
+  });
+
+  it("keeps the turn running when a Stop hook adds context and the turn continues", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
+    const receiptPath = path.join(root, "attempt-1.json");
+    const transcript = path.join(root, "t.jsonl");
+    await fs.writeFile(transcript, "");
+    await fs.writeFile(path.join(root, ".cloudx-forge-turn.json"), JSON.stringify({ workerId: "issue-1", attemptId: "attempt-1", receiptPath, expectedThreadId: SESSION }));
+    const base = { session_id: SESSION, cwd: root, transcript_path: transcript, prompt_id: "p1" };
+    const append = (record: unknown) => fs.appendFile(transcript, `${JSON.stringify(record)}\n`);
+    await hook(root, "UserPromptSubmit", base);
+    await hook(root, "Stop", { ...base, last_assistant_message: "Interim response." });
+    // As Claude Code 2.1.289 records hookSpecificOutput.additionalContext from a Stop hook.
+    await append({ type: "attachment", attachment: { type: "hook_additional_context" } });
+    await append({ type: "system", subtype: "stop_hook_summary", hookCount: 1, hookAdditionalContext: ["Also run the tests."] });
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ status: "running" });
+
+    await hook(root, "Stop", { ...base, last_assistant_message: "Final response." });
+    await append({ type: "system", subtype: "stop_hook_summary", hookCount: 1, hookAdditionalContext: [] });
+    await vi.waitFor(async () => expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ status: "completed" }), { timeout: 5_000 });
+    expect(JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))).toMatchObject({ text: "Final response." });
   });
 
   it("ignores another conversation and records API failures", async () => {

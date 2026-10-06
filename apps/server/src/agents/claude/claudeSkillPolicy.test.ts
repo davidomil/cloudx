@@ -36,9 +36,15 @@ async function fixture() {
   await fs.writeFile(path.join(repo, ".claude", "commands", "frontend", "component.md"), "Build a component.\n");
   await fs.mkdir(path.join(providerHome, "commands"), { recursive: true });
   await fs.writeFile(path.join(providerHome, "commands", "legacy.md"), "Old command.\n");
-  // Ignored directories are not scanned.
-  await fs.writeFile(path.join(repo, ".gitignore"), "node_modules/\n");
+  // Claude Code reads ignored and symlinked skills from the filesystem too.
+  await fs.writeFile(path.join(repo, ".gitignore"), "node_modules/\n.claude/skills/private/\n");
   await skill(path.join(repo, "node_modules", "pkg", ".claude", "skills", "vendored"));
+  await skill(path.join(repo, ".claude", "skills", "private"));
+  await skill(path.join(root, "shared-skills", "linked"));
+  await fs.symlink(path.join(root, "shared-skills", "linked"), path.join(repo, ".claude", "skills", "linked"));
+  await fs.mkdir(path.join(cwd, ".claude", "commands"), { recursive: true });
+  await fs.writeFile(path.join(root, "shared-command.md"), "Shared.\n");
+  await fs.symlink(path.join(root, "shared-command.md"), path.join(cwd, ".claude", "commands", "shared.md"));
   // A frontmatter name does not rename a skill; Claude Code uses the directory.
   await skill(path.join(repo, ".claude", "skills", "cloudx-system-create-cloudx-skill"), "jira");
   await skill(path.join(cwd, ".claude", "skills", "local-tool"));
@@ -67,10 +73,10 @@ describe("Claude skill policy", () => {
         autoMemoryEnabled: false,
         syncClaudeAiPlugins: false,
         syncClaudeAiSkills: false,
-        // Project skills from the working directory up to the repository root.
+        // Every skill and command Claude Code could load in the repository.
         skillOverrides: {
-          ...BUILT_IN, deploy: "off", docx: "off", "frontend:component": "off", legacy: "off", "local-tool": "off",
-          "nested-deploy": "off", notes: "off", pdf: "off"
+          ...BUILT_IN, deploy: "off", docx: "off", "frontend:component": "off", legacy: "off", linked: "off", "local-tool": "off",
+          "nested-deploy": "off", notes: "off", pdf: "off", private: "off", shared: "off", vendored: "off"
         },
         enabledPlugins: { "format@market": false, "review@market": false }
       },
@@ -86,7 +92,8 @@ describe("Claude skill policy", () => {
     expect(policy.linkSynced).toBe(true);
     expect(policy.settings.syncClaudeAiSkills).toBeUndefined();
     expect(policy.settings.skillOverrides).toEqual({
-      ...BUILT_IN, "cloudx-system-create-cloudx-skill": "off", deploy: "off", "frontend:component": "off", "local-tool": "off", "nested-deploy": "off", pdf: "off"
+      ...BUILT_IN, "cloudx-system-create-cloudx-skill": "off", deploy: "off", "frontend:component": "off", linked: "off", "local-tool": "off",
+      "nested-deploy": "off", pdf: "off", private: "off", shared: "off", vendored: "off"
     });
   });
 

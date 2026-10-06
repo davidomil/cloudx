@@ -87,34 +87,46 @@ export async function discoverClaudeUserSkills(providerHome: string): Promise<Cl
 }
 
 // Names of the project skills and commands Claude Code can load in this
-// session: anywhere in the repository, since nested ones load once Claude
-// works in their directory, plus the main checkout's skills for a linked
-// worktree without its own (Claude Code 2.1.277 and later).
+// session. At startup it reads .claude/ from the working directory up to the
+// repository root, and, in a linked worktree without root skills, the main
+// checkout's skills (Claude Code 2.1.277 and later); those directories are read
+// from the filesystem, so ignored and symlinked skills count. Nested ones load
+// once Claude works in their directory; Git lists those, ignored ones included.
 async function discoverProjectSkills(cwd: string): Promise<{ names: string[]; settingsDirectories: string[] }> {
   const start = path.resolve(cwd);
-  const root = await git(start, ["rev-parse", "--show-toplevel"]);
-  if (!root) {
-    const names = [...await skillsIn(path.join(start, ".claude", "skills")), ...(await commandsIn(path.join(start, ".claude", "commands"))).map(command => command.name)];
-    return { names, settingsDirectories: [start] };
+  const root = (await git(start, ["rev-parse", "--show-toplevel"]))?.trim();
+  const startup = root ? directoriesUpTo(start, root) : [start];
+  if (root) {
+    const common = await git(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    const main = common ? path.dirname(common.trim()) : root;
+    if (main !== root && !fs.existsSync(path.join(root, ".claude", "skills"))) startup.push(main);
   }
-  const repository = root.trim();
-  const listed = await git(repository, [
-    "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
-    ":(glob)**/.claude/skills/*/SKILL.md", ":(glob)**/.claude/commands/**/*.md"
-  ]) ?? "";
-  const names = listed.split("\0").filter(Boolean).flatMap(file => projectSkillName(file));
-  const common = await git(repository, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  const main = common ? path.dirname(common.trim()) : repository;
-  if (main !== repository && !fs.existsSync(path.join(repository, ".claude", "skills"))) names.push(...await skillsIn(path.join(main, ".claude", "skills")));
-  return { names, settingsDirectories: directoriesUpTo(start, repository) };
+  const names: string[] = [];
+  for (const directory of startup) {
+    names.push(...await skillsIn(path.join(directory, ".claude", "skills")));
+    names.push(...(await commandsIn(path.join(directory, ".claude", "commands"))).map(command => command.name));
+  }
+  if (root) {
+    const patterns = ["--", ":(glob)**/.claude/skills/*", ":(glob)**/.claude/skills/*/SKILL.md", ":(glob)**/.claude/commands/**/*.md"];
+    const listed = [
+      await git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", ...patterns]),
+      await git(root, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", ...patterns])
+    ].join("\0");
+    for (const file of new Set(listed.split("\0").filter(Boolean))) names.push(...await projectSkillName(root, file));
+  }
+  return { names, settingsDirectories: root ? directoriesUpTo(start, root) : [start] };
 }
 
-function projectSkillName(file: string): string[] {
+async function projectSkillName(root: string, file: string): Promise<string[]> {
   const parts = file.split("/");
   const at = parts.lastIndexOf(".claude");
   if (at < 0) return [];
   const [kind, ...rest] = parts.slice(at + 1);
-  const name = kind === "skills" ? rest[0] : kind === "commands" ? rest.join(":").replace(/\.md$/u, "") : undefined;
+  let name: string | undefined;
+  // A direct entry of skills/ is a skill when it holds a SKILL.md, as a
+  // symlinked skill directory does; Git does not list files behind the link.
+  if (kind === "skills" && (rest.length > 1 || await isFile(path.join(root, file, "SKILL.md")))) name = rest[0];
+  else if (kind === "commands") name = rest.join(":").replace(/\.md$/u, "");
   return name && CLAUDE_SKILL_NAME_PATTERN.test(name) ? [name] : [];
 }
 

@@ -93,15 +93,15 @@ export class ClaudeTerminal {
         throw new Error("Forge workers on Claude run without permission prompts. Accept Claude Code's bypass-permissions warning in Settings → Claude, then resume the worker.");
       account = await accounts.resolve("claude", agent.accountId);
       accountEnv = await accounts.launchEnv(account);
+      env = claudeLaunchEnv(buildToolEnv(this.env), configDir, accountEnv);
       overlayInput = {
         dataDir, tabId: input.tab.id, accountHome: accounts.home(account), providerHome: this.providerHome, executionId,
         resolved: template, cwd: input.cwd, userStatePath: claudeUserStatePath(this.env),
         trustProject: Boolean(await input.authorizeProjectTrust?.()) || settings.autoTrustWorkspace,
         allowedSkills: current.skills.filter(skill => skill.allowed).map(skill => skill.name),
-        accountEnv
+        launchEnv: env
       };
       overlay = await materializeClaudeHomeOverlay(overlayInput);
-      env = claudeLaunchEnv(buildToolEnv(this.env), configDir, accountEnv);
       applyTemplateEnv(env, template, overlay.rulesSkillsRoot, overlay.systemRules.map(rule => rule.id));
     } catch (error) {
       throw new PluginSessionNotStartedError(error);

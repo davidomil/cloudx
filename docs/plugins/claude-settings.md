@@ -88,9 +88,10 @@ Each Claude tab runs on the account chosen for it. The tab's
 configuration directory and the account's credentials are applied again
 after your login shell profile runs, so a profile that exports
 `ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` does not change the account.
-If the `env` block of `~/.claude/settings.json` sets a credential or
-endpoint variable, such as `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL`,
-CloudX tabs replace it with the selected account's value, or clear it.
+Credential and endpoint variables, such as `ANTHROPIC_API_KEY` or
+`ANTHROPIC_BASE_URL`, set in the `env` block of any settings file (yours
+or the project's) are replaced with the selected account's value, or
+cleared. An endpoint the CloudX service itself runs with is kept.
 
 ## Bypass permissions warning
 

@@ -33,6 +33,8 @@ const SETTLE_POLL_MS = 200;
 const SETTLE_TIMEOUT_MS = 15 * 60_000;
 // Claude Code writes this user record when a Stop hook blocks and the turn continues.
 const STOP_FEEDBACK_PREFIX = "Stop hook feedback";
+// Attachments Claude Code writes when Stop hook output continues the turn.
+const CONTINUING_ATTACHMENTS = new Set(["hook_additional_context", "hook_blocking_error"]);
 
 export function receiptsForEvent(event, payload, binding) {
   if (!payload || typeof payload !== "object" || !CONVERSATION_ID.test(String(payload.session_id ?? ""))) return [];
@@ -120,20 +122,23 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function applyEvent(configDir, binding, event, payload) {
-  for (const receipt of receiptsForEvent(event, payload, binding)) writeAtomicFile(path.join(configDir, receipt.name), receipt.value);
+function applyEvent(configDir, binding, event, payload, { tab = true } = {}) {
+  if (tab) for (const receipt of receiptsForEvent(event, payload, binding)) writeAtomicFile(path.join(configDir, receipt.name), receipt.value);
   const forge = readForgeBinding(configDir);
   if (forge) for (const receipt of forgeReceiptsForEvent(event, payload, forge, readJson(forge.receiptPath))) writeAtomicFile(receipt.path, receipt.value);
 }
 
 // Reads what the transcript gained after a Stop: "continued" when a Stop hook
-// blocked, "settled" when the Stop hooks finished, else undefined.
+// blocked or added context, "settled" when the Stop hooks finished without
+// either, else undefined.
 export function stopOutcome(appended) {
   for (const line of appended.split("\n")) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
     if (record?.type === "user" && messageText(record).startsWith(STOP_FEEDBACK_PREFIX)) return "continued";
-    if (record?.type === "system" && record.subtype === "stop_hook_summary") return "settled";
+    if (record?.type === "attachment" && CONTINUING_ATTACHMENTS.has(record.attachment?.type)) return "continued";
+    if (record?.type === "system" && record.subtype === "stop_hook_summary")
+      return Array.isArray(record.hookAdditionalContext) && record.hookAdditionalContext.length ? "continued" : "settled";
   }
   return undefined;
 }
@@ -145,7 +150,10 @@ function messageText(record) {
 }
 
 function readFrom(file, offset) {
-  const size = statSync(file).size;
+  if (!file) return "";
+  let size;
+  try { size = statSync(file).size; }
+  catch (error) { if (error.code === "ENOENT") return ""; throw error; }
   if (size <= offset) return "";
   const buffer = Buffer.alloc(Math.min(size - offset, MAX_INPUT_BYTES * 16));
   const descriptor = openSync(file, "r");
@@ -153,13 +161,14 @@ function readFrom(file, offset) {
   finally { closeSync(descriptor); }
 }
 
+// The turn stays running until the settle process sees the Stop hooks finish.
+// A transcript that does not exist yet is read from its start once it does;
+// without any transcript path, only the settle timeout completes the turn.
 function recordStop(configDir, binding, payload) {
-  const transcriptPath = payload?.transcript_path;
-  let offset;
-  try { offset = typeof transcriptPath === "string" && path.isAbsolute(transcriptPath) ? statSync(transcriptPath).size : undefined; }
-  catch { offset = undefined; }
-  // Without a transcript to watch, the Stop completes the turn as it arrives.
-  if (offset === undefined) return applyEvent(configDir, binding, "Stop", payload);
+  const transcriptPath = typeof payload?.transcript_path === "string" && path.isAbsolute(payload.transcript_path) ? payload.transcript_path : undefined;
+  let offset = 0;
+  try { if (transcriptPath) offset = statSync(transcriptPath).size; }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
   const stopId = randomUUID();
   writeAtomicFile(path.join(configDir, PENDING_STOP), { stopId, binding, transcriptPath, offset, payload });
   spawn(process.execPath, [fileURLToPath(import.meta.url), "--settle", configDir, stopId], { detached: true, stdio: "ignore" }).unref();
@@ -176,10 +185,11 @@ async function settle(configDir, stopId) {
     if (outcome || Date.now() > deadline) {
       rmSync(pendingPath, { force: true });
       if (outcome === "continued") return;
-      // A newer prompt replaced the turn this Stop belonged to.
+      // When a newer prompt already replaced the tab's turn, only the Forge
+      // attempt, which tracks its own first turn, still completes.
       const current = readJson(path.join(configDir, TURN_RECEIPT));
-      if (current && (current.sessionId !== pending.payload.session_id || current.turnId !== pending.payload.prompt_id)) return;
-      return applyEvent(configDir, pending.binding, "Stop", pending.payload);
+      const tab = !current || (current.sessionId === pending.payload.session_id && current.turnId === pending.payload.prompt_id);
+      return applyEvent(configDir, pending.binding, "Stop", pending.payload, { tab });
     }
     await sleep(SETTLE_POLL_MS);
   }
