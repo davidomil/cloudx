@@ -17,6 +17,7 @@ export const historicalDependencyPackages = [
   "fastify@5.10.0",
   "process-warning@5.0.0",
   "smol-toml@1.7.0",
+  "source-map-js@1.2.1",
   "vitest@4.1.6",
 ];
 
