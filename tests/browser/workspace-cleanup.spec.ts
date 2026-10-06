@@ -1,21 +1,93 @@
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import type {
-  WorkspaceCleanupJob,
-  WorkspaceCleanupPreview,
-  WorkspaceCleanupRequest,
+  CloudxUpdateBackup,
+  CloudxUpdateBackupCleanup,
+  CloudxUpdateBackupPreview,
+  CloudxUpdatePreview,
+  CloudxUpdateStatus,
 } from "@cloudx/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+
 const repoRoot = path.resolve(import.meta.dirname, "../..");
+const timestamp = "2026-10-03T22:35:00Z";
+const savedTarget = "c".repeat(40);
+const savedRunId = "11111111-1111-4111-8111-111111111111";
+const savedUpdateRequest = {
+  channel: "main",
+  targetCommit: savedTarget,
+  resumeRunId: savedRunId,
+};
+const preview: CloudxUpdatePreview = {
+  channel: "main",
+  currentCommit: "a".repeat(40),
+  runtime: {
+    verification: "verified",
+    commit: "a".repeat(40),
+    builtAt: timestamp,
+    sourceDirty: false,
+  },
+  checkedAt: timestamp,
+  state: "available",
+  target: {
+    commit: "b".repeat(40),
+    name: "main",
+    url: `https://github.com/davidomil/cloudx/commit/${"b".repeat(40)}`,
+  },
+  changelog: [],
+  changelogComplete: true,
+};
+const backup: CloudxUpdateBackup = {
+  id: "22222222-2222-4222-8222-222222222222:snapshot",
+  runId: "22222222-2222-4222-8222-222222222222",
+  kind: "snapshot",
+  sourceCommit: "a".repeat(40),
+  targetCommit: "b".repeat(40),
+  createdAt: timestamp,
+  outcome: "succeeded",
+  path: "/recovery/updates/retained-snapshot-with-a-long-directory-name",
+  logicalBytes: 16 * 1024 ** 3,
+  allocatedBytes: 16 * 1024 ** 3,
+  reclaimableBytes: 16 * 1024 ** 3,
+};
+const backupPreview: CloudxUpdateBackupPreview = {
+  id: "33333333-3333-4333-8333-333333333333",
+  createdAt: timestamp,
+  backups: [backup],
+  reclaimableBytes: backup.reclaimableBytes!,
+  estimateNote:
+    "Shared files are counted once. Actual reclaimed space may differ.",
+};
 let testRoot: string;
 let baseUrl: string;
 let server: ChildProcess;
 let serverLogs = "";
+let apiRequests: Array<{ method: string; path: string; body: unknown }>;
+let pageErrors: string[];
+
 test.beforeEach(async ({ page }) => {
   serverLogs = "";
+  apiRequests = [];
+  pageErrors = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.startsWith("/api/"))
+      apiRequests.push({
+        method: request.method(),
+        path: pathname,
+        body: request.postDataJSON(),
+      });
+  });
+  await page.route(/\/api\/system\/workspace-cleanup(?:[/?]|$)/, (route) =>
+    route.fulfill({
+      status: 410,
+      json: { message: "Manual cleanup was removed." },
+    }),
+  );
   testRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "cloudx-workspace-cleanup-"),
   );
@@ -96,8 +168,20 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/api/forge/checkout-evidence", (route) =>
     route.fulfill({ json: { archives: [] } }),
   );
+  await page.route("**/api/forge/git-history", (route) =>
+    route.fulfill({ json: { archives: [] } }),
+  );
+  await page.route("**/api/system/update", (route) =>
+    route.fulfill({ json: { available: true } }),
+  );
+  await page.route("**/api/system/update/preview", (route) =>
+    route.fulfill({ json: preview }),
+  );
   await page.route("**/api/system/update/backups", (route) =>
-    route.fulfill({ json: { backups: [] } }),
+    route.fulfill({ json: { backups: [backup] } }),
+  );
+  await page.route("**/api/system/update/backups/preview", (route) =>
+    route.fulfill({ json: backupPreview }),
   );
   await page.route("**/api/system/update/backups/cleanup", (route) =>
     route.fulfill({ json: null }),
@@ -124,593 +208,452 @@ test.afterEach(async ({}, testInfo) => {
     contentType: "text/plain",
   });
   if (testRoot) await fs.rm(testRoot, { recursive: true, force: true });
+  expect(
+    apiRequests.filter((request) =>
+      /workspace-cleanup|evidence-decision/.test(request.path),
+    ),
+  ).toEqual([]);
+  expect(pageErrors).toEqual([]);
 });
 
-test("Settings opens canonical Environments cleanup and retains its deletion job across Forge sections at every viewport", async ({
-  page,
-  isMobile,
-}, testInfo) => {
-  const firstId = "11111111-1111-1111-1111-111111111111";
-  const retainedId = "22222222-2222-2222-2222-222222222222";
-  const longPath =
-    "/home/developer/projects/cloudx/.cloudx/forge-workers/checkouts/retained-batch-with-an-extremely-long-directory-name";
-  const preview: WorkspaceCleanupPreview = {
-    id: "33333333-3333-3333-3333-333333333333",
-    createdAt: new Date().toISOString(),
-    reclaimableBytes: 4 * 1024 ** 3,
-    reclaimGroups: [
-      { bytes: 4 * 1024 ** 3, candidateIds: [firstId] },
-      { bytes: 1024 ** 3, candidateIds: [retainedId] },
-    ],
-    availableBytes: 1024 ** 3,
-    warnings: [],
-    candidates: [
-      {
-        id: firstId,
-        path: "/work/merged-checkout",
-        repository: "team/completed-project",
-        kind: "forge",
-        state: "completed",
-        lastActivity: "2026-09-27T00:00:00Z",
-        allocatedBytes: 4 * 1024 ** 3,
-        eligible: true,
-        reason: "Completed and inactive. Ignored dependencies can be deleted.",
-        sourceChanges: [],
-        unpublishedCommits: 0,
-        requiresDiscard: false,
-      },
-      {
-        id: retainedId,
-        path: longPath,
-        repository: "team/project-with-a-long-name-for-layout-review",
-        kind: "forge",
-        state: "completed",
-        lastActivity: "2026-09-27T00:00:00Z",
-        allocatedBytes: 1024 ** 3,
-        eligible: true,
-        reason: "Preserved by default.",
-        sourceChanges: ["source/unfinished.ts", "debug_tooling/notes.md"],
-        unpublishedCommits: 1,
-        requiresDiscard: true,
-      },
-      {
-        id: "44444444-4444-4444-4444-444444444444",
-        path: "/work/active-batch",
-        repository: "team/active-project",
-        kind: "forge",
-        state: "paused",
-        lastActivity: "2026-09-28T00:00:00Z",
-        allocatedBytes: 1024 ** 3,
-        eligible: false,
-        reason: "An unfinished worker or reviewer still needs this checkout.",
-        sourceChanges: [],
-        unpublishedCommits: 0,
-        requiresDiscard: false,
-      },
-    ],
-  };
-  let request: WorkspaceCleanupRequest | undefined;
-  let status: WorkspaceCleanupJob | null = null;
-  let finish = false;
-  await page.route("**/api/system/workspace-cleanup/preview", (route) =>
-    route.fulfill({ json: preview }),
-  );
-  await page.route("**/api/system/workspace-cleanup", async (route) => {
-    if (route.request().method() === "POST") {
-      request = route.request().postDataJSON();
-      status = {
-        id: "55555555-5555-5555-5555-555555555555",
-        state: "running",
-        startedAt: new Date().toISOString(),
-        availableBytesBefore: preview.availableBytes,
-        results: [
-          {
-            id: firstId,
-            path: preview.candidates[0]!.path,
-            status: "deleting",
-            reason: "Revalidating ownership, working files and activity.",
-          },
-        ],
-      };
-      await route.fulfill({ status: 202, json: status });
-    } else {
-      if (finish && status)
-        status = {
-          ...status,
-          state: "completed",
-          availableBytesAfter: 5 * 1024 ** 3,
-          results: status.results.map((item) => ({
-            ...item,
-            status: "deleted",
-            reason: "Permanently deleted; workspace metadata reconciled.",
-          })),
-        };
-      await route.fulfill({ json: status });
-    }
-  });
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await expect(page.locator(".workspace-pane").first()).toBeVisible();
+async function openSettings(page: Page, isMobile: boolean) {
   if (isMobile) {
     await page
       .getByRole("button", { name: "Workspace actions", exact: true })
       .click();
     await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
   } else
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page
+      .locator(".topbar")
+      .getByRole("button", { name: "Settings", exact: true })
+      .click();
   const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
-  await dialog
-    .getByRole("searchbox", { name: "Search settings" })
-    .fill("old workspaces");
+  await expect(dialog).toBeVisible();
+  return dialog;
+}
+
+async function expectManualCleanupAbsent(page: Page) {
+  for (const name of [
+    "Open workspace management",
+    "Manage Forge environments",
+    "Scan workspaces and environments",
+    "Environments",
+  ])
+    await expect(
+      page.getByRole("button", { name, exact: true, includeHidden: true }),
+    ).toHaveCount(0);
   await expect(
-    dialog.getByRole("region", { name: "Workspace cleanup" }),
+    page.getByRole("tab", {
+      name: "Workspaces",
+      exact: true,
+      includeHidden: true,
+    }),
   ).toHaveCount(0);
-  await dialog
-    .getByRole("button", { name: "Open workspace management", exact: true })
-    .click();
-  await expect(dialog).toHaveCount(0);
-  const forge = page.getByRole("region", { name: "Forge", exact: true });
-  const cleanup = forge.getByRole("region", {
-    name: "Workspace cleanup",
-    exact: true,
-  });
   await expect(
-    cleanup.getByRole("combobox", { name: "Workspace filter" }),
-  ).toHaveValue("all");
-  await cleanup
-    .getByRole("button", { name: "Scan workspaces and environments" })
-    .click();
-  await expect(
-    cleanup.getByRole("checkbox", {
-      name: `Select ${preview.candidates[0]!.path}`,
+    page.getByRole("region", {
+      name: "Workspace cleanup",
       exact: true,
+      includeHidden: true,
     }),
-  ).toBeChecked();
-  await expect(
-    cleanup.getByRole("checkbox", { name: `Select ${longPath}`, exact: true }),
-  ).not.toBeChecked();
-  await expect(
-    cleanup.getByRole("checkbox", {
-      name: "Select /work/active-batch",
-      exact: true,
-    }),
-  ).toBeDisabled();
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth + 1,
-    ),
-  ).toBe(true);
-  const retainedCheckbox = cleanup.getByRole("checkbox", {
-    name: `Select ${longPath}`,
-    exact: true,
-  });
-  await retainedCheckbox.scrollIntoViewIfNeeded();
-  expect((await retainedCheckbox.boundingBox())!.width).toBeLessThan(24);
-  expect(
-    await cleanup
-      .locator(".workspace-cleanup-choice strong")
-      .first()
-      .evaluate((element) => element.getBoundingClientRect().width),
-  ).toBeGreaterThan(80);
-  await page.screenshot({
-    path: testInfo.outputPath("workspace-cleanup-preview.png"),
-    fullPage: true,
-  });
-  const review = cleanup.getByRole("button", {
-    name: "Review deletion of 1 workspace",
-    exact: true,
-  });
-  await review.focus();
-  await page.keyboard.press("Enter");
-  await expect(
-    cleanup.getByRole("group", { name: "Confirm permanent deletion" }),
-  ).toContainText("cannot be recovered");
-  await cleanup
-    .getByRole("button", { name: "Delete permanently", exact: true })
-    .click();
-  await expect(
-    cleanup.getByRole("progressbar", { name: "Workspace cleanup progress" }),
-  ).toBeVisible();
-  expect(request?.candidateIds).toEqual([firstId]);
-  expect(request?.discardCandidateIds).toEqual([]);
-  await page.screenshot({
-    path: testInfo.outputPath("workspace-cleanup-progress.png"),
-    fullPage: true,
-  });
-  await forge.getByRole("button", { name: "Issues", exact: true }).click();
-  await expect(cleanup).toHaveCount(0);
-  await forge
-    .getByRole("button", { name: "Environments", exact: true })
-    .click();
-  await expect(
-    cleanup.getByRole("progressbar", { name: "Workspace cleanup progress" }),
-  ).toBeVisible();
-  finish = true;
-  await expect(
-    cleanup.getByRole("heading", { name: "Cleanup results" }),
-  ).toBeVisible();
-  await expect(cleanup).toContainText("5.00 GiB available after cleanup");
-  await expect(cleanup).toContainText("deleted");
-  await page.screenshot({
-    path: testInfo.outputPath("workspace-cleanup-results.png"),
-    fullPage: true,
-  });
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= innerWidth + 1,
-    ),
-  ).toBe(true);
-});
+  ).toHaveCount(0);
+}
 
-async function updateCapacityRecovery(
-  { page, isMobile }: { page: Page; isMobile: boolean },
-  testInfo: TestInfo,
-  disconnectCleanupStatus = false,
-) {
-  const target = "c".repeat(40);
-  const runId = "11111111-1111-4111-8111-111111111111";
-  const candidateId = "22222222-2222-4222-8222-222222222222";
-  const timestamp = "2026-10-03T22:35:00Z";
-  const requiredBytes = 40859257735;
-  let availableBytes = 27225911296;
-  let cleanup: WorkspaceCleanupJob | null = null;
-  let finishCleanup = false;
-  let cleanupStatusReads = 0;
-  let runningStatusReads = 0;
-  let statusDisconnected = false;
-  let capacityChecks = 0;
-  let resume: Record<string, unknown> | undefined;
-  const updateStatus = () => ({
-    available: true,
-    run: {
-      id: runId,
-      state: "failed",
-      targetCommit: target,
-      resumable: true,
-      message: "Update stopped; the previous installation is retained.",
-      startedAt: timestamp,
-      component: "capacity",
-      capacity: {
-        stage: "build-staging",
-        checkedAt: timestamp,
-        filesystems: [
-          {
-            device: "1",
-            mount: "/recovery",
-            destination: "/recovery/update",
-            requiredBytes,
-            availableBytes,
-            shortfallBytes: Math.max(0, requiredBytes - availableBytes),
-            headroomBytes: 3714477976,
-            requiredInodes: 2048,
-            availableInodes: 10000,
-            shortfallInodes: 0,
-            reservations: [
-              {
-                destination: "/recovery/update",
-                purpose: "snapshot and failed-start recovery",
-                bytes: 1024 ** 3,
-                inodes: 100,
-              },
-              {
-                destination: "/recovery/update",
-                purpose: "release checkout and build staging estimate",
-                bytes: 2 * 1024 ** 3,
-                inodes: 100,
-              },
-            ],
-          },
-        ],
-      },
-    },
-  });
-  const completeCleanup = () => {
-    if (!cleanup) return;
-    availableBytes = 50 * 1024 ** 3;
-    cleanup = {
-      ...cleanup,
-      state: "completed",
-      availableBytesAfter: availableBytes,
-      results: cleanup.results.map((item) => ({
-        ...item,
-        status: "deleted",
-        reason: "Permanently deleted",
-      })),
-    };
-  };
-  await page.route("**/api/system/update/preview", (route) =>
-    route.fulfill({
-      json: {
-        channel: "main",
-        currentCommit: "a".repeat(40),
-        runtime: {
-          verification: "verified",
-          commit: "a".repeat(40),
-          builtAt: timestamp,
-          sourceDirty: false,
-        },
-        checkedAt: timestamp,
-        state: "available",
-        target: {
-          commit: "b".repeat(40),
-          name: "main",
-          url: `https://github.com/davidomil/cloudx/commit/${"b".repeat(40)}`,
-        },
-        changelog: [],
-        changelogComplete: true,
-      },
-    }),
-  );
-  await page.route("**/api/system/update/capacity", (route) => {
-    capacityChecks++;
-    expect(route.request().postDataJSON()).toEqual({
-      channel: "main",
-      targetCommit: target,
-      resumeRunId: runId,
-    });
-    return route.fulfill({ json: updateStatus() });
-  });
-  await page.route("**/api/system/update", (route) => {
-    if (route.request().method() === "POST") {
-      resume = route.request().postDataJSON();
-      return route.fulfill({
-        status: 202,
-        json: {
-          available: true,
-          run: {
-            ...updateStatus().run,
-            state: "running",
-            resumable: false,
-            capacity: undefined,
-            message: "Resuming original saved target",
-          },
-        },
-      });
-    }
-    return route.fulfill({ json: updateStatus() });
-  });
-  await page.route("**/api/system/workspace-cleanup/preview", (route) =>
-    route.fulfill({
-      json: {
-        id: "33333333-3333-4333-8333-333333333333",
-        createdAt: timestamp,
-        availableBytes,
-        warnings: [],
-        reclaimableBytes: 16 * 1024 ** 3,
-        reclaimGroups: [{ bytes: 16 * 1024 ** 3, candidateIds: [candidateId] }],
-        candidates: [
-          {
-            id: candidateId,
-            path: "/work/completed-forge",
-            repository: "team/project",
-            kind: "forge",
-            state: "completed",
-            lastActivity: timestamp,
-            allocatedBytes: 16 * 1024 ** 3,
-            eligible: true,
-            reason: "Completed and inactive",
-            sourceChanges: [],
-            unpublishedCommits: 0,
-            requiresDiscard: false,
-          },
-          {
-            id: "44444444-4444-4444-8444-444444444444",
-            path: "/work/active-forge",
-            repository: "team/project",
-            kind: "forge",
-            state: "running",
-            lastActivity: timestamp,
-            allocatedBytes: 1024 ** 3,
-            eligible: false,
-            reason: "An unfinished worker still needs this checkout",
-            sourceChanges: [],
-            unpublishedCommits: 0,
-            requiresDiscard: false,
-          },
-          {
-            id: "66666666-6666-4666-8666-666666666666",
-            path: "/work/unpublished",
-            repository: "team/project",
-            kind: "forge",
-            state: "completed",
-            lastActivity: timestamp,
-            allocatedBytes: 1024 ** 3,
-            eligible: true,
-            reason: "Source changes must be preserved",
-            sourceChanges: ["source.ts"],
-            unpublishedCommits: 1,
-            requiresDiscard: true,
-          },
-        ],
-      },
-    }),
-  );
-  await page.route("**/api/system/workspace-cleanup", (route) => {
-    if (route.request().method() === "POST") {
-      expect(route.request().postDataJSON()).toMatchObject({
-        candidateIds: [candidateId],
-        discardCandidateIds: [],
-        confirmation: "Delete permanently",
-      });
-      cleanup = {
-        id: "55555555-5555-4555-8555-555555555555",
-        state: "running",
-        startedAt: timestamp,
-        availableBytesBefore: availableBytes,
-        results: [
-          {
-            id: candidateId,
-            path: "/work/completed-forge",
-            status: "deleting",
-            reason: "Revalidating ownership and activity",
-          },
-        ],
-      };
-      return route.fulfill({ status: 202, json: cleanup });
-    }
-    cleanupStatusReads++;
-    if (
-      disconnectCleanupStatus &&
-      cleanup?.state === "running" &&
-      !statusDisconnected &&
-      ++runningStatusReads === 2
-    ) {
-      statusDisconnected = true;
-      return route.fulfill({
-        status: 503,
-        json: { message: "Cleanup status connection lost." },
-      });
-    }
-    if (finishCleanup) completeCleanup();
-    return route.fulfill({ json: cleanup });
-  });
-  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
-  await expect(page.locator(".workspace-pane").first()).toBeVisible();
-  if (isMobile) {
-    await page
-      .getByRole("button", { name: "Workspace actions", exact: true })
-      .click();
-    await page.getByRole("menuitem", { name: "Settings", exact: true }).click();
-  } else
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Settings", exact: true });
+async function openUpdates(page: Page, isMobile: boolean) {
+  const dialog = await openSettings(page, isMobile);
   await dialog
     .getByRole("searchbox", { name: "Search settings" })
     .fill("update");
   await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
   const updates = dialog.getByRole("region", { name: "CloudX updates" });
+  const backups = updates.getByRole("region", {
+    name: "Retained update backups",
+  });
+  await expect(updates).toBeVisible();
+  await expectManualCleanupAbsent(page);
+  return { dialog, updates, backups };
+}
+
+function postedBodies(requestPath: string) {
+  return apiRequests
+    .filter(
+      (request) => request.path === requestPath && request.method === "POST",
+    )
+    .map((request) => request.body);
+}
+
+async function failedUpdate(page: Page) {
+  const requiredBytes = 40859257735;
+  let availableBytes = 27225911296;
+  let resumed = false;
+  const updateStatus = (): CloudxUpdateStatus => ({
+    available: true,
+    run: {
+      id: savedRunId,
+      state: resumed ? "running" : "failed",
+      targetCommit: savedTarget,
+      resumable: !resumed,
+      message: resumed
+        ? "Resuming original saved target"
+        : "Update stopped; the previous installation is retained.",
+      startedAt: timestamp,
+      component: "capacity",
+      capacity: resumed
+        ? undefined
+        : {
+            stage: "build-staging",
+            checkedAt: timestamp,
+            filesystems: [
+              {
+                device: "1",
+                mount: "/recovery",
+                destination: "/recovery/update",
+                requiredBytes,
+                availableBytes,
+                shortfallBytes: Math.max(0, requiredBytes - availableBytes),
+                headroomBytes: 3714477976,
+                requiredInodes: 2048,
+                availableInodes: 10000,
+                shortfallInodes: 0,
+                reservations: [
+                  {
+                    destination: "/recovery/update",
+                    purpose: "snapshot and failed-start recovery",
+                    bytes: 1024 ** 3,
+                    inodes: 100,
+                  },
+                  {
+                    destination: "/recovery/update",
+                    purpose: "release checkout and build staging estimate",
+                    bytes: 2 * 1024 ** 3,
+                    inodes: 100,
+                  },
+                ],
+              },
+            ],
+          },
+    },
+  });
+  await page.route("**/api/system/update/capacity", (route) =>
+    route.fulfill({ json: updateStatus() }),
+  );
+  await page.route("**/api/system/update", (route) => {
+    if (route.request().method() === "POST") resumed = true;
+    return route.fulfill({ status: resumed ? 202 : 200, json: updateStatus() });
+  });
+  return () => {
+    availableBytes = 50 * 1024 ** 3;
+  };
+}
+
+test("Settings removes workspace management while retained backup review and Forge evidence remain usable", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await expect(page.locator(".workspace-pane").first()).toBeVisible();
+  const dialog = await openSettings(page, isMobile);
+  await expectManualCleanupAbsent(page);
+  await dialog
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("old workspaces");
+  await expect(
+    dialog.getByRole("status").filter({ hasText: "matching settings" }),
+  ).toHaveText("0 matching settings across all tabs");
+  await expect(
+    dialog.getByRole("heading", { name: "No matching settings", exact: true }),
+  ).toBeVisible();
+  await expectManualCleanupAbsent(page);
+  await dialog
+    .getByRole("searchbox", { name: "Search settings" })
+    .fill("update");
+  await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
+  const updates = dialog.getByRole("region", { name: "CloudX updates" });
+  const backups = updates.getByRole("region", {
+    name: "Retained update backups",
+  });
+  const updateButton = updates.getByRole("button", {
+    name: "Update CloudX and dependencies",
+    exact: true,
+  });
+  await expect(updateButton).toBeEnabled();
+  await backups
+    .getByRole("button", { name: "Clean all update backups", exact: true })
+    .click();
+  const review = backups.getByRole("group", {
+    name: "Review permanent update backup deletion",
+  });
+  await expect(review).toContainText(
+    "1 eligible backup · 16.00 GiB estimated reclaimable",
+  );
+  await expect(
+    review.getByRole("button", {
+      name: "Delete all eligible backups permanently",
+    }),
+  ).toBeDisabled();
+  await expect(updateButton).toBeDisabled();
+  await review.getByRole("checkbox").check();
+  await review.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(review).toHaveCount(0);
+  expect(postedBodies("/api/system/update/backups/cleanup")).toEqual([]);
+  expect(postedBodies("/api/system/update/backups/preview")).toEqual([{}]);
+  await expect(updateButton).toBeEnabled();
+  await expect(backups).toContainText(backup.path);
+  await expectManualCleanupAbsent(page);
+  await dialog
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await page
+    .locator(".workspace-pane")
+    .first()
+    .getByTitle("Add tab to this pane")
+    .click();
+  await page
+    .getByRole("combobox", { name: "Plugin", exact: true })
+    .selectOption("forge");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const forge = page.getByRole("region", { name: "Forge", exact: true });
+  await forge.getByRole("button", { name: "Evidence", exact: true }).click();
+  const evidence = forge.getByRole("region", {
+    name: "Saved evidence",
+    exact: true,
+  });
+  await expect(evidence).toContainText(
+    "Finished Forge workspaces clean automatically.",
+  );
+  await expect(
+    evidence.getByText("Loading saved evidence…", { exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    evidence.locator("button, input, textarea, select, fieldset"),
+  ).toHaveCount(0);
+  await expectManualCleanupAbsent(page);
+  await forge.getByRole("button", { name: "Issues", exact: true }).click();
+  await expect(evidence).toHaveCount(0);
+  await forge.getByRole("button", { name: "Evidence", exact: true }).click();
+  await expect(evidence).toContainText(
+    "Finished Forge workspaces clean automatically.",
+  );
+  await expectManualCleanupAbsent(page);
+  await page.screenshot({
+    path: testInfo.outputPath("automatic-workspace-cleanup.png"),
+    fullPage: true,
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth + 1,
+    ),
+  ).toBe(true);
+});
+
+test("Update capacity rechecks reclaimed space and resumes the saved target without manual Forge cleanup", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const recoverCapacity = await failedUpdate(page);
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await expect(page.locator(".workspace-pane").first()).toBeVisible();
+  const { updates, backups } = await openUpdates(page, isMobile);
   await expect(updates).toContainText(
     "38.05 GiB required, 25.36 GiB available, 12.70 GiB more needed",
   );
-  await expect(updates).toContainText("3.46 GiB safety margin");
+  await expect(updates).toContainText(
+    "3.46 GiB safety margin included. Recovery copies and build staging remain reserved.",
+  );
+  await expect(updates).toContainText(
+    "snapshot and failed-start recovery: 1.00 GiB",
+  );
+  await expect(updates).toContainText(
+    "release checkout and build staging estimate: 2.00 GiB",
+  );
+  await expect(updates).toContainText(
+    `Resume target: ${savedTarget.slice(0, 12)}`,
+  );
+  await expect(
+    backups.getByRole("button", {
+      name: "Clean all update backups",
+      exact: true,
+    }),
+  ).toBeEnabled();
+  expect(postedBodies("/api/system/update/capacity")).toEqual([]);
+  expect(postedBodies("/api/system/update")).toEqual([]);
+  recoverCapacity();
   await updates
-    .getByRole("button", { name: "Manage Forge environments", exact: true })
+    .getByRole("button", { name: "Recheck update capacity", exact: true })
     .click();
-  await expect(dialog).toHaveCount(0);
-  const forge = page.getByRole("region", { name: "Forge", exact: true });
-  const environments = forge.getByRole("region", {
-    name: "Workspace cleanup",
+  await expect(updates).toContainText(
+    "38.05 GiB required, 50.00 GiB available, 0 B more needed",
+  );
+  expect(postedBodies("/api/system/update/capacity")).toEqual([
+    savedUpdateRequest,
+  ]);
+  expect(postedBodies("/api/system/update/backups/cleanup")).toEqual([]);
+  await expectManualCleanupAbsent(page);
+  const resume = updates.getByRole("button", {
+    name: "Resume update",
     exact: true,
   });
-  await expect(
-    environments.getByRole("combobox", { name: "Workspace filter" }),
-  ).toHaveValue("forge");
-  await environments
-    .getByRole("button", {
-      name: "Scan workspaces and environments",
-      exact: true,
-    })
-    .click();
-  await expect(
-    environments.getByRole("checkbox", {
-      name: "Select /work/active-forge",
-      exact: true,
-    }),
-  ).toBeDisabled();
-  await expect(
-    environments.getByRole("checkbox", {
-      name: "Select /work/unpublished",
-      exact: true,
-    }),
-  ).toBeDisabled();
-  await expect(environments).toContainText("16.00 GiB");
-  await environments
-    .getByRole("button", {
-      name: "Review deletion of 1 workspace",
-      exact: true,
-    })
-    .click();
-
-  await forge.getByRole("button", { name: "Settings", exact: true }).click();
-  await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
-  await expect(
-    updates.getByRole("button", { name: "Resume update", exact: true }),
-  ).toBeDisabled();
-  await expect(
-    dialog.getByRole("region", { name: "Workspace cleanup" }),
-  ).toHaveCount(0);
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
-  await environments
-    .getByRole("button", { name: "Cancel", exact: true })
-    .click();
-  expect(cleanup).toBeNull();
-  await environments
-    .getByRole("button", {
-      name: "Review deletion of 1 workspace",
-      exact: true,
-    })
-    .click();
-  await environments
-    .getByRole("button", { name: "Delete permanently", exact: true })
-    .click();
-  await expect(
-    environments.getByRole("progressbar", {
-      name: "Workspace cleanup progress",
-    }),
-  ).toBeVisible();
-  if (disconnectCleanupStatus) {
-    await expect(environments.getByRole("alert")).toContainText(
-      "Cleanup status unavailable: Cleanup status connection lost.",
-    );
-    const disconnectedReads = cleanupStatusReads;
-    finishCleanup = true;
-    completeCleanup();
-    await forge.getByRole("button", { name: "Issues", exact: true }).click();
-    await expect(environments).toHaveCount(0);
-    await forge
-      .getByRole("button", { name: "Environments", exact: true })
-      .click();
-    await environments
-      .getByRole("button", { name: "Reconnect cleanup status", exact: true })
-      .waitFor();
-    await forge
-      .getByRole("button", { name: "Refresh environments", exact: true })
-      .click();
-    await expect(
-      environments.getByRole("button", {
-        name: "Scan workspaces and environments",
-        exact: true,
-      }),
-    ).toBeDisabled();
-    await forge.getByRole("button", { name: "Settings", exact: true }).click();
-    await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
-    await expect(
-      updates.getByRole("button", { name: "Resume update", exact: true }),
-    ).toBeDisabled();
-    expect(capacityChecks).toBe(0);
-    await updates
-      .getByRole("button", { name: "Manage Forge environments", exact: true })
-      .click();
-    await expect(
-      environments.getByRole("heading", {
-        name: "Cleanup in progress",
-        exact: true,
-      }),
-    ).toBeVisible();
-    expect(cleanupStatusReads).toBe(disconnectedReads);
-    await environments
-      .getByRole("button", { name: "Reconnect cleanup status", exact: true })
-      .click();
-    await expect(environments.getByRole("alert")).toHaveCount(0);
-    await expect(
-      environments.getByRole("button", {
-        name: "Scan workspaces and environments",
-        exact: true,
-      }),
-    ).toBeEnabled();
-    expect(cleanupStatusReads).toBe(disconnectedReads + 1);
-  }
-  finishCleanup = true;
-  await expect(environments).toContainText("50.00 GiB available after cleanup");
-  await expect.poll(() => capacityChecks).toBeGreaterThan(0);
-
-  await forge.getByRole("button", { name: "Settings", exact: true }).click();
-  await dialog.getByRole("tab", { name: "Updates", exact: true }).click();
-  await expect(updates).toContainText("0 B more needed");
-  await expect(
-    updates.getByRole("button", { name: "Resume update", exact: true }),
-  ).toBeEnabled();
+  await expect(resume).toBeEnabled();
   await page.screenshot({
     path: testInfo.outputPath("update-capacity-recovered.png"),
+    fullPage: true,
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth + 1,
+    ),
+  ).toBe(true);
+  await resume.focus();
+  await page.keyboard.press("Enter");
+  await expect(updates).toContainText("Resuming original saved target");
+  expect(postedBodies("/api/system/update")).toEqual([savedUpdateRequest]);
+  await expectManualCleanupAbsent(page);
+});
+
+test("Retained backup cleanup reconnects before capacity recheck and saved-target resume across Settings navigation", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const recoverCapacity = await failedUpdate(page);
+  let cleanup: CloudxUpdateBackupCleanup | null = null;
+  let statusDisconnected = false;
+  let finished = false;
+  await page.route("**/api/system/update/backups", (route) =>
+    route.fulfill({ json: { backups: finished ? [] : [backup] } }),
+  );
+  await page.route("**/api/system/update/backups/cleanup", (route) => {
+    if (route.request().method() === "POST") {
+      cleanup = {
+        id: "44444444-4444-4444-8444-444444444444",
+        state: "running",
+        startedAt: timestamp,
+        results: [
+          {
+            id: backup.id,
+            runId: backup.runId,
+            path: backup.path,
+            status: "deleting",
+            deletedLogicalBytes: 0,
+          },
+        ],
+        freeSpace: [
+          {
+            path: "/recovery",
+            availableBytesBefore: 27225911296,
+            availableBytesAfter: null,
+          },
+        ],
+      };
+      return route.fulfill({ status: 202, json: cleanup });
+    }
+    if (cleanup && !statusDisconnected) {
+      statusDisconnected = true;
+      return route.fulfill({
+        status: 503,
+        json: { message: "Backup cleanup status connection lost." },
+      });
+    }
+    if (cleanup && finished) {
+      recoverCapacity();
+      cleanup = {
+        ...cleanup,
+        state: "completed",
+        finishedAt: timestamp,
+        results: cleanup.results.map((item) => ({
+          ...item,
+          status: "deleted",
+          deletedLogicalBytes: backup.logicalBytes!,
+        })),
+        freeSpace: [
+          {
+            path: "/recovery",
+            availableBytesBefore: 27225911296,
+            availableBytesAfter: 50 * 1024 ** 3,
+          },
+        ],
+      };
+    }
+    return route.fulfill({ json: cleanup });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  await expect(page.locator(".workspace-pane").first()).toBeVisible();
+  let { dialog, updates, backups } = await openUpdates(page, isMobile);
+  await backups
+    .getByRole("button", { name: "Clean all update backups", exact: true })
+    .click();
+  const review = backups.getByRole("group", {
+    name: "Review permanent update backup deletion",
+  });
+  await expect(review).toContainText(
+    "Recovery or downgrade using these saved data snapshots will become unavailable.",
+  );
+  const remove = review.getByRole("button", {
+    name: "Delete all eligible backups permanently",
+  });
+  await expect(remove).toBeDisabled();
+  await expect(
+    updates.getByRole("button", { name: "Resume update", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    updates.getByRole("button", {
+      name: "Recheck update capacity",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await review.getByRole("checkbox").check();
+  await remove.click();
+  await expect(
+    backups.getByRole("progressbar", {
+      name: "Update backup cleanup progress",
+    }),
+  ).toBeVisible();
+  await expect(backups.getByRole("alert")).toContainText(
+    "Could not monitor cleanup: Backup cleanup status connection lost.",
+  );
+  await expect(
+    updates.getByRole("button", { name: "Resume update", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    updates.getByRole("button", {
+      name: "Recheck update capacity",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  expect(postedBodies("/api/system/update/capacity")).toEqual([]);
+  expect(postedBodies("/api/system/update")).toEqual([]);
+  await expectManualCleanupAbsent(page);
+  finished = true;
+  await backups
+    .getByRole("button", { name: "Check cleanup status", exact: true })
+    .click();
+  await expect(backups.getByRole("alert")).toHaveCount(0);
+  await expect(backups).toContainText(
+    "1 deleted; 0 protected; 0 skipped; 0 failed",
+  );
+  await expect(backups).toContainText("50.00 GiB measured available afterward");
+  await expect(backups).toContainText("No retained update backups found.");
+  await dialog
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await expect(dialog).toHaveCount(0);
+  ({ dialog, updates, backups } = await openUpdates(page, isMobile));
+  await expect(backups).toContainText(
+    "1 deleted; 0 protected; 0 skipped; 0 failed",
+  );
+  await expect(
+    backups.getByRole("button", { name: "Check cleanup status", exact: true }),
+  ).toBeEnabled();
+  await updates
+    .getByRole("button", { name: "Recheck update capacity", exact: true })
+    .click();
+  await expect(updates).toContainText("0 B more needed");
+  expect(postedBodies("/api/system/update/capacity")).toEqual([
+    savedUpdateRequest,
+  ]);
+  expect(postedBodies("/api/system/update/backups/cleanup")).toEqual([
+    { previewId: backupPreview.id, confirmPermanentDeletion: true },
+  ]);
+  await page.screenshot({
+    path: testInfo.outputPath("retained-backup-cleanup-reconnected.png"),
     fullPage: true,
   });
   expect(
@@ -721,21 +664,7 @@ async function updateCapacityRecovery(
   await updates
     .getByRole("button", { name: "Resume update", exact: true })
     .click();
-  await expect
-    .poll(() => resume)
-    .toEqual({
-      channel: "main",
-      targetCommit: target,
-      resumeRunId: runId,
-    });
-}
-
-test(
-  "Update capacity recovery reviews Forge trash and resumes the same saved target",
-  updateCapacityRecovery,
-);
-
-test("Update capacity recovery reconnects unavailable cleanup status across navigation before resuming", ({
-  page,
-  isMobile,
-}, testInfo) => updateCapacityRecovery({ page, isMobile }, testInfo, true));
+  await expect(updates).toContainText("Resuming original saved target");
+  expect(postedBodies("/api/system/update")).toEqual([savedUpdateRequest]);
+  await expectManualCleanupAbsent(page);
+});

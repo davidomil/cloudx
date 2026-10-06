@@ -2,99 +2,136 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DisposableResource } from "@cloudx/shared";
+import type { DisposableResource, ForgeCheckoutEvidenceManifest, ForgeGitHistoryManifest } from "@cloudx/shared";
 import { ForgeResourcesPanel } from "./ForgeResourcesPanel.js";
-import { useWorkspaceCleanup } from "./workspaceCleanupSession.js";
-import { getWorkspaceCleanup } from "../workspaceCleanupApi.js";
-import { getForgeResources, decideForgeEvidence } from "../forgeResourcesApi.js";
+import { getForgeResources } from "../forgeResourcesApi.js";
+import { getForgeCheckoutEvidence } from "../forgeCheckoutEvidenceApi.js";
+import { getForgeGitHistory } from "../forgeGitHistoryApi.js";
 
-vi.mock("../workspaceCleanupApi.js", () => ({ getWorkspaceCleanup: vi.fn(), previewWorkspaceCleanup: vi.fn(), startWorkspaceCleanup: vi.fn() }));
-vi.mock("./ForgeCheckoutEvidencePanel.js", () => ({ ForgeCheckoutEvidencePanel: () => null }));
 vi.mock("../forgeResourcesApi.js", () => ({
-  getForgeResources: vi.fn(), decideForgeEvidence: vi.fn(),
+  getForgeResources: vi.fn(),
   forgeEvidenceFileUrl: (id: string, path: string) => `/api/forge/resources/${id}/evidence-file?${new URLSearchParams({ path })}`,
 }));
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-const held: DisposableResource = { id: "resource-1", kind: "container", engineId: "engine", name: "regression-env", owner: { workerId: "worker-1", attemptId: "attempt-1" }, consumers: [{ workerId: "worker-1", attemptId: "attempt-1" }], retentionReason: "Preserve the navigation reproduction log", state: "blocked", reason: "Select specific evidence before release.", allocatedBytes: 8192, reclaimedBytes: 0, updatedAt: "2026-10-04" };
-let root: Root;
+vi.mock("../forgeCheckoutEvidenceApi.js", () => ({
+  getForgeCheckoutEvidence: vi.fn(),
+  checkoutEvidenceManifestUrl: (id: string) => `/api/forge/checkout-evidence/${id}`,
+  checkoutEvidenceFileUrl: (id: string, path: string) => `/api/forge/checkout-evidence/${id}/file?${new URLSearchParams({ path })}`,
+}));
+vi.mock("../forgeGitHistoryApi.js", () => ({
+  getForgeGitHistory: vi.fn(),
+  gitHistoryManifestUrl: (id: string) => `/api/forge/git-history/${id}`,
+  gitHistoryBundleUrl: (id: string) => `/api/forge/git-history/${id}/file`,
+}));
+const resource: DisposableResource = {
+  id: "resource-1", kind: "container", engineId: "engine", name: "regression-env",
+  owner: { workerId: "worker-1", attemptId: "attempt-1" }, consumers: [], state: "deleted", reason: "Cleaned automatically", reclaimedBytes: 8192, updatedAt: "2026-10-06",
+  evidence: { state: "verified", paths: ["/evidence"], commitSha: "a".repeat(40), bytes: 1024,
+    files: [{ path: "evidence/test log.txt", bytes: 1024, sha256: "b".repeat(64) }] },
+};
+const archive: ForgeCheckoutEvidenceManifest = {
+  archiveId: "archive-1", workerId: "retired-worker", attemptId: "attempt-2", commitSha: "c".repeat(40),
+  checkoutIdentity: { dev: "1", ino: "2" }, paths: ["reports"], exportedAt: "2026-10-06T00:00:00.000Z", bytes: 34_048_143,
+  files: [{ path: "reports/coverage.json", bytes: 34_048_143, sha256: "d".repeat(64) }],
+};
+const history: ForgeGitHistoryManifest = {
+  archiveId: "history-1", workerId: "retired-worker", attemptId: "attempt-2", commitSha: "c".repeat(40),
+  checkoutIdentity: { dev: "1", ino: "2" }, exportedAt: "2026-10-06T00:00:00.000Z", bytes: 2048,
+  refs: [{ name: "refs/cloudx/before-rebase/snapshot-1", commitSha: "e".repeat(40) }],
+  files: [{ path: "history.bundle", bytes: 2048, sha256: "f".repeat(64) }],
+};
+let root: Root | undefined;
 let container: HTMLDivElement;
-async function render() {
+beforeEach(() => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.mocked(getForgeResources).mockResolvedValue([]);
+  vi.mocked(getForgeCheckoutEvidence).mockResolvedValue([]);
+  vi.mocked(getForgeGitHistory).mockResolvedValue([]);
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
-  function Harness() { return createElement(ForgeResourcesPanel, { cleanup: useWorkspaceCleanup() }); }
-  await act(async () => { root.render(createElement(Harness)); });
-  return container;
-}
-function button(label: string) { return [...container.querySelectorAll("button")].find(item => item.textContent === label)!; }
-async function click(label: string) { await act(async () => button(label).click()); }
-async function paths(value: string) {
-  const input = container.querySelector("textarea")!;
-  await act(async () => {
-    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, value);
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-  });
-}
-beforeEach(() => { vi.mocked(getWorkspaceCleanup).mockResolvedValue(null); vi.mocked(getForgeResources).mockResolvedValue([structuredClone(held)]); vi.mocked(decideForgeEvidence).mockResolvedValue(held); });
-afterEach(async () => { if (root) await act(async () => root.unmount()); document.body.replaceChildren(); vi.resetAllMocks(); });
+});
+afterEach(async () => {
+  await act(async () => root?.unmount()); root = undefined;
+  document.body.replaceChildren(); vi.resetAllMocks(); vi.unstubAllGlobals();
+});
+async function render(revision = 0) { await act(async () => root!.render(createElement(ForgeResourcesPanel, { revision }))); }
 
-describe("Forge evidence decisions", () => {
-  it("shows the specific protection and provenance, then exports only the entered paths", async () => {
+describe("Saved Forge evidence", () => {
+  it("replaces an empty resource history with one automatic-cleanup message and no controls", async () => {
+    vi.mocked(getForgeResources).mockResolvedValue([{ ...resource, evidence: undefined }, { ...resource, id: "discarded", evidence: { state: "discarded", paths: [] } }]);
     await render();
-    expect(container.textContent).toContain(held.retentionReason);
-    expect(container.textContent).toContain("worker-1");
-    expect(button("Export evidence and release").disabled).toBe(true);
-    await paths(" /work/evidence/test.log\n/work/reproduction.json ");
-    await act(async () => {
-      const input = container.querySelector<HTMLInputElement>('input[aria-label="Evidence commit for regression-env"]')!;
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "b".repeat(40));
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    await click("Export evidence and release");
-    expect(decideForgeEvidence).toHaveBeenCalledExactlyOnceWith(held.id, { action: "export", evidencePaths: ["/work/evidence/test.log", "/work/reproduction.json"], commitSha: "b".repeat(40) });
+    expect(container.querySelectorAll("p")).toHaveLength(1);
+    expect(container.textContent).toContain("Finished Forge workspaces clean automatically.");
+    expect(container.querySelector("article, button, input, textarea, select, fieldset")).toBeNull();
+  });
+  it("keeps verified reports and generated Git snapshots downloadable after workers retire", async () => {
+    vi.mocked(getForgeResources).mockResolvedValue([resource]);
+    vi.mocked(getForgeCheckoutEvidence).mockResolvedValue([archive]);
+    vi.mocked(getForgeGitHistory).mockResolvedValue([history]);
+    await render();
+    expect(container.querySelectorAll("article")).toHaveLength(3);
+    expect(container.textContent).toContain("worker-1"); expect(container.textContent).toContain("attempt-1");
+    expect(container.textContent).toContain("retired-worker"); expect(container.textContent).toContain("attempt-2");
+    expect(container.textContent).toContain(resource.evidence!.commitSha); expect(container.textContent).toContain(archive.commitSha);
+    expect(container.textContent).toContain("1.00 KiB saved"); expect(container.textContent).toContain("32.47 MiB saved");
+    expect([...container.querySelectorAll<HTMLAnchorElement>("a[download]")].map(link => link.getAttribute("href"))).toEqual([
+      "/api/forge/resources/resource-1/evidence", "/api/forge/resources/resource-1/evidence-file?path=evidence%2Ftest+log.txt",
+      "/api/forge/checkout-evidence/archive-1", "/api/forge/checkout-evidence/archive-1/file?path=reports%2Fcoverage.json",
+      "/api/forge/git-history/history-1", "/api/forge/git-history/history-1/file",
+    ]);
+    expect(container.querySelector('a[href$="history-1/file"]')?.getAttribute("download")).toBe("history.bundle");
+    expect(container.textContent).toContain("Preserved snapshots (1)");
+    expect(container.textContent).toContain(history.refs[0]!.name); expect(container.textContent).toContain(history.refs[0]!.commitSha);
+    expect(container.querySelector("button, input, textarea, select, fieldset")).toBeNull();
+  });
+  it("shows automatic archival and protected failures without offering evidence decisions", async () => {
+    vi.mocked(getForgeResources).mockResolvedValue([
+      { ...resource, state: "owned", evidence: { ...resource.evidence!, state: "exporting" } },
+      { ...resource, id: "blocked", state: "blocked", reason: "Select specific paths to export, keep the hold or confirm discard.", evidence: undefined, retentionReason: "Preserve validation reports" },
+      { ...resource, id: "failed", state: "failed", reason: "Archive verification failed.", evidence: { ...resource.evidence!, state: "missing" } },
+    ]);
+    await render();
+    expect(container.textContent).toContain("Saving evidence before automatic cleanup…");
+    expect([...container.querySelectorAll('[role="status"]')].filter(item => item.textContent === "Automatic cleanup is blocked to protect evidence. See the worker error.")).toHaveLength(2);
+    expect(container.textContent).not.toContain("Select specific paths");
+    expect(container.textContent).not.toContain("Archive verification failed.");
+    expect(container.querySelector("a, button, input, textarea, select, fieldset")).toBeNull();
+  });
+  it.each(["container", "checkout", "Git history"])("preserves available downloads when %s evidence cannot load", async source => {
+    vi.mocked(getForgeResources).mockResolvedValue([resource]);
+    vi.mocked(getForgeCheckoutEvidence).mockResolvedValue([archive]);
+    if (source === "container") vi.mocked(getForgeResources).mockRejectedValue(new Error("Resource journal unavailable."));
+    else if (source === "checkout") vi.mocked(getForgeCheckoutEvidence).mockRejectedValue(new Error("Checkout checksum verification failed."));
+    else vi.mocked(getForgeGitHistory).mockRejectedValue(new Error("Git history checksum verification failed."));
+    await render();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(source === "container" ? "Resource journal unavailable" : source === "checkout" ? "Checkout checksum verification failed" : "Git history checksum verification failed");
+    expect(container.querySelectorAll("a[download]")).toHaveLength(source === "Git history" ? 4 : 2);
+    expect(container.querySelector("button")).toBeNull();
+  });
+  it("loads and refreshes evidence through Forge revision changes without retry controls", async () => {
+    let finish!: (value: DisposableResource[]) => void;
+    vi.mocked(getForgeResources).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await render();
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("Loading saved evidence…");
+    await act(async () => finish([resource]));
+    expect(container.textContent).toContain("regression-env");
+    const previous = vi.mocked(getForgeResources).mock.calls[0]![0]!;
+    await render(1);
+    expect(previous.aborted).toBe(true);
+    expect(container.querySelector("article")).toBeNull();
     expect(getForgeResources).toHaveBeenCalledTimes(2);
+    expect(getForgeCheckoutEvidence).toHaveBeenCalledTimes(2);
+    expect(getForgeGitHistory).toHaveBeenCalledTimes(2);
   });
-  it("requires a deliberate discard checkbox and disables duplicate decisions while pending", async () => {
-    let finish!: (value: DisposableResource) => void;
-    vi.mocked(decideForgeEvidence).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  it("aborts all requests and ignores an old response after closing the evidence view", async () => {
+    let finish!: (value: DisposableResource[]) => void;
+    vi.mocked(getForgeResources).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
     await render();
-    expect(button("Discard evidence and release").disabled).toBe(true);
-    await act(async () => container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
-    await click("Discard evidence and release");
-    expect(container.querySelector("fieldset")?.disabled).toBe(true);
-    expect(container.textContent).toContain("Applying evidence decision");
-    expect(decideForgeEvidence).toHaveBeenCalledExactlyOnceWith(held.id, { action: "discard", confirmation: "Discard evidence" });
-    await act(async () => finish(held));
-    expect(container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.checked).toBe(false);
-  });
-  it("keeps an explicit hold and surfaces failures with a manual retry", async () => {
-    vi.mocked(decideForgeEvidence).mockRejectedValueOnce(new Error("An active shared consumer protects this environment."));
-    await render(); await click("Keep evidence hold");
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("active shared consumer");
-    expect(decideForgeEvidence).toHaveBeenCalledExactlyOnceWith(held.id, { action: "keep" });
-    expect(container.querySelector("fieldset")?.disabled).toBe(false);
-  });
-  it("offers verified downloads after removal and retries removal without re-exporting evidence", async () => {
-    const evidence = { state: "verified" as const, paths: ["/work/evidence/test.log"], commitSha: "a".repeat(40), files: [{ path: "work/evidence/test.log", bytes: 18, sha256: "b".repeat(64) }] };
-    vi.mocked(getForgeResources).mockResolvedValue([{ ...held, evidence, state: "failed" }]);
-    await render();
-    const link = container.querySelector<HTMLAnchorElement>('a[href*="evidence-file"]')!;
-    expect(link.getAttribute("href")).toContain("path=work%2Fevidence%2Ftest.log");
-    expect(container.textContent).toContain(evidence.commitSha);
-    await click("Retry environment cleanup");
-    expect(decideForgeEvidence).toHaveBeenCalledExactlyOnceWith(held.id, { action: "export" });
-    vi.mocked(getForgeResources).mockResolvedValue([{ ...held, evidence, state: "deleted", reclaimedBytes: 8192 }]);
-    await click("Refresh environments");
-    expect(container.textContent).toContain("8,192 writable bytes reclaimed");
-    expect(container.querySelector("fieldset")).toBeNull();
-    expect(container.querySelector('a[href*="evidence-file"]')).not.toBeNull();
-  });
-  it("shows loading errors, refreshes explicitly, and aborts requests when closed", async () => {
-    vi.mocked(getForgeResources).mockRejectedValueOnce(new Error("Resource journal unavailable."));
-    await render();
-    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Resource journal unavailable.");
-    await click("Refresh environments");
-    expect(container.textContent).toContain(held.name);
-    const signal = vi.mocked(getForgeResources).mock.calls.at(-1)![0]!;
-    await act(async () => root.unmount());
-    expect(signal.aborted).toBe(true);
+    const resourcesSignal = vi.mocked(getForgeResources).mock.calls[0]![0]!;
+    const archivesSignal = vi.mocked(getForgeCheckoutEvidence).mock.calls[0]![0]!;
+    const historySignal = vi.mocked(getForgeGitHistory).mock.calls[0]![0]!;
+    await act(async () => root!.unmount()); root = undefined;
+    await act(async () => finish([resource]));
+    expect(resourcesSignal.aborted).toBe(true); expect(archivesSignal.aborted).toBe(true);
+    expect(historySignal.aborted).toBe(true);
+    expect(container.textContent).toBe("");
   });
 });

@@ -12,6 +12,7 @@ import {
 import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
@@ -3327,6 +3328,132 @@ describe("Forge merged request cleanup", () => {
     const now = vi.spyOn(Date, "now").mockReturnValue(next);
     try { await f.service.poll(); } finally { now.mockRestore(); }
   }
+
+  async function retainedParentAndCleanedReviewer() {
+    const context = fixture();
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-completed-group-"));
+    onTestFinished(async () => {
+      await context.service.dispose();
+      await fs.rm(directory, { recursive: true, force: true });
+    });
+    const coding = await publishedIssue(context);
+    const reviewing = await context.service.startReview(context.deps.settings().repository, 7, false, placement);
+    await context.service.dispose();
+    const retainedWorkspace = { worktreePath: path.join(directory, "checkout"), retainedPaths: ["unpublished.txt"] };
+    await fs.mkdir(retainedWorkspace.worktreePath);
+    const unpublishedPath = path.join(retainedWorkspace.worktreePath, "unpublished.txt");
+    await fs.writeFile(unpublishedPath, "Unpublished investigation must survive retirement.\n");
+    const savedParent = context.stored().find(worker => worker.id === coding.id)!;
+    const savedReviewer = context.stored().find(worker => worker.id === reviewing.id)!;
+    const report = { kind: "review" as const, headSha: context.change.headSha, event: "approve" as const,
+      body: "Saved reviewer validation evidence.", comments: [] };
+    const parent: ForgeWorker = { ...savedParent, status: "completed", tabId: undefined, worktreePath: undefined,
+      branch: undefined, repositoryPath: retainedWorkspace.worktreePath, retainedWorkspace };
+    const reviewer: ForgeWorker = { ...savedReviewer, status: "completed", tabId: undefined, attemptId: undefined,
+      worktreePath: undefined, branch: undefined, repositoryPath: path.join(directory, "removed-reviewer"), issueWorkerId: parent.id,
+      error: "Disposable resource cleanup pending: Explicit evidence retention.", resourceCleanupNotificationDigest: "a".repeat(64),
+      completion: { ...savedReviewer.completion!, report,
+        turn: { workerId: reviewing.id, attemptId: reviewing.attemptId!, threadId: "review-thread", turnId: "review-turn", status: "completed" } },
+      draft: { ...report, id: reviewing.attemptId!, startedAt: reviewing.startedAt, status: "posted",
+        publication: { commentIds: [] }, postedAt: new Date().toISOString() } };
+    await context.deps.store.write(parseWorkers([parent, reviewer]));
+    const reports = new ForgeWorkerReports(directory);
+    const prepared = await reports.prepare(reviewer.completion!.attemptId, { workerId: reviewer.id });
+    await fs.writeFile(prepared.reportPath, JSON.stringify(report));
+    const removeReport = vi.spyOn(reports, "remove");
+    const history = { tabId: "saved-review-tab", capturedAt: new Date().toISOString(),
+      screen: { data: "Review validation passed.", cols: 80, rows: 24 } };
+    const histories = new ForgeWorkerHistoryStore(directory);
+    await histories.write(reviewer.id, history);
+    context.deps.reports = reports;
+    context.runtime.workerHistory.mockImplementation(id => histories.read(id));
+    context.runtime.isActive.mockReturnValue(false);
+    context.runtime.recover.mockImplementation(async id => id === parent.id
+      ? { tabIds: [], workspace: { id, repositoryPath: retainedWorkspace.worktreePath,
+        worktreePath: retainedWorkspace.worktreePath, branch: context.change.headBranch } }
+      : { tabIds: [], cleanupComplete: true });
+    context.runtime.cleanup.mockImplementation(async input => input.id === parent.id ? retainedWorkspace : undefined);
+    const cleanupResources = vi.fn(async (_worker: ForgeWorker) => {});
+    context.deps.cleanupDisposableResources = cleanupResources;
+    mergeAndClose(context);
+    context.service = new ForgeWorkflowService(context.deps);
+    return { context, parent, reviewer, retainedWorkspace, unpublishedPath, reports, removeReport, report, history, cleanupResources };
+  }
+
+  it("retires a cleaned completed reviewer behind a retained completed parent across repeated polls and restart", async () => {
+    const { context, parent, reviewer, retainedWorkspace, unpublishedPath, reports, removeReport, report, history, cleanupResources } =
+      await retainedParentAndCleanedReviewer();
+
+    await nextCompletionCheck(context);
+    await nextCompletionCheck(context);
+    await nextCompletionCheck(context);
+
+    expect(context.stored()).toMatchObject([{ id: parent.id, status: "completed", retainedWorkspace }]);
+    expect((await context.service.dashboard()).workers.map(worker => worker.id)).toEqual([parent.id]);
+    expect(cleanupResources.mock.calls.filter(([worker]) => worker.id === reviewer.id)).toHaveLength(1);
+    expect(context.runtime.cleanup).not.toHaveBeenCalledWith(expect.objectContaining({ id: reviewer.id }));
+    expect(context.provider.getChangeRequestStatus).toHaveBeenCalled();
+    expect(context.provider.postReview).not.toHaveBeenCalled();
+    expect(removeReport).not.toHaveBeenCalled();
+    expect(await reports.read(reviewer.completion!.attemptId)).toEqual(report);
+    expect(await context.service.workerHistory(reviewer.id)).toEqual(history);
+    expect(await fs.readFile(unpublishedPath, "utf8")).toBe("Unpublished investigation must survive retirement.\n");
+
+    await context.service.dispose();
+    context.service = new ForgeWorkflowService(context.deps);
+    await nextCompletionCheck(context);
+    expect(context.stored()).toMatchObject([{ id: parent.id, retainedWorkspace }]);
+    expect(await reports.read(reviewer.completion!.attemptId)).toEqual(report);
+    expect(await context.service.workerHistory(reviewer.id)).toEqual(history);
+    expect(await fs.readFile(unpublishedPath, "utf8")).toBe("Unpublished investigation must survive retirement.\n");
+    expect(removeReport).not.toHaveBeenCalled();
+  });
+
+  it.each(["open", "unavailable"] as const)("retires the completed reviewer without cleaning a retained parent whose issue is %s", async state => {
+    const { context, parent, retainedWorkspace, unpublishedPath } = await retainedParentAndCleanedReviewer();
+    context.issue.state = "open";
+    if (state === "unavailable") context.provider.getIssue.mockRejectedValue(new Error("Issue status unavailable"));
+
+    await nextCompletionCheck(context);
+
+    expect(context.stored()).toMatchObject([{ id: parent.id, status: "completed", retainedWorkspace }]);
+    expect(context.runtime.cleanup).not.toHaveBeenCalled();
+    expect(await fs.readFile(unpublishedPath, "utf8")).toBe("Unpublished investigation must survive retirement.\n");
+  });
+
+  it("preserves the cleaned completed reviewer until the associated request is authoritatively merged", async () => {
+    const { context, reviewer, cleanupResources } = await retainedParentAndCleanedReviewer();
+    context.change.merged = false;
+    context.change.state = "closed";
+
+    await nextCompletionCheck(context);
+    await nextCompletionCheck(context);
+
+    expect(context.stored().find(worker => worker.id === reviewer.id)).toMatchObject({ status: "completed", error: reviewer.error });
+    expect(cleanupResources).not.toHaveBeenCalledWith(expect.objectContaining({ id: reviewer.id }));
+    expect(context.provider.postReview).not.toHaveBeenCalled();
+  });
+
+  it.each(["unconfirmed publication", "provider recovery", "failed cleanup"] as const)("preserves completed-group protections for %s", async blocker => {
+    const { context, parent, reviewer, cleanupResources, reports, report } = await retainedParentAndCleanedReviewer();
+    if (blocker === "unconfirmed publication") context.issue.state = "open";
+    await context.deps.store.write(context.stored().map(worker => {
+      if (blocker === "unconfirmed publication" && worker.id === parent.id)
+        return { ...worker, pendingPublication: { headSha: context.change.headSha,
+          report: { kind: "issue" as const, title: "Pending publication", body: "Saved report", discussionReplies: [], resolvedDiscussionIds: [] }, repliedDiscussionIds: [] } };
+      if (worker.id !== reviewer.id) return worker;
+      return blocker === "provider recovery"
+        ? { ...worker, providerRetryAt: new Date(Date.now() + 3_600_000).toISOString() }
+        : blocker === "failed cleanup" ? { ...worker, status: "cleanup_failed" as const } : worker;
+    }));
+
+    await nextCompletionCheck(context);
+    await nextCompletionCheck(context);
+
+    expect(context.stored().find(worker => worker.id === reviewer.id)).toMatchObject({ error: reviewer.error });
+    expect(cleanupResources).not.toHaveBeenCalledWith(expect.objectContaining({ id: reviewer.id }));
+    expect(await reports.read(reviewer.completion!.attemptId)).toEqual(report);
+  });
 
   it("removes associated coding, draft and running review workers before reading their reports", async () => {
     const f = fixture();

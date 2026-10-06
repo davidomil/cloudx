@@ -1,12 +1,11 @@
 // @vitest-environment jsdom
 
-import { act, createElement, useState } from "react";
+import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CloudxUpdateCapacity, CloudxUpdatePreview, CloudxUpdateStatus, WorkspaceCleanupJob, WorkspaceCleanupPreview, WorkspaceCleanupRequest } from "@cloudx/shared";
+import type { CloudxUpdateCapacity, CloudxUpdatePreview, CloudxUpdateStatus } from "@cloudx/shared";
 
-import { WorkspaceCleanupPanel } from "./WorkspaceCleanupPanel.js";
-import { useWorkspaceCleanup } from "./workspaceCleanupSession.js";
+
 import { CloudxUpdatePanel, useCloudxUpdate } from "./CloudxUpdatePanel.js";
 
 let root: Root | undefined;
@@ -49,11 +48,7 @@ async function mount() {
   const saveWorkspace = async () => {};
   function Harness() {
     const update = useCloudxUpdate(true, saveWorkspace, reload);
-    const [cleanupOpen, setCleanupOpen] = useState(false);
-    const cleanup = useWorkspaceCleanup({ onComplete: () => { void update.reassessCapacity(); } });
-    return createElement("div", null,
-      createElement(CloudxUpdatePanel, { update, cleanupBusy: cleanup.busy, onOpenEnvironments: () => { cleanup.setFilter("forge"); setCleanupOpen(true); } }),
-      cleanupOpen ? createElement(WorkspaceCleanupPanel, { cleanup }) : null);
+    return createElement(CloudxUpdatePanel, { update });
 
   }
   await act(async () => root!.render(createElement(Harness)));
@@ -103,60 +98,25 @@ describe("Update capacity recovery", () => {
     expect(container.textContent).toContain("Usage is unknown");
     expect(container.textContent).not.toContain("0 B more needed");
   });
-  it.each([false, true])("reviews safe Forge trash, cancels without deletion, and reassesses after cleanup (partial failure: %s)", async partial => {
-    const candidate = { id: "22222222-2222-4222-8222-222222222222", path: "/work/completed-forge", repository: "team/project",
-      kind: "forge" as const, state: "completed", lastActivity: capacity.checkedAt, allocatedBytes: 16 * 1024 ** 3, eligible: true,
-      reason: "Completed and inactive", sourceChanges: [], unpublishedCommits: 0, requiresDiscard: false };
-    const cleanupPreview: WorkspaceCleanupPreview = { id: "33333333-3333-4333-8333-333333333333", createdAt: capacity.checkedAt,
-      candidates: [candidate, { ...candidate, id: "44444444-4444-4444-8444-444444444444", path: "/work/unpublished", requiresDiscard: true,
-        sourceChanges: ["source.ts"], unpublishedCommits: 1, reason: "Source changes are preserved" },
-        { ...candidate, id: "66666666-6666-4666-8666-666666666666", path: "/work/shared", eligible: false, reason: "Shared by an unfinished worker" }],
-      reclaimableBytes: candidate.allocatedBytes, reclaimGroups: [{ bytes: candidate.allocatedBytes, candidateIds: [candidate.id] }],
-      availableBytes: 27225911296, warnings: [], resourceOutcomes: [
-        { id: "retired", path: "docker:retired", state: "deleted", reason: "Issue closed", reclaimedBytes: 1024 ** 3, remainingBytes: 0 },
-        { id: "pending", path: "docker:pending", state: "failed", reason: "Ownership needs review", reclaimedBytes: 0, sizeUnavailable: true }
-      ] };
-    let job: WorkspaceCleanupJob | null = null;
-    let requested: WorkspaceCleanupRequest | undefined;
+  it.each([false, true])("reassesses after automatic reclamation without opening manual cleanup (shortage remains: %s)", async shortageRemains => {
+    const availableBytes = shortageRemains ? capacity.filesystems[0]!.availableBytes : 50 * 1024 ** 3;
     const fetch = vi.fn(async (url: string, init?: RequestInit) => {
-      if (url.endsWith("workspace-cleanup/preview")) return Response.json(cleanupPreview);
-      if (url.endsWith("workspace-cleanup")) {
-        if (init?.method === "POST") {
-          requested = JSON.parse(init.body as string);
-          job = { id: "55555555-5555-4555-8555-555555555555", state: "completed", startedAt: capacity.checkedAt,
-            availableBytesBefore: cleanupPreview.availableBytes, availableBytesAfter: partial ? cleanupPreview.availableBytes : 50 * 1024 ** 3,
-            results: [{ id: candidate.id, path: candidate.path, status: partial ? "failed" : "deleted", reason: partial ? "Resource could not be removed" : "Deleted" }] };
-        }
-        return Response.json(job);
-      }
       if (url.endsWith("update/capacity")) return reply({ ...failedCapacity, run: { ...failedCapacity.run!, capacity: { ...capacity,
-        filesystems: capacity.filesystems.map(item => ({ ...item, availableBytes: job!.availableBytesAfter!, shortfallBytes: Math.max(0, item.requiredBytes - job!.availableBytesAfter!) })) } } });
+        filesystems: capacity.filesystems.map(item => ({ ...item, availableBytes, shortfallBytes: Math.max(0, item.requiredBytes - availableBytes) })) } } });
       return reply(init?.method === "POST" ? { available: true, run: { ...failedCapacity.run!, capacity: undefined, state: "running", resumable: false } } : failedCapacity);
     });
     vi.stubGlobal("fetch", fetch);
     const container = await mount();
-    await click("Manage Forge environments");
-    await click("Scan workspaces and environments");
-    expect(container.textContent).toContain("16.00 GiB");
-    expect(container.textContent).toContain("1.00 GiB Docker writable-layer bytes removed · 0 B remaining");
-    expect(container.textContent).toContain("Ownership needs review");
-    expect(container.textContent).toContain("Remaining size unknown");
-    expect(container.querySelector<HTMLInputElement>('[aria-label="Select /work/unpublished"]')?.disabled).toBe(true);
-    expect(container.querySelector<HTMLInputElement>('[aria-label="Select /work/shared"]')?.disabled).toBe(true);
-    await click("Review deletion of 1 workspace");
-    expect(button("Resume update").disabled).toBe(true);
-    await click("Cancel");
-    expect(requested).toBeUndefined();
-    await click("Review deletion of 1 workspace");
-    await click("Delete permanently");
-    expect(requested?.candidateIds).toEqual([candidate.id]);
-    expect(requested?.discardCandidateIds).toEqual([]);
+    expect(container.textContent).not.toContain("Manage Forge environments");
+    expect(container.querySelector('[aria-label="Workspace cleanup"]')).toBeNull();
+    await click("Recheck update capacity");
     const recheck = fetch.mock.calls.find(([url]) => url.endsWith("update/capacity"));
     expect(JSON.parse(recheck![1]!.body as string)).toEqual({ channel: "main", targetCommit: failedCapacity.run!.targetCommit, resumeRunId: failedCapacity.run!.id });
-    expect(container.textContent).toContain(partial ? "12.70 GiB more needed" : "0 B more needed");
+    expect(container.textContent).toContain(shortageRemains ? "12.70 GiB more needed" : "0 B more needed");
     await click("Resume update");
     const resume = fetch.mock.calls.find(([url, init]) => url.endsWith("/update") && init?.method === "POST");
     expect(JSON.parse(resume![1]!.body as string)).toEqual({ channel: "main", targetCommit: failedCapacity.run!.targetCommit, resumeRunId: failedCapacity.run!.id });
+    expect(fetch.mock.calls.some(([url]) => url.includes("workspace-cleanup"))).toBe(false);
     expect(reload).not.toHaveBeenCalled();
   });
 });

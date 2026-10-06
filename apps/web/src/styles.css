@@ -3682,11 +3682,9 @@ a:hover svg {
   background: var(--color-card);
 }
 
-.forge-environments { flex: 1; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; overflow-wrap: anywhere; }
-.forge-environments :is(button, input, textarea, select, a, summary) { scroll-margin-block: 12px; }
+.forge-evidence { flex: 1; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; padding: 12px; overflow-wrap: anywhere; }
+.forge-evidence a { scroll-margin-block: 12px; }
 .forge-header, .forge-tabs { flex-shrink: 0; }
-.forge-environments .workspace-cleanup label { flex-direction: row; }
-.forge-environments .workspace-cleanup > label:has(select) { flex-direction: column; }
 
 .forge-header, .forge-actions, .forge-tabs, .forge-detail-heading, .forge-worker-heading, .forge-pagination {
   display: flex;
@@ -3790,9 +3788,6 @@ a:hover svg {
   .forge-worker-overlay-terminal { margin: 8px; }
 }
 .forge-worker { margin-top: 12px; padding: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
-.forge-resource fieldset { min-width: 0; margin: 12px 0 0; border: 0; padding: 0; }
-.forge-resource .forge-resource-confirm { flex-direction: row; align-items: flex-start; margin: 12px 0; }
-.forge-resource-confirm input[type="checkbox"] { width: 18px; height: 18px; flex: 0 0 auto; padding: 0; margin: 2px 0 0; accent-color: var(--color-accent); }
 .forge-worker-history { margin-top: 12px; border: 1px solid var(--color-border); border-radius: 5px; overflow-wrap: anywhere; }
 .forge-worker-history > summary { cursor: pointer; padding: 12px; }
 .forge-worker-history > .forge-worker { margin: 0; border: 0; border-top: 1px solid var(--color-border); border-radius: 0; }
@@ -8256,22 +8251,9 @@ a:hover svg {
 .forge-issue-group-heading small { color: var(--color-muted-foreground); font-weight: normal; font-size: 11px; }
 .forge-issue-group + .forge-issue-group { border-top: 1px solid var(--color-border); }
 
-.workspace-cleanup { min-width: 0; }
 .cloudx-update-backups-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem; }
 .cloudx-update-backups-heading h4 { margin: 0; }
 .cloudx-update-backups-heading .cx-button { max-width: 100%; white-space: normal; }
-.workspace-cleanup p { margin: 0.5rem 0; }
-.workspace-cleanup code, .workspace-cleanup small { display: block; overflow-wrap: anywhere; white-space: normal; }
-.workspace-cleanup-list, .workspace-cleanup-results > ul { list-style: none; padding: 0; display: grid; gap: 0.65rem; }
-.workspace-cleanup-list > li, .workspace-cleanup-results li { min-width: 0; padding: 0.7rem; border: 1px solid var(--color-border); border-radius: 6px; }
-.workspace-cleanup-choice { display: flex; align-items: start; gap: 0.5rem; }
-.workspace-cleanup-choice strong { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.workspace-cleanup-choice span { white-space: nowrap; }
-.workspace-cleanup label { display: flex; gap: 0.5rem; align-items: start; }
-.workspace-cleanup input[type="checkbox"] { flex: 0 0 auto; width: 18px; height: 18px; padding: 0; margin: 0.15rem 0 0; accent-color: var(--color-accent); }
-.workspace-cleanup-confirm { margin-top: 0.75rem; padding: 0.75rem; border: 1px solid var(--color-border); border-radius: 6px; }
-.workspace-cleanup-confirm button + button { margin-left: 0.5rem; }
-.workspace-cleanup progress { width: 100%; }
 
 .forge-merge-queues { flex: none; max-height: 28vh; overflow: auto; border-bottom: 1px solid var(--color-border); padding: 8px 12px; }
 .forge-merge-queues h3 { font-size: var(--font-size-sm); margin: 0 0 6px; overflow-wrap: anywhere; }
@@ -8281,8 +8263,6 @@ a:hover svg {
 .forge-merge-queue { border-left: 2px solid var(--color-accent); padding-left: 10px; margin: 10px 0; overflow-wrap: anywhere; }
 .forge-merge-queue p { margin: 4px 0; }
 
-.workspace-cleanup > .cx-button { justify-self: start; max-width: 100%; white-space: normal; }
-.workspace-cleanup small { color: var(--color-muted-foreground); font-size: var(--font-size-sm); }
 
 .cloudx-update-capacity pre {
   max-width: 100%;

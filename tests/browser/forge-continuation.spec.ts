@@ -98,10 +98,10 @@ async function workers(
     requested = resolve;
   });
 
-  await page.route("**/api/system/workspace-cleanup", (route) =>
-    route.fulfill({ json: null }),
-  );
   await page.route("**/api/forge/checkout-evidence", (route) =>
+    route.fulfill({ json: { archives: [] } }),
+  );
+  await page.route("**/api/forge/git-history", (route) =>
     route.fulfill({ json: { archives: [] } }),
   );
   await page.route("**/fixture-hooks/**", async (route) => {
@@ -224,7 +224,7 @@ test("shows retained checkout files without offering another worker attempt", as
   });
 });
 
-test("reviews legacy environment evidence and requires confirmation before discarding", async ({
+test("keeps saved evidence downloadable without manual cleanup or evidence decisions", async ({
   page,
 }, testInfo) => {
   const resource = {
@@ -233,65 +233,63 @@ test("reviews legacy environment evidence and requires confirmation before disca
     kind: "container",
     engineId: "fixture-engine",
     owner: { workerId: "issue-worker", attemptId: "earlier-attempt" },
-    consumers: [{ workerId: "issue-worker", attemptId: "earlier-attempt" }],
-    state: "blocked",
-    reason:
-      "The completed environment is stopped. Select the useful evidence before release.",
-    retentionReason: "Preserve the regression log for the validated commit.",
-    allocatedBytes: 8192,
-    reclaimedBytes: 0,
-    updatedAt: "2026-10-04",
+    consumers: [],
+    state: "deleted",
+    reason: "Completed environment cleaned automatically",
+    reclaimedBytes: 8192,
+    updatedAt: "2026-10-06",
+    evidence: {
+      state: "verified",
+      paths: ["/evidence"],
+      commitSha: "a".repeat(40),
+      bytes: 1024,
+      files: [
+        { path: "evidence/test.log", bytes: 1024, sha256: "b".repeat(64) },
+      ],
+    },
   };
-  const decisions: unknown[] = [];
+  const manualCleanupRequests: string[] = [];
+  page.on("request", (request) => {
+    if (/workspace-cleanup|evidence-decision/.test(request.url()))
+      manualCleanupRequests.push(request.url());
+  });
   await page.route("**/api/forge/resources", (route) =>
     route.fulfill({ json: { resources: [resource] } }),
   );
   await page.route(
-    "**/api/forge/resources/evidence-resource/evidence-decision",
-    (route) => {
-      decisions.push(route.request().postDataJSON());
-      resource.state = "deleted";
-      resource.reclaimedBytes = 8192;
-      return route.fulfill({ json: resource });
-    },
+    "**/api/forge/resources/evidence-resource/evidence-file?*",
+    (route) =>
+      route.fulfill({
+        body: "saved regression log",
+        contentType: "text/plain",
+        headers: { "content-disposition": "attachment" },
+      }),
   );
   await workers(page);
-  await page.getByRole("button", { name: "Environments", exact: true }).click();
-  const environment = page.getByRole("article", {
-    name: "Environment completed-regression-env",
+  await page.getByRole("button", { name: "Evidence", exact: true }).click();
+  const evidence = page.getByRole("article", {
+    name: "Saved evidence for completed-regression-env",
     exact: true,
   });
-  await expect(environment).toContainText(resource.retentionReason);
-  const discard = environment.getByRole("button", {
-    name: "Discard evidence and release",
-    exact: true,
-  });
-  await expect(discard).toBeDisabled();
-  await environment
-    .getByRole("textbox", {
-      name: "Evidence paths for completed-regression-env",
-    })
-    .fill("/work/evidence/test.log");
+  await expect(evidence).toContainText(resource.evidence.commitSha);
   await expect(
-    environment.getByRole("button", { name: "Export evidence and release" }),
-  ).toBeEnabled();
-  await environment
-    .getByRole("checkbox", {
-      name: "Discard this container’s evidence permanently",
-    })
-    .check();
-  const screenshot = testInfo.outputPath("environment-evidence-decision.png");
-  await page.screenshot({ path: screenshot, fullPage: true });
-  await testInfo.attach("environment-evidence-decision", {
+    evidence.getByRole("link", { name: "Download manifest" }),
+  ).toHaveAttribute("href", "/api/forge/resources/evidence-resource/evidence");
+  await expect(
+    evidence.locator("button, input, textarea, select, fieldset"),
+  ).toHaveCount(0);
+  const download = page.waitForEvent("download");
+  await evidence
+    .getByRole("link", { name: "evidence/test.log", exact: true })
+    .click();
+  expect((await download).suggestedFilename()).toBe("test.log");
+  const screenshot = testInfo.outputPath("saved-worker-evidence.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("saved-worker-evidence", {
     path: screenshot,
     contentType: "image/png",
   });
-  await discard.click();
-  await expect(environment).toContainText("8,192 writable bytes reclaimed");
-  await expect(environment.locator("fieldset")).toHaveCount(0);
-  expect(decisions).toEqual([
-    { action: "discard", confirmation: "Discard evidence" },
-  ]);
+  expect(manualCleanupRequests).toEqual([]);
 });
 
 test("continues an unfinished handoff with the exact message to its issue worker", async ({

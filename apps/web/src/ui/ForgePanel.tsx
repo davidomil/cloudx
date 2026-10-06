@@ -8,13 +8,12 @@ import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
 import { ForgeWorkerTerminalOverlay } from "./ForgeWorkerTerminalOverlay.js";
 import { ForgeResourcesPanel } from "./ForgeResourcesPanel.js";
-import type { WorkspaceCleanupController } from "./workspaceCleanupSession.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 type Request = <T>(hook: string, input?: Record<string, unknown>) => Promise<T>;
 type RunAction = (work: () => Promise<unknown>, interrupt?: boolean, workerId?: string) => Promise<boolean>;
-type View = "issues" | "changes" | "workers" | "environments";
+type View = "issues" | "changes" | "workers" | "evidence";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
 const queuePhaseLabels = { queued: "Queued", updating: "Updating branch", resolving: "Resolving conflicts", reviewing: "Reviewing changes", waiting_ci: "Waiting for CI", merging: "Merging", blocked: "Blocked" };
 const WorkerActions = createContext<{ globalBusy: boolean; pending: Set<string> }>({ globalBusy: false, pending: new Set() });
@@ -23,9 +22,7 @@ const WorkerContinuations = createContext<{
   setMessage: (workerId: string, message?: string) => void;
 } | null>(null);
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, cleanup, environmentsRequest }: {
-  cleanup: WorkspaceCleanupController;
-  environmentsRequest?: number;
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending }: {
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
@@ -46,12 +43,6 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
     return (await request<{ history?: ForgeWorkerHistory }>("forge.worker.history", { id })).history;
   }, [request]);
   const [view, setView] = useState<View>("issues");
-  const handledEnvironmentsRequest = useRef<number | undefined>(undefined);
-  useEffect(() => {
-    if (active && environmentsRequest && environmentsRequest !== handledEnvironmentsRequest.current) {
-      handledEnvironmentsRequest.current = environmentsRequest; setView("environments");
-    }
-  }, [active, environmentsRequest]);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>();
   const [terminalWorkerId, setTerminalWorkerId] = useState<string>();
   const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
@@ -165,13 +156,13 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
     </div> : null}
     {dashboard ? <>
       <nav className="forge-tabs" aria-label="Forge sections">
-        {(["issues", "changes", "workers", "environments"] as const).map((item) => <ControlButton key={item} size="compact" pressed={view === item} onClick={() => setView(item)}>
-          {item === "issues" ? "Issues" : item === "changes" ? changeLabel : item === "environments" ? "Environments" : `Workers (${workers.length})`}
+        {(["issues", "changes", "workers", "evidence"] as const).map((item) => <ControlButton key={item} size="compact" pressed={view === item} onClick={() => setView(item)}>
+          {item === "issues" ? "Issues" : item === "changes" ? changeLabel : item === "evidence" ? "Evidence" : `Workers (${workers.length})`}
           {item === "workers" && awaitingReview ? <span className="forge-badge">{awaitingReview} awaiting review</span> : null}
         </ControlButton>)}
       </nav>
       {view === "workers" ? <MergeQueues workers={workers} onSelect={setSelectedWorkerId} /> : null}
-      {view === "environments" ? <ForgeResourcesPanel cleanup={cleanup} /> : null}
+      {view === "evidence" ? <ForgeResourcesPanel revision={revision} /> : null}
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
         {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : (view === "issues" || view === "changes") && dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
