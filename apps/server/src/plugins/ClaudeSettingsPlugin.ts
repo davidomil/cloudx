@@ -1,5 +1,5 @@
 import { descriptorFromPlugin, type HookDefinition, type PluginSession, type WorkspacePlugin } from "@cloudx/plugin-api";
-import { CLAUDE_EFFORT_LEVELS, CLAUDE_LAUNCH_PERMISSION_MODES, CLAUDE_SETTINGS_HOOKS, CLAUDE_SETTINGS_PLUGIN_ID, CLAUDE_UPDATE_CHANNELS, type ClaudeGlobalSettingsUpdate } from "@cloudx/shared";
+import { CLAUDE_EFFORT_LEVELS, CLAUDE_LAUNCH_PERMISSION_MODES, CLAUDE_SKILL_NAME_PATTERN, CLAUDE_SETTINGS_HOOKS, CLAUDE_SETTINGS_PLUGIN_ID, CLAUDE_UPDATE_CHANNELS, type ClaudeGlobalSettingsUpdate } from "@cloudx/shared";
 
 import { CLAUDE_BYPASS_WARNING, type ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 
@@ -47,7 +47,8 @@ export class ClaudeSettingsPlugin implements WorkspacePlugin {
             language: nullable({ type: "string", maxLength: 64 }),
             autoUpdatesChannel: nullable({ type: "string", enum: [...CLAUDE_UPDATE_CHANNELS] }),
             permissionMode: { type: "string", enum: [...CLAUDE_LAUNCH_PERMISSION_MODES] },
-            autoTrustWorkspace: { type: "boolean" }
+            autoTrustWorkspace: { type: "boolean" },
+            allowedSkills: { type: "array", maxItems: 1000, items: { type: "string", pattern: CLAUDE_SKILL_NAME_PATTERN.source } }
           },
           required: ["expectedRevision"],
           additionalProperties: false

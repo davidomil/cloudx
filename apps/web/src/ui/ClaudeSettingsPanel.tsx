@@ -37,6 +37,7 @@ interface Draft {
   autoUpdatesChannel: string;
   permissionMode: ClaudeLaunchPermissionMode;
   autoTrustWorkspace: boolean;
+  allowedSkills: string[];
 }
 
 function draftFrom(settings: ClaudeGlobalSettings): Draft {
@@ -44,7 +45,8 @@ function draftFrom(settings: ClaudeGlobalSettings): Draft {
   return {
     model: settings.model ?? "", effortLevel: settings.effortLevel ?? "", alwaysThinkingEnabled: flag(settings.alwaysThinkingEnabled),
     fastMode: flag(settings.fastMode), outputStyle: settings.outputStyle ?? "", language: settings.language ?? "",
-    autoUpdatesChannel: settings.autoUpdatesChannel ?? "", permissionMode: settings.permissionMode, autoTrustWorkspace: settings.autoTrustWorkspace
+    autoUpdatesChannel: settings.autoUpdatesChannel ?? "", permissionMode: settings.permissionMode, autoTrustWorkspace: settings.autoTrustWorkspace,
+    allowedSkills: settings.skills.filter(skill => skill.allowed).map(skill => skill.name).sort()
   };
 }
 
@@ -57,6 +59,7 @@ function changes(settings: ClaudeGlobalSettings, draft: Draft): Omit<ClaudeGloba
     if (draft[key] !== saved[key]) update[key] = draft[key] === "" ? null : draft[key] === "true";
   if (draft.permissionMode !== saved.permissionMode) update.permissionMode = draft.permissionMode;
   if (draft.autoTrustWorkspace !== saved.autoTrustWorkspace) update.autoTrustWorkspace = draft.autoTrustWorkspace;
+  if (draft.allowedSkills.join("\n") !== saved.allowedSkills.join("\n")) update.allowedSkills = draft.allowedSkills;
   return update;
 }
 
@@ -179,6 +182,24 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
           <input type="checkbox" aria-label="Automatically trust workspace" checked={draft.autoTrustWorkspace} onChange={event => set("autoTrustWorkspace", event.target.checked)} />
           <span>Automatically trust workspace<small>Trusts the tab's working directory in its own Claude state. Folders you already trusted in Claude Code stay trusted either way.</small></span>
         </label>
+      </fieldset>
+
+      <fieldset className="codex-settings-group" disabled={busy !== null}>
+        <legend>Claude skills outside CloudX</legend>
+        <small>CloudX tabs use CloudX skills only, like Codex tabs. Bundled skills, plugins, project skills and auto-memory are off. Choose personal or claude.ai skills that CloudX tabs may also use.</small>
+        {settings.skills.map(skill => <label className="codex-settings-toggle" key={skill.name}>
+          <input
+            type="checkbox"
+            aria-label={`Allow ${skill.name}`}
+            checked={draft.allowedSkills.includes(skill.name)}
+            disabled={!skill.available && !draft.allowedSkills.includes(skill.name)}
+            onChange={event => set("allowedSkills", event.target.checked
+              ? [...draft.allowedSkills, skill.name].sort()
+              : draft.allowedSkills.filter(name => name !== skill.name))}
+          />
+          <span>{skill.name}<small>{skill.available ? skill.origin === "synced" ? "Synced from claude.ai." : "Personal skill." : "Not installed."}</small></span>
+        </label>)}
+        {!settings.skills.length ? <p>No personal or synced Claude skills are installed.</p> : null}
       </fieldset>
 
       <div className="codex-settings-save">

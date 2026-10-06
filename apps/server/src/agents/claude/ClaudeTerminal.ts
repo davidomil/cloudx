@@ -77,7 +77,7 @@ export class ClaudeTerminal {
     const executionId = randomUUID();
     const template = templateFromRuntimeContext(input.runtimeContext);
     const configDir = this.configDir(input.tab.id);
-    let settings: ClaudeLaunchPreferences;
+    let settings: Pick<ClaudeLaunchPreferences, "permissionMode" | "autoTrustWorkspace">;
     let account;
     let overlayInput: ClaudeHomeOverlayOptions;
     let overlay: ClaudeHomeOverlay;
@@ -94,7 +94,8 @@ export class ClaudeTerminal {
       overlayInput = {
         dataDir, tabId: input.tab.id, accountHome: accounts.home(account), providerHome: this.providerHome, executionId,
         resolved: template, cwd: input.cwd, userStatePath: claudeUserStatePath(this.env),
-        trustProject: Boolean(await input.authorizeProjectTrust?.()) || settings.autoTrustWorkspace
+        trustProject: Boolean(await input.authorizeProjectTrust?.()) || settings.autoTrustWorkspace,
+        allowedSkills: current.skills.filter(skill => skill.allowed).map(skill => skill.name)
       };
       overlay = await materializeClaudeHomeOverlay(overlayInput);
       env = claudeLaunchEnv(buildToolEnv(this.env), configDir, await accounts.launchEnv(account));

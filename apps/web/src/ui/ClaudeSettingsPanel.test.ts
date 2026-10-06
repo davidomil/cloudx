@@ -24,7 +24,12 @@ afterEach(async () => {
 const saved: ClaudeGlobalSettings = {
   revision: "a".repeat(64), settingsPath: "/home/user/.claude/settings.json",
   model: "opus", effortLevel: null, alwaysThinkingEnabled: null, fastMode: true, outputStyle: null, language: null, autoUpdatesChannel: null,
-  permissionMode: "bypassPermissions", autoTrustWorkspace: true, bypassAccepted: false, bypassDisabled: false
+  permissionMode: "bypassPermissions", autoTrustWorkspace: true, bypassAccepted: false, bypassDisabled: false,
+  skills: [
+    { name: "release-notes", origin: "personal", allowed: false, available: true },
+    { name: "docx", origin: "synced", allowed: true, available: true },
+    { name: "pdf", origin: "synced", allowed: false, available: true }
+  ]
 };
 
 function hooks(settings = saved) {
@@ -110,6 +115,17 @@ describe("ClaudeSettingsPanel", () => {
     await act(async () => button(container, "Update Claude Code").click());
     expect(callHook).toHaveBeenCalledWith("claude-settings.update-cli", {});
     expect(container.textContent).toContain("2.1.300 (Claude Code)");
+  });
+
+  it("saves the personal and synced skills CloudX tabs may use", async () => {
+    const callHook = hooks();
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    expect((control(container, "Allow docx") as HTMLInputElement).checked).toBe(true);
+    expect(container.textContent).toContain("Synced from claude.ai.");
+    await act(async () => (control(container, "Allow release-notes") as HTMLInputElement).click());
+    await act(async () => (control(container, "Allow docx") as HTMLInputElement).click());
+    await act(async () => button(container, "Save Claude settings").click());
+    expect(callHook).toHaveBeenCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), allowedSkills: ["release-notes"] });
   });
 });
 

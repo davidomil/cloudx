@@ -56,6 +56,28 @@ If your Claude settings set `permissions.disableBypassPermissionsMode`,
 the page says so; bypass tabs and Forge workers on Claude cannot start
 until that policy changes.
 
+## Skills and memory
+
+Claude tabs get the same CloudX rules and skills as Codex tabs: the
+CloudX system skills and the skills of the tab's template. As with
+Codex, CloudX decides which other skills a tab has. For each Claude tab
+it turns off, for that launch only:
+
+- the skills and workflows bundled with Claude Code
+- personal skills in `~/.claude/skills` and skills synced from claude.ai
+- project skills in `.claude/skills`, from the working directory up to
+  the repository root
+- plugins enabled in your user or project settings, and plugin sync
+- auto-memory
+
+Your own `~/.claude/settings.json` is not changed, so plain `claude`
+keeps all of these. The project's `CLAUDE.md` and `AGENTS.md` files
+still load, as they do for Codex.
+
+**Claude skills outside CloudX** lists your personal and synced skills.
+A skill you select there is available in new Claude tabs. Synced skills
+stay synced while at least one of them is selected.
+
 ## Bypass permissions warning
 
 Bypass mode needs Claude Code's warning accepted once. CloudX does not

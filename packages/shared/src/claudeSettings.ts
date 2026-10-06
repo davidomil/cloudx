@@ -16,6 +16,20 @@ export type ClaudeUpdateChannel = typeof CLAUDE_UPDATE_CHANNELS[number];
 export const CLAUDE_LAUNCH_PERMISSION_MODES = ["bypassPermissions", "acceptEdits", "auto", "manual", "plan"] as const;
 export type ClaudeLaunchPermissionMode = typeof CLAUDE_LAUNCH_PERMISSION_MODES[number];
 
+// Skills Claude Code finds outside CloudX: personal skills in the user's Claude
+// home and skills synced from claude.ai. CloudX tabs hide them unless allowed.
+export const CLAUDE_SKILL_ORIGINS = ["personal", "synced"] as const;
+export type ClaudeSkillOrigin = typeof CLAUDE_SKILL_ORIGINS[number];
+export const CLAUDE_SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+
+export interface ClaudeSkillChoice {
+  name: string;
+  origin: ClaudeSkillOrigin;
+  allowed: boolean;
+  // False for an allowed skill that is no longer installed.
+  available: boolean;
+}
+
 export interface ClaudeGlobalSettings {
   revision: string;
   settingsPath: string;
@@ -30,6 +44,7 @@ export interface ClaudeGlobalSettings {
   // CloudX launch preferences.
   permissionMode: ClaudeLaunchPermissionMode;
   autoTrustWorkspace: boolean;
+  skills: ClaudeSkillChoice[];
   // Bypass consent state from the native settings.
   bypassAccepted: boolean;
   bypassDisabled: boolean;
@@ -46,6 +61,8 @@ export interface ClaudeGlobalSettingsUpdate {
   autoUpdatesChannel?: ClaudeUpdateChannel | null;
   permissionMode?: ClaudeLaunchPermissionMode;
   autoTrustWorkspace?: boolean;
+  // Names of personal or synced skills CloudX tabs may use.
+  allowedSkills?: string[];
 }
 
 export interface ClaudeCliStatus {

@@ -18,6 +18,7 @@ import { replaceLink } from "../replaceLink.js";
 import { writeTextFileAtomic } from "../../jsonStateFile.js";
 import { shellQuote } from "../../terminal/ShellLaunch.js";
 import { ensureClaudeSettingsFile } from "./ClaudeSettingsService.js";
+import { claudeSkillPolicy, type ClaudeSkillPolicy } from "./claudeSkillPolicy.js";
 
 export const CLAUDE_FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
 
@@ -40,6 +41,8 @@ export interface ClaudeHomeOverlayOptions {
   trustProject?: boolean;
   // The user's own Claude state file. Folders trusted there stay trusted.
   userStatePath?: string;
+  // Personal or synced skills the user allowed in Settings → Claude.
+  allowedSkills?: readonly string[];
 }
 
 export interface ClaudeHomeOverlay {
@@ -92,15 +95,23 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
   const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
-  await materializeSkills(configDir, options.providerHome, rulesSkillsRoot, options.resolved, systemSkills);
+  const generated = generatedSkills(rulesSkillsRoot, options.resolved, systemSkills);
+  const policy = await claudeSkillPolicy({
+    providerHome: options.providerHome,
+    cwd: options.cwd,
+    allowedSkills: options.allowedSkills ?? [],
+    cloudxSkillNames: generated.map(skill => skill.directory)
+  });
+  await materializeSkills(configDir, options.providerHome, generated, policy);
   await writeInstructions(configDir, options.providerHome, options.resolved, systemRules);
   const settingsPath = path.join(configDir, ".cloudx-settings.json");
-  await writeAtomic(settingsPath, `${JSON.stringify(hookSettings(configDir, options.tabId, options.executionId), null, 2)}\n`);
+  const launchSettings = { ...policy.settings, ...hookSettings(configDir, options.tabId, options.executionId) };
+  await writeAtomic(settingsPath, `${JSON.stringify(launchSettings, null, 2)}\n`);
   return { configDir, rulesSkillsRoot, settingsPath, systemRules };
 }
 
-// CloudX passes its hooks with --settings so they are added to, not replacing,
-// the user's own settings.json hooks.
+// CloudX passes its hooks and skill policy with --settings. The hooks are
+// added to the user's own settings.json hooks.
 function hookSettings(configDir: string, tabId: string, executionId: string): Record<string, unknown> {
   const helper = fileURLToPath(new URL("../../../helpers/claude-hook-receipt.mjs", import.meta.url));
   const hook = (event: string) => [{
@@ -134,36 +145,38 @@ async function seedClaudeState(statePath: string, cwd: string | undefined, trust
   await writeAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
 }
 
-async function materializeSkills(
-  configDir: string,
-  providerHome: string,
+// Claude Code discovers skills one level below skills/, so CloudX skills use
+// a group prefix instead of nested group directories.
+function generatedSkills(
   rulesSkillsRoot: string,
   resolved: ResolvedPersonalityTemplate | undefined,
   systemSkills: CloudxSkill[]
+): { directory: string; source: string }[] {
+  return [
+    ...(resolved?.skills ?? []).map(skill => ({ directory: `${GENERATED_SKILL_GROUPS[0]}-${safeSegment(skill.id)}`, source: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)) })),
+    ...systemSkills.map(skill => ({ directory: `${GENERATED_SKILL_GROUPS[1]}-${safeSegment(skill.id)}`, source: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)) }))
+  ];
+}
+
+async function materializeSkills(
+  configDir: string,
+  providerHome: string,
+  generated: { directory: string; source: string }[],
+  policy: ClaudeSkillPolicy
 ): Promise<void> {
   const skillsDir = path.join(configDir, "skills");
   const existing = await optionalLstat(skillsDir);
   if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) throw new Error(`Unexpected Claude skills entry at ${skillsDir}.`);
   await fsp.rm(skillsDir, { recursive: true, force: true });
   await fsp.mkdir(skillsDir, { mode: 0o700 });
-  // Claude Code discovers skills one level below skills/, so CloudX skills use
-  // a group prefix instead of nested group directories.
-  const generated = [
-    ...(resolved?.skills ?? []).map(skill => ({ group: GENERATED_SKILL_GROUPS[0], id: skill.id, source: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)) })),
-    ...systemSkills.map(skill => ({ group: GENERATED_SKILL_GROUPS[1], id: skill.id, source: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)) }))
-  ];
   for (const skill of generated) {
-    await fsp.cp(skill.source, path.join(skillsDir, `${skill.group}-${safeSegment(skill.id)}`), { recursive: true, dereference: false, verbatimSymlinks: true });
+    await fsp.cp(skill.source, path.join(skillsDir, skill.directory), { recursive: true, dereference: false, verbatimSymlinks: true });
   }
   const userSkills = path.join(providerHome, "skills");
-  let entries: fs.Dirent[] = [];
-  try { entries = await fsp.readdir(userSkills, { withFileTypes: true }); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  for (const entry of entries) {
-    if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-    const target = path.join(skillsDir, entry.name);
+  for (const name of [...policy.personalDirectories, ...(policy.linkSynced ? ["synced"] : [])]) {
+    const target = path.join(skillsDir, name);
     if (await optionalLstat(target)) continue;
-    await fsp.symlink(path.join(userSkills, entry.name), target, "dir");
+    await fsp.symlink(path.join(userSkills, name), target, "dir");
   }
 }
 

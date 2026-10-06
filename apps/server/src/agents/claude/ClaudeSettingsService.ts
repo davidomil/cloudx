@@ -6,17 +6,20 @@ import {
   CLAUDE_EFFORT_LEVELS,
   CLAUDE_LAUNCH_PERMISSION_MODES,
   CLAUDE_MODEL_ID_PATTERN,
+  CLAUDE_SKILL_NAME_PATTERN,
   CLAUDE_TEXT_SETTING_PATTERN,
   CLAUDE_UPDATE_CHANNELS,
   isRecord,
   type ClaudeCliStatus,
   type ClaudeGlobalSettings,
   type ClaudeGlobalSettingsUpdate,
-  type ClaudeLaunchPermissionMode
+  type ClaudeLaunchPermissionMode,
+  type ClaudeSkillChoice
 } from "@cloudx/shared";
 
 import { JsonStateFile, writeTextFileAtomic } from "../../jsonStateFile.js";
 import { agentCommand, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } from "../agentCli.js";
+import { discoverClaudeUserSkills, type ClaudeUserSkill } from "./claudeSkillPolicy.js";
 
 const MAX_SETTINGS_BYTES = 1024 * 1024;
 const UPDATE_TIMEOUT_MS = 5 * 60_000;
@@ -32,9 +35,11 @@ export const CLAUDE_BYPASS_WARNING =
 export interface ClaudeLaunchPreferences {
   permissionMode: ClaudeLaunchPermissionMode;
   autoTrustWorkspace: boolean;
+  // Personal or synced skills CloudX tabs may use. All others are hidden.
+  allowedSkills: string[];
 }
 
-const DEFAULT_CLAUDE_LAUNCH_PREFERENCES: ClaudeLaunchPreferences = { permissionMode: "bypassPermissions", autoTrustWorkspace: true };
+const DEFAULT_CLAUDE_LAUNCH_PREFERENCES: ClaudeLaunchPreferences = { permissionMode: "bypassPermissions", autoTrustWorkspace: true, allowedSkills: [] };
 
 function claudeSettingsPath(providerHome: string): string {
   return path.join(providerHome, "settings.json");
@@ -73,7 +78,7 @@ export class ClaudeSettingsService {
 
   async read(): Promise<ClaudeGlobalSettings> {
     const target = claudeSettingsPath(this.providerHome());
-    return settingsFrom(target, await readText(target), await this.launchPreferences());
+    return settingsFrom(target, await readText(target), await this.launchPreferences(), await discoverClaudeUserSkills(this.providerHome()));
   }
 
   update(input: ClaudeGlobalSettingsUpdate): Promise<ClaudeGlobalSettings> {
@@ -118,7 +123,8 @@ export class ClaudeSettingsService {
     const target = claudeSettingsPath(home);
     const original = await readText(target);
     const preferences = await this.launchPreferences();
-    if (input.expectedRevision !== settingsFrom(target, original, preferences).revision) throw new Error("Claude settings changed. Reload before saving again.");
+    const installed = await discoverClaudeUserSkills(home);
+    if (input.expectedRevision !== settingsFrom(target, original, preferences, installed).revision) throw new Error("Claude settings changed. Reload before saving again.");
 
     const native = parseSettings(target, original);
     const changedKeys = NATIVE_KEYS.filter(key => input[key] !== undefined && input[key] !== (native[key] ?? null));
@@ -132,18 +138,25 @@ export class ClaudeSettingsService {
       if (await readText(target) !== (original ?? "{}\n")) throw new Error("Claude settings changed. Reload before saving again.");
       await writeThroughLink(target, native);
     }
-    const next = { permissionMode: input.permissionMode ?? preferences.permissionMode, autoTrustWorkspace: input.autoTrustWorkspace ?? preferences.autoTrustWorkspace };
-    if (next.permissionMode !== preferences.permissionMode || next.autoTrustWorkspace !== preferences.autoTrustWorkspace) await this.preferences.write(next);
+    const next: ClaudeLaunchPreferences = {
+      permissionMode: input.permissionMode ?? preferences.permissionMode,
+      autoTrustWorkspace: input.autoTrustWorkspace ?? preferences.autoTrustWorkspace,
+      allowedSkills: input.allowedSkills ? [...new Set(input.allowedSkills)].sort() : preferences.allowedSkills
+    };
+    for (const name of next.allowedSkills)
+      if (!preferences.allowedSkills.includes(name) && !installed.some(skill => skill.name === name)) throw new Error(`Claude skill ${name} is not installed.`);
+    if (JSON.stringify(next) !== JSON.stringify(preferences)) await this.preferences.write(next);
     return this.read();
   }
 }
 
-function settingsFrom(settingsPath: string, text: string | undefined, preferences: ClaudeLaunchPreferences): ClaudeGlobalSettings {
+function settingsFrom(settingsPath: string, text: string | undefined, preferences: ClaudeLaunchPreferences, installed: ClaudeUserSkill[]): ClaudeGlobalSettings {
   const native = parseSettings(settingsPath, text);
+  const skills = skillChoices(installed, preferences.allowedSkills);
   const string = (key: string) => typeof native[key] === "string" ? native[key] as string : null;
   const boolean = (key: string) => typeof native[key] === "boolean" ? native[key] as boolean : null;
   return {
-    revision: createHash("sha256").update(JSON.stringify([settingsPath, text ?? null, preferences])).digest("hex"),
+    revision: createHash("sha256").update(JSON.stringify([settingsPath, text ?? null, preferences, skills])).digest("hex"),
     settingsPath,
     model: string("model"),
     effortLevel: string("effortLevel"),
@@ -152,10 +165,23 @@ function settingsFrom(settingsPath: string, text: string | undefined, preference
     outputStyle: string("outputStyle"),
     language: string("language"),
     autoUpdatesChannel: string("autoUpdatesChannel"),
-    ...preferences,
+    permissionMode: preferences.permissionMode,
+    autoTrustWorkspace: preferences.autoTrustWorkspace,
+    skills,
     bypassAccepted: native[BYPASS_CONSENT_KEY] === true,
     bypassDisabled: isRecord(native.permissions) && native.permissions.disableBypassPermissionsMode === "disable"
   };
+}
+
+// Installed skills by name, plus allowed skills that are no longer installed so
+// the user can see and remove them.
+function skillChoices(installed: ClaudeUserSkill[], allowedSkills: string[]): ClaudeSkillChoice[] {
+  const choices = new Map<string, ClaudeSkillChoice>();
+  for (const skill of installed)
+    if (!choices.has(skill.name)) choices.set(skill.name, { name: skill.name, origin: skill.origin, allowed: allowedSkills.includes(skill.name), available: true });
+  for (const name of allowedSkills)
+    if (!choices.has(name)) choices.set(name, { name, origin: "personal", allowed: true, available: false });
+  return [...choices.values()].sort((a, b) => a.origin.localeCompare(b.origin) || a.name.localeCompare(b.name));
 }
 
 function parseSettings(settingsPath: string, text: string | undefined): Record<string, unknown> {
@@ -169,13 +195,18 @@ function parseSettings(settingsPath: string, text: string | undefined): Record<s
 
 function parsePreferences(value: unknown): ClaudeLaunchPreferences {
   if (value === undefined) return { ...DEFAULT_CLAUDE_LAUNCH_PREFERENCES };
-  if (!isRecord(value) || !CLAUDE_LAUNCH_PERMISSION_MODES.some(mode => mode === value.permissionMode) || typeof value.autoTrustWorkspace !== "boolean")
+  const allowedSkills = isRecord(value) && value.allowedSkills === undefined ? [] : isRecord(value) ? value.allowedSkills : undefined;
+  if (!isRecord(value) || !CLAUDE_LAUNCH_PERMISSION_MODES.some(mode => mode === value.permissionMode) || typeof value.autoTrustWorkspace !== "boolean" || !validSkillNames(allowedSkills))
     throw new Error("Claude launch preferences are invalid. Fix or remove claude-launch-preferences.json in the CloudX data directory.");
-  return { permissionMode: value.permissionMode as ClaudeLaunchPermissionMode, autoTrustWorkspace: value.autoTrustWorkspace };
+  return { permissionMode: value.permissionMode as ClaudeLaunchPermissionMode, autoTrustWorkspace: value.autoTrustWorkspace, allowedSkills };
+}
+
+function validSkillNames(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length <= 1_000 && value.every(name => typeof name === "string" && CLAUDE_SKILL_NAME_PATTERN.test(name));
 }
 
 function validateUpdate(input: ClaudeGlobalSettingsUpdate): void {
-  const allowed = ["expectedRevision", ...NATIVE_KEYS, "permissionMode", "autoTrustWorkspace"];
+  const allowed = ["expectedRevision", ...NATIVE_KEYS, "permissionMode", "autoTrustWorkspace", "allowedSkills"];
   if (!isRecord(input) || Object.keys(input).some(key => !allowed.includes(key)) ||
       typeof input.expectedRevision !== "string" || !/^[a-f0-9]{64}$/u.test(input.expectedRevision))
     throw new Error("Invalid Claude settings update.");
@@ -190,6 +221,7 @@ function validateUpdate(input: ClaudeGlobalSettingsUpdate): void {
     nullable(input[key], value => typeof value === "string" && CLAUDE_TEXT_SETTING_PATTERN.test(value), `Claude ${key} must be a short name of letters, numbers and spaces.`);
   if (input.permissionMode !== undefined && !CLAUDE_LAUNCH_PERMISSION_MODES.includes(input.permissionMode)) throw new Error("Invalid Claude permission mode.");
   if (input.autoTrustWorkspace !== undefined && typeof input.autoTrustWorkspace !== "boolean") throw new Error("Claude autoTrustWorkspace must be true or false.");
+  if (input.allowedSkills !== undefined && !validSkillNames(input.allowedSkills)) throw new Error("Claude allowedSkills must be a list of skill names.");
 }
 
 async function readText(target: string): Promise<string | undefined> {

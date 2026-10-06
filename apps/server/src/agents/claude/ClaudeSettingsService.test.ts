@@ -51,9 +51,33 @@ describe("ClaudeSettingsService", () => {
     const { service, providerHome, dataDir } = await setup({ theme: "dark" });
     const saved = await service.update({ expectedRevision: (await service.read()).revision, permissionMode: "acceptEdits", autoTrustWorkspace: false });
     expect(saved).toMatchObject({ permissionMode: "acceptEdits", autoTrustWorkspace: false });
-    expect(await service.launchPreferences()).toEqual({ permissionMode: "acceptEdits", autoTrustWorkspace: false });
+    expect(await service.launchPreferences()).toEqual({ permissionMode: "acceptEdits", autoTrustWorkspace: false, allowedSkills: [] });
     expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual({ theme: "dark" });
-    expect(JSON.parse(await fs.readFile(path.join(dataDir, "claude-launch-preferences.json"), "utf8"))).toEqual({ permissionMode: "acceptEdits", autoTrustWorkspace: false });
+    expect(JSON.parse(await fs.readFile(path.join(dataDir, "claude-launch-preferences.json"), "utf8"))).toEqual({ permissionMode: "acceptEdits", autoTrustWorkspace: false, allowedSkills: [] });
+  });
+
+  it("lists personal and synced skills and saves which ones CloudX tabs may use", async () => {
+    const { service, providerHome, dataDir } = await setup();
+    for (const directory of ["notes", "synced/account-1/docx"]) {
+      await fs.mkdir(path.join(providerHome, "skills", directory), { recursive: true });
+      await fs.writeFile(path.join(providerHome, "skills", directory, "SKILL.md"), "---\ndescription: Fixture.\n---\n");
+    }
+    expect((await service.read()).skills).toEqual([
+      { name: "notes", origin: "personal", allowed: false, available: true },
+      { name: "docx", origin: "synced", allowed: false, available: true }
+    ]);
+    await expect(service.update({ expectedRevision: (await service.read()).revision, allowedSkills: ["missing"] })).rejects.toThrow("Claude skill missing is not installed.");
+    const saved = await service.update({ expectedRevision: (await service.read()).revision, allowedSkills: ["docx", "notes", "docx"] });
+    expect(saved.skills.filter(skill => skill.allowed).map(skill => skill.name)).toEqual(["notes", "docx"]);
+    expect(await service.launchPreferences()).toMatchObject({ allowedSkills: ["docx", "notes"] });
+
+    // An allowed skill that was removed stays listed until the user clears it.
+    await fs.rm(path.join(providerHome, "skills", "notes"), { recursive: true });
+    expect((await service.read()).skills).toContainEqual({ name: "notes", origin: "personal", allowed: true, available: false });
+
+    // Preferences saved before skill choices existed still load.
+    await fs.writeFile(path.join(dataDir, "claude-launch-preferences.json"), JSON.stringify({ permissionMode: "plan", autoTrustWorkspace: true }));
+    expect(await service.launchPreferences()).toEqual({ permissionMode: "plan", autoTrustWorkspace: true, allowedSkills: [] });
   });
 
   it("writes through a linked settings file and reports consent and policy", async () => {

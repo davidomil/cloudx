@@ -24,7 +24,7 @@ function claudeEffortFor(value: unknown): ClaudeEffort | undefined {
 }
 
 export interface ClaudeLaunchArgsOptions {
-  settings: ClaudeLaunchPreferences;
+  settings: Pick<ClaudeLaunchPreferences, "permissionMode" | "autoTrustWorkspace">;
   settingsPath: string;
   addDirs: string[];
   // Starts a new conversation under this id.
