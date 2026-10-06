@@ -15,7 +15,11 @@ export interface ForgeEvidenceFile {
   path: string;
   bytes: number;
   sha256: string;
+  /** Link target preserved as inert JSON content, never followed or recreated. */
+  symbolicLink?: string;
 }
+
+export interface ForgeEvidenceBatch { files: ForgeEvidenceFile[]; bytes: number }
 
 export interface ForgeResourceEvidence {
   state: "pending" | "exporting" | "verified" | "kept" | "discarded" | "missing";
@@ -50,6 +54,8 @@ export interface DisposableResource {
   evidence?: ForgeResourceEvidence;
   state: "creating" | "owned" | "deleting" | "deleted" | "blocked" | "failed";
   reason: string;
+  /** Primary failure without secondary Docker stream-cancellation diagnostics. */
+  cleanupFailure?: string;
   allocatedBytes?: number;
   reclaimedBytes: number;
   removalStartedAt?: string;
@@ -70,4 +76,5 @@ export interface ForgeEvidenceManifest {
   exportedAt: string;
   files: ForgeEvidenceFile[];
   bytes: number;
+  batches?: ForgeEvidenceBatch[];
 }

@@ -37,6 +37,11 @@ export class ContainerCreationRejectedError extends Error {}
 export class ForgeDisposableCleanupError extends Error {
   constructor(reason: string, readonly blockerIdentity: string) { super(reason); }
 }
+export class ForgeEvidenceExportError extends Error {
+  constructor(readonly primaryReason: string, diagnostic: string, cause?: unknown) {
+    super(`${primaryReason} Docker evidence export: ${diagnostic}`, { cause });
+  }
+}
 
 /** Only creation receipts grant authority; names and discovered labels alone never do. */
 export class ForgeDisposableResources {
@@ -185,9 +190,15 @@ export class ForgeDisposableResources {
 
   private cleanupBlockerIdentity(resources: DisposableResource[]): string {
     return JSON.stringify(resources.sort((a, b) => a.id.localeCompare(b.id)).map(resource => ({ id: resource.id, name: resource.name,
+      engineId: resource.engineId, containerId: resource.containerId, created: resource.created,
+      owner: { workerId: resource.owner.workerId, attemptId: resource.owner.attemptId },
+      consumers: resource.consumers.map(consumer => ({ workerId: consumer.workerId, attemptId: consumer.attemptId }))
+        .sort((a, b) => a.workerId.localeCompare(b.workerId) || a.attemptId.localeCompare(b.attemptId)),
+      retentionReason: resource.retentionReason, paths: [...(resource.evidence?.paths ?? [])].sort(),
+      commitSha: resource.evidence?.commitSha, commitSource: resource.evidence?.commitSource,
       blocker: resource.reason === this.evidenceProtection(resource)
-        ? { retentionReason: resource.retentionReason, paths: [...(resource.evidence?.paths ?? [])].sort(), commitSha: resource.evidence?.commitSha }
-        : resource.reason })));
+        ? "evidence-retention"
+        : resource.cleanupFailure ?? resource.reason })));
   }
 
   async consumerIds(resourceId: string): Promise<string[]> {
@@ -208,6 +219,7 @@ export class ForgeDisposableResources {
 
   private async removeRecorded(resource: DisposableResource, state: ResourceJournal): Promise<void> {
     if (resource.state === "deleted") return;
+    resource.cleanupFailure = undefined;
     try {
       if (await this.recoverCreation(resource) === "deleted") return;
       const protection = await this.consumerProtection(resource, state);
@@ -247,6 +259,7 @@ export class ForgeDisposableResources {
     } catch (error) {
       resource.state = "failed";
       resource.reason = message(error);
+      resource.cleanupFailure = error instanceof ForgeEvidenceExportError ? error.primaryReason : resource.reason;
     } finally {
       resource.updatedAt = now();
       await this.write(state);
@@ -441,6 +454,7 @@ function validResource(item: DisposableResource): boolean {
     (item.creationRejected === undefined || item.creationRejected === true) &&
     typeof item.name === "string" && validConsumer(item.owner) && Array.isArray(item.consumers) && item.consumers.length > 0 && item.consumers.every(validConsumer) && item.consumers.some(consumer => sameConsumer(consumer, item.owner)) &&
     ["creating", "owned", "deleting", "deleted", "blocked", "failed"].includes(item.state) && typeof item.reason === "string" &&
+    (item.cleanupFailure === undefined || typeof item.cleanupFailure === "string" && item.cleanupFailure.length <= 128 * 1024) &&
     Number.isSafeInteger(item.reclaimedBytes) && item.reclaimedBytes >= 0 && (item.allocatedBytes === undefined || Number.isSafeInteger(item.allocatedBytes) && item.allocatedBytes >= 0) &&
     (item.retentionReason === undefined || typeof item.retentionReason === "string" && item.retentionReason.trim()) &&
     (item.evidence === undefined || validEvidence(item.evidence)) &&
@@ -454,7 +468,8 @@ function validEvidence(value: DisposableResource["evidence"]): boolean {
     (value.manifestSha256 === undefined || typeof value.manifestSha256 === "string" && /^[a-f0-9]{64}$/u.test(value.manifestSha256)) &&
     (value.bytes === undefined || Number.isSafeInteger(value.bytes) && value.bytes >= 0) &&
     (value.exportedAt === undefined || Number.isFinite(Date.parse(value.exportedAt))) &&
-    (value.files === undefined || Array.isArray(value.files) && value.files.every(file => typeof file.path === "string" && validEvidencePaths([`/${file.path}`]) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && /^[a-f0-9]{64}$/u.test(file.sha256))) &&
+    (value.files === undefined || Array.isArray(value.files) && value.files.every(file => file && typeof file.path === "string" && validEvidencePaths([`/${file.path}`]) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && /^[a-f0-9]{64}$/u.test(file.sha256) &&
+      (file.symbolicLink === undefined || typeof file.symbolicLink === "string" && file.symbolicLink.length > 0 && file.symbolicLink.length <= 4096 && !/[\u0000-\u001f]/u.test(file.symbolicLink)))) &&
     (value.state !== "verified" || value.archivePath && value.manifestSha256 && value.files?.length && value.bytes !== undefined && value.exportedAt));
 }
 function labelsFor(resource: DisposableResource): Record<string, string> { return { [resourceLabel]: resource.id, [ownerLabel]: resource.owner.workerId, [attemptLabel]: resource.owner.attemptId }; }
@@ -490,7 +505,7 @@ async function streamDockerEvidence(id: string, source: string, write: EvidenceS
   catch (error) {
     fail(error instanceof Error ? error : new Error(String(error)));
     await completion.catch(() => undefined);
-    if (stderr.trim()) throw new Error(`${message(error)} Docker evidence export: ${stderr.trim()}`, { cause: error });
+    if (stderr.trim()) throw new ForgeEvidenceExportError(message(error), stderr.trim(), error);
     throw error;
   }
   finally { clearTimeout(timeout); }

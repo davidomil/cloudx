@@ -6,8 +6,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ForgeWorker } from "@cloudx/shared";
-import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableResources } from "./ForgeDisposableResources.js";
+import type { DisposableResource, ForgeWorker } from "@cloudx/shared";
+import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableCleanupError, ForgeDisposableResources } from "./ForgeDisposableResources.js";
 import { Header } from "tar";
 
 const execute = vi.hoisted(() => vi.fn());
@@ -49,6 +49,29 @@ describe("Docker creation rejection receipts", () => {
       if (args[0] === "container" && args[1] === "ls") return { stdout: "" };
       throw new Error(`Unexpected Docker mutation: ${args.join(" ")}`);
     });
+  }
+
+  function ownedDockerContainer(): void {
+    const id = "a".repeat(64);
+    const created = new Date().toISOString();
+    let labels: Record<string, string> = {};
+    let running = true;
+    execute.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[0] === "info") return { stdout: "same-engine\n" };
+      if (args[0] === "create") {
+        labels = Object.fromEntries(args.flatMap((arg, index) => arg === "--label" ? [args[index + 1]!.split("=")] : []));
+        return { stdout: `${id}\n` };
+      }
+      if (args[1] === "inspect") return { stdout: JSON.stringify([{ Id: id, Created: created, Config: { Labels: labels }, State: { Running: running }, SizeRw: 2048 }]) };
+      if (args[1] === "stop") { running = false; return { stdout: id }; }
+      throw new Error(`Unexpected Docker operation: ${args.join(" ")}`);
+    });
+  }
+
+  async function cleanupBlocker(resources: ForgeDisposableResources, completed = worker): Promise<string> {
+    const failure = await resources.retire(completed).catch(error => error);
+    expect(failure).toBeInstanceOf(ForgeDisposableCleanupError);
+    return (failure as ForgeDisposableCleanupError).blockerIdentity;
   }
 
   it.each([
@@ -143,6 +166,66 @@ describe("Docker creation rejection receipts", () => {
     spawn.mockReturnValue(child);
     queueMicrotask(() => child.stderr.end("Could not find the file /work/evidence in container"));
     await expect(host.readEvidence("a".repeat(64), ["/work/evidence"], async () => {})).rejects.toThrow("Could not find the file");
+  });
+
+  it("persists one primary blocker across Docker cancellation diagnostics and restart, then distinguishes a changed rejection", async () => {
+    ownedDockerContainer();
+    const resource = await reopen().create(worker, { ...input, image: "node:22", retentionReason: "Keep reproduction evidence", evidencePaths: ["/work/evidence"] });
+    worker.status = "completed";
+    let previous: string | undefined;
+    for (const [diagnostic, delayed] of [["", false], ["write /dev/stdout: connection reset by peer", false], ["copy stream closed at a different time", true]] as const) {
+      spawn.mockImplementation(() => {
+        const child = dockerChild(Readable.from([evidenceTar([{ path: "outside/log", data: "unsafe" }])]));
+        if (delayed) child.kill.mockImplementation(() => { child.stderr.end(diagnostic); child.stdout.destroy(new Error("process killed")); return true; });
+        else if (diagnostic) child.stderr.end(diagnostic);
+        return child;
+      });
+      const blocker = await cleanupBlocker(reopen());
+      if (previous) expect(blocker).toBe(previous);
+      previous = blocker;
+      const [saved] = await reopen().records();
+      expect(saved).toMatchObject({ id: resource.id, state: "failed", cleanupFailure: "Container evidence archive contains an unsafe or unexpected path.", evidence: { state: "pending" } });
+      if (diagnostic) expect(saved!.reason).toContain(diagnostic);
+      expect(await fs.readdir(path.join(directory, "forge-evidence"))).toEqual([]);
+    }
+    spawn.mockImplementation(() => dockerChild(Readable.from([evidenceTar([
+      { path: "evidence/log", data: "first" }, { path: "evidence/log", data: "duplicate" },
+    ])])));
+    expect(await cleanupBlocker(reopen())).not.toBe(previous);
+    expect((await reopen().records())[0]?.cleanupFailure).toContain("duplicate paths");
+    expect(execute.mock.calls.some(([, args]) => args[1] === "rm")).toBe(false);
+  });
+
+  it("canonicalizes selections and consumers while reporting changed selection, commit provenance and consumer membership", async () => {
+    ownedDockerContainer();
+    const shared = { ...worker, id: randomUUID(), attemptId: randomUUID() };
+    const resources = () => new ForgeDisposableResources(directory, async () => [worker, shared], host);
+    worker.headSha = "b".repeat(40);
+    await resources().create(worker, { ...input, image: "node:22", retentionReason: "Keep fixture evidence", evidencePaths: ["/work/evidence", "/work/repro"], consumers: [{ workerId: shared.id, attemptId: shared.attemptId }] });
+    worker.status = shared.status = "completed";
+    await cleanupBlocker(resources());
+    spawn.mockImplementation(() => dockerChild(Readable.from([evidenceTar([{ path: "outside/log", data: "unsafe" }])])));
+    const initial = await cleanupBlocker(resources(), shared);
+    const journalPath = path.join(directory, "forge-disposable-resources.json");
+    const changeJournal = async (change: (resource: DisposableResource) => void) => {
+      const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
+      change(journal.resources[0]);
+      await fs.writeFile(journalPath, JSON.stringify(journal));
+    };
+    await changeJournal(resource => { resource.evidence!.paths.reverse(); resource.consumers.reverse(); });
+    expect(await cleanupBlocker(resources())).toBe(initial);
+    let previous = initial;
+    for (const change of [
+      (resource: DisposableResource) => { resource.evidence!.paths.push("/work/third"); },
+      (resource: DisposableResource) => { resource.evidence!.commitSource = "declared"; },
+      (resource: DisposableResource) => { resource.evidence!.commitSha = "c".repeat(40); },
+      (resource: DisposableResource) => { resource.consumers = resource.consumers.filter(consumer => consumer.workerId === worker.id); },
+    ]) {
+      await changeJournal(change);
+      const blocker = await cleanupBlocker(resources());
+      expect(blocker).not.toBe(previous);
+      previous = blocker;
+    }
   });
 
 });

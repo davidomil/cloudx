@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 import { text } from "node:stream/consumers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { JsonStateFile } from "../jsonStateFile.js";
-import { ForgeEvidenceFiles, maxEvidenceBytes, syncEvidenceReceipt, writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
+import { evidenceLinkContents, ForgeEvidenceFiles, maxEvidenceBytes, syncEvidenceReceipt, writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 
 const namespace = "forge-checkout-evidence";
 const id = "worker-183";
@@ -100,6 +100,116 @@ describe("bounded durable Forge evidence files", () => {
     await expect(writer.add("reports/0", Readable.from([]), 0)).rejects.toThrow("duplicate");
     await writer.abort();
   }, 20_000);
+
+  it("publishes a complete bounded collection once and reads files from every batch", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    for (let index = 0; index < 600; index++) await writer.add(`reports/${index}`, Readable.from([Buffer.from(`${index}`)]), String(index).length);
+    const files = writer.files;
+    const batches = writer.batches;
+    expect(batches.map(batch => batch.files.length)).toEqual([512, 88]);
+    await expect(writer.add("reports/0", Readable.from([]), 0)).rejects.toThrow("duplicate");
+    await writer.commit({ files, batches, bytes: writer.bytes }, async () => {
+      expect(await storage.readManifest("forge-evidence", id)).toBeUndefined();
+    });
+    await writer.abort();
+    await storage.verifyCollection("forge-evidence", id, batches, files);
+    expect(await text(await storage.fileStream("forge-evidence", id, "reports/599", 1))).toBe("599");
+  });
+
+  it("rotates storage batches by bytes while retaining the 256 MiB per-file bound", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    const size = maxEvidenceBytes / 2 + 1;
+    async function* report() {
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      for (let remaining = size; remaining > 0; remaining -= chunk.length) yield chunk.subarray(0, Math.min(remaining, chunk.length));
+    }
+    try {
+      await expect(writer.add("reports/oversized", report(), maxEvidenceBytes + 1)).rejects.toThrow("256 MiB per file");
+      await writer.add("reports/first", report(), size);
+      await writer.add("reports/second", report(), size);
+      expect(writer.batches.map(batch => batch.bytes)).toEqual([size, size]);
+      await writer.commit({ files: writer.files, batches: writer.batches, bytes: writer.bytes }, async () => {});
+      await storage.verifyCollection("forge-evidence", id, writer.batches, writer.files);
+    } finally { await writer.abort(); }
+  }, 20_000);
+
+  it("rotates batches by bounded metadata size for long fixture-link targets", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    const target = "/provider/" + "x".repeat(4000);
+    const data = evidenceLinkContents(target);
+    for (let index = 0; index < 300; index++) await writer.add(`fixtures/${index}`, Readable.from([data]), data.length, target);
+    expect(writer.batches).toHaveLength(2);
+    expect(writer.batches.every(batch => Buffer.byteLength(JSON.stringify(batch)) <= 1024 * 1024)).toBe(true);
+    await writer.commit({ files: writer.files, batches: writer.batches, bytes: writer.bytes }, async () => {});
+    await storage.verifyCollection("forge-evidence", id, writer.batches, writer.files);
+  });
+
+  it("rejects a collection root exceeding 33 MiB before recording intent or publishing", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    await writer.add(filePath, Readable.from([]), 0);
+    const manifest = { files: writer.files, batches: writer.batches, bytes: writer.bytes, padding: "" };
+    manifest.padding = "x".repeat(33 * 1024 * 1024 - Buffer.byteLength(JSON.stringify(manifest)) + 1);
+    const recordIntent = vi.fn();
+    await expect(writer.commit(manifest, recordIntent)).rejects.toThrow("metadata limit");
+    expect(recordIntent).not.toHaveBeenCalled();
+    expect(await storage.readManifest("forge-evidence", id)).toBeUndefined();
+    await writer.abort();
+    expect(await fs.readdir(path.join(directory, "forge-evidence"))).toEqual([]);
+  });
+
+  it("reopens a 33 MiB collection root while rejecting larger roots and batches above 1 MiB", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    await writer.add(filePath, Readable.from([]), 0);
+    const manifest = { files: writer.files, batches: writer.batches, bytes: writer.bytes, padding: "" };
+    const rootLimit = 33 * 1024 * 1024;
+    manifest.padding = "x".repeat(rootLimit - Buffer.byteLength(JSON.stringify(manifest)));
+    await writer.commit(manifest, async () => {});
+    const reopened = new ForgeEvidenceFiles(directory);
+    expect((await reopened.readManifest<{ padding: string }>("forge-evidence", id))?.padding.length).toBe(manifest.padding.length);
+    await reopened.verifyCollection("forge-evidence", id, writer.batches, writer.files);
+    const archive = path.join(directory, "forge-evidence", id);
+    await fs.truncate(path.join(archive, "manifest.json"), rootLimit + 1);
+    await expect(reopened.readManifest("forge-evidence", id)).rejects.toThrow("bounded regular file");
+    await fs.truncate(path.join(archive, "batch-0", "manifest.json"), 1024 * 1024 + 1);
+    await expect(reopened.readManifest("forge-evidence", id, 0)).rejects.toThrow("bounded regular file");
+  });
+
+  it.each(["manifest", "extra-batch", "symlink-parent", "link-content"] as const)("protects the source when collection %s is changed", async change => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    const target = "../../provider/projects";
+    const data = evidenceLinkContents(target);
+    await writer.add(filePath, Readable.from([data]), data.length, target);
+    const files = writer.files;
+    const batches = writer.batches;
+    await writer.commit({ files, batches, bytes: writer.bytes }, async () => {});
+    const archive = path.join(directory, "forge-evidence", id);
+    const batch = path.join(archive, "batch-0");
+    if (change === "manifest") await fs.writeFile(path.join(batch, "manifest.json"), JSON.stringify({ files, bytes: 0 }));
+    if (change === "extra-batch") await fs.mkdir(path.join(archive, "batch-1"));
+    if (change === "symlink-parent") {
+      await fs.rename(batch, path.join(directory, "outside-batch"));
+      await fs.symlink(path.join(directory, "outside-batch"), batch);
+    }
+    if (change === "link-content") await fs.writeFile(path.join(batch, blob), evidenceLinkContents("/etc/private"));
+    await expect(storage.verifyCollection("forge-evidence", id, batches, files)).rejects.toThrow();
+  });
+
+  it("rejects false link metadata and cleans all batches if the complete export intent fails", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    await expect(writer.add(filePath, Readable.from([Buffer.from("ordinary content")]), 16, "/etc/private")).rejects.toThrow("bounded storage policy");
+    await writer.abort();
+    const retry = await storage.beginCollection("forge-evidence", id);
+    for (let index = 0; index < 513; index++) await retry.add(`reports/${index}`, Readable.from([]), 0);
+    await expect(retry.commit({ files: retry.files, batches: retry.batches }, async () => { throw new Error("receipt unavailable"); })).rejects.toThrow("receipt unavailable");
+    expect(await storage.readManifest("forge-evidence", id)).toBeUndefined();
+    await retry.abort();
+    expect(await fs.readdir(path.join(directory, "forge-evidence"))).toEqual([]);
+  });
+
+  it("rejects malformed batch inventories with the bounded-policy error", async () => {
+    const malformed = [{ files: [null], bytes: 0 }] as unknown as import("@cloudx/shared").ForgeEvidenceBatch[];
+    await expect(storage.verifyCollection("forge-evidence", id, malformed, [])).rejects.toThrow("bounded storage policy");
+  });
 
   it.each(["../outside", ".", "..", "reports/../outside", "reports//log", "reports/.git/log"])("rejects unsafe evidence manifest path %s", async value => {
     const writer = await storage.begin(namespace, id);
