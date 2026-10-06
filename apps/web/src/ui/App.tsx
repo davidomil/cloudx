@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { AGENT_ACCOUNTS_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, DEFAULT_WORKSPACE_MAX_PANES, combineAgentUsage, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_TERMINAL_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, isAgentProviderId, type AgentAccountsState, type AgentProviderId, type AgentSelection, DEFAULT_WORKSPACE_MAX_PANES, combineAgentUsage, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -81,6 +81,7 @@ import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { agentSelection, agentTabChoices } from "./agentTabChoice.js";
 import { UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
 import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
@@ -94,6 +95,8 @@ import {
   selectTabSettingsContributions,
   type UiContributionRenderContext
 } from "./uiContributions.js";
+
+type CallUiHook = NonNullable<UiContributionRenderContext["callHook"]>;
 import { applyVoiceWorkspaceResultsToWorkspace, buildClientVoiceContext, voiceConsoleValue } from "./voiceWorkspace.js";
 import { WebViewerPanel } from "./WebViewerPanel.js";
 import { WorktreeManagerPanel } from "./WorktreeManagerPanel.js";
@@ -1486,7 +1489,7 @@ export function App() {
 
       {renderUiContributions("app.footer.actions")}
 
-      {createOpen ? <CreateTabDialog plugins={plugins} templates={rulesSkillsStore?.templates ?? []} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
+      {createOpen ? <CreateTabDialog plugins={plugins} callHook={pluginById.has(AGENT_ACCOUNTS_PLUGIN_ID) ? callUiHook : undefined} templates={rulesSkillsStore?.templates ?? []} defaultCwd={activeWindow?.defaultCwd ?? "~"} onCancel={closeCreateDialog} onCreate={handleCreate} /> : null}
       {settingsOpen && config ? (
         <SettingsDialog
           config={config}
@@ -2770,12 +2773,14 @@ function workspaceSocketReconnectDelayMs(attempt: number): number {
 
 function CreateTabDialog({
   plugins,
+  callHook,
   templates,
   defaultCwd,
   onCancel,
   onCreate
 }: {
   plugins: PluginDescriptor[];
+  callHook?: CallUiHook;
   templates: PersonalityTemplate[];
   defaultCwd: string;
   onCancel: () => void;
@@ -2793,9 +2798,15 @@ function CreateTabDialog({
   const [codexResumeIncludeNonInteractive, setCodexResumeIncludeNonInteractive] = useState(false);
   const [createDirectory, setCreateDirectory] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [agentAccounts, setAgentAccounts] = useState<AgentAccountsState>();
+  const [agentProviderId, setAgentProviderId] = useState<AgentProviderId>();
+  const [agentAccountId, setAgentAccountId] = useState<string>();
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
+  const agentChoices = useMemo(() => agentTabChoices(agentAccounts), [agentAccounts]);
+  const agentChoice = agentChoices.find((choice) => choice.providerId === agentProviderId) ?? agentChoices[0];
   const isLocalWeb = selectedPlugin?.panelKind === "web-viewer";
-  const isCodex = selectedPlugin?.id === "codex-terminal";
+  const isCodex = selectedPlugin?.id === AGENT_TERMINAL_PLUGIN_ID;
+  const isClaude = isCodex && agentChoice?.providerId === "claude";
   const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
   const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
 
@@ -2804,6 +2815,15 @@ function CreateTabDialog({
       setPluginId(selectCreateTabPluginId(creatablePlugins));
     }
   }, [creatablePlugins, selectedPlugin]);
+
+  useEffect(() => {
+    if (!callHook) return;
+    let disposed = false;
+    callHook<{ state: AgentAccountsState }>(AGENT_ACCOUNT_HOOKS.read, {})
+      .then((result) => { if (!disposed) setAgentAccounts(result.state); })
+      .catch(() => undefined);
+    return () => { disposed = true; };
+  }, [callHook]);
 
   useEffect(() => {
     if (!requiresDirectory) {
@@ -2827,7 +2847,10 @@ function CreateTabDialog({
       const initialInput = isLocalWeb && localWebUrl.trim()
         ? { url: localWebUrl.trim() }
         : isCodex
-          ? codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll, codexResumeIncludeNonInteractive)
+          ? agentTabInitialInput(
+            codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll && !isClaude, codexResumeIncludeNonInteractive && !isClaude),
+            agentSelection(agentChoice, agentAccountId)
+          )
           : undefined;
       await onCreate({
         pluginId,
@@ -2848,14 +2871,43 @@ function CreateTabDialog({
         <h2>New tab</h2>
         <label>
           Plugin
-          <select value={pluginId} onChange={(event) => setPluginId(event.target.value)} disabled={creatablePlugins.length === 0}>
-            {creatablePlugins.map((plugin) => (
-              <option key={plugin.id} value={plugin.id}>
-                {plugin.displayName}
-              </option>
-            ))}
+          <select
+            value={isCodex && agentChoice ? agentPluginOptionValue(agentChoice.providerId) : pluginId}
+            onChange={(event) => {
+              const [nextPluginId, providerId] = event.target.value.split(AGENT_OPTION_SEPARATOR);
+              setPluginId(nextPluginId!);
+              if (isAgentProviderId(providerId)) {
+                setAgentProviderId(providerId);
+                setAgentAccountId(undefined);
+              }
+            }}
+            disabled={creatablePlugins.length === 0}
+          >
+            {creatablePlugins.flatMap((plugin) => plugin.id === AGENT_TERMINAL_PLUGIN_ID && agentChoices.length
+              ? agentChoices.map((choice) => (
+                <option key={choice.providerId} value={agentPluginOptionValue(choice.providerId)}>
+                  {choice.label}
+                </option>
+              ))
+              : [
+                <option key={plugin.id} value={plugin.id}>
+                  {plugin.displayName}
+                </option>
+              ])}
           </select>
         </label>
+        {isCodex && agentChoice && agentChoice.accounts.length > 1 ? (
+          <label>
+            Account
+            <select aria-label="Account" value={agentSelection(agentChoice, agentAccountId)?.accountId} onChange={(event) => setAgentAccountId(event.target.value)}>
+              {agentChoice.accounts.map((account) => (
+                <option key={account.id} value={account.id}>
+                  {account.label}{account.isDefault ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
         {creatablePlugins.length === 0 ? <div className="empty-pane">No creatable plugins are available.</div> : null}
         {requiresDirectory ? (
           <div className="field-group">
@@ -2903,7 +2955,7 @@ function CreateTabDialog({
             <input value={codexResumeSessionId} onChange={(event) => setCodexResumeSessionId(event.target.value)} placeholder="UUID or thread name" {...noSystemTextAssistProps} />
           </label>
         ) : null}
-        {isCodex && codexResumeMode !== "new" && codexResumeMode !== "session" ? (
+        {isCodex && !isClaude && codexResumeMode !== "new" && codexResumeMode !== "session" ? (
           <>
             <label className="checkbox-row">
               <input type="checkbox" checked={codexResumeAll} onChange={(event) => setCodexResumeAll(event.target.checked)} />
@@ -2938,6 +2990,19 @@ function CreateTabDialog({
 
 export function selectCreateTabPluginId(plugins: PluginDescriptor[]): PluginId {
   return plugins.find((plugin) => plugin.id === "codex-terminal")?.id ?? plugins[0]?.id ?? "";
+}
+
+const AGENT_OPTION_SEPARATOR = "#";
+
+function agentPluginOptionValue(providerId: AgentProviderId): string {
+  return `${AGENT_TERMINAL_PLUGIN_ID}${AGENT_OPTION_SEPARATOR}${providerId}`;
+}
+
+export function agentTabInitialInput(
+  initialInput: CreateTabRequest["initialInput"],
+  agent: AgentSelection | undefined
+): CreateTabRequest["initialInput"] {
+  return agent ? { ...initialInput, agent } : initialInput;
 }
 
 export function codexTabInitialInput(
