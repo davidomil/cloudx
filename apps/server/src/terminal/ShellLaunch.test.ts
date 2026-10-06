@@ -4,7 +4,9 @@ import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 
-import { buildInteractiveShellLaunch, buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand, shellQuote } from "./ShellLaunch.js";
+import { execFileSync } from "node:child_process";
+
+import { buildEnforcedLoginShellLaunch, buildInteractiveShellLaunch, buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand, shellQuote } from "./ShellLaunch.js";
 
 describe("ShellLaunch", () => {
   it("starts bash terminals as login shells", () => {
@@ -19,6 +21,31 @@ describe("ShellLaunch", () => {
       command: "/bin/bash",
       args: ["-lc", "exec codex exec --model gpt-5.3-codex-spark"]
     });
+  });
+
+  it.each(["bash", "zsh"])("re-applies enforced variables after a %s login profile exports its own", shell => {
+    const shellPath = ["/bin", "/usr/bin"].map(directory => path.join(directory, shell)).find(candidate => fs.existsSync(candidate));
+    if (!shellPath) return;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-enforced-env-"));
+    onTestFinished(() => fs.rmSync(home, { recursive: true, force: true }));
+    const profile = "export ANTHROPIC_API_KEY=from-profile CLAUDE_CONFIG_DIR=/profile/claude CLAUDE_CODE_OAUTH_TOKEN=from-profile\n";
+    for (const file of [".bash_profile", ".zprofile"]) fs.writeFileSync(path.join(home, file), profile);
+    const launch = buildEnforcedLoginShellLaunch("env", [], { PATH: process.env.PATH, HOME: home, ZDOTDIR: home, SHELL: shellPath }, {
+      set: { ANTHROPIC_API_KEY: "selected key", CLAUDE_CONFIG_DIR: "/tab/claude" },
+      unset: ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"]
+    });
+    // The key travels in the environment, not on the command line.
+    expect(launch.args.join(" ")).not.toContain("selected key");
+    const seen = Object.fromEntries(execFileSync(launch.command, launch.args, { env: launch.env, encoding: "utf8" })
+      .split("\n").filter(line => line.includes("=")).map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+    expect(seen).toMatchObject({ ANTHROPIC_API_KEY: "selected key", CLAUDE_CONFIG_DIR: "/tab/claude" });
+    expect(seen.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(Object.keys(seen).filter(name => name.startsWith("CLOUDX_ENFORCED_"))).toEqual([]);
+  });
+
+  it("applies enforced variables directly when the shell runs no profile", () => {
+    expect(buildEnforcedLoginShellLaunch("claude", [], { SHELL: "/usr/bin/nu", ANTHROPIC_API_KEY: "inherited" }, { set: { CLAUDE_CONFIG_DIR: "/tab" }, unset: ["ANTHROPIC_API_KEY"] }))
+      .toEqual({ command: "claude", args: [], env: { SHELL: "/usr/bin/nu", CLAUDE_CONFIG_DIR: "/tab" } });
   });
 
   it("falls back to direct command launch for unsupported shells", () => {

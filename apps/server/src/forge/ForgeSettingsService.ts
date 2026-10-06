@@ -1,6 +1,6 @@
-import { DEFAULT_CODEX_MODEL, CODEX_REASONING_EFFORTS, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
+import { AGENT_ACCOUNTS_OPTION_SOURCE, DEFAULT_CODEX_MODEL, CODEX_REASONING_EFFORTS, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
 import type { ConfigService } from "../configService.js";
-import { CODEX_MODEL_OPTIONS } from "../aiModelOptions.js";
+import { AGENT_EXEC_MODEL_OPTIONS } from "../aiModelOptions.js";
 import type { ForgeConnectionService } from "./connections/ForgeConnectionService.js";
 import { ForgeCredentials, validateRepository } from "./providers/ForgeCredentials.js";
 import { createForgeProvider } from "./providers/index.js";
@@ -37,6 +37,8 @@ export class ForgeSettingsService {
       workerReasoningEffort: this.required("workerReasoningEffort") as CodexReasoningEffort,
       reviewModel: this.required("reviewModel"),
       reviewReasoningEffort: this.required("reviewReasoningEffort") as CodexReasoningEffort,
+      workerAccountId: this.optional("workerAccountId"),
+      reviewAccountId: this.optional("reviewAccountId"),
       maxRunMinutes: Number(this.config.getPluginConfig("forge").maxRunMinutes),
     };
   }
@@ -73,6 +75,11 @@ export class ForgeSettingsService {
     if (this.repositoryCredentials?.key !== key)
       this.repositoryCredentials = { key, credentials: new ForgeCredentials(current, async role => this.connections.credential(current, role), undefined, this.onFailure) };
     return this.repositoryCredentials.credentials;
+  }
+
+  private optional(key: string): string | undefined {
+    const value = this.config.getPluginConfig("forge")[key];
+    return typeof value === "string" && value.trim() ? value.trim() : undefined;
   }
 
   private required(key: string): string {
@@ -136,8 +143,17 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       label: "Coding model",
       type: "select",
       defaultValue: DEFAULT_CODEX_MODEL,
-      options: CODEX_MODEL_OPTIONS,
-      description: "Codex model for new coding runs and resumes.",
+      options: AGENT_EXEC_MODEL_OPTIONS,
+      description: "Model for new coding runs and resumes. A Claude model runs the worker in Claude Code.",
+    },
+    {
+      key: "workerAccountId",
+      label: "Coding account",
+      type: "string",
+      optionSource: AGENT_ACCOUNTS_OPTION_SOURCE,
+      defaultValue: "",
+      pattern: "^(?:[a-z0-9][a-z0-9-]{0,63})?$",
+      description: "Account for coding runs. Empty uses the default account of the model's provider.",
     },
     {
       key: "workerReasoningEffort",
@@ -161,8 +177,17 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       label: "Review model",
       type: "select",
       defaultValue: DEFAULT_CODEX_MODEL,
-      options: CODEX_MODEL_OPTIONS,
-      description: "Codex model for new review runs and resumes.",
+      options: AGENT_EXEC_MODEL_OPTIONS,
+      description: "Model for new review runs and resumes. A Claude model runs the reviewer in Claude Code.",
+    },
+    {
+      key: "reviewAccountId",
+      label: "Review account",
+      type: "string",
+      optionSource: AGENT_ACCOUNTS_OPTION_SOURCE,
+      defaultValue: "",
+      pattern: "^(?:[a-z0-9][a-z0-9-]{0,63})?$",
+      description: "Account for review runs. Empty uses the default account of the model's provider.",
     },
     {
       key: "reviewReasoningEffort",

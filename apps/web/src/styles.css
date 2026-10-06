@@ -8272,3 +8272,33 @@ a:hover svg {
 .cloudx-update-capacity code {
   overflow-wrap: anywhere;
 }
+
+.agent-accounts-panel { max-width: 720px; display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 16px; border: 1px solid var(--color-border); border-radius: 6px; overflow-wrap: anywhere; }
+.agent-accounts-panel h3, .agent-accounts-panel h4, .agent-accounts-panel p { margin: 0; }
+.agent-accounts-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-provider-status, .agent-account-group ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.agent-account-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-top: 1px solid var(--color-border); }
+.agent-account-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; min-width: 0; }
+.agent-account-summary small { flex-basis: 100%; color: var(--color-muted-foreground); }
+.agent-account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.agent-badge { padding: 0 6px; font-size: 0.8em; border: 1px solid var(--color-border); border-radius: 4px; }
+.agent-account-form { display: grid; gap: 8px; max-width: 420px; }
+.agent-account-form label { display: grid; gap: 4px; }
+.agent-warning, .agent-error { color: var(--color-destructive, #ff6b6b); }
+.agent-switch-menu { max-width: 280px; }
+.agent-switch-hint { margin: 2px 6px; font-size: 0.85em; color: var(--color-muted-foreground); }
+.agent-bypass { display: grid; gap: 8px; padding-top: 8px; border-top: 1px solid var(--color-border); }
+
+.usage-card { position: fixed; z-index: 280; padding: 10px 12px; color: var(--color-foreground); background: var(--surface-popover-background, rgb(10 10 15 / 0.98)); border: 1px solid var(--surface-popover-border, var(--color-border)); border-radius: 6px; box-shadow: 0 14px 36px rgb(0 0 0 / 0.4); pointer-events: none; }
+.usage-card-body { display: grid; gap: 6px; font-size: 0.85em; }
+.usage-card-body p, .usage-card-body dl, .usage-card-body ul { margin: 0; }
+.usage-card-body dl { display: grid; grid-template-columns: auto auto; gap: 2px 12px; }
+.usage-card-body dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.usage-card-body ul { padding-left: 16px; }
+.usage-cost { font-weight: 600; }
+.usage-note { color: var(--color-muted-foreground); }
+.forge-usage { font-variant-numeric: tabular-nums; }
+.agent-pricing-table { overflow-x: auto; }
+.agent-pricing-table table { border-collapse: collapse; font-size: 0.85em; }
+.agent-pricing-table th, .agent-pricing-table td { padding: 2px 4px; text-align: left; white-space: nowrap; }
+.agent-pricing-table input { width: 6em; }

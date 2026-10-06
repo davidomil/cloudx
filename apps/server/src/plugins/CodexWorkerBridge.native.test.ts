@@ -61,7 +61,7 @@ it.skipIf(!codex)("preserves the native worker completion while Codex generates 
     const binding = { workerId: "native-worker", attemptId: "native-attempt", receiptPath: path.join(root, "turn.json") };
     const tab: WorkspaceTab = { id: "native", pluginId: "codex-terminal", ownerPluginId: "forge", title: "Native", cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "", updatedAt: "" } };
     terminal = await new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env).createSession({
-      tab, cwd: root, codexTurn: binding,
+      tab, cwd: root, agentTurn: binding,
       initialInput: { prompt: "Return the configured native test response." },
       controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
     });

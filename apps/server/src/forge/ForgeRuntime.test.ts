@@ -194,7 +194,7 @@ function installReviewTabs(deps: ForgeRuntimeDependencies, workspace: ForgeWorks
     await fs.writeFile(path.join(launch, "config.toml"), "Generated worker configuration");
     await fs.writeFile(path.join(launch, "auth.json"), "Private disposable authentication");
     try {
-      resumedIds.push(await options!.prepareCodexSession!({ tabId: tab.id, cwd: tab.cwd, command: "/configured/codex", configurationArgs: [], env: {} }));
+      resumedIds.push(await options!.prepareAgentSession!({ tabId: tab.id, cwd: tab.cwd, command: "/configured/codex", configurationArgs: [], env: {} }));
       return { tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
     } catch (error) {
       tabs.delete(tab.id);
@@ -3499,7 +3499,7 @@ describe("ForgeRuntime Codex tabs", () => {
       templateId: "worker", ...codingModel, prompt: "Resolve the issue.", windowId: "window", paneId: "pane",
     };
     await runtime.launch(request);
-    const tracking = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.codexTurn!;
+    const tracking = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.agentTurn!;
     const completion: ForgeTurnCompletion = {
       workerId: workspace.id, attemptId: request.attemptId,
       threadId: randomUUID(), turnId: randomUUID(), status: "completed",
@@ -3746,6 +3746,32 @@ describe("ForgeRuntime Codex tabs", () => {
     expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
   });
 
+  it.each(["review", "batch"] as const)("keeps one Claude %s conversation id across launches without the Codex app server", async purpose => {
+    const deps = dependencies({ trustRepository: true });
+    deps.reviewConversations = { prepare: vi.fn() };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare(`claude-${purpose}`, purpose === "review");
+    const fixture = installReviewTabs(deps, workspace);
+    const request = { ...fixture.request, model: "claude-opus-5-5", accountId: "claude-work", ...(purpose === "batch" ? { preserveConversation: true as const } : {}) };
+
+    await runtime.close(await runtime.launch(request));
+    runtime = new ForgeRuntime(deps);
+    await runtime.close(await runtime.launch(request));
+
+    expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
+    expect(fixture.resumedIds).toHaveLength(2);
+    expect(fixture.resumedIds[0]).toMatch(/^[a-f0-9-]{36}$/u);
+    expect(fixture.resumedIds[1]).toBe(fixture.resumedIds[0]);
+    const calls = vi.mocked(deps.workspaceCommands.createTab).mock.calls;
+    expect(calls[0]![0].initialInput).toMatchObject({ agent: { providerId: "claude", accountId: "claude-work" }, model: "claude-opus-5-5" });
+    expect(calls[0]![0].initialInput!.prompt).toMatch(new RegExp(`^This conversation belongs to one Forge ${purpose === "batch" ? "issue batch" : "review worker"}`, "u"));
+    expect(calls[1]![0].initialInput!.prompt).toBe(request.prompt);
+    const manifest = JSON.parse(await fs.readFile(path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
+    expect(manifest.claudeConversation).toEqual({ key: purpose === "batch" ? "batchConversation" : "reviewConversation", sessionId: fixture.resumedIds[0] });
+
+    await expect(runtime.launch({ ...request, model: "gpt-6-astra" })).rejects.toThrow("runs on Claude");
+  });
+
   it.each(["missing binding", "invalid thread", "missing preservation"])("blocks a batch with %s before another native session can launch", async problem => {
     const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
@@ -3977,7 +4003,7 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(await runtime.launch(request)).toBe("codex-1");
     expect(deps.workspaceCommands.createTab).toHaveBeenCalledWith(
       expect.objectContaining({
-        initialInput: { prompt: request.prompt, ...codingModel },
+        initialInput: { prompt: request.prompt, ...codingModel, agent: { providerId: "codex" } },
         pluginMetadata: {
           "rules-skills": { selectedTemplateId: "worker" },
           "forge-workers": { workerId: workspace.id },
@@ -3986,7 +4012,7 @@ describe("ForgeRuntime Codex tabs", () => {
         paneId: "pane-1",
       }),
       { ownerPluginId: "forge", authorizeProjectTrust: expect.any(Function), prepareTerminalExecution: expect.any(Function),
-        codexTurn: { workerId: workspace.id, attemptId: request.attemptId,
+        agentTurn: { workerId: workspace.id, attemptId: request.attemptId,
           receiptPath: path.join(deps.dataDir, "forge-workers", "turns", workspace.id, `${request.attemptId}.json`) } },
     );
     expect(deps.sessions.executePluginAction).not.toHaveBeenCalled();

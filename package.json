@@ -57,6 +57,7 @@
     "test": "vitest run",
     "test:codex-recovery": "node scripts/test-codex-recovery.mjs",
     "test:browser": "playwright test",
+    "test:ci-local": "node scripts/ci/local.mjs",
     "test:coverage": "vitest run --coverage --reporter=dot",
     "test:policy": "vitest run scripts/ai-change",
     "typecheck": "tsc -b",

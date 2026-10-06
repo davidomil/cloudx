@@ -1,9 +1,51 @@
 import { configDefaults, defineConfig } from "vitest/config";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import MeasuredSequencer from "./scripts/ci/shards.mjs";
 
 const repoRoot = path.dirname(fileURLToPath(import.meta.url));
+// Match the CI verifier, whose candidate runs in UTC with an empty home and
+// no user Git configuration. Workers inherit these, so date parsing and the
+// real Git operations in tests behave the same on a developer machine; a
+// user's filters or hooks (git-lfs, for example) would otherwise run in them.
+process.env.TZ = "UTC";
+process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+// The verifier also keeps temporary files on tmpfs. Tests that do real Git
+// and disk-space work are several times slower on a busy disk, so a host run
+// uses the user's runtime tmpfs unless TMPDIR is set. It needs the free space
+// of the verifier's 8 GiB work tmpfs, because the update tests check real
+// capacity, and it must not be /dev/shm, which tests use as a second
+// filesystem.
+const TMPFS_MAGIC = 0x01021994;
+const VERIFIER_TMPFS_BYTES = 8 * 1024 ** 3;
+const runtimeDirectory = process.env.XDG_RUNTIME_DIR;
+if (
+  !process.env.TMPDIR &&
+  runtimeDirectory &&
+  fitsVerifierTmpfs(runtimeDirectory)
+) {
+  const temporary = fs.mkdtempSync(
+    path.join(runtimeDirectory, "cloudx-vitest-"),
+  );
+  process.env.TMPDIR = temporary;
+  process.on("exit", () =>
+    fs.rmSync(temporary, { recursive: true, force: true }),
+  );
+}
+
+function fitsVerifierTmpfs(directory: string): boolean {
+  try {
+    const statfs = fs.statfsSync(directory);
+    return (
+      statfs.type === TMPFS_MAGIC &&
+      statfs.bavail * statfs.bsize >= VERIFIER_TMPFS_BYTES &&
+      fs.statSync(directory).dev !== fs.statSync("/dev/shm").dev
+    );
+  } catch {
+    return false;
+  }
+}
 
 export default defineConfig({
   test: {

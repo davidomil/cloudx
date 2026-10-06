@@ -57,6 +57,7 @@ import {
   updateEnvFileContent,
   updateHostFromEnvConfig,
   validateCpuThreads,
+  buildEnvLines,
 } from "./install-cloudx.mjs";
 
 const TEST_ENV = { PATH: "/usr/bin" };
@@ -1900,5 +1901,14 @@ describe("installer prompt ownership", () => {
       input.destroy();
       output.destroy();
     }
+  });
+});
+
+describe("Claude Code environment", () => {
+  const base = { host: "127.0.0.1", port: 3001, allowedRoots: "~", dataDir: "/data", assistantBin: "/npm/bin/codex", toolPath: "/npm/bin", modelDir: "/models", device: "cpu", computeType: "int8", language: "en", cpuThreads: 2 };
+
+  it("records the Claude Code executable only when one is available", () => {
+    expect(buildEnvLines({ ...base, claudeBin: "/npm/bin/claude" })).toContain("CLOUDX_CLAUDE_BIN=/npm/bin/claude");
+    expect(buildEnvLines(base).some(line => line.startsWith("CLOUDX_CLAUDE_BIN="))).toBe(false);
   });
 });

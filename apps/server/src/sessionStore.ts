@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
+import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, type AgentSwitchRequest } from "@cloudx/shared";
 import type { ConfigValue, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
@@ -64,6 +65,9 @@ export class SessionStore {
   private readonly tabClosures = new Map<string, Promise<void>>();
   private readonly tabOwnershipActions = new Map<string, Promise<unknown>>();
   private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
+  // Tabs whose agent is being switched. Their input and actions are refused
+  // so no new turn starts while the switch is prepared.
+  private readonly switchingTabs = new Set<string>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
   private readonly shutdownController = new AbortController();
   private disposed = false;
@@ -181,7 +185,7 @@ export class SessionStore {
     const plugin = this.plugins.get(tab.pluginId);
     if (tab.ownerPluginId || plugin.panelKind !== "terminal") throw new Error("This tab does not support terminal recovery.");
     const recoveringConversation = request.action === "resume-conversation" || request.action === "select-conversation";
-    if (request.action === "new-shell" && plugin.id !== "standard-terminal" || recoveringConversation && plugin.id !== "codex-terminal") {
+    if (request.action === "new-shell" && plugin.id !== "standard-terminal" || recoveringConversation && plugin.id !== AGENT_TERMINAL_PLUGIN_ID) {
       throw new Error("The recovery action does not match this terminal.");
     }
     if (recoveringConversation && !plugin.recoverSession) throw new Error("Conversation recovery is unavailable.");
@@ -233,6 +237,56 @@ export class SessionStore {
     return this.getTab(tabId);
   }
 
+  // Relaunches an agent tab on another provider or account. The current run
+  // must be idle or ended; the plugin decides how context carries over.
+  switchAgent(tabId: string, request: AgentSwitchRequest): Promise<WorkspaceTab> {
+    if (this.disposed) return Promise.reject(new Error("Session store is disposed."));
+    if (this.tabClosures.has(tabId)) return Promise.reject(new Error("The tab is closing."));
+    if (this.tabOwnershipActions.has(tabId) || this.tabRecoveries.has(tabId))
+      return Promise.reject(new Error("Wait for this tab's current operation before switching."));
+    this.switchingTabs.add(tabId);
+    const switching = this.admitAction(undefined, () => this.switchAgentNow(tabId, request));
+    this.tabRecoveries.set(tabId, switching);
+    const finished = () => { this.tabRecoveries.delete(tabId); this.switchingTabs.delete(tabId); };
+    void switching.then(finished, finished);
+    return switching;
+  }
+
+  private async switchAgentNow(tabId: string, request: AgentSwitchRequest): Promise<WorkspaceTab> {
+    const tab = this.getTab(tabId);
+    const plugin = this.plugins.get(tab.pluginId);
+    if (!isAgentTab(tab) || !plugin.prepareAgentSwitch) throw new Error("Only agent terminal tabs can switch provider or account.");
+    if (tab.ownerPluginId) throw new Error("This run is managed by another plugin. Change its provider in that plugin's settings.");
+    const previous = this.sessions.get(tabId);
+    const alive = Boolean(previous && !previous.hasExited?.());
+    if (alive && !isIdleAgent(previous!))
+      throw new Error("The current run is still active. Wait for the turn to finish or stop it, then switch.");
+    const input = await this.sessionInput(tab);
+    input.initialInput = previous?.restoreInput?.() ?? input.initialInput;
+    const next = await plugin.prepareAgentSwitch(input, request);
+    // Preparation awaited account and handoff work; check the run again.
+    if (this.sessions.get(tabId) !== previous || (alive && !isIdleAgent(previous!)))
+      throw new Error("The run changed while the switch was prepared. Switch again when it is idle.");
+    if (previous) {
+      this.disposeSessionListeners(tabId);
+      if (alive) await previous.terminate?.();
+      this.sessions.delete(tabId);
+    }
+    this.initialInputs.set(tabId, structuredClone(next));
+    this.updateTab(tabId, { status: "starting", statusMessage: "Switching agent.", recovery: undefined });
+    try {
+      const session = await plugin.createSession(await this.sessionInput(this.getTab(tabId)));
+      this.bindSession(tabId, session);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.updateTab(tabId, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });
+      await this.savedSessions?.flush();
+      throw error;
+    }
+    await this.savedSessions?.flush();
+    return this.getTab(tabId);
+  }
+
   async tabOwnershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
     const tab = this.getTab(tabId);
     const plugin = this.plugins.get(tab.pluginId);
@@ -268,7 +322,7 @@ export class SessionStore {
     const pending = this.admitAction(undefined, async () => {
       const tab = this.getTab(tabId);
       const plugin = this.plugins.get(tab.pluginId);
-      if (tab.ownerPluginId || plugin.id !== "codex-terminal" || tab.recovery?.state !== "missing")
+      if (tab.ownerPluginId || plugin.id !== AGENT_TERMINAL_PLUGIN_ID || tab.recovery?.state !== "missing")
         throw new Error("Confirm that the Codex process ended before reconciling its source ownership.");
       const previous = this.sessions.get(tabId);
       if (previous && !previous.hasExited?.()) throw new Error("The Codex process is still active.");
@@ -372,7 +426,7 @@ export class SessionStore {
       this.tabs.set(id, tab);
       this.initialInputs.set(id, request.initialInput);
       if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
-      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareCodexSession: launchOptions.prepareCodexSession, prepareTerminalExecution: launchOptions.prepareTerminalExecution, codexTurn: launchOptions.codexTurn });
+      if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareAgentSession: launchOptions.prepareAgentSession, prepareTerminalExecution: launchOptions.prepareTerminalExecution, agentTurn: launchOptions.agentTurn });
       this.unpublishedTabIds.add(id);
       const session = await plugin.createSession({
         tab,
@@ -382,9 +436,9 @@ export class SessionStore {
         controls: this.createControls(id),
         initialInput: request.initialInput,
         authorizeProjectTrust: this.launchOptions.get(id)?.authorizeProjectTrust,
-        prepareCodexSession: this.launchOptions.get(id)?.prepareCodexSession,
+        prepareAgentSession: this.launchOptions.get(id)?.prepareAgentSession,
         prepareTerminalExecution: this.launchOptions.get(id)?.prepareTerminalExecution,
-        codexTurn: this.launchOptions.get(id)?.codexTurn,
+        agentTurn: this.launchOptions.get(id)?.agentTurn,
         config: this.configProvider.getPluginConfig(plugin.id),
         getConfig: () => this.configProvider.getPluginConfig(plugin.id)
       });
@@ -493,6 +547,17 @@ export class SessionStore {
       throw new Error(`Unknown tab: ${tabId}`);
     }
     return tab;
+  }
+
+  // False while the tab's agent is being switched; terminal input is dropped then.
+  acceptsInput(tabId: string): boolean {
+    return !this.switchingTabs.has(tabId);
+  }
+
+  // The session for an action that may start work in the tab.
+  private actionSession(tabId: string): PluginSession {
+    if (this.switchingTabs.has(tabId)) throw new Error("This tab is switching agents. Try again when the switch finishes.");
+    return this.getSession(tabId);
   }
 
   getSession(tabId: string): PluginSession {
@@ -609,7 +674,7 @@ export class SessionStore {
       throw new Error(`Action ${action.action} has no target tab.`);
     }
 
-    const session = this.getSession(targetTabId);
+    const session = this.actionSession(targetTabId);
     const pluginId = action.pluginId ?? session.tab.pluginId;
     if (pluginId !== session.tab.pluginId) {
       throw new Error(`Action targets plugin ${pluginId}, but tab ${targetTabId} uses ${session.tab.pluginId}.`);
@@ -677,7 +742,7 @@ export class SessionStore {
   async executePluginAction(tabId: string, action: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.admitAction(signal, async (admittedSignal) => {
       admittedSignal.throwIfAborted();
-      const session = this.getSession(tabId);
+      const session = this.actionSession(tabId);
       this.plugins.validateInput(session.tab.pluginId, action, input);
       const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input, { signal: admittedSignal, caller: { kind: "ui" } }));
       await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
@@ -693,7 +758,7 @@ export class SessionStore {
       if (!tabId) {
         throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
       }
-      const session = this.getSession(tabId);
+      const session = this.actionSession(tabId);
       if (session.tab.pluginId !== pluginId) {
         throw new Error(`Hook ${hookId} targets plugin ${pluginId}, but tab ${tabId} uses ${session.tab.pluginId}.`);
       }
@@ -889,9 +954,9 @@ export class SessionStore {
         tab,
         cwd: tab.cwd,
         authorizeProjectTrust: this.launchOptions.get(tabId)?.authorizeProjectTrust,
-        prepareCodexSession: this.launchOptions.get(tabId)?.prepareCodexSession,
+        prepareAgentSession: this.launchOptions.get(tabId)?.prepareAgentSession,
         prepareTerminalExecution: this.launchOptions.get(tabId)?.prepareTerminalExecution,
-        codexTurn: this.launchOptions.get(tabId)?.codexTurn,
+        agentTurn: this.launchOptions.get(tabId)?.agentTurn,
         runtimeContext,
         app: this.createAppContext(plugin.id, tabId),
         controls: this.createControls(tabId),
@@ -1476,4 +1541,14 @@ function mergePluginMetadata(current: PluginMetadataMap | undefined, pluginId: s
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// The provider's turn receipt is authoritative. Without one, a terminal that
+// has gone quiet after its last input counts as idle.
+function isIdleAgent(session: PluginSession): boolean {
+  const state = session.snapshot?.().state;
+  if (state?.turn === "running") return false;
+  if (state?.turn === "idle") return true;
+  const readiness = state?.readiness;
+  return Boolean(readiness && typeof readiness === "object" && (readiness as Record<string, unknown>).state === "ready");
 }

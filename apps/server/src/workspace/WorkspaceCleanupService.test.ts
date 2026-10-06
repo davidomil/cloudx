@@ -31,19 +31,22 @@ function service() {
 function observedService(processActivity?: WorkspaceProcessActivity) {
   return new WorkspaceCleanupService({ dataDir, pathPolicy: new PathPolicy([root]), forge, openDirectories: () => open, withInactiveDirectory: async (_directory, operation) => operation(), processActivity, protectedDirectories: [], trashDirectory: path.join(root, "trash") });
 }
-async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; state?: string; threads?: number | null; cwd?: string; files?: string[]; group?: string; managerPid?: string } = {}) {
+async function processFixture(options: { pid?: string; name?: string; parent?: string; uid?: number; effectiveUid?: number; savedGid?: number; state?: string; threads?: number | null; cwd?: string; files?: string[]; group?: string; managerPid?: string; exitSettleMs?: number; flags?: number } = {}) {
   const procDirectory = path.join(root, "proc");
   const pid = options.pid ?? "273";
   const directory = path.join(procDirectory, pid);
   await fs.mkdir(path.join(directory, "fd"), { recursive: true });
-  await fs.writeFile(path.join(directory, "stat"), `${pid} (${options.name ?? "systemd"}) ${options.state ?? "S"} ${options.parent ?? "1"} ${Array(17).fill("0").join(" ")} 1234\n`);
+  // Fields after the name: state, ppid, pgrp, session, tty, tpgid, flags, ..., starttime.
+  const fields = [options.state ?? "S", options.parent ?? "1", ...Array(17).fill("0"), "1234"];
+  fields[6] = String(options.flags ?? 0);
+  await fs.writeFile(path.join(directory, "stat"), `${pid} (${options.name ?? "systemd"}) ${fields.join(" ")}\n`);
   const uid = options.uid ?? 1000;
-  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${uid}\t${uid}\t${uid}\n${options.threads === null ? "" : `Threads:\t${options.threads ?? 1}\n`}`);
+  await fs.writeFile(path.join(directory, "status"), `Uid:\t${uid}\t${options.effectiveUid ?? uid}\t${options.effectiveUid ?? uid}\t${options.effectiveUid ?? uid}\nGid:\t1000\t1000\t${options.savedGid ?? 1000}\t1000\n${options.threads === null ? "" : `Threads:\t${options.threads ?? 1}\n`}`);
   await fs.writeFile(path.join(directory, "cgroup"), options.group ?? "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n");
   await fs.symlink(options.cwd ?? root, path.join(directory, "cwd"));
   for (const [fd, file] of (options.files ?? []).entries()) await fs.symlink(file, path.join(directory, "fd", String(fd)));
   const systemUserManager = vi.fn(async () => ({ pid: options.managerPid ?? pid, controlGroup: "/user.slice/user-1000.slice/user@1000.service", workingDirectory: "", rootDirectory: "", rootImage: "" }));
-  const observed = observedService(new WorkspaceProcessActivity({ procDirectory, uid: 1000, systemUserManager }));
+  const observed = observedService(new WorkspaceProcessActivity({ procDirectory, uid: 1000, systemUserManager, exitSettleMs: options.exitSettleMs }));
   return { observed, directory, systemUserManager };
 }
 function denyProcessAccess(file: string, code = "EACCES") {
@@ -407,7 +410,8 @@ describe("reviewed workspace cleanup", () => {
     const directory = await checkout("surviving-thread");
     const observed = observedService();
     const reviewed = await observed.preview();
-    expect(reviewed.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true });
+    const reviewedCandidate = reviewed.candidates.find(item => item.path === directory);
+    expect(reviewedCandidate, reviewedCandidate?.reason).toMatchObject({ eligible: true });
     const executable = path.join(root, "surviving-thread");
     await execute("cc", ["-Wall", "-Wextra", "-Werror", "-pthread", path.join(import.meta.dirname, "fixtures/surviving-thread.c"), "-o", executable]);
     const child = spawn(executable, [activity === "cwd and open file" ? directory : root, path.join(directory, "source.ts")], { cwd: root, stdio: ["pipe", "pipe", "pipe"] });
@@ -435,7 +439,8 @@ describe("reviewed workspace cleanup", () => {
       child.stdin.write("x");
       await stopped;
       const inactive = await observed.preview();
-      expect(inactive.candidates.find(item => item.path === directory)).toMatchObject({ eligible: true, sizeUnavailable: undefined });
+      const inactiveCandidate = inactive.candidates.find(item => item.path === directory);
+      expect(inactiveCandidate, inactiveCandidate?.reason).toMatchObject({ eligible: true, sizeUnavailable: undefined });
       await observed.start(selection(inactive)); await observed.settled();
       expect((await observed.status())?.results.find(item => item.path === directory)).toMatchObject({ status: "deleted" });
       await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
@@ -453,6 +458,72 @@ describe("reviewed workspace cleanup", () => {
     expect(candidate.reason).toContain("Thread group exit is unconfirmed");
     await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
     expect(await fs.stat(completed)).toBeTruthy();
+  });
+  // A thread of the fixture process: its stat flags and pending signals.
+  async function thread(directory: string, tid: string, { state = "S", flags = 0, sigPnd = "0", shdPnd = "0" } = {}) {
+    await fs.mkdir(path.join(directory, "task", tid), { recursive: true });
+    await fs.writeFile(path.join(directory, "task", tid, "stat"), `${tid} (node) ${state} 1 ${tid} ${tid} 0 -1 ${flags} ${Array(12).fill("0").join(" ")} 1234\n`);
+    await fs.writeFile(path.join(directory, "task", tid, "status"), `SigPnd:\t${sigPnd.padStart(16, "0")}\nShdPnd:\t${shdPnd.padStart(16, "0")}\n`);
+  }
+  it.each([
+    { evidence: "PF_EXITING", flags: 0x4 },
+    { evidence: "a pending SIGKILL", sigPnd: "100" },
+    { evidence: "a shared SIGKILL", shdPnd: "100" }
+  ])("waits for a thread group that is exiting, shown by $evidence, before allowing cleanup", async ({ flags, sigPnd, shdPnd }) => {
+    const completed = await checkout("exiting-thread-group");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 2, exitSettleMs: 5_000 });
+    await thread(directory, "274", { flags, sigPnd, shdPnd });
+    // The kernel finishes the exit while the scan waits.
+    const finished = setTimeout(() => void fs.writeFile(path.join(directory, "status"), "Uid:\t1000\t1000\t1000\t1000\nThreads:\t1\n"), 100);
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === completed)).toMatchObject({ eligible: true });
+    } finally { clearTimeout(finished); }
+  });
+  it("waits for an exiting process whose files became unreadable, and allows cleanup once it is gone", async () => {
+    const completed = await checkout("exiting-process");
+    const { observed, directory } = await processFixture({ name: "node", flags: 0x4, exitSettleMs: 5_000 });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    const reaped = setTimeout(() => void fs.rm(directory, { recursive: true, force: true }), 100);
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate, candidate.reason).toMatchObject({ eligible: true });
+    } finally { clearTimeout(reaped); denied.mockRestore(); }
+  });
+  it("keeps an exiting process uncertain when it does not finish within the bound", async () => {
+    const completed = await checkout("stuck-exiting-process");
+    const { observed, directory } = await processFixture({ name: "node", flags: 0x4, exitSettleMs: 100 });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false });
+      expect(candidate.reason).toContain("the exiting process did not finish");
+    } finally { denied.mockRestore(); }
+  });
+  it("allows cleanup when an exiting thread group disappears during the wait", async () => {
+    const completed = await checkout("vanishing-thread-group");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 2, exitSettleMs: 5_000 });
+    await thread(directory, "274", { flags: 0x4 });
+    const reaped = setTimeout(() => void fs.rm(directory, { recursive: true, force: true }), 100);
+    try {
+      expect((await observed.preview()).candidates.find(item => item.path === completed)).toMatchObject({ eligible: true });
+    } finally { clearTimeout(reaped); }
+  });
+  it("keeps an exiting thread group uncertain when it does not finish within the bound", async () => {
+    const completed = await checkout("stuck-thread-group");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 2, exitSettleMs: 100 });
+    await thread(directory, "274", { flags: 0x4 });
+    const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+    expect(candidate).toMatchObject({ eligible: false });
+    expect(candidate.reason).toContain("Thread group exit is unconfirmed: leader state Z; 2 threads remain.");
+  });
+  it("does not wait for a surviving thread that shows no sign of exiting", async () => {
+    const completed = await checkout("surviving-thread-group");
+    const { observed, directory } = await processFixture({ name: "node", state: "Z", threads: 2, exitSettleMs: 60_000 });
+    await thread(directory, "274", { state: "S", sigPnd: "4000" });
+    const started = Date.now();
+    const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
+    expect(candidate).toMatchObject({ eligible: false });
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
   it.each(["Z", "X", "x"])("allows cleanup only after confirming the %s leader has no surviving threads", async state => {
     const completed = await checkout("exited-thread-group");
@@ -550,6 +621,24 @@ describe("reviewed workspace cleanup", () => {
       expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273`);
       expect(candidate.reason).toContain("cwd:");
       expect(preview.reclaimableBytes).toBe(0);
+      await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+      expect(await fs.stat(completed)).toBeTruthy();
+    } finally { denied.mockRestore(); }
+  });
+  it.each([
+    { name: "setuid helper", effectiveUid: 0 },
+    { name: "setgid helper", savedGid: 112 }
+  ])("protects a checkout a $name may use even though its files are unreadable", async ({ effectiveUid, savedGid }) => {
+    // The kernel denies a set-id process's cwd and open files to its own user.
+    // That explains the denial; it does not show the process is elsewhere.
+    const completed = await checkout(`set-id-${effectiveUid ?? savedGid}`);
+    const { observed, directory } = await processFixture({ name: "helper", parent: "999", cwd: completed, effectiveUid, savedGid });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
+    try {
+      const preview = await observed.preview();
+      const candidate = preview.candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false });
+      expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273`);
       await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
       expect(await fs.stat(completed)).toBeTruthy();
     } finally { denied.mockRestore(); }

@@ -9,7 +9,8 @@ import { Terminal } from "@xterm/headless";
 import { CODEX_REASONING_EFFORTS, type TabIndicatorUpdate, type WorkspaceTab } from "@cloudx/shared";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
-import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, codexResumeInput, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { codexResumeInput } from "../agents/resumeInput.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
@@ -123,11 +124,11 @@ describe("CodexTerminalPlugin", () => {
   it("binds an owned native bridge to the prepared reviewer thread and attempt", async () => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
-      const codexTurn = { workerId: "worker", attemptId: "attempt", receiptPath: path.join(root, "turn.json") };
+      const agentTurn = { workerId: "worker", attemptId: "attempt", receiptPath: path.join(root, "turn.json") };
       const sessionId = "01a08470-d118-7b72-b1df-439e72e5c744";
       await plugin.createSession({
-        tab: { ...tab, ownerPluginId: "forge" }, cwd: root, codexTurn,
-        prepareCodexSession: async () => sessionId,
+        tab: { ...tab, ownerPluginId: "forge" }, cwd: root, agentTurn,
+        prepareAgentSession: async () => sessionId,
         initialInput: { prompt: "Continue the review." },
         controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
       });
@@ -145,7 +146,7 @@ describe("CodexTerminalPlugin", () => {
       vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
       let release!: (id: string) => void;
       const ready = new Promise<string>(resolve => { release = resolve; });
-      const prepareCodexSession = vi.fn(async launch => {
+      const prepareAgentSession = vi.fn(async launch => {
         expect(factory.spawns).toBe(0);
         expect(launch).toMatchObject({ tabId: tab.id, cwd: root, command: "/usr/bin/codex" });
         expect(await fs.realpath(path.join(launch.env.CODEX_HOME!, "sessions"))).toBe(path.join(home, "sessions"));
@@ -155,12 +156,12 @@ describe("CodexTerminalPlugin", () => {
         return ready;
       });
       const creation = plugin.createSession({
-        tab, cwd: root, prepareCodexSession,
+        tab, cwd: root, prepareAgentSession,
         controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
         initialInput: { prompt: "Review the next commit.", model: "gpt-6-astra", reasoningEffort: "max" }
       });
       void creation.catch(() => undefined);
-      await vi.waitFor(() => expect(prepareCodexSession).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(prepareAgentSession).toHaveBeenCalledOnce());
       expect(factory.spawns).toBe(0);
       release("01a08470-d118-7b72-b1df-439e72e5c744");
       await creation;
@@ -174,7 +175,7 @@ describe("CodexTerminalPlugin", () => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       const failure = new Error("Conversation process ownership is unresolved.");
       await expect(plugin.createSession({
-        tab, cwd: root, prepareCodexSession: async () => { throw failure; },
+        tab, cwd: root, prepareAgentSession: async () => { throw failure; },
         controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
       })).rejects.toBe(failure);
       expect(factory.spawns).toBe(0);
@@ -1722,15 +1723,15 @@ describe("Codex terminal update recovery", () => {
     const detach = vi.fn();
     Object.assign(terminal, { detach });
     const factory = { spawn: vi.fn(), attach: vi.fn(async () => terminal) };
-    const prepareCodexSession = vi.fn();
+    const prepareAgentSession = vi.fn();
     const plugin = new CodexTerminalPlugin(factory);
     const session = await plugin.restoreSession({
-      tab, cwd: tab.cwd, initialInput: { prompt: "Do not repeat this work" }, prepareCodexSession,
+      tab, cwd: tab.cwd, initialInput: { prompt: "Do not repeat this work" }, prepareAgentSession,
       controls: { setTabIndicator: vi.fn(), closeTab: vi.fn() }
     });
     expect(factory.attach).toHaveBeenCalledWith(tab.id);
     expect(factory.spawn).not.toHaveBeenCalled();
-    expect(prepareCodexSession).not.toHaveBeenCalled();
+    expect(prepareAgentSession).not.toHaveBeenCalled();
     expect(terminal.written).toBe("");
     terminal.emitData("Still working");
     expect(session.snapshot().recentOutput).toBe("Still working");
@@ -2029,7 +2030,7 @@ describe("Codex conversation recovery after process loss", () => {
       await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: root } }) + "\n");
       const initialInput = { ...previous.restoreInput?.(), resume: { mode: "session", sessionId: conversationId } };
       await expect(plugin.describeRecovery({ tab, cwd: root, controls, initialInput })).resolves.toMatchObject({ canResume: false, message: expect.stringContaining("cannot be confirmed") });
-      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput, prepareCodexSession: async () => { throw new Error("Must not prepare another conversation"); } });
+      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput, prepareAgentSession: async () => { throw new Error("Must not prepare another conversation"); } });
       expect(factory.bridgeLaunch().tuiArgs.slice(-2)).toEqual(["resume", conversationId]);
       expect(factory.args?.at(-1)).toContain("--cd");
       expect(factory.bridgeLaunch().tuiArgs).toContain("gpt-6-astra");

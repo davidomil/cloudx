@@ -47,6 +47,8 @@ export interface ForgeSettings {
   workerReasoningEffort: CodexReasoningEffort;
   reviewModel: string;
   reviewReasoningEffort: CodexReasoningEffort;
+  workerAccountId?: string;
+  reviewAccountId?: string;
   maxRunMinutes: number;
 }
 interface Runtime {
@@ -107,6 +109,7 @@ interface Runtime {
       templateId: string;
       model: string;
       reasoningEffort: CodexReasoningEffort;
+      accountId?: string;
       prompt: string;
       preserveConversation?: true;
       windowId: string;
@@ -1387,7 +1390,7 @@ export class ForgeWorkflowService {
     const status = completion.turn?.status;
     if (completion.reportError) throw new Error(completion.reportError);
     if (status === "interrupted" || status === "failed")
-      throw new Error(`The native Codex turn ${status}${completion.turn?.error ? `: ${completion.turn.error}` : "."} Its work and report were preserved.`);
+      throw new Error(`The native agent turn ${status}${completion.turn?.error ? `: ${completion.turn.error}` : "."} Its work and report were preserved.`);
     if (Date.now() >= Date.parse(completion.deadlineAt)) {
       const timeoutMs = this.deps.settings().maxRunMinutes * 60_000;
       this.log(worker, "warn", "worker_timed_out", { elapsedMs: Date.now() - Date.parse(worker.updatedAt), timeoutMs });
@@ -1399,7 +1402,7 @@ export class ForgeWorkflowService {
     }
     if (status !== "completed" && (!worker.tabId || !this.deps.runtime.isActive(worker.tabId))) {
       if (!completion.report) this.log(worker, "warn", "worker_report_missing");
-      throw new Error(`The Codex tab ended without successful native turn completion${completion.report ? "." : " or a completion report."} Its work and report were preserved.`);
+      throw new Error(`The agent tab ended without successful native turn completion${completion.report ? "." : " or a completion report."} Its work and report were preserved.`);
     }
   }
   private async completeAttempt(worker: ForgeWorker): Promise<boolean> {
@@ -2815,6 +2818,7 @@ export class ForgeWorkflowService {
         templateId: worker.templateId,
         model: worker.kind === "issue" ? settings.workerModel : settings.reviewModel,
         reasoningEffort: worker.kind === "issue" ? settings.workerReasoningEffort : settings.reviewReasoningEffort,
+        accountId: worker.kind === "issue" ? settings.workerAccountId : settings.reviewAccountId,
         prompt,
         ...(worker.batch ? { preserveConversation: true as const } : {}),
         ...placement,

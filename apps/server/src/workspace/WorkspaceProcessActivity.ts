@@ -1,10 +1,19 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { promisify } from "node:util";
 import { isSameOrChildPath } from "../pathBoundary.js";
 
 const execute = promisify(execFile);
+// A thread group whose leader has exited may still run threads. During an
+// ordinary exit those threads are already leaving: the kernel queues SIGKILL
+// to each (zap_other_threads) and sets PF_EXITING in do_exit. Only then is
+// the group given time to finish; other surviving threads stay uncertain.
+const PF_EXITING = 0x4;
+const SIGKILL_BIT = 1n << 8n;
+const DEFAULT_EXIT_SETTLE_MS = 2_000;
+const EXIT_POLL_MS = 20;
 interface ProcessIdentity {
   name: string;
   parent: string;
@@ -12,6 +21,8 @@ interface ProcessIdentity {
   started: string;
   uids: number[];
   threads?: number;
+  // PF_EXITING: the leader thread has started to exit.
+  exiting: boolean;
 }
 interface SystemUserManager {
   pid: string;
@@ -22,6 +33,8 @@ interface SystemUserManager {
 }
 interface Dependencies {
   procDirectory?: string;
+  // How long an exiting thread group may take to finish before it is uncertain.
+  exitSettleMs?: number;
   uid?: number;
   systemUserManager?: (uid: number) => Promise<SystemUserManager>;
 }
@@ -64,6 +77,11 @@ export class WorkspaceProcessActivity {
         if (exited(after)) { await this.assertThreadGroupExited(pid, after); continue; }
         const active = open.find(file => [file, file.replace(/ \(deleted\)$/u, "")].some(openPath => isSameOrChildPath(resolved, path.resolve(openPath))));
         if (active) throw new ActiveWorkspaceProcess(`A running process (PID ${pid}) still uses this workspace: ${active}`);
+        // An exiting process's files become unreadable before it is a zombie.
+        if (uncertainty.length && after.exiting && await this.otherThreadsExiting(pid)) {
+          await this.awaitExit(pid, after, uncertainty);
+          continue;
+        }
         if (uncertainty.length) {
           const verified = await this.isSystemUserInfrastructure(pid, after, resolved).catch(error => {
             throw new Error(`${uncertainty.join("; ")}; ${message(error)}`);
@@ -88,10 +106,54 @@ export class WorkspaceProcessActivity {
   private procPath(pid: string, file: string): string { return path.join(this.procDirectory, pid, file); }
 
   private async assertThreadGroupExited(pid: string, leader: ProcessIdentity): Promise<void> {
-    const current = await this.identity(pid);
-    if (!sameProcess(leader, current)) throw new Error("Process identity changed during inspection. Scan again.");
-    if (!exited(current) || current.threads !== 1)
-      throw new Error(`Thread group exit is unconfirmed: leader state ${current.state}; ${current.threads === undefined ? "thread count is unavailable" : `${current.threads} threads remain`}.`);
+    const deadline = Date.now() + (this.deps.exitSettleMs ?? DEFAULT_EXIT_SETTLE_MS);
+    while (true) {
+      let current: ProcessIdentity;
+      try { current = await this.identity(pid); }
+      catch (error) { if (vanished(error)) return; throw error; }
+      if (!sameProcess(leader, current)) throw new Error("Process identity changed during inspection. Scan again.");
+      if (exited(current) && current.threads === 1) return;
+      if (!exited(current) || current.threads === undefined || Date.now() >= deadline || !await this.otherThreadsExiting(pid))
+        throw new Error(`Thread group exit is unconfirmed: leader state ${current.state}; ${current.threads === undefined ? "thread count is unavailable" : `${current.threads} threads remain`}.`);
+      await sleep(EXIT_POLL_MS);
+    }
+  }
+
+  // Waits for a process whose threads are all exiting to finish, within the
+  // settle bound; otherwise its activity stays uncertain.
+  private async awaitExit(pid: string, leader: ProcessIdentity, uncertainty: string[]): Promise<void> {
+    const deadline = Date.now() + (this.deps.exitSettleMs ?? DEFAULT_EXIT_SETTLE_MS);
+    while (Date.now() < deadline) {
+      await sleep(EXIT_POLL_MS);
+      let current: ProcessIdentity;
+      try { current = await this.identity(pid); }
+      catch (error) { if (vanished(error)) return; throw error; }
+      if (!sameProcess(leader, current)) throw new Error("Process identity changed during inspection. Scan again.");
+      if (exited(current)) return this.assertThreadGroupExited(pid, current);
+    }
+    throw new Error(`${uncertainty.join("; ")}; the exiting process did not finish.`);
+  }
+
+  // True when every thread besides the leader is exiting or already gone.
+  private async otherThreadsExiting(pid: string): Promise<boolean> {
+    let threads: string[];
+    try { threads = await fs.readdir(this.procPath(pid, "task")); }
+    catch (error) { return vanished(error); }
+    for (const tid of threads.filter(tid => tid !== pid && /^\d+$/u.test(tid))) {
+      try {
+        const stat = await fs.readFile(this.procPath(pid, `task/${tid}/stat`), "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+        const flags = Number(fields[6]);
+        if (["Z", "X", "x"].includes(fields[0] ?? "") || (Number.isSafeInteger(flags) && (flags & PF_EXITING) !== 0)) continue;
+        const status = await fs.readFile(this.procPath(pid, `task/${tid}/status`), "utf8");
+        const masks = ["SigPnd", "ShdPnd"].map(name => new RegExp(`^${name}:\\s+([0-9a-f]+)\\s*$`, "mu").exec(status)?.[1]);
+        if (masks.some(mask => mask !== undefined && (BigInt(`0x${mask}`) & SIGKILL_BIT) !== 0n)) continue;
+        return false;
+      } catch (error) {
+        if (!vanished(error)) return false;
+      }
+    }
+    return true;
   }
 
   private async identity(pid: string): Promise<ProcessIdentity> {
@@ -103,7 +165,11 @@ export class WorkspaceProcessActivity {
     const threads = /^Threads:\s+(\d+)\s*$/mu.exec(status);
     if (!name || !/^\d+$/u.test(fields[1] ?? "") || !/^\d+$/u.test(fields[19] ?? "") || !uids)
       throw new Error("Process ownership or start-time identity is unavailable.");
-    return { name: name[1]!, parent: fields[1]!, state: fields[0]!, started: fields[19]!, uids: uids.slice(1).map(Number), ...(threads ? { threads: Number(threads[1]) } : {}) };
+    const flags = Number(fields[6]);
+    return {
+      name: name[1]!, parent: fields[1]!, state: fields[0]!, started: fields[19]!, uids: uids.slice(1).map(Number),
+      exiting: Number.isSafeInteger(flags) && (flags & PF_EXITING) !== 0, ...(threads ? { threads: Number(threads[1]) } : {})
+    };
   }
 
   private async isSystemUserInfrastructure(pid: string, identity: ProcessIdentity, directory: string): Promise<boolean> {

@@ -1039,10 +1039,12 @@ service to include debug events.
   contribution sync, terminal, workspace, and voice issues.
 - `CLOUDX_ALLOWED_ROOTS`: path-delimited roots tabs may open, default `~`.
 - `CLOUDX_DATA_DIR`: runtime state directory, default `.cloudx`.
-- `CLOUDX_VOICE_MODEL`: Codex planner model, default `gpt-5.6-luna`.
-- `CLOUDX_ASSISTANT_BIN`: resolved coding-assistant CLI path used by terminal
-  sessions. The installer currently writes the resolved Codex executable here;
-  future providers such as Claude can use the same variable.
+- `CLOUDX_VOICE_MODEL`: voice planner model, default `gpt-5.6-luna`. A
+  Claude model id runs planning on the default Claude account.
+- `CLOUDX_ASSISTANT_BIN`: resolved Codex CLI path used by terminal sessions.
+- `CLOUDX_CLAUDE_BIN`: Claude Code CLI path, default `claude` on `PATH`. The
+  installer writes it when it finds or installs Claude Code. See [Agents &
+  accounts](plugins/agent-accounts.md).
 - `CLOUDX_TOOL_PATH`: command directories prepended to child-process `PATH` so
   Cloudx shells and assistant subprocesses see the same tool installs as the
   installer.

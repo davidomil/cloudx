@@ -19,6 +19,7 @@ import { DEFAULT_CODEX_MODEL, type CloudxRule, type CloudxSkill } from "@cloudx/
 import type { CodexStateSources, ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 import { discoverCodexDefaultSkills, readCodexLaunchPreferences } from "../plugins/CodexLaunchPreferences.js";
 import { materializeCodexSkillSurface } from "./CodexSkillSurface.js";
+import { replaceLink } from "../agents/replaceLink.js";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -30,6 +31,8 @@ export interface CodexHomeOverlayOptions {
   resetCodexHome?: boolean;
   sources: CodexStateSources;
   source: ResolvedCodexStateSource;
+  // Home whose credentials this tab uses. Defaults to the shared Codex home.
+  authHome?: string;
 }
 
 export interface CodexHomeOverlay {
@@ -85,8 +88,9 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
   const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
 
-  await linkOrCopyIfExists(path.join(sourceCodexHome, "auth.json"), path.join(codexHome, "auth.json"));
-  await linkOrCopyIfExists(path.join(sourceCodexHome, ".credentials.json"), path.join(codexHome, ".credentials.json"));
+  const authHome = options.authHome ?? sourceCodexHome;
+  await replaceLink(path.join(authHome, "auth.json"), path.join(codexHome, "auth.json"));
+  await replaceLink(path.join(authHome, ".credentials.json"), path.join(codexHome, ".credentials.json"));
   await linkOrCopyIfExists(path.join(sourceCodexHome, "rules"), path.join(codexHome, "rules"));
   const stagedSkillPaths = await materializeSelectedSkills(sourceCodexHome, staging, rulesSkillsRoot, options.resolved, systemSkills, defaultSkillIds);
   const skillPaths = stagedSkillPaths.map((skillPath) => path.join(codexHome, path.relative(staging, skillPath)));

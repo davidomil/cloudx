@@ -85,7 +85,7 @@ it.skipIf(!nativeBinary)("new tabs and Forge workers use the selected installati
       const tab: WorkspaceTab = { id, pluginId: "codex-terminal", ...(worker ? { ownerPluginId: "forge" } : {}), title: id, cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "Running", updatedAt: "" } };
       const binding = { workerId: id, attemptId: `${id}-attempt`, receiptPath: path.join(root, `${id}-turn.json`) };
       const session = await plugin.createSession({
-        tab, cwd: root, ...(worker ? { codexTurn: binding, initialInput: { prompt: "Complete the native selection check." } } : {}),
+        tab, cwd: root, ...(worker ? { agentTurn: binding, initialInput: { prompt: "Complete the native selection check." } } : {}),
         controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
       });
       sessions.push(session);

@@ -180,4 +180,26 @@ describe("Forge setup in ordinary Settings", () => {
     expect(field(container, "Review template").disabled).toBe(true);
     expect(container.textContent).toContain("Create a template in Rules / Skills first");
   });
+
+  it("chooses a Forge account from the configured agent accounts", async () => {
+    const response = config();
+    response.plugins[0]!.fields.push({ key: "workerAccountId", label: "Coding account", type: "string", defaultValue: "", optionSource: "agent-accounts" });
+    const container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const save = vi.fn(async (_values: CloudxConfigValues) => {});
+    const callHook = vi.fn(async () => ({ state: { providers: [], accounts: [
+      { id: "claude-work", providerId: "claude", label: "Work", kind: "subscription", isDefault: true, createdAt: "2026-10-05T00:00:00.000Z" },
+      { id: "codex-home", providerId: "codex", label: "Home", kind: "subscription", isDefault: true, createdAt: "2026-10-05T00:00:00.000Z" }
+    ] } }));
+    await act(async () => root!.render(createElement(SettingsDialog, { config: response, rulesSkillsStore: templates, onSave: save, onCancel: vi.fn(), callHook: callHook as never })));
+    await act(async () => container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Forge Workers"]')!.click());
+
+    const account = field(container, "Coding account") as HTMLSelectElement;
+    expect([...account.options].map(option => option.textContent)).toEqual(["Default account of the model's provider", "Claude · Work", "Codex · Home"]);
+    await select(account, "claude-work");
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(callHook).toHaveBeenCalledWith("agent-accounts.read", {});
+    expect(save.mock.calls[0]![0].plugins.forge).toMatchObject({ workerAccountId: "claude-work" });
+  });
 });

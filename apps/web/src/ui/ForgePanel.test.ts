@@ -2590,3 +2590,16 @@ describe("ForgePanel", () => {
     expect(panel.textContent).not.toContain("Forge storage unavailable.");
   });
 });
+
+describe("ForgePanel usage", () => {
+  it("shows worker usage only when usage is enabled", async () => {
+    const usage = { totals: { input: 1_000, cachedInput: 0, cacheWrite: 0, output: 500, reasoning: 0, webSearches: 0, requests: 2 }, byModel: [], costUsd: 1.25, costBasis: "api-equivalent", unpricedModels: [] };
+    const testFixture = fixture({ workers: [worker] }, hook => hook === "agent-usage.read" ? { usage: { tabs: {}, forgeWorkers: { [worker.id]: usage }, total: usage } } : undefined);
+    const hidden = await renderPanel(testFixture);
+    expect(testFixture.calls.some(call => call.hook === "agent-usage.read")).toBe(false);
+    expect(hidden.textContent).not.toContain("API-equivalent");
+    const shown = await renderPanel(testFixture, { showUsage: true });
+    await vi.waitFor(() => expect(shown.textContent).toContain("Usage: $1.25 API-equivalent · 1.5k tokens"));
+    expect(testFixture.calls).toContainEqual(expect.objectContaining({ hook: "agent-usage.read", input: { forgeWorkerIds: [worker.id] } }));
+  });
+});

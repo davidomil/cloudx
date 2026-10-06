@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import type { RecoverTabRequest, TabRecovery, WorkspaceTab } from "@cloudx/shared";
+import { isAgentTab, type RecoverTabRequest, type TabRecovery, type WorkspaceTab } from "@cloudx/shared";
 
 import { tabOwnershipAvailability, previewTabOwnership, reconcileTabOwnership } from "../api.js";
 import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
@@ -46,7 +46,7 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
       <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "reconnect" }))}>Check connection</ControlButton> : null}
     {recovery.state === "missing" && tab.pluginId === "standard-terminal" && onRecover ?
       <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "new-shell" }))}>Open new shell</ControlButton> : null}
-    {recovery.state === "missing" && tab.pluginId === "codex-terminal" && onRecover ? <>
+    {recovery.state === "missing" && isAgentTab(tab) && onRecover ? <>
       {recovery.canResume && recovery.conversationId ? <>
         <p>Conversation: <code>{recovery.conversationId}</code></p>
         <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "resume-conversation" }))}>Resume conversation</ControlButton>

@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useId, useRef, useState } from "react";
 import { X } from "lucide-react";
-import type { ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
+import { isAgentTab, type ForgeWorker, type ForgeWorkerHistory, type WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 
@@ -17,7 +17,7 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
   const dialogRef = useRef<HTMLDialogElement>(null);
   const terminalRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
-  const terminal = workerTabs.find(tab => tab.id === worker.tabId && tab.ownerPluginId === "forge" && tab.pluginId === "codex-terminal" && tab.pluginMetadata?.["forge-workers"]?.workerId === worker.id);
+  const terminal = workerTabs.find(tab => tab.id === worker.tabId && tab.ownerPluginId === "forge" && isAgentTab(tab) && tab.pluginMetadata?.["forge-workers"]?.workerId === worker.id);
   const [saved, setSaved] = useState<{ history?: ForgeWorkerHistory; error?: string }>();
   const needsHistory = !terminal && worker.status !== "starting";
 

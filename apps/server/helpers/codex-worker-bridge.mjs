@@ -103,6 +103,33 @@ export class CodexWorkerTurn {
   }
 }
 
+/** Records whether any turn is running, for switching a tab to another agent. */
+export class CodexTurnActivity {
+  constructor(save) {
+    this.save = save;
+    this.requests = new Set();
+    this.running = new Set();
+    this.lastStatus = undefined;
+  }
+
+  fromClient(message) {
+    if (message.method === "turn/start" && message.id != null) this.requests.add(message.id);
+  }
+
+  fromServer(message) {
+    if (!message.method && this.requests.delete(message.id)) {
+      const turnId = message.result?.turn?.id;
+      if (!message.error && typeof turnId === "string" && turnId) this.running.add(turnId);
+    } else if (message.method === "turn/completed" && message.id == null) {
+      this.running.delete(message.params?.turn?.id);
+    } else return;
+    const status = this.running.size ? "running" : "idle";
+    if (status === this.lastStatus) return;
+    this.lastStatus = status;
+    this.save({ version: 1, status, updatedAt: new Date().toISOString() });
+  }
+}
+
 export function saveTurnReceipt(receiptPath, value) {
   const temporary = `${receiptPath}.${randomBytes(8).toString("hex")}.tmp`;
   const file = openSync(temporary, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
@@ -134,6 +161,11 @@ export async function runWorkerBridge(launch) {
   const selection = launch.selection ? new CodexConversationSelection(launch.selection,
     value => saveTurnReceipt(launch.selection.receiptPath, value)) : undefined;
   const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
+  // Activity only informs agent switching. A failed write must not end the session.
+  const activity = launch.activity ? new CodexTurnActivity(value => {
+    try { saveTurnReceipt(launch.activity.receiptPath, value); }
+    catch (error) { process.stderr.write(`CloudX turn activity: ${error.message}\n`); }
+  }) : undefined;
   if (!turn && !selection) throw new Error("A native bridge execution binding is required.");
   let finishing = false;
   const fail = error => {
@@ -169,6 +201,7 @@ export async function runWorkerBridge(launch) {
         permissions?.fromClient(message);
         selection?.fromClient(message);
         turn?.fromClient(message);
+        activity?.fromClient(message);
         const line = `${JSON.stringify(message)}\n`;
         if (native) forward(line);
         else {
@@ -227,6 +260,7 @@ export async function runWorkerBridge(launch) {
             permissions?.fromServer(message);
             selection?.fromServer(message);
             turn?.fromServer(message);
+            activity?.fromServer(message);
             socket.send(JSON.stringify(message));
           }
           if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) throw new Error("Native worker message exceeds the size limit.");

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { PluginSessionNotStartedError, type PreparedCodexLaunch } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError, type PreparedAgentLaunch } from "@cloudx/plugin-api";
 import { isRecord, type CodexReasoningEffort } from "@cloudx/shared";
 
 import { AppServerClient, type AppServerTransport } from "../appServer/AppServerClient.js";
@@ -21,15 +21,23 @@ export interface ReviewConversationBinding {
 
 interface ConversationTransport extends AppServerTransport { finish(): Promise<void>; terminate(): Promise<void> }
 
+// Standing context for a preserved review or batch conversation. Codex
+// receives it as an injected item; Claude receives it before the first prompt.
+export function forgeConversationContext(purpose: "review" | "batch", cwd: string): string {
+  return purpose === "batch"
+    ? `This conversation belongs to one Forge issue batch in ${JSON.stringify(cwd)}. Retain the combined requirements, member identities, implementation decisions and validation history across pauses, review feedback and rebases. Continue from the current owned checkout and preserve its working files.`
+    : `This conversation belongs to one Forge review worker in ${JSON.stringify(cwd)}. Retain prior review findings as context, and assess each requested revision from the current owned checkout.`;
+}
+
 /** Creates one durable worker thread and verifies that exact thread on later launches. */
 export class ForgeReviewConversation {
   constructor(
     private readonly dataDir: string,
-    private readonly createTransport: (launch: PreparedCodexLaunch, signal?: AbortSignal) => Promise<ConversationTransport> = (launch, signal) => OwnedAppServerTransport.create(launch, signal),
+    private readonly createTransport: (launch: PreparedAgentLaunch, signal?: AbortSignal) => Promise<ConversationTransport> = (launch, signal) => OwnedAppServerTransport.create(launch, signal),
   ) {}
 
   async prepare(
-    launch: PreparedCodexLaunch,
+    launch: PreparedAgentLaunch,
     options: {
       purpose: "review" | "batch";
       binding?: ReviewConversationBinding;
@@ -90,9 +98,7 @@ export class ForgeReviewConversation {
           threadId,
           items: [{
             type: "message", role: "user",
-            content: [{ type: "input_text", text: options.purpose === "batch"
-              ? `This conversation belongs to one Forge issue batch in ${JSON.stringify(launch.cwd)}. Retain the combined requirements, member identities, implementation decisions and validation history across pauses, review feedback and rebases. Continue from the current owned checkout and preserve its working files. Wait for the batch request before starting work.`
-              : `This conversation belongs to one Forge review worker in ${JSON.stringify(launch.cwd)}. Retain prior review findings as context, and assess each requested revision from the current owned checkout. Wait for the review request before starting work.` }],
+            content: [{ type: "input_text", text: `${forgeConversationContext(options.purpose, launch.cwd)} Wait for the ${options.purpose} request before starting work.` }],
           }],
         });
         if (!isRecord(initialized) || Object.keys(initialized).length !== 0)

@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Bell, Blocks, RefreshCw, ScrollText, Search, Settings2, X } from "lucide-react";
 
-import { CLOUDX_LOG_SOURCES } from "@cloudx/shared";
+import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_OPTION_SOURCE, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, CLAUDE_SETTINGS_PLUGIN_ID, CLOUDX_LOG_SOURCES, agentProviderLabel, type AgentAccount, type AgentAccountsState } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -9,6 +9,9 @@ import { CodexSettingsEditor } from "./CodexSettingsEditor.js";
 import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";
 import { ForgeConnections } from "./ForgeConnections.js";
+import { AgentAccountsPanel, type AgentLoginTab } from "./AgentAccountsPanel.js";
+import { ClaudeSettingsPanel } from "./ClaudeSettingsPanel.js";
+import { AgentPricingPanel } from "./AgentPricingPanel.js";
 import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
@@ -40,6 +43,8 @@ export function SettingsDialog({
   onRequestBrowserNotifications,
   cloudxUpdate,
   onOpenForge,
+  onOpenAgentLogin,
+  availablePluginIds,
   callHook,
   initialCategoryId = "general",
   onCategoryChange,
@@ -55,6 +60,9 @@ export function SettingsDialog({
   onRequestBrowserNotifications?: () => Promise<void>;
   cloudxUpdate?: CloudxUpdateController;
   onOpenForge?: () => void;
+  onOpenAgentLogin?: (tab: AgentLoginTab) => Promise<void> | void;
+  // Settings-only plugins without config fields, such as Agents & accounts.
+  availablePluginIds?: string[];
   callHook?: UiContributionRenderContext["callHook"];
   initialCategoryId?: string;
   onCategoryChange?: (categoryId: string) => void;
@@ -68,6 +76,16 @@ export function SettingsDialog({
   useEffect(() => { onCategoryChange?.(activeCategoryId); }, [activeCategoryId, onCategoryChange]);
   const [horizontalTabs, setHorizontalTabs] = useState(false);
   const [codexSettingsEditor] = useState(() => new CodexSettingsEditor());
+  const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>();
+  const usesAgentAccounts = config.plugins.some(plugin => plugin.fields.some(field => field.optionSource === AGENT_ACCOUNTS_OPTION_SOURCE));
+  useEffect(() => {
+    if (!callHook || !usesAgentAccounts) return;
+    let disposed = false;
+    callHook<{ state: AgentAccountsState }>(AGENT_ACCOUNT_HOOKS.read, {})
+      .then(result => { if (!disposed) setAgentAccounts(result.state.accounts); })
+      .catch(() => { if (!disposed) setAgentAccounts([]); });
+    return () => { disposed = true; };
+  }, [callHook, usesAgentAccounts]);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -138,6 +156,7 @@ export function SettingsDialog({
       content: <ConfigField
         field={field}
         templates={rulesSkillsStore?.templates}
+        agentAccounts={agentAccounts}
         value={(pluginId ? values.plugins[pluginId]?.[field.key] : values.global[field.key]) ?? field.defaultValue}
         onChange={value => pluginId ? setPluginValue(pluginId, field.key, value) : setGlobalValue(field.key, value)}
         onClearSecret={pluginId && field.type === "secret" && field.secretConfigured && onClearPluginSecret ? () => onClearPluginSecret(pluginId, field.key) : undefined}
@@ -165,6 +184,33 @@ export function SettingsDialog({
       id: "global-defaults",
       searchText: "Update Codex CLI active installed requested exact version pin upgrade downgrade previous verified latest stable published release Default model Fast mode service tier priority standard flex shared settings reload YOLO mode sandbox approval permissions automatically trust workspace default Codex skills imagegen reasoning effort web search personality",
       content: <CodexSettingsPanel editor={codexSettingsEditor} callHook={callHook} />,
+      mountWhenVisible: true
+    }]
+  });
+  if (callHook && availablePluginIds?.includes(AGENT_ACCOUNTS_PLUGIN_ID)) categories.push({
+    id: "agents",
+    label: "Agents & accounts",
+    description: "Codex and Claude accounts used by tabs, Forge workers and one-shot requests.",
+    entries: [{
+      id: "accounts",
+      searchText: "Agents accounts login sign in credentials Codex Claude subscription API key default provider switch",
+      content: <AgentAccountsPanel callHook={callHook} onOpenLogin={onOpenAgentLogin} />,
+      mountWhenVisible: true
+    }, ...(availablePluginIds?.includes(AGENT_USAGE_PLUGIN_ID) ? [{
+      id: "pricing",
+      searchText: "Model pricing cost usage tokens price per million input cached output override",
+      content: <AgentPricingPanel callHook={callHook} />,
+      mountWhenVisible: true
+    }] : [])]
+  });
+  if (callHook && availablePluginIds?.includes(CLAUDE_SETTINGS_PLUGIN_ID)) categories.push({
+    id: "claude",
+    label: "Claude",
+    description: "Claude Code defaults and how CloudX launches Claude tabs.",
+    entries: [{
+      id: "global-defaults",
+      searchText: "Claude Code CLI update version update channel latest stable Default model opus sonnet haiku effort extended thinking fast mode output style language permission mode bypass YOLO accept edits plan automatically trust workspace warning",
+      content: <ClaudeSettingsPanel callHook={callHook} />,
       mountWhenVisible: true
     }]
   });
@@ -381,7 +427,7 @@ function browserNotificationMessage(state: BrowserNotificationPermissionState): 
   return "Allow Cloudx to mirror in-app notifications through the browser notification system.";
 }
 
-function ConfigField({ field, value, onChange, onClearSecret, templates }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"] }) {
+function ConfigField({ field, value, onChange, onClearSecret, templates, agentAccounts }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"]; agentAccounts?: AgentAccount[] }) {
   const [clearing, setClearing] = useState(false);
 
   async function clearSecret() {
@@ -408,6 +454,20 @@ function ConfigField({ field, value, onChange, onClearSecret, templates }: { fie
         </select>
         {field.description ? <small>{field.description}</small> : null}
         {!templates?.length ? <small>Create a template in Rules / Skills first.</small> : null}
+      </label>
+    );
+  }
+
+  if (field.type === "string" && field.optionSource === AGENT_ACCOUNTS_OPTION_SOURCE) {
+    return (
+      <label>
+        {field.label}
+        <select aria-label={field.label} value={String(value)} onChange={event => onChange(event.target.value)}>
+          <option value="">Default account of the model's provider</option>
+          {value && agentAccounts && !agentAccounts.some(account => account.id === value) ? <option value={String(value)}>Saved account is unavailable</option> : null}
+          {agentAccounts?.map(account => <option key={account.id} value={account.id}>{agentProviderLabel(account.providerId)} · {account.label}</option>)}
+        </select>
+        {field.description ? <small>{field.description}</small> : null}
       </label>
     );
   }

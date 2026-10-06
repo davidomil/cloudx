@@ -4,11 +4,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { PluginSessionNotStartedError, type PreparedCodexLaunch } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError, type PreparedAgentLaunch } from "@cloudx/plugin-api";
 
 import {
+  AGENT_TERMINAL_PLUGIN_ID,
   RULES_SKILLS_PLUGIN_ID,
+  isAgentTab,
   isForgeTurnCompletion,
+  isRecord,
   type CodexReasoningEffort,
   type ForgeRepository,
   type ForgeReviewRevision,
@@ -28,6 +31,8 @@ import {
 } from "@cloudx/shared";
 
 import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
+import { isClaudeModel } from "../agents/claude/ClaudeLaunch.js";
+import { claudeOverlayPath } from "../agents/claude/ClaudeHomeOverlay.js";
 import { CodexStateSources, type ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 import { assertDirectoryIdentity, readDirectoryIdentity, isDurableDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, openOwnedDirectoryNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, stringifyJsonDocument, type OwnedDirectory } from "../jsonStateFile.js";
@@ -38,7 +43,7 @@ import type { WorkspaceCommandService } from "../workspace/WorkspaceCommandServi
 import type { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { forgeLog, type ForgeLogger } from "./ForgeLog.js";
 import { validateRepository } from "./providers/ForgeCredentials.js";
-import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
+import { ForgeReviewConversation, forgeConversationContext, isReviewConversationBinding, retireReviewSessionView, type ReviewConversationBinding } from "./ForgeReviewConversation.js";
 import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecution } from "./ForgeExecution.js";
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { cleanupIgnoredForgePath } from "./ForgeGeneratedCleanup.js";
@@ -170,6 +175,8 @@ interface OwnedWorkspace extends ForgeWorkspace {
   reviewConversation?: ReviewConversationBinding;
   batchConversation?: ReviewConversationBinding;
   batchConversationRequired?: true;
+  // Preserved review or batch conversation when the worker runs on Claude.
+  claudeConversation?: ClaudeConversationBinding;
   publicationAttemptId?: string;
   publicationHandoffs?: Record<string, OwnedPublicationHandoff>;
   retainedWorkspace?: ForgeRetainedWorkspace;
@@ -592,6 +599,7 @@ export class ForgeRuntime {
       templateId: string;
       model: string;
       reasoningEffort: CodexReasoningEffort;
+      accountId?: string;
       preserveConversation?: true;
       prompt: string;
       windowId: string;
@@ -604,9 +612,15 @@ export class ForgeRuntime {
     const owned = await this.readOwned(input.id);
     if (input.preserveConversation && owned.role !== "worker")
       throw new Error("Only a coding worker can preserve a batch conversation.");
-    if (owned.batchConversation && !input.preserveConversation)
+    if ((owned.batchConversation || owned.claudeConversation?.key === "batchConversation") && !input.preserveConversation)
       throw new Error("Resume this batch with its preserved conversation.");
     const conversationKey = owned.role === "reviewer" ? "reviewConversation" : input.preserveConversation ? "batchConversation" : undefined;
+    const providerId = isClaudeModel(input.model) ? "claude" : "codex";
+    if (conversationKey && providerId === "claude" && owned[conversationKey])
+      throw new Error("This worker's preserved conversation runs on Codex. Choose a Codex model in Forge settings to resume it.");
+    if (conversationKey && providerId === "codex" && owned.claudeConversation)
+      throw new Error("This worker's preserved conversation runs on Claude. Choose a Claude model in Forge settings to resume it.");
+    const newClaudeConversation = providerId === "claude" && conversationKey !== undefined && !owned.claudeConversation;
     if (
       owned.cleaned ||
       !owned.prepared ||
@@ -648,7 +662,7 @@ export class ForgeRuntime {
     owned.launchBootId = (await executionEnvironment()).bootId;
     await this.manifest(owned.id).write(owned);
     let preparingTabId: string | undefined;
-    const prepareCodexSession = conversationKey ? async (launch: PreparedCodexLaunch) => {
+    const claimConversationTab = async (launch: PreparedAgentLaunch) => {
       preparingTabId = launch.tabId;
       try {
         if (launch.cwd !== owned.worktreePath) throw new Error("Worker conversation checkout ownership does not match.");
@@ -660,6 +674,21 @@ export class ForgeRuntime {
         await this.captureTab(tab, ownership);
         await this.authorizeProjectTrust(owned);
       } catch (error) { throw new PluginSessionNotStartedError(error); }
+    };
+    // Claude keeps its conversation in its own session store. CloudX fixes the
+    // session id on the first launch and resumes that id afterwards.
+    const prepareClaudeSession = async (launch: PreparedAgentLaunch) => {
+      await claimConversationTab(launch);
+      if (!owned.claudeConversation) {
+        owned.claudeConversation = { key: conversationKey!, sessionId: randomUUID() };
+        await this.manifest(owned.id).write(owned);
+      }
+      if (owned.claudeConversation.key !== conversationKey)
+        throw new PluginSessionNotStartedError(new Error("The preserved Claude conversation belongs to a different worker role."));
+      return owned.claudeConversation.sessionId;
+    };
+    const prepareAgentSession = conversationKey && providerId === "claude" ? prepareClaudeSession : conversationKey ? async (launch: PreparedAgentLaunch) => {
+      await claimConversationTab(launch);
       return this.reviewConversations.prepare(launch, {
         purpose: conversationKey === "batchConversation" ? "batch" : "review",
         binding: owned[conversationKey],
@@ -673,12 +702,17 @@ export class ForgeRuntime {
       }, signal);
     } : undefined;
     const { tab } = await this.dependencies.workspaceCommands.createTab({
-      pluginId: "codex-terminal",
+      pluginId: AGENT_TERMINAL_PLUGIN_ID,
       cwd: owned.worktreePath,
       title: `Forge ${input.id}`,
       windowId: input.windowId,
       paneId: input.paneId,
-      initialInput: { prompt: input.prompt, model: input.model, reasoningEffort: input.reasoningEffort },
+      initialInput: {
+        prompt: newClaudeConversation ? `${forgeConversationContext(conversationKey === "batchConversation" ? "batch" : "review", owned.worktreePath)}\n\n${input.prompt}` : input.prompt,
+        model: input.model,
+        reasoningEffort: input.reasoningEffort,
+        agent: { providerId, ...(input.accountId ? { accountId: input.accountId } : {}) },
+      },
       pluginMetadata: {
         [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: input.templateId },
         "forge-workers": { workerId: input.id },
@@ -686,7 +720,7 @@ export class ForgeRuntime {
     }, {
       ownerPluginId: "forge",
       authorizeProjectTrust,
-      codexTurn: { workerId: input.id, attemptId: input.attemptId, receiptPath: receipt.filePath },
+      agentTurn: { workerId: input.id, attemptId: input.attemptId, receiptPath: receipt.filePath },
       prepareTerminalExecution: async tabId => {
         preparingTabId = tabId;
         const tab = this.dependencies.sessions.getTab(tabId);
@@ -699,7 +733,7 @@ export class ForgeRuntime {
         await this.captureTab(tab, ownership);
         return ownership.execution;
       },
-      ...(prepareCodexSession ? { prepareCodexSession } : {}),
+      ...(prepareAgentSession ? { prepareAgentSession } : {}),
     }).catch(async error => {
       if (error instanceof PluginSessionNotStartedError) {
         if (preparingTabId && this.ownedTabs.has(preparingTabId)) {
@@ -721,8 +755,8 @@ export class ForgeRuntime {
     this.ownedTabs.set(tab.id, ownedTab);
     try {
       await this.captureTab(tab, ownedTab);
-      if (conversationKey && (preparingTabId !== tab.id || !owned[conversationKey]?.threadId))
-        throw new Error("The worker launch did not bind its exact Codex conversation.");
+      if (conversationKey && (preparingTabId !== tab.id || !(providerId === "claude" ? owned.claudeConversation?.sessionId : owned[conversationKey]?.threadId)))
+        throw new Error("The worker launch did not bind its exact agent conversation.");
       owned.launchPending = false;
       await this.manifest(owned.id).write(owned);
       signal?.throwIfAborted();
@@ -834,6 +868,7 @@ export class ForgeRuntime {
         const worker = await this.readOwned(owned.workerId);
         await this.removeLaunch(owned.launch, tabId, worker.reviewConversation ?? worker.batchConversation);
       }
+      await this.removeClaudeLaunch(tabId);
       if (owned.execution) await this.executions.remove(owned.execution);
       owned.closed = true;
       await this.tabManifest(tabId).write(owned);
@@ -1056,7 +1091,7 @@ export class ForgeRuntime {
       }
       for (const tab of this.dependencies.sessions.listTabs()) {
         if (
-          tab.pluginId !== "codex-terminal" ||
+          !isAgentTab(tab) ||
           tab.ownerPluginId !== "forge" ||
           tab.pluginMetadata?.["forge-workers"]?.workerId !== id
         )
@@ -2251,7 +2286,7 @@ export class ForgeRuntime {
       this.ownedTabs.get(tabId) ??
       (await this.tabManifest(tabId).read<OwnedTab>());
     if (
-      tab.pluginId !== "codex-terminal" ||
+      !isAgentTab(tab) ||
       tab.ownerPluginId !== "forge" ||
       !owned ||
       owned.closed ||
@@ -2344,6 +2379,7 @@ export class ForgeRuntime {
       ((value.batchConversation !== undefined) !== (value.batchConversationRequired === true)) ||
       (value.batchConversation !== undefined &&
         (value.role !== "worker" || !isReviewConversationBinding(value.batchConversation))) ||
+      (value.claudeConversation !== undefined && !isClaudeConversationBinding(value.claudeConversation, value.role)) ||
       !isPublicationOwnership(value) ||
       (value.checkoutEvidence !== undefined && !isCheckoutEvidenceReceipt(value.checkoutEvidence)) ||
       (value.checkoutEvidenceRemovalStarted !== undefined && (value.checkoutEvidenceRemovalStarted !== true ||
@@ -2642,6 +2678,14 @@ export class ForgeRuntime {
       if (error.code === "ENOENT") return undefined;
       throw error;
     });
+  }
+
+  // Claude overlays hold links and generated settings only. Conversations stay
+  // in the user's Claude session store, so the overlay is always disposable.
+  private async removeClaudeLaunch(tabId: string): Promise<void> {
+    const launchPath = claudeOverlayPath(path.resolve(this.dependencies.dataDir), safeId(tabId));
+    if (!await requireSafeDirectory(this.dependencies.dataDir, path.dirname(launchPath), { create: false, label: "Claude launch directory" })) return;
+    await fs.rm(launchPath, { recursive: true, force: true });
   }
 
   private async removeLaunch(
@@ -2998,4 +3042,16 @@ async function git(
     clearTimeout(timer);
     signal?.removeEventListener("abort", abort);
   }
+}
+
+export interface ClaudeConversationBinding {
+  key: "reviewConversation" | "batchConversation";
+  sessionId: string;
+}
+
+function isClaudeConversationBinding(value: unknown, role: unknown): value is ClaudeConversationBinding {
+  return isRecord(value) &&
+    (value.key === "reviewConversation" && role === "reviewer" || value.key === "batchConversation" && role === "worker") &&
+    typeof value.sessionId === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(value.sessionId) &&
+    Object.keys(value).length === 2;
 }

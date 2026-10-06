@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
 import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
-import type { DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
+import type { AgentUsageSummary, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
@@ -9,6 +9,7 @@ import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
 import { ForgeWorkerTerminalOverlay } from "./ForgeWorkerTerminalOverlay.js";
 import { ForgeResourcesPanel } from "./ForgeResourcesPanel.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
+import { formatUsd, useAgentUsage, usageLine } from "./AgentUsage.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 type Request = <T>(hook: string, input?: Record<string, unknown>) => Promise<T>;
@@ -17,18 +18,23 @@ type View = "issues" | "changes" | "workers" | "evidence";
 type ReviewEdit = Pick<ForgeReviewDraft, "body" | "event" | "comments">;
 const queuePhaseLabels = { queued: "Queued", updating: "Updating branch", resolving: "Resolving conflicts", reviewing: "Reviewing changes", waiting_ci: "Waiting for CI", merging: "Merging", blocked: "Blocked" };
 const WorkerActions = createContext<{ globalBusy: boolean; pending: Set<string> }>({ globalBusy: false, pending: new Set() });
+const USAGE_REFRESH_MS = 15_000;
+// Usage per worker id, read for the workers on screen while the panel is active.
+const WorkerUsage = createContext<Record<string, AgentUsageSummary>>({});
 const WorkerContinuations = createContext<{
   messages: Record<string, string>;
   setMessage: (workerId: string, message?: string) => void;
 } | null>(null);
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending }: {
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, showUsage = false }: {
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
   paneId: string;
   onOpenSettings?: () => void;
   workerTabs: WorkspaceTab[];
+  // Reads token usage and cost per worker; requires the agent usage plugin.
+  showUsage?: boolean;
   active: boolean;
   uiScale: number;
   repositorySettingsKey: string;
@@ -135,11 +141,12 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const placement = { windowId, paneId };
   const repository = repositoryReady ? dashboard?.repository : undefined;
   const workers = dashboard?.workers ?? [];
+  const usage = useAgentUsage(callHook, showUsage && active && workers.length ? { forgeWorkerIds: workers.map(worker => worker.id) } : undefined, USAGE_REFRESH_MS);
   const terminalWorker = workers.find(worker => worker.id === terminalWorkerId);
   const changeLabel = repository?.provider === "gitlab" ? "Merge requests" : "Pull requests";
   const awaitingReview = workers.filter((worker) => worker.status === "awaiting_review" && !worker.autoReview?.enabled).length;
 
-  return <WorkerActions.Provider value={{ globalBusy: busy, pending: pendingWorkers }}><WorkerContinuations.Provider value={{ messages: continuationMessages, setMessage: setContinuationMessage }}><section className="forge-panel" aria-label="Forge">
+  return <WorkerUsage.Provider value={usage?.forgeWorkers ?? {}}><WorkerActions.Provider value={{ globalBusy: busy, pending: pendingWorkers }}><WorkerContinuations.Provider value={{ messages: continuationMessages, setMessage: setContinuationMessage }}><section className="forge-panel" aria-label="Forge">
     <header className="forge-header">
       <div><h2><GitPullRequest size={18} /> Forge</h2><p>{repository ? `${repository.provider === "github" ? "GitHub" : "GitLab"} · ${repository.projectPath}` : "Issue workers and reviews"}</p></div>
       <div className="forge-actions">
@@ -168,7 +175,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </ForgeWorkerTabs> : (view === "issues" || view === "changes") && dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
-  </section></WorkerContinuations.Provider></WorkerActions.Provider>;
+  </section></WorkerContinuations.Provider></WorkerActions.Provider></WorkerUsage.Provider>;
 }
 
 function ForgeItems({ kind, repository, request, revision, workers, placement, runAction, busy, onViewWorker, onBatchSaved }: {
@@ -369,6 +376,17 @@ function reviewStartedAt({ worker, archivedDraft }: ReviewRound): string {
   return archivedDraft?.startedAt ?? worker.draft?.startedAt ?? worker.startedAt;
 }
 
+function WorkerUsageLine({ workerId }: { workerId: string }) {
+  const summary = useContext(WorkerUsage)[workerId];
+  return summary?.totals.requests ? <p className="forge-muted forge-usage">Usage: {usageLine(summary)}</p> : null;
+}
+
+function WorkerUsageChip({ workerId }: { workerId: string }) {
+  const summary = useContext(WorkerUsage)[workerId];
+  if (!summary?.totals.requests) return null;
+  return <span className="forge-muted forge-usage" title={usageLine(summary)}>{summary.costBasis ? formatUsd(summary.costUsd) : "No price"}</span>;
+}
+
 function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
   const currentWorkers = workers.filter(worker => worker.status !== "completed" || worker.retainedWorkspace || (worker.kind === "review" && worker.draft?.status === "post_failed"));
   if (!currentWorkers.length) return null;
@@ -378,6 +396,7 @@ function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
       return <span key={worker.id} className="forge-item-worker">
         <span className={`forge-status forge-status-${postFailed ? "failed" : worker.status}`}>{worker.batch ? "Batch" : worker.kind === "issue" ? "Coding" : "Review"} · {postFailed ? "post failed" : worker.status.replaceAll("_", " ")}</span>
         {worker.activity ? <span className="forge-muted">{activityText(worker.activity)}</span> : null}
+        <WorkerUsageChip workerId={worker.id} />
         {worker.retainedWorkspace ? <span className="forge-muted">Retained working files</span> : null}
         {worker.autoReview?.enabled ? <span className="forge-muted">Auto review · {worker.autoReview.phase}</span> : null}
         {worker.ciRepair ? <span className="forge-muted">CI repair · {worker.ciRepair.phase} · {worker.ciRepair.attempts}/{MAX_FORGE_CI_REPAIR_ATTEMPTS} attempts</span> : null}
@@ -579,6 +598,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
   const card = <article className="forge-worker" aria-label={worker.batch ? `Batch worker ${worker.title}` : `${worker.kind} worker #${worker.number}`}>
     <div className="forge-worker-heading"><strong>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
     <p className="forge-muted">{worker.repository.projectPath}{worker.branch ? ` · ${worker.branch}` : ""}</p>
+    <WorkerUsageLine workerId={worker.id} />
     <BatchIssues worker={worker} />
     {!archivedDraft && worker.activity ? <p role="status" className="forge-notice">{activityText(worker.activity)}</p> : null}
     {!archivedDraft && !worker.activity && busy ? <p role="status" className="forge-muted">Worker action pending. Waiting for Forge to report its phase.</p> : null}

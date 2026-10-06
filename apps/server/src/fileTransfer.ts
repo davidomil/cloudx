@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { createGzip } from "node:zlib";
 
-import type { WorkspaceTab } from "@cloudx/shared";
+import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, type WorkspaceTab } from "@cloudx/shared";
 
 import { isSameOrChildPath } from "./pathBoundary.js";
 import type { PathPolicy } from "./pathPolicy.js";
@@ -63,7 +63,6 @@ interface TarEntry {
 const TAR_BLOCK_SIZE = 512;
 const TAR_END_BLOCKS = 2;
 const FILE_BROWSER_PLUGIN_ID = "file-browser";
-const CODEX_TERMINAL_PLUGIN_ID = "codex-terminal";
 const SYMLINK_DOWNLOAD_ERROR = "Symbolic links are not supported for file downloads.";
 
 export class FileTransferService {
@@ -286,8 +285,8 @@ export class FileTransferService {
   }
 
   private requireUploadTab(tab: WorkspaceTab): void {
-    if (tab.pluginId !== FILE_BROWSER_PLUGIN_ID && tab.pluginId !== CODEX_TERMINAL_PLUGIN_ID) {
-      throw new Error(`File uploads are only available for ${FILE_BROWSER_PLUGIN_ID} and ${CODEX_TERMINAL_PLUGIN_ID} tabs.`);
+    if (tab.pluginId !== FILE_BROWSER_PLUGIN_ID && !isAgentTab(tab)) {
+      throw new Error(`File uploads are only available for ${FILE_BROWSER_PLUGIN_ID} and ${AGENT_TERMINAL_PLUGIN_ID} tabs.`);
     }
   }
 }

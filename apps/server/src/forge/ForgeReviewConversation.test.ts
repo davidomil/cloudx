@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { PluginSessionNotStartedError, type PreparedCodexLaunch } from "@cloudx/plugin-api";
+import { PluginSessionNotStartedError, type PreparedAgentLaunch } from "@cloudx/plugin-api";
 
 import { CodexStateSources } from "../plugins/CodexStateSources.js";
 import { AppServerOwnershipError } from "../appServer/OwnedAppServerTransport.js";
@@ -13,7 +13,7 @@ vi.mock("../filesystemIdentity.js", () => ({ filesystemIdentity: async () => ({ 
 const threadId = "01a08470-d118-7b72-b1df-439e72e5c744";
 let root: string;
 let dataDir: string;
-let launch: PreparedCodexLaunch;
+let launch: PreparedAgentLaunch;
 let thread: Record<string, unknown>;
 let binding: ReviewConversationBinding | undefined;
 

@@ -141,7 +141,7 @@ else if (process.argv[2] === 'i') {
       const tab: WorkspaceTab = { id, pluginId: "codex-terminal", ...(worker ? { ownerPluginId: "forge" } : {}), title: id, cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "Running", updatedAt: "" } };
       const binding = { workerId: id, attemptId: `${id}-attempt`, receiptPath: path.join(root, `${id}-turn.json`) };
       const session = await plugin.createSession({ tab, cwd: root,
-        ...(worker ? { codexTurn: binding, initialInput: { prompt: "Keep the original Forge turn pending until the selection is rejected." } } : {}),
+        ...(worker ? { agentTurn: binding, initialInput: { prompt: "Keep the original Forge turn pending until the selection is rejected." } } : {}),
         controls: { closeTab: () => undefined, setTabIndicator: () => undefined },
       });
       sessions.push(session);

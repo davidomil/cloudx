@@ -15,7 +15,7 @@ import { AutomationRepository, type AutomationGroupSave } from "./AutomationRepo
 interface AutomationServiceOptions {
   logger?: Pick<ServiceLogger, "warn">;
   startDisabled?: boolean;
-  executorOptions?: Pick<AutomationExecutorOptions, "allowedRoots">;
+  executorOptions?: Pick<AutomationExecutorOptions, "allowedRoots" | "agentAccounts">;
   layoutEffects?: {
     applyLayoutInstruction(instruction: WorkspaceLayoutInstruction): Promise<void> | void;
   };

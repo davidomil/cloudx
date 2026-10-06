@@ -58,7 +58,8 @@ export class CodexExecVoicePlanner implements VoicePlanner {
   constructor(
     private readonly modelProvider: ModelProvider,
     private readonly logger?: StructuredVoiceLogger,
-    private readonly logOptions: VoiceDebugLogOptions = {}
+    private readonly logOptions: VoiceDebugLogOptions = {},
+    private readonly exec: (model: string, prompt: string, options?: CodexExecRunOptions) => Promise<string> = runCodexExec
   ) {}
 
   async plan(input: VoicePlannerInput): Promise<VoiceActionPlan> {
@@ -79,7 +80,7 @@ export class CodexExecVoicePlanner implements VoicePlanner {
     );
 
     try {
-      const output = await runCodexExec(model, prompt, {
+      const output = await this.exec(model, prompt, {
         schemaPath: resolveVoiceSchemaPath(),
         outputPrefix: "cloudx-voice-plan-",
         taskLabel: "voice planner",

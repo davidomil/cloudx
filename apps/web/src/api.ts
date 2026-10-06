@@ -680,6 +680,13 @@ export async function recoverTab(tabId: string, input: RecoverTabRequest): Promi
   });
 }
 
+export async function switchAgent(tabId: string, input: { providerId: string; accountId: string; model?: string }): Promise<WorkspaceTab> {
+  return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/switch-agent`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
 export async function tabOwnershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
   return fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/ownership`);
 }

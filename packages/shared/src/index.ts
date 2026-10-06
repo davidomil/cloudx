@@ -12,6 +12,10 @@ export * from "./codexUpdate.js";
 export * from "./cloudxUpdate.js";
 export * from "./cloudxUpdateBackups.js";
 export * from "./directoryOwnership.js";
+export * from "./agents.js";
+import type { AGENT_ACCOUNTS_OPTION_SOURCE } from "./agents.js";
+export * from "./claudeSettings.js";
+export * from "./agentUsage.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-5.6-luna";
 
@@ -621,7 +625,7 @@ export interface ConfigFieldDescriptor {
   visibility?: "user" | "internal";
   defaultValue: ConfigValue;
   secretConfigured?: boolean;
-  optionSource?: "rulesSkills.templates";
+  optionSource?: "rulesSkills.templates" | typeof AGENT_ACCOUNTS_OPTION_SOURCE;
   options?: ConfigFieldOption[];
   min?: number;
   max?: number;
