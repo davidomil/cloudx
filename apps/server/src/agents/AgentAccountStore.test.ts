@@ -47,15 +47,30 @@ describe("AgentAccountStore", () => {
   it("imports existing provider logins once as default accounts", async () => {
     const { env, dataDir, store } = await setup();
     await fs.mkdir(path.join(env.HOME!, ".codex"));
-    await fs.writeFile(path.join(env.HOME!, ".codex", "auth.json"), "{}");
+    await fs.writeFile(path.join(env.HOME!, ".codex", "auth.json"), JSON.stringify({ auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: {} }));
 
     const accounts = await store.list();
-    expect(accounts).toEqual([expect.objectContaining({ id: "codex-home", providerId: "codex", imported: true, isDefault: true })]);
+    expect(accounts).toEqual([expect.objectContaining({ id: "codex-home", providerId: "codex", kind: "subscription", imported: true, isDefault: true })]);
     expect(store.home(accounts[0]!)).toBe(path.join(env.HOME!, ".codex"));
 
     await store.delete("codex-home");
     expect(await new AgentAccountStore(dataDir, env).list()).toEqual([]);
     await expect(fs.stat(path.join(env.HOME!, ".codex", "auth.json"))).resolves.toBeTruthy();
+  });
+
+  it.each([
+    ["codex", ".codex/auth.json", { auth_mode: "apikey", OPENAI_API_KEY: "sk-test", tokens: null }, "api-key"],
+    ["codex", ".codex/auth.json", { OPENAI_API_KEY: "sk-test" }, "api-key"],
+    ["codex", ".codex/auth.json", { auth_mode: "chatgptAuthTokens", tokens: {} }, "subscription"],
+    ["codex", ".codex/auth.json", {}, undefined],
+    ["claude", ".claude/.credentials.json", { claudeAiOauth: { accessToken: "token" } }, "subscription"],
+    ["claude", ".claude/.credentials.json", {}, undefined]
+  ])("imports an existing %s login by its authentication method: %s %j", async (providerId, file, content, kind) => {
+    const { env, store } = await setup();
+    await fs.mkdir(path.dirname(path.join(env.HOME!, file)), { recursive: true });
+    await fs.writeFile(path.join(env.HOME!, file), JSON.stringify(content));
+    const imported = (await store.list()).filter(account => account.providerId === providerId);
+    expect(imported.map(account => account.kind)).toEqual(kind ? [kind] : []);
   });
 
   it("creates private account homes and keeps one default per provider", async () => {

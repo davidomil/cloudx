@@ -74,7 +74,8 @@ export class AgentPricing {
     return record => {
       const key = priceKey(record.model);
       const override = overrides[key];
-      const longContext = !override && record.input + record.cachedInput > LONG_CONTEXT_INPUT_TOKENS ? LONG_CONTEXT_PRICES[key] : undefined;
+      const totalInput = record.input + record.cachedInput + record.cacheWrite + record.cacheWrite1h;
+      const longContext = !override && totalInput > LONG_CONTEXT_INPUT_TOKENS ? LONG_CONTEXT_PRICES[key] : undefined;
       const price = override ?? longContext ?? BUILT_IN_PRICES[key];
       if (!price) return undefined;
       const speed = record.fast ? FAST_MODE_MULTIPLIER[key] ?? 1 : 1;

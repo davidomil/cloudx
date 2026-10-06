@@ -5,11 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { buildClaudeLaunchArgs, findClaudeTranscript } from "./ClaudeLaunch.js";
 import { claudeLaunchEnv } from "../agentCli.js";
-import { agentTurnReceiptPath } from "../agentTurn.js";
+import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { CodexConversationRecovery } from "../../plugins/CodexConversationRecovery.js";
 
@@ -55,6 +55,24 @@ describe("claudeLaunchEnv", () => {
 });
 
 describe("Claude overlay and hook receipts", () => {
+  it("overrides credential variables the shared settings env sets with the selected account's", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-shared-env-"));
+    const providerHome = path.join(root, "home", ".claude");
+    const accountHome = path.join(root, "account");
+    await Promise.all([providerHome, accountHome].map(directory => fs.mkdir(directory, { recursive: true })));
+    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { ANTHROPIC_API_KEY: "shared", ANTHROPIC_BASE_URL: "https://proxy.invalid", DISABLE_TELEMETRY: "1" } }));
+    const options = { dataDir: path.join(root, "data"), tabId: "tab-1", accountHome, providerHome, executionId: EXECUTION, cwd: root };
+
+    const subscription = await materializeClaudeHomeOverlay(options);
+    expect(JSON.parse(await fs.readFile(subscription.settingsPath, "utf8")).env).toEqual({ ANTHROPIC_API_KEY: "", ANTHROPIC_BASE_URL: "" });
+    const apiKey = await materializeClaudeHomeOverlay({ ...options, accountEnv: { ANTHROPIC_API_KEY: "selected" } });
+    expect(JSON.parse(await fs.readFile(apiKey.settingsPath, "utf8")).env).toEqual({ ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "" });
+    expect((await fs.stat(apiKey.settingsPath)).mode & 0o777).toBe(0o600);
+
+    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { DISABLE_TELEMETRY: "1" } }));
+    expect(JSON.parse(await fs.readFile((await materializeClaudeHomeOverlay(options)).settingsPath, "utf8")).env).toBeUndefined();
+  });
+
   it("links account credentials and the shared session store, and records hook receipts", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-overlay-"));
     const dataDir = path.join(root, "data");
@@ -98,7 +116,10 @@ describe("Claude overlay and hook receipts", () => {
     await run("sh", ["-c", `printf '%s' '${payload}' | ${process.execPath} ${HELPER} ${overlay.configDir} tab-1 ${EXECUTION} UserPromptSubmit`]);
     expect(JSON.parse(await fs.readFile(agentTurnReceiptPath(overlay.configDir), "utf8"))).toMatchObject({ sessionId: SESSION, turnId: "p1", status: "running" });
     await run("sh", ["-c", `printf '%s' '${payload}' | ${process.execPath} ${HELPER} ${overlay.configDir} tab-1 ${EXECUTION} Stop`]);
-    expect(JSON.parse(await fs.readFile(agentTurnReceiptPath(overlay.configDir), "utf8"))).toMatchObject({ status: "completed" });
+    // The turn completes once the transcript shows the Stop hooks finished.
+    expect(JSON.parse(await fs.readFile(agentTurnReceiptPath(overlay.configDir), "utf8"))).toMatchObject({ status: "running" });
+    await fs.appendFile(transcript, `${JSON.stringify({ type: "system", subtype: "stop_hook_summary", hookCount: 1 })}\n`);
+    await vi.waitFor(async () => expect(JSON.parse(await fs.readFile(agentTurnReceiptPath(overlay.configDir), "utf8"))).toMatchObject({ status: "completed" }), { timeout: 5_000 });
 
     // Malformed payloads never fail the hook.
     await expect(run("sh", ["-c", `printf 'not json' | ${process.execPath} ${HELPER} ${overlay.configDir} tab-1 ${EXECUTION} Stop`])).resolves.toBeTruthy();
@@ -132,6 +153,31 @@ describe("Claude Forge turn receipts", () => {
     expect(JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))).toMatchObject({ turnId: "p1", status: "completed", text: "Done. Report written." });
   });
 
+  it("completes after a Stop hook continues the turn, with the later final response", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
+    const receiptPath = path.join(root, "attempt-1.json");
+    const transcript = path.join(root, "t.jsonl");
+    await fs.writeFile(transcript, "");
+    await fs.writeFile(path.join(root, ".cloudx-forge-turn.json"), JSON.stringify({ workerId: "issue-1", attemptId: "attempt-1", receiptPath, expectedThreadId: SESSION }));
+    const base = { session_id: SESSION, cwd: root, transcript_path: transcript, prompt_id: "p1" };
+    const append = (record: unknown) => fs.appendFile(transcript, `${JSON.stringify(record)}\n`);
+    const receipt = async () => JSON.parse(await fs.readFile(receiptPath, "utf8"));
+
+    await hook(root, "UserPromptSubmit", base);
+    await hook(root, "Stop", { ...base, last_assistant_message: "I will run the tests next." });
+    // Another Stop hook blocks: Claude records its feedback and continues.
+    await append({ type: "user", message: { role: "user", content: "Stop hook feedback:\n[check] Run the tests first." } });
+    await append({ type: "system", subtype: "stop_hook_summary", hookCount: 2 });
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(await receipt()).toMatchObject({ status: "running" });
+
+    await append({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Tests pass." }] } });
+    await hook(root, "Stop", { ...base, last_assistant_message: "Tests pass. Done." });
+    await append({ type: "system", subtype: "stop_hook_summary", hookCount: 2 });
+    await vi.waitFor(async () => expect(await receipt()).toMatchObject({ status: "completed" }), { timeout: 5_000 });
+    expect(JSON.parse(await fs.readFile(`${receiptPath}.final.json`, "utf8"))).toMatchObject({ text: "Tests pass. Done." });
+  });
+
   it("ignores another conversation and records API failures", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
     const receiptPath = path.join(root, "attempt-1.json");
@@ -142,5 +188,27 @@ describe("Claude Forge turn receipts", () => {
     await hook(root, "UserPromptSubmit", { session_id: SESSION, cwd: root, prompt_id: "p1" });
     await hook(root, "StopFailure", { session_id: SESSION, cwd: root, prompt_id: "p1", error: "rate_limit" });
     expect(JSON.parse(await fs.readFile(receiptPath, "utf8"))).toMatchObject({ status: "failed", error: "rate_limit" });
+  });
+});
+
+describe("Claude turn state", () => {
+  it("treats a running turn the user interrupted as idle until the next prompt", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-interrupt-"));
+    const receipt = agentTurnReceiptPath(root);
+    const transcript = path.join(root, "t.jsonl");
+    const line = (record: unknown) => `${JSON.stringify(record)}\n`;
+    await fs.writeFile(receipt, JSON.stringify({ version: 1, sessionId: SESSION, turnId: "p1", status: "running" }));
+    await fs.writeFile(transcript, line({ type: "user", message: { role: "user", content: "Refactor the parser." } }) +
+      line({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } }) +
+      line({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] } }));
+    expect(readClaudeTurnState(receipt, transcript)).toBe("running");
+
+    // Esc writes the marker and no Stop hook runs.
+    await fs.appendFile(transcript, line({ type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user]" }] } }));
+    expect(readClaudeTurnState(receipt, transcript)).toBe("idle");
+
+    await fs.appendFile(transcript, line({ type: "user", message: { role: "user", content: "Try again, smaller." } }));
+    expect(readClaudeTurnState(receipt, transcript)).toBe("running");
+    expect(readClaudeTurnState(receipt, undefined)).toBe("running");
   });
 });

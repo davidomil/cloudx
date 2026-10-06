@@ -108,6 +108,35 @@ describe("SessionStore.switchAgent", () => {
     expect(plugin.sessions[0]!.terminated).toBe(false);
   });
 
+  it("refuses input and actions while the switch is prepared, then resumes them", async () => {
+    const { plugin, store, tab } = await setup();
+    plugin.sessions[0]!.readiness = "ready";
+    let release!: () => void;
+    const prepared = new Promise<void>(resolve => { release = resolve; });
+    const prepare = plugin.prepareAgentSwitch.bind(plugin);
+    plugin.prepareAgentSwitch = async (input, request) => { await prepared; return prepare(input, request); };
+
+    const switching = store.switchAgent(tab.id, REQUEST);
+    expect(store.acceptsInput(tab.id)).toBe(false);
+    await expect(store.executePluginAction(tab.id, "send", {})).rejects.toThrow("switching agents");
+    release();
+    await switching;
+    expect(store.acceptsInput(tab.id)).toBe(true);
+  });
+
+  it("keeps the run when a turn starts while the switch is prepared", async () => {
+    const { plugin, store, tab } = await setup();
+    const session = plugin.sessions[0]!;
+    session.readiness = "ready";
+    const prepare = plugin.prepareAgentSwitch.bind(plugin);
+    // A turn admitted before the freeze, for example from another client.
+    plugin.prepareAgentSwitch = async (input, request) => { session.turn = "running"; return prepare(input, request); };
+    await expect(store.switchAgent(tab.id, REQUEST)).rejects.toThrow("changed while the switch was prepared");
+    expect(session.terminated).toBe(false);
+    expect(plugin.sessions).toHaveLength(1);
+    expect(store.acceptsInput(tab.id)).toBe(true);
+  });
+
   it("trusts the provider's turn receipt over terminal quietness", async () => {
     const { plugin, store, tab } = await setup();
     plugin.sessions[0]!.readiness = "ready";

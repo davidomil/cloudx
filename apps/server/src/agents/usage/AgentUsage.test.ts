@@ -76,6 +76,21 @@ describe("transcript readers", () => {
     ]);
   });
 
+  it("separates Codex cache writes from ordinary input and prices each once", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-cache-write-"));
+    const day = path.join(home, "sessions", "2026", "10", "05");
+    await fs.mkdir(day, { recursive: true });
+    await fs.writeFile(path.join(day, `rollout-2026-10-05T10-00-00-${ROOT}.jsonl`), lines([
+      { timestamp: at(0), type: "session_meta", payload: { id: ROOT, source: "cli" } },
+      { timestamp: at(0), type: "turn_context", payload: { model: "gpt-6.1-sol" } },
+      codexUsage(ROOT, ROOT, "resp-write", 1, { input_tokens: 100_000, cached_input_tokens: 0, cache_write_input_tokens: 100_000, output_tokens: 0 })
+    ]));
+    const [record] = await new CodexUsageReader(() => home).records(ROOT, T0);
+    expect(record).toMatchObject({ input: 0, cachedInput: 0, cacheWrite: 100_000 });
+    const price = await new AgentPricing(home).pricer();
+    expect(price(record!)).toBeCloseTo(0.25, 10);
+  });
+
   it("reads appended Codex records without rereading the file", async () => {
     const home = await codexHome();
     const reader = new CodexUsageReader(() => home);

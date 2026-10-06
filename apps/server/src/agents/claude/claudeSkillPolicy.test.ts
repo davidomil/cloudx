@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { execFileSync } from "node:child_process";
+
 import { describe, expect, it } from "vitest";
 
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
@@ -25,8 +27,18 @@ async function fixture() {
   await skill(path.join(providerHome, "skills", "synced", "account-1", "pdf"));
   await fs.mkdir(path.join(providerHome, "skills", ".trash", "old"), { recursive: true });
   await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ enabledPlugins: { "review@market": true, "lint@market": false } }));
-  await fs.mkdir(path.join(repo, ".git"), { recursive: true });
+  await fs.mkdir(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: repo });
   await skill(path.join(repo, ".claude", "skills", "deploy"));
+  // Below the start directory: Claude loads it once it works in packages/other.
+  await skill(path.join(repo, "packages", "other", ".claude", "skills", "nested-deploy"));
+  await fs.mkdir(path.join(repo, ".claude", "commands", "frontend"), { recursive: true });
+  await fs.writeFile(path.join(repo, ".claude", "commands", "frontend", "component.md"), "Build a component.\n");
+  await fs.mkdir(path.join(providerHome, "commands"), { recursive: true });
+  await fs.writeFile(path.join(providerHome, "commands", "legacy.md"), "Old command.\n");
+  // Ignored directories are not scanned.
+  await fs.writeFile(path.join(repo, ".gitignore"), "node_modules/\n");
+  await skill(path.join(repo, "node_modules", "pkg", ".claude", "skills", "vendored"));
   // A frontmatter name does not rename a skill; Claude Code uses the directory.
   await skill(path.join(repo, ".claude", "skills", "cloudx-system-create-cloudx-skill"), "jira");
   await skill(path.join(cwd, ".claude", "skills", "local-tool"));
@@ -38,9 +50,10 @@ describe("Claude skill policy", () => {
   it("finds personal and synced skills by directory name", async () => {
     const { providerHome } = await fixture();
     expect(await discoverClaudeUserSkills(providerHome)).toEqual([
-      { name: "notes", origin: "personal" },
-      { name: "docx", origin: "synced" },
-      { name: "pdf", origin: "synced" }
+      { name: "notes", origin: "personal", source: "skills/notes" },
+      { name: "legacy", origin: "personal", source: "commands/legacy.md" },
+      { name: "docx", origin: "synced", source: "skills/synced/account-1/docx" },
+      { name: "pdf", origin: "synced", source: "skills/synced/account-1/pdf" }
     ]);
     expect(await discoverClaudeUserSkills(path.join(providerHome, "missing"))).toEqual([]);
   });
@@ -55,21 +68,37 @@ describe("Claude skill policy", () => {
         syncClaudeAiPlugins: false,
         syncClaudeAiSkills: false,
         // Project skills from the working directory up to the repository root.
-        skillOverrides: { ...BUILT_IN, deploy: "off", docx: "off", "local-tool": "off", notes: "off", pdf: "off" },
+        skillOverrides: {
+          ...BUILT_IN, deploy: "off", docx: "off", "frontend:component": "off", legacy: "off", "local-tool": "off",
+          "nested-deploy": "off", notes: "off", pdf: "off"
+        },
         enabledPlugins: { "format@market": false, "review@market": false }
       },
-      personalDirectories: [],
+      personalLinks: [],
       linkSynced: false
     });
   });
 
   it("keeps allowed personal and synced skills, and keeps sync on for an allowed synced skill", async () => {
     const { providerHome, cwd } = await fixture();
-    const policy = await claudeSkillPolicy({ providerHome, cwd, allowedSkills: ["notes", "docx"], cloudxSkillNames: [] });
-    expect(policy.personalDirectories).toEqual(["notes"]);
+    const policy = await claudeSkillPolicy({ providerHome, cwd, allowedSkills: ["notes", "legacy", "docx"], cloudxSkillNames: [] });
+    expect(policy.personalLinks).toEqual(["skills/notes", "commands/legacy.md"]);
     expect(policy.linkSynced).toBe(true);
     expect(policy.settings.syncClaudeAiSkills).toBeUndefined();
-    expect(policy.settings.skillOverrides).toEqual({ ...BUILT_IN, "cloudx-system-create-cloudx-skill": "off", deploy: "off", "local-tool": "off", pdf: "off" });
+    expect(policy.settings.skillOverrides).toEqual({
+      ...BUILT_IN, "cloudx-system-create-cloudx-skill": "off", deploy: "off", "frontend:component": "off", "local-tool": "off", "nested-deploy": "off", pdf: "off"
+    });
+  });
+
+  it("hides the main checkout's skills in a linked worktree that has none of its own", async () => {
+    const { root, providerHome, repo } = await fixture();
+    execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "base"], { cwd: repo });
+    const worktree = path.join(root, "worktree");
+    execFileSync("git", ["worktree", "add", "-q", "--detach", worktree], { cwd: repo });
+    const policy = await claudeSkillPolicy({ providerHome, cwd: worktree, allowedSkills: [], cloudxSkillNames: [] });
+    // Untracked in the main checkout, so only the inherited root skills apply.
+    expect(Object.keys(policy.settings.skillOverrides as object)).toEqual(expect.arrayContaining(["deploy"]));
+    expect(Object.keys(policy.settings.skillOverrides as object)).not.toContain("nested-deploy");
   });
 
   it("links only allowed skills into the tab and passes the policy with the CloudX hooks", async () => {
@@ -80,7 +109,8 @@ describe("Claude skill policy", () => {
     await fs.writeFile(path.join(accountHome, ".credentials.json"), "{}");
     const options = { dataDir, tabId: "tab-1", accountHome, providerHome, executionId: "11111111-1111-4111-8111-111111111111", cwd };
 
-    const overlay = await materializeClaudeHomeOverlay({ ...options, allowedSkills: ["notes"] });
+    const overlay = await materializeClaudeHomeOverlay({ ...options, allowedSkills: ["notes", "legacy"] });
+    expect(await fs.readlink(path.join(overlay.configDir, "commands", "legacy.md"))).toBe(path.join(providerHome, "commands", "legacy.md"));
     const entries = await fs.readdir(path.join(overlay.configDir, "skills"));
     expect(entries).toContain("notes");
     expect(entries).not.toContain("synced");
@@ -96,5 +126,6 @@ describe("Claude skill policy", () => {
     const relaunched = await fs.readdir(path.join(overlay.configDir, "skills"));
     expect(relaunched).toContain("synced");
     expect(relaunched).not.toContain("notes");
+    await expect(fs.readdir(path.join(overlay.configDir, "commands"))).rejects.toThrow();
   });
 });

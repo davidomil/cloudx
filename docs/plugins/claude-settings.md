@@ -64,9 +64,12 @@ Codex, CloudX decides which other skills a tab has. For each Claude tab
 it turns off, for that launch only:
 
 - the skills and workflows bundled with Claude Code
-- personal skills in `~/.claude/skills` and skills synced from claude.ai
-- project skills in `.claude/skills`, from the working directory up to
-  the repository root
+- personal skills and commands in `~/.claude/skills` and
+  `~/.claude/commands`, and skills synced from claude.ai
+- project skills and commands in any `.claude/skills` or
+  `.claude/commands` of the repository, including nested ones Claude
+  loads later in a session, and, in a linked worktree without its own
+  skills, those of the main checkout
 - plugins enabled in your user or project settings, and plugin sync
 - auto-memory
 
@@ -74,9 +77,20 @@ Your own `~/.claude/settings.json` is not changed, so plain `claude`
 keeps all of these. The project's `CLAUDE.md` and `AGENTS.md` files
 still load, as they do for Codex.
 
-**Claude skills outside CloudX** lists your personal and synced skills.
+**Claude skills outside CloudX** lists your personal skills and
+commands and your synced skills.
 A skill you select there is available in new Claude tabs. Synced skills
 stay synced while at least one of them is selected.
+
+## Accounts and credentials
+
+Each Claude tab runs on the account chosen for it. The tab's
+configuration directory and the account's credentials are applied again
+after your login shell profile runs, so a profile that exports
+`ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` does not change the account.
+If the `env` block of `~/.claude/settings.json` sets a credential or
+endpoint variable, such as `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL`,
+CloudX tabs replace it with the selected account's value, or clear it.
 
 ## Bypass permissions warning
 

@@ -25,7 +25,7 @@ import { fileURLToPath } from "node:url";
 import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory, TerminalProducer } from "../terminal/TerminalProcess.js";
 import { TerminalScreen } from "../terminal/TerminalScreen.js";
-import { buildLoginShellCommandLaunch, buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
+import { buildEnforcedLoginShellLaunch, buildToolEnv, resolveAssistantCommand, type EnforcedEnv } from "../terminal/ShellLaunch.js";
 import type { AgentAccountStore } from "../agents/AgentAccountStore.js";
 import { prepareAgentSwitch } from "../agents/AgentSwitch.js";
 import { agentTurnReceiptPath, readAgentTurnState, type AgentTurnState } from "../agents/agentTurn.js";
@@ -187,8 +187,11 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const sessionArgs = [...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
     const launchArgs = useBridge ? buildCodexRemoteTuiArgs(launchTemplate.args, sessionArgs) : [...launchTemplate.args, ...sessionArgs];
     const resume = codexResumeInput(restoredInput);
+    // The tab's CODEX_HOME overlay wins over one the user's profile exports.
+    const codexHome = launchTemplate.env.CODEX_HOME;
+    const enforced: EnforcedEnv = { set: codexHome ? { CODEX_HOME: codexHome } : {}, unset: [] };
     const launch = useBridge
-      ? buildLoginShellCommandLaunch(process.execPath, [
+      ? buildEnforcedLoginShellLaunch(process.execPath, [
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
         JSON.stringify({
           ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
@@ -204,12 +207,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           serverArgs: [...CLOUDX_CODEX_CONFIGURATION_ARGS, "app-server", "--listen", "stdio://"],
           tuiArgs: launchArgs
         })
-      ], launchTemplate.env)
-      : buildLoginShellCommandLaunch(command, launchArgs, launchTemplate.env);
+      ], launchTemplate.env, enforced)
+      : buildEnforcedLoginShellLaunch(command, launchArgs, launchTemplate.env, enforced);
     const execution = await input.prepareTerminalExecution?.(input.tab.id);
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
-      env: launchTemplate.env,
+      env: launch.env,
       cols: 100,
       rows: 30,
       ...(execution ? { execution } : {}),

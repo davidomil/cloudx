@@ -126,6 +126,14 @@ export class ClaudeSettingsService {
     const installed = await discoverClaudeUserSkills(home);
     if (input.expectedRevision !== settingsFrom(target, original, preferences, installed).revision) throw new Error("Claude settings changed. Reload before saving again.");
 
+    // Every check runs before either file is written.
+    const next: ClaudeLaunchPreferences = {
+      permissionMode: input.permissionMode ?? preferences.permissionMode,
+      autoTrustWorkspace: input.autoTrustWorkspace ?? preferences.autoTrustWorkspace,
+      allowedSkills: input.allowedSkills ? [...new Set(input.allowedSkills)].sort() : preferences.allowedSkills
+    };
+    for (const name of next.allowedSkills)
+      if (!preferences.allowedSkills.includes(name) && !installed.some(skill => skill.name === name)) throw new Error(`Claude skill ${name} is not installed.`);
     const native = parseSettings(target, original);
     const changedKeys = NATIVE_KEYS.filter(key => input[key] !== undefined && input[key] !== (native[key] ?? null));
     for (const key of changedKeys) {
@@ -138,13 +146,6 @@ export class ClaudeSettingsService {
       if (await readText(target) !== (original ?? "{}\n")) throw new Error("Claude settings changed. Reload before saving again.");
       await writeThroughLink(target, native);
     }
-    const next: ClaudeLaunchPreferences = {
-      permissionMode: input.permissionMode ?? preferences.permissionMode,
-      autoTrustWorkspace: input.autoTrustWorkspace ?? preferences.autoTrustWorkspace,
-      allowedSkills: input.allowedSkills ? [...new Set(input.allowedSkills)].sort() : preferences.allowedSkills
-    };
-    for (const name of next.allowedSkills)
-      if (!preferences.allowedSkills.includes(name) && !installed.some(skill => skill.name === name)) throw new Error(`Claude skill ${name} is not installed.`);
     if (JSON.stringify(next) !== JSON.stringify(preferences)) await this.preferences.write(next);
     return this.read();
   }

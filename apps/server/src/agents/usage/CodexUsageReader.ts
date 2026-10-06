@@ -85,16 +85,18 @@ function parseCodexLine(line: unknown, state: CodexParseState): CodexUsage | und
       typeof payload.response_id !== "string" || typeof payload.session_id !== "string" || typeof line.timestamp !== "string")
     return undefined;
   const usage = payload.usage;
+  // input_tokens includes both cache reads and cache writes.
   const cachedInput = count(usage.cached_input_tokens);
+  const cacheWrite = count(usage.cache_write_input_tokens);
   return {
     rootSession: payload.session_id,
     record: {
       id: `codex:${payload.response_id}`,
       at: Date.parse(line.timestamp),
       model: state.model,
-      input: Math.max(0, count(usage.input_tokens) - cachedInput),
+      input: Math.max(0, count(usage.input_tokens) - cachedInput - cacheWrite),
       cachedInput,
-      cacheWrite: count(usage.cache_write_input_tokens),
+      cacheWrite,
       cacheWrite1h: 0,
       output: count(usage.output_tokens),
       reasoning: count(usage.reasoning_output_tokens),

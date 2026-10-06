@@ -66,7 +66,10 @@ describe("ClaudeSettingsService", () => {
       { name: "notes", origin: "personal", allowed: false, available: true },
       { name: "docx", origin: "synced", allowed: false, available: true }
     ]);
-    await expect(service.update({ expectedRevision: (await service.read()).revision, allowedSkills: ["missing"] })).rejects.toThrow("Claude skill missing is not installed.");
+    // A rejected update writes neither the native settings nor the preferences.
+    await expect(service.update({ expectedRevision: (await service.read()).revision, model: "sonnet", allowedSkills: ["missing"] })).rejects.toThrow("Claude skill missing is not installed.");
+    expect((await service.read()).model).toBeNull();
+    await expect(fs.stat(path.join(providerHome, "settings.json"))).rejects.toThrow();
     const saved = await service.update({ expectedRevision: (await service.read()).revision, allowedSkills: ["docx", "notes", "docx"] });
     expect(saved.skills.filter(skill => skill.allowed).map(skill => skill.name)).toEqual(["notes", "docx"]);
     expect(await service.launchPreferences()).toMatchObject({ allowedSkills: ["docx", "notes"] });

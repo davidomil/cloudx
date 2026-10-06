@@ -8,7 +8,7 @@
 // Usage: node scripts/ci/local.mjs [--lanes coverage-1,static] [--jobs policy,isolated-lanes]
 // The working tree is tested as it is, including uncommitted changes.
 
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, spawnSync, execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -94,6 +94,29 @@ function workingTreeSnapshot() {
   return snapshot;
 }
 
+// A full-history CI checkout links to this repository. A linked worktree has
+// a .git file, and the verifier copies Git objects only from real directories,
+// so there it becomes a standalone local clone: objects are hard links, HEAD
+// and the index are this commit, and the working tree is the snapshot above.
+let historySource;
+function fullHistorySource() {
+  historySource ??= (async () => {
+    if ((await fs.lstat(path.join(repo, ".git"))).isDirectory()) return repo;
+    const target = path.join(workRoot, "source");
+    await fs.rm(target, { recursive: true, force: true });
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    execFileSync("git", ["clone", "--quiet", "--no-checkout", "--local", repo, target]);
+    execFileSync("git", ["update-ref", "--no-deref", "HEAD", head], { cwd: target });
+    execFileSync("git", ["read-tree", head], { cwd: target });
+    // Workflow steps fetch fixtures from origin, as in CI.
+    const origin = spawnSync("git", ["remote", "get-url", "origin"], { cwd: repo, encoding: "utf8" });
+    if (origin.status === 0) execFileSync("git", ["remote", "set-url", "origin", origin.stdout.trim()], { cwd: target });
+    await fs.cp(await workingTreeSnapshot(), target, { recursive: true, verbatimSymlinks: true });
+    return target;
+  })();
+  return historySource;
+}
+
 // Runs one job's steps in its own workspace, as on a CI runner. A full-history
 // checkout links to this repository; artifacts are files under the shared
 // artifacts directory.
@@ -114,7 +137,7 @@ async function runJob(name, job, context) {
       let code = 0;
       if (step.uses?.startsWith("actions/checkout@")) {
         const target = path.join(workspace, step.with?.path ?? "");
-        if (step.with?.path && step.with["fetch-depth"] === 0) await fs.symlink(repo, target);
+        if (step.with?.path && step.with["fetch-depth"] === 0) await fs.symlink(await fullHistorySource(), target);
         else await fs.cp(await workingTreeSnapshot(), target, { recursive: true, verbatimSymlinks: true });
       } else if (step.uses?.startsWith("actions/upload-artifact@")) {
         const target = path.join(context.artifacts, substitute(step.with.name, context));
@@ -139,7 +162,7 @@ async function runJob(name, job, context) {
         const realCwd = await fs.realpath(cwd);
         // Parallel lanes share the linked repository; a step there, such as
         // the fixture fetch, runs once per local run.
-        const sharedKey = realCwd === repo && step["working-directory"] ? script : undefined;
+        const sharedKey = realCwd === await fs.realpath(await fullHistorySource()) && step["working-directory"] ? script : undefined;
         if (sharedKey && context.sharedSteps.has(sharedKey)) code = await context.sharedSteps.get(sharedKey);
         else {
           const running = runScript(script, { cwd: realCwd, env, log, timeoutMs });

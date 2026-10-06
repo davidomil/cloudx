@@ -52,6 +52,44 @@ export function buildLoginShellCommandLaunch(command: string, args: string[], en
   };
 }
 
+// Variables a launched command must see as CloudX set them, even when the
+// user's login profile exports its own values.
+export interface EnforcedEnv {
+  set: Record<string, string>;
+  unset: readonly string[];
+}
+
+const ENFORCED_ENV_PREFIX = "CLOUDX_ENFORCED_";
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+
+// Like buildLoginShellCommandLaunch, then re-applies the enforced variables
+// after the profile has run. Values travel in the environment under reserved
+// names, never on a command line, and shell builtins move them into place
+// right before exec. Spawn the command with the returned env.
+export function buildEnforcedLoginShellLaunch(
+  command: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  enforced: EnforcedEnv
+): ProcessLaunch & { env: NodeJS.ProcessEnv } {
+  const names = Object.keys(enforced.set);
+  if ([...names, ...enforced.unset].some(name => !ENV_NAME_PATTERN.test(name))) throw new Error("Enforced environment variable names must be shell identifiers.");
+  const direct = { ...env };
+  for (const name of enforced.unset) delete direct[name];
+  Object.assign(direct, enforced.set);
+  if (!supportsLoginShell(resolveUserShell(env))) return { command, args, env: direct };
+  const unset = enforced.unset.filter(name => !names.includes(name));
+  const steps = [
+    ...(unset.length ? [`unset ${unset.join(" ")}`] : []),
+    ...names.map(name => `export ${name}="$${ENFORCED_ENV_PREFIX}${name}"; unset ${ENFORCED_ENV_PREFIX}${name}`)
+  ];
+  return {
+    command: resolveUserShell(env),
+    args: ["-lc", `${steps.map(step => `${step}; `).join("")}exec ${[command, ...args].map(shellQuote).join(" ")}`],
+    env: { ...direct, ...Object.fromEntries(names.map(name => [`${ENFORCED_ENV_PREFIX}${name}`, enforced.set[name]!])) }
+  };
+}
+
 export function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_/:=.,@%+-]+$/.test(value)) {
     return value;

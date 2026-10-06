@@ -65,6 +65,9 @@ export class SessionStore {
   private readonly tabClosures = new Map<string, Promise<void>>();
   private readonly tabOwnershipActions = new Map<string, Promise<unknown>>();
   private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
+  // Tabs whose agent is being switched. Their input and actions are refused
+  // so no new turn starts while the switch is prepared.
+  private readonly switchingTabs = new Set<string>();
   private readonly actionAdmission = new AsyncLocalStorage<ActionAdmission>();
   private readonly shutdownController = new AbortController();
   private disposed = false;
@@ -241,9 +244,11 @@ export class SessionStore {
     if (this.tabClosures.has(tabId)) return Promise.reject(new Error("The tab is closing."));
     if (this.tabOwnershipActions.has(tabId) || this.tabRecoveries.has(tabId))
       return Promise.reject(new Error("Wait for this tab's current operation before switching."));
+    this.switchingTabs.add(tabId);
     const switching = this.admitAction(undefined, () => this.switchAgentNow(tabId, request));
     this.tabRecoveries.set(tabId, switching);
-    void switching.then(() => this.tabRecoveries.delete(tabId), () => this.tabRecoveries.delete(tabId));
+    const finished = () => { this.tabRecoveries.delete(tabId); this.switchingTabs.delete(tabId); };
+    void switching.then(finished, finished);
     return switching;
   }
 
@@ -259,6 +264,9 @@ export class SessionStore {
     const input = await this.sessionInput(tab);
     input.initialInput = previous?.restoreInput?.() ?? input.initialInput;
     const next = await plugin.prepareAgentSwitch(input, request);
+    // Preparation awaited account and handoff work; check the run again.
+    if (this.sessions.get(tabId) !== previous || (alive && !isIdleAgent(previous!)))
+      throw new Error("The run changed while the switch was prepared. Switch again when it is idle.");
     if (previous) {
       this.disposeSessionListeners(tabId);
       if (alive) await previous.terminate?.();
@@ -541,6 +549,17 @@ export class SessionStore {
     return tab;
   }
 
+  // False while the tab's agent is being switched; terminal input is dropped then.
+  acceptsInput(tabId: string): boolean {
+    return !this.switchingTabs.has(tabId);
+  }
+
+  // The session for an action that may start work in the tab.
+  private actionSession(tabId: string): PluginSession {
+    if (this.switchingTabs.has(tabId)) throw new Error("This tab is switching agents. Try again when the switch finishes.");
+    return this.getSession(tabId);
+  }
+
   getSession(tabId: string): PluginSession {
     const session = this.sessions.get(tabId);
     if (!session) {
@@ -655,7 +674,7 @@ export class SessionStore {
       throw new Error(`Action ${action.action} has no target tab.`);
     }
 
-    const session = this.getSession(targetTabId);
+    const session = this.actionSession(targetTabId);
     const pluginId = action.pluginId ?? session.tab.pluginId;
     if (pluginId !== session.tab.pluginId) {
       throw new Error(`Action targets plugin ${pluginId}, but tab ${targetTabId} uses ${session.tab.pluginId}.`);
@@ -723,7 +742,7 @@ export class SessionStore {
   async executePluginAction(tabId: string, action: string, input: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
     return this.admitAction(signal, async (admittedSignal) => {
       admittedSignal.throwIfAborted();
-      const session = this.getSession(tabId);
+      const session = this.actionSession(tabId);
       this.plugins.validateInput(session.tab.pluginId, action, input);
       const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input, { signal: admittedSignal, caller: { kind: "ui" } }));
       await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
@@ -739,7 +758,7 @@ export class SessionStore {
       if (!tabId) {
         throw new Error(`Hook ${hookId} requires a target tab for plugin ${pluginId}.`);
       }
-      const session = this.getSession(tabId);
+      const session = this.actionSession(tabId);
       if (session.tab.pluginId !== pluginId) {
         throw new Error(`Hook ${hookId} targets plugin ${pluginId}, but tab ${tabId} uses ${session.tab.pluginId}.`);
       }

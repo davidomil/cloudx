@@ -23,9 +23,18 @@ import { claudeSkillPolicy, type ClaudeSkillPolicy } from "./claudeSkillPolicy.j
 export const CLAUDE_FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
 
 // Shared user configuration that every Claude tab sees through its overlay.
-// Credentials are linked separately from the tab's account home.
-const SHARED_ENTRIES = ["settings.json", "agents", "commands", "plugins", "output-styles"] as const;
+// Credentials are linked separately from the tab's account home. Personal
+// skills and commands are linked one by one when the user allows them.
+const SHARED_ENTRIES = ["settings.json", "agents", "plugins", "output-styles"] as const;
 const GENERATED_SKILL_GROUPS = ["cloudx", "cloudx-system"] as const;
+// Variables that choose the credentials or the API endpoint. Claude Code
+// applies the shared settings.json env block over the process environment,
+// so a value there would replace the selected account.
+const ACCOUNT_ENV_KEYS = [
+  "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CONFIG_DIR"
+] as const;
+const MAX_SHARED_SETTINGS_BYTES = 1024 * 1024;
 
 export interface ClaudeHomeOverlayOptions {
   dataDir: string;
@@ -43,6 +52,8 @@ export interface ClaudeHomeOverlayOptions {
   userStatePath?: string;
   // Personal or synced skills the user allowed in Settings → Claude.
   allowedSkills?: readonly string[];
+  // The selected account's credential variables, such as ANTHROPIC_API_KEY.
+  accountEnv?: Record<string, string>;
 }
 
 export interface ClaudeHomeOverlay {
@@ -105,7 +116,8 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   await materializeSkills(configDir, options.providerHome, generated, policy);
   await writeInstructions(configDir, options.providerHome, options.resolved, systemRules);
   const settingsPath = path.join(configDir, ".cloudx-settings.json");
-  const launchSettings = { ...policy.settings, ...hookSettings(configDir, options.tabId, options.executionId) };
+  const accountEnv = await accountEnvOverrides(path.join(options.providerHome, "settings.json"), configDir, options.accountEnv ?? {});
+  const launchSettings = { ...policy.settings, ...(accountEnv ? { env: accountEnv } : {}), ...hookSettings(configDir, options.tabId, options.executionId) };
   await writeAtomic(settingsPath, `${JSON.stringify(launchSettings, null, 2)}\n`);
   return { configDir, rulesSkillsRoot, settingsPath, systemRules };
 }
@@ -125,6 +137,25 @@ function hookSettings(configDir: string, tabId: string, executionId: string): Re
       StopFailure: hook("StopFailure")
     }
   };
+}
+
+// Overrides for the account variables the shared settings.json env sets: the
+// selected account's value, or empty, which Claude Code treats as unset.
+async function accountEnvOverrides(sharedSettings: string, configDir: string, accountEnv: Record<string, string>): Promise<Record<string, string> | undefined> {
+  let shared: unknown;
+  try {
+    const stat = await fsp.stat(sharedSettings);
+    if (!stat.isFile() || stat.size > MAX_SHARED_SETTINGS_BYTES) return undefined;
+    shared = JSON.parse(await fsp.readFile(sharedSettings, "utf8"));
+  } catch {
+    return undefined;
+  }
+  const env = shared && typeof shared === "object" && !Array.isArray(shared) ? (shared as Record<string, unknown>).env : undefined;
+  if (!env || typeof env !== "object" || Array.isArray(env)) return undefined;
+  const keys = ACCOUNT_ENV_KEYS.filter(key => key in env);
+  if (!keys.length) return undefined;
+  const selected: Record<string, string> = { ...accountEnv, CLAUDE_CONFIG_DIR: configDir };
+  return Object.fromEntries(keys.map(key => [key, selected[key] ?? ""]));
 }
 
 async function seedClaudeState(statePath: string, cwd: string | undefined, trustProject: boolean): Promise<void> {
@@ -169,14 +200,18 @@ async function materializeSkills(
   if (existing && (!existing.isDirectory() || existing.isSymbolicLink())) throw new Error(`Unexpected Claude skills entry at ${skillsDir}.`);
   await fsp.rm(skillsDir, { recursive: true, force: true });
   await fsp.mkdir(skillsDir, { mode: 0o700 });
+  // Earlier versions linked the whole commands/ directory.
+  const commandsDir = path.join(configDir, "commands");
+  if ((await optionalLstat(commandsDir))?.isSymbolicLink()) await fsp.unlink(commandsDir);
+  else await fsp.rm(commandsDir, { recursive: true, force: true });
   for (const skill of generated) {
     await fsp.cp(skill.source, path.join(skillsDir, skill.directory), { recursive: true, dereference: false, verbatimSymlinks: true });
   }
-  const userSkills = path.join(providerHome, "skills");
-  for (const name of [...policy.personalDirectories, ...(policy.linkSynced ? ["synced"] : [])]) {
-    const target = path.join(skillsDir, name);
+  for (const source of [...policy.personalLinks, ...(policy.linkSynced ? ["skills/synced"] : [])]) {
+    const target = path.join(configDir, ...source.split("/"));
     if (await optionalLstat(target)) continue;
-    await fsp.symlink(path.join(userSkills, name), target, "dir");
+    await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    await fsp.symlink(path.join(providerHome, ...source.split("/")), target);
   }
 }
 

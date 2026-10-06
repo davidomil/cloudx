@@ -11,6 +11,7 @@ import {
   isRecord,
   validateAgentAccountLabel,
   type AgentAccount,
+  type AgentAccountKind,
   type AgentAccountCreateInput,
   type AgentAccountsState,
   type AgentProviderId
@@ -18,13 +19,15 @@ import {
 
 import { JsonStateFile, writeTextFileAtomic } from "../jsonStateFile.js";
 import { resolveCodexHome } from "../rulesSkills/CodexHomeOverlay.js";
-import { agentCommand, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
+import type { EnforcedEnv } from "../terminal/ShellLaunch.js";
+import { agentCommand, claudeEnforcedEnv, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
 
 const ACCOUNTS_FILE = "agent-accounts.json";
 const ACCOUNTS_DIRECTORY = "agent-accounts";
 const API_KEY_FILE = ".cloudx-api-key";
 const MAX_API_KEY_LENGTH = 512;
 const MAX_ACCOUNTS = 64;
+const MAX_CREDENTIALS_BYTES = 1024 * 1024;
 
 interface StoredAccounts {
   version: 1;
@@ -38,6 +41,8 @@ export interface AgentLoginCommand {
   command: string;
   args: string[];
   env: NodeJS.ProcessEnv;
+  // The account's home, re-applied after the login shell's profile runs.
+  enforced: EnforcedEnv;
   cwd: string;
 }
 
@@ -181,8 +186,8 @@ export class AgentAccountStore {
     await fs.mkdir(home, { recursive: true, mode: 0o700 });
     const command = agentCommand(account.providerId, this.env);
     return account.providerId === "claude"
-      ? { command, args: ["auth", "login"], env: claudeLaunchEnv(this.env, home, {}), cwd: home }
-      : { command, args: ["login"], env: { ...this.env, CODEX_HOME: home }, cwd: home };
+      ? { command, args: ["auth", "login"], env: claudeLaunchEnv(this.env, home, {}), enforced: claudeEnforcedEnv(home, {}), cwd: home }
+      : { command, args: ["login"], env: { ...this.env, CODEX_HOME: home }, enforced: { set: { CODEX_HOME: home }, unset: [] }, cwd: home };
   }
 
   // Environment additions a launch needs beyond the provider home itself.
@@ -263,13 +268,14 @@ export class AgentAccountStore {
     let changed = false;
     for (const providerId of AGENT_PROVIDER_IDS) {
       if (stored.importedProviders.includes(providerId)) continue;
-      if (!await hasProviderLogin(providerId, providerHome(providerId, this.env))) continue;
+      const kind = await nativeLoginKind(providerId, providerHome(providerId, this.env));
+      if (!kind) continue;
       stored.importedProviders.push(providerId);
       stored.accounts.push({
         id: `${providerId}-home`,
         providerId,
         label: `${agentProviderLabel(providerId)} (${displayPath(providerHome(providerId, this.env), this.env)})`,
-        kind: "subscription",
+        kind,
         isDefault: !stored.accounts.some(entry => entry.providerId === providerId),
         createdAt: new Date().toISOString(),
         imported: true
@@ -291,9 +297,27 @@ function displayPath(target: string, env: NodeJS.ProcessEnv): string {
   return home && target.startsWith(`${home}${path.sep}`) ? `~${target.slice(home.length)}` : target;
 }
 
-async function hasProviderLogin(providerId: AgentProviderId, home: string): Promise<boolean> {
+// How an existing provider home is signed in, or undefined without a login.
+// Codex records the method in auth.json (codex-rs AuthMode: "apikey",
+// "chatgpt", "chatgptAuthTokens"); older files only hold the key or tokens.
+// Claude's .credentials.json holds a claude.ai OAuth login; a Console key
+// lives in .claude.json instead and is not imported.
+async function nativeLoginKind(providerId: AgentProviderId, home: string): Promise<AgentAccountKind | undefined> {
   const credentials = path.join(home, providerId === "codex" ? "auth.json" : ".credentials.json");
-  return fs.stat(credentials).then(stat => stat.isFile(), () => false);
+  let parsed: unknown;
+  try {
+    const stat = await fs.stat(credentials);
+    if (!stat.isFile() || stat.size > MAX_CREDENTIALS_BYTES) return undefined;
+    parsed = JSON.parse(await fs.readFile(credentials, "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  if (providerId === "claude") return isRecord(parsed.claudeAiOauth) ? "subscription" : undefined;
+  if (parsed.auth_mode === "apikey") return "api-key";
+  if (typeof parsed.auth_mode === "string") return "subscription";
+  if (isRecord(parsed.tokens)) return "subscription";
+  return typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY ? "api-key" : undefined;
 }
 
 function validateApiKey(value: unknown): string {

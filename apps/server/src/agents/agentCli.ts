@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import type { AgentProviderId, AgentProviderStatus } from "@cloudx/shared";
 import { agentProviderLabel } from "@cloudx/shared";
 
-import { buildToolEnv, resolveAssistantCommand, resolveClaudeCommand } from "../terminal/ShellLaunch.js";
+import { buildToolEnv, resolveAssistantCommand, resolveClaudeCommand, type EnforcedEnv } from "../terminal/ShellLaunch.js";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -107,4 +107,9 @@ export function claudeLaunchEnv(baseEnv: NodeJS.ProcessEnv, configDir: string, a
   const env = { ...baseEnv };
   for (const name of CLAUDE_INHERITED_ENV) delete env[name];
   return { ...env, ...accountEnv, CLAUDE_CONFIG_DIR: configDir };
+}
+
+// The same selection, re-applied after a login shell's profile has run.
+export function claudeEnforcedEnv(configDir: string, accountEnv: Record<string, string>): EnforcedEnv {
+  return { set: { ...accountEnv, CLAUDE_CONFIG_DIR: configDir }, unset: CLAUDE_INHERITED_ENV };
 }

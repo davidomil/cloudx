@@ -6671,6 +6671,7 @@ describe("buildServer", () => {
       plugins: { list: () => [] },
       sessions: {
         getSession: () => session,
+        acceptsInput: () => true,
         listTabs: () => [],
         getActiveTabId: () => undefined,
       },
@@ -6769,6 +6770,7 @@ describe("buildServer", () => {
         plugins: { list: () => [] },
         sessions: {
           getSession: () => session,
+          acceptsInput: () => true,
           listTabs: () => [],
           getActiveTabId: () => undefined,
         },
@@ -7661,6 +7663,7 @@ function terminalRouteTestServices(
     plugins: { list: () => [] },
     sessions: {
       getSession: () => session,
+      acceptsInput: () => true,
       listTabs: () => [],
       getActiveTabId: () => undefined,
     },

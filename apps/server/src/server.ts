@@ -1302,7 +1302,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       }
       try {
         if (message.type === "input") {
-          session.write?.(message.data);
+          // Input during an agent switch could start a turn the switch then ends.
+          if (services.sessions.acceptsInput(tabId)) session.write?.(message.data);
         }
         if (message.type === "resize") {
           session.resize?.(message.cols, message.rows);
@@ -1521,7 +1522,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   registerPluginTriggers(triggers, plugins);
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
-  automation = createAutomationService(automationRepository, { plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
+  automation = createAutomationService(automationRepository, { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
   return { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
 }
 

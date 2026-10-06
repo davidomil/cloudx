@@ -11,7 +11,6 @@ interface ProcessIdentity {
   state: string;
   started: string;
   uids: number[];
-  gids: number[];
   threads?: number;
 }
 interface SystemUserManager {
@@ -48,32 +47,23 @@ export class WorkspaceProcessActivity {
         if (exited(before)) { await this.assertThreadGroupExited(pid, before); continue; }
         const open: string[] = [];
         const uncertainty: string[] = [];
-        const uncertaintyCodes: string[] = [];
-        const uncertain = (label: string, error: unknown) => {
-          uncertainty.push(`${label}: ${message(error)}`);
-          uncertaintyCodes.push((error as NodeJS.ErrnoException).code ?? "");
-        };
         try { open.push(await fs.readlink(this.procPath(pid, "cwd"))); }
-        catch (error) { uncertain("cwd", error); }
+        catch (error) { uncertainty.push(`cwd: ${message(error)}`); }
         try {
           for (const fd of await fs.readdir(this.procPath(pid, "fd"))) {
             try {
               const file = await fs.readlink(this.procPath(pid, `fd/${fd}`));
               if (file.startsWith("/")) open.push(file);
             } catch (error) {
-              if (!vanished(error)) uncertain(`open file ${fd}`, error);
+              if (!vanished(error)) uncertainty.push(`open file ${fd}: ${message(error)}`);
             }
           }
-        } catch (error) { uncertain("open files", error); }
+        } catch (error) { uncertainty.push(`open files: ${message(error)}`); }
         const after = await this.identity(pid);
         if (!sameProcess(before, after)) throw new Error("Process identity changed during inspection. Scan again.");
         if (exited(after)) { await this.assertThreadGroupExited(pid, after); continue; }
         const active = open.find(file => [file, file.replace(/ \(deleted\)$/u, "")].some(openPath => isSameOrChildPath(resolved, path.resolve(openPath))));
         if (active) throw new ActiveWorkspaceProcess(`A running process (PID ${pid}) still uses this workspace: ${active}`);
-        // A set-id helper started by this user, such as fusermount3 (setuid) or
-        // ssh-agent (setgid), is not dumpable. The kernel denies its cwd and
-        // open files to this user, who cannot control it either.
-        if (uncertainty.length && setId(after) && uncertaintyCodes.every(code => code === "EACCES" || code === "EPERM")) continue;
         if (uncertainty.length) {
           const verified = await this.isSystemUserInfrastructure(pid, after, resolved).catch(error => {
             throw new Error(`${uncertainty.join("; ")}; ${message(error)}`);
@@ -110,11 +100,10 @@ export class WorkspaceProcessActivity {
     const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
     const status = await fs.readFile(this.procPath(pid, "status"), "utf8");
     const uids = /^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/mu.exec(status);
-    const gids = /^Gid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$/mu.exec(status);
     const threads = /^Threads:\s+(\d+)\s*$/mu.exec(status);
     if (!name || !/^\d+$/u.test(fields[1] ?? "") || !/^\d+$/u.test(fields[19] ?? "") || !uids)
       throw new Error("Process ownership or start-time identity is unavailable.");
-    return { name: name[1]!, parent: fields[1]!, state: fields[0]!, started: fields[19]!, uids: uids.slice(1).map(Number), gids: gids?.slice(1).map(Number) ?? [], ...(threads ? { threads: Number(threads[1]) } : {}) };
+    return { name: name[1]!, parent: fields[1]!, state: fields[0]!, started: fields[19]!, uids: uids.slice(1).map(Number), ...(threads ? { threads: Number(threads[1]) } : {}) };
   }
 
   private async isSystemUserInfrastructure(pid: string, identity: ProcessIdentity, directory: string): Promise<boolean> {
@@ -147,12 +136,8 @@ export class WorkspaceProcessActivity {
 
 class ActiveWorkspaceProcess extends Error {}
 function exited(identity: ProcessIdentity): boolean { return ["Z", "X", "x"].includes(identity.state); }
-// Real, effective, saved and filesystem ids differ after a set-id exec.
-function setId(identity: ProcessIdentity): boolean {
-  return [identity.uids, identity.gids].some(ids => ids.some(id => id !== ids[0]));
-}
 function sameProcess(first: ProcessIdentity, second: ProcessIdentity): boolean {
-  return first.started === second.started && first.name === second.name && first.parent === second.parent && first.uids.every((uid, index) => uid === second.uids[index]) && first.gids.every((gid, index) => gid === second.gids[index]);
+  return first.started === second.started && first.name === second.name && first.parent === second.parent && first.uids.every((uid, index) => uid === second.uids[index]);
 }
 function vanished(error: unknown): boolean { return ["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? ""); }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }

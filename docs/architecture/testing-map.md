@@ -226,6 +226,10 @@ Each job works on a copy of the working tree's tracked and unignored files, so
 uncommitted changes are tested and ignored files such as `node_modules` are
 not.
 
+In a linked worktree, the full-history `source` checkout is a local clone
+of this commit with the working tree copied in, because the verifier needs
+a real `.git` directory.
+
 It needs Docker. The lifecycle, systemd, native CLI, terminal stress and
 identity jobs need a disposable host, GitHub identity or pinned CLI
 releases, and are listed as not reproduced.
@@ -237,7 +241,8 @@ in `/etc/sysctl.d/`. The isolated lanes run as a separate user and are not
 affected by the host's watch count.
 
 The workspace cleanup tests that scan the real `/proc` see every process of
-the host user. A same-user process that disables its own tracing, such as an
-`sftp-server` behind an sshfs mount, has an unreadable cwd and makes those
-checkouts uncertain, so these tests fail on that host. The isolated lanes
-run in their own process namespace and do not see host processes.
+the host user. A same-user process whose files the kernel hides, such as a
+set-id helper (`fusermount3`, `ssh-agent`) or an `sftp-server` that disables
+its own tracing, makes those checkouts uncertain, so these tests fail on that
+host. That is the intended cleanup behavior. The isolated lanes run in their
+own process namespace and do not see host processes.

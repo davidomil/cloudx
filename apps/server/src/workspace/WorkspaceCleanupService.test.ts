@@ -555,19 +555,21 @@ describe("reviewed workspace cleanup", () => {
     } finally { denied.mockRestore(); }
   });
   it.each([
-    { code: "EACCES", effectiveUid: 0, eligible: true },
-    { code: "EPERM", effectiveUid: 0, eligible: true },
-    { code: "EACCES", savedGid: 112, eligible: true },
-    { code: "EIO", effectiveUid: 0, eligible: false },
-    { code: "EACCES", eligible: false }
-  ])("skips only set-id helpers whose files the kernel denies to this user: %j", async ({ code, effectiveUid, savedGid, eligible }) => {
-    const completed = await checkout(`set-id-helper-${code}-${effectiveUid}-${savedGid}`);
-    const { observed, directory } = await processFixture({ name: "helper", parent: "999", effectiveUid, savedGid });
-    const denied = denyProcessAccess(path.join(directory, "cwd"), code);
+    { name: "setuid helper", effectiveUid: 0 },
+    { name: "setgid helper", savedGid: 112 }
+  ])("protects a checkout a $name may use even though its files are unreadable", async ({ effectiveUid, savedGid }) => {
+    // The kernel denies a set-id process's cwd and open files to its own user.
+    // That explains the denial; it does not show the process is elsewhere.
+    const completed = await checkout(`set-id-${effectiveUid ?? savedGid}`);
+    const { observed, directory } = await processFixture({ name: "helper", parent: "999", cwd: completed, effectiveUid, savedGid });
+    const denied = denyProcessAccess(path.join(directory, "cwd"));
     try {
-      const candidate = (await observed.preview()).candidates.find(item => item.path === completed)!;
-      expect(candidate.eligible).toBe(eligible);
-      if (!eligible) expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273`);
+      const preview = await observed.preview();
+      const candidate = preview.candidates.find(item => item.path === completed)!;
+      expect(candidate).toMatchObject({ eligible: false });
+      expect(candidate.reason).toContain(`Process activity for ${completed} is uncertain: PID 273`);
+      await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+      expect(await fs.stat(completed)).toBeTruthy();
     } finally { denied.mockRestore(); }
   });
   it.each(["fd/0", "fd directory"])("protects unknown same-user open-file activity when the %s cannot be read", async unreadable => {

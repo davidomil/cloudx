@@ -72,8 +72,9 @@ describe("CodexTerminalPlugin on Claude", () => {
     await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, prompt: "Fix it" } });
 
     const configDir = path.join(dataDir, "claude-launches", "tab-1");
-    expect(factory.lastCommandLine).toMatch(/^exec claude --settings \S+\.cloudx-settings\.json --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
-    expect(factory.last.env).toMatchObject({ CLAUDE_CONFIG_DIR: configDir });
+    // The login profile runs first; the selection is re-applied before exec.
+    expect(factory.lastCommandLine).toMatch(/^unset ANTHROPIC_API_KEY .*; export CLAUDE_CONFIG_DIR="\$CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR"; unset CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR; exec claude --settings \S+\.cloudx-settings\.json --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
+    expect(factory.last.env).toMatchObject({ CLAUDE_CONFIG_DIR: configDir, CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR: configDir });
     expect(factory.last.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(restored.at(-1)).toMatchObject({ agent: { providerId: "claude", accountId: account.id } });
   });

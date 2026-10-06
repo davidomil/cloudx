@@ -4,7 +4,7 @@ import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_PROVIDER_IDS, agen
 
 import type { AgentAccountStore } from "../agents/AgentAccountStore.js";
 import type { TerminalProcessFactory } from "../terminal/TerminalProcess.js";
-import { buildLoginShellCommandLaunch, buildToolEnv } from "../terminal/ShellLaunch.js";
+import { buildEnforcedLoginShellLaunch, buildToolEnv } from "../terminal/ShellLaunch.js";
 import { CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES } from "./CodexTerminalPlugin.js";
 
 
@@ -115,11 +115,10 @@ export class AgentAccountsPlugin implements WorkspacePlugin {
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
-    const env = buildToolEnv(login.env);
-    const launch = buildLoginShellCommandLaunch(login.command, login.args, env);
+    const launch = buildEnforcedLoginShellLaunch(login.command, login.args, buildToolEnv(login.env), login.enforced);
     const terminal = await this.factory.spawn(launch.command, launch.args, {
       cwd: login.cwd,
-      env,
+      env: launch.env,
       cols: 100,
       rows: 30,
       sessionId: input.tab.id

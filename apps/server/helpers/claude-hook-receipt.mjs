@@ -6,9 +6,17 @@
 // Usage: claude-hook-receipt.mjs <configDir> <tabId> <executionId> <event>
 // The hook payload arrives as JSON on stdin. The hook always exits 0 so a
 // receipt failure never blocks the user's session.
-import { closeSync, constants, fsyncSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+//
+// Claude runs Stop hooks in parallel, and another hook can block the stop and
+// continue the same prompt. So Stop only records a pending stop and starts
+// `claude-hook-receipt.mjs --settle <configDir> <stopId>`, which completes the
+// turn once the transcript shows the Stop hooks finished without continuing.
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { closeSync, constants, fsyncSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 // File names match AGENT_TURN_RECEIPT and CLAUDE_FORGE_TURN_BINDING in the
@@ -16,7 +24,15 @@ const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 const CONVERSATION_RECEIPT = ".cloudx-conversation.json";
 const TURN_RECEIPT = ".cloudx-turn.json";
 const FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
+const PENDING_STOP = ".cloudx-turn-stop.json";
 const MAX_INPUT_BYTES = 1_048_576;
+const MAX_FINAL_TEXT_BYTES = 1024 * 1024;
+const SETTLE_POLL_MS = 200;
+// Longer than Claude Code's default 10-minute hook timeout. If no summary
+// appears by then, the Stop that did fire completes the turn.
+const SETTLE_TIMEOUT_MS = 15 * 60_000;
+// Claude Code writes this user record when a Stop hook blocks and the turn continues.
+const STOP_FEEDBACK_PREFIX = "Stop hook feedback";
 
 export function receiptsForEvent(event, payload, binding) {
   if (!payload || typeof payload !== "object" || !CONVERSATION_ID.test(String(payload.session_id ?? ""))) return [];
@@ -57,7 +73,7 @@ export function forgeReceiptsForEvent(event, payload, binding, current) {
   if (!current || current.status !== "running" || current.threadId !== threadId || current.turnId !== turnId) return [];
   if (event === "Stop") {
     const receipts = [{ path: binding.receiptPath, value: { ...current, status: "completed" } }];
-    if (typeof payload.last_assistant_message === "string" && Buffer.byteLength(payload.last_assistant_message) <= 1024 * 1024)
+    if (typeof payload.last_assistant_message === "string" && Buffer.byteLength(payload.last_assistant_message) <= MAX_FINAL_TEXT_BYTES)
       receipts.unshift({ path: `${binding.receiptPath}.final.json`, value: { ...current, status: "completed", text: payload.last_assistant_message } });
     return receipts;
   }
@@ -104,13 +120,83 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function main() {
-  const [configDir, tabId, executionId, event] = process.argv.slice(2);
-  if (!configDir || !path.isAbsolute(configDir) || !tabId || !CONVERSATION_ID.test(executionId ?? "") || !event) return;
-  const payload = JSON.parse(await readStdin());
-  for (const receipt of receiptsForEvent(event, payload, { tabId, executionId })) writeAtomicFile(path.join(configDir, receipt.name), receipt.value);
+function applyEvent(configDir, binding, event, payload) {
+  for (const receipt of receiptsForEvent(event, payload, binding)) writeAtomicFile(path.join(configDir, receipt.name), receipt.value);
   const forge = readForgeBinding(configDir);
   if (forge) for (const receipt of forgeReceiptsForEvent(event, payload, forge, readJson(forge.receiptPath))) writeAtomicFile(receipt.path, receipt.value);
+}
+
+// Reads what the transcript gained after a Stop: "continued" when a Stop hook
+// blocked, "settled" when the Stop hooks finished, else undefined.
+export function stopOutcome(appended) {
+  for (const line of appended.split("\n")) {
+    let record;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (record?.type === "user" && messageText(record).startsWith(STOP_FEEDBACK_PREFIX)) return "continued";
+    if (record?.type === "system" && record.subtype === "stop_hook_summary") return "settled";
+  }
+  return undefined;
+}
+
+function messageText(record) {
+  const content = record.message?.content;
+  if (typeof content === "string") return content;
+  return Array.isArray(content) ? content.map(part => typeof part?.text === "string" ? part.text : "").join("") : "";
+}
+
+function readFrom(file, offset) {
+  const size = statSync(file).size;
+  if (size <= offset) return "";
+  const buffer = Buffer.alloc(Math.min(size - offset, MAX_INPUT_BYTES * 16));
+  const descriptor = openSync(file, "r");
+  try { return buffer.subarray(0, readSync(descriptor, buffer, 0, buffer.length, offset)).toString("utf8"); }
+  finally { closeSync(descriptor); }
+}
+
+function recordStop(configDir, binding, payload) {
+  const transcriptPath = payload?.transcript_path;
+  let offset;
+  try { offset = typeof transcriptPath === "string" && path.isAbsolute(transcriptPath) ? statSync(transcriptPath).size : undefined; }
+  catch { offset = undefined; }
+  // Without a transcript to watch, the Stop completes the turn as it arrives.
+  if (offset === undefined) return applyEvent(configDir, binding, "Stop", payload);
+  const stopId = randomUUID();
+  writeAtomicFile(path.join(configDir, PENDING_STOP), { stopId, binding, transcriptPath, offset, payload });
+  spawn(process.execPath, [fileURLToPath(import.meta.url), "--settle", configDir, stopId], { detached: true, stdio: "ignore" }).unref();
+}
+
+async function settle(configDir, stopId) {
+  const pendingPath = path.join(configDir, PENDING_STOP);
+  const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+  while (true) {
+    const pending = readJson(pendingPath);
+    // A later Stop owns the turn now.
+    if (pending?.stopId !== stopId) return;
+    const outcome = stopOutcome(readFrom(pending.transcriptPath, pending.offset));
+    if (outcome || Date.now() > deadline) {
+      rmSync(pendingPath, { force: true });
+      if (outcome === "continued") return;
+      // A newer prompt replaced the turn this Stop belonged to.
+      const current = readJson(path.join(configDir, TURN_RECEIPT));
+      if (current && (current.sessionId !== pending.payload.session_id || current.turnId !== pending.payload.prompt_id)) return;
+      return applyEvent(configDir, pending.binding, "Stop", pending.payload);
+    }
+    await sleep(SETTLE_POLL_MS);
+  }
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args[0] === "--settle") {
+    const [, configDir, stopId] = args;
+    if (configDir && path.isAbsolute(configDir) && stopId) await settle(configDir, stopId);
+    return;
+  }
+  const [configDir, tabId, executionId, event] = args;
+  if (!configDir || !path.isAbsolute(configDir) || !tabId || !CONVERSATION_ID.test(executionId ?? "") || !event) return;
+  const payload = JSON.parse(await readStdin());
+  if (event === "Stop") return recordStop(configDir, { tabId, executionId }, payload);
+  applyEvent(configDir, { tabId, executionId }, event, payload);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

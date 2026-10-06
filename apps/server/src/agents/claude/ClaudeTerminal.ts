@@ -16,11 +16,11 @@ import { CodexConversationRecovery } from "../../plugins/CodexConversationRecove
 import { writeTextFileAtomic } from "../../jsonStateFile.js";
 import type { ResolvedPersonalityTemplate } from "../../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcessFactory } from "../../terminal/TerminalProcess.js";
-import { buildLoginShellCommandLaunch, buildToolEnv, resolveClaudeCommand } from "../../terminal/ShellLaunch.js";
+import { buildEnforcedLoginShellLaunch, buildToolEnv, resolveClaudeCommand } from "../../terminal/ShellLaunch.js";
 import type { AgentAccountStore } from "../AgentAccountStore.js";
 import type { AgentUsageRecorder } from "../usage/AgentUsageRecorder.js";
-import { claudeLaunchEnv } from "../agentCli.js";
-import { agentTurnReceiptPath, readAgentTurnState } from "../agentTurn.js";
+import { claudeEnforcedEnv, claudeLaunchEnv } from "../agentCli.js";
+import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
 import { codexResumeInput } from "../resumeInput.js";
 import {
   CLAUDE_FORGE_TURN_BINDING,
@@ -82,6 +82,7 @@ export class ClaudeTerminal {
     let overlayInput: ClaudeHomeOverlayOptions;
     let overlay: ClaudeHomeOverlay;
     let env: NodeJS.ProcessEnv;
+    let accountEnv: Record<string, string>;
     try {
       const current = await this.options.settings.read();
       // Forge workers run unattended, like Codex workers with approvals off.
@@ -91,14 +92,16 @@ export class ClaudeTerminal {
       if (input.agentTurn && !current.bypassAccepted)
         throw new Error("Forge workers on Claude run without permission prompts. Accept Claude Code's bypass-permissions warning in Settings → Claude, then resume the worker.");
       account = await accounts.resolve("claude", agent.accountId);
+      accountEnv = await accounts.launchEnv(account);
       overlayInput = {
         dataDir, tabId: input.tab.id, accountHome: accounts.home(account), providerHome: this.providerHome, executionId,
         resolved: template, cwd: input.cwd, userStatePath: claudeUserStatePath(this.env),
         trustProject: Boolean(await input.authorizeProjectTrust?.()) || settings.autoTrustWorkspace,
-        allowedSkills: current.skills.filter(skill => skill.allowed).map(skill => skill.name)
+        allowedSkills: current.skills.filter(skill => skill.allowed).map(skill => skill.name),
+        accountEnv
       };
       overlay = await materializeClaudeHomeOverlay(overlayInput);
-      env = claudeLaunchEnv(buildToolEnv(this.env), configDir, await accounts.launchEnv(account));
+      env = claudeLaunchEnv(buildToolEnv(this.env), configDir, accountEnv);
       applyTemplateEnv(env, template, overlay.rulesSkillsRoot, overlay.systemRules.map(rule => rule.id));
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
@@ -124,10 +127,11 @@ export class ClaudeTerminal {
     await conversation.reset();
     await fs.rm(agentTurnReceiptPath(configDir), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
-    const launch = buildLoginShellCommandLaunch(resolveClaudeCommand(env), args, env);
+    // The selected account wins over credentials the user's profile exports.
+    const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, claudeEnforcedEnv(configDir, accountEnv));
     const execution = await input.prepareTerminalExecution?.(input.tab.id);
     const terminalProcess = await this.options.factory.spawn(launch.command, launch.args, {
-      cwd: input.cwd, env, cols: 100, rows: 30,
+      cwd: input.cwd, env: launch.env, cols: 100, rows: 30,
       ...(execution ? { execution } : {}),
       ...(!input.tab.ownerPluginId ? { sessionId: input.tab.id } : {})
     });
@@ -208,7 +212,7 @@ export class ClaudeTerminal {
       replayBytes: this.options.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal" as const,
-      turnState: () => readAgentTurnState(receipt),
+      turnState: () => readClaudeTurnState(receipt, conversation.readForExecution(input.tab.id, current().codexExecutionId)?.transcriptPath),
       onEnded: () => this.options.usage?.ended(input.tab.id),
       restoreInput: current,
       observeConversation: () => conversation.observe(identity => {
