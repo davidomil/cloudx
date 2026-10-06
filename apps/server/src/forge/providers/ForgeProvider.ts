@@ -1,5 +1,6 @@
 import type {
   ForgeChangeRequest,
+  ForgeCiDiagnostic,
   ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
   ForgeCredentialRole,
@@ -27,6 +28,7 @@ export interface ForgeProvider {
   getIssue(number: number): Promise<ForgeIssueDetail>;
   getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus>;
   getChangeRequest(number: number): Promise<ForgeChangeRequest>;
+  getCiFailure(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic>;
   findChangeRequestByBranch(
     headBranch: string,
     baseBranch: string,

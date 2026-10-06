@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
-import type { ForgeIssueCompletionReport, ForgeIssueDetail, ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeTurnCompletion, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
+import type { ForgeCiDiagnostic, ForgeIssueCompletionReport, ForgeIssueDetail, ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeTurnCompletion, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
@@ -16,7 +16,7 @@ import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
-import type { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
+import { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
 import { validateReview } from "./providers/reviewValidation.js";
 import { ForgePlugin } from "../plugins/ForgePlugin.js";
@@ -58,6 +58,11 @@ function fixture(issueNumber = 1) {
     getIssue: vi.fn(async (_number?: number) => ({ ...issue })),
     getChangeRequestStatus: vi.fn(async () => ({ ...change })),
     getChangeRequest: vi.fn(async () => ({ ...change })),
+    getCiFailure: vi.fn(async (_change: ForgeChangeRequest): Promise<ForgeCiDiagnostic> => ({
+      repository: { provider: "github", apiUrl: "https://api.github.com", projectPath: "a/b" },
+      changeNumber: change.number, sourceHeadSha: change.headSha, targetHeadSha: change.targetHeadSha!,
+      failureKey: "logs-unavailable", state: "blocked", reason: "CI failure logs are unavailable.", jobs: [],
+    })),
     createChangeRequest: vi.fn(async () => change),
     updateChangeRequest: vi.fn(async (_number: number, _input: {title: string; body: string}) => {}),
     postReview: vi.fn(async (_number: number, _review: ForgeReviewSubmission): Promise<ForgeReviewPublication> => ({ commentIds: [] })),
@@ -4506,8 +4511,13 @@ describe("Forge discussion reply recovery", () => {
 describe("Forge issue auto review", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  async function automaticIssue(issueNumber = 1) {
+  async function automaticIssue(issueNumber = 1, providerKind: "github" | "gitlab" = "github") {
     const f = fixture(issueNumber);
+    if (providerKind === "gitlab") {
+      const settings = f.deps.settings();
+      f.deps.settings = () => ({ ...settings, repository: { ...settings.repository, provider: "gitlab", apiUrl: "https://gitlab.example/api/v4" } });
+      f.change.url = "https://gitlab.example/a/b/-/merge_requests/7";
+    }
     const save = f.deps.store.write;
     f.deps.store.write = async workers => save(parseWorkers(workers));
     let now = Date.now();
@@ -4597,27 +4607,568 @@ describe("Forge issue auto review", () => {
     expect(f.stored()).toEqual([]);
   });
 
-  it("pauses an approved current branch with failed CI and names the check results", async () => {
+  function failedCi(f: Pick<ReturnType<typeof fixture>, "change" | "deps" | "provider" | "reports">, extra: Partial<ForgeCiDiagnostic> = {}) {
+    const diagnostic: ForgeCiDiagnostic = {
+      repository: f.deps.settings().repository, changeNumber: f.change.number,
+      sourceHeadSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha!, testedSha: "e".repeat(40),
+      failureKey: `${f.change.headSha}:run-42:attempt-1:job-9`, state: "actionable",
+      jobs: [{ runId: "42", runAttempt: 1, jobId: "9", name: "affected tests", url: "https://ci.test/jobs/9",
+        conclusion: "failure", testedSha: "e".repeat(40), classification: "code", log: "AssertionError: null input throws" }],
+      ...extra,
+    };
+    f.change.checks = { state: "failed", url: `${f.change.url}/checks` };
+    f.provider.getCiFailure.mockResolvedValue(diagnostic);
+    f.reports.read.mockResolvedValue(undefined);
+    return diagnostic;
+  }
+
+  async function repairingCiIssue() {
     const f = await approvedIssue();
-    f.change.checks = { state: "failed", url: "https://github.com/a/b/pull/7/checks" };
-    f.runtime.updateIssueBranch.mockResolvedValue(f.change.headSha);
+    const diagnostic = failedCi(f);
     await f.poll();
-    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/CI.*failed.*https:\/\/github.com\/a\/b\/pull\/7\/checks.*Resume/) });
-    expect(f.currentIssue().pendingPublication).toBeUndefined();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1, diagnostic } });
+    return { ...f, diagnostic };
+  }
+
+  async function publishCiRepair(f: Awaited<ReturnType<typeof repairingCiIssue>>, headSha: string) {
+    f.codingReport({ handoff: { headSha, status: "ready", retainedPaths: [], details: "The failed test reproduces and passes with the fix." } });
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = headSha;
+      f.change.approved = false;
+      f.change.checks = { state: "pending", url: `${f.change.url}/checks` };
+      return headSha;
+    });
     await f.poll();
-    expect(f.runtime.updateIssueBranch).toHaveBeenCalledOnce();
-    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
-    f.change.checks.state = "passed";
+    if (f.currentReview().status !== "running") {
+      f.report(undefined);
+      await f.poll();
+    }
+  }
+
+  it("repairs an approved current branch once, republishes with its source lease, reviews and waits for fresh passing CI", async () => {
+    const f = await approvedIssue();
+    const sourceHead = f.change.headSha;
+    const firstReviewer = f.currentReview();
+    const diagnostic = failedCi(f);
+    const launch = f.runtime.launch.getMockImplementation()!;
+    f.runtime.launch.mockImplementation(async (...args) => {
+      const repair = f.currentIssue().ciRepair;
+      expect(repair).toMatchObject({ phase: "launching", attempts: 1, attemptedHeads: [sourceHead], diagnostic, attemptId: args[0].attemptId });
+      expect(f.currentIssue().attemptId).toBe(repair?.attemptId);
+      return launch(...args);
+    });
+    await f.poll();
+    f.runtime.launch.mockImplementation(launch);
+    expect(f.currentIssue()).toMatchObject({ status: "running", changeNumber: 7, branch: f.issue.branch,
+      ciRepair: { phase: "repairing", attempts: 1, attemptedHeads: [sourceHead], diagnostic } });
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(f.currentIssue().attemptId, expect.objectContaining({ ciRepair: expect.objectContaining({ diagnostic }) }));
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: f.issue.id, worktreePath: f.issue.worktreePath });
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0].prompt).toMatch(/reproduce/i);
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(2);
+    await f.poll(); await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.getCiFailure).toHaveBeenCalledOnce();
+    const repairedHead = "c".repeat(40);
+    await publishCiRepair({ ...f, diagnostic }, repairedHead);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, sourceHead);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.currentReview()).toMatchObject({ id: firstReviewer.id, headSha: repairedHead, status: "running", reviewHistory: [expect.objectContaining({ headSha: sourceHead })] });
+    expect(f.currentIssue().ciRepair).toMatchObject({ phase: "reviewing", repairedHeadSha: repairedHead });
+    f.report({ kind: "review", headSha: repairedHead, event: "approve", body: "Regression is covered", comments: [] });
+    await f.poll();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge" });
+    f.change.checks!.state = "unknown";
     f.change.mergeable = true;
-    await f.service.resume(f.issue.id, placement);
-    expect(f.provider.merge).toHaveBeenCalledOnce();
-    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    await f.poll();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.checks!.state = "passed";
+    f.change.mergeable = true;
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, repairedHead, f.change.targetHeadSha);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+    expect(f.provider.postReview).toHaveBeenCalledTimes(2);
+    expect(f.stored()).toEqual([]);
   });
 
-  it("updates a behind branch once when failed CI masks the provider behind status", async () => {
+  it("waits for the active reviewer, then repairs failed CI before publishing approval", async () => {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    const diagnostic = failedCi(f);
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.getCiFailure).not.toHaveBeenCalled();
+    expect(f.currentReview().status).toBe("running");
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Source looks sound", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1, diagnostic } });
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { reason: "Runner disk is full; application changes cannot repair infrastructure.", classification: "infrastructure" },
+    { reason: "CI credentials are unavailable; restore the provider permission.", classification: "credentials" },
+    { reason: "Required approval policy blocked the workflow.", classification: "policy" },
+    { reason: "The failed job log is unavailable; grant read access before diagnosing.", classification: "unknown" },
+    { reason: "The operator cancelled an optional job.", classification: "unknown" },
+  ] as const)("retains blocked diagnostics without coding: $reason", async ({ reason, classification }) => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f, { state: "blocked", reason, jobs: [{ runId: "42", runAttempt: 1, jobId: "9", name: "affected tests", url: "https://ci.test/jobs/9", conclusion: "failure", testedSha: f.change.headSha, classification }] });
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringContaining(reason),
+      ciRepair: { phase: "blocked", attempts: 0, attemptedHeads: [], diagnostic }, mergeQueue: { active: false } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["pending", "obsolete"] as const)("keeps %s CI evidence pollable without launching or counting a repair", async state => {
+    const f = await approvedIssue();
+    const reason = `${state} tested merge identity`;
+    const diagnostic = failedCi(f, { state, reason });
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", error: expect.stringContaining(reason),
+      ciRepair: { phase: "diagnosing", attempts: 0, attemptedHeads: [], diagnostic } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("stops waiting for CI diagnosis when the tested identity never progresses", async () => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f, { state: "pending", reason: "Waiting for the current tested merge identity." });
+    await f.poll();
+    f.advanceTime(120_001);
+    await f.poll();
+    const reads = f.provider.getCiFailure.mock.calls.length;
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", error: expect.stringMatching(/current tested merge identity.*Resume/i),
+      ciRepair: { phase: "diagnosing", attempts: 0, attemptedHeads: [], diagnostic } });
+    expect(f.provider.getCiFailure).toHaveBeenCalledTimes(reads);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["pending", "unknown", "skipped"] as const)("does not diagnose %s checks as terminal failures", async state => {
+    const f = await approvedIssue();
+    f.change.checks = { state: state === "skipped" ? "unknown" : state, url: `${f.change.url}/checks` };
+    f.reports.read.mockResolvedValue(undefined);
+    await f.poll(); await f.poll();
+    expect(f.provider.getCiFailure).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop"] as const)("honors explicit %s while CI diagnosis is in flight", async action => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f);
+    const diagnosing = deferred<void>();
+    const diagnosed = deferred<ForgeCiDiagnostic>();
+    f.provider.getCiFailure.mockImplementationOnce(() => { diagnosing.resolve(); return diagnosed.promise; });
+    const polling = f.poll();
+    await diagnosing.promise;
+    const stopping = f.service[action](f.issue.id);
+    diagnosed.resolve(diagnostic);
+    await Promise.all([polling, stopping]);
+    await f.poll();
+    expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("leaves disabled automation in operator control when CI fails", async () => {
+    const f = await approvedIssue();
+    await f.service.setAutoReview(f.issue.id, false, placement);
+    failedCi(f);
+    await f.poll(); await f.poll();
+    expect(f.provider.getCiFailure).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("honors disabled automation while CI diagnosis is in flight", async () => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f);
+    const diagnosing = deferred<void>();
+    const diagnosed = deferred<ForgeCiDiagnostic>();
+    f.provider.getCiFailure.mockImplementationOnce(() => { diagnosing.resolve(); return diagnosed.promise; });
+    const polling = f.poll();
+    await diagnosing.promise;
+    const disabling = f.service.setAutoReview(f.issue.id, false, placement);
+    diagnosed.resolve(diagnostic);
+    await Promise.all([polling, disabling]);
+    await f.poll();
+    expect(f.currentIssue().autoReview?.enabled).toBe(false);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("keeps other issue workers responsive while awaiting CI diagnosis", async () => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f, { state: "blocked", reason: "The runner needs attention." });
+    const issue = await f.provider.getIssue();
+    f.provider.getIssue.mockImplementation(async number => ({ ...issue, number: number ?? 1 }));
+    const diagnosing = deferred<void>();
+    const diagnosed = deferred<ForgeCiDiagnostic>();
+    f.provider.getCiFailure.mockImplementationOnce(() => { diagnosing.resolve(); return diagnosed.promise; });
+    const polling = f.poll();
+    await diagnosing.promise;
+    try {
+      const another = await f.service.startIssue(f.deps.settings().repository, 2, placement);
+      expect(another).toMatchObject({ number: 2, status: "running" });
+      expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    } finally {
+      diagnosed.resolve(diagnostic);
+      await polling;
+    }
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "blocked", attempts: 0 } });
+  });
+
+  it.each(["closed", "merged"] as const)("does not repair a %s request", async state => {
+    const f = await approvedIssue();
+    failedCi(f);
+    f.change.state = state;
+    f.change.merged = state === "merged";
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.getCiFailure).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["headSha", "headBranch", "baseBranch", "targetHeadSha"] as const)("rejects a changed %s after collecting CI evidence", async field => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f);
+    f.provider.getCiFailure.mockImplementationOnce(async () => {
+      f.change[field] = field.endsWith("Sha") ? "d".repeat(40) : "other-branch";
+      return diagnostic;
+    });
+    await f.poll(); await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.currentIssue().status).toMatch(/failed|paused/);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("stops an unchanged repair handoff with a concrete no-progress reason", async () => {
+    const f = await repairingCiIssue();
+    f.codingReport({ handoff: { headSha: f.diagnostic.sourceHeadSha, status: "ready", retainedPaths: ["diagnostic.txt"], details: "The failed assertion is still reproducible." } });
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/unchanged|progress/i), ciRepair: { phase: "blocked", attempts: 1 } });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["lowercase", "uppercase"] as const)("deduplicates the same failed source across a different run and restart (%s persisted SHA)", async shaCase => {
+    const f = await repairingCiIssue();
+    const saved = f.stored();
+    const issue = saved.find(worker => worker.id === f.issue.id)!;
+    issue.status = "awaiting_merge";
+    issue.ciRepair!.phase = "blocked";
+    const attemptedHead = shaCase === "uppercase" ? f.diagnostic.sourceHeadSha.toUpperCase() : f.diagnostic.sourceHeadSha;
+    issue.ciRepair!.attemptedHeads = [attemptedHead];
+    issue.ciRepair!.reason = "The failed assertion remains on the unchanged source.";
+    issue.autoReview!.phase = "merging";
+    issue.attemptId = undefined;
+    issue.completion = undefined;
+    await f.deps.store.write(saved);
+    failedCi(f, { failureKey: "same-source:new-run:new-attempt" });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    await restarted.resume(f.issue.id, placement);
+    await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "blocked", attempts: 1, attemptedHeads: [attemptedHead] }, error: expect.stringMatching(/already|same|unchanged/i) });
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+  });
+
+  it("permits a second failed source head and stops at the lifetime repair budget", async () => {
+    const f = await repairingCiIssue();
+    const secondHead = "c".repeat(40);
+    await publishCiRepair(f, secondHead);
+    const secondDiagnostic = failedCi(f);
+    f.report({ kind: "review", headSha: secondHead, event: "approve", body: "Source is ready", comments: [] });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 2, attemptedHeads: [f.diagnostic.sourceHeadSha, secondHead], diagnostic: secondDiagnostic } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(5);
+    const thirdHead = "d".repeat(40);
+    await publishCiRepair(f, thirdHead);
+    failedCi(f);
+    f.report({ kind: "review", headSha: thirdHead, event: "approve", body: "Source is ready", comments: [] });
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "blocked", attempts: 2 }, error: expect.stringMatching(/budget|limit|two|2/i) });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["diagnosing", "ready"] as const)("continues a persisted %s repair after restart with one durable launch intention", async phase => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f);
+    const saved = f.stored();
+    saved.find(worker => worker.id === f.issue.id)!.ciRepair = { phase, attempts: 0, attemptedHeads: [], ...(phase === "ready" ? { diagnostic } : {}) };
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll(); await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1, diagnostic } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.currentIssue().attemptId).toBe(f.currentIssue().ciRepair?.attemptId);
+  });
+
+  it("reconnects a running repair after restart without starting a second writer", async () => {
+    const f = await repairingCiIssue();
+    f.runtime.recover.mockResolvedValue({ workspace: { id: f.issue.id, repositoryPath: "/repo/work", worktreePath: "/repo/work", branch: f.issue.branch! }, tabIds: ["tab-1"] });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll(); await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attemptId: f.currentIssue().attemptId } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("consumes a completed repair report after restart and retains the exact source lease", async () => {
+    const f = await repairingCiIssue();
+    const repairedHead = "c".repeat(40);
+    f.codingReport({ handoff: { headSha: repairedHead, status: "ready", retainedPaths: ["failure-reproduction.txt"], details: "The captured assertion passes with this commit." } });
+    f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = repairedHead; f.change.checks = { state: "pending", url: `${f.change.url}/checks` }; return repairedHead; });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, f.diagnostic.sourceHeadSha);
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: repairedHead, ciRepair: { phase: "reviewing", attempts: 1 } });
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
+    expect(f.runtime.preparePublication).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(String), expect.objectContaining({ retainedPaths: ["failure-reproduction.txt"] }), expect.any(AbortSignal));
+  });
+
+  it("resumes interrupted CI repair publication after restart without another coding attempt", async () => {
+    const f = await repairingCiIssue();
+    const repairedHead = "c".repeat(40);
+    f.codingReport({ handoff: { headSha: repairedHead, status: "ready", retainedPaths: [], details: "The reproduced assertion passes." } });
+    f.runtime.publishBranch.mockRejectedValueOnce(new Error("Push response interrupted; inspect the remote."));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "failed", ciRepair: { phase: "publishing", repairedHeadSha: repairedHead }, pendingPublication: { handoff: { headSha: repairedHead } } });
+    f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = repairedHead; f.change.checks = { state: "pending", url: `${f.change.url}/checks` }; return repairedHead; });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.resume(f.issue.id, placement);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, f.diagnostic.sourceHeadSha);
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", ciRepair: { phase: "reviewing", attempts: 1 } });
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "target"] as const)("retains the repair when the %s changes before publication and preserves the lease on Resume", async moved => {
+    const f = await repairingCiIssue();
+    const repairedHead = "c".repeat(40);
+    f.codingReport({ handoff: { headSha: repairedHead, status: "ready", retainedPaths: ["failure-reproduction.txt"], details: "The reproduction passes with this commit." } });
+    if (moved === "source") f.change.headSha = "d".repeat(40);
+    else f.change.targetHeadSha = "d".repeat(40);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "blocked", attempts: 1 },
+      pendingPublication: { handoff: { headSha: repairedHead }, report: { handoff: { retainedPaths: ["failure-reproduction.txt"] } } }, error: expect.stringMatching(/source|target|changed/i) });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    await f.service.resume(f.issue.id, placement);
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    f.change.headSha = f.diagnostic.sourceHeadSha;
+    f.change.targetHeadSha = f.diagnostic.targetHeadSha;
+    f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = repairedHead; f.change.checks = { state: "pending", url: `${f.change.url}/checks` }; return repairedHead; });
+    await f.service.resume(f.issue.id, placement);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, f.diagnostic.sourceHeadSha);
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+  });
+
+  it("repairs a real GitLab merged-results failure, republishes and reviews, waits for its current pending pipeline, then merges success", async () => {
+    const f = await approvedIssue(1, "gitlab");
+    const sourceHead = f.change.headSha;
+    const repairedHead = "c".repeat(40);
+    const firstReviewer = f.currentReview();
+    const pipeline = { id: 42, project_id: 1, sha: "e".repeat(40), status: "failed", source: "merge_request_event",
+      web_url: "https://gitlab.example/a/b/-/pipelines/42" };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const pathname = decodeURIComponent(new URL(String(input)).pathname);
+      let body: unknown;
+      if (pathname === "/api/v4/projects/a/b/merge_requests/7") body = {
+        iid: 7, title: "Fix issue", description: "Tested", state: "opened", sha: f.change.headSha,
+        source_branch: f.change.headBranch, target_branch: "main", target_project_id: 1, head_pipeline: pipeline,
+        web_url: f.change.url, labels: [], author: { username: "worker" }, updated_at: "2026-09-01T00:00:00Z", draft: false,
+        detailed_merge_status: "mergeable", diff_refs: { head_sha: f.change.headSha, base_sha: f.change.baseSha },
+      };
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7/approvals") body = { approved: false, approved_by: [] };
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7/versions") body = [{ head_commit_sha: f.change.headSha,
+        patch_id_sha: f.change.headSha, created_at: "2026-09-01T00:00:00Z" }];
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7/discussions" || pathname === "/api/v4/projects/a/b/merge_requests/7/closes_issues") body = [];
+      else if (pathname === "/api/v4/projects/a/b/repository/branches/main") body = { name: "main", commit: { id: f.change.targetHeadSha } };
+      else if (pathname === `/api/v4/projects/a/b/repository/commits/${pipeline.sha}`) body = {
+        id: pipeline.sha, parent_ids: [f.change.targetHeadSha, f.change.headSha],
+      };
+      else if (pathname === "/api/v4/projects/a/b/pipelines/42") body = pipeline;
+      else if (pathname === "/api/v4/projects/a/b/pipelines/42/jobs") body = [{ id: 9, name: "affected tests", status: "failed",
+        allow_failure: false, failure_reason: "script_failure", web_url: "https://gitlab.example/a/b/-/jobs/9", commit: { id: pipeline.sha }, pipeline }];
+      else if (pathname === "/api/v4/projects/a/b/jobs/9/trace")
+        return new Response("AssertionError: null input throws\n", { headers: { "content-type": "text/plain" } });
+      else throw new Error(`Unexpected merged-results request: ${input}`);
+      return Response.json(body);
+    });
+    const credentials = { headers: async () => ({ "PRIVATE-TOKEN": "worker-test-secret" }), requestDelay: () => undefined,
+      deferRequests: () => {} } as unknown as ConstructorParameters<typeof ForgeHttpClient>[1];
+    const provider = new GitLabProvider(new ForgeHttpClient(f.deps.settings().repository, credentials, fetcher as typeof fetch));
+    f.provider.getChangeRequest.mockImplementation(async () => ({ ...structuredClone(f.change), checks: (await provider.getChangeRequest(7)).checks }));
+    f.provider.getCiFailure.mockImplementation(change => provider.getCiFailure(change));
+    f.report(undefined);
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1,
+      diagnostic: { state: "actionable", sourceHeadSha: sourceHead, testedSha: pipeline.sha } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.getCiFailure).toHaveBeenCalledOnce();
+
+    f.codingReport({ handoff: { headSha: repairedHead, status: "ready", retainedPaths: [], details: "The failed assertion reproduces and passes with the fix." } });
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = repairedHead;
+      f.change.approved = false;
+      pipeline.sha = "f".repeat(40);
+      pipeline.status = "pending";
+      return repairedHead;
+    });
+    await f.poll();
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, sourceHead);
+    expect(f.currentReview()).toMatchObject({ id: firstReviewer.id, status: "running", headSha: repairedHead });
+    expect(f.currentIssue().ciRepair).toMatchObject({ phase: "reviewing", attempts: 1 });
+    f.report({ kind: "review", headSha: repairedHead, event: "approve", body: "Regression is covered", comments: [] });
+    f.change.mergeable = true;
+    await f.poll(); await f.poll();
+    expect((await f.provider.getChangeRequest()).checks).toMatchObject({ state: "pending", url: pipeline.web_url });
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { attempts: 1 } });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+
+    pipeline.status = "success";
+    expect((await f.provider.getChangeRequest()).checks).toMatchObject({ state: "passed", url: pipeline.web_url });
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, repairedHead, f.change.targetHeadSha);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+    expect(f.stored()).toEqual([]);
+  });
+
+  function realCiDiagnostics(f: Awaited<ReturnType<typeof approvedIssue>>, providerKind: "github" | "gitlab", log: string, jobName = "affected tests") {
+    const repository = f.deps.settings().repository;
+    const sourceHead = f.change.headSha;
+    const targetHead = f.change.targetHeadSha;
+    const testedMerge = "e".repeat(40);
+    const token = "worker-test-secret";
+    const run = { id: 42, run_attempt: 1, head_sha: sourceHead, status: "completed", conclusion: "failure",
+      repository: { full_name: repository.projectPath }, pull_requests: [{ number: 7, head: { sha: sourceHead }, base: { sha: targetHead } }] };
+    const job = { id: 9, run_id: 42, head_sha: sourceHead, name: jobName, status: "completed", conclusion: "failure",
+      check_run_url: "https://api.github.com/repos/a/b/check-runs/9", html_url: "https://github.com/a/b/actions/runs/42/job/9" };
+    const pipeline = { id: 42, project_id: 1, sha: sourceHead, status: "failed" };
+    const labJob = { id: 9, name: jobName, status: "failed", allow_failure: false, failure_reason: "script_failure",
+      web_url: "https://gitlab.example/a/b/-/jobs/9", commit: { id: sourceHead }, pipeline };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      const pathname = decodeURIComponent(url.pathname);
+      let body: unknown;
+      if (pathname === "/graphql") body = { data: { repository: { pullRequest: {
+        number: 7, state: "OPEN", headRefOid: sourceHead, headRefName: f.change.headBranch, baseRefOid: targetHead, baseRefName: "main",
+        headRef: { target: { oid: sourceHead, statusCheckRollup: { contexts: {
+          nodes: [{ __typename: "CheckRun", databaseId: 9, name: jobName, status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }],
+          pageInfo: { hasNextPage: false },
+        } } } },
+      } } } };
+      else if (pathname === "/repos/a/b/actions/runs/42") body = run;
+      else if (pathname === "/repos/a/b/actions/runs/42/attempts/1/jobs") body = { jobs: [job] };
+      else if (pathname === "/repos/a/b/pulls/7") body = { number: 7, state: "open", merged: false, mergeable: true, head: { sha: sourceHead }, base: { sha: targetHead, repo: { full_name: "a/b" } } };
+      else if (pathname === "/repos/a/b/git/ref/pull/7/merge") body = { ref: "refs/pull/7/merge", object: { type: "commit", sha: testedMerge } };
+      else if (pathname === `/repos/a/b/git/commits/${testedMerge}`) body = { sha: testedMerge, parents: [{ sha: targetHead }, { sha: sourceHead }] };
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7") body = { iid: 7, state: "opened", sha: sourceHead, source_branch: f.change.headBranch, target_branch: "main", target_project_id: 1, head_pipeline: pipeline };
+      else if (pathname === "/api/v4/projects/a/b/repository/branches/main") body = { name: "main", commit: { id: targetHead } };
+      else if (pathname === "/api/v4/projects/a/b/pipelines/42") body = pipeline;
+      else if (pathname === "/api/v4/projects/a/b/repository/merge_base") body = { id: targetHead };
+      else if (pathname === "/api/v4/projects/a/b/pipelines/42/jobs") body = [labJob];
+      else if (pathname.endsWith("/jobs/9/logs") || pathname.endsWith("/jobs/9/trace"))
+        return new Response(`${providerKind === "github" ? `Syncing repository: a/b\n[command]/usr/bin/git log -1 --format=%H\n${testedMerge}\n` : ""}${log}`, { headers: { "content-type": "text/plain" } });
+      else throw new Error(`Unexpected CI evidence request: ${url}`);
+      return Response.json(body);
+    });
+    const credentials = { headers: async () => providerKind === "github" ? { Authorization: `Bearer ${token}` } : { "PRIVATE-TOKEN": token }, requestDelay: () => undefined, deferRequests: () => {} } as unknown as ConstructorParameters<typeof ForgeHttpClient>[1];
+    const http = new ForgeHttpClient(repository, credentials, fetcher as typeof fetch);
+    const provider = providerKind === "github" ? new GitHubProvider(http) : new GitLabProvider(http);
+    f.provider.getCiFailure.mockImplementation(change => provider.getCiFailure(change));
+    f.change.checks = { state: "failed", url: `${f.change.url}/checks` };
+    f.reports.read.mockResolvedValue(undefined);
+    return { repository, sourceHead, targetHead, testedMerge, token, fetcher };
+  }
+
+  it.each(["github", "gitlab"] as const)("collects real %s adapter diagnostics through the repair workflow and redacts credentials", async providerKind => {
+    const f = await approvedIssue(1, providerKind);
+    const opaqueSecrets = { access_token: "opaque-access-value", PASSWORD: "opaque-password-value", client_secret: "opaque-client-value" };
+    const { repository, sourceHead, targetHead, testedMerge, token, fetcher } = realCiDiagnostics(f, providerKind,
+      `AssertionError: null input throws\nCI_TOKEN=worker-test-secret\n${JSON.stringify(opaqueSecrets)}\n`);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1,
+      diagnostic: { repository, changeNumber: 7, sourceHeadSha: sourceHead, targetHeadSha: targetHead, state: "actionable", jobs: [{ runId: "42", runAttempt: 1, jobId: "9", testedSha: providerKind === "github" ? testedMerge : sourceHead, classification: "code", log: expect.stringContaining("[REDACTED]") }] } } });
+    for (const secret of [token, ...Object.values(opaqueSecrets)]) {
+      expect(JSON.stringify(f.reports.prepare.mock.calls.at(-1)?.[1])).not.toContain(secret);
+      expect(JSON.stringify(f.currentIssue().ciRepair)).not.toContain(secret);
+    }
+    expect(fetcher.mock.calls.some(([url]) => String(url).endsWith(providerKind === "github" ? "/actions/jobs/9/logs" : "/jobs/9/trace"))).toBe(true);
+    await f.poll(); await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  describe.each(["github", "gitlab"] as const)("real %s CI failure classification", providerKind => {
+    it.each([
+      { name: "HTTP 403 assertion", log: "AssertionError: expected 403 to equal 200", classification: "code" },
+      { name: "HTTP 503 assertion", log: "AssertionError: expected 503 to equal 200", classification: "code" },
+      { name: "rejects unauthorized clients", log: "FAIL rejects unauthorized clients\nAssertionError: expected false to equal true", classification: "code" },
+      { name: "provider authentication", log: "remote: Authentication failed: invalid access token", classification: "credentials" },
+      { name: "offline runner", log: "Runner offline: lost communication with the runner", classification: "infrastructure" },
+      { name: "HTTP assertion with an authentication failure", log: "AssertionError: expected 403 to equal 200\nremote: Authentication failed: invalid access token", classification: "credentials" },
+    ] as const)("routes $name to $classification without inventing another repair", async ({ name, log, classification }) => {
+      const f = await approvedIssue(1, providerKind);
+      realCiDiagnostics(f, providerKind, log, name);
+      await f.poll(); await f.poll();
+      const actionable = classification === "code";
+      expect(f.currentIssue()).toMatchObject({ status: actionable ? "running" : "paused", ciRepair: {
+        phase: actionable ? "repairing" : "blocked", attempts: actionable ? 1 : 0,
+        diagnostic: { state: actionable ? "actionable" : "blocked", jobs: [{ name, classification }] },
+      } });
+      expect(f.runtime.launch).toHaveBeenCalledTimes(actionable ? 3 : 2);
+      expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+      expect(f.provider.merge).not.toHaveBeenCalled();
+    });
+  });
+
+  it("does not repeat a launch with an uncertain persisted launch checkpoint", async () => {
+    const f = await approvedIssue();
+    const diagnostic = failedCi(f);
+    const saved = f.stored();
+    const issue = saved.find(worker => worker.id === f.issue.id)!;
+    const attemptId = randomUUID();
+    issue.ciRepair = { phase: "launching", attempts: 1, attemptedHeads: [f.change.headSha], diagnostic, attemptId };
+    issue.attemptId = attemptId;
+    issue.completion = undefined;
+    issue.status = "starting";
+    issue.error = undefined;
+    issue.autoReview!.phase = "implementing";
+    await f.deps.store.write(saved);
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    f.runtime.isActive.mockReturnValue(false);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll(); await restarted.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "launching", attempts: 1, attemptId }, error: expect.stringMatching(/launch|uncertain|reconcile/i) });
+  });
+
+  it("updates an explicitly behind branch once before attempting CI repair", async () => {
     const f = await approvedIssue();
     f.change.checks = { state: "failed", url: "https://github.com/a/b/pull/7/checks" };
-    f.change.requiresBaseUpdate = false;
+    f.change.requiresBaseUpdate = true;
     f.runtime.updateIssueBranch.mockResolvedValue("c".repeat(40));
     f.runtime.publishBranch.mockImplementation(async () => {
       f.change.headSha = "c".repeat(40);
@@ -4674,8 +5225,8 @@ describe("Forge issue auto review", () => {
     expect(f.provider.postReview).toHaveBeenCalledOnce();
   });
 
-  async function approvedIssue(issueNumber = 1) {
-    const f = await automaticIssue(issueNumber);
+  async function approvedIssue(issueNumber = 1, providerKind: "github" | "gitlab" = "github") {
+    const f = await automaticIssue(issueNumber, providerKind);
     f.codingReport(); await f.poll();
     f.change.mergeable = false;
     f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
