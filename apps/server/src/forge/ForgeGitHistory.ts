@@ -13,7 +13,14 @@ const bundleName = "history.bundle";
 const maxHistoryRefs = 128;
 const archiveIdPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 const commitPattern = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
-const generatedRefPattern = /^refs\/cloudx\/before-rebase\/(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
+
+export function generatedGitHistoryCommit(ref: string): string | undefined {
+  const beforeRebase = /^refs\/cloudx\/before-rebase\/([a-f0-9]{40}|[a-f0-9]{64})$/u.exec(ref);
+  if (beforeRebase) return beforeRebase[1];
+  const review = /^refs\/cloudx\/reviews\/([a-f0-9]{40}|[a-f0-9]{64})\/([a-f0-9]{40}|[a-f0-9]{64})\/(head|base)$/u.exec(ref);
+  if (!review || review[1]!.length !== review[2]!.length) return;
+  return review[3] === "head" ? review[1] : review[2];
+}
 
 export interface ForgeGitHistoryInput {
   workerId: string;
@@ -39,7 +46,7 @@ export class ForgeGitHistory {
       throw new Error("Durable Git history and staging must stay outside the disposable checkout.");
     if (await fs.realpath(input.checkoutIdentity.path) !== input.checkoutIdentity.path) throw new Error("Git history source must not contain symbolic links.");
     const checkout = await openOwnedDirectoryNoFollow(path.dirname(input.checkoutIdentity.path), input.checkoutIdentity.path, "Git history checkout", input.checkoutIdentity);
-    const refs = input.refs.map(name => ({ name, commitSha: name.slice(name.lastIndexOf("/") + 1) })).sort((left, right) => left.name.localeCompare(right.name));
+    const refs = input.refs.map(name => ({ name, commitSha: generatedGitHistoryCommit(name)! })).sort((left, right) => left.name.localeCompare(right.name));
     const assertSource = async () => {
       signal?.throwIfAborted();
       await checkout.assertCurrent();
@@ -177,7 +184,7 @@ async function sourceRefs(refs: ForgeGitHistoryRef[], runGit: RunForgeHistoryGit
   const output = await runGit(["--no-replace-objects", "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)%09%(objecttype)", ...refs.map(ref => ref.name)], signal);
   return output.split("\n").filter(Boolean).map(line => {
     const [name, commitSha, symbolic, type, extra] = line.split("\t");
-    if (!name || !commitSha || symbolic !== "" || type !== "commit" || extra !== undefined || !generatedRefPattern.test(name) || !commitPattern.test(commitSha))
+    if (!name || !commitSha || symbolic !== "" || type !== "commit" || extra !== undefined || generatedGitHistoryCommit(name) !== commitSha)
       throw new Error("Generated Git ref identity is invalid; the checkout was preserved.");
     return { name, commitSha };
   }).sort((left, right) => left.name.localeCompare(right.name));
@@ -289,9 +296,9 @@ function validateInput(input: ForgeGitHistoryInput): void {
   safeId(input.workerId);
   safeId(input.attemptId);
   if (!commitPattern.test(input.commitSha) || !Array.isArray(input.refs) || !input.refs.length || input.refs.length > maxHistoryRefs ||
-    new Set(input.refs).size !== input.refs.length || input.refs.some(ref => typeof ref !== "string" || !generatedRefPattern.test(ref)) ||
+    new Set(input.refs).size !== input.refs.length || input.refs.some(ref => typeof ref !== "string" || !generatedGitHistoryCommit(ref)) ||
     !input.checkoutIdentity || typeof input.checkoutIdentity.path !== "string" || path.resolve(input.checkoutIdentity.path) !== input.checkoutIdentity.path ||
-    !validIdentity(input.checkoutIdentity)) throw new Error("Only bounded, exact generated pre-rebase refs may be archived automatically.");
+    !validIdentity(input.checkoutIdentity)) throw new Error("Only bounded, exact generated pre-rebase or review head/base refs may be archived automatically.");
 }
 
 function assertInputManifest(input: ForgeGitHistoryInput, refs: ForgeGitHistoryRef[], manifest: ForgeGitHistoryManifest): void {
@@ -324,7 +331,7 @@ export function isGitHistoryReceipt(value: unknown): value is ForgeGitHistoryRec
 
 function validRefs(value: unknown): value is ForgeGitHistoryRef[] {
   return Array.isArray(value) && value.length > 0 && value.length <= maxHistoryRefs && value.every(ref => isRecord(ref) &&
-    typeof ref.name === "string" && generatedRefPattern.test(ref.name) && typeof ref.commitSha === "string" && commitPattern.test(ref.commitSha) && ref.name === `refs/cloudx/before-rebase/${ref.commitSha}`) &&
+    typeof ref.name === "string" && typeof ref.commitSha === "string" && commitPattern.test(ref.commitSha) && generatedGitHistoryCommit(ref.name) === ref.commitSha) &&
     new Set(value.map(ref => ref.name)).size === value.length;
 }
 function validIdentity(value: unknown): boolean { return isRecord(value) && typeof value.dev === "string" && /^\d+$/u.test(value.dev) && typeof value.ino === "string" && /^\d+$/u.test(value.ino); }

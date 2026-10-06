@@ -246,6 +246,149 @@ describe("Forge workflow retention after completed workspace discard", () => {
     expect(archives.flatMap(manifest => manifest.files).map(file => file.path)).toHaveLength(513);
   }, 30_000);
 
+  it.each(["branch", "tag", "annotated tag", "stash"] as const)("preserves a completed reviewer's unpublished %s after report archival and restart", async history => {
+    const fixture = await RetentionFixture.create("review");
+    const checkout = fixture.workspace.worktreePath;
+    await fs.unlink(path.join(checkout, "research.txt"));
+    await git(checkout, ["switch", "-c", "private-experiment"]);
+    await fs.writeFile(path.join(checkout, "README.md"), "Private reviewer investigation\n");
+    await git(checkout, ["add", "README.md"]);
+    let ref = "refs/heads/private-experiment";
+    if (history === "stash") {
+      await git(checkout, ["stash", "push", "-m", "Private reviewer investigation"]);
+      ref = "refs/stash";
+    } else {
+      await git(checkout, ["commit", "-m", "TEST: private reviewer investigation"]);
+      if (history === "tag" || history === "annotated tag") {
+        await git(checkout, history === "tag" ? ["tag", "private-review"] : ["tag", "-a", "private-review", "-m", "Private reviewer investigation"]);
+        ref = "refs/tags/private-review";
+      }
+    }
+    const privateCommit = await git(checkout, ["rev-parse", `${ref}^{commit}`]);
+    await git(checkout, ["checkout", "--detach", fixture.worker.headSha!]);
+    if (history !== "branch") await git(checkout, ["branch", "-D", "private-experiment"]);
+    const attemptId = await fixture.completeReviewWithReport();
+    await fixture.service.poll();
+    const retained = { worktreePath: checkout, retainedPaths: [".git"], reason: expect.stringContaining(ref) };
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: retained });
+    expect(await git(checkout, ["rev-parse", "HEAD"])).toBe(fixture.worker.headSha);
+    expect(await git(checkout, ["rev-parse", `${ref}^{commit}`])).toBe(privateCommit);
+    expect(await git(checkout, ["show", `${ref}:README.md`])).toBe("Private reviewer investigation");
+    const [report] = await new ForgeCheckoutEvidence(fixture.dataDir).list();
+    expect(report).toMatchObject({ workerId: fixture.worker.id, attemptId, commitSha: fixture.worker.headSha,
+      files: [{ path: "test-results/reproduction.log" }] });
+    await expect(fs.lstat(path.join(checkout, "test-results/reproduction.log"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await new ForgeGitHistory(fixture.dataDir).list()).toEqual([]);
+    await fixture.restart();
+    await fixture.service.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: retained });
+    expect(await git(checkout, ["rev-parse", `${ref}^{commit}`])).toBe(privateCommit);
+    expect(await fixture.reports.read(attemptId)).toEqual(fixture.report);
+    expect(await fixture.service.workerHistory(fixture.worker.id)).toEqual(fixture.history);
+  }, 20_000);
+
+  it("preserves a private reviewer ref introduced between the initial Git scan and removal authorization", async () => {
+    const fixture = await RetentionFixture.create("review");
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    const runGit = fixture.runtimeDependencies.git!;
+    const ref = "refs/heads/private-review-race";
+    let privateCommit: string | undefined;
+    fixture.runtimeDependencies.git = async (...args) => {
+      const output = await runGit(...args);
+      if (!privateCommit && args[1][0] === "for-each-ref" && args[1].some(argument => argument.startsWith("--no-merged="))) {
+        privateCommit = await git(fixture.workspace.worktreePath, ["commit-tree", `${fixture.worker.headSha}^{tree}`,
+          "-p", fixture.worker.headSha!, "-m", "Private reviewer history introduced during cleanup"]);
+        await git(fixture.workspace.worktreePath, ["update-ref", ref, privateCommit]);
+      }
+      return output;
+    };
+    await fixture.completeReviewWithReport();
+    await fixture.service.poll();
+    expect(privateCommit).toBeDefined();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "completed",
+      retainedWorkspace: { retainedPaths: [".git"], reason: expect.stringContaining(ref) } });
+    expect(await git(fixture.workspace.worktreePath, ["rev-parse", ref])).toBe(privateCommit);
+    expect((await fixture.receipt()).cleanupRemoval).toBeUndefined();
+  }, 20_000);
+
+  it.each(["refs/heads/private-review", "refs/cloudx/review-base", `refs/cloudx/reviews/${"a".repeat(40)}/${"b".repeat(40)}/head`])("preserves unpublished reviewer history in %s without an evidence retirement receipt", async ref => {
+    const fixture = await RetentionFixture.create("review", false, { initiallyRetained: false });
+    const checkout = fixture.workspace.worktreePath;
+    await fs.unlink(path.join(checkout, "research.txt"));
+    const privateCommit = await git(checkout, ["commit-tree", `${fixture.worker.headSha}^{tree}`,
+      "-p", fixture.worker.headSha!, "-m", "Private reviewer investigation"]);
+    await git(checkout, ["update-ref", ref, privateCommit]);
+    const retained = { retainedPaths: [".git"], reason: expect.stringContaining(ref) };
+    expect(await fixture.workflowDependencies.runtime.cleanup({ ...fixture.workspace, expectedHeadSha: fixture.worker.headSha })).toMatchObject(retained);
+    expect((await fixture.receipt()).evidenceRetirement).toBeUndefined();
+    await fixture.restart();
+    expect(await fixture.workflowDependencies.runtime.cleanup({ ...fixture.workspace, expectedHeadSha: fixture.worker.headSha })).toMatchObject(retained);
+    expect(await git(checkout, ["rev-parse", ref])).toBe(privateCommit);
+  }, 20_000);
+
+  it("blocks removal when a private reviewer ref appears after the final Git scan", async () => {
+    const fixture = await RetentionFixture.create("review");
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    const runGit = fixture.runtimeDependencies.git!;
+    const ref = "refs/heads/private-review-late-race";
+    let scans = 0;
+    let privateCommit: string | undefined;
+    fixture.runtimeDependencies.git = async (...args) => {
+      const output = await runGit(...args);
+      if (args[1][0] === "for-each-ref" && args[1].some(argument => argument.startsWith("--no-merged=")) && ++scans === 2) {
+        privateCommit = await git(fixture.workspace.worktreePath, ["commit-tree", `${fixture.worker.headSha}^{tree}`,
+          "-p", fixture.worker.headSha!, "-m", "Private reviewer history introduced after the final scan"]);
+        await git(fixture.workspace.worktreePath, ["update-ref", ref, privateCommit]);
+      }
+      return output;
+    };
+    const attemptId = await fixture.completeReviewWithReport();
+    await fixture.service.poll();
+    expect(privateCommit).toBeDefined();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("new or modified contents") });
+    const removal = (await fixture.receipt()).cleanupRemoval as { path: string };
+    expect(await git(removal.path, ["rev-parse", ref])).toBe(privateCommit);
+    await fixture.restart();
+    await fixture.service.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("new or modified contents") });
+    expect(await git(removal.path, ["rev-parse", ref])).toBe(privateCommit);
+    expect(await fixture.reports.read(attemptId)).toEqual(fixture.report);
+    expect(await fixture.service.workerHistory(fixture.worker.id)).toEqual(fixture.history);
+  }, 20_000);
+
+  it.each(["advanced beyond", "diverged from"] as const)("retires a clean completed reviewer when its recorded comparison base has %s its pinned head", async relationship => {
+    const fixture = await RetentionFixture.create("review", false, { initiallyRetained: false });
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    const source = path.join(fixture.root, "source");
+    if (relationship === "diverged from") {
+      await git(source, ["switch", "-c", "reviewed-change"]);
+      await fs.writeFile(path.join(source, "reviewed-change.txt"), "Published change under review\n");
+      await git(source, ["add", "reviewed-change.txt"]);
+      await git(source, ["commit", "-m", "TEST: published change under review"]);
+      await git(source, ["push", "origin", "reviewed-change"]);
+      fixture.worker.headSha = await git(source, ["rev-parse", "HEAD"]);
+      await git(source, ["switch", "main"]);
+    }
+    await fs.writeFile(path.join(source, "new-target.txt"), "Published target branch update\n");
+    await git(source, ["add", "new-target.txt"]);
+    await git(source, ["commit", "-m", "TEST: published target branch update"]);
+    await git(source, ["push", "origin", "main"]);
+    const baseSha = await git(source, ["rev-parse", "HEAD"]);
+    const runtime = new ForgeRuntime(fixture.runtimeDependencies);
+    await runtime.refreshReviewWorkspace(fixture.workspace, { headSha: fixture.worker.headSha!, baseSha, baseBranch: "main" });
+    const comparison = await runtime.prepareReviewScope(fixture.workspace);
+    await runtime.retainReviewBaseline(fixture.workspace, comparison.current);
+    await git(fixture.workspace.worktreePath, ["branch", "known-published-base", baseSha]);
+    const attemptId = await fixture.completeReviewWithReport();
+    await fixture.service.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const [report] = await new ForgeCheckoutEvidence(fixture.dataDir).list();
+    expect(report).toMatchObject({ workerId: fixture.worker.id, attemptId, commitSha: fixture.worker.headSha });
+    expect(await new ForgeGitHistory(fixture.dataDir).list()).toEqual([]);
+    expect(await fixture.service.workerHistory(fixture.worker.id)).toEqual(fixture.history);
+  }, 20_000);
+
   it("retires a completed checkout with pre-rebase history only after saving a restorable Git bundle", async () => {
     const fixture = await RetentionFixture.create();
     await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
@@ -531,6 +674,44 @@ describe("Forge workflow retention after completed workspace discard", () => {
     expect(await fixture.service.workerHistory(fixture.worker.id)).toEqual(fixture.history);
   });
 
+  it.each(["head", "base", "head with a private branch"] as const)("archives an unreachable reviewer snapshot %s without exempting private refs", async snapshot => {
+    const fixture = await RetentionFixture.create("review");
+    const checkout = fixture.workspace.worktreePath;
+    await fs.unlink(path.join(checkout, "research.txt"));
+    const previousCommit = await git(checkout, ["commit-tree", `${fixture.worker.headSha}^{tree}`,
+      "-p", fixture.worker.headSha!, "-m", "Previous reviewer snapshot"]);
+    const ref = snapshot === "base" ? `refs/cloudx/reviews/${fixture.worker.headSha}/${previousCommit}/base`
+      : `refs/cloudx/reviews/${previousCommit}/${fixture.worker.headSha}/head`;
+    await git(checkout, ["update-ref", ref, previousCommit]);
+    const privateBranch = "refs/heads/private-review-snapshot";
+    if (snapshot === "head with a private branch") await git(checkout, ["update-ref", privateBranch, previousCommit]);
+    const attemptId = await fixture.completeReviewWithReport();
+    await fixture.service.poll();
+    if (snapshot === "head with a private branch") {
+      expect((await fixture.store.read())[0]).toMatchObject({ status: "completed",
+        retainedWorkspace: { retainedPaths: [".git"], reason: expect.stringContaining(privateBranch) } });
+      expect(await git(checkout, ["rev-parse", privateBranch])).toBe(previousCommit);
+    } else {
+      expect(await fixture.store.read()).toEqual([]);
+      await expect(fs.lstat(checkout)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    await fixture.restart();
+    const archive = new ForgeGitHistory(fixture.dataDir);
+    const [manifest] = await archive.list();
+    expect(manifest).toMatchObject({ workerId: fixture.worker.id, attemptId, commitSha: fixture.worker.headSha,
+      refs: [{ name: ref, commitSha: previousCommit }] });
+    const bundlePath = path.join(fixture.root, "review-history.bundle");
+    const chunks: Buffer[] = [];
+    for await (const chunk of await archive.fileStream(manifest!.archiveId)) chunks.push(chunk);
+    await fs.writeFile(bundlePath, Buffer.concat(chunks));
+    const restored = path.join(fixture.root, "restored-review.git");
+    await git(fixture.root, ["init", "--bare", restored]);
+    await git(restored, ["fetch", bundlePath, `${ref}:${ref}`]);
+    expect(await git(restored, ["rev-parse", ref])).toBe(previousCommit);
+    expect(await git(restored, ["show", "-s", "--format=%s", ref])).toBe("Previous reviewer snapshot");
+    expect(await fixture.reports.read(attemptId)).toEqual(fixture.report);
+  }, 20_000);
+
   it.each(["missing", "invalid"] as const)("preserves stale workflow retention when the ownership receipt is %s", async receipt => {
     const fixture = await RetentionFixture.create();
     await fixture.discardWithoutWorkflowSave();
@@ -705,6 +886,18 @@ class RetentionFixture {
 
   receipt(): Promise<Record<string, unknown>> {
     return fs.readFile(this.manifestPath, "utf8").then(content => JSON.parse(content));
+  }
+
+  async completeReviewWithReport(): Promise<string> {
+    const attemptId = this.worker.attemptId!;
+    this.worker.completion = { attemptId, deadlineAt: new Date().toISOString() };
+    this.worker.attemptId = undefined;
+    await this.store.write([this.worker]);
+    await fs.appendFile(path.join(this.workspace.worktreePath, ".git/info/exclude"), "\ntest-results/\n");
+    await fs.mkdir(path.join(this.workspace.worktreePath, "test-results"));
+    await fs.writeFile(path.join(this.workspace.worktreePath, "test-results/reproduction.log"), "Completed reviewer validation\n");
+    await this.restart();
+    return attemptId;
   }
 
   async nameEvidence(relative: string, bytes: number): Promise<void> {

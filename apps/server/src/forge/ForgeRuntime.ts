@@ -44,7 +44,7 @@ import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { cleanupIgnoredForgePath } from "./ForgeGeneratedCleanup.js";
 import { isGeneratedForgeLink, isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
 import { ForgeCheckoutEvidence, isCheckoutEvidenceReceipt } from "./ForgeCheckoutEvidence.js";
-import { ForgeGitHistory, isGitHistoryReceipt } from "./ForgeGitHistory.js";
+import { ForgeGitHistory, generatedGitHistoryCommit, isGitHistoryReceipt } from "./ForgeGitHistory.js";
 import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 import { captureForgeRemovalContents, assertForgeRemovalContents, isForgeRemovalContents, type ForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 
@@ -1966,14 +1966,14 @@ export class ForgeRuntime {
         explicitRetainedPaths = owned.explicitRetainedPaths;
       }
       let retainedPaths = owned.prepared ? await this.filesRequiringRetention(owned, signal, explicitRetainedPaths) : [];
-      let unpublishedRefs = owned.prepared && owned.branchOwned
+      let unpublishedRefs = owned.prepared
         ? await this.unpublishedGitRefs(owned, expectedHeadSha, signal) : [];
       if (unpublishedRefs.length) { retainedPaths.push(".git"); retainedPaths.sort(); }
       const removalContents = retainedPaths.length ? undefined : await captureForgeRemovalContents(owned.worktree, signal);
       if (removalContents && owned.prepared) {
         // Every captured survivor must also pass the retention decision before removal.
         retainedPaths = await this.filesRequiringRetention(owned, signal, explicitRetainedPaths);
-        unpublishedRefs = owned.branchOwned ? await this.unpublishedGitRefs(owned, expectedHeadSha, signal) : [];
+        unpublishedRefs = await this.unpublishedGitRefs(owned, expectedHeadSha, signal);
         if (unpublishedRefs.length) { retainedPaths.push(".git"); retainedPaths.sort(); }
       }
       if (retainedPaths.length) {
@@ -2149,6 +2149,7 @@ export class ForgeRuntime {
     await this.assertCheckout(owned);
     const publishedHeads = [...new Set([
       owned.baseCommit, expectedHeadSha,
+      owned.role === "reviewer" ? owned.reviewBaseSha : undefined,
       owned.branchPublication?.confirmed ? owned.branchPublication.headSha : undefined,
       owned.issueRebase?.publication?.confirmed ? owned.issueRebase.publication.headSha : undefined,
       owned.publishedSync?.confirmed ? owned.publishedSync.expectedRemoteHeadSha : undefined,
@@ -2167,7 +2168,8 @@ export class ForgeRuntime {
         throw new Error("Git refs changed during cleanup. Local history was preserved.");
       unpublished.add(ref);
     }
-    const generated = [...unpublished].filter(ref => /^refs\/cloudx\/before-rebase\/(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(ref)).sort();
+    const generated = [...unpublished].filter(ref => generatedGitHistoryCommit(ref) &&
+      (owned.role === "reviewer" || ref.startsWith("refs/cloudx/before-rebase/"))).sort();
     if (owned.evidenceRetirement && generated.length) {
       await new ForgeGitHistory(this.dependencies.dataDir).preserve({
         workerId: owned.id, attemptId: owned.evidenceRetirement.attemptId, commitSha: owned.evidenceRetirement.commitSha,

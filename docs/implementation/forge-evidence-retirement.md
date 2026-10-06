@@ -53,7 +53,7 @@ archives live under `forge-evidence/<resourceId>`. Container creation requires
 specific evidence paths when evidence retention is requested. Legacy unnamed or
 explicitly kept holds are not silently discarded.
 
-## Pre-rebase history survives retirement
+## Generated Git history survives retirement
 
 Forge-generated `refs/cloudx/before-rebase/<commit>` snapshots are preserved in
 self-contained Git bundles under `forge-git-history/<archiveId>`. Before retiring
@@ -61,6 +61,19 @@ the checkout, Forge restores the exact refs into an empty repository and verifie
 its objects. The bundle, provenance and ownership receipt are then synchronized
 and checksum-verified. Arbitrary unpublished branches, stashes and other Git refs
 remain protected; this is not authority to discard unpublished work.
+
+Reviewer checkouts receive the same unpublished-ref checks as issue checkouts,
+before and after capturing removal contents. The receipt-recorded review head
+and comparison base are known comparison commits; mutable refs do not establish
+that authority. A private branch, tag or stash remains protected even when HEAD
+matches the reviewed commit and the report has already been archived.
+
+Rewritten reviews can leave older head or base snapshots unreachable from the
+current comparison. Exact `refs/cloudx/reviews/<head>/<base>/head` and `/base`
+snapshots use the same verified bundle archive. The ref must resolve directly to
+the commit embedded in its name; unpublished malformed, symbolic or retargeted
+snapshots remain protected. Archiving a generated snapshot does not exempt a private
+branch pointing to the same commit.
 
 Download `history.bundle` from Forge → Evidence to recover a snapshot. For example,
 after creating an empty repository, fetching the manifest-listed ref from the

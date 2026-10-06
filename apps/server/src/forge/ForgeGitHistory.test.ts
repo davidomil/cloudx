@@ -67,17 +67,21 @@ function beforeBundleVerification(action: (handle: FileHandle) => Promise<void>)
 }
 
 describe("Durable generated Git history", () => {
-  it("restores exact generated refs and their full history after the source checkout is deleted", async () => {
-    const fixtureState = await fixture();
+  it.each(["sha1", "sha256"].flatMap(objectFormat => ["before-rebase", "review head", "review base"].map(history => ({ objectFormat, history }))))("restores exact $history refs and their full $objectFormat history after the source checkout is deleted", async ({ objectFormat, history }) => {
+    const fixtureState = await fixture(objectFormat);
+    const firstRef = history === "before-rebase" ? fixtureState.ref : history === "review head"
+      ? `refs/cloudx/reviews/${fixtureState.originalSha}/${fixtureState.input.commitSha}/head`
+      : `refs/cloudx/reviews/${fixtureState.input.commitSha}/${fixtureState.originalSha}/base`;
+    await fixtureState.git(["update-ref", firstRef, fixtureState.originalSha]);
     const secondRef = `refs/cloudx/before-rebase/${fixtureState.input.commitSha}`;
     await fixtureState.git(["update-ref", secondRef, fixtureState.input.commitSha]);
     await fixtureState.git(["update-ref", "refs/private/unpublished", fixtureState.originalSha]);
     await fixtureState.git(["update-ref", "refs/stash", fixtureState.originalSha]);
-    const input = { ...fixtureState.input, refs: [secondRef, fixtureState.ref] };
+    const input = { ...fixtureState.input, refs: [secondRef, firstRef] };
     const manifest = await fixtureState.archive.preserve(input, undefined, fixtureState.save, fixtureState.git);
     expect(manifest.refs).toEqual([
       { name: secondRef, commitSha: fixtureState.input.commitSha },
-      { name: fixtureState.ref, commitSha: fixtureState.originalSha },
+      { name: firstRef, commitSha: fixtureState.originalSha },
     ].sort((left, right) => left.name.localeCompare(right.name)));
     expect(await fixtureState.git(["rev-parse", "refs/private/unpublished"])).toBe(`${fixtureState.originalSha}\n`);
     expect(await fixtureState.git(["rev-parse", "refs/stash"])).toBe(`${fixtureState.originalSha}\n`);
@@ -90,12 +94,12 @@ describe("Durable generated Git history", () => {
     for await (const chunk of stream) chunks.push(chunk);
     await fs.writeFile(download, Buffer.concat(chunks));
     const restored = path.join(fixtureState.root, "restored.git");
-    await execute("git", ["init", "--bare", "--template=", restored]);
+    await execute("git", ["init", "--bare", "--template=", `--object-format=${objectFormat}`, restored]);
     await execute("git", ["--git-dir", restored, "bundle", "verify", download]);
     await execute("git", ["--git-dir", restored, "fetch", download, ...manifest.refs.map(ref => `${ref.name}:${ref.name}`)]);
     const refs = (await execute("git", ["--git-dir", restored, "for-each-ref", "--format=%(objectname) %(refname)"])).stdout;
     expect(refs.trim().split("\n").sort()).toEqual(manifest.refs.map(ref => `${ref.commitSha} ${ref.name}`).sort());
-    expect((await execute("git", ["--git-dir", restored, "show", `${fixtureState.ref}:original.txt`])).stdout).toBe("Unpublished pre-rebase work\n");
+    expect((await execute("git", ["--git-dir", restored, "show", `${firstRef}:original.txt`])).stdout).toBe("Unpublished pre-rebase work\n");
     expect(await fs.readdir(path.join(fixtureState.dataDir, "forge-git-history-staging"))).toEqual([]);
   });
 
@@ -333,12 +337,20 @@ describe("Durable generated Git history", () => {
     expect(await fs.readdir(path.join(fixtureState.dataDir, "forge-git-history-staging"))).toEqual([]);
   });
 
-  it.each(["arbitrary ref", "stash", "malformed generated ref", "empty", "duplicate", "symbolic ref", "wrong SHA"])("rejects %s rather than widening automatic preservation", async invalid => {
+  it.each(["arbitrary ref", "stash", "malformed generated ref", "malformed review ref", "mixed review hashes", "tampered review snapshot", "symbolic review snapshot", "unverifiable merge-base", "empty", "duplicate", "symbolic ref", "wrong SHA"])("rejects %s rather than widening automatic preservation", async invalid => {
     const fixtureState = await fixture();
     let refs = [fixtureState.ref];
     if (invalid === "arbitrary ref") refs = ["refs/private/work"];
     if (invalid === "stash") refs = ["refs/stash"];
     if (invalid === "malformed generated ref") refs = ["refs/cloudx/before-rebase/../../HEAD"];
+    if (invalid === "malformed review ref") refs = ["refs/cloudx/reviews/../../HEAD/head"];
+    if (invalid === "mixed review hashes") refs = [`refs/cloudx/reviews/${fixtureState.originalSha}/${"a".repeat(64)}/head`];
+    if (invalid === "unverifiable merge-base") refs = [`refs/cloudx/reviews/${fixtureState.originalSha}/${fixtureState.input.commitSha}/merge-base`];
+    if (invalid === "tampered review snapshot" || invalid === "symbolic review snapshot") {
+      refs = [`refs/cloudx/reviews/${fixtureState.originalSha}/${fixtureState.input.commitSha}/head`];
+      if (invalid === "tampered review snapshot") await fixtureState.git(["update-ref", refs[0]!, fixtureState.input.commitSha]);
+      else await fixtureState.git(["symbolic-ref", refs[0]!, "refs/heads/main"]);
+    }
     if (invalid === "empty") refs = [];
     if (invalid === "duplicate") refs.push(fixtureState.ref);
     if (invalid === "symbolic ref") await fixtureState.git(["symbolic-ref", fixtureState.ref, "refs/heads/main"]);
