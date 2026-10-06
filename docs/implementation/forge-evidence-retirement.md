@@ -1,72 +1,68 @@
-# Forge cleanup and durable evidence
+# Automatic Forge retirement
 
-## Manage cleanup
+Forge removes disposable checkouts and owned containers after authoritative
+issue closure or merge and process quiescence. A completed review still protects
+its workspace until the request is merged. Paused, failed and unfinished workers,
+open batch issues and shared consumers remain protected.
 
-Forge → Environments combines the filesystem cleanup inventory and
-container evidence decisions. Settings → Workspaces opens all workspace
-types. Settings → Updates opens the Forge, trash and container filter.
-Retained update backups remain in Updates.
+There is no workspace cleanup menu, selection, trash workflow or cleanup shortcut
+in Settings or Updates. Forge → Evidence is read-only: it lists saved reports and
+Git history with manifest and file downloads. Retained installation backups are
+still managed separately in Settings → Updates.
 
-The application shares selection, cleanup jobs and busy state across
-navigation. Returning to Updates refreshes capacity. A failed
-cleanup-status request blocks cleanup and updates until the user
-reconnects status in Environments. Ordinary checkouts and worktrees
-remain explicitly labelled. Source discard and permanent deletion
-require separate confirmations.
+## Reports survive the checkout
 
-## Evidence handoff
+Retirement uses the attempt recorded in the completion receipt, even after the
+active attempt has ended. Named evidence and untracked report trees under
+`.cloudx`, `test-results`, `playwright-report`, `coverage` and `debug_tooling` move
+to private storage outside the disposable checkout. Automatic report selection
+never includes a tree with tracked files. Uncommitted source outside these report
+trees remains protected. Dependencies and build descendants are excluded.
 
-After authoritative closure or merge and process quiescence, named
-evidence moves to private storage outside the disposable checkout or
-container. The manifest records worker, attempt and commit provenance,
-selected paths, byte counts and SHA-256 checksums.
+Each archive contains at most 256 MiB of regular files and 512 files. A completed
+checkout can split up to 1 GiB and 4096 files into multiple archives; an individual
+file cannot exceed 256 MiB. Metadata is limited to 1 MiB. Content streams in
+64 KiB chunks. Named publication selections use the same bounded multiarchive
+plan. Unknown links, special files, embedded repositories and changed evidence block
+automatic retirement rather than being silently discarded.
 
-Exports stream to private files, flush their content and receipt, then
-publish the archive directory atomically. Content, size, inventory and
-provenance are verified before source removal. Verification synchronizes
-the archive directory and its parents again after restart. A failed
-directory sync keeps the disposable resource protected even when the
-archive is visible.
+Every archive and its ownership receipt must be durable before any selected
+source file is removed. Manifests record worker, completion attempt, commit,
+checkout identity, source paths, byte counts and SHA-256 checksums. Verification
+checks contents, inventory and provenance, and synchronizes archive directory
+names again after restart. Failed archive or receipt synchronization preserves
+the checkout. A cleanup failure appears on its worker instead of becoming a
+manual filesystem deletion workflow.
 
-Checkout archives live under `forge-checkout-evidence/<archiveId>`;
-container archives live under `forge-evidence/<resourceId>`. Each
-directory contains `manifest.json` and flat content files named from the
-hash of their source path. Environments exposes manifest and
-individual-file downloads after worker retirement. Existing verified
-compact container archives remain readable.
+Checkout archives live under `forge-checkout-evidence/<archiveId>`; container
+archives live under `forge-evidence/<resourceId>`. Container creation requires
+specific evidence paths when evidence retention is requested. Legacy unnamed or
+explicitly kept holds are not silently discarded.
 
-## Bounded selections
+## Pre-rebase history survives retirement
 
-Each export allows at most 256 MiB of regular file content and 512
-files. Metadata is limited to 1 MiB. File content is processed in 64 KiB
-chunks. Docker transport also has a 520 MiB tar limit, 8,192-entry limit
-and 60-second process timeout.
+Forge-generated `refs/cloudx/before-rebase/<commit>` snapshots are preserved in
+self-contained Git bundles under `forge-git-history/<archiveId>`. Before retiring
+the checkout, Forge restores the exact refs into an empty repository and verifies
+its objects. The bundle, provenance and ownership receipt are then synchronized
+and checksum-verified. Arbitrary unpublished branches, stashes and other Git refs
+remain protected; this is not authority to discard unpublished work.
 
-Declare specific valuable ignored files or subtrees with
-`retainedEvidencePaths`. Publication validates their existence,
-directory identities, file types and storage bounds. Select a specific
-report file inside a build tree instead of naming the entire build or
-dependency directory. Generated descendants are excluded from a named
-report subtree.
+Download `history.bundle` from Forge → Evidence to recover a snapshot. For example,
+after creating an empty repository, fetching the manifest-listed ref from the
+bundle into a local branch restores it: `git fetch /path/to/history.bundle
+refs/cloudx/before-rebase/<commit>:refs/heads/recovered`.
 
-Only ignored, untracked `test-results/.last-run.json` with a recognized
-Playwright report shape is automatically handed off. Unknown reports and
-reproduction files remain protected until explicitly named or
-deliberately discarded. Uncommitted source, unpublished Git refs and
-explicitly kept container holds remain protected.
+## Ownership remains authoritative
 
-## Existing retained resources
+Automatic removal still revalidates checkout ownership, Git state, process
+quiescence and directory identities. Container cleanup only removes exact
+receipt-owned containers after all consumers close; images and shared volumes
+are preserved. Ordinary repositories and developer worktrees are not part of
+automatic Forge retirement.
 
-In Environments, inspect the selected paths, commit and consumers before
-exporting a legacy hold. Keep preserves the hold; Export verifies the
-durable copy and releases the environment; Discard requires its explicit
-permanent-evidence confirmation. A verified archive offers cleanup retry
-without changing its provenance.
-
-Filesystem cleanup still revalidates session activity, process activity,
-directory identity and source protections. Unreadable same-user
-processes stay uncertain unless they are the authoritative systemd user
-manager or its verified PAM keeper in the exact `init.scope`. Readable
-active cwd and open files always protect the candidate. An exited
-process leader is skipped only after whole-group exit is established;
-surviving or unknown threads keep the candidate protected.
+Transient device numbers can change after reboot. Archive traversal compares
+descendants with the opened checkout's current device only after validating its
+durable filesystem identity. Generated dependency links are unlinked without
+following their targets; unknown or escaping links remain protected. Regular
+report files named `build` or `dist` are saved, not treated as directories.

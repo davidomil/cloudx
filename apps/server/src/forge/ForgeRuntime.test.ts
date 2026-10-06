@@ -13,6 +13,7 @@ import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeReviewRevision, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
+import { ForgeCheckoutEvidence } from "./ForgeCheckoutEvidence.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { WorkspaceCleanupService } from "../workspace/WorkspaceCleanupService.js";
 import * as filesystemEvidence from "../filesystemIdentity.js";
@@ -1582,6 +1583,40 @@ describe("ForgeRuntime publication handoff", () => {
     expect((await fs.stat(path.join(workspace.worktreePath, "reports/coverage.json"))).size).toBe(256 * 1024 * 1024 + 1);
     await expect(git(origin, "rev-parse", workspace.branch)).rejects.toThrow();
   });
+
+  it.each(["between batches", "after interrupted export"] as const)("protects named multiarchive evidence changed %s after the real publication handoff", async changed => {
+    const workspace = await prepare();
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\nreports/\n");
+    await fs.mkdir(path.join(workspace.worktreePath, "reports"));
+    for (let index = 0; index < 513; index++)
+      await fs.writeFile(path.join(workspace.worktreePath, "reports/report-" + index.toString().padStart(4, "0") + ".log"), "Validated evidence");
+    await runtime.preparePublication(workspace, "named-multiarchive", { ...ready(headSha, []), retainedEvidencePaths: ["reports"] });
+    await runtime.publishBranch(workspace);
+    const lastReport = path.join(workspace.worktreePath, "reports/report-0512.log");
+    const cleanup = { ...workspace, expectedHeadSha: headSha, retireEvidence: { attemptId: "named-multiarchive", commitSha: headSha, paths: ["reports"] } };
+    const originalExport = ForgeCheckoutEvidence.prototype.export;
+    let exports = 0;
+    const interrupted = vi.spyOn(ForgeCheckoutEvidence.prototype, "export").mockImplementation(async function (this: ForgeCheckoutEvidence, ...args) {
+      exports++;
+      if (changed === "after interrupted export" && exports === 2) throw new Error("Storage unavailable");
+      const manifest = await originalExport.apply(this, args);
+      if (changed === "between batches" && exports === 1) await fs.writeFile(lastReport, "Later unpublished investigation");
+      return manifest;
+    });
+    try {
+      await expect(runtime.cleanup(cleanup)).rejects.toThrow(changed === "between batches" ? /changed after the validated/ : /Storage unavailable/);
+    } finally { interrupted.mockRestore(); }
+    if (changed === "after interrupted export") {
+      await fs.writeFile(lastReport, "Later unpublished investigation");
+      runtime = new ForgeRuntime(dependencies());
+      await expect(runtime.cleanup(cleanup)).rejects.toThrow(/changed after the validated/);
+    }
+    expect(await fs.readFile(lastReport, "utf8")).toBe("Later unpublished investigation");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "reports/report-0000.log"), "utf8")).toBe("Validated evidence");
+    const owned = JSON.parse(await fs.readFile(path.join(root, "data/forge-workers/workspaces", workspace.id + ".json"), "utf8"));
+    expect(owned.checkoutEvidenceRemovalStarted).toBeUndefined();
+  }, 20_000);
 
   it("preserves named reports changed after the validated handoff during authoritative retirement", async () => {
     const workspace = await prepare();
@@ -4778,7 +4813,7 @@ describe("Forge completed retained checkout reconciliation", () => {
     } finally { await f.service.dispose(); }
   });
 
-  it("recomputes named evidence and stale protections while pruning generated siblings under generic report directories", async () => {
+  it("archives report trees automatically while preserving compiler-shaped handwritten source", async () => {
     const workspace = await prepare(randomUUID());
     await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
     await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\n.cloudx/\ntest-results/\n*.tsbuildinfo\n");
@@ -4794,13 +4829,15 @@ describe("Forge completed retained checkout reconciliation", () => {
     try {
       await f.service.poll();
       const retained = (await f.store.read())[0]!.retainedWorkspace!;
-      expect(retained.retainedPaths).toEqual([".cloudx/evidence.log", "research.tsbuildinfo", "test-results"]);
-      expect(retained.reason).toContain(".cloudx/evidence.log");
+      expect(retained.retainedPaths).toEqual(["research.tsbuildinfo"]);
+      expect(retained.reason).toContain("research.tsbuildinfo");
       expect(retained.reason).not.toContain("missing.log");
       for (const directory of [".cloudx/node_modules", "test-results/dist"]) await expect(fs.lstat(path.join(workspace.worktreePath, directory))).rejects.toMatchObject({ code: "ENOENT" });
-      expect(await fs.readFile(path.join(workspace.worktreePath, "test-results/reproduction.txt"), "utf8")).toBe("Useful reproduction");
-      await fs.rm(path.join(workspace.worktreePath, ".cloudx/evidence.log"));
-      await fs.rm(path.join(workspace.worktreePath, "test-results"), { recursive: true });
+      const archive = new ForgeCheckoutEvidence(path.join(root, "data"));
+      const [saved] = await archive.list();
+      const chunks: Buffer[] = [];
+      for await (const chunk of await archive.fileStream(saved!.archiveId, "test-results/reproduction.txt")) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe("Useful reproduction");
       await fs.rm(path.join(workspace.worktreePath, "research.tsbuildinfo"));
       await f.service.dispose();
       f.service = new ForgeWorkflowService(f.deps);

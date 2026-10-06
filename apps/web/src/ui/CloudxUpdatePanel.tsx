@@ -246,9 +246,8 @@ export function useCloudxUpdate(settingsOpen: boolean, saveWorkspace: () => Prom
   };
 }
 
-export function CloudxUpdatePanel({ update, onOpenForge, onOpenEnvironments, cleanupBusy = false }: {
+export function CloudxUpdatePanel({ update, onOpenForge }: {
   update: CloudxUpdateController; onOpenForge?: () => void;
-  onOpenEnvironments?: () => void; cleanupBusy?: boolean;
 }) {
   const { status, preview, channel, previewLoading, starting, checking, reassessing, notice, error } = update;
   const [backupCleanupBusy, setBackupCleanupBusy] = useState(true);
@@ -261,7 +260,7 @@ export function CloudxUpdatePanel({ update, onOpenForge, onOpenEnvironments, cle
   const selectedTargetDiffers = preview?.target?.commit !== status?.run?.targetCommit;
   const confirmingResume = canResume && status?.confirmation?.targetCommit === status.run?.targetCommit;
   const confirmation = confirmingResume || status?.confirmation?.targetCommit === preview?.target?.commit ? status?.confirmation : undefined;
-  const cleanupActive = cleanupBusy || backupCleanupBusy;
+  const cleanupActive = backupCleanupBusy;
   const startDisabled = !status?.available || !canUpdate || starting || running || checking || previewLoading || reassessing || cleanupActive || Boolean(error) || canResume && !selectedTargetDiffers;
   const forgeBlocker = status?.forgeBlocker ?? status?.run?.forgeBlocker;
   return <section className="settings-section browser-notification-settings cloudx-update-settings" aria-label="CloudX updates">
@@ -305,10 +304,8 @@ export function CloudxUpdatePanel({ update, onOpenForge, onOpenEnvironments, cle
     </ControlButton> : null}
     <ControlButton size="compact" onClick={update.check} disabled={starting || checking || previewLoading || reassessing || cleanupActive}>Check update status</ControlButton>
     {canResume ? <ControlButton size="compact" onClick={() => void update.reassessCapacity()} disabled={starting || checking || reassessing || cleanupActive}>{reassessing ? "Rechecking capacity…" : "Recheck update capacity"}</ControlButton> : null}
-    {onOpenEnvironments && !running ? <ControlButton size="compact" onClick={onOpenEnvironments} disabled={starting || checking || reassessing}>Manage Forge environments</ControlButton> : null}
-    <small>Workspace cleanup runs in Forge Environments. Update capacity is refreshed when you return to Updates.</small>
     <small>The update starts immediately and continues if you close Settings.</small>
-    <CloudxUpdateBackupsPanel updateActive={starting || running || checking || reassessing || cleanupBusy} onBusyChange={setBackupCleanupBusy} onComplete={update.check} />
+    <CloudxUpdateBackupsPanel updateActive={starting || running || checking || reassessing} onBusyChange={setBackupCleanupBusy} onComplete={update.check} />
   </section>;
 }
 

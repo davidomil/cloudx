@@ -6,6 +6,7 @@ import type { ForgeCheckoutEvidenceManifest, ForgeCheckoutEvidenceReceipt, Forge
 import type { DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
 import { ForgeEvidenceFiles, maxEvidenceBytes, maxEvidenceFiles } from "./ForgeEvidenceFiles.js";
+import { isGeneratedForgeLink } from "./ForgeGeneratedArtifacts.js";
 
 const namespace = "forge-checkout-evidence";
 const generatedTrees = new Set(["node_modules", "dist", "build", ".venv", "__pycache__", ".pytest_cache", ".vite"]);
@@ -14,6 +15,30 @@ const generatedTrees = new Set(["node_modules", "dist", "build", ".venv", "__pyc
 export class ForgeCheckoutEvidence {
   private readonly storage: ForgeEvidenceFiles;
   constructor(private readonly dataDir: string) { this.storage = new ForgeEvidenceFiles(dataDir); }
+
+  async planSelection(identity: DirectoryIdentity, paths: string[], signal?: AbortSignal): Promise<string[][]> {
+    const selection = selectionRoots(paths);
+    const batches: string[][] = [];
+    let batch: string[] = [];
+    let bytes = 0;
+    let totalBytes = 0;
+    let files = 0;
+    await visitEvidence(identity, selection, async (_target, relative, stat) => {
+      const size = Number(stat.size);
+      totalBytes += size;
+      if (size > maxEvidenceBytes || totalBytes > 1024 * 1024 * 1024 || ++files > 4096)
+        throw new Error("Completed checkout evidence exceeds the automatic archive limit (1 GiB / 4096 files, 256 MiB per file); the checkout was preserved.");
+      if (batch.length && (batch.length >= maxEvidenceFiles || bytes + size > maxEvidenceBytes)) {
+        batches.push(batch);
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(relative);
+      bytes += size;
+    }, signal);
+    if (batch.length) batches.push(batch);
+    return batches.length === 1 ? [selection] : batches;
+  }
 
   async validateSelection(identity: DirectoryIdentity, paths: string[], signal?: AbortSignal): Promise<void> {
     let bytes = 0;
@@ -70,9 +95,10 @@ export class ForgeCheckoutEvidence {
   async read(archiveId: string): Promise<ForgeCheckoutEvidenceManifest> {
     const manifest = await this.storage.readManifest<ForgeCheckoutEvidenceManifest>(namespace, archiveId);
     if (!validManifest(manifest) || manifest.archiveId !== archiveId) throw new Error("No valid checkout evidence manifest is available.");
-    const owned = await new JsonStateFile(this.dataDir, `forge-workers/workspaces/${safeId(manifest.workerId)}.json`, "Checkout evidence ownership").read<{ checkoutEvidence?: ForgeCheckoutEvidenceReceipt; worktree?: DirectoryIdentity }>();
-    if (!owned?.checkoutEvidence || !owned.worktree) throw new Error("Checkout evidence has no durable ownership receipt.");
-    return this.verifyReceipt(manifest.workerId, owned.worktree, owned.checkoutEvidence, manifest);
+    const owned = await new JsonStateFile(this.dataDir, `forge-workers/workspaces/${safeId(manifest.workerId)}.json`, "Checkout evidence ownership").read<{ checkoutEvidence?: ForgeCheckoutEvidenceReceipt; additionalCheckoutEvidence?: ForgeCheckoutEvidenceReceipt[]; worktree?: DirectoryIdentity }>();
+    const receipt = [owned?.checkoutEvidence, ...owned?.additionalCheckoutEvidence ?? []].find(receipt => receipt?.archiveId === archiveId);
+    if (!receipt || !owned?.worktree) throw new Error("Checkout evidence has no durable ownership receipt.");
+    return this.verifyReceipt(manifest.workerId, owned.worktree, receipt, manifest);
   }
 
   async list(): Promise<ForgeCheckoutEvidenceManifest[]> {
@@ -100,28 +126,6 @@ export class ForgeCheckoutEvidence {
   }
 }
 
-/** Only this documented report shape is automatically handed off without a named selection. */
-export async function playwrightLastRunEvidence(identity: DirectoryIdentity): Promise<string[]> {
-  const relative = "test-results/.last-run.json";
-  let recognized = false;
-  await visitEvidence(identity, [relative], async (target, _relative, stat) => {
-    if (stat.size > 1024n * 1024n) return;
-    const handle = await openEvidenceFile(target, stat);
-    try {
-      let report;
-      try { report = JSON.parse(await handle.readFile("utf8")); } catch { return; }
-      recognized = report && typeof report === "object" && !Array.isArray(report) &&
-        Object.keys(report).every(key => ["status", "failedTests", "testDurations"].includes(key)) &&
-        ["passed", "failed", "interrupted", "timedout"].includes(report.status) &&
-        Array.isArray(report.failedTests) && report.failedTests.every((id: unknown) => typeof id === "string") &&
-        (report.testDurations === undefined || report.testDurations && typeof report.testDurations === "object" && !Array.isArray(report.testDurations) &&
-          Object.values(report.testDurations).every(duration => typeof duration === "number" && Number.isFinite(duration) && duration >= 0));
-      assertUnchanged(stat, await handle.stat({ bigint: true }));
-    } finally { await handle.close(); }
-  }, undefined, true);
-  return recognized ? [relative] : [];
-}
-
 async function visitEvidence(identity: DirectoryIdentity, selections: string[], visitor: (target: string, relative: string, stat: BigIntStats, assertParents: () => Promise<void>) => Promise<void>,
   signal?: AbortSignal, allowMissing = false): Promise<void> {
   if (!selections.length || selections.some(relative => !safePath(relative))) throw new Error("Checkout evidence requires safe repository-relative paths without Git metadata.");
@@ -136,12 +140,18 @@ async function visitEvidence(identity: DirectoryIdentity, selections: string[], 
     let stat;
     try { stat = await fs.lstat(target, { bigint: true }); }
     catch (error) { if (allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
-    if (stat.dev.toString() !== identity.dev || stat.isSymbolicLink() || !stat.isDirectory() && !stat.isFile()) throw new Error("Checkout evidence contains a link, another filesystem or special file; the checkout was preserved.");
+    if (stat.dev.toString() !== root.identity.dev) throw new Error("Checkout evidence crosses a filesystem boundary; the checkout was preserved.");
     if (stat.isFile()) { await assertParents(); await visitor(target, relative, stat, assertParents); await assertParents(); return; }
-    if (generatedTrees.has(path.posix.basename(relative))) {
+    if (stat.isDirectory() && generatedTrees.has(path.posix.basename(relative))) {
       if (selected) throw new Error("Select specific evidence files instead of a dependency or build tree.");
       return;
     }
+    if (!selected && stat.isSymbolicLink()) {
+      const targetPath = await fs.readlink(target);
+      assertUnchanged(stat, await fs.lstat(target, { bigint: true }));
+      if (generatedTrees.has(path.posix.basename(relative)) || isGeneratedForgeLink(relative, targetPath)) return;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Checkout evidence contains a link or special file; the checkout was preserved.");
     const handle = await fs.open(target, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     let checkingParent = false;
     try {
@@ -159,7 +169,7 @@ async function visitEvidence(identity: DirectoryIdentity, selections: string[], 
     } finally { if (checkingParent) parentChecks.pop(); await handle.close(); }
   };
   try {
-    const unique = [...new Set(selections)].filter(file => !selections.some(parent => parent !== file && file.startsWith(`${parent}/`))).sort();
+    const unique = selectionRoots(selections);
     for (const relative of unique) {
       let target = root.childPath(relative.split("/")[0]!);
       let missing = false;
@@ -218,3 +228,6 @@ export function isCheckoutEvidenceReceipt(value: unknown): value is ForgeCheckou
 function safePath(value: unknown): value is string { return typeof value === "string" && value.length > 0 && value.length <= 4096 && !value.includes("\\") && !/[\u0000-\u001f]/u.test(value) && !path.posix.isAbsolute(value) && path.posix.normalize(value) === value && value.split("/").every(part => part !== ".git" && part !== "." && part !== ".." && part !== ""); }
 function safeId(value: string): string { if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(value)) throw new Error("Invalid checkout evidence worker identity."); return value; }
 function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+function selectionRoots(paths: string[]): string[] {
+  return [...new Set(paths)].filter(file => !paths.some(parent => parent !== file && file.startsWith(`${parent}/`))).sort();
+}

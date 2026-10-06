@@ -27,6 +27,33 @@ async function fixture() {
 }
 
 describe("Durable checkout evidence", () => {
+  it("preserves regular evidence files named build and dist instead of treating them as directories", async () => {
+    const fixtureState = await fixture();
+    for (const file of ["build", "dist"])
+      await fs.writeFile(path.join(fixtureState.source, "reports", file), "Handwritten evidence");
+    const manifest = await fixtureState.archive.export("worker-1", fixtureState.identity, fixtureState.receipt, fixtureState.save);
+    expect(manifest.files.map(file => file.path)).toEqual(["reports/build", "reports/dist", "reports/run.log"]);
+    await fixtureState.archive.removeExported(fixtureState.identity, manifest);
+    const chunks: Buffer[] = [];
+    for await (const chunk of await fixtureState.archive.fileStream(manifest.archiveId, "reports/build")) chunks.push(chunk);
+    expect(Buffer.concat(chunks).toString()).toBe("Handwritten evidence");
+  });
+
+  it("blocks a generated directory on a different filesystem before any destructive cleanup", async () => {
+    const fixtureState = await fixture();
+    await fs.mkdir(path.join(fixtureState.source, "reports/node_modules"));
+    const originalStat = fs.lstat.bind(fs);
+    const crossedFilesystem = vi.spyOn(fs, "lstat").mockImplementation(async (...args: Parameters<typeof fs.lstat>) => {
+      const stat = await originalStat(...args);
+      return String(args[0]).endsWith("/node_modules")
+        ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: BigInt(stat.dev) + 1n })
+        : stat;
+    });
+    try { await expect(fixtureState.archive.planSelection(fixtureState.identity, ["reports"])).rejects.toThrow(/filesystem boundary/); }
+    finally { crossedFilesystem.mockRestore(); }
+    expect(await fs.readFile(path.join(fixtureState.source, "reports/run.log"), "utf8")).toBe("Validation passed\n");
+  });
+
   it("streams manifest-listed downloads through real HTTP routes after the disposable source is gone", async () => {
     const f = await fixture();
     const manifest = await f.archive.export("worker-1", f.identity, f.receipt, f.save);

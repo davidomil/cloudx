@@ -3,7 +3,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CloudxConfigResponse, ForgeRepository, PluginDescriptor, WorkspaceCleanupJob, WorkspaceTab } from "@cloudx/shared";
+import type { CloudxConfigResponse, ForgeRepository, PluginDescriptor, WorkspaceTab } from "@cloudx/shared";
 import { App } from "./App.js";
 
 const roots: Root[] = [];
@@ -41,7 +41,7 @@ function deferred<T>() {
 }
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
-async function fixture(updateBlocked = false, splitWindow = false, capacityRecovery = false, cleanupTransport?: (url: string, init?: RequestInit) => Promise<Response>) {
+async function fixture(updateBlocked = false, splitWindow = false, capacityRecovery = false) {
   let current = repository;
   let saving = false;
   let submitted: CloudxConfigResponse["values"] | undefined;
@@ -57,7 +57,7 @@ async function fixture(updateBlocked = false, splitWindow = false, capacityRecov
   const issue = () => ({ number: 7, title: `Issue in ${current.projectPath}`, body: "Inspect this issue before starting.", state: "open", author: "author", labels: [], comments: [], updatedAt: "2026-09-08", url: "https://example.test/issue/7" });
   const dashboardBody = () => ({ result: { configured: true, repository: current, workers: [] } });
   vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
-    if (cleanupTransport && url.startsWith("/api/system/workspace-cleanup")) return cleanupTransport(url, init);
+
     if (url === "/api/windows/window" && init?.method === "PATCH") return reply({ persistence: [{ name: "Workspace layout", state: "available" }] });
     if (url === "/api/tabs/forge-tab/active") return reply({});
     if (updateBlocked && url === "/api/system/update") return reply({ available: true, forgeBlocker: {
@@ -74,9 +74,10 @@ async function fixture(updateBlocked = false, splitWindow = false, capacityRecov
       "/api/plugins": { plugins: [plugin] },
       "/api/workspace": { tabs: [tab], activeTabId: tab.id, activeWindowId: "window", templates: [], windows: [{ id: "window", name: "Test", defaultCwd: "/unused", createdAt: "2026-09-08", updatedAt: "2026-09-08", layout: { root: splitWindow ? { type: "split", id: "split", direction: "horizontal", sizes: [50, 50], children: [{ type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, { type: "pane", pane: { id: "pane-2", tabIds: [] } }] } : { type: "pane", pane: { id: "pane-1", tabIds: [tab.id], activeTabId: tab.id } }, activePaneId: "pane-1" } }] },
       "/api/config": config,
-      "/api/system/workspace-cleanup": null,
+
       "/api/forge/resources": { resources: [] },
       "/api/forge/checkout-evidence": { archives: [] },
+      "/api/forge/git-history": { archives: [] },
       "/api/system/update": updateStatus,
       "/api/system/update/backups": { backups: [] },
       "/api/system/update/backups/cleanup": null,
@@ -128,88 +129,31 @@ async function changeSetting(container: Element, label: string, value: string) {
 }
 
 describe("Forge repository settings in App", () => {
-  it("keeps cleanup and update capacity blocked across navigation after a failed poll until explicit reconnect reports completion", async () => {
-    let job: WorkspaceCleanupJob | null = null;
-    let statusFailure = false;
-    let statusRequests = 0;
-    let reconnect: ReturnType<typeof deferred<Response>> | undefined;
-    const candidateId = "22222222-2222-4222-8222-222222222222";
-    const f = await fixture(false, false, true, async (url, init) => {
-      if (url.endsWith("/preview")) return reply({ id: "33333333-3333-4333-8333-333333333333", createdAt: "2026-10-05", availableBytes: 8192, warnings: [], reclaimableBytes: 4096, reclaimGroups: [{ bytes: 4096, candidateIds: [candidateId] }],
-        candidates: [{ id: candidateId, path: "/work/completed-forge", repository: "team/project", kind: "forge", state: "completed", allocatedBytes: 4096, eligible: true, reason: "Completed and inactive", sourceChanges: [], unpublishedCommits: 0, requiresDiscard: false }] });
-      if (init?.method === "POST") {
-        job = { id: "44444444-4444-4444-8444-444444444444", state: "running", startedAt: "2026-10-05", availableBytesBefore: 8192,
-          results: [{ id: candidateId, path: "/work/completed-forge", status: "deleting", reason: "Revalidating activity" }] };
-        return reply(job);
-      }
-      statusRequests++;
-      if (statusFailure) throw new Error("Cleanup status connection lost.");
-      if (reconnect) return reconnect.promise;
-      return reply(job);
-    });
-    const forge = () => f.container.querySelector(".forge-panel")!;
-    async function updates() {
-      await click(forge(), "Settings");
-      await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
-    }
-    await updates(); await click(f.container, "Manage Forge environments");
-    await vi.waitFor(() => expect(f.container.querySelector('[aria-label="Workspace cleanup"]')).not.toBeNull());
-    await click(f.container, "Scan workspaces and environments");
-    await click(f.container, "Review deletion of 1 workspace"); await click(f.container, "Delete permanently");
-    statusFailure = true;
-    await act(async () => { await new Promise(resolve => setTimeout(resolve, 600)); });
-    expect(f.container.textContent).toContain("Cleanup status unavailable: Cleanup status connection lost.");
-    const disconnectedRequests = statusRequests;
-    job = { ...job!, state: "completed", availableBytesAfter: 16384, results: job!.results.map(item => ({ ...item, status: "deleted", reason: "Deleted" })) };
-    statusFailure = false;
-    await click(forge(), "Issues"); await click(forge(), "Environments"); await click(f.container, "Refresh environments");
-    await act(async () => { await new Promise(resolve => setTimeout(resolve, 600)); });
-    expect(statusRequests).toBe(disconnectedRequests);
-    expect(button(f.container, "Scan workspaces and environments").disabled).toBe(true);
-    expect(button(f.container, "Reconnect cleanup status").disabled).toBe(false);
-    await updates();
-    expect(button(f.container, "Resume update").disabled).toBe(true);
-    expect(f.capacityChecks).toEqual([]);
-    await click(f.container, "Manage Forge environments");
-    reconnect = deferred<Response>();
-    await click(f.container, "Reconnect cleanup status");
-    expect(button(f.container, "Checking cleanup status…").disabled).toBe(true);
-    expect(button(f.container, "Scan workspaces and environments").disabled).toBe(true);
-    await updates();
-    expect(button(f.container, "Resume update").disabled).toBe(true);
-    expect(f.capacityChecks).toEqual([]);
-    await act(async () => reconnect!.resolve(reply(job)));
-    await vi.waitFor(() => expect(f.capacityChecks.length).toBeGreaterThan(0));
-    expect(button(f.container, "Resume update").disabled).toBe(false);
-    expect(f.capacityChecks.every(request => JSON.stringify(request) === JSON.stringify({ channel: "main", targetCommit: "b".repeat(40), resumeRunId: "11111111-1111-4111-8111-111111111111" }))).toBe(true);
-    await click(f.container, "Manage Forge environments");
-    expect(f.container.textContent).toContain("16.00 KiB available after cleanup");
-    expect(f.container.textContent).not.toContain("Cleanup status unavailable");
-    expect(button(f.container, "Scan workspaces and environments").disabled).toBe(false);
-    expect(statusRequests).toBe(disconnectedRequests + 1);
+  it("shows read-only evidence without manual workspace menus in Forge, Settings or Updates", async () => {
+    const testFixture = await fixture();
+    await click(testFixture.container.querySelector(".forge-panel")!, "Evidence");
+    await vi.waitFor(() => expect(testFixture.container.querySelector('[aria-label="Saved evidence"]')).not.toBeNull());
+    expect(testFixture.container.textContent).toContain("Finished Forge workspaces clean automatically.");
+    expect(testFixture.container.querySelector('[aria-label="Saved evidence"] button, [aria-label="Saved evidence"] input')).toBeNull();
+    expect([...testFixture.container.querySelectorAll("button")].some(item => item.textContent === "Environments")).toBe(false);
+    await click(testFixture.container.querySelector(".forge-panel")!, "Settings");
+    expect(testFixture.container.querySelector('[role="tab"][aria-label="Workspaces"]')).toBeNull();
+    await act(async () => testFixture.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
+    expect(testFixture.container.textContent).not.toContain("Manage Forge environments");
+    expect(testFixture.container.textContent).not.toContain("Open workspace management");
+    expect(testFixture.container.textContent).toContain("Clean all update backups");
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).startsWith("/api/system/workspace-cleanup"))).toBe(false);
   });
 
-  it("opens canonical cleanup with Settings filters and refreshes update capacity on returning", async () => {
-    const f = await fixture(false, false, true);
-    await click(f.container.querySelector(".forge-panel")!, "Settings");
-    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Workspaces"]')!.click());
-    expect(f.container.querySelector('.settings-dialog [aria-label="Workspace cleanup"]')).toBeNull();
-    await click(f.container, "Open workspace management");
-    await vi.waitFor(() => expect(f.container.querySelector('[aria-label="Workspace cleanup"]')).not.toBeNull());
-    expect(f.container.querySelector<HTMLSelectElement>('[aria-label="Workspace filter"]')!.value).toBe("all");
-    expect(f.container.querySelectorAll(".forge-panel")).toHaveLength(1);
-    await click(f.container.querySelector(".forge-panel")!, "Issues");
-    await click(f.container.querySelector(".forge-panel")!, "Settings");
-    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
-    await click(f.container, "Manage Forge environments");
-    await vi.waitFor(() => expect(f.container.querySelector('[aria-label="Workspace cleanup"]')).not.toBeNull());
-    expect(f.container.querySelector<HTMLSelectElement>('[aria-label="Workspace filter"]')!.value).toBe("forge");
-    expect(f.capacityChecks).toHaveLength(0);
-    await click(f.container.querySelector(".forge-panel")!, "Settings");
-    await act(async () => f.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
-    await vi.waitFor(() => expect(f.capacityChecks).toEqual([{ channel: "main", targetCommit: "b".repeat(40), resumeRunId: "11111111-1111-4111-8111-111111111111" }]));
-    expect(f.container.querySelector('.settings-dialog [aria-label="Workspace cleanup"]')).toBeNull();
-    expect(f.container.querySelectorAll(".forge-panel")).toHaveLength(1);
+  it("keeps explicit update-capacity reassessment independent of workspace selection", async () => {
+    const testFixture = await fixture(false, false, true);
+    await click(testFixture.container.querySelector(".forge-panel")!, "Settings");
+    await act(async () => testFixture.container.querySelector<HTMLButtonElement>('[role="tab"][aria-label="Updates"]')!.click());
+    expect(testFixture.capacityChecks).toEqual([]);
+    await click(testFixture.container, "Recheck update capacity");
+    expect(testFixture.capacityChecks).toEqual([{ channel: "main", targetCommit: "b".repeat(40), resumeRunId: "11111111-1111-4111-8111-111111111111" }]);
+    expect(button(testFixture.container, "Resume update").disabled).toBe(false);
+    expect(testFixture.container.querySelector('[aria-label="Workspace cleanup"]')).toBeNull();
   });
 
   it("opens the existing Forge tab from an update blocker without creating another tab", async () => {

@@ -21,6 +21,7 @@ import type {
 } from "@cloudx/shared";
 
 import { TabContextService } from "../context/TabContextService.js";
+import { ForgeCheckoutEvidence } from "./ForgeCheckoutEvidence.js";
 import { ConfigService } from "../configService.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { PluginRegistry } from "../pluginRegistry.js";
@@ -64,7 +65,7 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
-  it("publishes named ignored evidence and preserves only that evidence after closure and restart", async () => {
+  it("publishes named ignored evidence and serves its archive after automatic retirement and restart", async () => {
     const fixture = await LifecycleFixture.create();
     const { resources, host } = await disposableEnvironments(fixture);
     const worker = await fixture.workflow.startIssue(repository, 1, fixture.placement);
@@ -86,19 +87,21 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     fixture.provider.issue.state = "closed";
     fixture.advanceCleanupInterval();
     await fixture.workflow.poll();
-    const completed = await fixture.worker(worker.id);
-    expect(completed).toMatchObject({ status: "completed", retainedWorkspace: { worktreePath: checkout, retainedPaths: [".cache/evidence.log"], reason: expect.stringContaining('".cache/evidence.log"') } });
-    await expectMissing(path.join(checkout, ".cache/generated.bin"));
-    expect(await fs.readFile(path.join(checkout, ".cache/evidence.log"))).toEqual(evidence);
-    expect(await git(checkout, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(await fixture.worker(worker.id)).toBeUndefined();
+    await expectMissing(checkout);
+    const archive = new ForgeCheckoutEvidence(fixture.dataDir);
+    const [manifest] = await archive.list();
+    expect(manifest).toMatchObject({ attemptId: worker.attemptId, commitSha: receipt.headSha, files: [{ path: ".cache/evidence.log", bytes: evidence.length }] });
     expect(await processIsRunning(receipt.pid)).toBe(false);
     expect(await host.allocatedBytes()).toBe(0);
     expect((await resources.records())[0]).toMatchObject({ state: "deleted", reclaimedBytes: 64 * 1024 });
     await fixture.restartWorkflow();
     fixture.advanceCleanupInterval();
     await fixture.workflow.poll();
-    expect(await fixture.worker(worker.id)).toMatchObject({ status: "completed", retainedWorkspace: completed.retainedWorkspace });
-    expect(await fs.readFile(path.join(checkout, ".cache/evidence.log"))).toEqual(evidence);
+    expect(await fixture.worker(worker.id)).toBeUndefined();
+    const chunks: Buffer[] = [];
+    for await (const chunk of await new ForgeCheckoutEvidence(fixture.dataDir).fileStream(manifest!.archiveId, ".cache/evidence.log")) chunks.push(chunk);
+    expect(Buffer.concat(chunks)).toEqual(evidence);
     expect(host.removed).toHaveLength(1);
   }, 20_000);
 
@@ -485,7 +488,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(implementation.headSha);
     expect(await git(fixture.origin, "show", `${implementation.headSha}:README.md`)).toBe("Fixture project");
     const retained = await fixture.worker(started.id);
-    expect(retained).toMatchObject({ status: "completed", headSha: implementation.headSha, retainedWorkspace: { worktreePath: checkout, retainedPaths: expect.arrayContaining(["README.md", "debug_tooling/diagnostics.bin", "ignored-diagnostics.bin"]) } });
+    expect(retained).toMatchObject({ status: "completed", headSha: implementation.headSha, retainedWorkspace: { worktreePath: checkout, retainedPaths: ["README.md", "ignored-diagnostics.bin"] } });
     expect(retained.worktreePath).toBeUndefined();
     expect(retained.error).toBeUndefined();
     expect(retained.mergeAttempted).toBeUndefined();
@@ -497,11 +500,15 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     await fixture.workflow.poll();
     expect(await fixture.worker(started.id)).toMatchObject({ status: "completed", retainedWorkspace: retained.retainedWorkspace });
     expect((await fixture.worker(started.id)).worktreePath).toBeUndefined();
-    expect(await fs.readFile(path.join(checkout, "debug_tooling", "diagnostics.bin"))).toEqual(diagnostics);
+    const archive = new ForgeCheckoutEvidence(fixture.dataDir);
+    const [manifest] = await archive.list();
+    const chunks: Buffer[] = [];
+    for await (const chunk of await archive.fileStream(manifest!.archiveId, "debug_tooling/diagnostics.bin")) chunks.push(chunk);
+    expect(Buffer.concat(chunks)).toEqual(diagnostics);
     expect(await fs.readFile(path.join(checkout, "ignored-diagnostics.bin"))).toEqual(ignored);
     expect(await fs.readFile(path.join(checkout, "README.md"))).toEqual(tracked);
     expect((await execute("git", ["show", ":README.md"], { cwd: checkout })).stdout).toBe(staged);
-    expect(await git(checkout, "status", "--porcelain=v1", "--untracked-files=all")).toBe(status);
+    expect(await git(checkout, "status", "--porcelain=v1", "--untracked-files=all")).toBe(status.split("\n").filter(entry => !entry.endsWith("debug_tooling/diagnostics.bin")).join("\n"));
     expect(await git(checkout, "rev-parse", "HEAD")).toBe(implementation.headSha);
     expect(fixture.gitPushes).toHaveLength(1);
     expect(fixture.factory.processes).toHaveLength(2);

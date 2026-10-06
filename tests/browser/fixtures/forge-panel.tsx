@@ -1,6 +1,6 @@
 import { createRoot } from "react-dom/client";
 import { WorkspaceRecoveryPanel } from "../../../apps/web/src/ui/WorkspaceRecoveryPanel.js";
-import { useWorkspaceCleanup } from "../../../apps/web/src/ui/workspaceCleanupSession.js";
+
 import { ForgePanel } from "../../../apps/web/src/ui/ForgePanel.js";
 import { fetchJson } from "../../../apps/web/src/api.js";
 import "@xterm/xterm/css/xterm.css";
@@ -38,10 +38,8 @@ createRoot(document.getElementById("root")!).render(
 );
 
 function ForgeFixture() {
-  const cleanup = useWorkspaceCleanup();
   return (
     <ForgePanel
-      cleanup={cleanup}
       callHook={(hookId, input, tabId) =>
         fetchJson(`/fixture-hooks/${hookId}`, {
           method: "POST",

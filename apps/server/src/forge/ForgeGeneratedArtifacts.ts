@@ -1,7 +1,15 @@
+import path from "node:path";
+
 const generatedDirectories = new Set(["node_modules", "dist", "build", ".venv", "__pycache__", ".pytest_cache", ".vite", ".cache"]);
 
 export function isGeneratedForgePath(relative: string): boolean {
   return relative.split("/").some(part => generatedDirectories.has(part)) || relative.endsWith(".tsbuildinfo");
+}
+
+export function isGeneratedForgeLink(relative: string, target: string): boolean {
+  if (path.posix.isAbsolute(target) || target.includes("\\") || target.includes("\0")) return false;
+  const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(relative), target));
+  return resolved !== ".." && !resolved.startsWith("../") && !resolved.split("/").includes(".git") && isGeneratedForgePath(resolved);
 }
 
 export function isTypeScriptBuildInfo(content: string): boolean {

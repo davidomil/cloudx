@@ -1,11 +1,10 @@
 import { createRoot } from "react-dom/client";
 import { ForgePanel } from "../../../apps/web/src/ui/ForgePanel.js";
-import { useWorkspaceCleanup } from "../../../apps/web/src/ui/workspaceCleanupSession.js";
+
 import { fetchJson } from "../../../apps/web/src/api.js";
 import "../../../apps/web/src/styles.css";
 
 function EnvironmentsFixture() {
-  const cleanup = useWorkspaceCleanup();
   return (
     <ForgePanel
       callHook={(hookId, input, tabId) =>
@@ -14,7 +13,7 @@ function EnvironmentsFixture() {
           body: JSON.stringify({ input, tabId }),
         })
       }
-      cleanup={cleanup}
+
       tab={{
         id: "forge-tab",
         pluginId: "forge",

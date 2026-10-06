@@ -1,82 +1,59 @@
-import { useCallback, useEffect, useState } from "react";
-import type { DisposableResource, EvidenceDecision } from "@cloudx/shared";
-import { decideForgeEvidence, getForgeResources, forgeEvidenceFileUrl } from "../forgeResourcesApi.js";
-import { ControlButton } from "./Control.js";
-import { ForgeCheckoutEvidencePanel } from "./ForgeCheckoutEvidencePanel.js";
-import { WorkspaceCleanupPanel } from "./WorkspaceCleanupPanel.js";
-import type { WorkspaceCleanupController } from "./workspaceCleanupSession.js";
+import { useEffect, useState } from "react";
+import { formatCapacityBytes } from "@cloudx/shared";
+import type { DisposableResource, ForgeCheckoutEvidenceManifest, ForgeEvidenceFile, ForgeGitHistoryManifest } from "@cloudx/shared";
+import { getForgeResources, forgeEvidenceFileUrl } from "../forgeResourcesApi.js";
+import { checkoutEvidenceFileUrl, checkoutEvidenceManifestUrl, getForgeCheckoutEvidence } from "../forgeCheckoutEvidenceApi.js";
+import { getForgeGitHistory, gitHistoryBundleUrl, gitHistoryManifestUrl } from "../forgeGitHistoryApi.js";
 
-export function ForgeResourcesPanel({ cleanup }: { cleanup: WorkspaceCleanupController }) {
-  const [resources, setResources] = useState<DisposableResource[]>();
-  const [error, setError] = useState<string>();
-  const [revision, setRevision] = useState(0);
-  const refresh = useCallback(() => setRevision(value => value + 1), []);
+export function ForgeResourcesPanel({ revision }: { revision: number }) {
+  const [evidence, setEvidence] = useState<{ resources: DisposableResource[]; archives: ForgeCheckoutEvidenceManifest[]; history: ForgeGitHistoryManifest[]; errors: string[] }>();
   useEffect(() => {
     const controller = new AbortController();
-    setError(undefined);
-    void getForgeResources(controller.signal).then(value => {
-      if (!controller.signal.aborted) setResources(value);
-    }, failure => { if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : String(failure)); });
+    setEvidence(undefined);
+    void Promise.allSettled([getForgeResources(controller.signal), getForgeCheckoutEvidence(controller.signal), getForgeGitHistory(controller.signal)]).then(([resources, archives, history]) => {
+      if (controller.signal.aborted) return;
+      setEvidence({
+        resources: resources.status === "fulfilled" ? resources.value.filter(resource => resource.evidence?.state !== "discarded" && (resource.evidence || resource.retentionReason && resource.state !== "deleted")) : [],
+        archives: archives.status === "fulfilled" ? archives.value : [],
+        history: history.status === "fulfilled" ? history.value : [],
+        errors: [resources, archives, history].flatMap(result => result.status === "rejected" ? [result.reason instanceof Error ? result.reason.message : String(result.reason)] : []),
+      });
+    });
     return () => controller.abort();
   }, [revision]);
-  return <section className="forge-environments" aria-label="Disposable environments" tabIndex={0}>
-    <WorkspaceCleanupPanel cleanup={cleanup} />
-    <h3>Container evidence and history</h3>
-    <p>Completed environments release their named evidence to durable storage before cleanup. Older holds need an explicit evidence decision.</p>
-    <ControlButton size="compact" onClick={refresh}>Refresh environments</ControlButton>
-    {error ? <p role="alert">{error}</p> : null}
-    {!resources && !error ? <p role="status">Loading environments…</p> : null}
-    {resources?.length === 0 ? <p>No recorded disposable environments.</p> : null}
-    {resources?.map(resource => <ResourceEvidence key={resource.id} resource={resource} onChanged={refresh} cleanup={cleanup} />)}
-    <ForgeCheckoutEvidencePanel />
+  return <section className="forge-evidence" aria-label="Saved evidence" tabIndex={0}>
+    <h3>Saved evidence</h3>
+    <p>Finished Forge workspaces clean automatically.</p>
+    {!evidence ? <p role="status">Loading saved evidence…</p> : null}
+    {evidence?.errors.map((error, index) => <p key={index} role="alert">{error}</p>)}
+    {evidence?.resources.map(resource => <article key={resource.id} className="forge-worker" aria-label={`Saved evidence for ${resource.name}`}>
+      <strong>{resource.name}</strong>
+      {resource.evidence?.state === "verified" ? <SavedEvidence workerId={resource.owner.workerId} attemptId={resource.owner.attemptId} commitSha={resource.evidence.commitSha}
+        bytes={resource.evidence.bytes} exportedAt={resource.evidence.exportedAt} files={resource.evidence.files ?? []}
+        manifestUrl={`/api/forge/resources/${encodeURIComponent(resource.id)}/evidence`} fileUrl={path => forgeEvidenceFileUrl(resource.id, path)} />
+        : <p role="status">{resource.state === "failed" || resource.state === "blocked" ? "Automatic cleanup is blocked to protect evidence. See the worker error." : "Saving evidence before automatic cleanup…"}</p>}
+    </article>)}
+    {evidence?.archives.map(archive => <article key={archive.archiveId} className="forge-worker" aria-label={`Saved evidence for worker ${archive.workerId}`}>
+      <strong>Worker <code>{archive.workerId}</code></strong>
+      <SavedEvidence workerId={archive.workerId} attemptId={archive.attemptId} commitSha={archive.commitSha} bytes={archive.bytes} exportedAt={archive.exportedAt}
+        files={archive.files} manifestUrl={checkoutEvidenceManifestUrl(archive.archiveId)} fileUrl={path => checkoutEvidenceFileUrl(archive.archiveId, path)} />
+    </article>)}
+    {evidence?.history.map(archive => <article key={archive.archiveId} className="forge-worker" aria-label={`Saved Git history for worker ${archive.workerId}`}>
+      <strong>Saved Git history</strong>
+      <SavedEvidence workerId={archive.workerId} attemptId={archive.attemptId} commitSha={archive.commitSha} bytes={archive.bytes} exportedAt={archive.exportedAt}
+        files={archive.files} manifestUrl={gitHistoryManifestUrl(archive.archiveId)} fileUrl={() => gitHistoryBundleUrl(archive.archiveId)} />
+      <details><summary>Preserved snapshots ({archive.refs.length})</summary><ul>{archive.refs.map(ref => <li key={ref.name}><code>{ref.name}</code> · <code>{ref.commitSha}</code></li>)}</ul></details>
+    </article>)}
   </section>;
 }
 
-function ResourceEvidence({ resource, onChanged, cleanup }: { resource: DisposableResource; onChanged: () => void; cleanup: WorkspaceCleanupController }) {
-  const [paths, setPaths] = useState((resource.evidence?.paths ?? []).join("\n"));
-  const [commitSha, setCommitSha] = useState(resource.evidence?.commitSha ?? "");
-  const [confirmed, setConfirmed] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  async function decide(action: EvidenceDecision["action"]) {
-    setBusy(true);
-    setError(undefined);
-    try {
-      await cleanup.perform(async () => { await decideForgeEvidence(resource.id, {
-        action,
-        ...(action === "export" && resource.evidence?.state !== "verified" ? { evidencePaths: paths.split("\n").map(path => path.trim()).filter(Boolean) } : {}),
-        ...(action === "export" && resource.evidence?.state !== "verified" && commitSha.trim() ? { commitSha: commitSha.trim() } : {}),
-        ...(action === "discard" ? { confirmation: "Discard evidence" as const } : {}),
-      }); });
-      setConfirmed(false);
-      onChanged();
-    } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
-    finally { setBusy(false); }
-  }
-  const deleted = resource.state === "deleted";
-  return <article className="forge-worker forge-resource" aria-label={`Environment ${resource.name}`}>
-    <strong>{resource.name}</strong> <span className="forge-status">{resource.state}</span>
-    <p>{resource.reason}</p>
-    {resource.retentionReason ? <p>Protected evidence: {resource.retentionReason}</p> : null}
-    <p className="forge-muted">Worker <code>{resource.owner.workerId}</code> · Attempt <code>{resource.owner.attemptId}</code></p>
-    <details><summary>Shared consumers ({resource.consumers.length})</summary><ul>{resource.consumers.map(consumer => <li key={`${consumer.workerId}:${consumer.attemptId}`}><code>{consumer.workerId}</code> · <code>{consumer.attemptId}</code></li>)}</ul></details>
-    <p>{deleted ? `${resource.reclaimedBytes.toLocaleString()} writable bytes reclaimed` : resource.allocatedBytes === undefined ? "Writable-layer size unknown" : `${resource.allocatedBytes.toLocaleString()} writable bytes recorded`}</p>
-    {resource.evidence ? <p>Evidence: {resource.evidence.state}{resource.evidence.commitSha ? <> · Commit <code>{resource.evidence.commitSha}</code> ({resource.evidence.commitSource === "declared" ? "declared for this evidence" : "worker revision"})</> : null}</p> : null}
-    {resource.evidence?.state === "verified" ? <a href={`/api/forge/resources/${encodeURIComponent(resource.id)}/evidence`} download>Download verified evidence manifest</a> : null}
-    {resource.evidence?.files?.length ? <ul>{resource.evidence.files.map(file => <li key={file.path}><a href={forgeEvidenceFileUrl(resource.id, file.path)} download>{file.path}</a> ({file.bytes.toLocaleString()} bytes)</li>)}</ul> : null}
-    {!deleted && (resource.retentionReason || resource.evidence) ? <fieldset disabled={busy || cleanup.busy || cleanup.operationBusy}>
-      <legend>{resource.evidence?.state === "verified" ? "Verified evidence is durable; retry environment cleanup" : "Review evidence hold"}</legend>
-      {resource.evidence?.state !== "verified" ? <><label>Specific evidence paths in the container, one per line<textarea aria-label={`Evidence paths for ${resource.name}`} value={paths} onChange={event => setPaths(event.target.value)} placeholder="/work/evidence/test.log" /></label>
-      <label>Validated commit SHA (optional)<input aria-label={`Evidence commit for ${resource.name}`} value={commitSha} onChange={event => setCommitSha(event.target.value)} placeholder="Full SHA of the tested commit" /></label></> : null}
-      <p>Select useful logs, reports or reproduction files. Dependency and build trees are excluded. All consumers must have authoritative completion receipts.</p>
-      <div className="forge-actions">
-        {resource.evidence?.state !== "verified" ? <ControlButton size="compact" onClick={() => void decide("keep")}>Keep evidence hold</ControlButton> : null}
-        <ControlButton size="compact" disabled={resource.evidence?.state !== "verified" && !paths.trim()} onClick={() => void decide("export")}>{resource.evidence?.state === "verified" ? "Retry environment cleanup" : "Export evidence and release"}</ControlButton>
-      </div>
-      {resource.evidence?.state !== "verified" ? <><label className="forge-resource-confirm"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)} /> Discard this container’s evidence permanently</label>
-      <ControlButton size="compact" disabled={!confirmed} onClick={() => void decide("discard")}>Discard evidence and release</ControlButton></> : null}
-    </fieldset> : null}
-    {busy ? <p role="status">Applying evidence decision…</p> : null}
-    {error ? <p role="alert">{error}</p> : null}
-  </article>;
+function SavedEvidence({ workerId, attemptId, commitSha, bytes, exportedAt, files, manifestUrl, fileUrl }: {
+  workerId: string; attemptId: string; commitSha?: string; bytes?: number; exportedAt?: string; files: ForgeEvidenceFile[]; manifestUrl: string; fileUrl: (path: string) => string;
+}) {
+  return <>
+    <p className="forge-muted">Worker <code>{workerId}</code> · Attempt <code>{attemptId}</code>{commitSha ? <> · Commit <code>{commitSha}</code></> : null}</p>
+    {bytes !== undefined || exportedAt ? <p>{bytes !== undefined ? `${formatCapacityBytes(bytes)} saved` : null}{exportedAt ? <> · {new Date(exportedAt).toLocaleString()}</> : null}</p> : null}
+    <a href={manifestUrl} download="evidence-manifest.json">Download manifest</a>
+    <ul>{files.map(file => <li key={file.path}><a href={fileUrl(file.path)} download={file.path.split("/").at(-1)}>{file.path}</a> ({formatCapacityBytes(file.bytes)})</li>)}</ul>
+  </>;
 }

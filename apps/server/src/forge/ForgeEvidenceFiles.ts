@@ -108,7 +108,7 @@ export class ForgeEvidenceFiles {
   }
 
   private async directory(namespace: string, create: boolean): Promise<string | undefined> {
-    if (!/^forge-(?:checkout-)?evidence$/u.test(namespace)) throw new Error("Unknown Forge evidence storage namespace.");
+    if (!/^forge-(?:(?:checkout-)?evidence|git-history)$/u.test(namespace)) throw new Error("Unknown Forge evidence storage namespace.");
     const directory = path.resolve(this.dataDir, namespace);
     if (!await requireSafeDirectory(this.dataDir, directory, { create, label: "Forge evidence storage" })) return undefined;
     if (await fs.realpath(directory) !== directory) throw new Error("Evidence storage must not have symbolic-link parents.");

@@ -3,7 +3,7 @@ import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { DirectoryIdentity } from "../directoryIdentity.js";
 import { openOwnedDirectoryNoFollow } from "../jsonStateFile.js";
-import { isGeneratedForgePath, isTypeScriptBuildInfo } from "./ForgeGeneratedArtifacts.js";
+import { isGeneratedForgeLink, isGeneratedForgePath, isTypeScriptBuildInfo } from "./ForgeGeneratedArtifacts.js";
 
 /** Remove generated contents through owned directory descriptors, preserving named evidence. */
 export async function cleanupIgnoredForgePath(identity: DirectoryIdentity, relative: string, protectedPaths: string[], signal?: AbortSignal): Promise<string[]> {
@@ -33,8 +33,14 @@ export async function cleanupIgnoredForgePath(identity: DirectoryIdentity, relat
     const explicitlyProtected = protectedPaths.some(protectedPath => file === protectedPath || file.startsWith(`${protectedPath}/`));
     if (explicitlyProtected) return { paths: [file], unknown: false };
     if (path.basename(file) === ".git") return { paths: [file], unknown: true };
-    const generated = isGeneratedForgePath(file);
     const stat = await fs.lstat(target);
+    let generated = isGeneratedForgePath(file);
+    if (stat.isSymbolicLink()) {
+      generated ||= isGeneratedForgeLink(file, await fs.readlink(target));
+      const current = await fs.lstat(target);
+      if (current.dev !== stat.dev || current.ino !== stat.ino || current.mtimeMs !== stat.mtimeMs || current.ctimeMs !== stat.ctimeMs)
+        throw new Error("Generated link changed; its replacement was preserved.");
+    }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       if (!generated) return { paths: [file], unknown: true };
       if (file.endsWith(".tsbuildinfo") && !isGeneratedForgePath(path.dirname(file))) {

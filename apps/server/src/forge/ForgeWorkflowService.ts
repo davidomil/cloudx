@@ -2916,6 +2916,7 @@ export class ForgeWorkflowService {
       if (worker.worktreePath) {
         if (!worker.repositoryPath) throw new Error("Worker checkout ownership is missing.");
         const report = worker.completion?.report?.kind === "issue" ? worker.completion.report : worker.pendingPublication?.report;
+        const completedAttemptId = worker.completion?.attemptId ?? worker.attemptId;
         const retainedPaths = [...new Set([...(report?.handoff?.retainedPaths ?? []), ...(report?.handoff?.retainedEvidencePaths ?? [])])];
         const retained = await this.waitForWorkerIO(worker, "Preserving working files and cleaning up", () => this.deps.runtime.cleanup({
           id: worker.id,
@@ -2925,8 +2926,8 @@ export class ForgeWorkflowService {
           expectedHeadSha: worker.kind === "issue" ? expectedHeadSha : undefined,
           ...(issueClosed ? { issueClosed: true as const } : {}),
           ...(retainedPaths.length ? { retainedPaths } : {}),
-          ...(worker.status === "completed" && worker.attemptId && expectedHeadSha ? { retireEvidence: {
-            attemptId: worker.attemptId, commitSha: worker.kind === "review" ? worker.headSha ?? expectedHeadSha : expectedHeadSha,
+          ...(worker.status === "completed" && completedAttemptId && expectedHeadSha ? { retireEvidence: {
+            attemptId: completedAttemptId, commitSha: worker.kind === "review" ? worker.headSha ?? expectedHeadSha : expectedHeadSha,
             paths: report?.handoff?.retainedEvidencePaths ?? [],
           } } : {}),
         }));

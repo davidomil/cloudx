@@ -1347,3 +1347,4 @@ function stripNullishValues(input: Record<string, unknown>): Record<string, unkn
 export * from "./workspaceCleanup.js";
 export * from "./forgeResources.js";
 export * from "./forgeCheckoutEvidence.js";
+export * from "./forgeGitHistory.js";

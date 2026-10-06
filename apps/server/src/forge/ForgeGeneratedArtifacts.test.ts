@@ -1,7 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { isGeneratedForgePath, isTypeScriptBuildInfo } from "./ForgeGeneratedArtifacts.js";
+import { isGeneratedForgeLink, isGeneratedForgePath, isTypeScriptBuildInfo } from "./ForgeGeneratedArtifacts.js";
 
 describe("Forge generated artifacts", () => {
+  it.each([
+    [".cloudx/native/bin/codex", "../lib/node_modules/@openai/codex/bin/codex.js", true],
+    [".cloudx/bin/tool", "../dist/tool.js", true],
+    [".cloudx/bin/tool", "../../../node_modules/tool.js", false],
+    [".cloudx/bin/tool", "/other/node_modules/tool.js", false],
+    [".cloudx/bin/tool", "../../.git/node_modules/tool.js", false],
+    [".cloudx/bin/tool", "../source/tool.js", false],
+    [".cloudx/bin/tool", "..\\node_modules\\tool.js", false],
+    [".cloudx/bin/tool", "../node_modules/\0tool.js", false],
+  ] as const)("classifies generated link %s → %s without following its target", (relative, target, disposable) => {
+    expect(isGeneratedForgeLink(relative, target)).toBe(disposable);
+  });
+
   it("recognizes dependency and build paths without classifying report directories as disposable", () => {
     for (const file of ["node_modules/package/index.js", ".cloudx/project/dist/app.js", "app/tsconfig.tsbuildinfo"])
       expect(isGeneratedForgePath(file)).toBe(true);
