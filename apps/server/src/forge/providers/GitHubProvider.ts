@@ -1,5 +1,6 @@
 import type {
   ForgeChangeRequest,
+  ForgeCiDiagnostic,
   ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
   ForgeComment,
@@ -41,6 +42,7 @@ import {
 } from "./validation.js";
 import { validateCreateRequest, validateRequestText, validateReview } from "./reviewValidation.js";
 import { assertGitHubScopedFilter, resolveListScope } from "./listScope.js";
+import { GitHubCiDiagnostics } from "./GitHubCiDiagnostics.js";
 
 interface GitHubReadiness {
   headSha: string;
@@ -162,6 +164,10 @@ export class GitHubProvider implements ForgeProvider {
 
   async getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus> {
     return this.readStatus(number);
+  }
+
+  async getCiFailure(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic> {
+    return new GitHubCiDiagnostics(this.http).collect(change);
   }
 
   private async mergeIdentityFailureReason(headSha: string) {

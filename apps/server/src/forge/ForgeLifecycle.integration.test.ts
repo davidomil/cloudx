@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   ForgeChangeRequest,
   ForgeChangeRequestStatus,
+  ForgeCiDiagnostic,
   ForgeCreateChangeRequest,
   ForgeCredentialRole,
   ForgeIssueDetail,
@@ -2446,6 +2447,10 @@ class LocalForgeProvider implements ForgeProvider {
   readonly merges: string[] = [];
 
   constructor(private readonly origin: string) {}
+  async getCiFailure(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic> {
+    return { repository, changeNumber: change.number, sourceHeadSha: change.headSha, targetHeadSha: change.targetHeadSha,
+      failureKey: "fixture-no-ci", state: "blocked", jobs: [], reason: "This local fixture has no CI jobs." };
+  }
   async listIssues() { return { items: [...this.issues.values()].map(issue => structuredClone(issue)) }; }
   async listChangeRequests() { return { items: [...this.changes.values()].map((change) => structuredClone(change)) }; }
   async getIssue(number: number) {

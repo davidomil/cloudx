@@ -4,6 +4,37 @@ export const FORGE_PLUGIN_ID = "forge";
 export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
 export const MAX_FORGE_BATCH_ISSUES = 50;
+export const MAX_FORGE_CI_REPAIR_ATTEMPTS = 2;
+export interface ForgeCiDiagnostic {
+  repository: ForgeRepository;
+  changeNumber: number;
+  sourceHeadSha: string;
+  targetHeadSha: string;
+  testedSha?: string;
+  failureKey: string;
+  state: "actionable" | "blocked" | "pending" | "obsolete";
+  reason?: string;
+  jobs: Array<{
+    runId: string;
+    runAttempt: number;
+    jobId: string;
+    name: string;
+    url: string;
+    conclusion: string;
+    testedSha?: string;
+    classification: "code" | "infrastructure" | "credentials" | "policy" | "unknown";
+    log?: string;
+  }>;
+}
+export interface ForgeCiRepair {
+  phase: "diagnosing" | "ready" | "launching" | "repairing" | "publishing" | "reviewing" | "blocked";
+  attempts: number;
+  attemptedHeads: string[];
+  diagnostic?: ForgeCiDiagnostic;
+  attemptId?: string;
+  repairedHeadSha?: string;
+  reason?: string;
+}
 export const MAX_FORGE_REVIEW_REPORT_BODY_LENGTH = 100_000;
 // Drafts also contain Forge's scope summary, including up to four 64-character SHAs.
 export const MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH = MAX_FORGE_REVIEW_REPORT_BODY_LENGTH + 512;
@@ -126,6 +157,7 @@ export interface ForgeWorker {
     headSha: string;
     targetHeadSha: string;
   };
+  ciRepair?: ForgeCiRepair;
   rebaseRecovery?: {
     branch: string;
     baseBranch: string;

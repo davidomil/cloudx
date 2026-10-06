@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ForgeIssueCompletionReport, ForgeReviewScope, ForgeWorker } from "@cloudx/shared";
+import { MAX_FORGE_CI_REPAIR_ATTEMPTS } from "@cloudx/shared";
+import type { ForgeCiDiagnostic, ForgeCiRepair, ForgeIssueCompletionReport, ForgeReviewScope, ForgeWorker } from "@cloudx/shared";
 import { parseReview, parseScopedReview, parseWorkerReport, parseWorkers } from "./ForgeWorkflowValidation.js";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
 
@@ -31,6 +32,125 @@ const reviewWorkerId = "22222222-2222-4222-8222-222222222222";
 const autoReview: NonNullable<ForgeWorker["autoReview"]> = {
   enabled: true, phase: "implementing", placement: { windowId: "window-1", paneId: "pane-1" }
 };
+
+describe("Persisted CI repair evidence", () => {
+  const diagnostic: ForgeCiDiagnostic = {
+    repository: worker.repository, changeNumber: 12, sourceHeadSha: headSha,
+    targetHeadSha: "b".repeat(40), testedSha: "c".repeat(40), failureKey: "run-1:1:job-1",
+    state: "actionable", jobs: [{
+      runId: "run-1", runAttempt: 1, jobId: "job-1", name: "Unit tests",
+      url: "https://github.com/cloudx/example/actions/runs/1/job/1", conclusion: "failure",
+      testedSha: "c".repeat(40), classification: "code", log: "Expected true, received false.",
+    }],
+  };
+  const ready: ForgeCiRepair = { phase: "ready", attempts: 0, attemptedHeads: [], diagnostic };
+  const active: ForgeCiRepair = { ...ready, phase: "repairing", attempts: 1, attemptedHeads: [headSha], attemptId: reviewWorkerId };
+  const owned = { ...worker, changeNumber: 12, headSha };
+  const parse = (ciRepair: unknown) => parseWorkers([{ ...owned, ciRepair }])[0].ciRepair;
+
+  it("retains bounded diagnostics and completed attempts independently of the active worker attempt", () => {
+    const reviewing: ForgeCiRepair = { ...active, phase: "reviewing", repairedHeadSha: "d".repeat(40) };
+    for (const ciRepair of [ready, active, reviewing, { ...reviewing, phase: "diagnosing", diagnostic: undefined }]) {
+      expect(parse(ciRepair)).toEqual(ciRepair);
+      expect(parse(ciRepair)).not.toBe(ciRepair);
+    }
+    expect(parseWorkers([{ ...owned, attemptId: worker.id, ciRepair: reviewing }])[0].ciRepair).toEqual(reviewing);
+  });
+
+  it("keeps the prelaunch checkpoint before a coding attempt has been allocated", () => {
+    const launching = { ...active, phase: "launching", attemptId: undefined };
+    expect(parse(launching)).toEqual(launching);
+  });
+
+  it("retains individual tested identities when workflows do not share one tested commit", () => {
+    const ciRepair = { ...ready, diagnostic: { ...diagnostic, testedSha: undefined, jobs: [diagnostic.jobs[0], { ...diagnostic.jobs[0], runId: "run-2", jobId: "job-2", testedSha: "e".repeat(40) }] } };
+    expect(parse(ciRepair)).toEqual(ciRepair);
+  });
+
+  it.each(["blocked", "pending", "obsolete"] as const)("retains %s diagnosis without launchable logs", state => {
+    const ciRepair = { phase: state === "blocked" ? "blocked" : "diagnosing", attempts: 0, attemptedHeads: [], diagnostic: { ...diagnostic, state, reason: "CI identity or runner needs attention.", jobs: [] } };
+    expect(parse(ciRepair)).toEqual(ciRepair);
+  });
+
+  it.each(["blocked", "pending", "obsolete"] as const)("preserves %s jobs whose tested commit could not be verified", state => {
+    const ciRepair = { ...ready, phase: state === "blocked" ? "blocked" : "diagnosing", diagnostic: { ...diagnostic, state, testedSha: undefined, jobs: [{ ...diagnostic.jobs[0], testedSha: undefined }] } };
+    expect(parse(ciRepair)).toEqual(ciRepair);
+  });
+
+  it.each([undefined, "c".repeat(40)])("requires every actionable job's tested commit even when the aggregate identity is %s", testedSha => {
+    const ciRepair = { ...ready, diagnostic: { ...diagnostic, testedSha, jobs: [{ ...diagnostic.jobs[0], testedSha: undefined }] } };
+    expect(() => parse(ciRepair)).toThrow(/Actionable CI diagnostics/);
+  });
+
+  it("accepts the exact repair budget, SHA-256 identities and evidence bounds", () => {
+    const ciRepair = {
+      ...active, phase: "blocked", attempts: MAX_FORGE_CI_REPAIR_ATTEMPTS,
+      attemptedHeads: [headSha, "d".repeat(64)], repairedHeadSha: "e".repeat(64), reason: "r".repeat(4096),
+      diagnostic: { ...diagnostic, failureKey: "f".repeat(4096), reason: "r".repeat(4096),
+        jobs: Array.from({ length: 10 }, (_, index) => ({ ...diagnostic.jobs[0], jobId: String(index), log: "l".repeat(32_000) })) },
+    };
+    expect(parse(ciRepair)).toEqual(ciRepair);
+  });
+
+  it.each([
+    null, {}, [], { ...ready, phase: "unknown" }, { ...ready, phase: ["ready"] },
+    ...[-1, 0.5, "1", MAX_FORGE_CI_REPAIR_ATTEMPTS + 1].map(attempts => ({ ...ready, attempts })),
+    { ...active, attemptedHeads: [] }, { ...ready, attemptedHeads: [headSha] },
+    { ...active, attemptedHeads: ["a".repeat(41)] }, { ...active, attemptedHeads: null },
+    { ...active, attempts: 2, attemptedHeads: [headSha, headSha.toUpperCase()] },
+    { ...active, attemptedHeads: ["b".repeat(40)] },
+    { ...active, attemptId: "1".repeat(36) }, { ...active, attemptId: 7 },
+    { ...ready, attemptId: reviewWorkerId }, { ...active, repairedHeadSha: "bad" },
+    { ...active, reason: " " }, { ...active, reason: "r".repeat(4097) },
+    { ...ready, diagnostic: undefined }, { ...ready, diagnostic: { ...diagnostic, state: "blocked" } },
+    { ...ready, diagnostic: { ...diagnostic, state: "pending" } },
+    { ...ready, phase: "diagnosing" }, { ...active, attemptId: undefined },
+    { ...active, phase: "publishing", attemptId: undefined },
+    { ...active, phase: "reviewing", attemptId: undefined },
+    { ...active, phase: "publishing" }, { ...active, phase: "reviewing" },
+    { ...active, repairedHeadSha: headSha }, { ...ready, phase: "launching" },
+    { ...ready, attempts: MAX_FORGE_CI_REPAIR_ATTEMPTS, attemptedHeads: [headSha, "d".repeat(40)] },
+  ])("rejects malformed, unbounded or contradictory repair state %#", ciRepair => {
+    expect(() => parse(ciRepair)).toThrow();
+  });
+
+  it.each([
+    null, {}, [], { ...diagnostic, state: "failed" }, { ...diagnostic, state: ["actionable"] },
+    { ...diagnostic, sourceHeadSha: "a".repeat(41) }, { ...diagnostic, targetHeadSha: "g".repeat(40) },
+    { ...diagnostic, testedSha: "bad" },
+    { ...diagnostic, failureKey: " " }, { ...diagnostic, failureKey: "f".repeat(4097) },
+    { ...diagnostic, reason: " " }, { ...diagnostic, reason: "r".repeat(4097) },
+    { ...diagnostic, jobs: null }, { ...diagnostic, jobs: [] },
+    { ...diagnostic, jobs: Array.from({ length: 11 }, (_, index) => ({ ...diagnostic.jobs[0], jobId: String(index) })) },
+    { ...diagnostic, jobs: [diagnostic.jobs[0], diagnostic.jobs[0]] },
+    ...[
+      null, {}, { ...diagnostic.jobs[0], runId: " " }, { ...diagnostic.jobs[0], runId: "r".repeat(257) },
+      { ...diagnostic.jobs[0], runAttempt: 0 }, { ...diagnostic.jobs[0], runAttempt: 1.5 },
+      { ...diagnostic.jobs[0], runAttempt: "1" }, { ...diagnostic.jobs[0], jobId: undefined },
+      { ...diagnostic.jobs[0], name: " " }, { ...diagnostic.jobs[0], conclusion: " " },
+      ...["success", "cancelled", "skipped", "pending", "unknown"].map(conclusion => ({ ...diagnostic.jobs[0], conclusion })),
+      { ...diagnostic.jobs[0], classification: "other" }, { ...diagnostic.jobs[0], testedSha: "bad" },
+      { ...diagnostic.jobs[0], testedSha: headSha }, { ...diagnostic.jobs[0], url: "javascript:alert(1)" },
+      { ...diagnostic.jobs[0], url: "relative" }, { ...diagnostic.jobs[0], url: "u".repeat(4097) },
+      { ...diagnostic.jobs[0], log: 1 }, { ...diagnostic.jobs[0], log: "l".repeat(32_001) },
+      { ...diagnostic.jobs[0], log: undefined }, { ...diagnostic.jobs[0], log: " " },
+      ...["infrastructure", "credentials", "policy", "unknown"].map(classification => ({ ...diagnostic.jobs[0], classification })),
+    ].map(job => ({ ...diagnostic, jobs: [job] })),
+  ])("rejects malformed or nonactionable failure evidence marked actionable %#", diagnostic => {
+    expect(() => parse({ ...ready, diagnostic })).toThrow();
+  });
+
+  it("binds diagnostics to the issue repository and published request", () => {
+    for (const repository of [
+      { ...worker.repository, provider: "gitlab" }, { ...worker.repository, apiUrl: "https://other.example" },
+      { ...worker.repository, projectPath: "other/repository" }, null,
+    ]) expect(() => parse({ ...ready, diagnostic: { ...diagnostic, repository } })).toThrow();
+    for (const changeNumber of [0, 1.5, "12", 13])
+      expect(() => parse({ ...ready, diagnostic: { ...diagnostic, changeNumber } })).toThrow();
+    expect(() => parseWorkers([{ ...owned, changeNumber: undefined, ciRepair: ready }])).toThrow();
+    expect(() => parseWorkers([{ ...owned, kind: "review", ciRepair: ready }])).toThrow(/issue/i);
+  });
+});
 
 describe("Review body limits", () => {
   const review = { kind: "review" as const, headSha, event: "approve" as const, comments: [], body: "x".repeat(100_000) };

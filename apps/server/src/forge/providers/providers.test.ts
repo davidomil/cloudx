@@ -233,12 +233,15 @@ function labFixture(
     version?: Record<string, unknown>;
     notes?: unknown[];
     diffs?: unknown[];
+    commits?: Record<string, Record<string, unknown>>;
     intercept?: Handler;
   } = {},
 ) {
   return harness(gitlab, (url, options) => {
     const path = url.pathname;
     if (overrides.intercept) return overrides.intercept(url, options);
+    if (path.includes("/repository/commits/"))
+      return response(overrides.commits?.[path.split("/").at(-1)!] ?? {});
     if (path.includes("/repository/branches/"))
       return response({ name: overrides.request?.target_branch ?? "main", commit: { id: previousSha }, ...overrides.target });
     if (options.method === "PUT" && path.endsWith("/merge"))
@@ -1160,6 +1163,54 @@ describe("GitHub review and exact-commit merge", () => {
 
   it("does not attribute an older GitLab pipeline failure to the current revision", async () => {
     const { provider } = labFixture({ request: { head_pipeline: { sha: previousSha, status: "failed", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
+  });
+
+  it("follows a current GitLab merged-results pipeline from failed through pending to success", async () => {
+    const testedSha = "c".repeat(40);
+    const pipeline = { sha: testedSha, status: "failed", source: "merge_request_event", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" };
+    const { provider, calls } = labFixture({
+      request: { head_pipeline: pipeline },
+      commits: { [testedSha]: { id: testedSha, parent_ids: [previousSha, headSha] } },
+    });
+
+    for (const [status, state] of [["failed", "failed"], ["pending", "pending"], ["success", "passed"]]) {
+      pipeline.status = status;
+      expect(await provider.getChangeRequest(7)).toMatchObject({
+        headSha,
+        targetHeadSha: previousSha,
+        checks: { state, url: pipeline.web_url },
+      });
+    }
+    expect(calls.filter(call => call.url.pathname.endsWith(`/repository/commits/${testedSha}`))).toHaveLength(3);
+  });
+
+  it.each([
+    ["failed", "failed"], ["success", "passed"], ["canceled", "failed"],
+    ["created", "pending"], ["waiting_for_resource", "pending"], ["preparing", "pending"],
+    ["running", "pending"], ["pending", "pending"], ["manual", "pending"], ["scheduled", "pending"],
+    ["skipped", "unknown"],
+  ])("maps current merged-results pipeline status %s to %s after validating both parents", async (status, state) => {
+    const testedSha = "c".repeat(40);
+    const pipelineUrl = "https://gitlab.example/group/subgroup/repo/-/pipelines/17";
+    const { provider } = labFixture({
+      request: { head_pipeline: { sha: testedSha, status, source: "merge_request_event", web_url: pipelineUrl } },
+      commits: { [testedSha]: { id: testedSha, parent_ids: [headSha, previousSha] } },
+    });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state, url: pipelineUrl } });
+  });
+
+  it.each(["failed", "pending", "success"].flatMap(status => [
+    { status, identity: "superseded source", parents: [previousSha, "d".repeat(40)] },
+    { status, identity: "superseded target", parents: ["d".repeat(40), headSha] },
+    { status, identity: "one parent", parents: [headSha] },
+    { status, identity: "additional parent", parents: [previousSha, headSha, "d".repeat(40)] },
+  ]))("does not attribute a $status merged-results pipeline with $identity to the current request", async ({ status, parents }) => {
+    const testedSha = "c".repeat(40);
+    const { provider } = labFixture({
+      request: { head_pipeline: { sha: testedSha, status, source: "merge_request_event", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } },
+      commits: { [testedSha]: { id: testedSha, parent_ids: parents } },
+    });
     expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
   });
 

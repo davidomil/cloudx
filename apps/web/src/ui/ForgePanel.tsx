@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
-import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
+import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import type { DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -380,6 +380,7 @@ function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {
         {worker.activity ? <span className="forge-muted">{activityText(worker.activity)}</span> : null}
         {worker.retainedWorkspace ? <span className="forge-muted">Retained working files</span> : null}
         {worker.autoReview?.enabled ? <span className="forge-muted">Auto review · {worker.autoReview.phase}</span> : null}
+        {worker.ciRepair ? <span className="forge-muted">CI repair · {worker.ciRepair.phase} · {worker.ciRepair.attempts}/{MAX_FORGE_CI_REPAIR_ATTEMPTS} attempts</span> : null}
         {worker.error ? <span className={worker.status === "awaiting_publication" ? "forge-muted" : "forge-item-worker-error"} title={worker.error}>{worker.error}</span> : null}
       </span>;
     })}
@@ -519,6 +520,17 @@ function MergeQueueStatus({ worker, workers }: { worker: ForgeWorker; workers: F
   </section>;
 }
 
+function CiRepairStatus({ repair }: { repair: NonNullable<ForgeWorker["ciRepair"]> }) {
+  return <section aria-label="CI repair">
+    <p role="status">CI repair · {repair.phase} · {repair.attempts}/{MAX_FORGE_CI_REPAIR_ATTEMPTS} attempts used</p>
+    {repair.reason || repair.diagnostic?.reason ? <p>{repair.reason ?? repair.diagnostic!.reason}</p> : null}
+    {repair.diagnostic ? <p className="forge-muted">Source <code>{repair.diagnostic.sourceHeadSha.slice(0, 8)}</code> · Target <code>{repair.diagnostic.targetHeadSha.slice(0, 8)}</code></p> : null}
+    {repair.diagnostic?.jobs.length ? <ul>{repair.diagnostic.jobs.map(job => <li key={`${job.runId}:${job.runAttempt}:${job.jobId}`}>
+      <a href={job.url} target="_blank" rel="noreferrer">{job.name}</a> · {job.conclusion} · Run {job.runId}, attempt {job.runAttempt}
+    </li>)}</ul> : null}
+  </section>;
+}
+
 function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, runAction, busy, onViewWorker, canSubmitReview = true, showAutoReview = true, collapsible = false }: WorkerCardProps) {
   const [controlling, setControlling] = useState(false);
   const continuation = useContext(WorkerContinuations)!;
@@ -583,6 +595,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
     {!archivedDraft ? <MergeQueueStatus worker={worker} workers={workers} /> : null}
+    {!archivedDraft && worker.ciRepair ? <CiRepairStatus repair={worker.ciRepair} /> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && !conflict && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     {!archivedDraft && ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) ? <DirectoryOwnershipRecovery key={worker.id}
       disabled={busy || controlling || reviewRunning}

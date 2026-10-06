@@ -1,5 +1,6 @@
 import type {
   ForgeChangeRequest,
+  ForgeCiDiagnostic,
   ForgeChangeRequestStatus,
   ForgeChangeRequestSummary,
   ForgeComment,
@@ -41,6 +42,7 @@ import {
 } from "./validation.js";
 import { rejectQuickActions, validateCreateRequest, validateRequestText, validateReview } from "./reviewValidation.js";
 import { resolveListScope } from "./listScope.js";
+import { GitLabCiDiagnostics } from "./GitLabCiDiagnostics.js";
 
 const commonFilters = new Set([
   "state",
@@ -194,6 +196,7 @@ export class GitLabProvider implements ForgeProvider {
     if (diffHeadSha !== headSha)
       throw new ForgeHeadChangedError([headSha, diffHeadSha], observations);
     const mergeStatus = string(current.detailed_merge_status);
+    const checks = await this.headChecks(current, headSha, targetHeadSha);
     if (await this.readTargetHeadSha(status.baseBranch) !== targetHeadSha)
       throw new ForgeProviderError("The target branch changed while loading. Refresh before proceeding.", 409);
     return {
@@ -204,7 +207,7 @@ export class GitLabProvider implements ForgeProvider {
       mergeable: mergeStatus === "mergeable",
       requiresBaseUpdate: mergeStatus === "need_rebase",
       hasConflicts: mergeStatus === "conflict",
-      checks: gitlabHeadChecks(current, headSha),
+      checks,
       approved,
       unresolvedDiscussions,
       comments,
@@ -219,6 +222,22 @@ export class GitLabProvider implements ForgeProvider {
       this.linkedIssues(number),
     ]);
     return { ...gitlabStatus(record(response.body), number), linkedIssues };
+  }
+
+  async getCiFailure(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic> {
+    return new GitLabCiDiagnostics(this.http).collect(change);
+  }
+
+  private async headChecks(request: Record<string, unknown>, headSha: string, targetHeadSha: string): Promise<NonNullable<ForgeChangeRequest["checks"]>> {
+    const checks = gitlabHeadChecks(request, headSha);
+    if (checks.state !== "unknown" || !request.head_pipeline) return checks;
+    const pipeline = record(request.head_pipeline);
+    if (pipeline.source !== "merge_request_event") return checks;
+    const testedSha = gitlabHeadSha(pipeline.sha);
+    if (testedSha === headSha) return checks;
+    if (await new GitLabCiDiagnostics(this.http).testedCurrentBase(testedSha, { headSha, targetHeadSha }))
+      return gitlabHeadChecks(request, testedSha);
+    return checks;
   }
 
   private async readTargetHeadSha(branch: string): Promise<string> {

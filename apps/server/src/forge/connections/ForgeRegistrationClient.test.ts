@@ -23,7 +23,7 @@ const installation = {
   id: 42,
   app_id: 123,
   suspended_at: null,
-  permissions: { contents: "write", issues: "write", pull_requests: "write", checks: "read", workflows: "write" },
+  permissions: { contents: "write", issues: "write", pull_requests: "write", checks: "read", workflows: "write", actions: "read" },
 };
 
 describe("GitHub application registration", () => {
@@ -51,6 +51,7 @@ describe("GitHub application registration", () => {
         pull_requests: "write",
         checks: "read",
         workflows: "write",
+        actions: "read",
       },
     });
     expect(reviewer.manifest.default_permissions).toEqual({
@@ -216,6 +217,14 @@ describe("GitHub application registration", () => {
         "reviewer",
       ),
     ).resolves.toEqual({ installationId: "42" });
+  });
+
+  it("requires Actions read permission before installing a worker that must collect failure logs", async () => {
+    const { actions, ...permissions } = installation.permissions;
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ ...installation, permissions }));
+    await expect(new ForgeRegistrationClient(fetcher).githubInstallation(repository, app, "42", "worker"))
+      .rejects.toThrow("Grant the worker GitHub App actions: read permission");
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it.each(["worker", "reviewer"] as const)("requires checks read access to classify superseded CI for the %s", async role => {
