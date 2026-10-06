@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
-import { Header, type types } from "tar";
+import { Header, Pax, type types } from "tar";
 import type { DisposableResource, ForgeWorker } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
@@ -22,6 +22,48 @@ const evidenceBytes = Buffer.from("validation passed\n");
 const writableBytes = 4 * 1024 * 1024;
 
 describe("Completed Forge evidence lifecycle", () => {
+  it("publishes 2100 long-target fixture links and verifies the reopened archive before automatic retirement", async () => {
+    const owner = completedWorker("review");
+    const resource = savedEnvironment(owner, true);
+    resource.evidence!.paths = ["/review/repro"];
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    const target = "/provider/" + "x".repeat(4000);
+    fixture.host.archives = { "/review/repro": Array.from({ length: 2100 }, (_, index) =>
+      ({ path: `repro/fixtures/${index}`, type: "SymbolicLink", linkpath: target })) };
+    fixture.host.failure = "remove";
+    await fixture.workflow.poll();
+
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "verified" }, reason: "remove interrupted" });
+    expect(fixture.host.removed).toEqual([]);
+    expect(fixture.host.containers.has(resource.containerId!)).toBe(true);
+    const archive = path.join(fixture.directory, "forge-evidence", resource.id);
+    expect((await fs.stat(path.join(archive, "manifest.json"))).size).toBeGreaterThan(16 * 1024 * 1024);
+    expect((await fs.stat(path.join(archive, "manifest.json"))).size).toBeLessThanOrEqual(33 * 1024 * 1024);
+
+    await fixture.restart();
+    const manifest = await fixture.resources.readEvidence(resource.id);
+    expect(manifest).toMatchObject({ owner: resource.owner, consumers: resource.consumers, paths: resource.evidence!.paths, commitSha: committedHead, bytes: 8_494_500 });
+    expect(manifest.files).toHaveLength(2100);
+    expect(manifest.files.every(file => file.symbolicLink === target)).toBe(true);
+    expect(manifest.batches).toHaveLength(9);
+    for (const [index, batch] of manifest.batches!.entries()) {
+      expect((await fs.stat(path.join(archive, `batch-${index}`, "manifest.json"))).size).toBeLessThanOrEqual(1024 * 1024);
+      expect(batch.files.length).toBeLessThanOrEqual(512);
+      expect(batch.bytes).toBeLessThanOrEqual(256 * 1024 * 1024);
+    }
+    fixture.host.failure = undefined;
+    fixture.host.beforeRemove = async () => { expect(await fixture.resources.readEvidence(resource.id)).toEqual(manifest); };
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(await fixture.store.read()).toEqual([]);
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "deleted", evidence: { state: "verified" } });
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+    expect(fixture.host.exports).toHaveLength(1);
+    await fixture.restart();
+    expect(await fixture.resources.readEvidence(resource.id)).toEqual(manifest);
+    expect(JSON.parse((await buffer(await fixture.resources.evidenceFile(resource.id, "review/repro/fixtures/2099"))).toString()))
+      .toEqual({ type: "SymbolicLink", target });
+  }, 30_000);
+
   it("automatically archives logs, all schema files and fixture links in bounded batches before retiring the container", async () => {
     const owner = completedWorker("review");
     const resource = savedEnvironment(owner, true);
@@ -502,6 +544,7 @@ async function* fixtureTar(entries: TarFixtureEntry[], interruptAfter?: number) 
     const data = Buffer.from(entry.data ?? "");
     const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, linkpath: entry.linkpath, mode: 0o600 });
     header.encode();
+    if (header.needPax) yield new Pax({ path: entry.path, linkpath: entry.linkpath }).encode();
     yield header.block!;
     if (data.length) yield data;
     yield Buffer.alloc((512 - data.length % 512) % 512);

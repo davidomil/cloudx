@@ -11,7 +11,8 @@ export const maxEvidenceCollectionBytes = 1024 * 1024 * 1024;
 export const maxEvidenceCollectionFiles = 4096;
 const maxEvidenceBatches = 16;
 const maxManifestBytes = 1024 * 1024;
-const maxCollectionManifestBytes = maxManifestBytes * maxEvidenceBatches;
+// The root stores both files and batches[].files, plus collection provenance.
+const maxCollectionManifestBytes = maxManifestBytes * (2 * maxEvidenceBatches + 1);
 
 export async function writeEvidenceReceipt(file: JsonStateFile, value: unknown): Promise<void> {
   const parent = path.dirname(file.filePath);

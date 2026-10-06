@@ -144,6 +144,36 @@ describe("bounded durable Forge evidence files", () => {
     await storage.verifyCollection("forge-evidence", id, writer.batches, writer.files);
   });
 
+  it("rejects a collection root exceeding 33 MiB before recording intent or publishing", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    await writer.add(filePath, Readable.from([]), 0);
+    const manifest = { files: writer.files, batches: writer.batches, bytes: writer.bytes, padding: "" };
+    manifest.padding = "x".repeat(33 * 1024 * 1024 - Buffer.byteLength(JSON.stringify(manifest)) + 1);
+    const recordIntent = vi.fn();
+    await expect(writer.commit(manifest, recordIntent)).rejects.toThrow("metadata limit");
+    expect(recordIntent).not.toHaveBeenCalled();
+    expect(await storage.readManifest("forge-evidence", id)).toBeUndefined();
+    await writer.abort();
+    expect(await fs.readdir(path.join(directory, "forge-evidence"))).toEqual([]);
+  });
+
+  it("reopens a 33 MiB collection root while rejecting larger roots and batches above 1 MiB", async () => {
+    const writer = await storage.beginCollection("forge-evidence", id);
+    await writer.add(filePath, Readable.from([]), 0);
+    const manifest = { files: writer.files, batches: writer.batches, bytes: writer.bytes, padding: "" };
+    const rootLimit = 33 * 1024 * 1024;
+    manifest.padding = "x".repeat(rootLimit - Buffer.byteLength(JSON.stringify(manifest)));
+    await writer.commit(manifest, async () => {});
+    const reopened = new ForgeEvidenceFiles(directory);
+    expect((await reopened.readManifest<{ padding: string }>("forge-evidence", id))?.padding.length).toBe(manifest.padding.length);
+    await reopened.verifyCollection("forge-evidence", id, writer.batches, writer.files);
+    const archive = path.join(directory, "forge-evidence", id);
+    await fs.truncate(path.join(archive, "manifest.json"), rootLimit + 1);
+    await expect(reopened.readManifest("forge-evidence", id)).rejects.toThrow("bounded regular file");
+    await fs.truncate(path.join(archive, "batch-0", "manifest.json"), 1024 * 1024 + 1);
+    await expect(reopened.readManifest("forge-evidence", id, 0)).rejects.toThrow("bounded regular file");
+  });
+
   it.each(["manifest", "extra-batch", "symlink-parent", "link-content"] as const)("protects the source when collection %s is changed", async change => {
     const writer = await storage.beginCollection("forge-evidence", id);
     const target = "../../provider/projects";
