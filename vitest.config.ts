@@ -13,14 +13,17 @@ process.env.TZ = "UTC";
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
 // The verifier also keeps temporary files on tmpfs. Tests that do real Git
 // and disk-space work are several times slower on a busy disk, so a host run
-// uses the user's runtime tmpfs unless TMPDIR is set. It must not be
-// /dev/shm, which tests use as a second filesystem.
+// uses the user's runtime tmpfs unless TMPDIR is set. It needs the free space
+// of the verifier's 8 GiB work tmpfs, because the update tests check real
+// capacity, and it must not be /dev/shm, which tests use as a second
+// filesystem.
 const TMPFS_MAGIC = 0x01021994;
+const VERIFIER_TMPFS_BYTES = 8 * 1024 ** 3;
 const runtimeDirectory = process.env.XDG_RUNTIME_DIR;
 if (
   !process.env.TMPDIR &&
   runtimeDirectory &&
-  isSeparateTmpfs(runtimeDirectory)
+  fitsVerifierTmpfs(runtimeDirectory)
 ) {
   const temporary = fs.mkdtempSync(
     path.join(runtimeDirectory, "cloudx-vitest-"),
@@ -31,10 +34,12 @@ if (
   );
 }
 
-function isSeparateTmpfs(directory: string): boolean {
+function fitsVerifierTmpfs(directory: string): boolean {
   try {
+    const statfs = fs.statfsSync(directory);
     return (
-      fs.statfsSync(directory).type === TMPFS_MAGIC &&
+      statfs.type === TMPFS_MAGIC &&
+      statfs.bavail * statfs.bsize >= VERIFIER_TMPFS_BYTES &&
       fs.statSync(directory).dev !== fs.statSync("/dev/shm").dev
     );
   } catch {
