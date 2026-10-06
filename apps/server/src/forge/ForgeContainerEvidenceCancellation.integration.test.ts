@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Header } from "tar";
+import { maxEvidenceCollectionBytes } from "./ForgeEvidenceFiles.js";
 import { describe, expect, it, onTestFinished } from "vitest";
 import type { ForgeWorker } from "@cloudx/shared";
 import { readContainerEvidenceTar, type EvidenceSink } from "./ForgeContainerEvidence.js";
@@ -19,7 +20,7 @@ function header(filePath: string, bytes: number): Buffer {
 async function* reportTar(failure: "interrupted" | "input-limit" | undefined, firstReportChunk: Promise<void>): AsyncGenerator<Buffer> {
   const chunk = Buffer.alloc(chunkBytes, 0x61);
   if (failure === "input-limit") {
-    const generatedBytes = 519 * 1024 * 1024;
+    const generatedBytes = maxEvidenceCollectionBytes * 2 + 7 * 1024 * 1024;
     yield header("evidence/node_modules/generated.bin", generatedBytes);
     for (let bytes = 0; bytes < generatedBytes; bytes += chunkBytes) yield chunk;
   }

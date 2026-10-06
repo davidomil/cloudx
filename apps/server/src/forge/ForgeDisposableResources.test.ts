@@ -66,6 +66,16 @@ describe("Forge disposable resource ownership and lifecycle", () => {
   const service = () => new ForgeDisposableResources(directory, async () => structuredClone(workers), host);
   beforeEach(async () => { directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-resources-")); workers = [worker()]; host = new ContainerHost(); resources = service(); });
   afterEach(async () => { await fs.rm(directory, { recursive: true, force: true }); });
+  it.each([["null", null], ["object", {}], ["empty", ""], ["overlong", "x".repeat(4097)], ["control character", "target\u0000private"]])("rejects %s saved fixture-link metadata before any host mutation", async (_scenario, symbolicLink) => {
+    await create("link-validation", { evidencePaths: ["/work/evidence"] });
+    const journalPath = path.join(directory, "forge-disposable-resources.json");
+    const journal = JSON.parse(await fs.readFile(journalPath, "utf8"));
+    journal.resources[0].evidence.files = [{ path: "work/evidence/link", bytes: 0, sha256: "a".repeat(64), symbolicLink }];
+    await fs.writeFile(journalPath, JSON.stringify(journal));
+    await expect(service().records()).rejects.toThrow("Disposable resource ownership journal is invalid");
+    expect(host.removed).toEqual([]);
+    expect(host.stopped).toEqual([]);
+  });
 
   it("reclaims only exact receipt-owned stopped containers after closure and persists measured writable bytes", async () => {
     const first = await create(); const second = await create("cloudx-128-feedback-upgrade");
@@ -234,7 +244,7 @@ describe("Forge disposable resource ownership and lifecycle", () => {
     await expect(resources.retire(workers[0]!)).rejects.toThrow("removal denied");
     const archivePath = path.join(directory, (await service().records())[0]!.evidence!.archivePath!);
     const blob = createHash("sha256").update("work/evidence/log").digest("hex") + ".data";
-    await fs.writeFile(path.join(path.dirname(archivePath), blob), "corrupted"); host.failure = undefined;
+    await fs.writeFile(path.join(path.dirname(archivePath), "batch-0", blob), "corrupted"); host.failure = undefined;
     await expect(service().retire(workers[0]!)).rejects.toThrow("verification failed"); expect(host.removed).toEqual([]);
   });
   it("preserves downloads from existing verified compact archives while finishing their reviewed retirement", async () => {

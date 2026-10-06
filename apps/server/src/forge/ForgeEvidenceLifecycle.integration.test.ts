@@ -1,16 +1,17 @@
 import { Readable } from "node:stream";
 import { buffer } from "node:stream/consumers";
-import type { EvidenceSink } from "./ForgeContainerEvidence.js";
+import { readContainerEvidenceTar, type EvidenceSink } from "./ForgeContainerEvidence.js";
 import { randomUUID, createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { Header, type types } from "tar";
 import type { DisposableResource, ForgeWorker } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { NotificationsPlugin } from "../plugins/NotificationsPlugin.js";
-import { ForgeDisposableResources, type ContainerIdentity, type DisposableContainerHost } from "./ForgeDisposableResources.js";
+import { ForgeDisposableResources, ForgeEvidenceExportError, type ContainerIdentity, type DisposableContainerHost } from "./ForgeDisposableResources.js";
 import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 
@@ -21,6 +22,112 @@ const evidenceBytes = Buffer.from("validation passed\n");
 const writableBytes = 4 * 1024 * 1024;
 
 describe("Completed Forge evidence lifecycle", () => {
+  it("automatically archives logs, all schema files and fixture links in bounded batches before retiring the container", async () => {
+    const owner = completedWorker("review");
+    const resource = savedEnvironment(owner, true);
+    resource.evidence!.paths = ["/review/evidence", "/review/repro"];
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.archives = reproductionArchives();
+    fixture.host.beforeRemove = async () => {
+      const manifest = await fixture.resources.readEvidence(resource.id);
+      expect(manifest.files).toHaveLength(604);
+      expect(manifest.batches?.map(batch => batch.files.length)).toEqual([512, 92]);
+      expect(manifest.batches?.every(batch => batch.bytes <= 256 * 1024 * 1024)).toBe(true);
+    };
+    await fixture.workflow.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+    expect(fixture.notifications.list()).toEqual([]);
+    await fixture.restart();
+    const manifest = await fixture.resources.readEvidence(resource.id);
+    expect(manifest).toMatchObject({ owner: resource.owner, consumers: resource.consumers, paths: resource.evidence!.paths, commitSha: committedHead });
+    expect(manifest.files.filter(file => file.symbolicLink).map(file => file.symbolicLink).sort()).toEqual([
+      "../../../../provider/projects", "/opt/pinned-codex/bin/codex", "/review/provider/projects",
+    ].sort());
+    expect(await buffer(await fixture.resources.evidenceFile(resource.id, "review/evidence/validation.log"))).toEqual(evidenceBytes);
+    expect(await buffer(await fixture.resources.evidenceFile(resource.id, "review/repro/accounts-codex-schema/599.json"))).toEqual(Buffer.from("schema 599"));
+    const link = manifest.files.find(file => file.symbolicLink)!;
+    expect(JSON.parse((await buffer(await fixture.resources.evidenceFile(resource.id, link.path))).toString())).toEqual({ type: "SymbolicLink", target: link.symbolicLink });
+    expect(fixture.host.exports).toHaveLength(1);
+  });
+
+  it("cleans every staged batch after a partial tar export and automatically recovers the full selection after restart", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    resource.evidence!.paths = ["/review/evidence", "/review/repro"];
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.archives = reproductionArchives();
+    fixture.host.tarFailureAfter = 520;
+    await fixture.workflow.poll();
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "pending" }, reason: "reproduction tar interrupted" });
+    expect((await fixture.resources.records())[0]?.evidence?.manifestSha256).toBeUndefined();
+    expect(await fs.readdir(path.join(fixture.directory, "forge-evidence"))).toEqual([]);
+    expect(fixture.host.removed).toEqual([]);
+    fixture.host.tarFailureAfter = undefined;
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect((await fixture.resources.readEvidence(resource.id)).files).toHaveLength(604);
+    expect(fixture.host.exports).toHaveLength(2);
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+  });
+
+  it("verifies every batch again after restart and preserves the container until a corrupted later batch is restored", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    resource.evidence!.paths = ["/review/evidence", "/review/repro"];
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.archives = reproductionArchives();
+    fixture.host.failure = "remove";
+    await fixture.workflow.poll();
+    const filePath = "review/repro/accounts-codex-schema/599.json";
+    const blob = createHash("sha256").update(filePath).digest("hex") + ".data";
+    const location = path.join(fixture.directory, "forge-evidence", resource.id, "batch-1", blob);
+    await fs.writeFile(location, "corrupted later batch");
+    fixture.host.failure = undefined;
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect((await fixture.resources.records())[0]).toMatchObject({ state: "failed", evidence: { state: "verified" }, reason: expect.stringContaining("verification failed") });
+    expect(fixture.host.removed).toEqual([]);
+    expect(fixture.host.containers.has(resource.containerId!)).toBe(true);
+    expect(fixture.host.exports).toHaveLength(1);
+    await fs.writeFile(location, "schema 599");
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+    expect(fixture.host.exports).toHaveLength(1);
+  });
+
+  it("deduplicates primary export failures across diagnostic variants and restart while reporting changed blockers", async () => {
+    const owner = completedWorker();
+    const resource = savedEnvironment(owner, true);
+    const fixture = await EvidenceLifecycleFixture.create([owner], [resource]);
+    fixture.host.exportError = new ForgeEvidenceExportError("Unsafe archive path", "connection reset by peer");
+    await fixture.workflow.poll();
+    const digest = (await fixture.store.read())[0]!.resourceCleanupNotificationDigest;
+    expect(fixture.notifications.list()).toHaveLength(1);
+    fixture.notifications.dismissAll();
+    fixture.host.exportError = new ForgeEvidenceExportError("Unsafe archive path", "write /dev/stdout: broken pipe");
+    await fixture.workflow.reconcileResourceCleanup();
+    await fixture.restart();
+    fixture.host.exportError = new ForgeEvidenceExportError("Unsafe archive path", "");
+    await fixture.workflow.poll();
+    expect(fixture.notifications.list()).toEqual([]);
+    expect((await fixture.store.read())[0]?.resourceCleanupNotificationDigest).toBe(digest);
+    fixture.host.exportError = new ForgeEvidenceExportError("Special file in archive", "connection reset by peer");
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(fixture.notifications.list()).toHaveLength(1);
+    expect((await fixture.store.read())[0]?.resourceCleanupNotificationDigest).not.toBe(digest);
+    fixture.notifications.dismissAll();
+    await fixture.restart();
+    await fixture.workflow.poll();
+    expect(fixture.notifications.list()).toEqual([]);
+    expect(fixture.host.removed).toEqual([]);
+    fixture.host.exportError = undefined;
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.removed).toEqual([resource.containerId]);
+  });
   it.each(["issue", "review"] as const)("announces an unchanged %s cleanup hold once across forced checks, dismissal, timed checks and restart", async kind => {
     const owner = completedWorker(kind);
     const resource = savedEnvironment(owner);
@@ -351,6 +458,10 @@ class SavedContainerHost implements DisposableContainerHost {
   failure?: "export" | "remove";
   reportBytes?: number;
   partialExport = false;
+  archives?: Record<string, TarFixtureEntry[]>;
+  tarFailureAfter?: number;
+  exportError?: Error;
+  beforeRemove?: () => Promise<void>;
   async *reportStream() {
     let remaining = this.reportBytes!;
     while (remaining) {
@@ -369,14 +480,47 @@ class SavedContainerHost implements DisposableContainerHost {
   async remove(id: string): Promise<void> {
     this.events.push(`remove:${id}`);
     if (this.failure === "remove") throw new Error("remove interrupted");
+    await this.beforeRemove?.();
     this.containers.delete(id); this.removed.push(id);
   }
   async readEvidence(id: string, paths: string[], write: EvidenceSink) {
     this.events.push(`export:${id}`); this.exports.push(id);
     if (this.failure === "export") throw new Error("export interrupted");
+    if (this.exportError) throw this.exportError;
+    if (this.archives) {
+      for (const source of paths) await readContainerEvidenceTar(source, fixtureTar(this.archives[source]!, this.tarFailureAfter), write);
+      return;
+    }
     if (this.reportBytes !== undefined) await write(paths[0]!.slice(1), this.reportStream(), this.reportBytes);
     else if (paths.includes(evidencePath)) await write(evidencePath.slice(1), Readable.from([evidenceBytes]), evidenceBytes.length);
   }
+}
+
+interface TarFixtureEntry { path: string; data?: string; type?: types.EntryTypeName; linkpath?: string }
+async function* fixtureTar(entries: TarFixtureEntry[], interruptAfter?: number) {
+  for (const [index, entry] of entries.entries()) {
+    const data = Buffer.from(entry.data ?? "");
+    const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, linkpath: entry.linkpath, mode: 0o600 });
+    header.encode();
+    yield header.block!;
+    if (data.length) yield data;
+    yield Buffer.alloc((512 - data.length % 512) % 512);
+    if (index === interruptAfter) throw new Error("reproduction tar interrupted");
+  }
+  yield Buffer.alloc(1024);
+}
+function reproductionArchives(): Record<string, TarFixtureEntry[]> {
+  return {
+    "/review/evidence": [{ path: "evidence/validation.log", data: evidenceBytes.toString() }],
+    "/review/repro": [
+      { path: "repro/account-kind-import-Ivuswc/codex/tmp/arg0/codex-arg0zwAz11/apply_patch", type: "SymbolicLink", linkpath: "/opt/pinned-codex/bin/codex" },
+      { path: "repro/accounts-policy/data/claude-launches/settings.json/projects", type: "SymbolicLink", linkpath: "/review/provider/projects" },
+      { path: "repro/accounts-round3/credentials/local/data/claude-launches/local-api-key/projects", type: "SymbolicLink", linkpath: "../../../../provider/projects" },
+      ...Array.from({ length: 600 }, (_, index) => ({ path: `repro/accounts-codex-schema/${index}.json`, data: `schema ${index}` })),
+      { path: "repro/node_modules/generated", data: "disposable dependency" },
+      { path: "repro/dist/output.js", data: "disposable build" },
+    ],
+  };
 }
 
 class EvidenceLifecycleFixture {

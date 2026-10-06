@@ -45,8 +45,37 @@ describe("specific bounded Docker evidence archive parsing", () => {
   it.each(["../outside", "/outside", "evidence/../outside", "other/log", "evidence\\outside"])("rejects archive path %s without extracting it", async file => {
     await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: file, data: "private" }]))).rejects.toThrow("unsafe or unexpected path");
   });
-  it.each(["SymbolicLink", "Link", "FIFO", "CharacterDevice"] as const)("rejects %s evidence entries", async type => {
+  it.each(["Link", "FIFO", "CharacterDevice"] as const)("rejects %s evidence entries", async type => {
     await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: "evidence/log", type, ...(["SymbolicLink", "Link"].includes(type) ? { linkpath: "/etc/passwd" } : {}) }]))).rejects.toThrow("links, special files");
+  });
+  it.each(["/opt/codex/bin/codex", "../../provider/projects", "/etc/passwd"])("preserves fixture link %s as inert metadata", async target => {
+    const files = await readContainerEvidenceTar("/review/repro", evidenceTar([
+      { path: "repro/fixture/apply_patch", type: "SymbolicLink", linkpath: target },
+      { path: "repro/result.log", data: "test passed" },
+    ]));
+    expect(files.map(file => [file.path, file.data.toString()])).toEqual([
+      ["review/repro/fixture/apply_patch", JSON.stringify({ type: "SymbolicLink", target })],
+      ["review/repro/result.log", "test passed"],
+    ]);
+  });
+  it("streams more than one batch of selected schema files without omitting any", async () => {
+    const files = await readContainerEvidenceTar("/review/repro", evidenceTar(Array.from({ length: 600 }, (_, index) =>
+      ({ path: `repro/schema/${index}.json`, data: `${index}` }))));
+    expect(files).toHaveLength(600);
+    expect(files[599]?.data.toString()).toBe("599");
+  });
+  it("rejects archive entries beneath a fixture link and duplicate directory paths", async () => {
+    await expect(readContainerEvidenceTar("/review/repro", evidenceTar([
+      { path: "repro/projects", type: "SymbolicLink", linkpath: "/private" },
+      { path: "repro/projects/secret", data: "must not be copied" },
+    ]))).rejects.toThrow("link parent");
+    await expect(readContainerEvidenceTar("/review/repro", evidenceTar([
+      { path: "repro", type: "Directory" }, { path: "repro", type: "Directory" },
+    ]))).rejects.toThrow("duplicate");
+  });
+  it("keeps an aggregate file-count ceiling even when individual storage batches fit", async () => {
+    await expect(readContainerEvidenceTar("/review/repro", evidenceTar(Array.from({ length: 4097 }, (_, index) =>
+      ({ path: `repro/schema/${index}.json`, data: "" }))))).rejects.toThrow("bounded collection limit");
   });
   it("rejects duplicate entries and truncated or corrupted archives", async () => {
     await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: "evidence/log", data: "first" }, { path: "evidence/log", data: "second" }]))).rejects.toThrow("duplicate paths");
@@ -54,6 +83,12 @@ describe("specific bounded Docker evidence archive parsing", () => {
     archive[0] = 0;
     await expect(readContainerEvidenceTar("/work/evidence", archive)).rejects.toThrow();
     await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: "evidence/log", data: "missing body", size: 9999 }]))).rejects.toThrow();
+  });
+  it("rejects oversized extended metadata instead of silently changing the following evidence path", async () => {
+    await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([
+      { path: "pax", type: "ExtendedHeader", data: "x".repeat(1024 * 1024 + 1) },
+      { path: "evidence/log", data: "must stay protected" },
+    ]))).rejects.toThrow("oversized metadata");
   });
   it("rejects oversized evidence before buffering its entry body", async () => {
     await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: "evidence/large", size: 256 * 1024 * 1024 + 1 }]))).rejects.toThrow("bounded storage limit");

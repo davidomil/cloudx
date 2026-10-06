@@ -7,9 +7,9 @@ import { Parser, type ReadEntry } from "tar";
 import type { DisposableResource, ForgeEvidenceManifest, ForgeResourceEvidence } from "@cloudx/shared";
 import { JsonStateFile, requireSafeDirectory } from "../jsonStateFile.js";
 import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
-import { ForgeEvidenceFiles, maxEvidenceBytes, maxEvidenceFiles } from "./ForgeEvidenceFiles.js";
+import { evidenceLinkContents, ForgeEvidenceFiles, maxEvidenceBytes, maxEvidenceFiles, maxEvidenceCollectionBytes, maxEvidenceCollectionFiles } from "./ForgeEvidenceFiles.js";
 
-export type EvidenceSink = (filePath: string, data: AsyncIterable<Uint8Array>, expectedBytes: number) => Promise<void>;
+export type EvidenceSink = (filePath: string, data: AsyncIterable<Uint8Array>, expectedBytes: number, symbolicLink?: string) => Promise<void>;
 export type ContainerEvidenceSource = (write: EvidenceSink) => Promise<void>;
 interface EvidenceArchive { manifest: ForgeEvidenceManifest; contents?: Record<string, string> }
 const namespace = "forge-evidence";
@@ -23,10 +23,12 @@ export function validEvidencePaths(value: unknown, allowEmpty = false): value is
     value.every((item, index) => value.every((other, otherIndex) => index === otherIndex || item !== other && !item.startsWith(`${other}/`)));
 }
 
-/** Parse Docker stdout as data and stream regular files to a bounded disk sink. */
+/** Parse Docker stdout as data; links become inert records without extracting or following them. */
 export async function readContainerEvidenceTar(source: string, tar: AsyncIterable<Uint8Array>, write: EvidenceSink): Promise<void> {
   if (!validEvidencePaths([source])) throw new Error("Evidence requires specific absolute container paths outside generated environments.");
   const keys = new Set<string>();
+  const links = new Set<string>();
+  let files = 0;
   let bytes = 0;
   let archiveBytes = 0;
   let entries = 0;
@@ -37,7 +39,7 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
   const destination = new Writable({
     write(chunk: Buffer, _encoding, callback) {
       archiveBytes += chunk.length;
-      if (archiveBytes > maxEvidenceBytes * 2 + 8 * 1024 * 1024) { callback(new Error("Container evidence tar exceeds its bounded input limit; select narrower paths.")); return; }
+      if (archiveBytes > maxEvidenceCollectionBytes * 2 + 8 * 1024 * 1024) { callback(new Error("Container evidence tar exceeds its bounded input limit; the environment was preserved.")); return; }
       if (parser.write(chunk)) callback();
       else parser.once("drain", callback);
     },
@@ -49,26 +51,40 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
   });
   // Consume rejection immediately even if source input fails before finalization.
   completion.catch(error => { destination.destroy(error as Error); });
+  parser.on("ignoredEntry", () => parser.abort(new Error("Container evidence archive contains unsupported entries or oversized metadata.")));
   parser.on("entry", entry => {
     const fail = (reason: string) => parser.abort(new Error(reason));
     if (++entries > 8192) { fail("Container evidence tar has too many entries; select narrower paths."); return; }
     const name = entry.path.replace(/^\.\//u, "").replace(/\/$/u, "");
-    if (!name || name.includes("\\") || /[\u0000-\u001f]/u.test(name) || path.posix.isAbsolute(name) || path.posix.normalize(name) !== name || name.split("/")[0] !== root) {
+    if (!name || name.length > 4096 || name.includes("\\") || /[\u0000-\u001f]/u.test(name) || path.posix.isAbsolute(name) || path.posix.normalize(name) !== name || name.split("/")[0] !== root) {
       fail("Container evidence archive contains an unsafe or unexpected path."); return;
     }
     const filePath = source.slice(1) + name.slice(root.length);
+    if (keys.has(filePath)) { fail("Container evidence archive contains duplicate paths."); return; }
+    if ([...links].some(link => filePath.startsWith(`${link}/`))) { fail("Container evidence archive contains a symbolic-link parent."); return; }
+    keys.add(filePath);
     if (generatedEvidencePath(filePath) || filePath.split("/").includes(".git") || entry.type === "Directory") { entry.resume(); return; }
-    if (!["File", "OldFile"].includes(entry.type) || entry.linkpath || keys.has(filePath)) {
+    let linkData: Buffer | undefined;
+    if (entry.type === "SymbolicLink") {
+      if (entry.size !== 0 || [...keys].some(key => key.startsWith(`${filePath}/`))) { fail("Container evidence archive contains an invalid symbolic-link parent or body."); return; }
+      try { linkData = evidenceLinkContents(entry.linkpath); } catch { fail("Evidence symbolic-link metadata is invalid."); return; }
+      links.add(filePath);
+    } else if (!["File", "OldFile"].includes(entry.type) || entry.linkpath) {
       fail("Container evidence archive contains links, special files or duplicate paths."); return;
     }
-    if (!Number.isSafeInteger(entry.size) || entry.size < 0 || bytes + entry.size > maxEvidenceBytes || keys.size >= maxEvidenceFiles) {
-      fail("Evidence exceeds the bounded storage limit (256 MiB / 512 files); select narrower paths."); return;
+    const size = linkData?.length ?? entry.size;
+    if (!Number.isSafeInteger(size) || size < 0 || size > maxEvidenceBytes) {
+      fail("Evidence exceeds the bounded storage limit (256 MiB per file); the environment was preserved."); return;
     }
-    keys.add(filePath); bytes += entry.size;
+    if (bytes + size > maxEvidenceCollectionBytes || ++files > maxEvidenceCollectionFiles) {
+      fail("Evidence exceeds the bounded collection limit (1 GiB / 4096 files); the environment was preserved."); return;
+    }
+    bytes += size;
+    if (linkData) entry.resume();
     pendingEntries.add(entry);
     entry.on("error", (error: Error) => parser.abort(error));
     tail = tail.then(async () => {
-      await write(filePath, entry, entry.size);
+      await write(filePath, linkData ? Readable.from([linkData]) : entry, size, linkData ? entry.linkpath : undefined);
       pendingEntries.delete(entry);
     });
     tail.catch(error => parser.abort(error instanceof Error ? error : new Error(String(error))));
@@ -82,7 +98,7 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
     await tail.catch(() => undefined);
     throw error;
   }
-  if (!keys.size) throw new Error(`Evidence source ${source} has no exportable regular files; select specific valuable data.`);
+  if (!files) throw new Error(`Evidence source ${source} has no exportable files or fixture links; select specific valuable data.`);
 }
 
 export class ForgeContainerEvidence {
@@ -92,17 +108,18 @@ export class ForgeContainerEvidence {
   async export(resource: DisposableResource, source: ContainerEvidenceSource, recordIntent: (receipt: ForgeResourceEvidence) => Promise<void>): Promise<ForgeResourceEvidence> {
     const evidence = resource.evidence;
     if (!evidence || !validEvidencePaths(evidence.paths) || !resource.containerId || !resource.created) throw new Error("Evidence export requires exact source and container provenance.");
-    const writer = await this.storage.begin(namespace, resource.id);
+    const writer = await this.storage.beginCollection(namespace, resource.id);
     try {
-      await source(async (filePath, data, expectedBytes) => {
+      await source(async (filePath, data, expectedBytes, symbolicLink) => {
         if (!selectedEvidenceKey(filePath, evidence.paths)) throw new Error("Evidence source returned a path outside its declared selection.");
-        await writer.add(filePath, data, expectedBytes);
+        await writer.add(filePath, data, expectedBytes, symbolicLink);
       });
       const files = writer.files.sort((left, right) => left.path.localeCompare(right.path));
       const manifest: ForgeEvidenceManifest = {
         resourceId: resource.id, owner: resource.owner, consumers: resource.consumers, engineId: resource.engineId,
         containerId: resource.containerId, created: resource.created, reason: resource.retentionReason, paths: evidence.paths,
         commitSha: evidence.commitSha, commitSource: evidence.commitSource, exportedAt: new Date().toISOString(), files, bytes: writer.bytes,
+        batches: writer.batches,
       };
       const receipt: ForgeResourceEvidence = { ...evidence, state: "verified", archivePath: archivePath(resource.id), manifestSha256: sha256(JSON.stringify(manifest)), files, bytes: writer.bytes, exportedAt: manifest.exportedAt };
       // The full selection must stream successfully before its durable export intent is accepted.
@@ -131,11 +148,12 @@ export class ForgeContainerEvidence {
       manifest.containerId !== resource.containerId || manifest.created !== resource.created || manifest.reason !== resource.retentionReason || JSON.stringify(manifest.owner) !== JSON.stringify(resource.owner) ||
       JSON.stringify(manifest.consumers) !== JSON.stringify(resource.consumers) || JSON.stringify(manifest.paths) !== JSON.stringify(evidence.paths) ||
       manifest.commitSha !== evidence.commitSha || manifest.commitSource !== evidence.commitSource || !Number.isFinite(Date.parse(manifest.exportedAt)) ||
-      !Array.isArray(manifest.files) || !manifest.files.length || manifest.files.length > maxEvidenceFiles || manifest.files.some(file => !selectedEvidenceKey(file.path, evidence.paths)))
+      !Array.isArray(manifest.files) || !manifest.files.length || manifest.files.length > (manifest.batches ? maxEvidenceCollectionFiles : maxEvidenceFiles) || manifest.files.some(file => !file || !selectedEvidenceKey(file.path, evidence.paths)))
       throw new Error("Evidence manifest does not match its ownership and export receipt.");
     if (JSON.stringify(manifest.files) !== JSON.stringify(evidence.files) || manifest.bytes !== evidence.bytes || manifest.exportedAt !== evidence.exportedAt ||
       manifest.bytes !== manifest.files.reduce((sum, file) => sum + file.bytes, 0)) throw new Error("Evidence archive size or file inventory changed.");
     if (archive.contents) verifyLegacyContents(archive);
+    else if (manifest.batches) await this.storage.verifyCollection(namespace, resource.id, manifest.batches, manifest.files);
     else await this.storage.verify(namespace, resource.id, manifest.files);
     return archive;
   }
@@ -144,7 +162,8 @@ export class ForgeContainerEvidence {
     const archive = await this.read(resource);
     if (!archive.manifest.files.some(file => file.path === filePath)) throw new Error("Unknown evidence file.");
     if (archive.contents) return Readable.from([Buffer.from(archive.contents[filePath]!, "base64")]);
-    return this.storage.fileStream(namespace, resource.id, filePath);
+    const batch = archive.manifest.batches?.findIndex(batch => batch.files.some(file => file.path === filePath));
+    return this.storage.fileStream(namespace, resource.id, filePath, batch);
   }
 
   private async readArchive(resource: DisposableResource): Promise<EvidenceArchive | undefined> {
