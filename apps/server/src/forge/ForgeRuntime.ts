@@ -42,7 +42,7 @@ import { ForgeReviewConversation, isReviewConversationBinding, retireReviewSessi
 import { ForgeExecutionRecovery, executionEnvironment, isUuid, type ForgeExecution } from "./ForgeExecution.js";
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { cleanupIgnoredForgePath } from "./ForgeGeneratedCleanup.js";
-import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
+import { isGeneratedForgeLink, isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
 import { ForgeCheckoutEvidence, isCheckoutEvidenceReceipt } from "./ForgeCheckoutEvidence.js";
 import { ForgeGitHistory, isGitHistoryReceipt } from "./ForgeGitHistory.js";
 import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
@@ -2009,6 +2009,7 @@ export class ForgeRuntime {
   private async handoffCheckoutEvidence(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
     const retirement = owned.evidenceRetirement!;
     const archive = new ForgeCheckoutEvidence(this.dependencies.dataDir);
+    const supplementExisting = Boolean(owned.checkoutEvidence);
     if (!owned.checkoutEvidenceRemovalStarted) await this.assertPublicationEvidence(owned, signal);
     if (!owned.checkoutEvidence) {
       const requested = publicationFiles(retirement.paths, this.publicationHandoff(owned)?.retainedEvidencePaths ?? []);
@@ -2026,11 +2027,23 @@ export class ForgeRuntime {
     }
     const receipts = [owned.checkoutEvidence!, ...owned.additionalCheckoutEvidence ?? []];
     const manifests: ForgeCheckoutEvidenceManifest[] = [];
-    for (const receipt of receipts) {
+    const exportReceipt = async (receipt: ForgeCheckoutEvidenceReceipt) => {
       manifests.push(await archive.export(owned.id, owned.worktree, receipt, async intent => {
         Object.assign(receipt, intent);
         await this.manifest(owned.id).write(owned);
       }, signal));
+    };
+    for (const receipt of receipts) await exportReceipt(receipt);
+    if (supplementExisting) {
+      const paths = await this.automaticEvidencePaths(owned, signal, manifests.flatMap(manifest => manifest.files.map(file => file.path)));
+      const batches = paths.length ? await archive.planSelection(owned.worktree, paths, signal) : [];
+      if (batches.length) {
+        const { attemptId, commitSha } = owned.checkoutEvidence!;
+        const supplemental = batches.map(paths => ({ archiveId: randomUUID(), attemptId, commitSha, paths }));
+        owned.additionalCheckoutEvidence = [...owned.additionalCheckoutEvidence ?? [], ...supplemental];
+        await this.manifest(owned.id).write(owned);
+        for (const receipt of supplemental) await exportReceipt(receipt);
+      }
     }
     if (!owned.checkoutEvidenceRemovalStarted) {
       await this.assertPublicationEvidence(owned, signal);
@@ -2039,7 +2052,7 @@ export class ForgeRuntime {
     }
     for (const manifest of manifests) {
       await this.assertCleanupQuiescent(owned);
-      await archive.removeExported(owned.worktree, manifest, signal);
+      await archive.removeExported(owned.worktree, { ...manifest, paths: manifest.files.map(file => file.path) }, signal);
     }
     owned.explicitRetainedPaths = owned.explicitRetainedPaths?.filter(file =>
       !manifests.some(manifest => manifest.files.some(exported => file === exported.path ||
@@ -2056,15 +2069,50 @@ export class ForgeRuntime {
       throw new Error("Named checkout evidence changed after the validated publication handoff; its source was preserved.");
   }
 
-  private async automaticEvidencePaths(owned: OwnedWorkspace, signal?: AbortSignal): Promise<string[]> {
+  private async automaticEvidencePaths(owned: OwnedWorkspace, signal?: AbortSignal, archivedPaths: string[] = []): Promise<string[]> {
     const roots = [".cloudx", "test-results", "playwright-report", "coverage", "debug_tooling"];
+    const generatedTrees = new Set(["node_modules", "dist", "build", ".venv", "__pycache__", ".pytest_cache", ".vite"]);
     const paths: string[] = [];
+    const device = (await fs.lstat(owned.worktreePath, { bigint: true })).dev;
+    let entries = 0;
     for (const root of roots) {
-      const untracked = await this.runGit(owned.worktreePath, ["ls-files", "--others", "--exclude-standard", "-z", "--", root], signal);
-      const ignored = await this.runGit(owned.worktreePath, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", root], signal);
-      if ((untracked || ignored) && !(await this.runGit(owned.worktreePath, ["ls-files", "-z", "--", root], signal)).length) paths.push(root);
+      const untracked = await this.runGit(owned.worktreePath, ["ls-files", "--others", "--exclude-standard", "--directory", "--no-empty-directory", "-z", "--", root], signal);
+      const ignored = await this.runGit(owned.worktreePath, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "--no-empty-directory", "-z", "--", root], signal);
+      const tracked = (await this.runGit(owned.worktreePath, ["ls-files", "-z", "--", root], signal)).split("\0").filter(Boolean);
+      const protectedPaths = [...tracked, ...archivedPaths];
+      const select = async (relative: string): Promise<void> => {
+        signal?.throwIfAborted();
+        if (++entries > 4096) throw new Error("Checkout evidence selection contains too many entries; select narrower paths.");
+        if (!isRetainedEvidencePaths([relative]) || relative !== root && !relative.startsWith(`${root}/`))
+          throw new Error("Git returned an invalid checkout evidence inventory; its files were preserved.");
+        if (protectedPaths.some(file => file === relative || relative.startsWith(`${file}/`))) return;
+        const absolute = path.join(owned.worktreePath, relative);
+        if (!await requireSafeDirectory(owned.worktreePath, path.dirname(absolute), { create: false, label: "Checkout evidence parent" }))
+          throw new Error("Checkout evidence parent disappeared; its files were preserved.");
+        const stat = await fs.lstat(absolute, { bigint: true });
+        if (stat.dev !== device) throw new Error("Checkout evidence crosses a filesystem boundary; the checkout was preserved.");
+        if (relative.split("/").slice(0, -1).some(part => generatedTrees.has(part))) return;
+        if (!stat.isFile() && generatedTrees.has(path.posix.basename(relative))) return;
+        if (stat.isSymbolicLink() && isGeneratedForgeLink(relative, await fs.readlink(absolute))) return;
+        if (!protectedPaths.some(file => file.startsWith(`${relative}/`))) { paths.push(relative); return; }
+        const directory = await fs.open(absolute, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        try {
+          const opened = await directory.stat({ bigint: true });
+          if (opened.dev !== stat.dev || opened.ino !== stat.ino || opened.dev !== device)
+            throw new Error("Checkout evidence directory changed; its files were preserved.");
+          const children = await fs.readdir(`/proc/self/fd/${directory.fd}`);
+          if (children.includes(".git") || ["HEAD", "objects", "refs"].every(name => children.includes(name)))
+            throw new Error("Checkout evidence contains repository history; recover its source before cleanup.");
+          for (const child of children.sort()) await select(`${relative}/${child}`);
+          const current = await fs.lstat(absolute, { bigint: true });
+          if (current.dev !== stat.dev || current.ino !== stat.ino)
+            throw new Error("Checkout evidence directory changed; its files were preserved.");
+        } finally { await directory.close(); }
+      };
+      for (const relative of new Set(`${untracked}${ignored}`.split("\0").filter(Boolean).map(file => file.replace(/\/$/u, ""))))
+        await select(relative);
     }
-    return paths;
+    return publicationFiles(paths, []);
   }
 
   private async finishCheckoutRemoval(owned: OwnedWorkspace, signal?: AbortSignal): Promise<boolean> {
@@ -2297,7 +2345,7 @@ export class ForgeRuntime {
       !isPublicationOwnership(value) ||
       (value.checkoutEvidence !== undefined && !isCheckoutEvidenceReceipt(value.checkoutEvidence)) ||
       (value.checkoutEvidenceRemovalStarted !== undefined && (value.checkoutEvidenceRemovalStarted !== true ||
-        !value.checkoutEvidence?.manifestSha256 || value.additionalCheckoutEvidence?.some(receipt => !receipt.manifestSha256))) ||
+        !value.checkoutEvidence?.manifestSha256)) ||
       (value.gitHistory !== undefined && !isGitHistoryReceipt(value.gitHistory)) ||
       (value.additionalCheckoutEvidence !== undefined && (!value.checkoutEvidence || !Array.isArray(value.additionalCheckoutEvidence) ||
         value.additionalCheckoutEvidence.length > 4096 || value.additionalCheckoutEvidence.some(receipt => !isCheckoutEvidenceReceipt(receipt)) ||

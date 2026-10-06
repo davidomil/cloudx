@@ -16,8 +16,10 @@ Retirement uses the attempt recorded in the completion receipt, even after the
 active attempt has ended. Named evidence and untracked report trees under
 `.cloudx`, `test-results`, `playwright-report`, `coverage` and `debug_tooling` move
 to private storage outside the disposable checkout. Automatic report selection
-never includes a tree with tracked files. Uncommitted source outside these report
-trees remains protected. Dependencies and build descendants are excluded.
+chooses untracked and ignored report subtrees and individual files disjoint from
+tracked paths, including reports beside tracked documentation in the same root.
+Tracked edits and uncommitted source outside report roots remain protected.
+Dependencies and build descendants are excluded.
 
 Each archive contains at most 256 MiB of regular files and 512 files. A completed
 checkout can split up to 1 GiB and 4096 files into multiple archives; an individual
@@ -33,6 +35,18 @@ checks contents, inventory and provenance, and synchronizes archive directory
 names again after restart. Failed archive or receipt synchronization preserves
 the checkout. A cleanup failure appears on its worker instead of becoming a
 manual filesystem deletion workflow.
+
+After partial archival, retirement discovers remaining automatic reports and
+appends durable supplemental receipts with the original completion provenance.
+Pending supplemental receipts survive restart without clearing the validated
+original-removal marker. All recorded archives are exported and verified before
+exact manifest-listed source files are unlinked.
+
+The original named publication fingerprint remains required until the
+original-removal marker is durably saved. After removal starts, missing old named
+files do not block supplemental archival. New unknown files appearing after
+export remain protected by the normal retention check; changed selected files
+block unlink.
 
 Checkout archives live under `forge-checkout-evidence/<archiveId>`; container
 archives live under `forge-evidence/<resourceId>`. Container creation requires

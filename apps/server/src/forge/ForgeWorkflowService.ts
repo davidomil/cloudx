@@ -2670,9 +2670,16 @@ export class ForgeWorkflowService {
       if (this.disposed) return;
       if (this.isReserved(worker)) continue;
       if (worker.status === "cleanup_failed" && !await this.deps.runtime.pendingCheckoutRemoval?.(worker.id)) continue;
+      let mergeChecked = false;
       if (worker.kind === "issue" && worker.status !== "draft" &&
           !recoveringIds.has(worker.id)) {
         try {
+          const related = this.relatedWorkers(worker);
+          if (related.some(candidate => candidate.kind === "review" && candidate.status === "completed" && candidate.number === worker.changeNumber) &&
+              !related.some(candidate => hasUnconfirmedPublication(candidate) || recoveringIds.has(candidate.id))) {
+            mergeChecked = true;
+            if (await this.reconcileMergedChange(worker)) return;
+          }
           if (await this.reconcileClosedIssues(worker)) return;
         } catch (error) {
           this.log(worker, "warn", "completion_check_failed", forgeErrorFields(error));
@@ -2689,7 +2696,7 @@ export class ForgeWorkflowService {
       checked.add(key);
       await this.forWorker(worker, async () => {
         try {
-          if (await this.reconcileMergedChange(worker)) return;
+          if (!mergeChecked && await this.reconcileMergedChange(worker)) return;
           for (const issue of this.workers.filter(candidate => candidate.kind === "issue" && candidate.changeNumber === number &&
             sameRepository(candidate.repository, worker.repository) && candidate.headSha &&
             (["paused", "stopped", "failed"].includes(candidate.status) || candidate.status === "awaiting_review" && !candidate.autoReview?.enabled) &&

@@ -8,6 +8,7 @@ import type { ForgeRepository, ForgeWorker, WorkspaceTab } from "@cloudx/shared"
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { PathPolicy } from "../pathPolicy.js";
+import * as FilesystemIdentity from "../filesystemIdentity.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies, type ForgeWorkspace } from "./ForgeRuntime.js";
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
@@ -71,6 +72,146 @@ describe("Forge workflow retention after completed workspace discard", () => {
     expect(manifest?.files.map(file => file.path)).toEqual(["test-results/.last-run.json", "test-results/reproduction.ts"]);
   });
 
+  it.each([false, true])("archives untracked and ignored reports beside tracked documentation validation while preserving modified source: %s", async modified => {
+    const trackedPaths = ["debug_tooling/documentation-validation/README.md", "debug_tooling/documentation-validation/run_validation.py"];
+    const fixture = await RetentionFixture.create("issue", false, { trackedReportPaths: trackedPaths });
+    if (!modified) await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    if (modified) await fs.writeFile(path.join(fixture.workspace.worktreePath, trackedPaths[1]!), "Unpublished validation changes\n");
+    await fs.appendFile(path.join(fixture.workspace.worktreePath, ".git/info/exclude"), "\ndebug_tooling/ignored-reports/\n");
+    const reportPaths = ["debug_tooling/documentation-validation/run.log", "debug_tooling/ignored-reports/run.log", "debug_tooling/reports/run.log", "debug_tooling/root.log"];
+    for (const relative of reportPaths) {
+      await fs.mkdir(path.dirname(path.join(fixture.workspace.worktreePath, relative)), { recursive: true });
+      await fs.writeFile(path.join(fixture.workspace.worktreePath, relative), "Finished validation\n");
+    }
+    await fixture.service.poll();
+    const archives = await new ForgeCheckoutEvidence(fixture.dataDir).list();
+    expect(archives.flatMap(manifest => manifest.files.map(file => file.path)).sort()).toEqual(reportPaths);
+    expect(archives.every(manifest => manifest.paths.every(relative => !trackedPaths.some(tracked => tracked === relative || tracked.startsWith(`${relative}/`))))).toBe(true);
+    if (modified) {
+      expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: { retainedPaths: [trackedPaths[1], "research.txt"] } });
+      expect(await fs.readFile(path.join(fixture.workspace.worktreePath, trackedPaths[0]!), "utf8")).toBe("Tracked validation source\n");
+      expect(await fs.readFile(path.join(fixture.workspace.worktreePath, trackedPaths[1]!), "utf8")).toBe("Unpublished validation changes\n");
+      expect(await fs.readFile(path.join(fixture.workspace.worktreePath, "research.txt"), "utf8")).toBe("Useful investigation\n");
+      for (const relative of reportPaths)
+        await expect(fs.lstat(path.join(fixture.workspace.worktreePath, relative))).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      expect(await fixture.store.read()).toEqual([]);
+      await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it.each(["new unknown file", "changed selected file"] as const)("preserves a %s appearing after report export", async changed => {
+    const fixture = await RetentionFixture.create();
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    await fs.appendFile(path.join(fixture.workspace.worktreePath, ".git/info/exclude"), "\ntest-results/\n");
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, "test-results"));
+    const reportPath = "test-results/run.log";
+    const changedPath = changed === "new unknown file" ? "test-results/later-investigation.txt" : reportPath;
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, reportPath), "Finished validation\n");
+    const originalExport = ForgeCheckoutEvidence.prototype.export;
+    const changedSource = vi.spyOn(ForgeCheckoutEvidence.prototype, "export").mockImplementation(async function (this: ForgeCheckoutEvidence, ...args) {
+      const manifest = await originalExport.apply(this, args);
+      await fs.writeFile(path.join(fixture.workspace.worktreePath, changedPath), "Unpublished investigation\n");
+      return manifest;
+    });
+    try { await fixture.service.poll(); } finally { changedSource.mockRestore(); }
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, changedPath), "utf8")).toBe("Unpublished investigation\n");
+    if (changed === "new unknown file") {
+      expect((await fixture.store.read())[0]).toMatchObject({ status: "completed", retainedWorkspace: { retainedPaths: ["test-results"] } });
+      await expect(fs.lstat(path.join(fixture.workspace.worktreePath, reportPath))).rejects.toMatchObject({ code: "ENOENT" });
+    } else {
+      expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("changed after export") });
+    }
+    const [manifest] = await new ForgeCheckoutEvidence(fixture.dataDir).list();
+    expect(manifest?.files.map(file => file.path)).toEqual([reportPath]);
+  });
+
+  it("blocks a generated directory on another filesystem beside tracked report-root source before skipping it", async () => {
+    const fixture = await RetentionFixture.create("issue", false, { trackedReportPaths: ["debug_tooling/documentation-validation/README.md"] });
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, "debug_tooling/node_modules"));
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "debug_tooling/node_modules/generated.bin"), "Disposable dependency\n");
+    await fs.writeFile(path.join(fixture.workspace.worktreePath, "debug_tooling/run.log"), "Finished validation\n");
+    const originalStat = fs.lstat.bind(fs);
+    const crossedFilesystem = vi.spyOn(fs, "lstat").mockImplementation(async (...args: Parameters<typeof fs.lstat>) => {
+      const stat = await originalStat(...args);
+      return String(args[0]).endsWith("/node_modules")
+        ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { dev: BigInt(stat.dev) + 1n })
+        : stat;
+    });
+    try { await fixture.service.poll(); } finally { crossedFilesystem.mockRestore(); }
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("filesystem boundary") });
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, "debug_tooling/run.log"), "utf8")).toBe("Finished validation\n");
+    expect(await new ForgeCheckoutEvidence(fixture.dataDir).list()).toEqual([]);
+  });
+
+  it("appends durable supplemental reports after partial archival, preserves all sources on export failure, and resumes pending receipts after restart", async () => {
+    const fixture = await RetentionFixture.create("issue", false, { initiallyRetained: false });
+    const namedPath = ".cloudx/validation/original.log";
+    await fixture.nameEvidence(namedPath, 20);
+    await fixture.workflowDependencies.runtime.preparePublication!(fixture.workspace, fixture.worker.attemptId!, {
+      headSha: fixture.worker.headSha!, status: "ready", retainedPaths: ["research.txt"], retainedEvidencePaths: [namedPath], details: "Keep the original validated report",
+    });
+    const originalPaths = ["test-results/report-0000.log", "test-results/report-0512.log"];
+    await fs.mkdir(path.join(fixture.workspace.worktreePath, "test-results"));
+    for (let index = 0; index < 513; index++)
+      await fs.writeFile(path.join(fixture.workspace.worktreePath, `test-results/report-${index.toString().padStart(4, "0")}.log`), "Original validation\n");
+    const originalRemove = ForgeCheckoutEvidence.prototype.removeExported;
+    let removals = 0;
+    const interruptedRemoval = vi.spyOn(ForgeCheckoutEvidence.prototype, "removeExported").mockImplementation(async function (this: ForgeCheckoutEvidence, ...args) {
+      if (++removals === 2) throw new Error("Original source removal interrupted");
+      return originalRemove.apply(this, args);
+    });
+    try { await fixture.service.poll(); } finally { interruptedRemoval.mockRestore(); }
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: "Original source removal interrupted" });
+    const originalReceipt = await fixture.receipt();
+    expect(originalReceipt.checkoutEvidenceRemovalStarted).toBe(true);
+    expect(originalReceipt.additionalCheckoutEvidence).toHaveLength(1);
+    await expect(fs.lstat(path.join(fixture.workspace.worktreePath, namedPath))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(path.join(fixture.workspace.worktreePath, originalPaths[0]!))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, originalPaths[1]!), "utf8")).toBe("Original validation\n");
+    const supplementalPaths = [".cloudx/validation/supplemental.log", "debug_tooling/reports/supplemental.log", "test-results/supplemental.log"];
+    for (const relative of supplementalPaths) {
+      await fs.mkdir(path.dirname(path.join(fixture.workspace.worktreePath, relative)), { recursive: true });
+      await fs.writeFile(path.join(fixture.workspace.worktreePath, relative), "Supplemental validation\n");
+    }
+    await fixture.restart();
+    const originalExport = ForgeCheckoutEvidence.prototype.export;
+    const failedSupplement = vi.spyOn(ForgeCheckoutEvidence.prototype, "export").mockImplementation(async function (this: ForgeCheckoutEvidence, ...args) {
+      if (!args[2].manifestSha256) {
+        const owned = await fixture.receipt();
+        expect(owned.checkoutEvidenceRemovalStarted).toBe(true);
+        expect(owned.checkoutEvidence).toEqual(originalReceipt.checkoutEvidence);
+        expect(owned.additionalCheckoutEvidence).toContainEqual(args[2]);
+        throw new Error("Supplemental archive storage unavailable");
+      }
+      return originalExport.apply(this, args);
+    });
+    try { await fixture.service.resume(fixture.worker.id, { windowId: "main", paneId: "pane-1" }); }
+    finally { failedSupplement.mockRestore(); }
+    expect((await fixture.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: "Supplemental archive storage unavailable" });
+    const failedReceipt = await fixture.receipt();
+    const supplementalReceipts = (failedReceipt.additionalCheckoutEvidence as { archiveId: string; manifestSha256?: string }[]).slice(1);
+    expect(supplementalReceipts).toHaveLength(1);
+    expect(supplementalReceipts[0]!.manifestSha256).toBeUndefined();
+    for (const relative of supplementalPaths)
+      expect(await fs.readFile(path.join(fixture.workspace.worktreePath, relative), "utf8")).toBe("Supplemental validation\n");
+    expect(await fs.readFile(path.join(fixture.workspace.worktreePath, originalPaths[1]!), "utf8")).toBe("Original validation\n");
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    await fixture.restart();
+    await fixture.service.resume(fixture.worker.id, { windowId: "main", paneId: "pane-1" });
+    expect(await fixture.store.read()).toEqual([]);
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    const completedReceipt = await fixture.receipt();
+    expect(completedReceipt.checkoutEvidence).toEqual(originalReceipt.checkoutEvidence);
+    expect((completedReceipt.additionalCheckoutEvidence as { archiveId: string }[]).map(receipt => receipt.archiveId)).toEqual(
+      (failedReceipt.additionalCheckoutEvidence as { archiveId: string }[]).map(receipt => receipt.archiveId));
+    const archives = await new ForgeCheckoutEvidence(fixture.dataDir).list();
+    expect(archives).toHaveLength(3);
+    expect(archives.every(manifest => manifest.workerId === fixture.worker.id && manifest.attemptId === fixture.worker.attemptId && manifest.commitSha === fixture.worker.headSha)).toBe(true);
+    expect(archives.flatMap(manifest => manifest.files).filter(file => supplementalPaths.includes(file.path)).map(file => file.path).sort()).toEqual(supplementalPaths);
+  }, 30_000);
+
   it.each(["issue", "review"] as const)("automatically retires a completed %s using its saved completion attempt after the active attempt was cleared", async kind => {
     const fixture = await RetentionFixture.create(kind);
     await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
@@ -103,7 +244,7 @@ describe("Forge workflow retention after completed workspace discard", () => {
     const archives = await new ForgeCheckoutEvidence(fixture.dataDir).list();
     expect(archives.map(manifest => manifest.files.length).sort((left, right) => left - right)).toEqual([1, 512]);
     expect(archives.flatMap(manifest => manifest.files).map(file => file.path)).toHaveLength(513);
-  });
+  }, 30_000);
 
   it("retires a completed checkout with pre-rebase history only after saving a restorable Git bundle", async () => {
     const fixture = await RetentionFixture.create();
@@ -244,6 +385,7 @@ describe("Forge workflow retention after completed workspace discard", () => {
   });
 
   it("retires a completed report checkout after reboot changes transient device numbers but durable ownership matches", async () => {
+    vi.spyOn(FilesystemIdentity, "filesystemIdentity").mockResolvedValue({ filesystemType: "ef53", filesystemId: "f00d1234" });
     const fixture = await RetentionFixture.create();
     await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
     await fixture.nameEvidence(".cloudx/validation/run.log", 20);
@@ -491,7 +633,8 @@ class RetentionFixture {
     this.service = new ForgeWorkflowService(this.workflowDependencies);
   }
 
-  static async create(kind: ForgeWorker["kind"] = "issue", trackedLastRun = false): Promise<RetentionFixture> {
+  static async create(kind: ForgeWorker["kind"] = "issue", trackedLastRun = false,
+    { trackedReportPaths = [], initiallyRetained = true }: { trackedReportPaths?: string[]; initiallyRetained?: boolean } = {}): Promise<RetentionFixture> {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-forge-retention-"));
     const source = path.join(root, "source");
     const origin = path.join(root, "origin.git");
@@ -502,6 +645,11 @@ class RetentionFixture {
     await git(source, ["config", "user.email", "forge-test@example.invalid"]);
     await fs.writeFile(path.join(source, "README.md"), "Initial content\n");
     await git(source, ["add", "README.md"]);
+    for (const relative of trackedReportPaths) {
+      await fs.mkdir(path.dirname(path.join(source, relative)), { recursive: true });
+      await fs.writeFile(path.join(source, relative), "Tracked validation source\n");
+      await git(source, ["add", relative]);
+    }
     if (trackedLastRun) {
       await fs.mkdir(path.join(source, "test-results"));
       await fs.writeFile(path.join(source, "test-results/.last-run.json"), '{"status":"passed","failedTests":[]}');
@@ -529,8 +677,8 @@ class RetentionFixture {
       ...(review ? { headSha, baseSha: headSha } : {}) }) };
     await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
     await fs.writeFile(path.join(workspace.worktreePath, "research.txt"), "Useful investigation\n");
-    const retainedWorkspace = await runtime.cleanup({ ...workspace, expectedHeadSha: headSha });
-    expect(retainedWorkspace).toMatchObject({ retainedPaths: ["research.txt"] });
+    const retainedWorkspace = initiallyRetained ? await runtime.cleanup({ ...workspace, expectedHeadSha: headSha }) : undefined;
+    if (initiallyRetained) expect(retainedWorkspace).toMatchObject({ retainedPaths: ["research.txt"] });
     const worker: ForgeWorker = { id, kind, number: review ? 7 : 178, title: "Retained completed workspace", repository,
       repositoryPath: workspace.repositoryPath, baseBranch: "main", templateId: "worker", status: "completed", headSha,
       attemptId: randomUUID(), ...(retainedWorkspace ? { retainedWorkspace } : {}), autoPost: false,
