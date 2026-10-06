@@ -56,6 +56,9 @@ running; wait for it to finish or stop it first.
   one-line summary of each tool call and the git status, then starts the
   other provider with a prompt that points to the file. Tool output and
   reasoning are not carried over.
+- **A conversation without a prompt yet.** Neither provider saves a
+  conversation before its first prompt, so there is nothing to carry
+  over: the tab starts a new conversation on the chosen account.
 
 Forge workers switch through Forge settings instead: a Claude model in
 **Coding model** or **Review model** runs that role on Claude Code, and

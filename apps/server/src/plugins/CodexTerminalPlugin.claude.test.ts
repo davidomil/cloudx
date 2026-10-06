@@ -153,6 +153,20 @@ describe("CodexTerminalPlugin on Claude", () => {
     expect(next.prompt).toContain(String(next.agentHandoff));
   });
 
+  it("starts the target fresh when the conversation has no transcript yet", async () => {
+    const { plugin, tab, cwd, controls, accounts, account } = await setup();
+    const other = await accounts.create({ providerId: "claude", label: "Personal", kind: "subscription" });
+    const codex = await accounts.create({ providerId: "codex", label: "Codex", kind: "subscription" });
+    // Claude Code writes the transcript only once the first prompt arrives.
+    const current = { agent: { providerId: "claude", accountId: account.id }, resume: { mode: "session", sessionId: SESSION } };
+
+    expect(await plugin.prepareAgentSwitch({ tab, cwd, controls, initialInput: current }, { providerId: "claude", accountId: other.id }))
+      .toEqual({ agent: { providerId: "claude", accountId: other.id } });
+    const next = await plugin.prepareAgentSwitch({ tab, cwd, controls, initialInput: current }, { providerId: "codex", accountId: codex.id });
+    expect(next).toEqual({ agent: { providerId: "codex", accountId: codex.id } });
+    await expect(fs.readdir(path.join(cwd, ".cloudx", "handoffs"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("records the confirmed conversation for usage and closes it when Claude exits", async () => {
     const { factory, tab, cwd, controls, env, dataDir, accounts, claudeSettings, restored } = await setup();
     const usage = { conversationStarted: vi.fn(), ended: vi.fn() };

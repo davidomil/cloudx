@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isRecord } from "@cloudx/shared";
 
+import { MissingTranscriptError } from "../agents/missingTranscript.js";
 import { shellQuote } from "../terminal/ShellLaunch.js";
 
 const RECEIPT = ".cloudx-conversation.json";
@@ -134,5 +135,5 @@ export async function findCodexTranscript(sessionId: string, sourceHome: string)
       } finally { await file.close(); }
     }
   }
-  throw new Error(`The transcript for Codex conversation ${sessionId} is unavailable. Select a saved session.`);
+  throw new MissingTranscriptError(`The transcript for Codex conversation ${sessionId} is unavailable. Select a saved session.`);
 }

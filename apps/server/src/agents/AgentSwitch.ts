@@ -10,6 +10,7 @@ import {
 import type { AgentAccountStore } from "./AgentAccountStore.js";
 import { readAgentTranscript, writeAgentHandoff } from "./AgentHandoff.js";
 import { isClaudeModel } from "./claude/ClaudeLaunch.js";
+import { MissingTranscriptError } from "./missingTranscript.js";
 import { resumeSessionId } from "./resumeInput.js";
 
 export interface AgentSwitchContext {
@@ -26,7 +27,8 @@ const LAUNCH_ONLY_KEYS = ["prompt", "resume", "model", "reasoningEffort", "agent
 // Returns the startup input that relaunches a tab on the requested account.
 // The caller checks that no turn is running before switching.
 // The same provider resumes its native conversation; another provider starts
-// from a handoff file written from the current conversation.
+// from a handoff file written from the current conversation. A conversation
+// without a transcript has nothing to carry over, so the target starts fresh.
 export async function prepareAgentSwitch(context: AgentSwitchContext, request: AgentSwitchRequest): Promise<Record<string, unknown>> {
   if (!isAgentProviderId(request.providerId)) throw new Error("Choose Codex or Claude.");
   const validModel = request.providerId === "claude" ? isClaudeModel : (model: string) => MODEL_ID_PATTERN.test(model);
@@ -34,7 +36,12 @@ export async function prepareAgentSwitch(context: AgentSwitchContext, request: A
     throw new Error(`The model is not valid for ${agentProviderLabel(request.providerId)}.`);
   const current = readAgentSelection(context.initialInput?.agent) ?? { providerId: "codex" as const };
   const target = await context.accounts.resolve(request.providerId, request.accountId);
-  const sessionId = resumeSessionId(context.initialInput);
+  const conversationId = resumeSessionId(context.initialInput);
+  const transcript = conversationId ? await context.transcriptPath(current.providerId, conversationId).catch((error: unknown) => {
+    if (error instanceof MissingTranscriptError) return undefined;
+    throw error;
+  }) : undefined;
+  const sessionId = transcript ? conversationId : undefined;
   const previous = context.initialInput ?? {};
   const next: Record<string, unknown> = Object.fromEntries(Object.entries(previous).filter(([key]) => !LAUNCH_ONLY_KEYS.includes(key)));
   next.agent = { providerId: target.providerId, accountId: target.id };
@@ -53,7 +60,7 @@ export async function prepareAgentSwitch(context: AgentSwitchContext, request: A
     cwd: context.cwd,
     from: { providerId: current.providerId, accountLabel: fromAccount?.label, sessionId },
     to: { providerId: target.providerId, accountLabel: target.label },
-    entries: await readAgentTranscript(current.providerId, await context.transcriptPath(current.providerId, sessionId))
+    entries: await readAgentTranscript(current.providerId, transcript!)
   });
   return { ...next, prompt: handoff.prompt, agentHandoff: handoff.path };
 }

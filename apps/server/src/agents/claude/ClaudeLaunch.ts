@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { CLAUDE_MODEL_ID_PATTERN as CLAUDE_MODEL_PATTERN } from "@cloudx/shared";
 
+import { MissingTranscriptError } from "../missingTranscript.js";
 import { codexResumeInput } from "../resumeInput.js";
 import type { ClaudeLaunchPreferences } from "./ClaudeSettingsService.js";
 
@@ -61,7 +62,7 @@ export async function findClaudeTranscript(projectsDir: string, sessionId: strin
   let projects;
   try { projects = await fs.readdir(projectsDir, { withFileTypes: true }); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`The transcript for Claude conversation ${sessionId} is unavailable. Select a saved session.`);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new MissingTranscriptError(`The transcript for Claude conversation ${sessionId} is unavailable. Select a saved session.`);
     throw error;
   }
   if (projects.length > 100_000) throw new Error("Claude session lookup exceeded the directory limit.");
@@ -75,6 +76,6 @@ export async function findClaudeTranscript(projectsDir: string, sessionId: strin
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
   }
-  throw new Error(`The transcript for Claude conversation ${sessionId} is unavailable. Select a saved session.`);
+  throw new MissingTranscriptError(`The transcript for Claude conversation ${sessionId} is unavailable. Select a saved session.`);
 }
 
