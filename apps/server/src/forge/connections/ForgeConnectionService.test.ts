@@ -311,7 +311,7 @@ describe("Forge connection HTTP routes", () => {
     const f = await server();
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     f.registration.githubConvert.mockResolvedValueOnce({ appId: "11", privateKey, slug: "cloudx-worker", name: "CloudX worker" });
-    const permissions: Record<string, string> = { contents: "write", issues: "write", pull_requests: "write", checks: "read" };
+    const permissions: Record<string, string> = { contents: "write", issues: "write", pull_requests: "write", checks: "read", actions: "read" };
     const client = new ForgeRegistrationClient(async () => Response.json({ id: 41, app_id: 11, suspended_at: null, permissions }));
     f.registration.githubInstallation.mockImplementation(client.githubInstallation.bind(client));
     const start = await f.app.inject({ method: "POST", url: "/api/forge/connections/github/start", headers: { origin }, payload: { repository: github, role: "worker" } });

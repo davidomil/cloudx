@@ -1,7 +1,9 @@
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeBatchIssueResult,
+  ForgeCiDiagnostic,
+  ForgeCiRepair,
   ForgeIssueBatch,
   ForgeIssueCompletionReport,
   ForgePublicationObservation,
@@ -377,6 +379,91 @@ function parseRebaseRecovery(value: unknown, worker: ForgeWorker): NonNullable<F
   return { branch, baseBranch, expectedHeadSha, originalHeadSha, targetHeadSha, phase, ...(headSha ? { headSha } : {}) };
 }
 
+function parseCiDiagnostic(value: unknown, worker: ForgeWorker): ForgeCiDiagnostic {
+  const input = object(value);
+  const repository = object(input.repository);
+  if (repository.provider !== worker.repository.provider ||
+    repository.apiUrl !== worker.repository.apiUrl || repository.projectPath !== worker.repository.projectPath ||
+    input.changeNumber !== worker.changeNumber)
+    throw new Error("CI diagnostics must match the owning issue repository and published request.");
+  const state = input.state;
+  if (state !== "actionable" && state !== "blocked" && state !== "pending" && state !== "obsolete")
+    throw new Error("Invalid CI diagnostic state.");
+  const testedSha = input.testedSha === undefined ? undefined : commitSha(input.testedSha, "CI tested commit");
+  if (!Array.isArray(input.jobs) || input.jobs.length > 10)
+    throw new Error("CI diagnostics can contain at most 10 failing jobs.");
+  const jobs: ForgeCiDiagnostic["jobs"] = input.jobs.map(raw => {
+    const job = object(raw);
+    if (!Number.isSafeInteger(job.runAttempt) || Number(job.runAttempt) < 1)
+      throw new Error("CI jobs require a positive run attempt.");
+    const classification = job.classification;
+    if (classification !== "code" && classification !== "infrastructure" && classification !== "credentials" &&
+      classification !== "policy" && classification !== "unknown")
+      throw new Error("Invalid CI failure classification.");
+    const url = nonblankText(job.url, "CI job URL", 4096);
+    if (!["http:", "https:"].includes(new URL(url).protocol))
+      throw new Error("CI job links must use HTTP or HTTPS.");
+    return {
+      runId: nonblankText(job.runId, "CI run identity", 256), runAttempt: Number(job.runAttempt),
+      jobId: nonblankText(job.jobId, "CI job identity", 256), name: nonblankText(job.name, "CI job name", 4096),
+      url, conclusion: nonblankText(job.conclusion, "CI job conclusion", 128),
+      ...(job.testedSha === undefined ? {} : { testedSha: commitSha(job.testedSha, "CI job tested commit") }), classification,
+      ...(job.log === undefined ? {} : { log: text(job.log, "CI job log", 32_000) }),
+    };
+  });
+  const jobIdentities = jobs.map(job => JSON.stringify([job.runId, job.runAttempt, job.jobId]));
+  if (new Set(jobIdentities).size !== jobIdentities.length)
+    throw new Error("CI job attempt identities must be unique.");
+  if (state === "actionable" && (!jobs.length || jobs.some(job => !job.testedSha || job.classification !== "code" || !job.log?.trim() ||
+    !["failure", "failed", "timed_out"].includes(job.conclusion) ||
+    testedSha !== undefined && job.testedSha.toLowerCase() !== testedSha.toLowerCase())))
+    throw new Error("Actionable CI diagnostics require code failures, bounded logs and matching tested commits.");
+  return {
+    repository: { ...worker.repository }, changeNumber: worker.changeNumber!,
+    sourceHeadSha: commitSha(input.sourceHeadSha, "CI source head"), targetHeadSha: commitSha(input.targetHeadSha, "CI target head"),
+    ...(testedSha === undefined ? {} : { testedSha }), failureKey: nonblankText(input.failureKey, "CI failure identity", 4096),
+    state, ...(input.reason === undefined ? {} : { reason: nonblankText(input.reason, "CI diagnostic reason", 4096) }), jobs,
+  };
+}
+
+function parseCiRepair(value: unknown, worker: ForgeWorker): ForgeCiRepair {
+  const input = object(value);
+  if (worker.kind !== "issue" || !worker.changeNumber)
+    throw new Error("CI repair requires an owning issue worker and published request.");
+  const phase = input.phase;
+  if (phase !== "diagnosing" && phase !== "ready" && phase !== "launching" && phase !== "repairing" &&
+    phase !== "publishing" && phase !== "reviewing" && phase !== "blocked")
+    throw new Error("Invalid CI repair phase.");
+  const attempts = input.attempts;
+  if (!Number.isSafeInteger(attempts) || Number(attempts) < 0 || Number(attempts) > MAX_FORGE_CI_REPAIR_ATTEMPTS ||
+    !Array.isArray(input.attemptedHeads) || input.attemptedHeads.length !== attempts)
+    throw new Error("CI repair history must match its bounded attempt count.");
+  const attemptedHeads = input.attemptedHeads.map(head => commitSha(head, "CI repair attempted head"));
+  if (new Set(attemptedHeads.map(head => head.toLowerCase())).size !== attemptedHeads.length)
+    throw new Error("CI repair attempted heads must be unique.");
+  const diagnostic = input.diagnostic === undefined ? undefined : parseCiDiagnostic(input.diagnostic, worker);
+  const attemptId = input.attemptId === undefined ? undefined : nonblankText(input.attemptId, "CI repair attempt identity", 36);
+  if (attemptId !== undefined && (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(attemptId) || !attempts))
+    throw new Error("Invalid CI repair attempt identity.");
+  const repairedHeadSha = input.repairedHeadSha === undefined ? undefined : commitSha(input.repairedHeadSha, "CI repaired head");
+  if (phase !== "diagnosing" && phase !== "blocked" && diagnostic?.state !== "actionable" ||
+    phase === "diagnosing" && diagnostic?.state === "actionable" ||
+    ["launching", "repairing", "publishing", "reviewing"].includes(phase) && !attempts ||
+    ["launching", "repairing", "publishing", "reviewing"].includes(phase) &&
+      diagnostic!.sourceHeadSha.toLowerCase() !== attemptedHeads.at(-1)?.toLowerCase() ||
+    ["repairing", "publishing", "reviewing"].includes(phase) && !attemptId ||
+    ["publishing", "reviewing"].includes(phase) && !repairedHeadSha ||
+    phase === "ready" && attempts === MAX_FORGE_CI_REPAIR_ATTEMPTS ||
+    repairedHeadSha !== undefined && (!attempts || repairedHeadSha.toLowerCase() === attemptedHeads.at(-1)?.toLowerCase()))
+    throw new Error("CI repair phase must match its diagnostic and attempt evidence.");
+  return {
+    phase, attempts: Number(attempts), attemptedHeads,
+    ...(diagnostic === undefined ? {} : { diagnostic }), ...(attemptId === undefined ? {} : { attemptId }),
+    ...(repairedHeadSha === undefined ? {} : { repairedHeadSha }),
+    ...(input.reason === undefined ? {} : { reason: nonblankText(input.reason, "CI repair reason", 4096) }),
+  };
+}
+
 function publicationTimestamp(value: unknown): string {
   const timestamp = text(value, "publication timestamp", 24);
   if (!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(timestamp) ||
@@ -658,7 +745,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     if (worker.status === "draft" && (!parsed.batch || [
       "repositoryPath", "worktreePath", "branch", "tabId", "attemptId", "completion", "retainedWorkspace",
       "publicationState", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
-      "mergeConflict", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest",
+      "mergeConflict", "ciRepair", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest",
     ].some(key => worker[key] !== undefined) || parsed.batch.results !== undefined))
       throw new Error("A draft batch cannot own execution or publication state.");
     if (worker.completion !== undefined) {
@@ -754,6 +841,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     }
     if (worker.rebaseRecovery !== undefined)
       parsed.rebaseRecovery = parseRebaseRecovery(worker.rebaseRecovery, parsed);
+    if (worker.ciRepair !== undefined)
+      parsed.ciRepair = parseCiRepair(worker.ciRepair, parsed);
     if (parsed.providerRetryAt && (
       parsed.kind !== "issue" || parsed.status !== "paused" || !parsed.autoReview?.enabled ||
       parsed.mergeAttempted || ["creating", "uncertain"].includes(parsed.publicationState ?? "") ||

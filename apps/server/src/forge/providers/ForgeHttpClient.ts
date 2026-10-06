@@ -8,6 +8,16 @@ import { ForgeProviderError, forgeRequestTimeoutMs, type ForgeDiagnosticObserver
 import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
 import { list } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
+import { readCiLog } from "./ciEvidence.js";
+
+interface ForgeRequestOptions {
+  method?: string;
+  body?: unknown;
+  role?: ForgeCredentialRole;
+  text?: boolean;
+  graphql?: boolean;
+  signal?: AbortSignal;
+}
 
 export class ForgeHttpClient {
   constructor(
@@ -23,14 +33,25 @@ export class ForgeHttpClient {
 
   async request(
     path: string,
-    options: {
-      method?: string;
-      body?: unknown;
-      role?: ForgeCredentialRole;
-      text?: boolean;
-      graphql?: boolean;
-      signal?: AbortSignal;
-    } = {},
+    options: ForgeRequestOptions = {},
+  ): Promise<{ body: unknown; headers: Headers }> {
+    return this.performRequest(path, options);
+  }
+
+  async ciLog(path: string): Promise<string> {
+    const prefix = this.repository.provider === "github"
+      ? `/repos/${this.repository.projectPath.split("/").map(encodeURIComponent).join("/")}/actions/jobs/`
+      : `/projects/${encodeURIComponent(this.repository.projectPath)}/jobs/`;
+    if (!path.startsWith(prefix) || !/^\d+\/(?:logs|trace)$/.test(path.slice(prefix.length)) ||
+        !path.endsWith(this.repository.provider === "github" ? "/logs" : "/trace"))
+      throw new ForgeProviderError("CI logs require a job in the configured repository.");
+    return String((await this.performRequest(path, {}, true)).body);
+  }
+
+  private async performRequest(
+    path: string,
+    options: ForgeRequestOptions,
+    ciLog = false,
   ): Promise<{ body: unknown; headers: Headers }> {
     const role = options.role ?? this.readRole;
     const method = (options.method ?? "GET").toUpperCase();
@@ -62,7 +83,7 @@ export class ForgeHttpClient {
         signal,
         this.onFailure,
       )),
-      Accept: options.text ? "application/vnd.github.diff" : "application/json",
+      Accept: ciLog && this.repository.provider === "gitlab" ? "text/plain" : options.text ? "application/vnd.github.diff" : "application/json",
       ...(this.repository.provider === "github"
         ? { "X-GitHub-Api-Version": "2026-03-10" }
         : {}),
@@ -97,6 +118,29 @@ export class ForgeHttpClient {
       throw failures.transport(error, signal, changesRemoteState);
     }
     failures.received(response);
+    const secrets = ciLog ? Object.entries(headers)
+      .filter(([name]) => /authorization|private-token/i.test(name))
+      .flatMap(([, value]) => {
+        const token = value.replace(/^Bearer /, "");
+        return [value, token, encodeURIComponent(token), Buffer.from(token).toString("base64")];
+      }) : [];
+    if (ciLog && this.repository.provider === "github" && response.status === 302) {
+      const location = response.headers.get("location");
+      await response.body?.cancel();
+      let download: URL;
+      try { download = new URL(location ?? ""); } catch { throw failures.prepare("GitHub did not supply a safe job-log download URL."); }
+      const configured = new URL(this.repository.apiUrl);
+      const allowed = download.hostname === "results-receiver.actions.githubusercontent.com" ||
+        /^[a-z0-9-]+\.blob\.core\.windows\.net$/.test(download.hostname) ||
+        configured.hostname !== "api.github.com" && download.origin === configured.origin;
+      if (!allowed || download.protocol !== "https:" || download.username || download.password ||
+          download.hash || download.port && download.port !== "443")
+        throw failures.prepare("GitHub supplied an unsafe job-log download URL.");
+      try {
+        response = await this.fetcher(download.href, { method: "GET", redirect: "manual", signal, credentials: "omit", referrerPolicy: "no-referrer", headers: { Accept: "text/plain" } });
+      } catch (error) { throw failures.transport(error, signal, false); }
+      failures.received(response);
+    }
     if (!response.ok) {
       const failure = httpFailure(response, this.repository.provider);
       this.credentials.deferRequests(failure.retryAfterMs);
@@ -107,6 +151,11 @@ export class ForgeHttpClient {
       }
     }
     try {
+      if (ciLog) {
+        const text = await readCiLog(response, secrets);
+        if (signal.aborted) throw signal.reason;
+        return { body: text, headers: response.headers };
+      }
       const text = await readBoundedBody(response);
       if (signal.aborted) throw signal.reason;
       return {

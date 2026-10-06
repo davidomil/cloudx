@@ -233,12 +233,15 @@ function labFixture(
     version?: Record<string, unknown>;
     notes?: unknown[];
     diffs?: unknown[];
+    commits?: Record<string, Record<string, unknown>>;
     intercept?: Handler;
   } = {},
 ) {
   return harness(gitlab, (url, options) => {
     const path = url.pathname;
     if (overrides.intercept) return overrides.intercept(url, options);
+    if (path.includes("/repository/commits/"))
+      return response(overrides.commits?.[path.split("/").at(-1)!] ?? {});
     if (path.includes("/repository/branches/"))
       return response({ name: overrides.request?.target_branch ?? "main", commit: { id: previousSha }, ...overrides.target });
     if (options.method === "PUT" && path.endsWith("/merge"))
@@ -1161,6 +1164,20 @@ describe("GitHub review and exact-commit merge", () => {
   it("does not attribute an older GitLab pipeline failure to the current revision", async () => {
     const { provider } = labFixture({ request: { head_pipeline: { sha: previousSha, status: "failed", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } } });
     expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
+  });
+
+  it.each([
+    { parents: [previousSha, headSha], expected: "failed" },
+    { parents: [previousSha, "d".repeat(40)], expected: "unknown" },
+    { parents: ["d".repeat(40), headSha], expected: "unknown" },
+    { parents: [previousSha, headSha, "d".repeat(40)], expected: "unknown" },
+  ])("reports merged-results failure only when its tested parents bind the current target and source ($expected)", async ({ parents, expected }) => {
+    const testedSha = "c".repeat(40);
+    const { provider } = labFixture({
+      request: { head_pipeline: { sha: testedSha, status: "failed", source: "merge_request_event", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } },
+      commits: { [testedSha]: { id: testedSha, parent_ids: parents } },
+    });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: expected } });
   });
 
   it("loads issue comments, inline comments, review decisions and the pinned comparison base", async () => {

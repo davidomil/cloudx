@@ -56,6 +56,24 @@ worker’s input. Enabling **Auto review** coordinates coding, review,
 corrections, and the eligible merge automatically; a clarification
 request pauses the loop.
 
+With **Auto review** enabled, a terminal failure in required CI starts
+an automatic repair on the same issue checkout, even before approval.
+Forge waits for any running reviewer, collects bounded and sanitized
+job logs, and pins the diagnosis to the request, source and target
+commits, tested commit and run attempt. The worker reproduces the
+failure and commits a validated fix. Forge publishes to the existing
+PR/MR with the saved source-head lease, reviews the patch, and requires
+fresh passing CI before merging.
+
+The worker card shows the repair phase, attempt count and job links.
+Each issue worker has a budget of two automatic CI repair attempts;
+the same source commit cannot start another attempt. Missing logs,
+infrastructure or credential failures, and uncertain launch outcomes
+retain the checkout and show the action needed. **Pause**, **Stop** and
+disabled **Auto review** prevent automatic repair. GitHub issue worker
+Apps need **Actions: read** permission to collect logs; approve the
+updated permission on existing installations before continuing setup.
+
 ## Batch related issues
 
 In **Issues**, select the checkboxes beside related issues, enter a

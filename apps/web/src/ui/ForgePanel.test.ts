@@ -150,6 +150,24 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("shows the saved CI repair phase, finite budget and failing job identity without rendering logs", async () => {
+    const repairing: ForgeWorker = { ...worker, ciRepair: {
+      phase: "repairing", attempts: 1, attemptedHeads: [change.headSha], attemptId: "repair-attempt",
+      diagnostic: { repository, changeNumber: change.number, sourceHeadSha: change.headSha, targetHeadSha: change.targetHeadSha,
+        failureKey: "ci-failure", state: "actionable", jobs: [{ runId: "101", runAttempt: 2, jobId: "201",
+          name: "TypeScript checks", url: "https://github.com/cloudx/example/actions/runs/101/job/201", conclusion: "failure",
+          testedSha: change.headSha, classification: "code", log: "Internal sanitized failure evidence" }] },
+    } };
+    const panel = await renderPanel(fixture({ workers: [repairing] }));
+    expect(panel.querySelector(".forge-item-workers")!.textContent).toContain("CI repair · repairing · 1/2 attempts");
+    await click(panel, "Workers (1)");
+    const status = panel.querySelector('[aria-label="CI repair"]')!;
+    expect(status.textContent).toContain("CI repair · repairing · 1/2 attempts used");
+    expect(status.textContent).toContain("Source aaaaaaaa · Target bbbbbbbb");
+    expect(status.textContent).toContain("Run 101, attempt 2");
+    expect(status.querySelector("a")?.getAttribute("href")).toBe(repairing.ciRepair!.diagnostic!.jobs[0]!.url);
+    expect(panel.textContent).not.toContain("Internal sanitized failure evidence");
+  });
   it("shows the pending terminal phase and queue delay while an unrelated CI-paused worker remains actionable", async () => {
     const finishing: ForgeWorker = { ...worker, activity: {
       phase: "Finishing terminal and saving context", since: "2026-09-28T02:00:00.000Z", elapsedMs: 566_000, queueDelayMs: 2400,
