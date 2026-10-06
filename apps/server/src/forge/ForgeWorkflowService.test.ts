@@ -4981,8 +4981,81 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
   });
 
-  it.each(["github", "gitlab"] as const)("collects real %s adapter diagnostics through the repair workflow and redacts credentials", async providerKind => {
-    const f = await approvedIssue(1, providerKind);
+  it("repairs a real GitLab merged-results failure, republishes and reviews, waits for its current pending pipeline, then merges success", async () => {
+    const f = await approvedIssue(1, "gitlab");
+    const sourceHead = f.change.headSha;
+    const repairedHead = "c".repeat(40);
+    const firstReviewer = f.currentReview();
+    const pipeline = { id: 42, project_id: 1, sha: "e".repeat(40), status: "failed", source: "merge_request_event",
+      web_url: "https://gitlab.example/a/b/-/pipelines/42" };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const pathname = decodeURIComponent(new URL(String(input)).pathname);
+      let body: unknown;
+      if (pathname === "/api/v4/projects/a/b/merge_requests/7") body = {
+        iid: 7, title: "Fix issue", description: "Tested", state: "opened", sha: f.change.headSha,
+        source_branch: f.change.headBranch, target_branch: "main", target_project_id: 1, head_pipeline: pipeline,
+        web_url: f.change.url, labels: [], author: { username: "worker" }, updated_at: "2026-09-01T00:00:00Z", draft: false,
+        detailed_merge_status: "mergeable", diff_refs: { head_sha: f.change.headSha, base_sha: f.change.baseSha },
+      };
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7/approvals") body = { approved: false, approved_by: [] };
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7/versions") body = [{ head_commit_sha: f.change.headSha,
+        patch_id_sha: f.change.headSha, created_at: "2026-09-01T00:00:00Z" }];
+      else if (pathname === "/api/v4/projects/a/b/merge_requests/7/discussions" || pathname === "/api/v4/projects/a/b/merge_requests/7/closes_issues") body = [];
+      else if (pathname === "/api/v4/projects/a/b/repository/branches/main") body = { name: "main", commit: { id: f.change.targetHeadSha } };
+      else if (pathname === `/api/v4/projects/a/b/repository/commits/${pipeline.sha}`) body = {
+        id: pipeline.sha, parent_ids: [f.change.targetHeadSha, f.change.headSha],
+      };
+      else if (pathname === "/api/v4/projects/a/b/pipelines/42") body = pipeline;
+      else if (pathname === "/api/v4/projects/a/b/pipelines/42/jobs") body = [{ id: 9, name: "affected tests", status: "failed",
+        allow_failure: false, failure_reason: "script_failure", web_url: "https://gitlab.example/a/b/-/jobs/9", commit: { id: pipeline.sha }, pipeline }];
+      else if (pathname === "/api/v4/projects/a/b/jobs/9/trace")
+        return new Response("AssertionError: null input throws\n", { headers: { "content-type": "text/plain" } });
+      else throw new Error(`Unexpected merged-results request: ${input}`);
+      return Response.json(body);
+    });
+    const credentials = { headers: async () => ({ "PRIVATE-TOKEN": "worker-test-secret" }), requestDelay: () => undefined,
+      deferRequests: () => {} } as unknown as ConstructorParameters<typeof ForgeHttpClient>[1];
+    const provider = new GitLabProvider(new ForgeHttpClient(f.deps.settings().repository, credentials, fetcher as typeof fetch));
+    f.provider.getChangeRequest.mockImplementation(async () => ({ ...structuredClone(f.change), checks: (await provider.getChangeRequest(7)).checks }));
+    f.provider.getCiFailure.mockImplementation(change => provider.getCiFailure(change));
+    f.report(undefined);
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1,
+      diagnostic: { state: "actionable", sourceHeadSha: sourceHead, testedSha: pipeline.sha } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.getCiFailure).toHaveBeenCalledOnce();
+
+    f.codingReport({ handoff: { headSha: repairedHead, status: "ready", retainedPaths: [], details: "The failed assertion reproduces and passes with the fix." } });
+    f.runtime.publishBranch.mockImplementation(async () => {
+      f.change.headSha = repairedHead;
+      f.change.approved = false;
+      pipeline.sha = "f".repeat(40);
+      pipeline.status = "pending";
+      return repairedHead;
+    });
+    await f.poll();
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, sourceHead);
+    expect(f.currentReview()).toMatchObject({ id: firstReviewer.id, status: "running", headSha: repairedHead });
+    expect(f.currentIssue().ciRepair).toMatchObject({ phase: "reviewing", attempts: 1 });
+    f.report({ kind: "review", headSha: repairedHead, event: "approve", body: "Regression is covered", comments: [] });
+    f.change.mergeable = true;
+    await f.poll(); await f.poll();
+    expect((await f.provider.getChangeRequest()).checks).toMatchObject({ state: "pending", url: pipeline.web_url });
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { attempts: 1 } });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+
+    pipeline.status = "success";
+    expect((await f.provider.getChangeRequest()).checks).toMatchObject({ state: "passed", url: pipeline.web_url });
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(7, repairedHead, f.change.targetHeadSha);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(2);
+    expect(f.provider.postReview).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(4);
+    expect(f.stored()).toEqual([]);
+  });
+
+  function realCiDiagnostics(f: Awaited<ReturnType<typeof approvedIssue>>, providerKind: "github" | "gitlab", log: string, jobName = "affected tests") {
     const repository = f.deps.settings().repository;
     const sourceHead = f.change.headSha;
     const targetHead = f.change.targetHeadSha;
@@ -4990,10 +5063,10 @@ describe("Forge issue auto review", () => {
     const token = "worker-test-secret";
     const run = { id: 42, run_attempt: 1, head_sha: sourceHead, status: "completed", conclusion: "failure",
       repository: { full_name: repository.projectPath }, pull_requests: [{ number: 7, head: { sha: sourceHead }, base: { sha: targetHead } }] };
-    const job = { id: 9, run_id: 42, head_sha: sourceHead, name: "affected tests", status: "completed", conclusion: "failure",
+    const job = { id: 9, run_id: 42, head_sha: sourceHead, name: jobName, status: "completed", conclusion: "failure",
       check_run_url: "https://api.github.com/repos/a/b/check-runs/9", html_url: "https://github.com/a/b/actions/runs/42/job/9" };
     const pipeline = { id: 42, project_id: 1, sha: sourceHead, status: "failed" };
-    const labJob = { id: 9, name: "affected tests", status: "failed", allow_failure: false, failure_reason: "script_failure",
+    const labJob = { id: 9, name: jobName, status: "failed", allow_failure: false, failure_reason: "script_failure",
       web_url: "https://gitlab.example/a/b/-/jobs/9", commit: { id: sourceHead }, pipeline };
     const fetcher = vi.fn(async (input: string | URL | Request) => {
       const url = new URL(String(input));
@@ -5002,7 +5075,7 @@ describe("Forge issue auto review", () => {
       if (pathname === "/graphql") body = { data: { repository: { pullRequest: {
         number: 7, state: "OPEN", headRefOid: sourceHead, headRefName: f.change.headBranch, baseRefOid: targetHead, baseRefName: "main",
         headRef: { target: { oid: sourceHead, statusCheckRollup: { contexts: {
-          nodes: [{ __typename: "CheckRun", databaseId: 9, name: "affected tests", status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }],
+          nodes: [{ __typename: "CheckRun", databaseId: 9, name: jobName, status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }],
           pageInfo: { hasNextPage: false },
         } } } },
       } } } };
@@ -5017,7 +5090,7 @@ describe("Forge issue auto review", () => {
       else if (pathname === "/api/v4/projects/a/b/repository/merge_base") body = { id: targetHead };
       else if (pathname === "/api/v4/projects/a/b/pipelines/42/jobs") body = [labJob];
       else if (pathname.endsWith("/jobs/9/logs") || pathname.endsWith("/jobs/9/trace"))
-        return new Response(`${providerKind === "github" ? `Syncing repository: a/b\n[command]/usr/bin/git log -1 --format=%H\n${testedMerge}\n` : ""}AssertionError: null input throws\nCI_TOKEN=${token}\n`, { headers: { "content-type": "text/plain" } });
+        return new Response(`${providerKind === "github" ? `Syncing repository: a/b\n[command]/usr/bin/git log -1 --format=%H\n${testedMerge}\n` : ""}${log}`, { headers: { "content-type": "text/plain" } });
       else throw new Error(`Unexpected CI evidence request: ${url}`);
       return Response.json(body);
     });
@@ -5027,14 +5100,48 @@ describe("Forge issue auto review", () => {
     f.provider.getCiFailure.mockImplementation(change => provider.getCiFailure(change));
     f.change.checks = { state: "failed", url: `${f.change.url}/checks` };
     f.reports.read.mockResolvedValue(undefined);
+    return { repository, sourceHead, targetHead, testedMerge, token, fetcher };
+  }
+
+  it.each(["github", "gitlab"] as const)("collects real %s adapter diagnostics through the repair workflow and redacts credentials", async providerKind => {
+    const f = await approvedIssue(1, providerKind);
+    const opaqueSecrets = { access_token: "opaque-access-value", PASSWORD: "opaque-password-value", client_secret: "opaque-client-value" };
+    const { repository, sourceHead, targetHead, testedMerge, token, fetcher } = realCiDiagnostics(f, providerKind,
+      `AssertionError: null input throws\nCI_TOKEN=worker-test-secret\n${JSON.stringify(opaqueSecrets)}\n`);
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1,
       diagnostic: { repository, changeNumber: 7, sourceHeadSha: sourceHead, targetHeadSha: targetHead, state: "actionable", jobs: [{ runId: "42", runAttempt: 1, jobId: "9", testedSha: providerKind === "github" ? testedMerge : sourceHead, classification: "code", log: expect.stringContaining("[REDACTED]") }] } } });
-    expect(JSON.stringify(f.reports.prepare.mock.calls.at(-1)?.[1])).not.toContain(token);
+    for (const secret of [token, ...Object.values(opaqueSecrets)]) {
+      expect(JSON.stringify(f.reports.prepare.mock.calls.at(-1)?.[1])).not.toContain(secret);
+      expect(JSON.stringify(f.currentIssue().ciRepair)).not.toContain(secret);
+    }
     expect(fetcher.mock.calls.some(([url]) => String(url).endsWith(providerKind === "github" ? "/actions/jobs/9/logs" : "/jobs/9/trace"))).toBe(true);
     await f.poll(); await f.poll();
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
     expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  describe.each(["github", "gitlab"] as const)("real %s CI failure classification", providerKind => {
+    it.each([
+      { name: "HTTP 403 assertion", log: "AssertionError: expected 403 to equal 200", classification: "code" },
+      { name: "HTTP 503 assertion", log: "AssertionError: expected 503 to equal 200", classification: "code" },
+      { name: "rejects unauthorized clients", log: "FAIL rejects unauthorized clients\nAssertionError: expected false to equal true", classification: "code" },
+      { name: "provider authentication", log: "remote: Authentication failed: invalid access token", classification: "credentials" },
+      { name: "offline runner", log: "Runner offline: lost communication with the runner", classification: "infrastructure" },
+      { name: "HTTP assertion with an authentication failure", log: "AssertionError: expected 403 to equal 200\nremote: Authentication failed: invalid access token", classification: "credentials" },
+    ] as const)("routes $name to $classification without inventing another repair", async ({ name, log, classification }) => {
+      const f = await approvedIssue(1, providerKind);
+      realCiDiagnostics(f, providerKind, log, name);
+      await f.poll(); await f.poll();
+      const actionable = classification === "code";
+      expect(f.currentIssue()).toMatchObject({ status: actionable ? "running" : "paused", ciRepair: {
+        phase: actionable ? "repairing" : "blocked", attempts: actionable ? 1 : 0,
+        diagnostic: { state: actionable ? "actionable" : "blocked", jobs: [{ name, classification }] },
+      } });
+      expect(f.runtime.launch).toHaveBeenCalledTimes(actionable ? 3 : 2);
+      expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+      expect(f.provider.merge).not.toHaveBeenCalled();
+    });
   });
 
   it("does not repeat a launch with an uncertain persisted launch checkpoint", async () => {

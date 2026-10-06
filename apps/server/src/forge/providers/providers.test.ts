@@ -1166,18 +1166,52 @@ describe("GitHub review and exact-commit merge", () => {
     expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
   });
 
+  it("follows a current GitLab merged-results pipeline from failed through pending to success", async () => {
+    const testedSha = "c".repeat(40);
+    const pipeline = { sha: testedSha, status: "failed", source: "merge_request_event", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" };
+    const { provider, calls } = labFixture({
+      request: { head_pipeline: pipeline },
+      commits: { [testedSha]: { id: testedSha, parent_ids: [previousSha, headSha] } },
+    });
+
+    for (const [status, state] of [["failed", "failed"], ["pending", "pending"], ["success", "passed"]]) {
+      pipeline.status = status;
+      expect(await provider.getChangeRequest(7)).toMatchObject({
+        headSha,
+        targetHeadSha: previousSha,
+        checks: { state, url: pipeline.web_url },
+      });
+    }
+    expect(calls.filter(call => call.url.pathname.endsWith(`/repository/commits/${testedSha}`))).toHaveLength(3);
+  });
+
   it.each([
-    { parents: [previousSha, headSha], expected: "failed" },
-    { parents: [previousSha, "d".repeat(40)], expected: "unknown" },
-    { parents: ["d".repeat(40), headSha], expected: "unknown" },
-    { parents: [previousSha, headSha, "d".repeat(40)], expected: "unknown" },
-  ])("reports merged-results failure only when its tested parents bind the current target and source ($expected)", async ({ parents, expected }) => {
+    ["failed", "failed"], ["success", "passed"], ["canceled", "failed"],
+    ["created", "pending"], ["waiting_for_resource", "pending"], ["preparing", "pending"],
+    ["running", "pending"], ["pending", "pending"], ["manual", "pending"], ["scheduled", "pending"],
+    ["skipped", "unknown"],
+  ])("maps current merged-results pipeline status %s to %s after validating both parents", async (status, state) => {
+    const testedSha = "c".repeat(40);
+    const pipelineUrl = "https://gitlab.example/group/subgroup/repo/-/pipelines/17";
+    const { provider } = labFixture({
+      request: { head_pipeline: { sha: testedSha, status, source: "merge_request_event", web_url: pipelineUrl } },
+      commits: { [testedSha]: { id: testedSha, parent_ids: [headSha, previousSha] } },
+    });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state, url: pipelineUrl } });
+  });
+
+  it.each(["failed", "pending", "success"].flatMap(status => [
+    { status, identity: "superseded source", parents: [previousSha, "d".repeat(40)] },
+    { status, identity: "superseded target", parents: ["d".repeat(40), headSha] },
+    { status, identity: "one parent", parents: [headSha] },
+    { status, identity: "additional parent", parents: [previousSha, headSha, "d".repeat(40)] },
+  ]))("does not attribute a $status merged-results pipeline with $identity to the current request", async ({ status, parents }) => {
     const testedSha = "c".repeat(40);
     const { provider } = labFixture({
-      request: { head_pipeline: { sha: testedSha, status: "failed", source: "merge_request_event", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } },
+      request: { head_pipeline: { sha: testedSha, status, source: "merge_request_event", web_url: "https://gitlab.example/group/subgroup/repo/-/pipelines/17" } },
       commits: { [testedSha]: { id: testedSha, parent_ids: parents } },
     });
-    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: expected } });
+    expect(await provider.getChangeRequest(7)).toMatchObject({ checks: { state: "unknown" } });
   });
 
   it("loads issue comments, inline comments, review decisions and the pinned comparison base", async () => {

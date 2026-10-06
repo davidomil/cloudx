@@ -25,9 +25,12 @@ export function finishCiDiagnostic(diagnostic: ForgeCiDiagnostic): ForgeCiDiagno
 }
 
 export function classifyCiLog(log: string): CiJob["classification"] {
-  if (/bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|unauthorized|\b401\b|\b403\b|token (?:has )?expired/i.test(log)) return "credentials";
-  if (/billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i.test(log)) return "policy";
-  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b503\b/i.test(log)) return "infrastructure";
+  const operationalLog = log.split(/\r?\n/).filter(line =>
+    !/assertion(?:error| failed)|\bexpected\b.*\b(?:received|actual|equal)\b|\bFAIL(?:ED)?\b.*(?:test|spec)/i.test(line),
+  ).join("\n");
+  if (/bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i.test(operationalLog)) return "credentials";
+  if (/billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i.test(operationalLog)) return "policy";
+  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i.test(operationalLog)) return "infrastructure";
   if (/assertion(?:error| failed)|\bFAIL(?:ED)?\b.*(?:test|spec)|(?:test|spec).*(?:failed|failure|timed out)|\b(?:TypeError|SyntaxError|ReferenceError|CompileError)\b|\berror TS\d+\b|\berror\[E\d+\]|compilation failed|lint.*(?:error|failed)|eslint|prettier|\bexpected\b.*\b(?:received|actual|equal)\b/i.test(log)) return "code";
   return "unknown";
 }
@@ -89,6 +92,7 @@ export function sanitizeCiLog(text: string, secrets: string[]): string {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, "[REDACTED PRIVATE KEY]")
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|glpat-[A-Za-z0-9_-]+|AKIA[A-Z0-9]{16})\b/g, "[REDACTED]")
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/=_-]+/gi, "[REDACTED AUTHORIZATION]")
+    .replace(/((["'])[A-Za-z0-9_]{0,80}(?:password|passwd|secret|token|api[_-]?key|authorization|credential)[A-Za-z0-9_]{0,80}\2\s*[=:]\s*)(?:"(?:\\[\s\S]|[^"\\])*(?:"|$)|'(?:\\[\s\S]|[^'\\])*(?:'|$)|[^,\r\n}\]]+)/gi, '$1"[REDACTED]"')
     .replace(/(\b[A-Za-z0-9_]{0,80}(?:password|passwd|secret|token|api[_-]?key|authorization|credential)[A-Za-z0-9_]{0,80}\s*[=:]\s*)[^\r\n]+/gi, "$1[REDACTED]")
     .replace(/https?:\/\/[^\s<>"']+/gi, value => {
       try {

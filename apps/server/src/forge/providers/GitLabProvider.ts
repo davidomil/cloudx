@@ -232,10 +232,11 @@ export class GitLabProvider implements ForgeProvider {
     const checks = gitlabHeadChecks(request, headSha);
     if (checks.state !== "unknown" || !request.head_pipeline) return checks;
     const pipeline = record(request.head_pipeline);
-    if (pipeline.status !== "failed" || pipeline.source !== "merge_request_event") return checks;
+    if (pipeline.source !== "merge_request_event") return checks;
     const testedSha = gitlabHeadSha(pipeline.sha);
+    if (testedSha === headSha) return checks;
     if (await new GitLabCiDiagnostics(this.http).testedCurrentBase(testedSha, { headSha, targetHeadSha }))
-      return { state: "failed", url: webUrl(pipeline.web_url) };
+      return gitlabHeadChecks(request, testedSha);
     return checks;
   }
 

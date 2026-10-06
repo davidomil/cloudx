@@ -353,6 +353,61 @@ describe("GitLab required CI diagnostics", () => {
 });
 
 describe("CI log transport boundaries", () => {
+  it.each(["github", "gitlab"] as const)("redacts opaque structured secrets through the %s adapter while retaining failure evidence", async provider => {
+    const secrets = ["opaque-app-secret", "opaque-password", "opaque-client-secret"];
+    const log = `${JSON.stringify({ access_token: secrets[0], PASSWORD: secrets[1], client_secret: secrets[2], error: codeFailure.trim() })}\n${codeFailure}`;
+    const fixture = provider === "github" ? githubFixture({ log }) : gitlabFixture({ log });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "actionable", jobs: [{ classification: "code", log: expect.stringContaining(codeFailure) }] });
+    const saved = JSON.stringify(diagnostic);
+    for (const secret of secrets) expect(saved).not.toContain(secret);
+    expect(diagnostic.jobs[0].log).toContain('"access_token":"[REDACTED]"');
+    expect(diagnostic.jobs[0].log).toContain('"PASSWORD":"[REDACTED]"');
+    expect(diagnostic.jobs[0].log).toContain('"client_secret":"[REDACTED]"');
+    expect(diagnostic.jobs[0].log).toContain('"error":"AssertionError: expected 1 to equal 2');
+  });
+
+  it.each(["github", "gitlab"] as const)("redacts escaped and single-quoted structured secrets through the %s adapter", async provider => {
+    const log = `${JSON.stringify({ access_token: 'opaque,escaped"secret\\tail', PASSWORD: "opaque\nmultiline" })}\n{'client_secret': 'opaque\\\'single,secret', 'error': 'AssertionError: expected 1 to equal 2'}\n${codeFailure}`;
+    const fixture = provider === "github" ? githubFixture({ log }) : gitlabFixture({ log });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic.state).toBe("actionable");
+    const saved = diagnostic.jobs[0].log!;
+    expect(saved).not.toContain("opaque");
+    expect(saved).not.toContain("escaped");
+    expect(saved).not.toContain("single,secret");
+    expect(saved).not.toContain("multiline");
+    expect(saved).toContain("'error': 'AssertionError: expected 1 to equal 2'");
+    expect(saved).toContain(codeFailure);
+  });
+
+  describe.each(["github", "gitlab"] as const)("%s failure classification", provider => {
+    it.each([
+      "AssertionError: expected 403 to equal 200",
+      "AssertionError: expected 503 to equal 200",
+      "FAIL tests/auth.test.ts > rejects unauthorized clients\nAssertionError: expected true to equal false",
+      "AssertionError: expected HTTP status 403 Forbidden to equal 200",
+      "AssertionError: expected 503 Service Unavailable to equal 200",
+    ])("offers repair for application test evidence: %s", async log => {
+      const fixture = provider === "github" ? githubFixture({ log }) : gitlabFixture({ log });
+      expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "actionable", jobs: [{ classification: "code", log: expect.stringContaining(log) }] });
+    });
+
+    it.each([
+      { log: "Authentication failed: bad credentials", classification: "credentials" },
+      { log: "Error: unauthorized", classification: "credentials" },
+      { log: "Request failed with HTTP status 403 Forbidden", classification: "credentials" },
+      { log: "npm ERR! code E401", classification: "credentials" },
+      { log: "Runner lost communication with provider", classification: "infrastructure" },
+      { log: "Request failed with HTTP status 503", classification: "infrastructure" },
+      { log: "503 Service Unavailable", classification: "infrastructure" },
+    ])("blocks actual $classification errors even alongside assertions: $log", async ({ log, classification }) => {
+      const trace = `${codeFailure}${log}`;
+      const fixture = provider === "github" ? githubFixture({ log: trace }) : gitlabFixture({ log: trace });
+      expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [{ classification }] });
+    });
+  });
+
   it.each([
     "https://attacker.example/log", "http://productionresults.blob.core.windows.net/log", "https://127.0.0.1/log",
     "https://productionresults.blob.core.windows.net.attacker.example/log", "https://user:password@productionresults.blob.core.windows.net/log",
