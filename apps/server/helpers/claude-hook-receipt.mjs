@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants, fsyncSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -30,6 +31,8 @@ const TURN_STOPS = ".cloudx-turn-stops.json";
 const MAX_INPUT_BYTES = 1_048_576;
 const MAX_FINAL_TEXT_BYTES = 1024 * 1024;
 const SETTLE_POLL_MS = 200;
+const READ_CHUNK_BYTES = 4 * 1024 * 1024;
+const MAX_LINE_BYTES = 64 * 1024 * 1024;
 // Longer than Claude Code's default 10-minute hook timeout. If no summary
 // appears by then, the Stop that did fire completes the turn.
 const SETTLE_TIMEOUT_MS = 15 * 60_000;
@@ -134,32 +137,83 @@ function applyEvent(configDir, binding, event, payload, { tab = true } = {}) {
   if (forge) for (const receipt of forgeReceiptsForEvent(event, payload, forge, readJson(forge.receiptPath))) writeAtomicFile(receipt.path, receipt.value);
 }
 
-// Reads the turn's transcript records for its stopIndex-th Stop (from 1).
-// "continued" when that Stop's hooks blocked or added context within the cap,
-// "settled" when they ended the turn, else undefined while its summary is
-// missing. `followed` tells whether Claude wrote a response after it.
-export function stopOutcome(turnRecords, stopIndex, cap) {
-  let index = 0;
-  let continued = false;
-  let outcome;
-  let followed = false;
-  for (const line of turnRecords.split("\n")) {
-    let record;
-    try { record = JSON.parse(line); } catch { continue; }
-    if (outcome) {
-      if (record?.type === "assistant") { followed = true; break; }
-      continue;
+// Follows a turn's transcript records for its stopIndex-th Stop (from 1).
+// `outcome` becomes "continued" when that Stop's hooks blocked or added
+// context and Claude did not hit its cap, or "settled" when they ended the
+// turn; `followed` tells whether Claude wrote a response after it. Claude
+// counts consecutive continuations and resets the count when a response
+// calls a tool.
+export class StopScanner {
+  constructor(stopIndex, cap) {
+    this.stopIndex = stopIndex;
+    this.cap = cap;
+    this.summaries = 0;
+    this.consecutive = 0;
+    this.continued = false;
+    this.outcome = undefined;
+    this.followed = false;
+  }
+
+  record(record) {
+    if (this.outcome) {
+      if (record?.type === "assistant") this.followed = true;
+      return;
     }
-    if (record?.type === "user" && messageText(record).startsWith(STOP_FEEDBACK_PREFIX)) continued = true;
-    if (record?.type === "attachment" && CONTINUING_ATTACHMENTS.has(record.attachment?.type)) continued = true;
+    if (record?.type === "assistant" && Array.isArray(record.message?.content) && record.message.content.some(part => part?.type === "tool_use")) this.consecutive = 0;
+    if (record?.type === "user" && messageText(record).startsWith(STOP_FEEDBACK_PREFIX)) this.continued = true;
+    if (record?.type === "attachment" && CONTINUING_ATTACHMENTS.has(record.attachment?.type)) this.continued = true;
     if (record?.type === "system" && record.subtype === "stop_hook_summary") {
-      index += 1;
-      if (Array.isArray(record.hookAdditionalContext) && record.hookAdditionalContext.length) continued = true;
-      if (index === stopIndex) outcome = continued && !(cap > 0 && stopIndex > cap) ? "continued" : "settled";
-      continued = false;
+      this.summaries += 1;
+      if (Array.isArray(record.hookAdditionalContext) && record.hookAdditionalContext.length) this.continued = true;
+      this.consecutive = this.continued ? this.consecutive + 1 : 0;
+      if (this.summaries === this.stopIndex)
+        this.outcome = this.continued && !(this.cap > 0 && this.consecutive > this.cap) ? "continued" : "settled";
+      this.continued = false;
     }
   }
-  return outcome ? { outcome, followed } : undefined;
+
+  lines(text) {
+    for (const line of text.split("\n")) {
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      this.record(record);
+    }
+    return this;
+  }
+}
+
+// Reads a transcript forward from an offset in bounded chunks, keeping a
+// partial last line and multi-byte characters for the next read.
+export class TranscriptReader {
+  constructor(file, offset) {
+    this.file = file;
+    this.offset = offset;
+    this.pending = "";
+    this.decoder = new StringDecoder("utf8");
+  }
+
+  // Calls onLine for each complete line added since the last read.
+  read(onLine) {
+    if (!this.file) return;
+    let size;
+    try { size = statSync(this.file).size; }
+    catch (error) { if (error.code === "ENOENT") return; throw error; }
+    if (size <= this.offset) return;
+    const descriptor = openSync(this.file, "r");
+    try {
+      const buffer = Buffer.alloc(READ_CHUNK_BYTES);
+      while (this.offset < size) {
+        const bytes = readSync(descriptor, buffer, 0, Math.min(buffer.length, size - this.offset), this.offset);
+        if (!bytes) break;
+        this.offset += bytes;
+        const lines = (this.pending + this.decoder.write(buffer.subarray(0, bytes))).split("\n");
+        this.pending = lines.pop() ?? "";
+        // A line that never ends is not a transcript record.
+        if (this.pending.length > MAX_LINE_BYTES) this.pending = "";
+        for (const line of lines) onLine(line);
+      }
+    } finally { closeSync(descriptor); }
+  }
 }
 
 function messageText(record) {
@@ -168,17 +222,6 @@ function messageText(record) {
   return Array.isArray(content) ? content.map(part => typeof part?.text === "string" ? part.text : "").join("") : "";
 }
 
-function readFrom(file, offset) {
-  if (!file) return "";
-  let size;
-  try { size = statSync(file).size; }
-  catch (error) { if (error.code === "ENOENT") return ""; throw error; }
-  if (size <= offset) return "";
-  const buffer = Buffer.alloc(Math.min(size - offset, MAX_INPUT_BYTES * 16));
-  const descriptor = openSync(file, "r");
-  try { return buffer.subarray(0, readSync(descriptor, buffer, 0, buffer.length, offset)).toString("utf8"); }
-  finally { closeSync(descriptor); }
-}
 
 function transcriptSize(transcriptPath) {
   try { return transcriptPath ? statSync(transcriptPath).size : 0; }
@@ -223,13 +266,19 @@ function recordStop(configDir, binding, payload) {
 async function settle(configDir, stopId) {
   const pendingPath = path.join(configDir, PENDING_STOP);
   const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+  let scanner;
+  let reader;
   while (true) {
     const pending = readJson(pendingPath);
     // A later Stop owns the turn now.
     if (pending?.stopId !== stopId) return;
-    const result = stopOutcome(readFrom(pending.transcriptPath, pending.offset), pending.stopIndex, pending.cap);
-    if (result?.outcome === "continued" && result.followed) return;
-    if (result?.outcome === "settled" || Date.now() > deadline) {
+    if (!scanner) {
+      scanner = new StopScanner(pending.stopIndex, pending.cap);
+      reader = new TranscriptReader(pending.transcriptPath, pending.offset);
+    }
+    reader.read(line => scanner.lines(line));
+    if (scanner.outcome === "continued" && scanner.followed) return;
+    if (scanner.outcome === "settled" || Date.now() > deadline) {
       rmSync(pendingPath, { force: true });
       // When a newer prompt already replaced the tab's turn, only the Forge
       // attempt, which tracks its own first turn, still completes.

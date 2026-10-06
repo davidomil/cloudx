@@ -245,6 +245,38 @@ describe("Claude Forge turn receipts", () => {
     expect(await final()).toMatchObject({ text: "Second." });
   });
 
+  it("applies the continuation cap only to consecutive continuations without a tool call", async () => {
+    const { root, transcript, base, record, receipt, final } = await forgeAttempt();
+    const cap = { CLAUDE_CODE_STOP_HOOK_BLOCK_CAP: "1" };
+    const toolCall = { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: {} }] } };
+    await fs.writeFile(transcript, "");
+    await hook(root, "UserPromptSubmit", base);
+    await hook(root, "Stop", { ...base, last_assistant_message: "First." }, cap);
+    await fs.appendFile(transcript, record(feedback) + record(summary()) + record(toolCall) + record(response("Interim after tool.")));
+    // A tool call reset Claude's count, so this continuation is within the cap.
+    await hook(root, "Stop", { ...base, last_assistant_message: "Interim after tool." }, cap);
+    await fs.appendFile(transcript, record(feedback) + record(summary()));
+    await new Promise(resolve => setTimeout(resolve, 600));
+    expect(await receipt()).toMatchObject({ status: "running" });
+    await fs.appendFile(transcript, record(response("Actual final response.")));
+    await hook(root, "Stop", { ...base, last_assistant_message: "Actual final response." }, cap);
+    await fs.appendFile(transcript, record(summary()));
+    await vi.waitFor(async () => expect(await receipt()).toMatchObject({ status: "completed" }), { timeout: 5_000 });
+    expect(await final()).toMatchObject({ text: "Actual final response." });
+  });
+
+  it("finds the final summary of a turn longer than one read", async () => {
+    const { root, transcript, base, record, receipt, final } = await forgeAttempt();
+    await fs.writeFile(transcript, "");
+    await hook(root, "UserPromptSubmit", base);
+    const output = { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x".repeat(1024 * 1024) }] } };
+    await fs.appendFile(transcript, record(output).repeat(18) + record(response("Done.")));
+    await hook(root, "Stop", { ...base, last_assistant_message: "Done." });
+    await fs.appendFile(transcript, record(summary()));
+    await vi.waitFor(async () => expect(await receipt()).toMatchObject({ status: "completed" }), { timeout: 10_000 });
+    expect(await final()).toMatchObject({ text: "Done." });
+  });
+
   it("ignores another conversation and records API failures", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
     const receiptPath = path.join(root, "attempt-1.json");
