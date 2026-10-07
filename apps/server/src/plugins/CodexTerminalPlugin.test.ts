@@ -2077,14 +2077,24 @@ describe("Codex conversation recovery after process loss", () => {
 });
 
 
-it.each([false, true])("surfaces a split bridge recovery blocker on terminal failure (public tab %s)", publicTab => {
+it.each([false, true].flatMap(publicTab => [false, true].map(noisyShutdown => ({ publicTab, noisyShutdown }))))("surfaces a split bridge recovery blocker on terminal failure (public tab $publicTab, noisy shutdown $noisyShutdown)", ({ publicTab, noisyShutdown }) => {
   const process = new FakeTerminalProcess();
   const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
   const session = new CodexTerminalSession(tab, process, controls, { closeOnExit: publicTab, replayBytes: 1 });
   process.emitData("CloudX native worker bri");
-  process.emitData("dge: Native app-server message exceeds the 128 MiB output limit.\r\n");
+  process.emitData("dge: Native app-server message exceeds the 128 MiB output limit.\r\n" + (noisyShutdown ? "late native stderr\r\n".repeat(300) : ""));
   process.exit(1);
   expect(session.snapshot()).toMatchObject({ status: "failed", statusMessage: expect.stringContaining("Native app-server message exceeds the 128 MiB output limit.") });
   expect(session.snapshot().statusMessage).toContain("code 1");
   expect(controls.closeTab).not.toHaveBeenCalled();
+});
+
+it("keeps the latest bridge blocker bounded after later shutdown output", () => {
+  const process = new FakeTerminalProcess();
+  const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, replayBytes: 1 });
+  process.emitData("CloudX native worker bridge: Previous failure.\r\n");
+  process.emitData("CloudX native worker bridge: " + "x".repeat(5000) + "\r\n");
+  process.emitData("late native stderr\r\n".repeat(300));
+  process.exit(1);
+  expect(session.snapshot().statusMessage).toBe("Terminal exited with code 1. " + "x".repeat(1024));
 });

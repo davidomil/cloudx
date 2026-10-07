@@ -4,22 +4,45 @@ import { WebSocket } from "ws";
 export const MAX_NATIVE_OUTPUT_BYTES = 128 * 1024 * 1024;
 const OUTPUT_SEND_TIMEOUT_MS = 30_000;
 
+/** Copy fragments into one growing buffer so tiny reads cannot retain unbounded metadata. */
+class NativeMessageBuffer {
+  constructor(limit) { this.limit = limit; this.clear(); }
+
+  append(part) {
+    const size = this.bytes + part.length;
+    if (size > this.limit) throw outputSizeError(this.limit);
+    if (!part.length) return;
+    if (size > (this.buffer?.length ?? 0)) {
+      const capacity = Math.min(this.limit, Math.max(size, 4096, (this.buffer?.length ?? 0) * 2));
+      const buffer = Buffer.allocUnsafe(capacity);
+      this.buffer?.copy(buffer, 0, 0, this.bytes);
+      this.buffer = buffer;
+    }
+    part.copy(this.buffer, this.bytes);
+    this.bytes = size;
+  }
+
+  take() {
+    const line = this.buffer?.toString("utf8", 0, this.bytes) ?? "";
+    this.clear();
+    return line;
+  }
+
+  clear() { this.buffer = undefined; this.bytes = 0; }
+}
+
 /** Decode each JSONL message once, with a byte budget independent of client input. */
 export async function* readNativeMessages(input, { maxMessageBytes = MAX_NATIVE_OUTPUT_BYTES, isConnected = () => true } = {}) {
-  let fragments = [];
-  let bytes = 0;
+  const frame = new NativeMessageBuffer(maxMessageBytes);
   for await (const chunk of input) {
-    if (!isConnected()) { fragments = []; bytes = 0; continue; }
+    if (!isConnected()) { frame.clear(); continue; }
     let offset = 0;
     while (offset < chunk.length) {
       const end = chunk.indexOf(10, offset);
       const part = chunk.subarray(offset, end === -1 ? chunk.length : end);
-      bytes += part.length;
-      if (bytes > maxMessageBytes) throw outputSizeError(maxMessageBytes);
-      if (part.length) fragments.push(part);
+      frame.append(part);
       if (end === -1) break;
-      const line = Buffer.concat(fragments, bytes).toString("utf8");
-      fragments = []; bytes = 0;
+      const line = frame.take();
       if (line.trim()) {
         let message;
         try { message = JSON.parse(line); }
@@ -32,7 +55,7 @@ export async function* readNativeMessages(input, { maxMessageBytes = MAX_NATIVE_
       offset = end + 1;
     }
   }
-  if (bytes && isConnected()) throw new Error("Native app-server output ended with an incomplete JSON message.");
+  if (frame.bytes && isConnected()) throw new Error("Native app-server output ended with an incomplete JSON message.");
 }
 
 /** One in-flight message backpressures stdout until the visible client drains it. */

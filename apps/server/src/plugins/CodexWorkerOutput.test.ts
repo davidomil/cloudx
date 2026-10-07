@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { spawnSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { afterEach, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
@@ -49,6 +50,33 @@ it("counts UTF-8 bytes across chunks and resets the budget for each coalesced fr
     Buffer.from("\n\r\n"),
     Buffer.concat([line, Buffer.from("\n"), line, Buffer.from("\n")])
   ], line.length)).toEqual([{ text: "🙂" }, { text: "🙂" }, { text: "🙂" }]);
+});
+
+it("bounds retained memory when native stdout delivers a history message one byte at a time", () => {
+  const probe = spawnSync(process.execPath, ["--expose-gc", "--input-type=module", "-e", `
+    import assert from 'node:assert/strict';
+    import { readNativeMessages } from ${JSON.stringify(new URL("../../helpers/codex-worker-output.mjs", import.meta.url).href)};
+    global.gc();
+    const baseline = process.memoryUsage().heapUsed;
+    const payloadBytes = 256 * 1024;
+    const input = (async function* () {
+      yield Buffer.from('{"result":"');
+      const byte = Buffer.from('x');
+      for (let i = 0; i < payloadBytes; i++) yield byte;
+      global.gc();
+      const retainedHeap = process.memoryUsage().heapUsed - baseline;
+      assert.ok(retainedHeap < 16 * 1024 * 1024, 'Tiny stdout fragments retained ' + retainedHeap + ' heap bytes');
+      yield Buffer.from('"}\\n');
+    })();
+    let count = 0;
+    for await (const message of readNativeMessages(input)) {
+      assert.equal(message.result.length, payloadBytes);
+      count++;
+    }
+    assert.equal(count, 1);
+  `], { encoding: "utf8", timeout: 15_000, maxBuffer: 65_536 });
+  expect(probe.error).toBeUndefined();
+  expect(probe.status, probe.stderr).toBe(0);
 });
 
 it.each([false, true])("rejects oversized backend frames before retaining them (newline %s)", async newline => {

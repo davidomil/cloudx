@@ -851,6 +851,7 @@ export class CodexTerminalSession implements PluginSession {
   private outputPaused = false;
   private recentOutput = "";
   private failureOutput = "";
+  private bridgeFailure: string | undefined;
   private stopped = false;
   private finishing = false;
   private status: WorkspaceTab["status"];
@@ -886,7 +887,11 @@ export class CodexTerminalSession implements PluginSession {
       if (screenRestored) this.writeScreen(data);
       this.lastOutputAt = Date.now();
       this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
-      this.failureOutput = trimRecentOutput(`${this.failureOutput}${data}`, 4096);
+      this.failureOutput += data;
+      for (const failure of stripVTControlCharacters(this.failureOutput).matchAll(/CloudX native worker bridge: ([^\r\n]{1,1024})/gu)) {
+        this.bridgeFailure = failure[1]?.trim();
+      }
+      this.failureOutput = trimRecentOutput(this.failureOutput, 4096);
       let sawCommandFinish = false;
       for (const event of this.shellIntegrationParser.push(data)) {
         sawCommandFinish = true;
@@ -953,9 +958,7 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   private withBridgeFailure(exitMessage: string): string {
-    const failures = [...stripVTControlCharacters(this.failureOutput).matchAll(/CloudX native worker bridge: ([^\r\n]+)/gu)];
-    const detail = failures.at(-1)?.[1]?.slice(0, 1024).trim();
-    return detail ? `${exitMessage} ${detail}` : exitMessage;
+    return this.bridgeFailure ? `${exitMessage} ${this.bridgeFailure}` : exitMessage;
   }
 
   restoreInput(): Record<string, unknown> | undefined {
