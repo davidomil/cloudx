@@ -22,6 +22,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { CLOUDX_SYSTEM_RULES, CLOUDX_SYSTEM_SKILLS, cloudxSkillFilePath, cloudxSystemSkillFilePath, type ResolvedPersonalityTemplate } from "../rulesSkills/RulesSkillsCatalogService.js";
 import type { TerminalProcess, TerminalProcessFactory, TerminalProducer } from "../terminal/TerminalProcess.js";
 import { TerminalScreen } from "../terminal/TerminalScreen.js";
@@ -849,6 +850,7 @@ export class CodexTerminalSession implements PluginSession {
   private pendingScreenBytes = 0;
   private outputPaused = false;
   private recentOutput = "";
+  private failureOutput = "";
   private stopped = false;
   private finishing = false;
   private status: WorkspaceTab["status"];
@@ -884,6 +886,7 @@ export class CodexTerminalSession implements PluginSession {
       if (screenRestored) this.writeScreen(data);
       this.lastOutputAt = Date.now();
       this.recentOutput = trimRecentOutput(`${this.recentOutput}${data}`, this.replayBytes);
+      this.failureOutput = trimRecentOutput(`${this.failureOutput}${data}`, 4096);
       let sawCommandFinish = false;
       for (const event of this.shellIntegrationParser.push(data)) {
         sawCommandFinish = true;
@@ -921,7 +924,7 @@ export class CodexTerminalSession implements PluginSession {
         return;
       }
       if (this.options.closeOnExit) {
-        const message = completed ? "Codex exited cleanly." : `Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`;
+        const message = completed ? "Codex exited cleanly." : this.withBridgeFailure(`Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`);
         const closeAfterMs = this.options.closeOnExitAfterMs ?? 0;
         if (completed && Date.now() - this.startedAt >= closeAfterMs) {
           this.controls.closeTab(message);
@@ -933,7 +936,7 @@ export class CodexTerminalSession implements PluginSession {
       if (completed) {
         this.setStatus("completed", "Terminal exited cleanly.");
       } else {
-        this.setStatus("failed", `Terminal exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`);
+        this.setStatus("failed", this.withBridgeFailure(`Terminal exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`));
       }
     }));
     const disconnect = this.terminalProcess.onDisconnect?.((error) => {
@@ -947,6 +950,12 @@ export class CodexTerminalSession implements PluginSession {
 
   onData(listener: (data: string) => void): () => void {
     return this.terminalProcess.onData(listener);
+  }
+
+  private withBridgeFailure(exitMessage: string): string {
+    const failures = [...stripVTControlCharacters(this.failureOutput).matchAll(/CloudX native worker bridge: ([^\r\n]+)/gu)];
+    const detail = failures.at(-1)?.[1]?.slice(0, 1024).trim();
+    return detail ? `${exitMessage} ${detail}` : exitMessage;
   }
 
   restoreInput(): Record<string, unknown> | undefined {

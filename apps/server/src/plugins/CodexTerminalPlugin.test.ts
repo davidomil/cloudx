@@ -253,7 +253,7 @@ describe("CodexTerminalPlugin", () => {
       expect(closeTab).not.toHaveBeenCalled();
       expect(session.snapshot()).toMatchObject({
         status: "failed",
-        statusMessage: signal ? `Codex exited from signal ${signal}.` : `Codex exited with code ${exitCode}.`,
+        statusMessage: (signal ? `Codex exited from signal ${signal}.` : `Codex exited with code ${exitCode}.`) + " startup failed.",
         recentOutput: "CloudX native worker bridge: startup failed.\r\n"
       });
       session.stop?.();
@@ -2074,4 +2074,17 @@ describe("Codex conversation recovery after process loss", () => {
       await expect(plugin.recoverSession({ tab, cwd: root, controls, initialInput: { prompt: "Old work", resume: { mode: "session", sessionId: conversationId } } })).rejects.toThrow("Spawn acknowledgement lost");
     });
   });
+});
+
+
+it.each([false, true])("surfaces a split bridge recovery blocker on terminal failure (public tab %s)", publicTab => {
+  const process = new FakeTerminalProcess();
+  const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+  const session = new CodexTerminalSession(tab, process, controls, { closeOnExit: publicTab, replayBytes: 1 });
+  process.emitData("CloudX native worker bri");
+  process.emitData("dge: Native app-server message exceeds the 128 MiB output limit.\r\n");
+  process.exit(1);
+  expect(session.snapshot()).toMatchObject({ status: "failed", statusMessage: expect.stringContaining("Native app-server message exceeds the 128 MiB output limit.") });
+  expect(session.snapshot().statusMessage).toContain("code 1");
+  expect(controls.closeTab).not.toHaveBeenCalled();
 });

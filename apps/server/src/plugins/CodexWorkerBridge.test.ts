@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -747,3 +748,88 @@ if (backend) {
       await expect(fs.access(`/proc/${entry.pid}`)).rejects.toMatchObject({ code: "ENOENT" });
   } finally { await terminal.terminate(); }
 }, 15_000);
+
+
+it.each([false, true].flatMap(forge => [1024, 3 * 1024 * 1024].map(imageBytes => ({ forge, imageBytes }))))(
+  "recovers image history with $imageBytes bytes per image (Forge $forge), preserving selection, permissions and subsequent input",
+  async ({ forge, imageBytes }) => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-large-history-"));
+    directories.push(directory);
+    const command = path.join(directory, "codex.mjs");
+    const receiptPath = path.join(directory, "selected.json");
+    const turnPath = path.join(directory, "turn.json");
+    const transcriptPath = path.join(directory, "saved.jsonl");
+    const observedPath = path.join(directory, "observed.json");
+    const sessionId = "01a08470-d118-7b72-b1df-439e72e5c744";
+    const content = Array.from({ length: 13 }, () => ({ type: "image", data: "A".repeat(imageBytes), mimeType: "image/png" }));
+    const history = JSON.stringify({ turns: [{ id: "saved-turn", items: [{ type: "mcpToolCall", result: { content } }] }], marker: "Restored 🙂 history" });
+    await fs.writeFile(transcriptPath, history + "\n");
+    const digest = createHash("sha256").update(history).digest("hex");
+    const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+    await fs.writeFile(command, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+import { once } from 'node:events';
+import { createHash } from 'node:crypto';
+import WebSocket from ${JSON.stringify(ws)};
+const history = fs.readFileSync(${JSON.stringify(transcriptPath)}, 'utf8').trim();
+const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+if (process.argv.includes('app-server')) {
+  for await (const line of readline.createInterface({ input: process.stdin })) {
+    const request = JSON.parse(line);
+    if (request.method === 'thread/resume') {
+      const reply = Buffer.from(JSON.stringify({ id: request.id, result: { thread: { id: ${JSON.stringify(sessionId)}, cwd: process.cwd(), ...JSON.parse(history) }, runtimeWorkspaceRoots: [process.cwd()] } }) + '\\n');
+      const unicode = reply.indexOf(Buffer.from('🙂'));
+      // Split the UTF-8 character and stream the image data across stdout chunks.
+      for (const part of [reply.subarray(0, unicode + 1), reply.subarray(unicode + 1)]) {
+        for (let offset = 0; offset < part.length; offset += 16381) {
+          if (!process.stdout.write(part.subarray(offset, offset + 16381))) await once(process.stdout, 'drain');
+        }
+      }
+      // A following frame can arrive in the same stdout read as the large frame's tail.
+      send({ method: 'history/loaded', params: { marker: 'Restored 🙂 history' } });
+    } else if (request.method === 'turn/start') {
+      send({ id: request.id, result: { turn: { id: 'next-turn', status: 'inProgress' } } });
+      send({ method: 'turn/completed', params: { threadId: ${JSON.stringify(sessionId)}, turn: { id: 'next-turn', status: 'completed' } } });
+    } else throw new Error('Unexpected input after recovery');
+  }
+} else {
+  const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
+  socket.on('open', () => socket.send(JSON.stringify({ id: 1, method: 'thread/resume', params: { threadId: ${JSON.stringify(sessionId)} } })));
+  let receivedHistory = false;
+  socket.on('message', data => {
+    const reply = JSON.parse(data.toString());
+    if (reply.id === 1) {
+      const { id, cwd, ...restored } = reply.result.thread;
+      if (createHash('sha256').update(JSON.stringify(restored)).digest('hex') !== ${JSON.stringify(digest)}) throw new Error('Changed history');
+      if (JSON.stringify(reply.result.runtimeWorkspaceRoots) !== JSON.stringify([process.cwd(), '/cloudx-skills'])) throw new Error('Missing writable roots');
+      if (JSON.parse(fs.readFileSync(${JSON.stringify(receiptPath)}, 'utf8')).sessionId !== id) throw new Error('Selection not durable before history render');
+      receivedHistory = true;
+    } else if (reply.method === 'history/loaded') {
+      if (!receivedHistory || reply.params.marker !== 'Restored 🙂 history') throw new Error('Lost or reordered history');
+      socket.send(JSON.stringify({ id: 2, method: 'turn/start', params: { threadId: ${JSON.stringify(sessionId)} } }));
+    } else if (reply.method === 'turn/completed') {
+      if (${forge} && JSON.parse(fs.readFileSync(${JSON.stringify(turnPath)}, 'utf8')).status !== 'completed') throw new Error('Missing Forge completion');
+      fs.writeFileSync(${JSON.stringify(observedPath)}, JSON.stringify({ historyBytes: Buffer.byteLength(history), images: 13, inputAfterRecovery: true }));
+      socket.close();
+      setTimeout(() => process.exit(0), 50);
+    }
+  });
+}
+`, { mode: 0o755 });
+    const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
+      selection: { tabId: "large-history", executionId: sessionId, receiptPath },
+      ...(forge ? { binding: { workerId: "worker", attemptId: "attempt", receiptPath: turnPath, expectedThreadId: sessionId } } : {}),
+      command, serverArgs: ["app-server"], tuiArgs: [], permissions: { yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] }
+    })], { cwd: directory, env: { PATH: process.env.PATH }, cols: 100, rows: 30 });
+    let output = "";
+    let exited: TerminalExit | undefined;
+    terminal.onData(chunk => { output = (output + chunk).slice(-4096); });
+    terminal.onExit(event => { exited = event; });
+    try {
+      await expect.poll(() => exited ?? output, { timeout: 10_000 }).toMatchObject({ exitCode: 0 });
+      expect(JSON.parse(await fs.readFile(observedPath, "utf8"))).toEqual({ historyBytes: Buffer.byteLength(history), images: 13, inputAfterRecovery: true });
+      expect(createHash("sha256").update(await fs.readFile(transcriptPath)).digest("hex")).toBe(createHash("sha256").update(history + "\n").digest("hex"));
+    } finally { await terminal.terminate(); }
+  }, 15_000
+);
