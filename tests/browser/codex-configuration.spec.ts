@@ -43,7 +43,55 @@ test.afterAll(async () => {
   );
 });
 
-async function openFixture(page: Page, selectedProfile = "writing") {
+const quickAliases = [
+  {
+    field: "model",
+    family: "model",
+    label: "Default model",
+    initial: "gpt-6.1-sol",
+    quick: "gpt-6-sol",
+    native: "gpt-6-astra",
+  },
+  {
+    field: "serviceTier",
+    family: "service_tier",
+    label: "Fast mode",
+    initial: "priority",
+    quick: "default",
+    native: "flex",
+  },
+  {
+    field: "reasoningEffort",
+    family: "model_reasoning_effort",
+    label: "Reasoning effort",
+    initial: "low",
+    quick: "high",
+    native: "xhigh",
+  },
+  {
+    field: "webSearch",
+    family: "web_search",
+    label: "Web search",
+    initial: "cached",
+    quick: "live",
+    native: "disabled",
+  },
+  {
+    field: "personality",
+    family: "personality",
+    label: "Personality",
+    initial: "friendly",
+    quick: "none",
+    native: "none",
+  },
+] as const;
+
+async function openFixture(
+  page: Page,
+  selectedProfile = "writing",
+  initialQuickDefaults = false,
+  selectedVersion = "0.162.1",
+) {
   const settings: CodexGlobalSettings = {
     revision: "a".repeat(64),
     model: null,
@@ -83,11 +131,22 @@ async function openFixture(page: Page, selectedProfile = "writing") {
       ],
     },
   };
+  if (initialQuickDefaults)
+    for (const alias of quickAliases) {
+      settings[alias.field] = alias.initial;
+      settings.configuration!.values[alias.family] = alias.initial;
+    }
+  settings.configuration!.selectedVersion = selectedVersion;
   const profiles: Record<string, CodexGlobalSettings> = {};
   const profileSettings = (name: string) =>
     (profiles[name] ??= {
       ...structuredClone(settings),
       revision: "c".repeat(64),
+      model: null,
+      serviceTier: null,
+      reasoningEffort: null,
+      webSearch: null,
+      personality: null,
       configuration: {
         ...structuredClone(settings.configuration!),
         targetProfile: name,
@@ -123,6 +182,16 @@ async function openFixture(page: Page, selectedProfile = "writing") {
       for (const [key, value] of Object.entries(input.nativeOptions ?? {})) {
         if (value === null) delete values[key];
         else values[key] = value as (typeof values)[string];
+      }
+      for (const alias of quickAliases) {
+        const value =
+          input[alias.field] === undefined
+            ? input.nativeOptions?.[alias.family]
+            : input[alias.field];
+        if (value === undefined) continue;
+        target[alias.field] = value;
+        if (value === null) delete values[alias.family];
+        else values[alias.family] = value;
       }
       target.revision = String(++revision).repeat(64);
       target.configuration!.effectiveValues = structuredClone(values);
@@ -262,6 +331,52 @@ test("searches grouped native settings, saves nested values, reloads and unsets 
   });
 });
 
+test("keeps synchronized model edits in their selected profile and reloads the base draft when switching targets", async ({
+  page,
+}) => {
+  const { settings, profiles, updates } = await openFixture(page, "", true);
+  const target = page.getByRole("combobox", { name: "Configuration target" });
+  const quick = page.getByRole("textbox", {
+    name: "Default model",
+    exact: true,
+  });
+  await quick.fill("unsaved-base-model");
+  await target.selectOption("writing");
+  await expect(quick).toHaveValue("");
+  await page
+    .getByRole("searchbox", { name: "Search Codex options" })
+    .fill("model");
+  const native = page.getByRole("textbox", {
+    name: "Native model",
+    exact: true,
+  });
+  await expect(native).toHaveValue("");
+  await quick.fill("gpt-6-sol");
+  await native.fill('"gpt-6-astra"');
+  await expect(quick).toHaveValue("gpt-6-astra");
+  await page.getByRole("button", { name: "Save Codex settings" }).click();
+  await expect(
+    page.getByRole("button", { name: "Reload", exact: true }),
+  ).toBeEnabled();
+  expect(updates[0]).toEqual({
+    expectedRevision: "c".repeat(64),
+    targetProfile: "writing",
+    model: "gpt-6-astra",
+  });
+  expect(profiles.writing.model).toBe("gpt-6-astra");
+  expect(settings.model).toBe("gpt-6.1-sol");
+  await quick.fill("discarded-profile-model");
+  await page.getByRole("button", { name: "Reload", exact: true }).click();
+  await expect(quick).toHaveValue("gpt-6-astra");
+  await expect(native).toHaveValue('"gpt-6-astra"');
+  await target.selectOption("");
+  await expect(quick).toHaveValue("gpt-6.1-sol");
+  await expect(native).toHaveValue('"gpt-6.1-sol"');
+  await expect(
+    page.getByRole("button", { name: "Save Codex settings" }),
+  ).toBeDisabled();
+});
+
 test("creates a separate native profile and selects it for new launches without changing base defaults", async ({
   page,
 }) => {
@@ -343,5 +458,186 @@ test("keeps invalid JSON local and requires reload after a conflicting save", as
   expect(updates[1]).toEqual({
     expectedRevision: "b".repeat(64),
     nativeOptions: { model_verbosity: "low" },
+  });
+});
+
+for (const order of [
+  "quick then native",
+  "native then quick",
+  "native unset",
+  "quick unset",
+] as const) {
+  test(`quick and structured controls share the latest draft through ${order}`, async ({
+    page,
+  }) => {
+    const { settings, updates } = await openFixture(page, "", true);
+    const search = page.getByRole("searchbox", {
+      name: "Search Codex options",
+    });
+    const save = page.getByRole("button", { name: "Save Codex settings" });
+    for (const alias of quickAliases.filter(
+      (alias) => alias.field !== "personality",
+    )) {
+      await search.fill(alias.family);
+      const native = page.getByRole("textbox", {
+        name: `Native ${alias.family}`,
+        exact: true,
+      });
+      const quick = page.getByRole(
+        alias.field === "model" ? "textbox" : "combobox",
+        { name: alias.label, exact: true },
+      );
+      const quickEdit = async (value: string) =>
+        alias.field === "model" ? quick.fill(value) : quick.selectOption(value);
+      let latest: string | null;
+      if (order === "quick then native" || order === "native unset") {
+        await quickEdit(alias.quick);
+        await expect(native).toHaveValue(JSON.stringify(alias.quick));
+        latest = order === "native unset" ? null : alias.native;
+        if (latest === null)
+          await page
+            .getByRole("button", { name: `Unset ${alias.family}`, exact: true })
+            .click();
+        else await native.fill(JSON.stringify(latest));
+      } else {
+        await native.fill(JSON.stringify(alias.native));
+        await expect(quick).toHaveValue(alias.native);
+        latest = order === "quick unset" ? null : alias.quick;
+        await quickEdit(latest ?? "");
+      }
+      await expect(quick).toHaveValue(latest ?? "");
+      await expect(native).toHaveValue(
+        latest === null ? "" : JSON.stringify(latest),
+      );
+      await search.fill("notifications");
+      await save.click();
+      await expect(save).toBeDisabled();
+      await expect(
+        page.getByRole("button", { name: "Reload", exact: true }),
+      ).toBeEnabled();
+      expect(updates.at(-1)).toEqual({
+        expectedRevision:
+          updates.length === 1
+            ? "a".repeat(64)
+            : String(updates.length).repeat(64),
+        [alias.field]: latest,
+      });
+      expect(settings[alias.field]).toBe(latest);
+      await search.fill(alias.family);
+      await page.getByRole("button", { name: "Reload", exact: true }).click();
+      await expect(quick).toHaveValue(latest ?? "");
+      await expect(native).toHaveValue(
+        latest === null ? "" : JSON.stringify(latest),
+      );
+    }
+  });
+}
+
+for (const version of ["0.160.0", "0.162.1"]) {
+  test(`labels deprecated ignored fields and OS-specific nested options for Codex ${version}`, async ({
+    page,
+  }) => {
+    await openFixture(page, "", true, version);
+    const search = page.getByRole("searchbox", {
+      name: "Search Codex options",
+    });
+    await search.fill("features.multi_agent_v2.usage_hint_enabled");
+    await page
+      .getByText("Nested options for features", { exact: true })
+      .click();
+    const ignored = page.getByRole("listitem").filter({
+      has: page.locator("code", {
+        hasText: /^features\.multi_agent_v2\.usage_hint_enabled$/,
+      }),
+    });
+    await expect(ignored).toContainText("deprecated");
+    await expect(ignored).toContainText("value is ignored");
+    await search.fill("computer_use");
+    await page
+      .getByText("Nested options for computer_use", { exact: true })
+      .click();
+    for (const platform of ["macos", "windows"]) {
+      const options = page.getByRole("listitem").filter({
+        has: page.locator("code", {
+          hasText: new RegExp(`^computer_use\\.${platform}(?:\\.|$)`),
+        }),
+      });
+      expect(await options.count()).toBeGreaterThan(1);
+      for (const option of await options.all())
+        await expect(option).toContainText(`· ${platform}`);
+    }
+    await search.fill("personality");
+    await expect(
+      page.getByRole("textbox", { name: "Native personality", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole("group", {
+        name: "personality · deprecated · all",
+        exact: true,
+      }),
+    ).toContainText("no longer select a communication style");
+    const personality = page.getByRole("combobox", {
+      name: "Personality",
+      exact: true,
+    });
+    await personality.selectOption("none");
+    await page.getByRole("button", { name: "Save Codex settings" }).click();
+    await expect(personality).toHaveValue("none");
+    await personality.selectOption("");
+    await page.getByRole("button", { name: "Save Codex settings" }).click();
+    await expect(
+      page.getByRole("button", { name: "Save Codex settings" }),
+    ).toBeDisabled();
+    await expect(personality).toHaveValue("");
+  });
+}
+
+test("saves provider-native model strings outside the quick API contract without conflicting aliases", async ({
+  page,
+}) => {
+  const { settings, updates } = await openFixture(page, "", true);
+  const quick = page.getByRole("textbox", {
+    name: "Default model",
+    exact: true,
+  });
+  await page
+    .getByRole("searchbox", { name: "Search Codex options" })
+    .fill("model");
+  const native = page.getByRole("textbox", {
+    name: "Native model",
+    exact: true,
+  });
+  const save = page.getByRole("button", { name: "Save Codex settings" });
+  for (const model of ["local/model@preview", "x".repeat(129)]) {
+    await quick.fill("gpt-6-sol");
+    await native.fill(JSON.stringify(model));
+    await expect(quick).toHaveValue(model);
+    await expect(quick).not.toHaveAttribute("aria-invalid", "true");
+    await expect(save).toBeEnabled();
+    await save.click();
+    await expect(
+      page.getByRole("button", { name: "Reload", exact: true }),
+    ).toBeEnabled();
+    expect(updates.at(-1)).toEqual({
+      expectedRevision:
+        updates.length === 1
+          ? "a".repeat(64)
+          : String(updates.length).repeat(64),
+      nativeOptions: { model },
+    });
+    expect(settings.model).toBe(model);
+    await page.getByRole("button", { name: "Reload", exact: true }).click();
+    await expect(quick).toHaveValue(model);
+    await expect(native).toHaveValue(JSON.stringify(model));
+  }
+  await native.fill('"local/model@preview"');
+  await quick.fill("gpt-6-astra");
+  await save.click();
+  await expect(
+    page.getByRole("button", { name: "Reload", exact: true }),
+  ).toBeEnabled();
+  expect(updates.at(-1)).toEqual({
+    expectedRevision: "3".repeat(64),
+    model: "gpt-6-astra",
   });
 });

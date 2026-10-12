@@ -83,6 +83,41 @@ describe("reviewed native Codex configuration", () => {
     expect(() => isCodexKnownPath(["model"], "0.163.0")).toThrow("no reviewed");
   });
 
+  it.each(["0.160.0", "0.162.1"] as CodexConfigurationVersion[])("recognizes arbitrary hook JSON descendants without opening typed tables for %s", version => {
+    const input = ["hooks", "SessionStart", "0", "hooks", "0", "input"];
+    for (const suffix of [["details", "name"], ["tags", "0"], ["records", "0", "nested", "0", "name"]])
+      expect(isCodexKnownPath([...input, ...suffix], version), suffix.join(".")).toBe(true);
+    for (const parts of [
+      ["hooks", "SessionStart", "0", "hooks", "0", "unexpected", "name"],
+      ["model_providers", "company", "base_url", "extra"],
+      ["mcp_servers", "company", "env", "API_KEY", "nested"],
+      ["tui", "unexpected", "name"],
+    ]) expect(isCodexKnownPath(parts, version), parts.join(".")).toBe(false);
+    expect(isCodexKnownPath(["desktop", "window", "geometry"], version)).toBe(true);
+    expect(isCodexReadOnlyPath(["desktop", "window", "geometry"], version)).toBe(true);
+    expect(isCodexProtectedPath(["mcp_servers", "company", "env", "API_KEY", "nested"])).toBe(true);
+  });
+
+  it.each(["0.160.0", "0.162.1"] as CodexConfigurationVersion[])("retains ignored leaf deprecation independently of its feature stage for %s", version => {
+    const catalog = codexConfigurationCatalog(version);
+    expect(catalog.find(entry => entry.path === "features.multi_agent_v2")).toMatchObject({ status: "stable", editable: true });
+    const ignored = catalog.find(entry => entry.path === "features.multi_agent_v2.usage_hint_enabled")!;
+    expect(ignored).toMatchObject({ status: "deprecated", editable: false });
+    expect(ignored.reason).toContain("ignored");
+    expect(isCodexReadOnlyPath(ignored.path.split("."), version)).toBe(true);
+    expect(catalog.find(entry => entry.path === "profiles.*.features.multi_agent_v2.usage_hint_enabled")).toMatchObject({ status: "deprecated", editable: false });
+  });
+
+  it.each(["0.160.0", "0.162.1"] as CodexConfigurationVersion[])("labels each computer-use operating-system subtree for %s", version => {
+    const catalog = codexConfigurationCatalog(version);
+    for (const platform of ["macos", "windows"]) {
+      const entries = catalog.filter(entry => entry.path === `computer_use.${platform}` || entry.path.startsWith(`computer_use.${platform}.`));
+      expect(entries.length).toBeGreaterThan(1);
+      for (const entry of entries) expect(entry.platform, entry.path).toBe(platform);
+    }
+    expect(catalog.find(entry => entry.path === "computer_use.default_app_access")).toMatchObject({ platform: "all" });
+  });
+
   it("explains managed state and tracks native feature removal by CLI version", () => {
     expect(isCodexReadOnlyPath(["desktop", "window", "geometry"])).toBe(true);
     expect(isCodexReadOnlyPath(["hooks", "state", "hook", "trusted"])).toBe(true);

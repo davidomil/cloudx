@@ -1,5 +1,6 @@
 import { parse, type TomlTable } from "smol-toml";
 import { parseTOML, type AST } from "toml-eslint-parser";
+import { DEFAULT_CODEX_MODEL } from "@cloudx/shared";
 
 type Value = string | number | boolean | Value[] | { [key: string]: Value };
 const parts = (key: AST.TOMLKey) => key.keys.map(part => part.type === "TOMLBare" ? part.name : part.value);
@@ -114,6 +115,10 @@ export function mergeCodexConfigurationLayers<T extends Record<string, unknown>>
     (result as Record<string, unknown>)[key] = object(previous) && object(value) ? mergeCodexConfigurationLayers(previous, value) : value;
   }
   return result;
+}
+
+export function withCodexLaunchModelDefault<T extends Record<string, unknown>>(config: T): T {
+  return config.model === undefined ? { ...config, model: DEFAULT_CODEX_MODEL } : config;
 }
 
 /** A visible entry can be removed explicitly; hidden sibling fields survive edits to retained entries. */

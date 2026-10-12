@@ -13,6 +13,10 @@ export const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xh
 export const webSearchModes = ["disabled", "cached", "live", "indexed"] as const;
 export const personalities = ["none"] as const;
 type NativeSetting = "reasoningEffort" | "webSearch" | "personality";
+const quickSettings = {
+  model: "model", serviceTier: "service_tier", reasoningEffort: "model_reasoning_effort", webSearch: "web_search", personality: "personality"
+} as const;
+type QuickSetting = keyof typeof quickSettings;
 
 interface EditorState {
   settings?: CodexGlobalSettings;
@@ -63,32 +67,24 @@ export class CodexSettingsEditor {
     return serviceTiers.find(tier => tier.value === this.state.serviceTier)?.value;
   }
 
-  get validModel() {
-    return !this.state.model || /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(this.state.model);
-  }
-
-  private get modelChanged() {
-    return Boolean(this.state.settings && this.state.model !== (this.state.settings.model ?? ""));
-  }
-
-  private get modeChanged() {
-    const { settings, serviceTier, modeSelected } = this.state;
-    return Boolean(settings && (serviceTier !== (settings.serviceTier ?? "") || (modeSelected && this.selectedTier && settings.fastModeEnabled === false)));
-  }
-
   get canSave() {
-    return !this.state.busy && this.validModel && !this.nativeError && Object.keys(this.changedSettings()).length > 0;
+    return !this.state.busy && !this.nativeError && Object.keys(this.changedSettings()).length > 0;
   }
 
   get nativeError(): string | undefined {
     for (const [family, value] of Object.entries(this.state.nativeDrafts)) {
       if (!value.trim()) continue;
-      try { JSON.parse(value); } catch { return `Enter valid JSON for ${family}, or use Unset to inherit.`; }
+      try {
+        const parsed = JSON.parse(value);
+        if (Object.values(quickSettings).some(key => key === family) && parsed !== null && typeof parsed !== "string")
+          return `${family} must be a JSON string, or use Unset to inherit.`;
+      } catch { return `Enter valid JSON for ${family}, or use Unset to inherit.`; }
     }
   }
 
   setNativeOption(family: string, value: string): void {
-    if (!this.state.busy) this.update({ nativeDrafts: { ...this.state.nativeDrafts, [family]: value }, saved: false });
+    if (this.state.busy) return;
+    this.update({ nativeDrafts: { ...this.state.nativeDrafts, [family]: value }, ...(family === "service_tier" ? { modeSelected: true } : {}), saved: false });
   }
 
   selectLaunchProfile(configProfile: string): void {
@@ -102,11 +98,11 @@ export class CodexSettingsEditor {
   }
 
   setModel(model: string): void {
-    if (!this.state.busy) this.update({ model, saved: false });
+    this.setNativeOption("model", model ? JSON.stringify(model) : "");
   }
 
   selectMode(serviceTier: string): void {
-    if (!this.state.busy) this.update({ serviceTier, modeSelected: true, saved: false });
+    this.setNativeOption("service_tier", serviceTier ? JSON.stringify(serviceTier) : "");
   }
 
   enableFastMode(): void {
@@ -126,7 +122,7 @@ export class CodexSettingsEditor {
   }
 
   selectNativeSetting(field: NativeSetting, value: string): void {
-    if (!this.state.busy) this.update({ [field]: value, saved: false });
+    this.setNativeOption(quickSettings[field], value ? JSON.stringify(value) : "");
   }
 
   async reload(): Promise<void> {
@@ -179,33 +175,51 @@ export class CodexSettingsEditor {
   }
 
   private changedSettings(): Omit<CodexGlobalSettingsUpdate, "expectedRevision"> {
-    const { settings, model, yoloMode, autoTrustWorkspace, defaultSkills, reasoningEffort, webSearch, personality } = this.state;
+    const { settings, yoloMode, autoTrustWorkspace, defaultSkills } = this.state;
     if (!settings) return {};
     const update: Omit<CodexGlobalSettingsUpdate, "expectedRevision"> = {};
-    if (this.modelChanged) update.model = model || null;
-    if (this.modeChanged) update.serviceTier = this.selectedTier ?? null;
     if (yoloMode !== settings.yoloMode) update.yoloMode = yoloMode;
     if (autoTrustWorkspace !== settings.autoTrustWorkspace) update.autoTrustWorkspace = autoTrustWorkspace;
-    if (reasoningEffort !== (settings.reasoningEffort ?? "")) update.reasoningEffort = reasoningEfforts.find(value => value === reasoningEffort) ?? null;
-    if (webSearch !== (settings.webSearch ?? "")) update.webSearch = webSearchModes.find(value => value === webSearch) ?? null;
-    if (personality !== (settings.personality ?? "")) update.personality = personalities.find(value => value === personality) ?? null;
     const skillChanges = Object.fromEntries(defaultSkills
       .filter(skill => settings.defaultSkills.find(saved => saved.id === skill.id)?.enabled !== skill.enabled)
       .map(skill => [skill.id, skill.enabled]));
     if (Object.keys(skillChanges).length) update.defaultSkills = skillChanges;
     if (!this.state.targetProfile && this.state.configProfile !== (settings.configProfile ?? "")) update.configProfile = this.state.configProfile || null;
-    const nativeOptions = Object.fromEntries(Object.entries(this.state.nativeDrafts).flatMap(([family, draft]) => {
+    const nativeOptions: NonNullable<CodexGlobalSettingsUpdate["nativeOptions"]> = {};
+    for (const [family, draft] of Object.entries(this.state.nativeDrafts)) {
       const value = draft.trim() ? JSON.parse(draft) : null;
-      return JSON.stringify(value) === JSON.stringify(settings.configuration?.values[family] ?? null) ? [] : [[family, value]];
-    }));
+      const field = (Object.keys(quickSettings) as QuickSetting[]).find(field => quickSettings[field] === family);
+      const original = field ? settings[field] : settings.configuration?.values[family] ?? null;
+      if (JSON.stringify(value) === JSON.stringify(original)) continue;
+      if (field && supportedQuickValue(field, value)) Object.assign(update, { [field]: value });
+      else nativeOptions[family] = value;
+    }
+    if (this.state.modeSelected && this.selectedTier && settings.fastModeEnabled === false) update.serviceTier = this.selectedTier;
     if (Object.keys(nativeOptions).length) update.nativeOptions = nativeOptions;
     return update;
   }
 
   private update(change: Partial<EditorState>): void {
     this.state = { ...this.state, ...change };
+    for (const field of Object.keys(quickSettings) as QuickSetting[]) {
+      const draft = this.state.nativeDrafts[quickSettings[field]];
+      let value: unknown = this.state.settings?.[field];
+      if (draft !== undefined) {
+        try { value = draft.trim() ? JSON.parse(draft) : null; }
+        catch { value = null; }
+      }
+      this.state[field] = typeof value === "string" ? value : "";
+    }
     this.listeners.forEach(listener => listener());
   }
+}
+
+function supportedQuickValue(field: QuickSetting, value: unknown): boolean {
+  if (value === null) return true;
+  if (field === "model") return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value);
+  const options = field === "serviceTier" ? serviceTiers.map(tier => tier.value)
+    : field === "reasoningEffort" ? reasoningEfforts : field === "webSearch" ? webSearchModes : personalities;
+  return typeof value === "string" && options.some(option => option === value);
 }
 
 function errorMessage(error: unknown): string {

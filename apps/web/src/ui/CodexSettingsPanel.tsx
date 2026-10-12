@@ -12,7 +12,7 @@ import type { UiContributionRenderContext } from "./uiContributions.js";
 export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettingsEditor; callHook: NonNullable<UiContributionRenderContext["callHook"]> }) {
   const { settings, model, serviceTier, modeSelected, yoloMode, autoTrustWorkspace, defaultSkills, reasoningEffort, webSearch, personality, busy, error, saved } = useSyncExternalStore(editor.subscribe, editor.getSnapshot);
   useEffect(() => { editor.load(callHook); }, [editor, callHook]);
-  const { selectedTier, validModel, canSave } = editor;
+  const { selectedTier, canSave } = editor;
 
   return <section className="codex-settings-panel" aria-label="Global Codex settings" aria-busy={busy !== null}>
     <header className="codex-settings-header">
@@ -29,16 +29,15 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
         <legend>Model and behavior</legend>
         <label>
           Default model
-          <input aria-label="Default model" value={model} placeholder={DEFAULT_CODEX_MODEL} maxLength={128} disabled={busy !== null} aria-invalid={!validModel} autoComplete="off" autoCapitalize="none" spellCheck={false} onChange={event => { editor.setModel(event.target.value); }} />
-          <small>Leave blank to use the CloudX default: GPT-6.1 Sol ({DEFAULT_CODEX_MODEL}), unless a profile, project, or session selects another model.</small>
+          <input aria-label="Default model" value={model} placeholder={DEFAULT_CODEX_MODEL} disabled={busy !== null} autoComplete="off" autoCapitalize="none" spellCheck={false} onChange={event => { editor.setModel(event.target.value); }} />
+          <small>Leave blank to use the CloudX default: GPT-6.1 Sol ({DEFAULT_CODEX_MODEL}), unless a profile, project, or session selects another model. Use a model identifier supported by the selected Codex provider; native validation checks it when saving.</small>
         </label>
-        {!validModel ? <p className="codex-settings-notice" role="alert">Enter a model identifier of at most 128 letters, numbers, dots, underscores, colons, slashes, or hyphens, starting with a letter or number.</p> : null}
         <label>
           Fast mode
           <select aria-label="Fast mode" value={serviceTier} disabled={busy !== null} onChange={event => { editor.selectMode(event.target.value); }}>
             <option value="">Model default</option>
             {serviceTiers.map(tier => <option key={tier.value} value={tier.value}>{tier.label}</option>)}
-            {settings.serviceTier && !serviceTiers.some(tier => tier.value === settings.serviceTier) ? <option value={settings.serviceTier}>Saved value: {settings.serviceTier}</option> : null}
+            {serviceTier && !serviceTiers.some(tier => tier.value === serviceTier) ? <option value={serviceTier}>{serviceTier === settings.serviceTier ? "Saved" : "Draft"} value: {serviceTier}</option> : null}
           </select>
           <small>On uses priority service; Off uses standard service. Flex selects flexible service. Model default removes the global service tier override.</small>
         </label>
@@ -105,7 +104,7 @@ function NativeSettingSelect({ label, value, savedValue, options, disabled, onCh
     <select aria-label={label} value={value} disabled={disabled} onChange={event => onChange(event.target.value)}>
       <option value="">Codex default</option>
       {options.map(option => <option key={option} value={option}>{option}</option>)}
-      {savedValue && !options.includes(savedValue) ? <option value={savedValue}>Saved value: {savedValue}</option> : null}
+      {value && !options.includes(value) ? <option value={value}>{value === savedValue ? "Saved" : "Draft"} value: {value}</option> : null}
     </select>
     <small>{children}</small>
   </label>;

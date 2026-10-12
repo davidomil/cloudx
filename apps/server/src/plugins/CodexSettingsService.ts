@@ -11,7 +11,7 @@ import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 import { readCodexConfiguration, validateCodexNativeOptions } from "./CodexConfigurationSettings.js";
 import { validateNativeCodexConfiguration } from "./CodexConfigurationProbe.js";
-import { editCodexConfiguration, mergeCodexConfigurationLayers, parseCodexConfiguration, preserveHiddenCodexValues } from "./CodexConfigurationDocument.js";
+import { editCodexConfiguration, mergeCodexConfigurationLayers, parseCodexConfiguration, preserveHiddenCodexValues, withCodexLaunchModelDefault } from "./CodexConfigurationDocument.js";
 import { resolveCodexConfigurationPaths } from "./CodexConfigurationPaths.js";
 
 export class CodexSettingsService {
@@ -81,12 +81,10 @@ export class CodexSettingsService {
       const name = input.targetProfile ?? settings.configProfile;
       const profileText = name ? (input.targetProfile ? text : await this.sources.readConfig(source, signal, name)) : undefined;
       if (name && name !== input.targetProfile && !expectedLayers.some(layer => layer.profile === name)) expectedLayers.push({ profile: name, content: profileText });
-      const modelChoices = [input.model, input.reasoningEffort, input.nativeOptions?.model, input.nativeOptions?.model_reasoning_effort];
-      const checkModel = modelChoices.some(value => value !== undefined && value !== null)
-        || [input.personality, input.nativeOptions?.personality].some(value => value !== undefined && value !== null && value !== "none");
       const baseCandidate = input.targetProfile ? baseOriginal ?? "" : text;
       const origin = (value: string) => stringify(resolveCodexConfigurationPaths(parseCodexConfiguration(value), source.home, this.env.HOME));
-      await validateNativeCodexConfiguration(current.configuration!.selectedCommand, origin(baseCandidate), buildToolEnv(this.env), signal, name && profileText !== undefined ? { name, text: origin(profileText) } : undefined, checkModel);
+      const checkPersonality = [input.personality, input.nativeOptions?.personality].some(value => value !== undefined && value !== null && value !== "none");
+      await validateNativeCodexConfiguration(current.configuration!.selectedCommand, origin(baseCandidate), buildToolEnv(this.env), signal, name && profileText !== undefined ? { name, text: origin(profileText) } : undefined, resolveCodexConfigurationPaths(current.configuration!.effectiveValues, source.home, this.env.HOME), checkPersonality);
       const verified = await this.settings(source, original, defaultSkills, signal, input.targetProfile);
       if (verified.revision !== current.revision)
         throw new Error("Codex configuration layers or selected executable changed. Reload before saving settings.");
@@ -126,6 +124,10 @@ export class CodexSettingsService {
         settings.configuration.overrides.push(`Selected native profile: ${preferences.configProfile}.config.toml`);
       }
     }
+    if (settings.configuration.effectiveValues.model === undefined) {
+      settings.configuration.effectiveValues = withCodexLaunchModelDefault(settings.configuration.effectiveValues);
+      settings.configuration.overrides.push(`model: CloudX launch default ${settings.configuration.effectiveValues.model} applies when no user/profile model is set.`);
+    }
     settings.revision = createHash("sha256").update(JSON.stringify([settings.revision, baseText, targetProfile, settings.configuration.profileFiles, selectedProfileText, command, version])).digest("hex");
     return settings;
   }
@@ -137,11 +139,18 @@ const nativeSettings = {
   personality: "personality",
 } as const;
 
+const nativeAliases = { model: "model", serviceTier: "service_tier", ...nativeSettings } as const;
+
 function validateUpdate(input: CodexGlobalSettingsUpdate): void {
   if (!input || typeof input !== "object" || Array.isArray(input)
     || Object.keys(input).some((key) => !["expectedRevision", "model", "serviceTier", "yoloMode", "autoTrustWorkspace", "defaultSkills", "nativeOptions", "targetProfile", "configProfile", ...Object.keys(nativeSettings)].includes(key))
     || typeof input.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(input.expectedRevision))
     throw new Error("Invalid shared Codex settings update.");
+  for (const [field, key] of Object.entries(nativeAliases)) {
+    const quick = input[field as keyof typeof nativeAliases];
+    if (quick !== undefined && input.nativeOptions && Object.hasOwn(input.nativeOptions, key) && quick !== input.nativeOptions[key])
+      throw new Error(`Conflicting Codex ${key} values. Submit one value before saving.`);
+  }
   for (const profile of [input.targetProfile, input.configProfile]) if (profile !== undefined && profile !== null) codexConfigurationFilename(profile);
   if (input.model !== undefined && input.model !== null
     && (typeof input.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(input.model)))

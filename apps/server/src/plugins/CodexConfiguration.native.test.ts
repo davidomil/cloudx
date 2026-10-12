@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { expect, it } from "vitest";
 import { parse } from "smol-toml";
 import type { WorkspaceTab } from "@cloudx/shared";
@@ -147,9 +148,225 @@ it.skipIf(!codex)("rejects reasoning effort missing from the selected native mod
   } finally { await fixture.dispose(); }
 }, 15_000);
 
+it.skipIf(!codex)("rejects unsupported Plan effort and an unset that would expose the native Plan preset", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { plan_mode_reasoning_effort: "low" } });
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    for (const effort of ["banana", null]) {
+      await expect(fixture.settings.update({ expectedRevision: selected.revision, nativeOptions: { plan_mode_reasoning_effort: effort } }))
+        .rejects.toThrow(/Plan reasoning effort/);
+      expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    }
+    await fixture.launch();
+    await fixture.enterPlanMode();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex).each(["model_reasoning_effort", "plan_mode_reasoning_effort"])("rejects clearing a profile that masks an unsupported base %s", async key => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    await fs.writeFile(path.join(fixture.home, "writing.config.toml"), 'model_reasoning_effort="low"\nplan_mode_reasoning_effort="low"\n');
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" });
+    const saved = await fixture.settings.update({ expectedRevision: selected.revision, nativeOptions: { [key]: "banana" } });
+    expect(saved.configuration?.effectiveValues[key]).toBe("low");
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: saved.revision, configProfile: null })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    await fixture.launch();
+    if (key === "plan_mode_reasoning_effort") await fixture.enterPlanMode();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex).each(["model_reasoning_effort", "plan_mode_reasoning_effort"])("rejects unsetting a profile %s that masks an unsupported base value", async key => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const configPath = path.join(fixture.home, "config.toml");
+    await fs.writeFile(configPath, `${key}="banana"\n${await fs.readFile(configPath, "utf8")}`);
+    const profilePath = path.join(fixture.home, "writing.config.toml");
+    await fs.writeFile(profilePath, 'model_reasoning_effort="low"\nplan_mode_reasoning_effort="low"\n');
+    const original = await fixture.settings.read();
+    await fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" });
+    const profile = await fixture.settings.read(undefined, "writing");
+    const text = await fs.readFile(profilePath, "utf8");
+    const base = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: profile.revision, targetProfile: "writing", nativeOptions: { [key]: null } })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(profilePath, "utf8")).toBe(text);
+    expect(await fs.readFile(configPath, "utf8")).toBe(base);
+  } finally { await fixture.dispose(); }
+}, 15_000);
+
+it.skipIf(!codex).each(["model_reasoning_effort", "plan_mode_reasoning_effort"])("rejects selecting a profile with an unsupported %s", async key => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const configPath = path.join(fixture.home, "config.toml");
+    const profilePath = path.join(fixture.home, "writing.config.toml");
+    await fs.writeFile(profilePath, `model_reasoning_effort="low"\nplan_mode_reasoning_effort="low"\n`.replace(`${key}="low"`, `${key}="banana"`));
+    const original = await fixture.settings.read();
+    const base = await fs.readFile(configPath, "utf8");
+    const profile = await fs.readFile(profilePath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(base);
+    expect(await fs.readFile(profilePath, "utf8")).toBe(profile);
+  } finally { await fixture.dispose(); }
+}, 15_000);
+
+it.skipIf(!codex)("unsetting main effort inherits the advertised model default without changing Plan effort", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model_reasoning_effort: "xhigh", plan_mode_reasoning_effort: "low" } });
+    const saved = await fixture.settings.update({ expectedRevision: selected.revision, reasoningEffort: null });
+    expect(saved.configuration?.values).not.toHaveProperty("model_reasoning_effort");
+    expect(saved.configuration?.values.plan_mode_reasoning_effort).toBe("low");
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("unsetting Plan effort uses its advertised native preset independently of main effort", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models[0].supported_reasoning_levels.push({ effort: "medium", description: "medium" });
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model_reasoning_effort: "xhigh", plan_mode_reasoning_effort: "low" } });
+    const saved = await fixture.settings.update({ expectedRevision: selected.revision, nativeOptions: { plan_mode_reasoning_effort: null } });
+    expect(saved.configuration?.values).not.toHaveProperty("plan_mode_reasoning_effort");
+    expect(saved.configuration?.values.model_reasoning_effort).toBe("xhigh");
+    await fixture.launch();
+    await fixture.enterPlanMode();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ reasoning: { effort: "medium" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex).each(["model_reasoning_effort", "plan_mode_reasoning_effort"])("rejects a model change that would make %s unsupported", async key => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models.push({ ...catalog.models[0], slug: "gpt-6-sol", supported_reasoning_levels: [{ effort: "low", description: "low" }] });
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model_reasoning_effort: "low", plan_mode_reasoning_effort: "low", [key]: "xhigh" } });
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: selected.revision, model: "gpt-6-sol" })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+  } finally { await fixture.dispose(); }
+}, 15_000);
+
+it.skipIf(!codex)("unsetting model validates the CloudX launch default when the native catalog prefers another model", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models.unshift({ ...catalog.models[0], slug: "custom-native-default", default_reasoning_level: "xhigh" });
+    catalog.models[1].priority = 1;
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const configPath = path.join(fixture.home, "config.toml");
+    await fs.writeFile(configPath, (await fs.readFile(configPath, "utf8")).replace('model = "gpt-6.1-sol"', 'model = "custom-native-default"'));
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { plan_mode_reasoning_effort: "low" } });
+    const text = await fs.readFile(configPath, "utf8");
+    await fs.writeFile(catalogPath, JSON.stringify({ models: [catalog.models[0]] }));
+    await expect(fixture.settings.update({ expectedRevision: selected.revision, model: null })).rejects.toThrow(/capabilities.*not advertised/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const saved = await fixture.settings.update({ expectedRevision: selected.revision, model: null });
+    expect(saved.configuration?.values).not.toHaveProperty("model");
+    expect(saved.configuration?.effectiveValues.model).toBe("gpt-6.1-sol");
+    expect(saved.configuration?.overrides.some(value => value.includes("CloudX launch default"))).toBe(true);
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model: "gpt-6.1-sol", reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("an ignored personality in a profile does not suppress effective effort validation or block native launch", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const profilePath = path.join(fixture.home, "writing.config.toml");
+    const profile = 'personality="friendly"\nmodel_reasoning_effort="low"\nplan_mode_reasoning_effort="low"\n';
+    await fs.writeFile(profilePath, profile);
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" });
+    const configPath = path.join(fixture.home, "config.toml");
+    const base = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: selected.revision, nativeOptions: { plan_mode_reasoning_effort: "banana" }, configProfile: null })).rejects.toThrow(/Plan reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(base);
+    expect(await fs.readFile(profilePath, "utf8")).toBe(profile);
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("nested arbitrary MCP hook input survives native save, read and reload", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const input = { details: { name: "start" }, tags: ["a", "b"], records: [{ nested: [true, { count: 2 }] }] };
+    const hooks = { SessionStart: [{ hooks: [{ type: "mcp_tool", server: "local", tool: "start", input }] }] };
+    const original = await fixture.settings.read();
+    const saved = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { hooks } });
+    expect(saved.configuration?.values.hooks).toEqual(hooks);
+    expect((await fixture.settings.read()).configuration?.values.hooks).toEqual(hooks);
+    const next = structuredClone(hooks);
+    next.SessionStart[0]!.hooks[0]!.input.details.name = "reloaded";
+    const reloaded = await fixture.settings.update({ expectedRevision: saved.revision, nativeOptions: { hooks: next } });
+    expect(reloaded.configuration?.values.hooks).toEqual(next);
+    expect(parse(await fs.readFile(path.join(fixture.home, "config.toml"), "utf8")).hooks).toEqual(next);
+  } finally { await fixture.dispose(); }
+}, 15_000);
+
+it.skipIf(!codex)("rejects a same-name legacy table before selecting a separate launch profile", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const configPath = path.join(fixture.home, "config.toml");
+    await fs.appendFile(configPath, '[profiles.writing]\nmodel_verbosity="low"\n');
+    const profilePath = path.join(fixture.home, "writing.config.toml");
+    await fs.writeFile(profilePath, 'model_verbosity="high"\n');
+    const original = await fixture.settings.read();
+    const text = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" })).rejects.toThrow(/legacy.*profiles\.writing/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    expect(await fs.readFile(profilePath, "utf8")).toBe('model_verbosity="high"\n');
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests).toHaveLength(1);
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("an unrelated legacy table does not block a separate native launch profile", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const configPath = path.join(fixture.home, "config.toml");
+    await fs.appendFile(configPath, '[profiles.other]\nmodel_verbosity="low" # keep unrelated legacy content\n');
+    await fs.writeFile(path.join(fixture.home, "writing.config.toml"), 'model_verbosity="high"\n');
+    const original = await fixture.settings.read();
+    await fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" });
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ text: { verbosity: "high" } });
+    expect(await fs.readFile(configPath, "utf8")).toContain('# keep unrelated legacy content');
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
 interface ConfigurationRequest {
   text?: { verbosity?: string };
-  reasoning?: { summary?: string };
+  reasoning?: { summary?: string; effort?: string };
 }
 
 class NativeConfigurationSession {
@@ -252,6 +469,14 @@ class NativeConfigurationSession {
     }, { timeout: 10_000 }).toMatchObject({ threadId, turnId: expect.any(String) });
     await this.session!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
     return completed!;
+  }
+
+  async enterPlanMode() {
+    await this.session!.handleAction("enter_text", { text: "/plan" });
+    await expect.poll(() => stripVTControlCharacters(this.session!.snapshot().recentOutput ?? ""), { timeout: 5_000 }).toContain("/plan");
+    await this.session!.handleAction("send_key", { key: "enter" });
+    await expect.poll(() => stripVTControlCharacters(this.session!.snapshot().recentOutput ?? ""), { timeout: 5_000 }).toContain("Plan mode");
+    await this.session!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
   }
 
   async dispose() {

@@ -15,11 +15,11 @@ import {
   rulesSkillsRootPath,
   type ResolvedPersonalityTemplate
 } from "./RulesSkillsCatalogService.js";
-import { DEFAULT_CODEX_MODEL, type CloudxRule, type CloudxSkill } from "@cloudx/shared";
+import type { CloudxRule, CloudxSkill } from "@cloudx/shared";
 import type { CodexStateSources, ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 import { discoverCodexDefaultSkills, readCodexLaunchPreferences } from "../plugins/CodexLaunchPreferences.js";
 import { materializeCodexSkillSurface } from "./CodexSkillSurface.js";
-import { mergeCodexConfigurationLayers } from "../plugins/CodexConfigurationDocument.js";
+import { mergeCodexConfigurationLayers, withCodexLaunchModelDefault } from "../plugins/CodexConfigurationDocument.js";
 import { resolveCodexConfigurationPaths } from "../plugins/CodexConfigurationPaths.js";
 import { replaceLink } from "../agents/replaceLink.js";
 
@@ -66,7 +66,7 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   if (preferences.configProfile && selectedProfileText === undefined) throw new Error("Selected native Codex configuration profile is missing.");
   const combinedConfig = selectedProfileText === undefined ? prepareOverlayConfig(sourceConfig, options.source.home)
     : mergeCodexConfigurationLayers(prepareOverlayConfig(sourceConfig, options.source.home), prepareOverlayConfig(selectedProfileText, options.source.home));
-  const config = resolveCodexConfigurationPaths(combinedConfig, options.source.home, baseEnv.HOME);
+  const config = withCodexLaunchModelDefault(resolveCodexConfigurationPaths(combinedConfig, options.source.home, baseEnv.HOME));
   if (options.trustedProjectPath !== undefined) {
     const projectPath = options.trustedProjectPath;
     if (!path.isAbsolute(projectPath) || projectPath !== options.cwd || await fsp.realpath(projectPath) !== projectPath) {
@@ -312,9 +312,6 @@ async function writeOverlayConfig(
   skillPaths: string[],
   disabledSkillPaths: string[]
 ): Promise<void> {
-  if (config.model === undefined) {
-    config.model = DEFAULT_CODEX_MODEL;
-  }
   const skills = tomlTable(config.skills, "skills");
   skills.bundled = { enabled: false };
   const nativeSkills = Array.isArray(skills.config) ? skills.config : [];

@@ -305,13 +305,13 @@ describe("global Codex settings editor", () => {
     expect(button(container, "Enable fast mode support").disabled).toBe(false);
   });
 
-  it.each(["not a model", "-starts-with-hyphen", "x".repeat(129)])("rejects an invalid model identifier %s", async value => {
+  it.each(["local/model@preview", "-starts-with-hyphen", "x".repeat(129)])("routes the native model string %s through native schema validation", async value => {
     const { container, calls } = await mount();
     await fill(model(container), value);
-    expect(model(container).getAttribute("aria-invalid")).toBe("true");
-    expect(button(container, "Save Codex settings").disabled).toBe(true);
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Enter a model identifier");
-    expect(calls).toHaveLength(1);
+    expect(model(container).getAttribute("aria-invalid")).toBeNull();
+    expect(button(container, "Save Codex settings").disabled).toBe(false);
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", nativeOptions: { model: value } });
   });
 
   it("keeps a failed save's draft and revision until Reload reads the shared file", async () => {

@@ -32,6 +32,32 @@ async function fixture(text = 'model_verbosity="medium" # preserve preference\n'
 }
 
 describe("native settings persistence through the hook boundary", () => {
+  it.each([
+    ["model", "model", "gpt-6-sol", "gpt-6-astra"],
+    ["serviceTier", "service_tier", "priority", "flex"],
+    ["reasoningEffort", "model_reasoning_effort", "low", "xhigh"],
+    ["webSearch", "web_search", "cached", "live"],
+    ["personality", "personality", "none", "friendly"],
+  ])("rejects conflicting quick and structured %s values and unsets before saving", async (field, key, quick, native) => {
+    const f = await fixture();
+    const current = await f.service.read();
+    const original = await fs.readFile(f.configPath, "utf8");
+    for (const [left, right] of [[quick, native], [null, native], [quick, null]]) {
+      await expect(f.call("codex-settings.update", { expectedRevision: current.revision, [field]: left, nativeOptions: { [key]: right } })).rejects.toThrow(/Conflicting Codex/);
+      expect(await fs.readFile(f.configPath, "utf8")).toBe(original);
+      expect((await f.service.read()).revision).toBe(current.revision);
+    }
+    expect(validateNativeCodexConfiguration).not.toHaveBeenCalled();
+  });
+
+  it("accepts agreeing quick and structured values without discarding either choice", async () => {
+    const f = await fixture();
+    const current = await f.service.read();
+    const saved = await f.call("codex-settings.update", { expectedRevision: current.revision, model: "gpt-6-sol", nativeOptions: { model: "gpt-6-sol" } });
+    expect(saved).toMatchObject({ settings: { model: "gpt-6-sol", configuration: { values: { model: "gpt-6-sol" } } } });
+    expect(parse(await fs.readFile(f.configPath, "utf8"))).toMatchObject({ model: "gpt-6-sol" });
+  });
+
   it("saves nested options and resets a family without rewriting unrelated comments", async () => {
     const f = await fixture('model_verbosity="medium" # preserve preference\n[tui]\nanimations=true # preserve animation note\n[unknown]\nkeep="private value"\n');
     const current = await f.service.read();

@@ -72,9 +72,17 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
         supportedReasoningEfforts: ["low", "medium", "high"].map(
           (reasoningEffort) => ({ reasoningEffort }),
         ),
+        defaultReasoningEffort: "medium",
+        isDefault: model === "gpt-6.1-sol",
         supportsPersonality: false,
       })),
       nextCursor: null,
+    };
+  } else if (request.method === "collaborationMode/list" && ready) {
+    result = {
+      data: [
+        { name: "Plan", mode: "plan", model: null, reasoning_effort: "medium" },
+      ],
     };
   } else {
     throw new Error(

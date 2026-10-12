@@ -24,6 +24,43 @@ describe("native Codex settings", () => {
     expect(() => validateCodexNativeOptions({ model_verbosity: "high", tui: { animations: false, resume_cwd: "current" } }, settings, "")).not.toThrow();
   });
 
+  it.each(["0.160.0", "0.162.1"])("saves, reads and reloads arbitrary nested MCP hook input on %s", version => {
+    const text = '# source note\n[unrelated]\nkeep="original"\n';
+    const input = { details: { name: "start" }, tags: ["a", "b"], records: [{ nested: [{ name: "first" }] }] };
+    const hooks = { SessionStart: [{ hooks: [{ type: "mcp_tool", server: "local", tool: "start", input }] }] };
+    const initial = snapshot(text, version);
+    expect(() => validateCodexNativeOptions({ hooks }, initial, text)).not.toThrow();
+    const saved = editCodexConfiguration(text, "hooks", initial.values.hooks, hooks);
+    expect(snapshot(saved, version).values.hooks).toEqual(hooks);
+    expect(saved).toContain('# source note\n[unrelated]\nkeep="original"');
+    const updated = structuredClone(hooks);
+    updated.SessionStart[0]!.hooks[0]!.input.details.name = "reload";
+    updated.SessionStart[0]!.hooks[0]!.input.tags.push("c");
+    const read = snapshot(saved, version);
+    expect(() => validateCodexNativeOptions({ hooks: updated }, read, saved)).not.toThrow();
+    const reloaded = editCodexConfiguration(saved, "hooks", read.values.hooks, updated);
+    expect(snapshot(reloaded, version).values.hooks).toEqual(updated);
+    expect(parse(reloaded).unrelated).toEqual({ keep: "original" });
+    expect(() => validateCodexNativeOptions({ hooks: { ...updated, unexpected: { nested: true } } }, snapshot(reloaded, version), reloaded)).toThrow(/not a reviewed/);
+    expect(() => validateCodexNativeOptions({ desktop: { window: { geometry: [1, 2] } } }, read, saved)).toThrow(/not an editable/);
+  });
+
+  it.each(["0.160.0", "0.162.1"])("publishes existing nested MCP hook JSON without dropping objects or array items on %s", version => {
+    const text = '[hooks]\nSessionStart=[{ hooks=[{ type="mcp_tool", server="local", tool="start", input={ details={ name="start" }, tags=["a", "b"], records=[{ names=["first"] }] } }] }]\n';
+    expect(snapshot(text, version).values.hooks).toEqual(parse(text).hooks);
+  });
+
+  it.each(["0.160.0", "0.162.1"])("preserves ignored native fields while rejecting edits on %s", version => {
+    const text = '[features.multi_agent_v2]\nenabled=true\nusage_hint_enabled=true # ignored legacy value\n';
+    const read = snapshot(text, version);
+    expect(read.values.features).toEqual({ multi_agent_v2: { enabled: true } });
+    expect(() => validateCodexNativeOptions({ features: { multi_agent_v2: { enabled: false, usage_hint_enabled: false } } }, read, text)).toThrow(/managed/);
+    expect(() => validateCodexNativeOptions({ features: { multi_agent_v2: { enabled: false } } }, read, text)).not.toThrow();
+    const edited = editCodexConfiguration(text, "features", read.values.features, { multi_agent_v2: { enabled: false } });
+    expect(parse(edited).features).toEqual({ multi_agent_v2: { enabled: false, usage_hint_enabled: true } });
+    expect(edited).toContain("# ignored legacy value");
+  });
+
   it("blocks unreviewed executables and reports profile precedence without exposing secrets", () => {
     expect(() => validateCodexNativeOptions({ tui: {} }, snapshot('model="custom"', "9.0.0"), "")).toThrow(/reviewed schema/);
     const settings = snapshot('model_verbosity="high"\nprofile="review"\n[profiles.review]\nmodel_verbosity="low"\n');

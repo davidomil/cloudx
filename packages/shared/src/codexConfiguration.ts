@@ -164,7 +164,8 @@ export function codexConfigurationCatalog(version: string = CODEX_CONFIGURATION_
     const nativeFeature = featureMetadata ? (nativeFeatures as Record<string, { stage: string }>)[featureMetadata] : undefined;
     const removedFeatureReason = "Removed native feature retained only for parsing old configuration; changing it has no supported effect.";
     const reason = nativeFeature?.stage === "Removed" ? removedFeatureReason : mappedReason === removedFeatureReason ? undefined : mappedReason;
-    const editable = nativeFeature ? reason === undefined : mappedEditable;
+    const editable = nativeFeature && mappedReason === removedFeatureReason
+      ? nativeFeature.stage !== "Removed" : mappedEditable && nativeFeature?.stage !== "Removed";
     const feature = /^features\.([^.]+)$/.exec(localPath)?.[1];
     const nativeDefault = feature ? (nativeFeatures as Record<string, { default: boolean | null; defaultDescription: string; stage: string }>)[feature] : undefined;
     const types = [...new Set(nodes.flatMap(node => typeof node.type === "string" ? [node.type] : node.type ?? []))];
@@ -174,7 +175,8 @@ export function codexConfigurationCatalog(version: string = CODEX_CONFIGURATION_
     return {
       path, family: path.split(".")[0]!, group,
       description: described ?? `Native ${path.replaceAll(".", " ").replaceAll("_", " ")} configuration.`,
-      status: path === "profile" || path.startsWith("profiles") ? "deprecated" : nativeFeature ? featureStatus(nativeFeature.stage) : status,
+      status: path === "profile" || path.startsWith("profiles") || status === "deprecated" && mappedReason !== removedFeatureReason
+        ? "deprecated" : nativeFeature ? featureStatus(nativeFeature.stage) : status,
       platform, scope, editable, ...(reason ? { reason } : {}),
       type: types.length === 1 ? types[0] as CodexConfigurationType : "mixed",
       ...(uniqueChoices.length ? { enum: uniqueChoices } : {}),
@@ -199,15 +201,20 @@ function runtimeDefaultDescription(path: string, description: string | undefined
 }
 
 const protectedPatterns = (mapping as MappingRow[]).filter(row => row[4] === "secret").map(row => row[0].split("."));
-const knownPatterns = new Map<string, readonly string[][]>();
+const knownPatterns = new Map<string, readonly { parts: string[]; arbitraryValues: boolean }[]>();
 
 export function isCodexKnownPath(parts: readonly string[], version: string = CODEX_CONFIGURATION_BASELINE_VERSION): boolean {
   let patterns = knownPatterns.get(version);
   if (!patterns) {
-    patterns = [...inventoryCodexConfiguration(codexConfigurationValidationSchema(version)).keys()].map(path => path.split("."));
+    const inventory = inventoryCodexConfiguration(codexConfigurationValidationSchema(version));
+    patterns = [...inventory.keys()].map(path => ({
+      parts: path.split("."),
+      arbitraryValues: path.endsWith(".*") && Boolean(inventory.get(path.slice(0, -2))?.some(node =>
+        node.additionalProperties === true || node.additionalProperties && typeof node.additionalProperties === "object" && !Object.keys(node.additionalProperties).length)),
+    }));
     knownPatterns.set(version, patterns);
   }
-  return patterns.some(pattern => pattern.length === parts.length && pathMatches(pattern, parts));
+  return patterns.some(pattern => (pattern.parts.length === parts.length || pattern.arbitraryValues) && pathMatches(pattern.parts, parts));
 }
 
 export function isCodexProtectedPath(parts: readonly string[]): boolean {
