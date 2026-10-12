@@ -345,7 +345,9 @@ export class LifecycleBrowserProfile {
       .locator(".workspace-pane.active")
       .getByTitle("Add tab to this pane")
       .click();
-    await this.page.getByLabel("Plugin").selectOption("codex-terminal");
+    await this.page
+      .getByLabel("Plugin")
+      .selectOption({ label: "Codex Terminal" });
     await this.page.getByLabel("Title").fill("Lifecycle preserved Codex");
     const [response] = await Promise.all([
       this.page.waitForResponse(

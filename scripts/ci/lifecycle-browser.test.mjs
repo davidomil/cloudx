@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { JSDOM } from "jsdom";
 import {
   assertPreservedConversation,
   conversationEvidence,
@@ -89,6 +90,93 @@ function savedConversation(home = "/isolated/.codex") {
     ),
   };
 }
+
+describe("lifecycle Codex tab selection", () => {
+  async function seedProfile(options) {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-seed-"));
+    const profile = new LifecycleBrowserProfile({
+      home,
+      repoRoot: "/workspace",
+      provider: { baseURL: "http://127.0.0.1:1234/v1" },
+    });
+    const dom = new JSDOM(`<select>${options}</select>`);
+    const dropdown = dom.window.document.querySelector("select");
+    const create = vi.fn();
+    const nativePromptReached = new Error("Native prompt reached");
+    profile.json = vi.fn(async (_method, route) => {
+      if (route === "/api/windows")
+        return {
+          activeWindowId: "window",
+          windows: [{ id: "window", layout: { activePaneId: "shell-pane" } }],
+        };
+      if (route === "/api/tabs") return { tab: { id: "shell" } };
+      return {};
+    });
+    profile.action = vi.fn();
+    profile.readTerminal = async (_tabId, marker) => `${marker}123`;
+    profile.expect = () => ({ toHaveCount: async () => {} });
+    profile.page = {
+      goto: async () => {},
+      locator: () => ({ getByTitle: () => ({ click: async () => {} }) }),
+      getByLabel: (label) =>
+        label === "Plugin"
+          ? {
+              selectOption: async (selection) => {
+                const option = [...dropdown.options].find((option) =>
+                  typeof selection === "string"
+                    ? option.value === selection || option.label === selection
+                    : option.label === selection.label,
+                );
+                if (!option) throw new Error("Requested plugin is unavailable");
+                dropdown.value = option.value;
+              },
+            }
+          : { fill: async () => {} },
+      waitForResponse: async () => ({
+        status: () => 201,
+        json: async () => ({ tab: { id: "codex" } }),
+      }),
+      getByRole: () => ({ click: create }),
+    };
+    profile.submitInitialPrompt = async () => {
+      throw nativePromptReached;
+    };
+    return { profile, dropdown, create, nativePromptReached, dom };
+  }
+
+  it("seeds the Codex provider when Claude precedes its provider-aware option", async () => {
+    const { profile, dropdown, create, nativePromptReached, dom } =
+      await seedProfile(`
+        <option value="codex-terminal#claude">Claude Code</option>
+        <option value="codex-terminal#codex">Codex Terminal</option>
+      `);
+    try {
+      await expect(profile.seed()).rejects.toBe(nativePromptReached);
+      expect(dropdown.value).toBe("codex-terminal#codex");
+      expect(create).toHaveBeenCalledOnce();
+      expect(profile.seeded.codexTabId).toBe("codex");
+    } finally {
+      dom.window.close();
+      await fs.rm(profile.home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not create a different provider when Codex is unavailable", async () => {
+    const { profile, create, dom } = await seedProfile(
+      '<option value="codex-terminal#claude">Claude Code</option>',
+    );
+    try {
+      await expect(profile.seed()).rejects.toThrow(
+        "Requested plugin is unavailable",
+      );
+      expect(create).not.toHaveBeenCalled();
+      expect(profile.seeded).toBeUndefined();
+    } finally {
+      dom.window.close();
+      await fs.rm(profile.home, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("saved lifecycle conversation evidence", () => {
   it("preserves the exact saved evidence while permitting metadata appended by a reconnect", () => {
