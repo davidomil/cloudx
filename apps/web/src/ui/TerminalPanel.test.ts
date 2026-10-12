@@ -37,6 +37,7 @@ vi.mock("@xterm/xterm", () => ({
     readonly writeCalls: string[] = [];
     readonly inputHandlers: Array<(data: string) => void> = [];
     readonly _core = { _inputHandler: { parse: (_data: string) => undefined } };
+    readonly parser = { registerOscHandler: () => ({ dispose: () => undefined }) };
 
     constructor(options: Record<string, unknown>) {
       this.options = options;

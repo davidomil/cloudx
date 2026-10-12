@@ -125,13 +125,34 @@ it("enforces the output cap after observers augment a response", async () => {
   expect(socket.received).toEqual([]);
 });
 
-it("propagates a connected client's send error and removes the close listener", async () => {
+it.each([null, "EPIPE", "ECONNRESET"])("propagates a connected client's send error (%s) and removes the close listener", async code => {
   const socket = new VisibleClient();
   const forwarding = forwardNativeOutput(Readable.from([Buffer.from("{}\n")]), socket, () => {});
   const rejected = expect(forwarding).rejects.toThrow("write failed");
   await vi.waitFor(() => expect(socket.received).toHaveLength(1));
-  socket.drain(new Error("write failed"));
+  socket.drain(Object.assign(new Error("write failed"), code ? { code } : {}));
   await rejected;
+  expect(socket.listenerCount("close")).toBe(0);
+});
+
+it.each(["EPIPE", "ECONNRESET"])("drains native output when the client starts closing after its %s send callback", async code => {
+  const socket = new VisibleClient();
+  const observe = vi.fn();
+  let drained = false;
+  const input = Readable.from((async function* () {
+    yield Buffer.from('{}\n{"late":');
+    yield Buffer.from("x".repeat(1024));
+    drained = true;
+  })());
+  const forwarding = forwardNativeOutput(input, socket, observe, { maxMessageBytes: 8 });
+  const finished = expect(forwarding).resolves.toBeUndefined();
+  await vi.waitFor(() => expect(socket.received).toHaveLength(1));
+  socket.drain(Object.assign(new Error(`write ${code}`), { code }));
+  socket.readyState = WebSocket.CLOSING;
+  await finished;
+  expect(drained).toBe(true);
+  expect(input.destroyed).toBe(true);
+  expect(observe).toHaveBeenCalledOnce();
   expect(socket.listenerCount("close")).toBe(0);
 });
 

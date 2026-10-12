@@ -57,6 +57,15 @@ describe("Persisted CI repair evidence", () => {
     expect(parseWorkers([{ ...owned, attemptId: worker.id, ciRepair: reviewing }])[0].ciRepair).toEqual(reviewing);
   });
 
+  it("retains the required aggregate gate alongside its proved producer", () => {
+    const requiredGate = { jobId: "gate-1", name: "CI aggregate", url: "https://github.com/cloudx/example/actions/runs/1/job/2", log: "UPGRADE_RESULT: failure" };
+    const repair = { ...ready, diagnostic: { ...diagnostic, jobs: [{ ...diagnostic.jobs[0], requiredGate }] } };
+    expect(parse(repair)).toEqual(repair);
+    for (const patch of [{ jobId: "job-1" }, { jobId: "" }, { name: "" }, { url: "javascript:alert(1)" }, { log: "x".repeat(32_001) }]) {
+      expect(() => parse({ ...repair, diagnostic: { ...repair.diagnostic, jobs: [{ ...repair.diagnostic.jobs[0], requiredGate: { ...requiredGate, ...patch } }] } })).toThrow();
+    }
+  });
+
   it("keeps the prelaunch checkpoint before a coding attempt has been allocated", () => {
     const launching = { ...active, phase: "launching", attemptId: undefined };
     expect(parse(launching)).toEqual(launching);

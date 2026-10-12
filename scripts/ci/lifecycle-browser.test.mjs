@@ -284,6 +284,52 @@ describe("saved lifecycle conversation evidence", () => {
 });
 
 describe("initial native conversation selection", () => {
+  it("creates the Codex tab by its UI label when plugin values include a provider", async () => {
+    const options = [
+      { label: "Claude Code", value: "codex-terminal#claude" },
+      { label: "Codex Terminal", value: "codex-terminal#codex" },
+    ];
+    let selected;
+    const profile = new LifecycleBrowserProfile({});
+    const selectOption = vi.fn(async (choice) => {
+      const option = options.find((option) => option.label === choice.label);
+      if (!option) throw new Error("The plugin option is unavailable.");
+      selected = option.value;
+      return [selected];
+    });
+    const click = vi.fn(async () => {});
+    profile.page = {
+      locator: () => ({ getByTitle: () => ({ click }) }),
+      getByLabel: (label) =>
+        label === "Plugin" ? { selectOption } : { fill: vi.fn() },
+      getByRole: () => ({ click }),
+      waitForResponse: async (matches) => {
+        const response = {
+          request: () => ({ method: () => "POST" }),
+          url: () => "http://localhost/api/tabs",
+          status: () => 201,
+          json: async () => ({
+            tab: {
+              id: "codex",
+              pluginId: "codex-terminal",
+              agentProvider: selected.split("#")[1],
+            },
+          }),
+        };
+        expect(matches(response)).toBe(true);
+        return response;
+      },
+    };
+    await expect(profile.createCodexTab()).resolves.toEqual({
+      id: "codex",
+      pluginId: "codex-terminal",
+      agentProvider: "codex",
+    });
+    expect(selectOption).toHaveBeenCalledExactlyOnceWith({
+      label: "Codex Terminal",
+    });
+  });
+
   async function selectionProfile() {
     const dataDir = await fs.mkdtemp(
       path.join(os.tmpdir(), "cloudx-lifecycle-selection-"),

@@ -196,10 +196,14 @@ export async function runWorkerBridge(launch) {
     let queuedBytes = 0;
     const queued = [];
     const forward = line => {
+      if (finishing || retiring) return;
       if (native.stdin.writableLength + Buffer.byteLength(line) > MAX_INPUT_BYTES) throw new Error("Native worker input exceeds the size limit.");
       native.stdin.write(line);
     };
-    socket.on("error", fail);
+    socket.on("error", error => {
+      if (["EPIPE", "ECONNRESET"].includes(error.code) && socket.readyState === WebSocket.CLOSING) return;
+      fail(error);
+    });
     socket.on("message", data => {
       try {
         const message = JSON.parse(data.toString());
@@ -240,7 +244,12 @@ export async function runWorkerBridge(launch) {
       // the backend here so their first SQLite migrations cannot race.
       native = spawn(launch.command, launch.serverArgs, { stdio: ["pipe", "pipe", "inherit"] });
       native.on("error", fail);
-      native.stdin.on("error", fail);
+      native.stdin.on("error", error => {
+        // Pending writes can outlive the client's close handshake. Its visible
+        // exit still decides completion; a closed pipe cannot override it.
+        if (error.code === "EPIPE" && (finishing || retiring)) return;
+        fail(error);
+      });
       native.stdout.on("error", fail);
       native.on("exit", (code, signal) => {
         if (!finishing && !retiring) fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`));

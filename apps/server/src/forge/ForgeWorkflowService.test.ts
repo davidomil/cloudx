@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -5287,16 +5287,19 @@ describe("Forge issue auto review", () => {
     expect(f.stored()).toEqual([]);
   });
 
-  function realCiDiagnostics(f: Awaited<ReturnType<typeof approvedIssue>>, providerKind: "github" | "gitlab", log: string, jobName = "affected tests") {
+  function realCiDiagnostics(f: Awaited<ReturnType<typeof approvedIssue>>, providerKind: "github" | "gitlab", log: string, jobName = "affected tests", aggregate = false) {
     const repository = f.deps.settings().repository;
     const sourceHead = f.change.headSha;
     const targetHead = f.change.targetHeadSha;
     const testedMerge = "e".repeat(40);
     const token = "worker-test-secret";
     const run = { id: 42, run_attempt: 1, head_sha: sourceHead, status: "completed", conclusion: "failure",
-      repository: { full_name: repository.projectPath }, pull_requests: [{ number: 7, head: { sha: sourceHead }, base: { sha: targetHead } }] };
+      ...(aggregate ? { event: "pull_request", path: ".github/workflows/ci.yml", workflow_id: 88 } : {}), repository: { full_name: repository.projectPath }, pull_requests: [{ number: 7, head: { sha: sourceHead }, base: { sha: targetHead } }] };
     const job = { id: 9, run_id: 42, head_sha: sourceHead, name: jobName, status: "completed", conclusion: "failure",
       check_run_url: "https://api.github.com/repos/a/b/check-runs/9", html_url: "https://github.com/a/b/actions/runs/42/job/9" };
+    const gate = { ...job, id: 10, name: "CI aggregate", check_run_url: "https://api.github.com/repos/a/b/check-runs/10", html_url: "https://github.com/a/b/actions/runs/42/job/10" };
+    const optional = { ...job, id: 11, name: "Unrelated optional", check_run_url: "https://api.github.com/repos/a/b/check-runs/11", html_url: "https://github.com/a/b/actions/runs/42/job/11" };
+    const workflow = Buffer.from(`jobs:\n  aggregate:\n    name: CI aggregate\n    needs: upgrade\n  upgrade:\n    name: ${jobName}\n  optional:\n    name: Unrelated optional\n`);
     const pipeline = { id: 42, project_id: 1, sha: sourceHead, status: "failed" };
     const labJob = { id: 9, name: jobName, status: "failed", allow_failure: false, failure_reason: "script_failure",
       web_url: "https://gitlab.example/a/b/-/jobs/9", commit: { id: sourceHead }, pipeline };
@@ -5307,12 +5310,18 @@ describe("Forge issue auto review", () => {
       if (pathname === "/graphql") body = { data: { repository: { pullRequest: {
         number: 7, state: "OPEN", headRefOid: sourceHead, headRefName: f.change.headBranch, baseRefOid: targetHead, baseRefName: "main",
         headRef: { target: { oid: sourceHead, statusCheckRollup: { contexts: {
-          nodes: [{ __typename: "CheckRun", databaseId: 9, name: jobName, status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }],
+          nodes: [{ __typename: "CheckRun", databaseId: aggregate ? 10 : 9, name: aggregate ? "CI aggregate" : jobName, status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }],
           pageInfo: { hasNextPage: false },
         } } } },
       } } } };
       else if (pathname === "/repos/a/b/actions/runs/42") body = run;
-      else if (pathname === "/repos/a/b/actions/runs/42/attempts/1/jobs") body = { jobs: [job] };
+      else if (pathname === "/repos/a/b/actions/runs/42/attempts/1/jobs") body = { jobs: aggregate ? [gate, job, optional] : [job] };
+      else if (pathname === "/repos/a/b/contents/.github/workflows/ci.yml") {
+        expect(url.searchParams.get("ref")).toBe(testedMerge);
+        body = { type: "file", path: ".github/workflows/ci.yml", encoding: "base64", size: workflow.length,
+          content: workflow.toString("base64"), sha: createHash("sha1").update(`blob ${workflow.length}\0`).update(workflow).digest("hex") };
+      }
+      else if (pathname.endsWith("/jobs/10/logs")) return new Response("INSTALLED_UPGRADE_RESULT: failure\n");
       else if (pathname === "/repos/a/b/pulls/7") body = { number: 7, state: "open", merged: false, mergeable: true, head: { sha: sourceHead }, base: { sha: targetHead, repo: { full_name: "a/b" } } };
       else if (pathname === "/repos/a/b/git/ref/pull/7/merge") body = { ref: "refs/pull/7/merge", object: { type: "commit", sha: testedMerge } };
       else if (pathname === `/repos/a/b/git/commits/${testedMerge}`) body = { sha: testedMerge, parents: [{ sha: targetHead }, { sha: sourceHead }] };
@@ -5349,6 +5358,18 @@ describe("Forge issue auto review", () => {
     }
     expect(fetcher.mock.calls.some(([url]) => String(url).endsWith(providerKind === "github" ? "/actions/jobs/9/logs" : "/jobs/9/trace"))).toBe(true);
     await f.poll(); await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("launches one repair for the optional upgrade producer of a checkout-free required aggregate", async () => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", `${"build output\n".repeat(4500)}TimeoutError: locator.selectOption: Timeout 30000ms exceeded.\n`, "Installed previous-version upgrade", true);
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1,
+      diagnostic: { state: "actionable", jobs: [{ jobId: "9", classification: "code", testedSha: evidence.testedMerge,
+        log: expect.stringContaining("locator.selectOption"), requiredGate: { jobId: "10", name: "CI aggregate" } }] } } });
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/11/logs"))).toBe(false);
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
     expect(f.provider.merge).not.toHaveBeenCalled();
   });

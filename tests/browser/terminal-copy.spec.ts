@@ -3,7 +3,9 @@ import react from "@vitejs/plugin-react";
 import { createServer as createHttpServer, type Server } from "node:http";
 import path from "node:path";
 import fs from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { createServer, type ViteDevServer } from "vite";
+import { NativeCodexCopySession } from "./fixtures/native-codex-copy.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let server: ViteDevServer;
@@ -1299,6 +1301,397 @@ for (const clipboardDenied of [false, true]) {
     });
   }
 }
+
+test("explains forced terminal selection without taking application mouse gestures", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  const stream = await terminalStream(page);
+  await page.getByText("Copy help", { exact: true }).click();
+  await expect(page.locator(".terminal-copy-help")).toContainText(
+    "Hold Shift and drag",
+  );
+  await expect(page.locator(".terminal-copy-help")).toContainText(
+    "Fullscreen applications own normal dragging",
+  );
+  await page.getByText("Copy help", { exact: true }).click();
+  stream.data("\x1bcnative selection\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+  await expect(page.locator(".xterm-rows")).toContainText("native selection");
+  await select(page, [0, 0], [16, 0]);
+  await expect(
+    page.getByRole("complementary", { name: "Saved terminal selection" }),
+  ).toBeHidden();
+  await page.keyboard.press("Control+c");
+  expect(stream.input.join("")).toContain("\x1b[<0;");
+  await expect.poll(() => stream.input.join("")).toContain("\x03");
+});
+
+test("stages application clipboard text until an explicit trusted copy and preserves native input", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop clipboard.");
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  await page.evaluate(() =>
+    navigator.clipboard.writeText("clipboard sentinel"),
+  );
+  const text = "native application selection · 界 café";
+  stream.data(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
+  const request = page.getByRole("complementary", {
+    name: "Application clipboard request",
+  });
+  await expect(request.getByRole("textbox")).toHaveValue(text);
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    "clipboard sentinel",
+  );
+  await request
+    .getByRole("button", { name: "Copy application text" })
+    .evaluate((element: HTMLButtonElement) => element.click());
+  await expect(request).toContainText("Use the Copy application text button");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    "clipboard sentinel",
+  );
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Control+c");
+  await expect.poll(() => stream.input.join("")).toBe("\x03");
+  stream.data(
+    `\x1b]52;c;${Buffer.from("unexpected replacement").toString("base64")}\x1b\\`,
+  );
+  await expect(request).toContainText(
+    "Another application clipboard request was ignored",
+  );
+  await expect(request.getByRole("textbox")).toHaveValue(text);
+  await request.getByRole("button", { name: "Copy application text" }).click();
+  await expect(request).toBeHidden();
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toBe(text);
+  expect(stream.input).toEqual(["\x03"]);
+});
+
+for (const gesture of ["Control+c", "browser copy"]) {
+  test(`copies only the highlighted application preview word while a terminal selection is saved using ${gesture}`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop clipboard.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page);
+    const saved = "old saved terminal text";
+    stream.data(`\x1bc${saved}`);
+    await expect(page.locator(".xterm-rows")).toContainText(saved);
+    await select(page, [0, 0], [saved.length, 0]);
+    const selection = page.getByRole("textbox", {
+      name: "Selected terminal text",
+    });
+    await expect(selection).toHaveValue(saved);
+    const application = "review this command before copying";
+    stream.data(`\x1b]52;c;${Buffer.from(application).toString("base64")}\x07`);
+    const preview = page.getByRole("textbox", {
+      name: "Application clipboard text",
+    });
+    await expect(preview).toHaveValue(application);
+    await preview.focus();
+    await preview.evaluate((element: HTMLTextAreaElement) => {
+      const start = element.value.indexOf("command");
+      element.setSelectionRange(start, start + "command".length);
+    });
+    if (gesture === "browser copy")
+      expect(await page.evaluate(() => document.execCommand("copy"))).toBe(
+        true,
+      );
+    else await page.keyboard.press(gesture);
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe("command");
+    await expect(preview).toHaveValue(application);
+    await expect(selection).toHaveValue(saved);
+    expect(stream.input).toEqual([]);
+
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.press("Control+c");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(saved);
+    await expect(selection).toBeHidden();
+    await expect(preview).toHaveValue(application);
+    expect(stream.input).toEqual([]);
+    await page.keyboard.press("Control+c");
+    await expect.poll(() => stream.input.join("")).toBe("\x03");
+  });
+}
+
+test("keeps application preview context menus and Escape native while a terminal selection is saved", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop clipboard.");
+  const stream = await terminalStream(page);
+  const saved = "old saved terminal text";
+  stream.data(`\x1bc${saved}`);
+  await expect(page.locator(".xterm-rows")).toContainText(saved);
+  await select(page, [0, 0], [saved.length, 0]);
+  stream.data(
+    `\x1b]52;c;${Buffer.from("review application text").toString("base64")}\x07`,
+  );
+  const preview = page.getByRole("textbox", {
+    name: "Application clipboard text",
+  });
+  await expect(preview).toHaveValue("review application text");
+  const contextMenu = await preview.evaluate((element) => {
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+    });
+    return element.dispatchEvent(event);
+  });
+  expect(contextMenu).toBe(true);
+  await expect(page.getByRole("menu", { exact: true })).toBeHidden();
+  await preview.focus();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(saved);
+  expect(stream.input).toEqual([]);
+
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toBeHidden();
+  await expect(preview).toHaveValue("review application text");
+  expect(stream.input).toEqual([]);
+});
+
+test("reports application clipboard permission denial and retains the reviewed text", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop clipboard.");
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  await page.evaluate(() => {
+    navigator.clipboard.writeText = async () => {
+      throw new DOMException("Permission denied", "NotAllowedError");
+    };
+  });
+  stream.data(
+    `\x1b]52;c;${Buffer.from("review this application text").toString("base64")}\x07`,
+  );
+  const request = page.getByRole("complementary", {
+    name: "Application clipboard request",
+  });
+  await request.getByRole("button", { name: "Copy application text" }).click();
+  await expect(request).toContainText("Copy failed: Permission denied");
+  await expect(request.getByRole("textbox")).toHaveValue(
+    "review this application text",
+  );
+  await request
+    .getByRole("button", { name: "Dismiss clipboard request" })
+    .click();
+  await expect(request).toBeHidden();
+  expect(stream.input).toEqual([]);
+});
+
+for (const [description, payload, rejection] of [
+  ["read", "c;?", "Clipboard reads are blocked"],
+  ["primary target", "p;YQ==", "Only clipboard text requests are supported"],
+  ["malformed base64", "c;Y!==", "invalid base64"],
+  ["invalid UTF-8", "c;/w==", "not valid UTF-8"],
+  [
+    "control data",
+    `c;${Buffer.from("bad\x1b[31m").toString("base64")}`,
+    "unsafe control characters",
+  ],
+  [
+    "oversize",
+    `c;${Buffer.from("x".repeat(100_001)).toString("base64")}`,
+    "exceeds 100,000 bytes",
+  ],
+] as const) {
+  test(`rejects ${description} application clipboard requests without reading or replacing the clipboard`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop clipboard.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page);
+    await page.evaluate(() =>
+      navigator.clipboard.writeText("clipboard sentinel"),
+    );
+    stream.data(`\x1b]52;${payload}\x07`);
+    const request = page.getByRole("complementary", {
+      name: "Application clipboard request",
+    });
+    await expect(request).toContainText(rejection);
+    await expect(
+      request.getByRole("button", { name: "Copy application text" }),
+    ).toBeDisabled();
+    await expect(request.getByRole("textbox")).toHaveValue("");
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+      "clipboard sentinel",
+    );
+    expect(stream.input).toEqual([]);
+  });
+}
+
+test("clears application clipboard requests when switching terminal tabs", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop clipboard.");
+  const stream = await terminalStream(page);
+  stream.data("\x1b]52;c;c2F2ZWQ=\x07");
+  const request = page.getByRole("complementary", {
+    name: "Application clipboard request",
+  });
+  await expect(request.getByRole("textbox")).toHaveValue("saved");
+  await page.getByRole("button", { name: "Switch tab" }).click();
+  await expect.poll(stream.connections).toBe(2);
+  await expect(request).toBeHidden();
+  await page.getByRole("button", { name: "Switch tab" }).click();
+  await expect(request).toBeHidden();
+});
+
+test("copies a real Codex fullscreen selection through OSC 52 to browser paste", async ({
+  page,
+  context,
+}, testInfo) => {
+  const codex = process.env.CLOUDX_NATIVE_CODEX;
+  test.skip(
+    !codex || testInfo.project.name !== "desktop-chromium",
+    "Set CLOUDX_NATIVE_CODEX to an installed native CLI with fullscreen selection and OSC 52 support.",
+  );
+  test.setTimeout(60_000);
+  expect(path.isAbsolute(codex!)).toBe(true);
+  const version = execFileSync(codex!, ["--version"], {
+    encoding: "utf8",
+  }).trim();
+  if (process.env.CLOUDX_NATIVE_CODEX_VERSION)
+    expect(version).toBe(
+      `codex-cli ${process.env.CLOUDX_NATIVE_CODEX_VERSION}`,
+    );
+  const native = await NativeCodexCopySession.create(codex!);
+  const answer = native.answer;
+  try {
+    let socket: WebSocketRoute | undefined;
+    await page.routeWebSocket("**/ws/terminal/*", (connection) => {
+      socket = connection;
+      connection.onMessage((message) =>
+        native.input(JSON.parse(String(message))),
+      );
+    });
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await page.goto(baseUrl);
+    await expect(page.locator(".xterm-rows")).toContainText("Cloudx tab");
+    const dimensions = await page.evaluate(() => ({
+      cols: window.testTerminal.cols,
+      rows: window.testTerminal.rows,
+    }));
+    await native.start(dimensions, (chunk) =>
+      socket!.send(JSON.stringify({ type: "data", data: chunk })),
+    );
+    await expect
+      .poll(
+        () => page.evaluate(() => window.testTerminal.modes.mouseTrackingMode),
+        { timeout: 15_000 },
+      )
+      .not.toBe("none");
+    await expect(page.locator(".xterm-rows")).toContainText(
+      "Ask Codex to do anything",
+    );
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.evaluate(() =>
+      navigator.clipboard.writeText(
+        "Provide the isolated clipboard test answer.",
+      ),
+    );
+    await page.keyboard.press("Control+Shift+v");
+    await expect(page.locator(".xterm-rows")).toContainText(
+      "Provide the isolated clipboard test answer.",
+    );
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".xterm-rows")).toContainText(answer, {
+      timeout: 15_000,
+    });
+    await expect.poll(() => native.requestCount).toBe(1);
+    await page.evaluate(() =>
+      navigator.clipboard.writeText("clipboard sentinel"),
+    );
+    const row = await page
+      .locator(".xterm-rows > div")
+      .evaluateAll(
+        (elements, expected) =>
+          elements.findIndex((element) =>
+            element.textContent?.includes(expected),
+          ),
+        answer,
+      );
+    expect(row).toBeGreaterThanOrEqual(0);
+    const column = await page.evaluate(
+      ({ row, answer }) =>
+        window.testTerminal.buffer.active
+          .getLine(row)!
+          .translateToString(false)
+          .indexOf(answer),
+      { row, answer },
+    );
+    expect(column).toBeGreaterThanOrEqual(0);
+    await select(page, [column, row], [column + answer.length, row]);
+    expect(await page.evaluate(() => window.testTerminal.getSelection())).toBe(
+      "",
+    );
+    await expect(
+      page.getByRole("complementary", { name: "Saved terminal selection" }),
+    ).toBeHidden();
+    await page.keyboard.press("Control+c");
+    const request = page.getByRole("complementary", {
+      name: "Application clipboard request",
+    });
+    await expect(request.getByRole("textbox")).toHaveValue(answer);
+    expect(native.output).toContain("\x1b]52;c;");
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+      "clipboard sentinel",
+    );
+    await page.screenshot({
+      path: testInfo.outputPath("native-codex-clipboard-request.png"),
+    });
+    await request
+      .getByRole("button", { name: "Copy application text" })
+      .click();
+    await expect(request).toBeHidden();
+    await page.evaluate(() => {
+      const paste = document.createElement("textarea");
+      paste.setAttribute("aria-label", "Browser paste target");
+      document.body.append(paste);
+    });
+    const paste = page.getByRole("textbox", { name: "Browser paste target" });
+    await paste.focus();
+    await page.keyboard.press("Control+v");
+    await expect(paste).toHaveValue(answer);
+    testInfo.annotations.push(
+      { type: "native-cli-version", description: version },
+      { type: "browser-version", description: context.browser()!.version() },
+    );
+  } finally {
+    try {
+      await fs.writeFile(
+        testInfo.outputPath("native-codex-terminal.txt"),
+        native.output,
+      );
+    } finally {
+      await native.dispose();
+    }
+  }
+});
 
 test("copies the saved selection while a supported native Codex picker hands off and redraws", async ({
   page,

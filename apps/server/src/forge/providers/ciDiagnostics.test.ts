@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeRepository } from "@cloudx/shared";
 import { createForgeProvider, ForgeCredentials } from "./index.js";
@@ -62,6 +64,9 @@ function githubFixture(options: {
   mergeRefSha?: string;
   parents?: string[];
   intercept?: Handler;
+  jobs?: Record<string, unknown>[];
+  logs?: Record<string, string>;
+  workflow?: string;
 } = {}) {
   let downloads = 0;
   return harness(github, (url, init) => {
@@ -73,7 +78,15 @@ function githubFixture(options: {
       } } } }, ...options.request,
     } } } });
     if (url.pathname === "/repos/owner/repo/actions/runs/100") return Response.json({ ...run, ...options.run });
-    if (url.pathname === "/repos/owner/repo/actions/runs/100/attempts/2/jobs") return Response.json({ jobs: [{ ...hubJob, ...options.job }] });
+    if (url.pathname === "/repos/owner/repo/actions/runs/100/attempts/2/jobs") return Response.json({ jobs: options.jobs ?? [{ ...hubJob, ...options.job }] });
+    const jobLog = /\/actions\/jobs\/(\d+)\/logs$/.exec(url.pathname);
+    if (jobLog && options.logs) return new Response(options.logs[jobLog[1]] ?? "");
+    if (url.pathname === "/repos/owner/repo/contents/.github/workflows/ci.yml") {
+      expect(url.searchParams.get("ref")).toBe(tested);
+      const content = Buffer.from(options.workflow ?? "");
+      return Response.json({ type: "file", path: ".github/workflows/ci.yml", encoding: "base64", size: content.length,
+        content: content.toString("base64"), sha: createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex") });
+    }
     if (url.pathname === "/repos/owner/repo/actions/jobs/501/logs") return new Response(null, { status: 302, headers: { location: logDownload } });
     if (url.origin === "https://productionresults.blob.core.windows.net") { downloads++; return new Response(`${options.checkout ?? checkout}${options.log ?? codeFailure}`); }
     if (url.pathname === "/repos/owner/repo/pulls/7") return Response.json({ number: 7, state: "open", merged: false, mergeable: options.mergeable === undefined ? true : options.mergeable, head: { sha: source }, base: { sha: target, repo: { full_name: "owner/repo" } } });
@@ -442,20 +455,180 @@ describe("CI log transport boundaries", () => {
     expect(saved).toContain("REDACTED");
   });
 
-  it("bounds streamed evidence, cancels the body and discards a truncated final secret line", async () => {
+  it("retains bounded tail evidence and redacts secrets across streamed chunks", async () => {
     let sent = 0;
     const cancel = vi.fn();
     const fixture = harness(gitlab, () => new Response(new ReadableStream({
       pull(controller) {
-        if (sent === 0) { controller.enqueue(new TextEncoder().encode(`${codeFailure}${"x".repeat(maxCiLogBytes - codeFailure.length - 20)}\nAPI_TOKEN=secret-crossing-the-boundary`)); sent++; }
-        else controller.enqueue(new Uint8Array(100_000));
+        if (sent++ === 0) controller.enqueue(new TextEncoder().encode(`${codeFailure}${"normal output\n".repeat(maxCiLogBytes / 10)}API_TOKEN=secret-crossing`));
+        else if (sent === 2) controller.enqueue(new TextEncoder().encode("-the-boundary\nTimeoutError: locator.selectOption: Timeout 30000ms exceeded.\n"));
+        else controller.close();
       }, cancel,
     })));
     const log = await fixture.http.ciLog("/projects/group%2Frepo/jobs/501/trace");
     expect(log.length).toBeLessThanOrEqual(32_000);
-    expect(log).toContain("CI log truncated");
+    expect(log).toContain("locator.selectOption");
     expect(log).not.toContain("secret-crossing");
-    expect(cancel).toHaveBeenCalledOnce();
-    expect(sent).toBe(1);
+    expect(sent).toBe(3);
+  });
+});
+
+const aggregateWorkflow = `jobs:
+  aggregate:
+    name: CI aggregate
+    needs: [installed-upgrade, browser]
+  installed-upgrade:
+    name: Installed previous-version upgrade
+  browser:
+    name: Browser smoke
+  optional:
+    name: Unrelated optional job
+`;
+const aggregateJob = { ...hubJob, name: "CI aggregate" };
+const upgradeJob = { ...hubJob, id: 502, name: "Installed previous-version upgrade",
+  check_run_url: "https://api.github.com/repos/owner/repo/check-runs/902", html_url: "https://github.com/owner/repo/actions/runs/100/job/502" };
+const browserJob = { ...hubJob, id: 503, name: "Browser smoke", conclusion: "success",
+  check_run_url: "https://api.github.com/repos/owner/repo/check-runs/903", html_url: "https://github.com/owner/repo/actions/runs/100/job/503" };
+const optionalJob = { ...hubJob, id: 504, name: "Unrelated optional job",
+  check_run_url: "https://api.github.com/repos/owner/repo/check-runs/904", html_url: "https://github.com/owner/repo/actions/runs/100/job/504" };
+function aggregateFixture(options: Parameters<typeof githubFixture>[0] = {}) {
+  return githubFixture({ checks: [{ ...check, name: "CI aggregate" }, { ...check, databaseId: 902, name: upgradeJob.name, isRequired: false }],
+    run: { event: "pull_request", path: ".github/workflows/ci.yml", workflow_id: 88 },
+    jobs: [aggregateJob, upgradeJob, browserJob, optionalJob], workflow: aggregateWorkflow,
+    logs: { "501": "INSTALLED_UPGRADE_RESULT: failure\nError: INSTALLED_UPGRADE_RESULT was failure; expected success\n",
+      "502": `${checkout}${"build output\n".repeat(4000)}TimeoutError: locator.selectOption: Timeout 30000ms exceeded.\n`,
+      "504": `${checkout}Runner offline\n` }, ...options });
+}
+
+describe("GitHub checkout-free required aggregate gates", () => {
+  it("diagnoses only the proved optional producer with late Playwright evidence", async () => {
+    const fixture = aggregateFixture();
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "actionable", testedSha: tested, jobs: [{
+      jobId: "502", name: upgradeJob.name, testedSha: tested, classification: "code", log: expect.stringContaining("locator.selectOption"),
+      requiredGate: { jobId: "501", name: "CI aggregate", log: expect.stringContaining("INSTALLED_UPGRADE_RESULT") },
+    }] });
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).includes("/jobs/504/logs"))).toBe(false);
+  });
+
+  it.each([
+    { workflow: aggregateWorkflow.replace("needs: [installed-upgrade, browser]", "needs: [missing]") },
+    { workflow: aggregateWorkflow.replace("name: Unrelated optional job", "name: Installed previous-version upgrade") },
+    { workflow: aggregateWorkflow.replace("name: Installed previous-version upgrade", "name: ${{ inputs.name }}") },
+    { workflow: aggregateWorkflow.replace("needs: [installed-upgrade, browser]", "needs: [browser]") },
+    { jobs: [aggregateJob, browserJob, optionalJob] },
+    { jobs: [aggregateJob, upgradeJob, { ...upgradeJob, id: 505 }, browserJob, optionalJob] },
+  ])("blocks missing, ambiguous, dynamic or unrelated dependencies %j", async options => {
+    expect(await aggregateFixture(options).provider.getCiFailure(change)).toMatchObject({ state: "blocked", reason: expect.any(String) });
+  });
+
+  it.each([
+    { run_id: 101 }, { run_attempt: 1 }, { head_sha: stale }, { status: "queued" }, { conclusion: "cancelled" },
+    { check_run_url: "https://attacker.example/check-runs/902" },
+  ])("blocks a producer not bound to the same repository, attempt and source %j", async patch => {
+    expect(await aggregateFixture({ jobs: [aggregateJob, { ...upgradeJob, ...patch }, browserJob] }).provider.getCiFailure(change)).toMatchObject({ state: "blocked" });
+  });
+
+  it.each([
+    { log: "remote: Authentication failed: invalid access token", classification: "credentials" },
+    { log: "Approval required by policy", classification: "policy" },
+    { log: "No space left on device", classification: "infrastructure" },
+  ])("preserves $classification blockers inside the aggregate", async ({ log, classification }) => {
+    const fixture = aggregateFixture({ logs: { "501": `aggregate\n${"normal\n".repeat(6000)}${log}\n${"normal\n".repeat(6000)}Error: expected success\n` } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [{ jobId: "501", classification }] });
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).includes("/jobs/502/logs"))).toBe(false);
+  });
+
+  it("blocks a conflicting checkout hidden in the producer's middle", async () => {
+    const log = `${checkout}${"normal\n".repeat(6000)}${checkout.replace(tested, stale)}${"normal\n".repeat(6000)}${codeFailure}`;
+    expect(await aggregateFixture({ logs: { "501": "INSTALLED_UPGRADE_RESULT: failure\n", "502": log } }).provider.getCiFailure(change))
+      .toMatchObject({ state: "blocked", reason: expect.stringContaining("checkout revision"), jobs: [{ jobId: "502" }] });
+  });
+
+  it.each(["producer", "gate", "workflow", "sibling", "attempt"])("invalidates moved %s evidence after collecting producer logs", async movement => {
+    let jobsRead = 0;
+    let runsRead = 0;
+    const original = aggregateFixture();
+    const fixture = aggregateFixture({ intercept: (url, init) => {
+      if (url.pathname.endsWith("/attempts/2/jobs") && ++jobsRead === 2) {
+        const jobs = [aggregateJob, upgradeJob, browserJob, optionalJob].map(job => ({ ...job }));
+        if (movement === "producer") jobs[1].name = "Moved producer";
+        if (movement === "gate") jobs[0].check_run_url = "https://api.github.com/repos/owner/repo/check-runs/999";
+        if (movement === "sibling") jobs[2].conclusion = "failure";
+        return Response.json({ jobs });
+      }
+      if (url.pathname.endsWith("/actions/runs/100") && ++runsRead === 2) return Response.json({ ...run,
+        event: "pull_request", path: ".github/workflows/ci.yml", workflow_id: movement === "workflow" ? 99 : 88,
+        run_attempt: movement === "attempt" ? 3 : 2 });
+      return original.fetcher(url, init);
+    } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "obsolete" });
+  });
+
+  it("does not accept the current aggregate workflow with a superseded producer checkout", async () => {
+    const fixture = aggregateFixture({ logs: { "501": "INSTALLED_UPGRADE_RESULT: failure\n", "502": `${checkout.replace(tested, stale)}${codeFailure}` } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", reason: expect.stringContaining("pinned aggregate") });
+  });
+});
+
+
+// The required gates in the production workflow share the same failed lane.
+const pinnedWorkflow = readFileSync(new URL("../../../../../.github/workflows/ci.yml", import.meta.url), "utf8");
+const productionJobNames = [
+  "CI aggregate", "Repository policy", "TypeScript (build, type-check, test)",
+  "Codex native recovery (installer)", "Codex native recovery (0.156.1)",
+  "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Pinned lifecycle revisions",
+  "Clean installation", "Installed previous-version upgrade", "Python services (pytest)",
+  "Browser smoke (desktop and mobile)", "Isolated full verifier", "Trusted merge identity",
+  "Isolated verifier (coverage-1)", "Isolated verifier (coverage-2)",
+  "Isolated verifier (coverage-3)", "Isolated verifier (coverage-4)",
+  "Isolated verifier (static)", "Isolated verifier (asr)", "Isolated verifier (documentation)",
+  "Isolated verifier (browser-1)", "Isolated verifier (browser-2)", "Merged isolated coverage",
+];
+const productionJobs = productionJobNames.map((name, index) => ({
+  ...hubJob, id: 501 + index, name,
+  conclusion: ["CI aggregate", "Python services (pytest)", "Browser smoke (desktop and mobile)",
+    "Isolated full verifier", "Isolated verifier (browser-2)"].includes(name) ? "failure" : "success",
+  check_run_url: `https://api.github.com/repos/owner/repo/check-runs/${901 + index}`,
+  html_url: `https://github.com/owner/repo/actions/runs/100/job/${501 + index}`,
+}));
+function productionAggregateFixture(options: Parameters<typeof githubFixture>[0] = {}) {
+  return githubFixture({ checks: [{ ...check, name: "CI aggregate" }],
+    run: { event: "pull_request", path: ".github/workflows/ci.yml", workflow_id: 88 },
+    jobs: productionJobs, workflow: pinnedWorkflow,
+    logs: Object.fromEntries(productionJobs.map(job => [job.id, job.name === "Isolated verifier (browser-2)"
+      ? `${checkout}${codeFailure}` : "Process completed with exit code 1.\n"])), ...options });
+}
+
+describe("GitHub shared failed producers in the pinned CloudX workflow", () => {
+  it.each([false, true])("retains one producer shared by required gates, including a checked-out full verifier: %s", async checkedOut => {
+    const fixture = productionAggregateFixture();
+    if (checkedOut) {
+      const original = fixture.fetcher.getMockImplementation()!;
+      fixture.fetcher.mockImplementation((url, init) => String(url).endsWith("/jobs/512/logs")
+        ? Promise.resolve(new Response(`${checkout}Process completed with exit code 1.\n`)) : original(url, init));
+    }
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "actionable", testedSha: tested,
+      jobs: [{ jobId: "522", name: "Isolated verifier (browser-2)", classification: "code" }] });
+    expect(diagnostic.jobs).toHaveLength(1);
+    expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/522/logs"))).toHaveLength(1);
+  });
+
+  it("rejects actual cycles between failed gates", async () => {
+    const workflow = pinnedWorkflow.replace("needs:\n      - isolated-lanes", "needs:\n      - aggregate");
+    expect(await productionAggregateFixture({ workflow }).provider.getCiFailure(change))
+      .toMatchObject({ state: "blocked", reason: expect.stringContaining("cycle") });
+  });
+
+  it.each(["producer", "shared gate"])("rechecks the %s identity after collecting logs", async movement => {
+    let jobsRead = 0;
+    const original = productionAggregateFixture();
+    const fixture = productionAggregateFixture({ intercept: (url, init) => {
+      if (url.pathname.endsWith("/attempts/2/jobs") && ++jobsRead === 2) return Response.json({ jobs:
+        productionJobs.map(job => job.name === (movement === "producer" ? "Isolated verifier (browser-2)" : "Browser smoke (desktop and mobile)")
+          ? { ...job, check_run_url: "https://api.github.com/repos/owner/repo/check-runs/999" } : job) });
+      return original.fetcher(url, init);
+    } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "obsolete" });
   });
 });

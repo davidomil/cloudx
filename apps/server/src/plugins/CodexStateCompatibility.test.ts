@@ -99,12 +99,12 @@ with sqlite3.connect(sys.argv[1]) as db: db.execute("INSERT INTO threads VALUES 
     const f = await fixture();
     expect(await f.compatibility.snapshots(f.home, undefined, f.destination)).toEqual([]);
     await fs.writeFile(path.join(f.home, "state_5.sqlite"), "not a database");
-    await expect(f.compatibility.snapshots(f.home, undefined, `${f.destination}-corrupt`)).rejects.toThrow("shared-state compatibility verification failed");
+    await expect(f.compatibility.snapshots(f.home, undefined, `${f.destination}-corrupt`)).rejects.toThrow("snapshot preparation failed");
     expect(await fs.readdir(`${f.destination}-corrupt`)).toEqual([]);
     await fs.rm(path.join(f.home, "state_5.sqlite"));
     database(path.join(f.root, "private.sqlite"));
     await fs.symlink(path.join(f.root, "private.sqlite"), path.join(f.home, "state_5.sqlite"));
-    await expect(f.compatibility.snapshots(f.home, undefined, `${f.destination}-link`)).rejects.toThrow("shared-state compatibility verification failed");
+    await expect(f.compatibility.snapshots(f.home, undefined, `${f.destination}-link`)).rejects.toThrow("snapshot preparation failed");
   });
 
   it("checks the shared SQLite environment override and rejects ambiguous relative overrides", async () => {
@@ -170,7 +170,7 @@ time.sleep(30)
     await fs.writeFile(input, kind === "invalid-type" ? '[42]' : JSON.stringify(Array(10004).fill(f.home)));
     if (kind === "oversized") await fs.truncate(input, 16_777_217);
     const helper = fileURLToPath(new URL("../../helpers/codex-state-snapshot.py", import.meta.url));
-    expect(() => execFileSync("python3", ["-I", "-S", helper, "snapshot", input, f.destination], { stdio: "pipe" })).toThrow("Codex shared-state compatibility check failed");
+    expect(() => execFileSync("python3", ["-I", "-S", helper, "snapshot", input, f.destination], { stdio: "pipe" })).toThrow('"code": "directory-list"');
     await expect(fs.stat(f.destination)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -193,7 +193,8 @@ assert (home / "state_5.sqlite").stat().st_size < 50000
 try:
  snapshot([str(home)], sys.argv[3])
 except ValueError as error:
- assert "1 GiB limit" in str(error)
+ assert error.code == "snapshot-budget"
+ assert error.observed_bytes > error.limit_bytes == 50000
  print("bounded")
 else:
  raise AssertionError("WAL contents bypassed the snapshot limit")
@@ -201,5 +202,129 @@ finally:
  db.close()
 `, helper, f.home, f.destination], { encoding: "utf8" });
     expect(result.trim()).toBe("bounded");
+  });
+
+  it("copies retained history larger than the former 1 GiB limit without changing the source", async () => {
+    const f = await fixture();
+    const original = path.join(f.home, "thread_history_1.sqlite");
+    database(original, "db.execute(\"CREATE TABLE history (payload TEXT)\"); db.execute(\"INSERT INTO history VALUES ('retained history')\")");
+    const retainedBytes = await fs.readFile(original);
+    await fs.truncate(original, 1_313_394_688);
+
+    const [snapshot] = await f.compatibility.snapshots(f.home, undefined, f.destination);
+
+    expect((await fs.stat(original)).size).toBe(1_313_394_688);
+    const source = await fs.open(original, "r");
+    try {
+      const prefix = Buffer.alloc(retainedBytes.length);
+      await source.read(prefix, 0, prefix.length, 0);
+      expect(prefix).toEqual(retainedBytes);
+    } finally { await source.close(); }
+    for (const file of [original, path.join(snapshot!, "thread_history_1.sqlite")]) {
+      execFileSync("python3", ["-I", "-S", "-c", "import sqlite3, sys\nwith sqlite3.connect(sys.argv[1]) as db: assert db.execute('SELECT payload FROM history').fetchone() == ('retained history',)", file]);
+    }
+  });
+
+  it("reports the observed database size and bounded limit as a snapshot preparation failure", async () => {
+    const f = await fixture();
+    const original = path.join(f.home, "thread_history_1.sqlite");
+    database(original);
+    const limitBytes = 8 * 1024 ** 3;
+    await fs.truncate(original, limitBytes + 1);
+
+    const failure = await f.compatibility.snapshots(f.home, undefined, f.destination).catch(error => error);
+
+    expect(failure).toMatchObject({
+      diagnostic: { stage: "snapshot", code: "database-size", observedBytes: limitBytes + 1, limitBytes },
+      message: expect.stringContaining(`${limitBytes + 1} bytes`),
+    });
+    expect(failure.message).toContain(`${limitBytes} bytes`);
+    expect(failure.message).toContain("snapshot preparation failed");
+    expect(failure.message).not.toContain("compatibility verification failed");
+    expect(await fs.readdir(f.destination)).toEqual([]);
+  });
+
+  it("reports an aggregate budget failure even when each retained database fits", async () => {
+    const f = await fixture();
+    for (const name of ["state_5.sqlite", "thread_history_1.sqlite"]) database(path.join(f.home, name), "db.execute('CREATE TABLE payload (data BLOB)'); db.execute('INSERT INTO payload VALUES (zeroblob(20000))')");
+    const bin = path.join(f.root, "bin");
+    await fs.mkdir(bin);
+    const python = execFileSync("python3", ["-I", "-S", "-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim();
+    await fs.writeFile(path.join(bin, "python3"), `#!${python}
+import json, runpy, sys
+module = runpy.run_path(sys.argv[3])
+module["snapshot"].__globals__["MAX_BYTES"] = 50000
+try:
+ print(json.dumps(module["snapshot"](module["read_directories"](sys.argv[5]), sys.argv[6])))
+except module["SnapshotPreparationError"] as error:
+ print(json.dumps(error.diagnostic()), file=sys.stderr)
+ sys.exit(1)
+`, { mode: 0o700 });
+
+    const failure = await new CodexStateCompatibility({ PATH: bin }).snapshots(f.home, undefined, f.destination).catch(error => error);
+
+    expect(failure.diagnostic).toEqual({ stage: "snapshot", code: "snapshot-budget", observedBytes: 65536, limitBytes: 50000 });
+    expect(failure.message).toContain("Aggregate Codex snapshot size is 65536 bytes; the limit is 50000 bytes");
+    expect(failure.message).toContain("Compatibility verification could not complete");
+  });
+
+  it("checks available disk space before copying retained state", async () => {
+    const f = await fixture();
+    await fs.mkdir(f.destination);
+    const file = path.join(f.home, "state_5.sqlite");
+    database(file);
+    const before = await fs.readFile(file);
+    const helper = fileURLToPath(new URL("../../helpers/codex-state-snapshot.py", import.meta.url));
+    const result = execFileSync("python3", ["-I", "-S", "-c", `
+import json, runpy, sys, types
+module = runpy.run_path(sys.argv[1])
+module["os"].statvfs = lambda _: types.SimpleNamespace(f_bavail=0, f_frsize=4096)
+try:
+ module["snapshot"]([sys.argv[2]], sys.argv[3])
+except module["SnapshotPreparationError"] as error:
+ print(json.dumps(error.diagnostic()))
+else:
+ raise AssertionError("Snapshot bypassed disk-space preflight")
+`, helper, f.home, f.destination], { encoding: "utf8" });
+    expect(JSON.parse(result)).toEqual({ stage: "snapshot", code: "disk-space", observedBytes: before.length, limitBytes: 0 });
+    expect(await fs.readFile(file)).toEqual(before);
+    expect((await fs.stat(path.join(f.destination, "0/state_5.sqlite"))).size).toBe(0);
+  });
+
+  it("keeps private configuration and raw subprocess failures out of preparation diagnostics", async () => {
+    const f = await fixture();
+    await fs.writeFile(path.join(f.home, "config.toml"), "private-secret = [invalid-private-secret");
+    const failure = await f.compatibility.snapshots(f.home, undefined, f.destination).catch(error => error);
+    expect(failure.diagnostic).toEqual({ stage: "snapshot", code: "configuration" });
+    expect(failure.message).toContain("snapshot preparation failed");
+    expect(failure.message).not.toContain("private-secret");
+    await expect(fs.stat(f.destination)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves a pristine baseline and treats baseline copy failures as preparation errors", async () => {
+    const f = await fixture();
+    database(path.join(f.home, "state_5.sqlite"));
+    const [snapshot] = await f.compatibility.snapshots(f.home, undefined, f.destination);
+    const pristine = path.join(f.root, "pristine");
+    await f.compatibility.preserveSnapshot(snapshot!, pristine);
+    await expect(f.compatibility.verifyConversation(pristine, "original")).resolves.toBeUndefined();
+    const copy = vi.spyOn(fs, "cp").mockRejectedValue(Object.assign(new Error("private-secret"), { code: "ENOSPC" }));
+    try {
+      const failure = await f.compatibility.preserveSnapshot(snapshot!, path.join(f.root, "no-space")).catch(error => error);
+      expect(failure.diagnostic).toEqual({ stage: "snapshot", code: "disk-full" });
+      expect(failure.message).toContain("disk space");
+      expect(failure.message).not.toContain("private-secret");
+    } finally { copy.mockRestore(); }
+  });
+
+  it("checks space for the pristine baseline before beginning a copy", async () => {
+    const f = await fixture();
+    database(path.join(f.home, "state_5.sqlite"));
+    const [snapshot] = await f.compatibility.snapshots(f.home, undefined, f.destination);
+    const statfs = vi.spyOn(fs, "statfs").mockResolvedValue({ bavail: 0, bsize: 4096 } as Awaited<ReturnType<typeof fs.statfs>>);
+    try {
+      await expect(f.compatibility.preserveSnapshot(snapshot!, path.join(f.root, "no-space"))).rejects.toMatchObject({ diagnostic: { stage: "snapshot", code: "disk-space", limitBytes: 0 } });
+      await expect(fs.stat(path.join(f.root, "no-space"))).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { statfs.mockRestore(); }
   });
 });

@@ -6,6 +6,19 @@ import { integer, string, invalid, webUrl } from "./validation.js";
 export type CiJob = ForgeCiDiagnostic["jobs"][number];
 export const maxCiFailureJobs = 8;
 export const maxCiLogBytes = 128_000;
+export const maxCiLogScanBytes = 16_000_000;
+const maxCiLogCharacters = 31_900;
+const operationalCiBlockers = {
+  credentials: /bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i,
+  policy: /billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i,
+  infrastructure: /runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i,
+};
+
+export interface CiLogEvidence {
+  log: string;
+  classification: CiJob["classification"];
+  checkout: { shas: string[]; invalid: boolean };
+}
 
 export function ciDiagnostic(repository: ForgeRepository, change: ForgeChangeRequest): ForgeCiDiagnostic {
   return {
@@ -19,7 +32,7 @@ export function finishCiDiagnostic(diagnostic: ForgeCiDiagnostic): ForgeCiDiagno
   diagnostic.failureKey = createHash("sha256").update(JSON.stringify([
     diagnostic.repository, diagnostic.changeNumber, diagnostic.sourceHeadSha,
     diagnostic.targetHeadSha, diagnostic.testedSha,
-    diagnostic.jobs.map(job => [job.runId, job.runAttempt, job.jobId, job.testedSha, job.conclusion]).sort(),
+    diagnostic.jobs.map(job => [job.runId, job.runAttempt, job.jobId, job.requiredGate?.jobId, job.testedSha, job.conclusion]).sort(),
   ])).digest("hex");
   return diagnostic;
 }
@@ -28,10 +41,9 @@ export function classifyCiLog(log: string): CiJob["classification"] {
   const operationalLog = log.split(/\r?\n/).filter(line =>
     !/assertion(?:error| failed)|\bexpected\b.*\b(?:received|actual|equal)\b|\bFAIL(?:ED)?\b.*(?:test|spec)/i.test(line),
   ).join("\n");
-  if (/bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i.test(operationalLog)) return "credentials";
-  if (/billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i.test(operationalLog)) return "policy";
-  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i.test(operationalLog)) return "infrastructure";
-  if (/assertion(?:error| failed)|\bFAIL(?:ED)?\b.*(?:test|spec)|(?:test|spec).*(?:failed|failure|timed out)|\b(?:TypeError|SyntaxError|ReferenceError|CompileError)\b|\berror TS\d+\b|\berror\[E\d+\]|compilation failed|lint.*(?:error|failed)|eslint|prettier|\bexpected\b.*\b(?:received|actual|equal)\b/i.test(log)) return "code";
+  for (const classification of ["credentials", "policy", "infrastructure"] as const)
+    if (operationalCiBlockers[classification].test(operationalLog)) return classification;
+  if (/assertion(?:error| failed)|\bFAIL(?:ED)?\b.*(?:test|spec)|(?:test|spec).*(?:failed|failure|timed out)|\b(?:TypeError|SyntaxError|ReferenceError|CompileError)\b|\berror TS\d+\b|\berror\[E\d+\]|compilation failed|lint.*(?:error|failed)|eslint|prettier|\bexpected\b.*\b(?:received|actual|equal)\b|\blocator\.\w+:\s*(?:Timeout \d+ms exceeded|.*(?:failed|timed out))|\b(?:Error|TimeoutError):\s*expect\([^\r\n]*\)\.[^\r\n]*(?:failed|timed out|timeout)/i.test(log)) return "code";
   return "unknown";
 }
 
@@ -104,25 +116,148 @@ export function sanitizeCiLog(text: string, secrets: string[]): string {
     });
 }
 
-export async function readCiLog(response: Response, secrets: string[]): Promise<string> {
+export async function readCiLog(response: Response, secrets: string[], projectPath: string): Promise<CiLogEvidence> {
   const reader = response.body?.getReader();
-  if (!reader) return "";
-  const chunks: Uint8Array[] = [];
+  const evidence: CiLogEvidence = { log: "", classification: "unknown", checkout: { shas: [], invalid: false } };
+  if (!reader) return evidence;
+  const excerpts = new CiLogExcerpts(secrets, projectPath, evidence);
+  const decoder = new TextDecoder();
+  let pending = "";
   let bytes = 0;
-  let truncated = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      const remaining = maxCiLogBytes - bytes;
-      chunks.push(value.subarray(0, remaining));
-      bytes += Math.min(value.byteLength, remaining);
-      if (value.byteLength > remaining || bytes === maxCiLogBytes) { truncated = true; break; }
+      bytes += value.byteLength;
+      if (bytes > maxCiLogScanBytes)
+        throw new ForgeProviderError("The CI log exceeds the full-scan byte limit; complete checkout and blocker evidence cannot be verified.");
+      pending += decoder.decode(value, { stream: true });
+      let newline: number;
+      while ((newline = pending.indexOf("\n")) !== -1) {
+        const line = pending.slice(0, newline + 1);
+        if (Buffer.byteLength(line) > maxCiLogBytes)
+          throw new ForgeProviderError("The CI log contains a line beyond the safe evidence limit.");
+        excerpts.add(line);
+        pending = pending.slice(newline + 1);
+      }
+      if (Buffer.byteLength(pending) > maxCiLogBytes)
+        throw new ForgeProviderError("The CI log contains a line beyond the safe evidence limit.");
     }
+    pending += decoder.decode();
+    if (pending) excerpts.add(pending);
+    excerpts.finish();
+    return evidence;
   } finally { await reader.cancel(); }
-  let text = Buffer.concat(chunks).toString("utf8");
-  if (truncated) text = text.slice(0, Math.max(0, text.lastIndexOf("\n")));
-  const clean = sanitizeCiLog(text, secrets);
-  const excerpt = clean.slice(0, 31_900);
-  return truncated || excerpt.length < clean.length ? `${excerpt}\n[CI log truncated]` : clean;
+}
+
+class CiLogExcerpts {
+  private complete = "";
+  private shortened = false;
+  private prefix = "";
+  private tail = "";
+  private checkoutLog = "";
+  private blockerLog = new Map<CiJob["classification"], string>();
+  private repository = "";
+  private awaitingSha = false;
+  private privateKey = false;
+  private secretValuePending = false;
+  private secretQuote = "";
+
+  constructor(private readonly secrets: string[], private readonly projectPath: string, private readonly evidence: CiLogEvidence) {}
+
+  add(raw: string): void {
+    const line = raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim();
+    const classification = classifyCiLog(line);
+    const clean = this.redact(raw);
+    const priorities: CiJob["classification"][] = ["unknown", "code", "infrastructure", "policy", "credentials"];
+    if (priorities.indexOf(classification) > priorities.indexOf(this.evidence.classification))
+      this.evidence.classification = classification;
+    if ((classification === "credentials" || classification === "policy" || classification === "infrastructure") && !this.blockerLog.has(classification)) {
+      const match = operationalCiBlockers[classification].exec(clean);
+      const context = match
+        ? clean.slice(Math.max(0, match.index - 300), match.index + 700).trim()
+        : "[REDACTED blocker text]";
+      this.blockerLog.set(classification, `[${classification}] ${context}\n`);
+    }
+    this.checkout(line, clean);
+    if (!this.shortened) {
+      this.complete += clean;
+      if (this.complete.length > maxCiLogCharacters) { this.complete = ""; this.shortened = true; }
+    }
+    if (this.prefix.length < 6_000) this.prefix = (this.prefix + clean).slice(0, 6_000);
+    this.tail = (this.tail + clean).slice(-19_000);
+  }
+
+  finish(): void {
+    if (this.awaitingSha) this.evidence.checkout.invalid = true;
+    this.evidence.log = this.shortened ? [
+      this.prefix, "[CI log truncated; full stream scanned]",
+      this.checkoutLog && `[Checkout evidence]\n${this.checkoutLog}`,
+      this.blockerLog.size && `[Operational blocker evidence]\n${[...this.blockerLog.values()].join("")}`,
+      `[Failure tail]\n${this.tail}`,
+    ].filter(Boolean).join("\n").slice(0, maxCiLogCharacters) : this.complete;
+  }
+
+  private checkout(line: string, clean: string): void {
+    if (this.awaitingSha) {
+      const sha = line.replace(/^'(.*)'$/, "$1");
+      if (/^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(sha)) {
+        if (!this.evidence.checkout.shas.includes(sha) && this.evidence.checkout.shas.length < 2)
+          this.evidence.checkout.shas.push(sha);
+      } else this.evidence.checkout.invalid = true;
+      this.checkoutLog = (this.checkoutLog + clean).slice(0, 2_000);
+      this.awaitingSha = false;
+    }
+    const syncing = /^Syncing repository: (\S+)$/.exec(line);
+    if (syncing) this.repository = syncing[1];
+    if (this.repository === this.projectPath && /^\[command\].*\bgit log -1 --format=(?:%H|'%H')$/.test(line)) {
+      this.awaitingSha = true;
+      this.checkoutLog = (this.checkoutLog + `Syncing repository: ${this.projectPath}\n` + clean).slice(0, 2_000);
+    }
+  }
+
+  private redact(raw: string): string {
+    if (this.privateKey) {
+      const end = /-----END [A-Z ]*PRIVATE KEY-----/.exec(raw);
+      if (!end) return "";
+      this.privateKey = false;
+      return this.redact(raw.slice(end.index + end[0].length));
+    }
+    if (this.secretQuote) {
+      const end = closingQuote(raw, this.secretQuote);
+      if (end === -1) return "";
+      this.secretQuote = "";
+      return this.redact(raw.slice(end + 1));
+    }
+    if (this.secretValuePending) {
+      const value = raw.replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trimStart();
+      if (!value) return raw;
+      this.secretValuePending = false;
+      if (value[0] === '"' || value[0] === "'") {
+        const end = closingQuote(value.slice(1), value[0]);
+        if (end === -1) { this.secretQuote = value[0]; return '"[REDACTED]"\n'; }
+        return '"[REDACTED]"' + this.redact(value.slice(end + 2));
+      }
+      return "[REDACTED]\n";
+    }
+    const assignments = /((['"])[A-Za-z0-9_]{0,80}(?:password|passwd|secret|token|api[_-]?key|authorization|credential)[A-Za-z0-9_]{0,80}\2|\b[A-Za-z0-9_]{0,80}(?:password|passwd|secret|token|api[_-]?key|authorization|credential)[A-Za-z0-9_]{0,80})\s*[=:]\s*/gi;
+    for (const assignment of raw.matchAll(assignments)) {
+      const value = raw.slice(assignment.index + assignment[0].length);
+      if (!value) this.secretValuePending = true;
+      else if ((value[0] === '"' || value[0] === "'") && closingQuote(value.slice(1), value[0]) === -1)
+        this.secretQuote = value[0];
+    }
+    const begin = /-----BEGIN [A-Z ]*PRIVATE KEY-----/.exec(raw);
+    if (begin && !/-----END [A-Z ]*PRIVATE KEY-----/.test(raw.slice(begin.index))) this.privateKey = true;
+    return sanitizeCiLog(raw, this.secrets);
+  }
+}
+
+function closingQuote(value: string, quote: string): number {
+  let escaped = false;
+  for (let index = 0; index < value.length; index++) {
+    if (!escaped && value[index] === quote) return index;
+    escaped = !escaped && value[index] === "\\";
+  }
+  return -1;
 }

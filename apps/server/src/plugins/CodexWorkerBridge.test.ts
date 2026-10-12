@@ -348,6 +348,140 @@ if (process.argv.includes('app-server')) {
   } finally { await terminal.terminate(); }
 }, 10_000);
 
+it.each([
+  { completion: "completed", disconnect: true, exitCode: 0, expectedCode: 0 },
+  { completion: "completed", disconnect: true, exitCode: 7, expectedCode: 7 },
+  { completion: "completed", disconnect: true, exitCode: null, expectedCode: 1 },
+  { completion: "running", disconnect: true, exitCode: 0, expectedCode: 1 },
+  { completion: "running", disconnect: false, exitCode: null, expectedCode: 1 },
+  { completion: "completed", disconnect: false, exitCode: null, expectedCode: 1 }
+])("preserves the visible exit when backend input closes: $completion, client disconnected $disconnect, exit $exitCode", async ({ completion, disconnect, exitCode, expectedCode }) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-shutdown-pipe-"));
+  directories.push(directory);
+  const command = path.join(directory, "codex.mjs");
+  const receiptPath = path.join(directory, "turn.json");
+  const closedPath = path.join(directory, "visible-disconnected");
+  const pipeClosedPath = path.join(directory, "backend-pipe-closed");
+  const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+import WebSocket from ${JSON.stringify(ws)};
+if (process.argv.includes('app-server')) {
+  const reader = readline.createInterface({ input: process.stdin });
+  reader.once('line', () => {
+    reader.pause();
+    const closePipe = () => {
+      fs.writeFileSync(${JSON.stringify(pipeClosedPath)}, 'closed');
+      process.exit(0);
+    };
+    ${disconnect ? `const shutdown = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(closedPath)})) return;
+      clearInterval(shutdown);
+      closePipe();
+    }, 10);` : "setTimeout(closePipe, 100);"}
+    process.stdout.write(JSON.stringify(${JSON.stringify(response)}) + '\\n');
+    ${completion === "completed" ? `process.stdout.write(JSON.stringify(${JSON.stringify(complete())}) + '\\n');` : ""}
+    setInterval(() => {}, 1000);
+  });
+} else {
+  const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
+  socket.on('open', () => socket.send(JSON.stringify(${JSON.stringify(start)})));
+  socket.on('message', data => {
+    const message = JSON.parse(data.toString());
+    if (${completion === "completed" ? "message.method !== 'turn/completed'" : "message.id !== 4"}) return;
+    socket.send(JSON.stringify({ id: 'shutdown-reply', result: 'x'.repeat(2 * 1024 * 1024) }));
+    ${disconnect ? "socket.close();" : ""}
+  });
+  socket.on('close', () => {
+    fs.writeFileSync(${JSON.stringify(closedPath)}, 'closed');
+    ${exitCode === null ? "setInterval(() => {}, 1000);" : `setTimeout(() => process.exit(${exitCode}), 500);`}
+  });
+}
+`, { mode: 0o755 });
+  const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
+    binding: { ...binding, receiptPath }, command, serverArgs: ["app-server"], tuiArgs: []
+  })], { cwd: directory, env: process.env, cols: 100, rows: 30 });
+  let output = "";
+  terminal.onData(data => { output += data; });
+  let exited: TerminalExit | undefined;
+  terminal.onExit(exit => { exited = exit; });
+  try {
+    await expect.poll(() => exited, { timeout: 7_000 }).toBeDefined();
+    expect(exited).toMatchObject({ exitCode: expectedCode });
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8")).status).toBe(completion);
+    if (!disconnect || completion === "completed") {
+      expect(await fs.readFile(pipeClosedPath, "utf8")).toBe("closed");
+      if (!disconnect) expect(output).toMatch(/write EPIPE|Codex app-server exited before its visible worker \(0\)/);
+      else if (exitCode === null) expect(output).toContain("Native visible client disconnected without exiting.");
+      else expect(output).not.toContain("CloudX native worker bridge:");
+    } else expect(output).toContain("Native visible client disconnected before its owned turn completed.");
+  } finally { await terminal.terminate(); }
+}, 10_000);
+
+it.each([
+  { completion: "completed", exitCode: 0, expectedCode: 0 },
+  { completion: "completed", exitCode: 7, expectedCode: 7 },
+  { completion: "completed", exitCode: null, expectedCode: 1 },
+  { completion: "running", exitCode: 0, expectedCode: 1 }
+])("preserves the visible exit when its peer closes during native output: $completion, exit $exitCode", async ({ completion, exitCode, expectedCode }) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-output-close-"));
+  directories.push(directory);
+  const command = path.join(directory, "codex.mjs");
+  const receiptPath = path.join(directory, "turn.json");
+  const releasePath = path.join(directory, "release-late-output");
+  const receivedPath = path.join(directory, "late-output-received");
+  const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
+  await fs.writeFile(command, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+import WebSocket from ${JSON.stringify(ws)};
+if (process.argv.includes('app-server')) {
+  readline.createInterface({ input: process.stdin }).once('line', () => {
+    process.stdout.write(JSON.stringify(${JSON.stringify(response)}) + '\\n');
+    ${completion === "completed" ? `process.stdout.write(JSON.stringify(${JSON.stringify(complete())}) + '\\n');` : ""}
+    const late = setInterval(() => {
+      if (!fs.existsSync(${JSON.stringify(releasePath)})) return;
+      clearInterval(late);
+      process.stdout.write(JSON.stringify({ method: 'thread/name/updated', params: { threadId: 'thread', threadName: 'x'.repeat(2 * 1024 * 1024) } }) + '\\n');
+    }, 10);
+    setInterval(() => {}, 1000);
+  });
+} else {
+  const socket = new WebSocket(process.argv[process.argv.indexOf('--remote') + 1], { headers: { Authorization: 'Bearer ' + process.env.CLOUDX_CODEX_WORKER_TOKEN } });
+  socket.on('open', () => socket.send(JSON.stringify(${JSON.stringify(start)})));
+  socket.on('message', data => {
+    const message = JSON.parse(data.toString());
+    if (${completion === "completed" ? "message.method !== 'turn/completed'" : "message.id !== 4"}) return;
+    socket._socket.once('data', () => {
+      fs.writeFileSync(${JSON.stringify(receivedPath)}, 'received');
+      socket.terminate();
+    });
+    fs.writeFileSync(${JSON.stringify(releasePath)}, 'release');
+  });
+  socket.on('close', () => {
+    ${exitCode === null ? "setInterval(() => {}, 1000);" : `setTimeout(() => process.exit(${exitCode}), 200);`}
+  });
+}
+`, { mode: 0o755 });
+  const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
+    binding: { ...binding, receiptPath }, command, serverArgs: ["app-server"], tuiArgs: []
+  })], { cwd: directory, env: process.env, cols: 100, rows: 30 });
+  let output = "";
+  terminal.onData(data => { output += data; });
+  let exited: TerminalExit | undefined;
+  terminal.onExit(exit => { exited = exit; });
+  try {
+    await expect.poll(() => exited, { timeout: 7_000 }).toBeDefined();
+    expect(exited).toMatchObject({ exitCode: expectedCode });
+    expect(await fs.readFile(receivedPath, "utf8")).toBe("received");
+    expect(JSON.parse(await fs.readFile(receiptPath, "utf8")).status).toBe(completion);
+    if (completion !== "completed") expect(output).toContain("Native visible client disconnected before its owned turn completed.");
+    else if (exitCode === null) expect(output).toContain("Native visible client disconnected without exiting.");
+    else expect(output).not.toContain("CloudX native worker bridge:");
+  } finally { await terminal.terminate(); }
+}, 10_000);
+
 it.each(["before worker start", "before worker reply", "during worker turn", "after worker completion"].flatMap(timing =>
   ["system", "thread_title"].map(threadSource => ({ timing, threadSource }))
 ))("keeps $threadSource title generation separate $timing", ({ timing, threadSource }) => {
