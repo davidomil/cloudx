@@ -688,6 +688,111 @@ describe("Explicit directory ownership reconciliation", () => {
 });
 
 describe("Issue publication handoff", () => {
+  async function heldHandoffCapture() {
+    const f = fixture();
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-held-handoff-"));
+    const store = new ForgeWorkflowStore(new PluginDataStore(directory));
+    const reports = new ForgeWorkerReports(directory);
+    const removeReport = vi.spyOn(reports, "remove");
+    const service = new ForgeWorkflowService({ ...f.deps, store, reports });
+    const handoff = { headSha: f.change.headSha, retainedPaths: ["diagnostics.txt"], retainedEvidencePaths: [".cache/capture.log"] };
+    const capture = deferred<typeof handoff>();
+    const siblingReceipt = deferred<void>();
+    let polling: Promise<void> | undefined;
+    onTestFinished(async () => {
+      siblingReceipt.resolve();
+      capture.resolve(handoff);
+      try {
+        await polling?.catch(() => {});
+        await service.dispose();
+      } finally { await fs.rm(directory, { recursive: true, force: true }); }
+    });
+    f.provider.getIssue.mockImplementation(async number => ({ ...f.issue, number: number! }));
+    f.runtime.launch.mockImplementation(async input => `tab-${input.id}`);
+    const publisher = await service.startIssue(f.deps.settings().repository, 1, placement);
+    const sibling = await service.startIssue(f.deps.settings().repository, 2, placement);
+    const report: ForgeIssueCompletionReport = {
+      kind: "issue", title: "Fix", body: "Committed tests passed", discussionReplies: [], resolvedDiscussionIds: [],
+      handoff: { ...handoff, status: "ready", details: "The intended commit is validated; diagnostics and capture evidence are retained." },
+    };
+    await fs.writeFile(path.join(directory, "forge-reports", `${publisher.attemptId}.json`), JSON.stringify(report));
+    f.runtime.readTurnCompletion.mockImplementation(async (workerId, attemptId) => {
+      if (workerId === sibling.id) await siblingReceipt.promise;
+      return { workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: "completed", error: undefined };
+    });
+    f.runtime.preparePublication.mockImplementation(async () => capture.promise);
+    polling = service.poll();
+    void polling.catch(() => {});
+    const persistSiblingReceipt = async () => {
+      await vi.waitFor(() => expect(f.runtime.preparePublication).toHaveBeenCalledOnce());
+      siblingReceipt.resolve();
+      await vi.waitFor(async () => expect((await store.read()).find(worker => worker.id === sibling.id)).toMatchObject({
+        status: "running", attemptId: sibling.attemptId, completion: { turn: { status: "completed" } },
+      }));
+      expect((await store.read()).find(worker => worker.id === publisher.id)).toMatchObject({
+        status: "running", attemptId: publisher.attemptId, completion: { report, readyAt: expect.any(String), turn: { status: "completed" } },
+      });
+      expect((await service.dashboard()).workers.find(worker => worker.id === publisher.id)?.pendingPublication).toBeUndefined();
+      expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+      expect(removeReport).not.toHaveBeenCalled();
+    };
+    return { ...f, service, store, reports, removeReport, publisher, sibling, report, handoff, capture, polling, persistSiblingReceipt };
+  }
+
+  it("allows sibling receipt persistence while another worker captures its declared handoff", async () => {
+    const f = await heldHandoffCapture();
+    await f.persistSiblingReceipt();
+    expect(f.runtime.preparePublication).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.publisher.id }),
+      f.publisher.attemptId, f.report.handoff, expect.any(AbortSignal));
+    f.capture.resolve(f.handoff);
+    await f.polling;
+    expect((await f.store.read()).find(worker => worker.id === f.publisher.id)).toMatchObject({ status: "awaiting_review", headSha: f.handoff.headSha });
+    expect((await f.store.read()).find(worker => worker.id === f.sibling.id)).toMatchObject({ status: "running", completion: { turn: { status: "completed" } } });
+    expect(f.runtime.publishBranch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.publisher.id }), expect.any(AbortSignal), f.handoff.headSha);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.runtime.close).not.toHaveBeenCalledWith(f.sibling.tabId);
+    expect(f.runtime.pause).not.toHaveBeenCalledWith(f.sibling.tabId);
+    expect(f.removeReport).toHaveBeenCalledExactlyOnceWith(f.publisher.attemptId);
+    expect(await f.reports.read(f.publisher.attemptId!)).toBeUndefined();
+  });
+
+  it("retains completed work and the running sibling after rejected held handoff capture", async () => {
+    const f = await heldHandoffCapture();
+    await f.persistSiblingReceipt();
+    f.capture.reject(new ForgeHandoffError("The declared diagnostics.txt could not be captured."));
+    await f.polling;
+    const workers = await f.store.read();
+    expect(workers.find(worker => worker.id === f.publisher.id)).toMatchObject({
+      status: "failed", attemptId: f.publisher.attemptId, completion: { report: f.report, turn: { status: "completed" }, continuationRequired: expect.stringContaining("diagnostics.txt") },
+    });
+    expect(workers.find(worker => worker.id === f.publisher.id)?.pendingPublication).toBeUndefined();
+    expect(workers.find(worker => worker.id === f.sibling.id)).toMatchObject({ status: "running", attemptId: f.sibling.attemptId, completion: { turn: { status: "completed" } } });
+    expect(await f.reports.read(f.publisher.attemptId!)).toEqual(f.report);
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(f.runtime.close).not.toHaveBeenCalledWith(f.sibling.tabId);
+    expect(f.runtime.pause).not.toHaveBeenCalledWith(f.sibling.tabId);
+    expect(f.removeReport).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop", "shutdown"] as const)("retains completed work without publishing when %s interrupts held handoff capture", async action => {
+    const f = await heldHandoffCapture();
+    await f.persistSiblingReceipt();
+    const controlling = action === "shutdown" ? f.service.dispose() : f.service[action](f.publisher.id);
+    expect(f.runtime.preparePublication).toHaveBeenCalledWith(expect.any(Object), f.publisher.attemptId, f.report.handoff, expect.objectContaining({ aborted: true }));
+    // Resolve despite cancellation to check the service before it attaches captured state.
+    f.capture.resolve(f.handoff);
+    await Promise.all([f.polling, controlling]);
+    const publisher = (await f.store.read()).find(worker => worker.id === f.publisher.id)!;
+    expect(publisher).toMatchObject({ attemptId: f.publisher.attemptId, completion: { report: f.report, readyAt: expect.any(String), turn: { status: "completed" } } });
+    if (action !== "shutdown") expect(publisher.status).toBe(action === "pause" ? "paused" : "stopped");
+    expect(publisher.pendingPublication).toBeUndefined();
+    expect(await f.reports.read(f.publisher.attemptId!)).toEqual(f.report);
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).not.toHaveBeenCalled();
+    expect(f.removeReport).not.toHaveBeenCalled();
+  });
+
   it("pins the intended commit before publication and reuses it after restart", async () => {
     const f = fixture();
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
