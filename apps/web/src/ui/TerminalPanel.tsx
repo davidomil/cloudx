@@ -12,6 +12,7 @@ import { uploadFileBrowserFile } from "../api.js";
 import { TerminalSelectionCopy } from "./terminalSelectionCopy.js";
 import { TerminalClipboardRequest } from "./terminalClipboardRequest.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
+import { CodexCommandDetails } from "./CodexCommandDetails.js";
 
 interface TerminalView {
   tabId: string;
@@ -158,10 +159,14 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     await onRecover(input);
     setConnectionError(undefined);
   }} /> : undefined;
-  return preserveOutput ? <div className="terminal-recovery-with-output">
+  const content = preserveOutput ? <div className="terminal-recovery-with-output">
     {recoveryPanel}
     <div className="terminal-panel" ref={containerRef} role="region" aria-label="Codex terminal output" />
   </div> : recoveryPanel ?? <div className="terminal-panel" ref={containerRef} />;
+  return tab.pluginId === "codex-terminal" ? <div className="codex-terminal-view">
+    <CodexCommandDetails tabId={tab.id} tabTitle={tab.title} active={active && !needsRecovery} />
+    {content}
+  </div> : content;
 }
 
 function disposeTerminalViewInternal(tabId: string): void {
@@ -461,6 +466,7 @@ function fitAndResize(view: TerminalView, focus = false): void {
   if (!view.terminal.element || !view.container) {
     return;
   }
+  focus = focus && !document.querySelector(".codex-command-dialog[open]");
   const fontSize = responsiveTerminalFontSize(view.container, view.uiScale);
   if (view.terminal.options.fontSize !== fontSize) {
     view.selectionCopy?.preserveBeforeRedraw();

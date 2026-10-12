@@ -8,6 +8,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { WorkspaceTab } from "@cloudx/shared";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import { CodexTerminalSession } from "./CodexTerminalPlugin.js";
+import { codexCommandDetailsPath, readCodexCommandDetails } from "./CodexCommandDetails.js";
 import type { TerminalProcess } from "../terminal/TerminalProcess.js";
 import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 
@@ -751,18 +752,27 @@ if (backend) {
 
 
 it.each([false, true].flatMap(forge => [1024, 3 * 1024 * 1024].map(imageBytes => ({ forge, imageBytes }))))(
-  "recovers image history with $imageBytes bytes per image (Forge $forge), preserving selection, permissions and subsequent input",
+  "recovers image history with $imageBytes bytes per image (Forge $forge), preserving command details, selection, permissions and subsequent input",
   async ({ forge, imageBytes }) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-large-history-"));
     directories.push(directory);
     const command = path.join(directory, "codex.mjs");
     const receiptPath = path.join(directory, "selected.json");
     const turnPath = path.join(directory, "turn.json");
+    const commandReceiptPath = codexCommandDetailsPath(directory);
     const transcriptPath = path.join(directory, "saved.jsonl");
     const observedPath = path.join(directory, "observed.json");
     const sessionId = "01a08470-d118-7b72-b1df-439e72e5c744";
     const content = Array.from({ length: 13 }, () => ({ type: "image", data: "A".repeat(imageBytes), mimeType: "image/png" }));
-    const history = JSON.stringify({ turns: [{ id: "saved-turn", items: [{ type: "mcpToolCall", result: { content } }] }], marker: "Restored 🙂 history" });
+    const savedCommand = {
+      type: "commandExecution", id: "saved-command", command: "printf 'saved 🙂 output'", cwd: directory,
+      status: "completed", exitCode: 0, aggregatedOutput: "saved 🙂 output\n"
+    };
+    const nextCommand = {
+      ...savedCommand, id: "next-command", command: "python3 - <<'PY'\nprint('literal \\n and quotes \"🙂\"')\nPY",
+      aggregatedOutput: "literal \\n and quotes \"🙂\"\ncontinued output\n"
+    };
+    const history = JSON.stringify({ turns: [{ id: "saved-turn", items: [{ type: "mcpToolCall", result: { content } }, savedCommand] }], marker: "Restored 🙂 history" });
     await fs.writeFile(transcriptPath, history + "\n");
     const digest = createHash("sha256").update(history).digest("hex");
     const ws = pathToFileURL(createRequire(import.meta.url).resolve("ws")).href;
@@ -790,6 +800,9 @@ if (process.argv.includes('app-server')) {
       send({ method: 'history/loaded', params: { marker: 'Restored 🙂 history' } });
     } else if (request.method === 'turn/start') {
       send({ id: request.id, result: { turn: { id: 'next-turn', status: 'inProgress' } } });
+      send({ method: 'item/started', params: { threadId: ${JSON.stringify(sessionId)}, turnId: 'next-turn', item: ${JSON.stringify({ ...nextCommand, status: "inProgress", aggregatedOutput: null, exitCode: null })} } });
+      send({ method: 'item/commandExecution/outputDelta', params: { threadId: ${JSON.stringify(sessionId)}, turnId: 'next-turn', itemId: 'next-command', delta: ${JSON.stringify(nextCommand.aggregatedOutput)} } });
+      send({ method: 'item/completed', params: { threadId: ${JSON.stringify(sessionId)}, turnId: 'next-turn', item: ${JSON.stringify({ ...nextCommand, aggregatedOutput: null })} } });
       send({ method: 'turn/completed', params: { threadId: ${JSON.stringify(sessionId)}, turn: { id: 'next-turn', status: 'completed' } } });
     } else throw new Error('Unexpected input after recovery');
   }
@@ -819,6 +832,7 @@ if (process.argv.includes('app-server')) {
 `, { mode: 0o755 });
     const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [fileURLToPath(helper), JSON.stringify({
       selection: { tabId: "large-history", executionId: sessionId, receiptPath },
+      commandDetails: { tabId: "large-history", executionId: sessionId, receiptPath: commandReceiptPath },
       ...(forge ? { binding: { workerId: "worker", attemptId: "attempt", receiptPath: turnPath, expectedThreadId: sessionId } } : {}),
       command, serverArgs: ["app-server"], tuiArgs: [], permissions: { yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] }
     })], { cwd: directory, env: { PATH: process.env.PATH }, cols: 100, rows: 30 });
@@ -830,6 +844,13 @@ if (process.argv.includes('app-server')) {
       await expect.poll(() => exited ?? output, { timeout: 10_000 }).toMatchObject({ exitCode: 0 });
       expect(JSON.parse(await fs.readFile(observedPath, "utf8"))).toEqual({ historyBytes: Buffer.byteLength(history), images: 13, inputAfterRecovery: true });
       expect(createHash("sha256").update(await fs.readFile(transcriptPath)).digest("hex")).toBe(createHash("sha256").update(history + "\n").digest("hex"));
+      const details = await readCodexCommandDetails(directory, "large-history", sessionId);
+      expect(details).toMatchObject({ status: "available", tabId: "large-history", executionId: sessionId });
+      expect(details.commands).toEqual([savedCommand, nextCommand].map((item, index) => ({
+        threadId: sessionId, turnId: index === 0 ? "saved-turn" : "next-turn", id: item.id,
+        command: item.command, cwd: directory, status: "completed", exitCode: 0,
+        output: item.aggregatedOutput, commandTruncated: false, outputTruncated: false
+      })));
     } finally { await terminal.terminate(); }
   }, 15_000
 );

@@ -8,6 +8,7 @@ export * from "./forgeConnections.js";
 export * from "./jira.js";
 export * from "./documentationArchive.js";
 export * from "./codexSettings.js";
+export * from "./codexCommandDetails.js";
 export * from "./codexUpdate.js";
 export * from "./cloudxUpdate.js";
 export * from "./cloudxUpdateBackups.js";

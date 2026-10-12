@@ -56,6 +56,49 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it("reads command details without recording an action or changing terminal input", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-command-details-route-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const snapshot = {
+      version: 1, tabId: "codex-details", executionId: "execution", status: "available", commands: [{
+        threadId: "thread", turnId: "turn", id: "command", command: "printf 'one\\ntwo'\n", cwd: root,
+        status: "completed", output: "one\ntwo", commandTruncated: false, outputTruncated: false, exitCode: 0
+      }]
+    };
+    const handleAction = vi.fn().mockResolvedValue(snapshot);
+    const session = {
+      tab: { id: snapshot.tabId, pluginId: "codex-terminal" },
+      handleAction
+    };
+    vi.spyOn(services.sessions, "getSession").mockReturnValue(session as unknown as ReturnType<SessionStore["getSession"]>);
+    const execute = vi.spyOn(services.sessions, "executePluginAction");
+    const record = vi.spyOn(TabContextService.prototype, "record");
+    const app = await buildServer(config, services);
+    try {
+      const response = await app.inject({ method: "GET", url: `/api/tabs/${snapshot.tabId}/command-details` });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["cache-control"]).toBe("no-store");
+      expect(response.json()).toEqual(snapshot);
+      expect(handleAction).toHaveBeenCalledExactlyOnceWith("command_details", {});
+      expect(execute).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+
+      handleAction.mockResolvedValueOnce({ ...snapshot, tabId: "different-tab" });
+      expect((await app.inject({ method: "GET", url: `/api/tabs/${snapshot.tabId}/command-details` })).statusCode).toBe(500);
+      handleAction.mockResolvedValueOnce({ ...snapshot, commands: [{ ...snapshot.commands[0], output: 42 }] });
+      expect((await app.inject({ method: "GET", url: `/api/tabs/${snapshot.tabId}/command-details` })).statusCode).toBe(500);
+      session.tab.pluginId = "standard-terminal";
+      const callsBefore = handleAction.mock.calls.length;
+      expect((await app.inject({ method: "GET", url: `/api/tabs/${snapshot.tabId}/command-details` })).statusCode).toBe(400);
+      expect(handleAction).toHaveBeenCalledTimes(callsBefore);
+    } finally {
+      await app.close();
+      record.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("exposes process startup identity without treating an unstamped development server as a verified target", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-runtime-identity-"));
     const app = await buildServer(testConfig(root));
