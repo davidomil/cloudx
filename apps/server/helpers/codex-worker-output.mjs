@@ -67,12 +67,11 @@ export async function forwardNativeOutput(input, socket, observe, options = {}) 
     const encoded = JSON.stringify(message);
     if (Buffer.byteLength(encoded) > (options.maxMessageBytes ?? MAX_NATIVE_OUTPUT_BYTES))
       throw outputSizeError(options.maxMessageBytes ?? MAX_NATIVE_OUTPUT_BYTES);
-    await new Promise((resolve, reject) => {
+    const sendError = await new Promise(resolve => {
       const finish = error => {
         clearTimeout(timer);
         socket.off("close", closed);
-        if (error && isConnected()) reject(error);
-        else resolve();
+        resolve(error);
       };
       const closed = () => finish();
       const timer = setTimeout(() => finish(new Error("Native visible client did not drain app-server output within the send deadline.")), options.sendTimeoutMs ?? OUTPUT_SEND_TIMEOUT_MS);
@@ -80,6 +79,8 @@ export async function forwardNativeOutput(input, socket, observe, options = {}) 
       try { socket.send(encoded, finish); }
       catch (error) { finish(error); }
     });
+    // A write callback can precede the transport's close/error dispatch.
+    if (sendError && isConnected()) throw sendError;
   }
 }
 
