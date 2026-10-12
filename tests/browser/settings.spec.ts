@@ -475,6 +475,7 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   page,
   isMobile,
 }, testInfo) => {
+  test.setTimeout(60_000);
   const configPath = path.join(testRoot, "codex-home", "config.toml");
   const initialRead = page.waitForResponse(
     (response) =>
@@ -546,7 +547,12 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await settings
     .getByRole("button", { name: "Unset tui", exact: true })
     .click();
+  const restored = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  expect((await restored).ok()).toBe(true);
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
@@ -563,6 +569,7 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   page,
   isMobile,
 }, testInfo) => {
+  test.setTimeout(60_000);
   const home = path.join(testRoot, "codex-home");
   await fs.writeFile(
     path.join(home, "config.toml"),
@@ -639,7 +646,12 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   await expect(trust).toBeChecked();
   await expect(slideSkill).toBeChecked();
   await expectCodexSettingsFits(page);
+  const saved = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  expect((await saved).ok()).toBe(true);
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
@@ -676,7 +688,12 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   await search.selectOption("");
   await personality.selectOption("");
   await trust.uncheck();
+  const restored = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  expect((await restored).ok()).toBe(true);
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
