@@ -1095,12 +1095,8 @@ export class SessionStore {
   }
 
   async applyRuntimeContexts(predicate: (tab: WorkspaceTab) => boolean, reason = "Applying runtime context."): Promise<WorkspaceTab[]> {
-    const tabs = this.listTabs().filter((tab) => this.sessions.has(tab.id) && predicate(tab));
-    const applied: WorkspaceTab[] = [];
-    for (const tab of tabs) {
-      applied.push(await this.applyRuntimeContext(tab.id, reason));
-    }
-    return applied;
+    const tabs = this.listTabs().filter((tab) => (this.sessions.has(tab.id) || this.restartingNativeTabs.has(tab.id)) && predicate(tab));
+    return Promise.all(tabs.map(tab => this.applyRuntimeContext(tab.id, reason)));
   }
 
   private updateTab(tabId: string, patch: Partial<WorkspaceTab>): void {

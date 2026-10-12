@@ -44,14 +44,16 @@ class ControlledTerminal implements TerminalProcess {
 
 class ControlledTerminals implements TerminalProcessFactory {
   readonly launches: Array<{ terminal: ControlledTerminal; options: TerminalSpawnOptions }> = [];
+  launchDelay: Gate | undefined;
   nextSpawnFailure: Error | undefined;
 
-  async spawn(_command: string, _args: string[], options: TerminalSpawnOptions) {
+  readonly spawn = vi.fn(async (_command: string, _args: string[], options: TerminalSpawnOptions) => {
+    await this.launchDelay?.waiting;
     if (this.nextSpawnFailure) throw this.nextSpawnFailure;
     const terminal = new ControlledTerminal();
     this.launches.push({ terminal, options });
     return terminal;
-  }
+  });
 }
 
 function templateContext(name: string): WorkspaceRuntimeContext {
@@ -60,7 +62,7 @@ function templateContext(name: string): WorkspaceRuntimeContext {
   } } } };
 }
 
-async function fixture() {
+async function fixture(options: { precedingTab?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-runtime-recovery-"));
   const home = path.join(root, "codex-home");
   const dataDir = path.join(root, "data");
@@ -89,9 +91,10 @@ async function fixture() {
     await sources.dispose();
     await fs.rm(root, { recursive: true, force: true });
   });
+  const precedingTab = options.precedingTab ? await store.createTab({ pluginId: AGENT_TERMINAL_PLUGIN_ID, cwd: root }) : undefined;
   const tab = await store.createTab({ pluginId: AGENT_TERMINAL_PLUGIN_ID, cwd: root, initialInput: { prompt: "Never replay the original prompt." } });
   const previous = store.getSession(tab.id);
-  const launch = terminals.launches[0]!;
+  const launch = terminals.launches.at(-1)!;
   const executionId = String(previous.restoreInput?.()?.codexExecutionId);
   const threadId = "01a08470-d118-7b72-b1df-439e72e5c744";
   const work: CodexNativeWork = {
@@ -110,13 +113,98 @@ async function fixture() {
   });
   const request: RecoverTabRequest = { action: "restart-native", executionId, sessionId: threadId };
   return {
-    root, store, tab, previous, terminals, resolver, saved, request, retiring: launch.terminal,
+    root, store, tab, precedingTab, previous, terminals, resolver, saved, request, retiring: launch.terminal,
     selectTemplate(name: string) { currentContext = templateContext(name); },
     gate() { const gate = new Gate(); gates.push(gate); return gate; }
   };
 }
 
 describe("runtime context during native recovery", () => {
+  it("queues bulk template saves during replacement launch and persists the update on the replacement", async () => {
+    const f = await fixture();
+    const sibling = await f.store.createTab({ pluginId: AGENT_TERMINAL_PLUGIN_ID, cwd: f.root });
+    const siblingSession = f.store.getSession(sibling.id);
+    const siblingTerminal = f.terminals.launches[1]!.terminal;
+    const launch = f.gate();
+    f.terminals.launchDelay = launch;
+    const recovering = f.store.recoverTab(f.tab.id, f.request);
+    await vi.waitFor(() => expect(f.terminals.spawn).toHaveBeenCalledTimes(3));
+    expect(() => f.store.getSession(f.tab.id)).toThrow();
+    f.selectTemplate("Changed");
+    const updating = f.store.applyRuntimeContexts(candidate => candidate.id === f.tab.id, "Applying window template changes.");
+    const savedUpdate = vi.fn();
+    void updating.then(savedUpdate);
+    await f.store.applyRuntimeContexts(candidate => candidate.id === sibling.id);
+    expect(savedUpdate).not.toHaveBeenCalled();
+    expect(siblingTerminal.written).toContain("Changed");
+    expect(siblingTerminal.terminate).not.toHaveBeenCalled();
+    expect(f.store.getSession(sibling.id)).toBe(siblingSession);
+    expect(f.retiring.written).toBe("");
+    launch.release();
+    await recovering;
+    const applied = await updating;
+    expect(applied.map(tab => tab.id)).toEqual([f.tab.id]);
+    const replacement = f.store.getSession(f.tab.id);
+    expect(replacement.restoreInput?.()).toMatchObject({ resume: { mode: "session", sessionId: f.request.sessionId } });
+    expect(templateFromRuntimeContext(replacement.restoreInput?.()?.codexRuntimeContext as WorkspaceRuntimeContext)?.template.name).toBe("Changed");
+    expect(f.terminals.launches[2]!.terminal.written).toContain("Changed");
+    expect(f.terminals.launches[2]!.terminal.written).not.toContain("Never replay");
+    expect(f.retiring.written).toBe("");
+    await f.saved.flush();
+    const persisted = (await f.saved.read())!.sessions.find(saved => saved.tab.id === f.tab.id)!;
+    expect(templateFromRuntimeContext(persisted.initialInput?.codexRuntimeContext as WorkspaceRuntimeContext)?.template.name).toBe("Changed");
+  });
+
+  it("rejects bulk template saves queued during a failed replacement launch without submitting the update", async () => {
+    const f = await fixture();
+    const launch = f.gate();
+    f.terminals.launchDelay = launch;
+    f.terminals.nextSpawnFailure = new Error("Replacement launch rejected.");
+    const recovering = f.store.recoverTab(f.tab.id, f.request);
+    await vi.waitFor(() => expect(f.terminals.spawn).toHaveBeenCalledTimes(2));
+    expect(() => f.store.getSession(f.tab.id)).toThrow();
+    f.selectTemplate("Changed");
+    const updating = f.store.applyRuntimeContexts(() => true, "Applying saved rules/skills changes.");
+    const outcomes = Promise.allSettled([recovering, updating]);
+    launch.release();
+    expect(await outcomes).toEqual([
+      { status: "rejected", reason: expect.objectContaining({ message: "Replacement launch rejected." }) },
+      { status: "rejected", reason: expect.objectContaining({ message: "Replacement launch rejected." }) }
+    ]);
+    expect(f.retiring.written).toBe("");
+    expect(f.terminals.launches).toHaveLength(1);
+    expect(f.store.getTab(f.tab.id)).toMatchObject({ status: "failed", nativeWork: { recoveryStatus: "failed" } });
+    await f.saved.flush();
+    const persisted = (await f.saved.read())!.sessions.find(saved => saved.tab.id === f.tab.id)!;
+    expect(templateFromRuntimeContext(persisted.initialInput?.codexRuntimeContext as WorkspaceRuntimeContext)?.template.name).toBe("Original");
+    expect(await f.store.applyRuntimeContexts(() => true)).toEqual([]);
+  });
+
+  it("queues every bulk target before an earlier tab update can outlast a replacement failure", async () => {
+    const f = await fixture({ precedingTab: true });
+    const launch = f.gate();
+    f.terminals.launchDelay = launch;
+    f.terminals.nextSpawnFailure = new Error("Replacement launch rejected.");
+    const recovering = f.store.recoverTab(f.tab.id, f.request);
+    await vi.waitFor(() => expect(f.terminals.spawn).toHaveBeenCalledTimes(3));
+    f.selectTemplate("Changed");
+    const resolution = f.gate();
+    f.resolver.runtimeContextFor.mockImplementationOnce(async () => { await resolution.waiting; return templateContext("Changed"); });
+    const updating = f.store.applyRuntimeContexts(() => true);
+    const outcomes = Promise.allSettled([recovering, updating]);
+    launch.release();
+    await expect(recovering).rejects.toThrow("Replacement launch rejected.");
+    resolution.release();
+    expect(await outcomes).toEqual([
+      { status: "rejected", reason: expect.objectContaining({ message: "Replacement launch rejected." }) },
+      { status: "rejected", reason: expect.objectContaining({ message: "Replacement launch rejected." }) }
+    ]);
+    await vi.waitFor(() => expect(f.terminals.launches[0]!.terminal.written).toContain("Changed"));
+    expect(f.store.getSession(f.precedingTab!.id)).toBeDefined();
+    expect(f.retiring.written).toBe("");
+    expect(f.terminals.launches).toHaveLength(2);
+  });
+
   it("acknowledges a template update on the replacement while shutdown waits and other tabs keep accepting updates", async () => {
     const f = await fixture();
     const sibling = await f.store.createTab({ pluginId: AGENT_TERMINAL_PLUGIN_ID, cwd: f.root });
