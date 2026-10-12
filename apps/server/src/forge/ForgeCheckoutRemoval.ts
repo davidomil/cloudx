@@ -29,12 +29,14 @@ export function isForgeRemovalContents(value: unknown): value is ForgeRemovalCon
 }
 
 /** Authorize exact contents; missing entries are allowed when resuming partial removal. */
-export async function captureForgeRemovalContents(identity: DirectoryIdentity, signal?: AbortSignal): Promise<ForgeRemovalContents[]> {
+export async function captureForgeRemovalContents(identity: DirectoryIdentity, signal?: AbortSignal,
+  observeContent?: (relative: string, stat: BigIntStats, sha256?: string) => void): Promise<ForgeRemovalContents[]> {
   const root = await openOwnedDirectoryNoFollow(path.dirname(identity.path), identity.path, "Checkout removal", identity);
   const entries: ForgeRemovalContents[] = [];
   const buffer = Buffer.alloc(64 * 1024);
   let bytes = 0;
   const record = (relative: string, stat: BigIntStats, content?: string) => {
+    observeContent?.(relative, stat, content);
     // Directory times and sizes change as authorized children are deleted.
     const metadata = [stat.ino, stat.birthtimeNs, stat.mode, stat.uid, stat.gid,
       ...(stat.isDirectory() ? [] : [stat.size, stat.mtimeNs])].map(String);

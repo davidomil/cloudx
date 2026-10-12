@@ -81,6 +81,7 @@ import { ForgeDisposableResources } from "./forge/ForgeDisposableResources.js";
 import { registerForgeDisposableResourceRoutes } from "./forge/ForgeDisposableResourceRoutes.js";
 import { registerForgeCheckoutEvidenceRoutes } from "./forge/ForgeCheckoutEvidenceRoutes.js";
 import { registerForgeGitHistoryRoutes } from "./forge/ForgeGitHistoryRoutes.js";
+import { registerForgeDiagnosticSnapshotRoutes } from "./forge/ForgeDiagnosticSnapshotRoutes.js";
 import { ForgeWorkflowStore, ForgeWorkerReports } from "./forge/ForgeWorkflowStore.js";
 import { ForgeConnectionService } from "./forge/connections/ForgeConnectionService.js";
 import { ForgeConnectionStore } from "./forge/connections/ForgeConnectionStore.js";
@@ -387,6 +388,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     registerForgeDisposableResourceRoutes(app, services.forgeResources, services.forge, config.trustedOrigins);
     registerForgeCheckoutEvidenceRoutes(app, config.dataDir);
     registerForgeGitHistoryRoutes(app, config.dataDir);
+    registerForgeDiagnosticSnapshotRoutes(app, services.forge, config.trustedOrigins);
   }
   const installationRoot = path.resolve(import.meta.dirname, "../../..");
   services.workspaceCleanup ??= new WorkspaceCleanupService({

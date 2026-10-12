@@ -12,6 +12,9 @@ import {
   isAgentTab,
   isForgeTurnCompletion,
   isRecord,
+  validateForgeDiagnosticSnapshotInput,
+  type ForgeDiagnosticSnapshotInput,
+  type ForgeDiagnosticSnapshotResult,
   type CodexReasoningEffort,
   type ForgeRepository,
   type ForgeReviewRevision,
@@ -52,6 +55,7 @@ import { ForgeCheckoutEvidence, isCheckoutEvidenceReceipt } from "./ForgeCheckou
 import { ForgeGitHistory, generatedGitHistoryCommit, isGitHistoryReceipt } from "./ForgeGitHistory.js";
 import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 import { captureForgeRemovalContents, assertForgeRemovalContents, isForgeRemovalContents, type ForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
+import { ForgeDiagnosticSnapshots, isOwnedDiagnosticSnapshot, type OwnedDiagnosticSnapshot } from "./ForgeDiagnosticSnapshots.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -143,6 +147,7 @@ export class ForgeHandoffError extends Error {
 }
 
 interface OwnedWorkspace extends ForgeWorkspace {
+  diagnosticSnapshots?: OwnedDiagnosticSnapshot[];
   repository: DirectoryIdentity;
   explicitRetainedPaths?: string[];
   evidenceRetirement?: { attemptId: string; commitSha: string; paths: string[] };
@@ -886,9 +891,6 @@ export class ForgeRuntime {
       reconciliation.validate(preview, input);
       await this.assertReconciliationQuiescent(owned, tabs);
       await reconciliation.assertCurrent();
-      for (const directory of missing)
-        if (await this.disposableDirectoryExists(directory))
-          throw new Error("A removed worker directory reappeared after inspection. Inspect ownership again before reconciling.");
       if (await this.configHash(owned) !== owned.gitConfigHash)
         throw new Error("Worker Git configuration changed after inspection; its checkout was preserved.");
       const sourceDirectories = new Map<JsonStateFile, OwnedDirectory>();
@@ -907,6 +909,10 @@ export class ForgeRuntime {
             throw new Error("Worker ownership records changed after inspection. Inspect them again before reconciling.");
         }
         for (const directory of sourceDirectories.values()) await directory.assertCurrent();
+        await reconciliation.assertCurrent();
+        for (const directory of missing)
+          if (await this.disposableDirectoryExists(directory))
+            throw new Error("A removed worker directory reappeared after inspection. Inspect ownership again before reconciling.");
         // Every path, record and process is validated before replacing any metadata.
         for (const record of records) {
           const directory = sourceDirectories.get(record.file);
@@ -960,6 +966,26 @@ export class ForgeRuntime {
     owned.repository = await reconciliation.add(owned.repository);
     owned.worktree = await reconciliation.add(owned.worktree);
     owned.gitDirectory = await reconciliation.add(owned.gitDirectory!);
+    for (const snapshot of owned.diagnosticSnapshots ?? []) {
+      snapshot.origin.checkout = await reconciliation.add(snapshot.origin.checkout);
+      snapshot.origin.gitDirectory = await reconciliation.add(snapshot.origin.gitDirectory);
+      snapshot.parentIdentity = await disposable(snapshot.parentIdentity);
+      const retiring = { ...snapshot.identity, path: path.join(snapshot.parentIdentity.path, "retiring-source") };
+      const sourceExists = await this.disposableDirectoryExists(snapshot.identity.path);
+      const retiringExists = await this.disposableDirectoryExists(retiring.path);
+      if (snapshot.state === "removed" && (sourceExists || retiringExists))
+        throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} reappeared after retirement; recover its replacement before Resume.`);
+      if (retiringExists && (snapshot.state !== "removing" || sourceExists))
+        throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} has conflicting removal directories; recover both copies before Resume.`);
+      if (retiringExists) {
+        const identity = await reconciliation.add(retiring);
+        snapshot.identity = { ...identity, path: snapshot.identity.path };
+        missing.add(snapshot.identity.path);
+      } else {
+        snapshot.identity = await disposable(snapshot.identity);
+        missing.add(retiring.path);
+      }
+    }
     if (await this.configHash(owned) !== owned.gitConfigHash)
       throw new Error("Worker Git configuration or origin changed; its checkout was preserved.");
     const tabs: OwnedTab[] = [];
@@ -1713,6 +1739,26 @@ export class ForgeRuntime {
     }
   }
 
+  createDiagnosticSnapshot(workspace: ForgeWorkspace, attemptId: string, input: ForgeDiagnosticSnapshotInput): Promise<ForgeDiagnosticSnapshotResult> {
+    const signal = AbortSignal.timeout(60_000);
+    return this.serialize(workspace.id, "diagnostic snapshot", signal, async () => {
+      safeId(attemptId);
+      validateForgeDiagnosticSnapshotInput(input);
+      const owned = await this.matchOwned(workspace);
+      await this.assertCheckout(owned);
+      if (!owned.prepared || owned.cleaned || owned.cleanupRemoval || !owned.gitDirectory)
+        throw new Error("Diagnostic copies require an active prepared checkout.");
+      if ((owned.diagnosticSnapshots?.length ?? 0) >= 100) throw new Error("This checkout reached its diagnostic snapshot limit.");
+      const snapshot = await new ForgeDiagnosticSnapshots().create(owned.worktree, owned.gitDirectory, owned.origin,
+        owned.id, attemptId, input, args => this.runGit(owned.worktreePath, args, signal), async snapshot => {
+          owned.diagnosticSnapshots ??= [];
+          if (!owned.diagnosticSnapshots.includes(snapshot)) owned.diagnosticSnapshots.push(snapshot);
+          await this.manifest(owned.id).write(owned);
+        }, signal);
+      return { path: snapshot.path, kind: snapshot.kind, retentionPolicy: snapshot.retentionPolicy };
+    });
+  }
+
   cleanup(workspace: ForgeWorkspace, signal?: AbortSignal): Promise<ForgeRetainedWorkspace | void> {
     return this.serialize(workspace.id, "cleanup", signal, async () => {
       const owned = await this.matchOwned(workspace);
@@ -1997,6 +2043,9 @@ export class ForgeRuntime {
         throw new Error("Review checkout differs from its evidence commit; its files were preserved.");
       owned.cleanupHeadSha = expectedHeadSha;
       if (owned.prepared && owned.evidenceRetirement) {
+        await new ForgeDiagnosticSnapshots().retire(owned.worktree, owned.diagnosticSnapshots ?? [],
+          publicationFiles(owned.explicitRetainedPaths ?? [], this.publicationHandoff(owned)?.retainedEvidencePaths ?? []),
+          () => this.manifest(owned.id).write(owned), args => this.runGit(owned.worktreePath, args, signal), signal);
         await this.handoffCheckoutEvidence(owned, signal);
         explicitRetainedPaths = owned.explicitRetainedPaths;
       }
@@ -2137,7 +2186,7 @@ export class ForgeRuntime {
             throw new Error("Checkout evidence directory changed; its files were preserved.");
           const children = await fs.readdir(`/proc/self/fd/${directory.fd}`);
           if (children.includes(".git") || ["HEAD", "objects", "refs"].every(name => children.includes(name)))
-            throw new Error("Checkout evidence contains repository history; recover its source before cleanup.");
+            throw new Error(`Checkout evidence ${JSON.stringify(relative)} contains repository history. Preserve the complete copy, including all Git objects, in a verified archive outside the checkout and relocate its source, then use Resume.`);
           for (const child of children.sort()) await select(`${relative}/${child}`);
           const current = await fs.lstat(absolute, { bigint: true });
           if (current.dev !== stat.dev || current.ino !== stat.ino)
@@ -2335,6 +2384,9 @@ export class ForgeRuntime {
       typeof value.gitPending !== "boolean" ||
       typeof value.branchOwned !== "boolean" ||
       typeof value.cleaned !== "boolean" ||
+      (value.diagnosticSnapshots !== undefined && (!Array.isArray(value.diagnosticSnapshots) ||
+        value.diagnosticSnapshots.length > 100 || value.diagnosticSnapshots.some(snapshot => !isOwnedDiagnosticSnapshot(snapshot, id, value.worktree)) ||
+        new Set(value.diagnosticSnapshots.map(snapshot => snapshot.path)).size !== value.diagnosticSnapshots.length)) ||
       (value.cleanupRemoval !== undefined && (!isIdentity(value.cleanupRemoval) ||
         path.dirname(value.cleanupRemoval.path) !== path.dirname(value.worktreePath) ||
         !value.cleanupRemoval.path.startsWith(path.join(path.dirname(value.worktreePath), `cleanup-${id}-`)) ||

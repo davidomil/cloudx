@@ -162,7 +162,8 @@ async function visitEvidence(identity: DirectoryIdentity, selections: string[], 
       });
       checkingParent = true;
       const children = (await fs.readdir(`/proc/self/fd/${handle.fd}`)).sort();
-      if (children.includes(".git") || ["HEAD", "objects", "refs"].every(name => children.includes(name))) throw new Error("Checkout evidence contains repository history; recover its source before cleanup.");
+      if (children.includes(".git") || ["HEAD", "objects", "refs"].every(name => children.includes(name)))
+        throw new Error(`Checkout evidence ${JSON.stringify(relative)} contains repository history. Preserve the complete copy, including all Git objects, in a verified archive outside the checkout and relocate its source, then use Resume.`);
       for (const child of children) await visit(`/proc/self/fd/${handle.fd}/${child}`, `${relative}/${child}`, false);
       const current = await fs.lstat(target, { bigint: true });
       if (current.dev !== stat.dev || current.ino !== stat.ino) throw new Error("Checkout evidence directory identity changed; its replacement was preserved.");
