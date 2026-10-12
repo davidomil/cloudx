@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -42,6 +42,112 @@ it("propagates a missing Settings response so lifecycle cleanup can retain the b
   expect(result.status, result.stderr).toBe(0);
   expect(result.stdout).toContain("Update POST timed out");
   expect(result.stdout).toContain("trace retained");
+});
+
+describe("lifecycle terminal attachment", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function terminalProbe(marker, input) {
+    vi.useFakeTimers();
+    const sockets = [];
+    vi.stubGlobal("location", { protocol: "https:", host: "localhost:9140" });
+    vi.stubGlobal(
+      "WebSocket",
+      class {
+        send = vi.fn();
+        close = vi.fn();
+        constructor(url) {
+          this.url = url;
+          sockets.push(this);
+        }
+        receive(message) {
+          this.onmessage({ data: JSON.stringify(message) });
+        }
+      },
+    );
+    const profile = new LifecycleBrowserProfile({});
+    profile.page = { evaluate: (read, args) => read(args) };
+    const result = profile.readTerminal("selected-tab", marker, input);
+    const socket = sockets[0];
+    socket.onopen();
+    return { result, socket };
+  }
+
+  it.each(["screen", "data"])(
+    "accepts a %s replay when the native banner has scrolled away",
+    async (type) => {
+      const { result, socket } = terminalProbe();
+      const data = "\x1b[HThe lifecycle acceptance conversation is saved.";
+      socket.receive({ type, data, cols: 80, rows: 24 });
+      await expect(result).resolves.toBe(data);
+      expect(socket.url).toBe("wss://localhost:9140/ws/terminal/selected-tab");
+      expect(socket.send).not.toHaveBeenCalled();
+      expect(socket.close).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("waits for a replay frame after connection and unrelated control messages", async () => {
+    const { result, socket } = terminalProbe();
+    const completed = vi.fn();
+    void result.then(completed);
+    socket.receive({ type: "ready" });
+    await Promise.resolve();
+    expect(completed).not.toHaveBeenCalled();
+    socket.receive({ type: "screen", data: "", cols: 80, rows: 24 });
+    await expect(result).resolves.toBe("");
+    expect(socket.close).toHaveBeenCalledOnce();
+  });
+
+  it("requires the exact shell state marker across replay and live output", async () => {
+    const { result, socket } = terminalProbe(
+      "LIFECYCLE_AFTER:saved-state:123",
+      "print-shell-state",
+    );
+    expect(socket.send).toHaveBeenCalledWith(
+      JSON.stringify({ type: "input", data: "print-shell-state\r" }),
+    );
+    const completed = vi.fn();
+    void result.then(completed);
+    socket.receive({
+      type: "screen",
+      data: "LIFECYCLE_AFTER:wrong-state:456\r\n",
+    });
+    socket.receive({ type: "data", data: "LIFECYCLE_AFTER:saved-state:" });
+    await Promise.resolve();
+    expect(completed).not.toHaveBeenCalled();
+    socket.receive({ type: "data", data: "123\r\n" });
+    await expect(result).resolves.toContain("LIFECYCLE_AFTER:saved-state:123");
+    expect(socket.close).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["onerror", "Terminal websocket failed."],
+    ["onclose", "Terminal closed before returning the expected output."],
+  ])("rejects %s before a terminal replay", async (event, message) => {
+    const { result, socket } = terminalProbe();
+    socket[event]();
+    await expect(result).rejects.toThrow(message);
+    expect(socket.close).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([undefined, "required-shell-marker"])(
+    "retains the deadline when the expected replay is absent (%s)",
+    async (marker) => {
+      const { result, socket } = terminalProbe(marker);
+      const rejected = expect(result).rejects.toThrow(/before its deadline/);
+      if (marker)
+        socket.receive({ type: "screen", data: "different-shell-state" });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await rejected;
+      expect(socket.close).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 });
 
 function savedConversation(home = "/isolated/.codex") {
@@ -548,7 +654,7 @@ describe("profile preservation after an update", () => {
           requiresInterruption: false,
         }),
       ).resolves.toMatchObject({ conversationEvidencePreserved: true });
-      expect(profile.readTerminal).toHaveBeenCalledWith("tab", "Codex");
+      expect(profile.readTerminal).toHaveBeenCalledWith("tab");
       expect(profile.action).toHaveBeenCalledWith(
         "tab",
         "wait_until_ready",
@@ -578,6 +684,21 @@ describe("profile preservation after an update", () => {
       ).rejects.toThrow(
         /compatible upgrade must preserve the Codex execution/i,
       );
+    } finally {
+      await fs.rm(profile.dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an attached Codex terminal that no longer responds after a compatible upgrade", async () => {
+    const { profile } = await installedProfile();
+    profile.action.mockResolvedValue({ result: { ready: false } });
+    try {
+      await expect(
+        profile.verifyPreservedProfile({ requiresInterruption: false }),
+      ).rejects.toThrow(
+        "The preserved Codex process must still respond after update.",
+      );
+      expect(profile.readTerminal).toHaveBeenCalledWith("tab");
     } finally {
       await fs.rm(profile.dataDir, { recursive: true, force: true });
     }

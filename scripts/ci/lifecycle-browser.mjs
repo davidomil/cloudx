@@ -528,7 +528,9 @@ export class LifecycleBrowserProfile {
           };
           const timer = setTimeout(
             () =>
-              finish("Terminal did not become attachable before its deadline."),
+              finish(
+                "Terminal did not return the expected replay before its deadline.",
+              ),
             30_000,
           );
           socket.onopen = () => {
@@ -544,9 +546,9 @@ export class LifecycleBrowserProfile {
           };
           socket.onmessage = (event) => {
             const message = JSON.parse(event.data);
-            if (message.type === "data" || message.type === "screen")
-              output = (output + message.data).slice(-131_072);
-            if (output.includes(marker)) finish();
+            if (message.type !== "data" && message.type !== "screen") return;
+            output = (output + message.data).slice(-131_072);
+            if (marker === undefined || output.includes(marker)) finish();
           };
         }),
       { tabId, marker, input },
@@ -754,7 +756,7 @@ export class LifecycleBrowserProfile {
         marker,
         'printf \'\\nLIFECYCLE_AFTER:%s:%s\\n\' "$CLOUDX_LIFECYCLE_ID" "$$"',
       );
-      await this.readTerminal(this.seeded.codexTabId, "Codex");
+      await this.readTerminal(this.seeded.codexTabId);
       const readiness = await this.action(
         this.seeded.codexTabId,
         "wait_until_ready",
