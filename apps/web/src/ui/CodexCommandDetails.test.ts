@@ -114,6 +114,51 @@ describe("Codex command details", () => {
     expect(showModal).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["forward", "backward", "none"] as const)("preserves %s output selection and scroll across appended output", async direction => {
+    const control = await mount();
+    await control.open();
+    const output = control.output();
+    const start = 7;
+    const end = direction === "none" ? start : 21;
+    output.focus();
+    output.setSelectionRange(start, end, direction);
+    output.scrollTop = 120;
+    output.scrollLeft = 30;
+    const selectedText = output.value.slice(start, end);
+    const next = snapshot();
+    for (const chunk of ["continued output\n", "more output\n"]) {
+      next.commands[0].output += chunk;
+      read.mockResolvedValue(structuredClone(next));
+      await tick();
+      expect(output.value).toBe(next.commands[0].output);
+      expect([output.selectionStart, output.selectionEnd, output.selectionDirection]).toEqual([start, end, direction]);
+      expect(output.value.slice(output.selectionStart, output.selectionEnd)).toBe(selectedText);
+      expect([output.scrollTop, output.scrollLeft]).toEqual([120, 30]);
+      expect(document.activeElement).toBe(output);
+    }
+  });
+
+  it("preserves unfocused output selection and clamps it when retained output becomes shorter", async () => {
+    const control = await mount();
+    await control.open();
+    const output = control.output();
+    output.focus();
+    output.setSelectionRange(7, 21, "backward");
+    control.command().focus();
+    const next = snapshot();
+    next.commands[0].output += "continued output\n";
+    read.mockResolvedValue(next);
+    await tick();
+    expect([output.selectionStart, output.selectionEnd, output.selectionDirection]).toEqual([7, 21, "backward"]);
+    expect(document.activeElement).toBe(control.command());
+    next.commands[0].output = "short";
+    read.mockResolvedValue(structuredClone(next));
+    await tick();
+    expect(output.value).toBe("short");
+    expect([output.selectionStart, output.selectionEnd]).toEqual([5, 5]);
+    expect(document.activeElement).toBe(control.command());
+  });
+
   it.each(["Escape", "cancel"])("dismisses with %s, consumes the event and restores the trigger", async method => {
     const control = await mount();
     await control.open();

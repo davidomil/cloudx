@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { FileText, X } from "lucide-react";
 import { type CodexCommandDetails as RecordedCommand, type CodexCommandDetailsSnapshot } from "@cloudx/shared";
 
@@ -92,8 +92,19 @@ function CommandDialog({ tabId, tabTitle, executionId, command, onDismiss }: {
   onDismiss: () => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const outputRef = useRef<HTMLTextAreaElement>(null);
   const dismissRef = useRef(onDismiss);
   dismissRef.current = onDismiss;
+
+  useLayoutEffect(() => {
+    const output = outputRef.current!;
+    if (output.value === command.output) return;
+    const { selectionStart, selectionEnd, selectionDirection, scrollTop, scrollLeft } = output;
+    output.value = command.output;
+    output.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+    output.scrollTop = scrollTop;
+    output.scrollLeft = scrollLeft;
+  }, [command.output]);
 
   useEffect(() => {
     const dialog = dialogRef.current!;
@@ -127,7 +138,7 @@ function CommandDialog({ tabId, tabTitle, executionId, command, onDismiss }: {
     </div>
     <label>Full command<textarea aria-label="Full command" value={command.command} readOnly spellCheck={false} wrap="off" /></label>
     {command.commandTruncated ? <p className="codex-command-retention" role="status">Command exceeds the retained size limit; the text shown is truncated.</p> : null}
-    <label className="codex-command-output">Command output<textarea aria-label="Command output" value={command.output} readOnly spellCheck={false} wrap="off" placeholder={command.status === "inProgress" ? "Waiting for output…" : "No output recorded."} /></label>
+    <label className="codex-command-output">Command output<textarea aria-label="Command output" ref={outputRef} readOnly spellCheck={false} wrap="off" placeholder={command.status === "inProgress" ? "Waiting for output…" : "No output recorded."} /></label>
     {command.outputTruncated ? <p className="codex-command-retention" role="status">Output exceeds the retained size limit; the text shown is truncated.</p> : null}
   </dialog>;
 }

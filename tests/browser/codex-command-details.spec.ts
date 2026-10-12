@@ -170,6 +170,74 @@ test("preserves multiline text, native copy, scrolling and draft while output co
   );
 });
 
+for (const direction of ["forward", "backward"] as const) {
+  test(`copies ${direction} selected output after repeated streamed appends`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const { snapshots, input, opener } = await openFixture(page);
+    await opener.click();
+    const dialog = page.getByRole("dialog", {
+      name: "Codex command and output",
+    });
+    const commandOutput = dialog.getByRole("textbox", {
+      name: "Command output",
+      exact: true,
+    });
+    await expect(commandOutput).toHaveValue(output);
+    await commandOutput.focus();
+    const selected = await commandOutput.evaluate((element, direction) => {
+      const textarea = element as HTMLTextAreaElement;
+      textarea.setSelectionRange(7, 34, direction);
+      textarea.scrollTop = 1_000;
+      textarea.scrollLeft = 100;
+      return {
+        start: textarea.selectionStart,
+        end: textarea.selectionEnd,
+        direction: textarea.selectionDirection,
+        top: textarea.scrollTop,
+        left: textarea.scrollLeft,
+      };
+    }, direction);
+    expect(selected).toMatchObject({ start: 7, end: 34, direction });
+    expect(selected.top).toBeGreaterThan(0);
+    expect(selected.left).toBeGreaterThan(0);
+    for (const chunk of ["continued output\n", "more streamed output\n"]) {
+      snapshots.alpha.commands[0].output += chunk;
+      await expect(commandOutput).toHaveValue(
+        snapshots.alpha.commands[0].output,
+      );
+      await expect(commandOutput).toBeFocused();
+      expect(
+        await commandOutput.evaluate((element) => {
+          const textarea = element as HTMLTextAreaElement;
+          return {
+            start: textarea.selectionStart,
+            end: textarea.selectionEnd,
+            direction: textarea.selectionDirection,
+            top: textarea.scrollTop,
+            left: textarea.scrollLeft,
+          };
+        }),
+      ).toEqual(selected);
+      await page.evaluate(() => navigator.clipboard.writeText("before copy"));
+      await page.keyboard.press("ControlOrMeta+C");
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(output.slice(7, 34));
+    }
+    await testInfo.attach("browser-version", {
+      body: page.context().browser()!.version(),
+      contentType: "text/plain",
+    });
+    await page.keyboard.press("Escape");
+    await expect(dialog).not.toBeVisible();
+    await expect(opener).toBeFocused();
+    expect(input).toEqual([]);
+  });
+}
+
 test("keeps details tied to their tab, execution and selected command", async ({
   page,
 }) => {
