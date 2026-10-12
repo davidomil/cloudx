@@ -331,36 +331,87 @@ it.skipIf(!codex)("nested arbitrary MCP hook input survives native save, read an
   } finally { await fixture.dispose(); }
 }, 15_000);
 
-it.skipIf(!codex)("rejects a same-name legacy table before selecting a separate launch profile", async () => {
+it.skipIf(!codex).each(["base", "selected profile"])("rejects a same-name legacy table from the %s before selecting a separate launch profile", async location => {
   const fixture = await NativeConfigurationSession.create();
   try {
     const configPath = path.join(fixture.home, "config.toml");
-    await fs.appendFile(configPath, '[profiles.writing]\nmodel_verbosity="low"\n');
     const profilePath = path.join(fixture.home, "writing.config.toml");
     await fs.writeFile(profilePath, 'model_verbosity="high"\n');
+    await fs.appendFile(location === "base" ? configPath : profilePath, '# Keep this legacy table unchanged.\n[profiles.writing]\nmodel_verbosity="low"\n');
     const original = await fixture.settings.read();
     const text = await fs.readFile(configPath, "utf8");
+    const profile = await fs.readFile(profilePath, "utf8");
     await expect(fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" })).rejects.toThrow(/legacy.*profiles\.writing/);
     expect(await fs.readFile(configPath, "utf8")).toBe(text);
-    expect(await fs.readFile(profilePath, "utf8")).toBe('model_verbosity="high"\n');
+    expect(await fs.readFile(profilePath, "utf8")).toBe(profile);
+    expect((await fixture.settings.read()).revision).toBe(original.revision);
     await fixture.launch();
     await fixture.completeTurn();
     expect(fixture.requests).toHaveLength(1);
   } finally { await fixture.dispose(); }
 }, 30_000);
 
-it.skipIf(!codex)("an unrelated legacy table does not block a separate native launch profile", async () => {
+it.skipIf(!codex).each(["base", "selected profile"])("an unrelated legacy table in the %s does not block a separate native launch profile", async location => {
   const fixture = await NativeConfigurationSession.create();
   try {
     const configPath = path.join(fixture.home, "config.toml");
-    await fs.appendFile(configPath, '[profiles.other]\nmodel_verbosity="low" # keep unrelated legacy content\n');
-    await fs.writeFile(path.join(fixture.home, "writing.config.toml"), 'model_verbosity="high"\n');
+    const profilePath = path.join(fixture.home, "writing.config.toml");
+    await fs.writeFile(profilePath, 'model_verbosity="high"\n');
+    const legacyPath = location === "base" ? configPath : profilePath;
+    await fs.appendFile(legacyPath, '[profiles.other]\nmodel_verbosity="low" # keep unrelated legacy content\n');
     const original = await fixture.settings.read();
     await fixture.settings.update({ expectedRevision: original.revision, configProfile: "writing" });
     await fixture.launch();
     await fixture.completeTurn();
     expect(fixture.requests[0]).toMatchObject({ text: { verbosity: "high" } });
-    expect(await fs.readFile(configPath, "utf8")).toContain('# keep unrelated legacy content');
+    expect(await fs.readFile(legacyPath, "utf8")).toContain('# keep unrelated legacy content');
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("a namespaced model uses native canonical metadata without an exact catalog entry", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const configPath = path.join(fixture.home, "config.toml");
+    await fs.writeFile(configPath, (await fs.readFile(configPath, "utf8")).replace(/^model_catalog_json = .*\n/m, ""));
+    const original = await fixture.settings.read();
+    const saved = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "vendor/gpt-6.1-sol" } });
+    expect(saved.configuration?.values.model).toBe("vendor/gpt-6.1-sol");
+    expect(saved.configuration?.values).not.toHaveProperty("model_catalog_json");
+    const text = await fs.readFile(configPath, "utf8");
+    for (const key of ["model_reasoning_effort", "plan_mode_reasoning_effort"]) {
+      await expect(fixture.settings.update({ expectedRevision: saved.revision, nativeOptions: { [key]: "banana" } })).rejects.toThrow(/reasoning effort/);
+      expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    }
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model: "vendor/gpt-6.1-sol", reasoning: { effort: "low" } });
+    expect(parse(await fs.readFile(fixture.overlayConfigPath, "utf8")).model).toBe("vendor/gpt-6.1-sol");
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("an advertised model with no default main reasoning effort saves and completes a default-mode turn", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models.push({ ...catalog.models[0], slug: "local-no-reasoning", default_reasoning_level: null, supported_reasoning_levels: [] });
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const original = await fixture.settings.read();
+    const saved = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "local-no-reasoning" } });
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    for (const key of ["model_reasoning_effort", "plan_mode_reasoning_effort"]) {
+      for (const effort of ["low", "none", "banana"]) {
+        await expect(fixture.settings.update({ expectedRevision: saved.revision, nativeOptions: { [key]: effort } })).rejects.toThrow(/reasoning effort/);
+        expect(await fs.readFile(configPath, "utf8")).toBe(text);
+      }
+    }
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model: "local-no-reasoning", reasoning: {} });
+    expect(fixture.requests[0]?.reasoning).not.toHaveProperty("effort");
+    expect(saved.configuration?.values).not.toHaveProperty("model_reasoning_effort");
+    expect(saved.configuration?.values).not.toHaveProperty("plan_mode_reasoning_effort");
   } finally { await fixture.dispose(); }
 }, 30_000);
 

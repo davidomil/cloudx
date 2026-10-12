@@ -17,14 +17,31 @@ function supportsReasoningEffort(model: NativeModelCapabilities | undefined, eff
     && model.supportedReasoningEfforts.some(item => item?.reasoningEffort === effort);
 }
 
+function longestModelPrefix(models: NativeModelCapabilities[], requested: string): NativeModelCapabilities | undefined {
+  let matched: NativeModelCapabilities | undefined;
+  for (const model of models) {
+    if (typeof model?.model === "string" && requested.startsWith(model.model)
+      && (!matched || model.model.length > matched.model.length)) matched = model;
+  }
+  return matched;
+}
+
+function resolveNativeModelCapabilities(models: NativeModelCapabilities[], requested: unknown): NativeModelCapabilities | undefined {
+  if (typeof requested !== "string") return undefined;
+  const direct = longestModelPrefix(models, requested);
+  if (direct) return direct;
+  const namespaced = /^[A-Za-z0-9_-]+\/([^/]*)$/.exec(requested);
+  return namespaced ? longestModelPrefix(models, namespaced[1]!) : undefined;
+}
+
 /** Parse the candidate with the selected native executable, without using its credentials or state. */
 export async function validateNativeCodexConfiguration(command: string, config: string, env: NodeJS.ProcessEnv, signal: AbortSignal | undefined, profile: { name: string; text: string } | undefined, previous: Readonly<Record<string, unknown>>, checkPersonality: boolean): Promise<void> {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-validation-"));
   try {
     const base = parseCodexConfiguration(config);
-    if (profile && base.profiles && typeof base.profiles === "object" && Object.hasOwn(base.profiles, profile.name))
-      throw new Error(`Native Codex launch profile conflicts with legacy profiles.${profile.name}. Remove the legacy table before selecting this profile.`);
     const candidate = withCodexLaunchModelDefault(profile ? mergeCodexConfigurationLayers(base, parseCodexConfiguration(profile.text)) : base);
+    if (profile && candidate.profiles && typeof candidate.profiles === "object" && Object.hasOwn(candidate.profiles, profile.name))
+      throw new Error(`Native Codex launch profile conflicts with legacy profiles.${profile.name}. Remove the legacy table before selecting this profile.`);
     const effective = stringify(candidate);
     const before = withCodexLaunchModelDefault(previous);
     const modelSourceChanged = candidate.model_provider !== previous.model_provider || candidate.model_catalog_json !== previous.model_catalog_json;
@@ -73,13 +90,13 @@ export async function validateNativeCodexConfiguration(command: string, config: 
           }
           if (message.id === 3) {
             const models: NativeModelCapabilities[] = Array.isArray(message.result?.data) ? message.result.data : [];
-            advertised = models.find(item => item?.model === candidate.model);
-            const modelChanged = modelSourceChanged || advertised?.model !== before.model;
-            const mainInherited = candidate.model_reasoning_effort === undefined && (modelChanged || previous.model_reasoning_effort !== undefined);
-            const planInherited = candidate.plan_mode_reasoning_effort === undefined && (modelChanged || previous.plan_mode_reasoning_effort !== undefined);
+            advertised = resolveNativeModelCapabilities(models, candidate.model);
+            const mainInherited = candidate.model_reasoning_effort === undefined && (selectionChanged || previous.model_reasoning_effort !== undefined);
+            const planInherited = candidate.plan_mode_reasoning_effort === undefined && previous.plan_mode_reasoning_effort !== undefined;
             const effort = mainInherited ? advertised?.defaultReasoningEffort : candidate.model_reasoning_effort;
+            const inheritsNoMainEffort = mainInherited && effort === "none";
             if (message.error || !advertised) stop(new Error("Selected model capabilities are not advertised by native Codex. Configure a model catalog before changing model-specific defaults."));
-            else if ((mainInherited || effort !== undefined) && !supportsReasoningEffort(advertised, effort)) stop(new Error("Selected model does not advertise the chosen reasoning effort."));
+            else if ((mainInherited || effort !== undefined) && !inheritsNoMainEffort && !supportsReasoningEffort(advertised, effort)) stop(new Error("Selected model does not advertise the chosen reasoning effort."));
             else if (candidate.plan_mode_reasoning_effort !== undefined && !supportsReasoningEffort(advertised, candidate.plan_mode_reasoning_effort)) stop(new Error("Selected model does not advertise the chosen Plan reasoning effort."));
             else if (checkPersonality && candidate.personality !== undefined && candidate.personality !== "none" && advertised.supportsPersonality !== true) stop(new Error("Selected model does not advertise personality support."));
             else if (planInherited) child.stdin.write(`${JSON.stringify({ id: 4, method: "collaborationMode/list", params: {} })}\n`);
