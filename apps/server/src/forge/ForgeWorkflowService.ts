@@ -1415,8 +1415,7 @@ export class ForgeWorkflowService {
     this.operations.get(worker.id)?.signal.throwIfAborted();
     if (report.kind === "issue") {
       if (worker.batch) await this.validateBatchPublication(worker, report);
-      worker.pendingPublication ??= { report, repliedDiscussionIds: [] };
-      await this.preparePublication(worker);
+      await this.preparePublication(worker, worker.pendingPublication ?? { report, repliedDiscussionIds: [] });
       if (worker.ciRepair?.phase === "repairing" && !await this.acceptCiRepairReport(worker)) return true;
       if (worker.attemptId) {
         await this.deps.reports.remove(worker.attemptId);
@@ -1463,17 +1462,19 @@ export class ForgeWorkflowService {
       await this.requireHandoffContinuation(worker, new Error(`The combined batch request needs correction: ${message(error)}`));
     }
   }
-  private async preparePublication(worker: ForgeWorker): Promise<void> {
-    const publication = worker.pendingPublication!;
+  private async preparePublication(worker: ForgeWorker, publication = worker.pendingPublication!): Promise<void> {
     if (publication.baseUpdate || publication.handoff || publication.headSha) return;
     const completion = worker.completion!;
     try {
       const declared = publication.report.handoff;
       if (declared?.status === "needs_work")
         throw new ForgeHandoffError(`Implementation needs work: ${declared.details}`);
-      publication.handoff = await this.waitForWorkerIO(worker, "Validating committed handoff", () => this.deps.runtime.preparePublication(
+      const handoff = await this.waitForWorkerIO(worker, "Validating committed handoff", () => this.deps.runtime.preparePublication(
         workerWorkspace(worker), completion.attemptId, declared, this.operations.get(worker.id)?.signal,
       ));
+      this.operations.get(worker.id)?.signal.throwIfAborted();
+      publication.handoff = handoff;
+      worker.pendingPublication = publication;
       await this.persist();
     } catch (error) {
       if (!publication.handoff) worker.pendingPublication = undefined;
