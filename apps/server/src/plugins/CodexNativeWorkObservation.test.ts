@@ -135,6 +135,60 @@ it("does not accept saved-history completion but supports no-goal clients withou
   expect(tab.last().recoveryStatus).toBe("succeeded");
 });
 
+it("retains provider diagnostics and confirms no-goal recovery after the resume goal query is rejected", () => {
+  const failed = conversation();
+  failed.start();
+  failed.complete("failed", providerError);
+  const savedError = failed.last().lastError;
+  const resumed = conversation(true, threadId, savedError);
+  resumed.fromClient({ id: 7, method: "thread/goal/get", params: { threadId } });
+  resumed.fromServer({ id: 7, error: { code: -32600, message: "goals feature is disabled" } });
+  expect(resumed.last()).toMatchObject({ recoveryStatus: "awaiting_turn", lastError: savedError });
+  resumed.start("recovery-turn");
+  resumed.complete("completed", undefined, "recovery-turn");
+  expect(resumed.last()).toMatchObject({ turnStatus: "completed", recoveryStatus: "succeeded", lastError: savedError });
+  expect(resumed.last().goalStatus).toBeUndefined();
+});
+
+it.each(["thread/goal/get", "thread/goal/set"])("keeps known blocked-goal protection and provider diagnostics after %s is rejected", method => {
+  const savedError = nativeWorkError(providerError, "terminal");
+  const tab = conversation(true, threadId, savedError, "blocked");
+  tab.fromClient({ id: 7, method, params: { threadId, status: "active" } });
+  tab.fromServer({ id: 7, error: { code: -32600, message: "goals feature is disabled" } });
+  expect(tab.last()).toMatchObject({ recoveryStatus: "awaiting_goal_resume", goalStatus: "blocked", lastError: savedError });
+  tab.start();
+  tab.complete();
+  expect(tab.last()).toMatchObject({ turnStatus: "completed", recoveryStatus: "awaiting_goal_resume", goalStatus: "blocked", lastError: savedError });
+});
+
+it("still fails recovery when the native turn start is rejected", () => {
+  const tab = conversation(true);
+  tab.fromClient({ id: 7, method: "turn/start", params: { threadId } });
+  tab.fromServer({ id: 7, error: providerError });
+  expect(tab.last()).toMatchObject({ turnStatus: "failed", recoveryStatus: "failed", lastError: { kind: "terminal", requestId } });
+});
+
+it.each(["terminal", "retry"])("preserves the complete saved other processing-error diagnostic on exact resume for %s receipts", kind => {
+  const savedError = nativeWorkError({ ...providerError, codexErrorInfo: "other", httpStatusCode: 200 }, kind);
+  expect(savedError).toEqual({ message: "The provider reported an internal processing error.", kind, code: "other", requestId, httpStatusCode: 200 });
+  const tab = conversation(true, threadId, savedError);
+  expect(tab.last().lastError).toEqual(savedError);
+  expect(JSON.stringify(tab.saved)).not.toMatch(/credential|private|Authorization|provider response body/);
+});
+
+it("restores only accepted safe messages and supported diagnostic fields", () => {
+  const safe = nativeWorkError(providerError, "terminal");
+  const restored = conversation(true, threadId, { ...safe, credentials: "secret", additionalDetails: "private conversation" });
+  expect(restored.last().lastError).toEqual(safe);
+  expect(JSON.stringify(restored.saved)).not.toMatch(/secret|private|credentials|additionalDetails/);
+  const unsafe = conversation(true, threadId, {
+    message: "Authorization: Bearer secret; private conversation", kind: "terminal", code: "other",
+    requestId: "secret", httpStatusCode: 900, additionalDetails: "private request body"
+  });
+  expect(unsafe.last().lastError).toEqual({ message: "Codex reported a native turn error.", kind: "terminal", code: "other" });
+  expect(JSON.stringify(unsafe.saved)).not.toMatch(/secret|private|Authorization|additionalDetails/);
+});
+
 it("requires reactivation of a previously known blocked goal even before its native snapshot", () => {
   const tab = conversation(true, threadId, undefined, "blocked");
   expect(tab.last()).toMatchObject({ goalStatus: "blocked", recoveryStatus: "awaiting_goal_resume" });

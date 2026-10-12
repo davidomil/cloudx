@@ -66,6 +66,7 @@ export class SessionStore {
   private readonly tabOwnershipActions = new Map<string, Promise<unknown>>();
   private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
   private readonly tabRecoveryRequests = new Map<string, RecoverTabRequest>();
+  private readonly tabRuntimeContextActions = new Map<string, Promise<unknown>>();
   private readonly restartingNativeTabs = new Set<string>();
   // Tabs whose agent is being switched. Their input and actions are refused
   // so no new turn starts while the switch is prepared.
@@ -185,7 +186,9 @@ export class SessionStore {
     }
     if (request.action === "restart-native") this.restartingNativeTabs.add(tabId);
     this.tabRecoveryRequests.set(tabId, { ...request });
-    const recovering = this.admitAction(undefined, () => this.recoverTabNow(tabId, request));
+    const recovering = this.admitAction(undefined, () => request.action === "restart-native"
+      ? this.serializeRuntimeContext(tabId, () => this.recoverTabNow(tabId, request))
+      : this.recoverTabNow(tabId, request));
     this.tabRecoveries.set(tabId, recovering);
     const finished = () => {
       this.tabRecoveries.delete(tabId);
@@ -1059,7 +1062,22 @@ export class SessionStore {
     return restarted;
   }
 
-  async applyRuntimeContext(tabId: string, reason = "Applying runtime context."): Promise<WorkspaceTab> {
+  private serializeRuntimeContext<T>(tabId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.tabRuntimeContextActions.get(tabId);
+    const pending = previous ? previous.then(action) : action();
+    this.tabRuntimeContextActions.set(tabId, pending);
+    const finished = () => {
+      if (this.tabRuntimeContextActions.get(tabId) === pending) this.tabRuntimeContextActions.delete(tabId);
+    };
+    void pending.then(finished, finished);
+    return pending;
+  }
+
+  applyRuntimeContext(tabId: string, reason = "Applying runtime context."): Promise<WorkspaceTab> {
+    return this.admitAction(undefined, () => this.serializeRuntimeContext(tabId, () => this.applyRuntimeContextNow(tabId, reason)));
+  }
+
+  private async applyRuntimeContextNow(tabId: string, reason: string): Promise<WorkspaceTab> {
     const tab = this.getTab(tabId);
     const session = this.sessions.get(tabId);
     if (!session?.applyRuntimeContext || !this.runtimeContextResolver) {

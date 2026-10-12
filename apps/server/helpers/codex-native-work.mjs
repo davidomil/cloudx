@@ -45,6 +45,12 @@ export function nativeWorkError(error, kind) {
   };
 }
 
+function restoredNativeWorkError(error) {
+  const restored = nativeWorkError(error, error.kind === "retry" ? "retry" : "terminal");
+  if (Object.values(ERROR_MESSAGES).includes(error.message)) restored.message = error.message;
+  return restored;
+}
+
 /** Selected native work health is independent of terminal liveness and switch activity. */
 export class CodexNativeWorkObservation {
   constructor(binding, save, selection) {
@@ -80,7 +86,7 @@ export class CodexNativeWorkObservation {
       this.recoveryTurnId = undefined;
       this.state = {
         version: 1, tabId: this.binding.tabId, executionId: this.binding.executionId, threadId,
-        ...(this.recovering && this.binding.previousError ? { lastError: nativeWorkError(this.binding.previousError, this.binding.previousError.kind === "retry" ? "retry" : "terminal") } : {}),
+        ...(this.recovering && this.binding.previousError ? { lastError: restoredNativeWorkError(this.binding.previousError) } : {}),
         ...(this.recovering && this.binding.previousGoalStatus ? { goalStatus: this.binding.previousGoalStatus } : {}),
         ...(this.recovering ? { recoveryStatus: this.goalResumeRequired ? "awaiting_goal_resume" : "awaiting_turn" } : {})
       };
@@ -110,7 +116,7 @@ export class CodexNativeWorkObservation {
       if (!request || request.threadId !== this.state.threadId) return;
       this.pending.delete(message.id);
       if (message.error) {
-        this.recordError(message.error, "terminal", request.method === "turn/start");
+        if (request.method === "turn/start") this.recordError(message.error, "terminal");
       } else if (request.method === "turn/start") {
         this.startTurn(message.result?.turn?.id);
       } else if (Object.hasOwn(message.result ?? {}, "goal")) {
