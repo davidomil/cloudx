@@ -8,6 +8,11 @@ export const maxCiFailureJobs = 8;
 export const maxCiLogBytes = 128_000;
 export const maxCiLogScanBytes = 16_000_000;
 const maxCiLogCharacters = 31_900;
+const operationalCiBlockers = {
+  credentials: /bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i,
+  policy: /billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i,
+  infrastructure: /runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i,
+};
 
 export interface CiLogEvidence {
   log: string;
@@ -36,9 +41,8 @@ export function classifyCiLog(log: string): CiJob["classification"] {
   const operationalLog = log.split(/\r?\n/).filter(line =>
     !/assertion(?:error| failed)|\bexpected\b.*\b(?:received|actual|equal)\b|\bFAIL(?:ED)?\b.*(?:test|spec)/i.test(line),
   ).join("\n");
-  if (/bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i.test(operationalLog)) return "credentials";
-  if (/billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i.test(operationalLog)) return "policy";
-  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i.test(operationalLog)) return "infrastructure";
+  for (const classification of ["credentials", "policy", "infrastructure"] as const)
+    if (operationalCiBlockers[classification].test(operationalLog)) return classification;
   if (/assertion(?:error| failed)|\bFAIL(?:ED)?\b.*(?:test|spec)|(?:test|spec).*(?:failed|failure|timed out)|\b(?:TypeError|SyntaxError|ReferenceError|CompileError)\b|\berror TS\d+\b|\berror\[E\d+\]|compilation failed|lint.*(?:error|failed)|eslint|prettier|\bexpected\b.*\b(?:received|actual|equal)\b|\blocator\.\w+:\s*(?:Timeout \d+ms exceeded|.*(?:failed|timed out))|\b(?:Error|TimeoutError):\s*expect\([^\r\n]*\)\.[^\r\n]*(?:failed|timed out|timeout)/i.test(log)) return "code";
   return "unknown";
 }
@@ -168,8 +172,13 @@ class CiLogExcerpts {
     const priorities: CiJob["classification"][] = ["unknown", "code", "infrastructure", "policy", "credentials"];
     if (priorities.indexOf(classification) > priorities.indexOf(this.evidence.classification))
       this.evidence.classification = classification;
-    if (["credentials", "policy", "infrastructure"].includes(classification) && !this.blockerLog.has(classification))
-      this.blockerLog.set(classification, clean.slice(0, 1_000));
+    if ((classification === "credentials" || classification === "policy" || classification === "infrastructure") && !this.blockerLog.has(classification)) {
+      const match = operationalCiBlockers[classification].exec(clean);
+      const context = match
+        ? clean.slice(Math.max(0, match.index - 300), match.index + 700).trim()
+        : "[REDACTED blocker text]";
+      this.blockerLog.set(classification, `[${classification}] ${context}\n`);
+    }
     this.checkout(line, clean);
     if (!this.shortened) {
       this.complete += clean;

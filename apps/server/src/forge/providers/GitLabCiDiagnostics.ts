@@ -2,7 +2,7 @@ import type { ForgeChangeRequest, ForgeCiDiagnostic } from "@cloudx/shared";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 import { ForgeProviderError } from "./ForgeProvider.js";
 import { boolean, integer, list, record, string } from "./validation.js";
-import { ciDiagnostic, ciEvidenceFailure, ciId, ciJobName, ciSha, ciUrl, classifyCiLog, classifyDiagnostic, finishCiDiagnostic, maxCiFailureJobs, type CiJob } from "./ciEvidence.js";
+import { ciDiagnostic, ciEvidenceFailure, ciId, ciJobName, ciSha, ciUrl, classifyDiagnostic, finishCiDiagnostic, maxCiFailureJobs, type CiJob } from "./ciEvidence.js";
 
 export class GitLabCiDiagnostics {
   private readonly path: string;
@@ -50,9 +50,9 @@ export class GitLabCiDiagnostics {
           conclusion: string(job.status), testedSha, classification: "unknown",
         };
         diagnostic.jobs.push(evidence);
-        const log = await this.http.ciLog(`${this.path}/jobs/${id}/trace`);
-        evidence.log = log;
-        evidence.classification = this.classification(job, log);
+        const collected = await this.http.ciLogEvidence(`${this.path}/jobs/${id}/trace`);
+        evidence.log = collected.log;
+        evidence.classification = this.classification(job, collected.classification);
       }
       const latestRequest = await this.snapshot(change, diagnostic);
       if (!latestRequest) return finishCiDiagnostic(diagnostic);
@@ -113,8 +113,7 @@ export class GitLabCiDiagnostics {
     return failed;
   }
 
-  private classification(job: Record<string, unknown>, log: string): CiJob["classification"] {
-    const classification = classifyCiLog(log);
+  private classification(job: Record<string, unknown>, classification: CiJob["classification"]): CiJob["classification"] {
     if (classification === "credentials" || classification === "policy" || classification === "infrastructure") return classification;
     const reason = string(job.failure_reason);
     if (["runner_system_failure", "stuck_or_timeout_failure", "scheduler_failure", "data_integrity_failure", "runner_unsupported"].includes(reason)) return "infrastructure";

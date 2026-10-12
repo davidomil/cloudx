@@ -74,9 +74,11 @@ export class TerminalSelectionCopy {
     container.append(this.panel, this.menu, this.help);
 
     const capture = { capture: true, signal: this.events.signal };
-    container.addEventListener("keydown", this.onKeyDown, capture);
-    container.addEventListener("copy", this.onCopy, capture);
-    container.addEventListener("contextmenu", this.onContextMenu, capture);
+    for (const element of [terminal.element!, this.panel, this.menu, this.help]) {
+      element.addEventListener("keydown", this.onKeyDown, capture);
+      element.addEventListener("copy", this.onCopy, capture);
+      element.addEventListener("contextmenu", this.onContextMenu, capture);
+    }
     terminal.element!.addEventListener("mousedown", this.onMouseDown, capture);
     terminal.element!.addEventListener("mousedown", this.captureClickedRange, { signal: this.events.signal });
     window.addEventListener("mousemove", this.onMouseMove, capture);

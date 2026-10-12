@@ -1373,6 +1373,102 @@ test("stages application clipboard text until an explicit trusted copy and prese
   expect(stream.input).toEqual(["\x03"]);
 });
 
+for (const gesture of ["Control+c", "browser copy"]) {
+  test(`copies only the highlighted application preview word while a terminal selection is saved using ${gesture}`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop clipboard.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page);
+    const saved = "old saved terminal text";
+    stream.data(`\x1bc${saved}`);
+    await expect(page.locator(".xterm-rows")).toContainText(saved);
+    await select(page, [0, 0], [saved.length, 0]);
+    const selection = page.getByRole("textbox", {
+      name: "Selected terminal text",
+    });
+    await expect(selection).toHaveValue(saved);
+    const application = "review this command before copying";
+    stream.data(`\x1b]52;c;${Buffer.from(application).toString("base64")}\x07`);
+    const preview = page.getByRole("textbox", {
+      name: "Application clipboard text",
+    });
+    await expect(preview).toHaveValue(application);
+    await preview.focus();
+    await preview.evaluate((element: HTMLTextAreaElement) => {
+      const start = element.value.indexOf("command");
+      element.setSelectionRange(start, start + "command".length);
+    });
+    if (gesture === "browser copy")
+      expect(await page.evaluate(() => document.execCommand("copy"))).toBe(
+        true,
+      );
+    else await page.keyboard.press(gesture);
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe("command");
+    await expect(preview).toHaveValue(application);
+    await expect(selection).toHaveValue(saved);
+    expect(stream.input).toEqual([]);
+
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.press("Control+c");
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(saved);
+    await expect(selection).toBeHidden();
+    await expect(preview).toHaveValue(application);
+    expect(stream.input).toEqual([]);
+    await page.keyboard.press("Control+c");
+    await expect.poll(() => stream.input.join("")).toBe("\x03");
+  });
+}
+
+test("keeps application preview context menus and Escape native while a terminal selection is saved", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-chromium", "Desktop clipboard.");
+  const stream = await terminalStream(page);
+  const saved = "old saved terminal text";
+  stream.data(`\x1bc${saved}`);
+  await expect(page.locator(".xterm-rows")).toContainText(saved);
+  await select(page, [0, 0], [saved.length, 0]);
+  stream.data(
+    `\x1b]52;c;${Buffer.from("review application text").toString("base64")}\x07`,
+  );
+  const preview = page.getByRole("textbox", {
+    name: "Application clipboard text",
+  });
+  await expect(preview).toHaveValue("review application text");
+  const contextMenu = await preview.evaluate((element) => {
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+    });
+    return element.dispatchEvent(event);
+  });
+  expect(contextMenu).toBe(true);
+  await expect(page.getByRole("menu", { exact: true })).toBeHidden();
+  await preview.focus();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toHaveValue(saved);
+  expect(stream.input).toEqual([]);
+
+  await page.locator(".xterm-helper-textarea").focus();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("textbox", { name: "Selected terminal text" }),
+  ).toBeHidden();
+  await expect(preview).toHaveValue("review application text");
+  expect(stream.input).toEqual([]);
+});
+
 test("reports application clipboard permission denial and retains the reviewed text", async ({
   page,
   context,

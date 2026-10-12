@@ -52,6 +52,23 @@ describe("complete CI log evidence with bounded excerpts", () => {
     expect(evidence.log).toContain(blocker);
   });
 
+  it.each([
+    ["credentials", "fatal: authentication failed"],
+    ["policy", "Workflow is disabled; approval required"],
+    ["infrastructure", "Runner lost communication with the server"],
+  ])("retains redacted context around a %s blocker deep in an omitted line", async (classification, blocker) => {
+    const middle = `${"x".repeat(1_500)} "token":"opaque-context-secret", worker-private-token ${blocker} ${"y".repeat(1_500)}\n`;
+    const evidence = await scan(checkout() + noise + middle + noise + browserFailure);
+    expect(evidence.classification).toBe(classification);
+    expect(evidence.log).toContain(blocker);
+    expect(evidence.log).toContain("REDACTED");
+    expect(evidence.log).not.toContain("opaque-context-secret");
+    expect(evidence.log).not.toContain("worker-private-token");
+    expect(evidence.log).not.toContain("x".repeat(1_000));
+    expect(evidence.log).not.toContain("y".repeat(1_000));
+    expect(evidence.log.length).toBeLessThanOrEqual(32_000);
+  });
+
   it("preserves blocker precedence throughout the full stream", async () => {
     const evidence = await scan("Runner offline\n" + noise + "approval required\n" + noise + "HTTP 401 unauthorized\n" + browserFailure);
     expect(evidence.classification).toBe("credentials");

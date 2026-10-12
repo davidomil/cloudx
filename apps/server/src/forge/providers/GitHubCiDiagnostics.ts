@@ -56,56 +56,75 @@ export class GitHubCiDiagnostics {
           throw new ForgeProviderError("The failed check does not match a terminal workflow job.");
         if (job.name !== failure.name) throw new ForgeProviderError("The required check and workflow job names differ.");
         const identities = new Map<number, string>();
-        const visited = new Set<number>();
+        const active = new Set<number>();
+        const completed = new Set<number>();
         let workflow: GitHubWorkflowDependencies | undefined;
         let workflowSha: string | undefined;
         const inspect = async (producer: Record<string, unknown>, gate?: CiJob["requiredGate"]): Promise<boolean> => {
           const jobId = ciId(producer.id);
-          if (visited.has(jobId)) throw new ForgeProviderError("Aggregate dependencies repeat or form a cycle.");
-          visited.add(jobId);
-          if (visited.size > maxCiFailureJobs * 2 || diagnostic.jobs.length >= maxCiFailureJobs)
+          if (active.has(jobId)) throw new ForgeProviderError("Aggregate dependencies form a cycle.");
+          if (!identities.has(jobId) && identities.size >= maxCiFailureJobs * 2)
             throw new ForgeProviderError("Too many failed CI dependencies to diagnose safely.");
           if (ciId(producer.run_id) !== failure.runId || ciSha(producer.head_sha) !== change.headSha ||
               producer.run_attempt !== undefined && ciId(producer.run_attempt) !== failure.runAttempt ||
               producer.status !== "completed" || !["failure", "timed_out"].includes(string(producer.conclusion)))
             throw new ForgeProviderError("A failed dependency does not match this terminal run attempt and source.");
-          identities.set(jobId, this.jobIdentity(producer));
-          const existing = diagnostic.jobs.find(job => job.runId === String(failure.runId) && job.runAttempt === failure.runAttempt && job.jobId === String(jobId));
-          if (existing) {
-            if (workflowSha && existing.testedSha !== workflowSha) throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
-            return existing.classification === "code" && Boolean(existing.testedSha);
-          }
-          const evidence: CiJob = {
-            runId: String(failure.runId), runAttempt: failure.runAttempt, jobId: String(jobId),
-            name: ciJobName(producer.name), url: ciUrl(producer.html_url), conclusion: string(producer.conclusion),
-            classification: "unknown", ...(gate ? { requiredGate: gate } : {}),
-          };
-          diagnostic.jobs.push(evidence);
-          const collected = await this.http.ciLogEvidence(`${this.path}/actions/jobs/${jobId}/logs`);
-          Object.assign(evidence, { log: collected.log, classification: collected.classification });
-          if (["credentials", "policy", "infrastructure"].includes(evidence.classification)) {
-            classifyDiagnostic(diagnostic);
-            return false;
-          }
-          if (collected.checkout.invalid || collected.checkout.shas.length > 1)
-            throw new ForgeProviderError("The complete job log does not prove one tested checkout revision in the configured repository.");
-          const testedSha = collected.checkout.shas[0];
-          if (testedSha) {
-            if (workflowSha && testedSha !== workflowSha) throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
-            if (!await this.testedCurrentCommit(testedSha, change, diagnostic)) return false;
-            evidence.testedSha = testedSha;
+          const identity = this.jobIdentity(producer);
+          if (identities.has(jobId) && identities.get(jobId) !== identity)
+            throw new ForgeProviderError("A shared dependency changed its job identity.");
+          identities.set(jobId, identity);
+          if (completed.has(jobId)) return true;
+          active.add(jobId);
+          try {
+            const existing = diagnostic.jobs.find(job => job.runId === String(failure.runId) && job.runAttempt === failure.runAttempt && job.jobId === String(jobId));
+            if (existing) {
+              if (workflowSha && existing.testedSha !== workflowSha) throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
+              const inspected = existing.classification === "code" && Boolean(existing.testedSha);
+              if (inspected) completed.add(jobId);
+              return inspected;
+            }
+            if (diagnostic.jobs.length >= maxCiFailureJobs)
+              throw new ForgeProviderError("Too many failed CI dependencies to diagnose safely.");
+            const evidence: CiJob = {
+              runId: String(failure.runId), runAttempt: failure.runAttempt, jobId: String(jobId),
+              name: ciJobName(producer.name), url: ciUrl(producer.html_url), conclusion: string(producer.conclusion),
+              classification: "unknown", ...(gate ? { requiredGate: gate } : {}),
+            };
+            diagnostic.jobs.push(evidence);
+            const collected = await this.http.ciLogEvidence(`${this.path}/actions/jobs/${jobId}/logs`);
+            Object.assign(evidence, { log: collected.log, classification: collected.classification });
+            if (["credentials", "policy", "infrastructure"].includes(evidence.classification)) {
+              classifyDiagnostic(diagnostic);
+              return false;
+            }
+            if (collected.checkout.invalid || collected.checkout.shas.length > 1)
+              throw new ForgeProviderError("The complete job log does not prove one tested checkout revision in the configured repository.");
+            const testedSha = collected.checkout.shas[0];
+            if (testedSha) {
+              if (workflowSha && testedSha !== workflowSha) throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
+              if (!await this.testedCurrentCommit(testedSha, change, diagnostic)) return false;
+              evidence.testedSha = testedSha;
+              // A checkout also appears in result-only verifier gates. Unknown
+              // output needs the pinned dependencies before it can offer repair.
+              if (evidence.classification === "code" || run.path === undefined) {
+                completed.add(jobId);
+                return true;
+              }
+            }
+            if (!workflow) {
+              workflowSha = await this.workflowRevision(run, change, diagnostic);
+              if (!workflowSha) return false;
+              workflow = await this.pinnedWorkflow(run, workflowSha);
+            }
+            const dependencies = workflow.failedDependencies(producer, jobs);
+            diagnostic.jobs.pop();
+            const requiredGate = gate ?? { jobId: evidence.jobId, name: evidence.name, url: evidence.url, log: evidence.log! };
+            for (const dependency of dependencies) if (!await inspect(dependency, requiredGate)) return false;
+            completed.add(jobId);
             return true;
+          } finally {
+            active.delete(jobId);
           }
-          if (!workflow) {
-            workflowSha = await this.workflowRevision(run, change, diagnostic);
-            if (!workflowSha) return false;
-            workflow = await this.pinnedWorkflow(run, workflowSha);
-          }
-          const dependencies = workflow.failedDependencies(producer, jobs);
-          diagnostic.jobs.pop();
-          const requiredGate = gate ?? { jobId: evidence.jobId, name: evidence.name, url: evidence.url, log: evidence.log! };
-          for (const dependency of dependencies) if (!await inspect(dependency, requiredGate)) return false;
-          return true;
         };
         const inspected = await inspect(job);
         const runTestedSha = diagnostic.jobs.at(-1)?.testedSha;

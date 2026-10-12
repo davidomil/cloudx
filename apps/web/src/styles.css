@@ -7424,6 +7424,11 @@ a:hover svg {
     opacity: 0.7;
   }
 
+  .terminal-copy-help {
+    right: 34px;
+    max-width: min(480px, calc(100% - 46px));
+  }
+
   .file-browser-body {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(150px, var(--file-tree-size, 280px)) 9px minmax(0, 1fr);

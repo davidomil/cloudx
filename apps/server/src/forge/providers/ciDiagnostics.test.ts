@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { ForgeChangeRequest, ForgeRepository } from "@cloudx/shared";
 import { createForgeProvider, ForgeCredentials } from "./index.js";
@@ -566,5 +567,68 @@ describe("GitHub checkout-free required aggregate gates", () => {
   it("does not accept the current aggregate workflow with a superseded producer checkout", async () => {
     const fixture = aggregateFixture({ logs: { "501": "INSTALLED_UPGRADE_RESULT: failure\n", "502": `${checkout.replace(tested, stale)}${codeFailure}` } });
     expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", reason: expect.stringContaining("pinned aggregate") });
+  });
+});
+
+
+// The required gates in the production workflow share the same failed lane.
+const pinnedWorkflow = readFileSync(new URL("../../../../../.github/workflows/ci.yml", import.meta.url), "utf8");
+const productionJobNames = [
+  "CI aggregate", "Repository policy", "TypeScript (build, type-check, test)",
+  "Codex native recovery (installer)", "Codex native recovery (0.156.1)",
+  "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Pinned lifecycle revisions",
+  "Clean installation", "Installed previous-version upgrade", "Python services (pytest)",
+  "Browser smoke (desktop and mobile)", "Isolated full verifier", "Trusted merge identity",
+  "Isolated verifier (coverage-1)", "Isolated verifier (coverage-2)",
+  "Isolated verifier (coverage-3)", "Isolated verifier (coverage-4)",
+  "Isolated verifier (static)", "Isolated verifier (asr)", "Isolated verifier (documentation)",
+  "Isolated verifier (browser-1)", "Isolated verifier (browser-2)", "Merged isolated coverage",
+];
+const productionJobs = productionJobNames.map((name, index) => ({
+  ...hubJob, id: 501 + index, name,
+  conclusion: ["CI aggregate", "Python services (pytest)", "Browser smoke (desktop and mobile)",
+    "Isolated full verifier", "Isolated verifier (browser-2)"].includes(name) ? "failure" : "success",
+  check_run_url: `https://api.github.com/repos/owner/repo/check-runs/${901 + index}`,
+  html_url: `https://github.com/owner/repo/actions/runs/100/job/${501 + index}`,
+}));
+function productionAggregateFixture(options: Parameters<typeof githubFixture>[0] = {}) {
+  return githubFixture({ checks: [{ ...check, name: "CI aggregate" }],
+    run: { event: "pull_request", path: ".github/workflows/ci.yml", workflow_id: 88 },
+    jobs: productionJobs, workflow: pinnedWorkflow,
+    logs: Object.fromEntries(productionJobs.map(job => [job.id, job.name === "Isolated verifier (browser-2)"
+      ? `${checkout}${codeFailure}` : "Process completed with exit code 1.\n"])), ...options });
+}
+
+describe("GitHub shared failed producers in the pinned CloudX workflow", () => {
+  it.each([false, true])("retains one producer shared by required gates, including a checked-out full verifier: %s", async checkedOut => {
+    const fixture = productionAggregateFixture();
+    if (checkedOut) {
+      const original = fixture.fetcher.getMockImplementation()!;
+      fixture.fetcher.mockImplementation((url, init) => String(url).endsWith("/jobs/512/logs")
+        ? Promise.resolve(new Response(`${checkout}Process completed with exit code 1.\n`)) : original(url, init));
+    }
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "actionable", testedSha: tested,
+      jobs: [{ jobId: "522", name: "Isolated verifier (browser-2)", classification: "code" }] });
+    expect(diagnostic.jobs).toHaveLength(1);
+    expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/522/logs"))).toHaveLength(1);
+  });
+
+  it("rejects actual cycles between failed gates", async () => {
+    const workflow = pinnedWorkflow.replace("needs:\n      - isolated-lanes", "needs:\n      - aggregate");
+    expect(await productionAggregateFixture({ workflow }).provider.getCiFailure(change))
+      .toMatchObject({ state: "blocked", reason: expect.stringContaining("cycle") });
+  });
+
+  it.each(["producer", "shared gate"])("rechecks the %s identity after collecting logs", async movement => {
+    let jobsRead = 0;
+    const original = productionAggregateFixture();
+    const fixture = productionAggregateFixture({ intercept: (url, init) => {
+      if (url.pathname.endsWith("/attempts/2/jobs") && ++jobsRead === 2) return Response.json({ jobs:
+        productionJobs.map(job => job.name === (movement === "producer" ? "Isolated verifier (browser-2)" : "Browser smoke (desktop and mobile)")
+          ? { ...job, check_run_url: "https://api.github.com/repos/owner/repo/check-runs/999" } : job) });
+      return original.fetcher(url, init);
+    } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "obsolete" });
   });
 });
