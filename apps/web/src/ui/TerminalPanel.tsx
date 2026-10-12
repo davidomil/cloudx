@@ -13,10 +13,12 @@ import { TerminalSelectionCopy } from "./terminalSelectionCopy.js";
 import { TerminalClipboardRequest } from "./terminalClipboardRequest.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 import { CodexCommandDetails } from "./CodexCommandDetails.js";
+import { CodexNativeWorkPanel } from "./CodexNativeWorkPanel.js";
 
 interface TerminalView {
   tabId: string;
   tabUpdatedAt: string;
+  executionId?: string;
   pluginId: string;
   terminal: Terminal;
   fit: FitAddon;
@@ -144,7 +146,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
       view.onConnectionError = undefined;
       viewRef.current = null;
     };
-  }, [tab.id, tab.cwd, tab.title, uiScale, needsRecovery, recoveryEnabled, preserveOutput]);
+  }, [tab.id, tab.cwd, tab.title, tab.nativeWork?.executionId, uiScale, needsRecovery, recoveryEnabled, preserveOutput]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -164,6 +166,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     <div className="terminal-panel" ref={containerRef} role="region" aria-label="Codex terminal output" />
   </div> : recoveryPanel ?? <div className="terminal-panel" ref={containerRef} />;
   return tab.pluginId === "codex-terminal" ? <div className="codex-terminal-view">
+    <CodexNativeWorkPanel tab={tab} onRecover={onRecover} />
     <CodexCommandDetails tabId={tab.id} tabTitle={tab.title} active={active && !needsRecovery} />
     {content}
   </div> : content;
@@ -186,7 +189,11 @@ function disposeTerminalViewInternal(tabId: string): void {
 }
 
 function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: number): TerminalView {
-  const existing = terminalViews.get(tab.id);
+  let existing = terminalViews.get(tab.id);
+  if (existing && existing.executionId !== tab.nativeWork?.executionId) {
+    disposeTerminalViewInternal(tab.id);
+    existing = undefined;
+  }
   if (existing) {
     existing.uiScale = uiScale;
     existing.tabId = tab.id;
@@ -207,7 +214,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   terminal.loadAddon(fit);
 
   const socket = createTerminalSocket(tab.id);
-  const view: TerminalView = { tabId: tab.id, tabUpdatedAt: tab.updatedAt, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false };
+  const view: TerminalView = { tabId: tab.id, tabUpdatedAt: tab.updatedAt, executionId: tab.nativeWork?.executionId, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false };
   terminalViews.set(tab.id, view);
   registerTerminalView(tab.id, {
     dispose: () => disposeTerminalViewInternal(tab.id),

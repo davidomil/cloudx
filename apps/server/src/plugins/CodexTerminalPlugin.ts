@@ -19,6 +19,8 @@ import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery, findCodexTranscript } from "./CodexConversationRecovery.js";
 import { codexCommandDetailsPath, readCodexCommandDetails, unavailableCommandDetails } from "./CodexCommandDetails.js";
 import type { CodexCommandDetailsSnapshot } from "@cloudx/shared";
+import type { CodexNativeWork, RecoverTabRequest } from "@cloudx/shared";
+import { CodexNativeWorkReceipt } from "./CodexNativeWork.js";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -188,8 +190,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     }
     const conversation = launchTemplate.overlay ? new CodexConversationRecovery(launchTemplate.overlay.codexHome) : undefined;
     const selection = conversation ? { tabId: input.tab.id, executionId: randomUUID(), receiptPath: conversation.receiptPath } : undefined;
+    const work = launchTemplate.overlay ? new CodexNativeWorkReceipt(launchTemplate.overlay.codexHome) : undefined;
+    const targetedRecovery = input.initialInput?.codexNativeRecovery === true;
+    delete restoredInput.codexNativeRecovery;
     restoredInput = { ...restoredInput, codexExecutionId: selection?.executionId };
     await conversation?.reset();
+    if (work) await fs.rm(work.receiptPath, { force: true });
     if (launchTemplate.overlay) await fs.rm(codexCommandDetailsPath(launchTemplate.overlay.codexHome), { force: true });
     if (launchTemplate.overlay) await fs.rm(agentTurnReceiptPath(launchTemplate.overlay.codexHome), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
@@ -207,6 +213,11 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         JSON.stringify({
           ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
+          ...(selection && work ? { workHealth: {
+            tabId: input.tab.id, executionId: selection.executionId, receiptPath: work.receiptPath,
+            ...(targetedRecovery ? { expectedThreadId: input.tab.nativeWork!.threadId, recovery: true,
+              previousError: input.tab.nativeWork?.lastError, previousGoalStatus: input.tab.nativeWork?.goalStatus } : {})
+          } } : {}),
           ...(selection && launchTemplate.overlay ? { commandDetails: { tabId: input.tab.id, executionId: selection.executionId, receiptPath: codexCommandDetailsPath(launchTemplate.overlay.codexHome) } } : {}),
           ...(launchTemplate.overlay ? { activity: { receiptPath: agentTurnReceiptPath(launchTemplate.overlay.codexHome) } } : {}),
           startupPicker: resume?.mode === "picker",
@@ -241,6 +252,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       turnState: launchTemplate.overlay ? () => readAgentTurnState(agentTurnReceiptPath(launchTemplate.overlay!.codexHome)) : undefined,
       nativeTurn: input.agentTurn,
       restoreInput: () => restoredInput,
+      initialNativeWork: targetedRecovery && selection ? {
+        version: 1, tabId: input.tab.id, executionId: selection.executionId, threadId: input.tab.nativeWork!.threadId,
+        updatedAt: new Date().toISOString(), goalStatus: input.tab.nativeWork?.goalStatus, lastError: input.tab.nativeWork?.lastError,
+        recoveryStatus: input.tab.nativeWork?.goalStatus && input.tab.nativeWork.goalStatus !== "active" && input.tab.nativeWork.goalStatus !== "complete" ? "awaiting_goal_resume" : "awaiting_turn"
+      } : undefined,
+      observeNativeWork: work ? listener => work.observe(input.tab.id, restoredInput.codexExecutionId, listener) : undefined,
       commandDetails: launchTemplate.overlay ? () => readCodexCommandDetails(launchTemplate.overlay!.codexHome, input.tab.id, restoredInput.codexExecutionId) : undefined,
       onEnded: () => this.providers?.usage?.ended(input.tab.id),
       observeConversation: () => conversation?.observe(identity => {
@@ -300,6 +317,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       }
     }
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
+    const work = this.sources ? new CodexNativeWorkReceipt(this.sources.viewPath(input.tab.id)) : undefined;
+    let initialNativeWork: CodexNativeWork | undefined;
+    try { initialNativeWork = work?.readForExecution(input.tab.id, restoredInput.codexExecutionId); }
+    catch { /* An unverified receipt cannot authorize native recovery. */ }
     return new CodexTerminalSession(input.tab, terminal, input.controls, {
       closeOnExit: input.initialInput?.codexRecovered !== true,
       closeOnExitAfterMs: CODEX_CLOSE_ON_EXIT_GRACE_MS,
@@ -309,6 +330,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceSummary: "Existing interactive Codex CLI session.",
       turnState: this.sources ? () => readAgentTurnState(agentTurnReceiptPath(this.sources!.viewPath(input.tab.id))) : undefined,
       restoreInput: () => restoredInput,
+      initialNativeWork,
+      observeNativeWork: work ? listener => work.observe(input.tab.id, restoredInput.codexExecutionId, listener) : undefined,
       commandDetails: this.sources ? () => readCodexCommandDetails(this.sources!.viewPath(input.tab.id), input.tab.id, restoredInput.codexExecutionId) : undefined,
       onEnded: () => this.providers?.usage?.ended(input.tab.id),
       observeConversation: () => conversation?.observe(identity => {
@@ -381,6 +404,31 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ...input, initialInput, prepareAgentSession: undefined,
       runtimeContext: isRecord(codexRuntimeContext) ? codexRuntimeContext as WorkspaceRuntimeContext : input.runtimeContext
     }, true);
+  }
+
+  async prepareNativeRecovery(input: CreatePluginSessionInput, request: RecoverTabRequest): Promise<CreatePluginSessionInput> {
+    if (request.action !== "restart-native" || !this.sources || readAgentSelection(input.initialInput?.agent)?.providerId === "claude")
+      throw new Error("Native recovery requires a bound Codex conversation.");
+    const home = this.sources.viewPath(input.tab.id);
+    const identity = new CodexConversationRecovery(home).readForExecution(input.tab.id, request.executionId);
+    const work = new CodexNativeWorkReceipt(home).readForExecution(input.tab.id, request.executionId);
+    if (!identity?.selection || !work || request.executionId !== input.initialInput?.codexExecutionId ||
+        identity.sessionId !== request.sessionId || work.threadId !== identity.sessionId)
+      throw new Error("The selected Codex conversation or execution changed. Refresh this tab before recovering.");
+    if (identity.cwd !== input.cwd) throw new Error("The saved Codex conversation workspace differs from this tab. Select the correct workspace before recovering.");
+    if (work.turnStatus === "running" || work.turnStatus !== "failed" && work.goalStatus !== "blocked")
+      throw new Error("Native recovery requires a stopped failed turn or blocked goal.");
+    await this.requireConversation(input.tab.id, identity.sessionId);
+    await this.codexAccount(readAgentSelection(input.initialInput?.agent));
+    const currentIdentity = new CodexConversationRecovery(home).readForExecution(input.tab.id, request.executionId);
+    const currentWork = new CodexNativeWorkReceipt(home).readForExecution(input.tab.id, request.executionId);
+    if (!currentIdentity?.selection || currentIdentity.sessionId !== identity.sessionId || currentIdentity.cwd !== identity.cwd ||
+        !currentWork || currentWork.threadId !== work.threadId || currentWork.turnId !== work.turnId ||
+        currentWork.turnStatus !== work.turnStatus || currentWork.goalStatus !== work.goalStatus)
+      throw new Error("The native conversation changed while recovery was prepared. Refresh this tab before recovering.");
+    return { ...input, tab: { ...input.tab, nativeWork: work }, initialInput: {
+      ...input.initialInput, resume: { mode: "session", sessionId: identity.sessionId }, codexNativeRecovery: true
+    } };
   }
 
   async ownershipAvailability(input: CreatePluginSessionInput): Promise<DirectoryOwnershipAvailability> {
@@ -792,6 +840,8 @@ interface TerminalSessionOptions {
   restoreInput?(): Record<string, unknown>;
   commandDetails?(): Promise<CodexCommandDetailsSnapshot>;
   observeConversation?(): (() => void) | undefined;
+  initialNativeWork?: CodexNativeWork;
+  observeNativeWork?(listener: (work: CodexNativeWork | undefined) => void): () => void;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
 }
 
@@ -882,6 +932,9 @@ export class CodexTerminalSession implements PluginSession {
   private terminalClosed = false;
   private readonly terminalSubscriptions: Array<() => void> = [];
   private stopObservingConversation: (() => void) | undefined;
+  private stopObservingNativeWork: (() => void) | undefined;
+  private nativeWorkState: CodexNativeWork | undefined;
+  private readonly nativeWorkListeners = new Set<(work: CodexNativeWork | undefined) => void>();
 
   constructor(
     public readonly tab: WorkspaceTab,
@@ -892,6 +945,11 @@ export class CodexTerminalSession implements PluginSession {
     this.status = tab.status;
     this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
     this.stopObservingConversation = options.observeConversation?.();
+    this.nativeWorkState = options.initialNativeWork;
+    this.stopObservingNativeWork = options.observeNativeWork?.(work => {
+      this.nativeWorkState = work;
+      for (const listener of this.nativeWorkListeners) listener(work);
+    });
     if ("pauseOutput" in terminalProcess && typeof terminalProcess.pauseOutput === "function"
       && "resumeOutput" in terminalProcess && typeof terminalProcess.resumeOutput === "function") {
       this.producer = terminalProcess as TerminalProducer;
@@ -925,6 +983,7 @@ export class CodexTerminalSession implements PluginSession {
     if (screenSubscription) this.terminalSubscriptions.push(screenSubscription);
     this.terminalSubscriptions.push(this.terminalProcess.onExit((event) => {
       this.stopObservingConversation?.();
+      this.stopObservingNativeWork?.();
       this.terminalClosed = true;
       this.clearPendingSubmitTimers();
       this.clearReadyQuietTimer();
@@ -979,6 +1038,15 @@ export class CodexTerminalSession implements PluginSession {
     return this.options.restoreInput?.();
   }
 
+  nativeWork(): CodexNativeWork | undefined {
+    return this.nativeWorkState;
+  }
+
+  onNativeWorkChange(listener: (work: CodexNativeWork | undefined) => void): () => void {
+    this.nativeWorkListeners.add(listener);
+    return () => this.nativeWorkListeners.delete(listener);
+  }
+
   hasExited(): boolean {
     return this.terminalClosed;
   }
@@ -1001,6 +1069,7 @@ export class CodexTerminalSession implements PluginSession {
 
   stop(): void {
     this.stopObservingConversation?.();
+    this.stopObservingNativeWork?.();
     this.stopped = true;
     this.terminalClosed = true;
     this.clearPendingSubmitTimers();
@@ -1014,6 +1083,7 @@ export class CodexTerminalSession implements PluginSession {
   detach(): void {
     if (!this.terminalProcess.detach) throw new Error("This terminal cannot survive server shutdown.");
     this.stopObservingConversation?.();
+    this.stopObservingNativeWork?.();
     this.clearPendingSubmitTimers();
     this.clearReadyQuietTimer();
     for (const unsubscribe of this.terminalSubscriptions) unsubscribe();
@@ -1062,6 +1132,7 @@ export class CodexTerminalSession implements PluginSession {
     if (this.stopped) throw new Error("Codex completion was cancelled.");
     this.terminalClosed = true;
     this.stopObservingConversation?.();
+    this.stopObservingNativeWork?.();
     this.setReadiness("closed", "Codex turn completed.");
     this.setStatus("completed", "Codex turn completed.");
   }
@@ -1079,6 +1150,7 @@ export class CodexTerminalSession implements PluginSession {
     }
     this.terminalClosed = true;
     this.stopObservingConversation?.();
+    this.stopObservingNativeWork?.();
     this.setReadiness("closed", "Terminal was stopped.");
     this.setStatus("stopped", "Terminal was stopped.");
   }
@@ -1114,7 +1186,8 @@ export class CodexTerminalSession implements PluginSession {
       status: this.status,
       statusMessage: this.statusMessage,
       recentOutput: this.recentOutput,
-      state: { readiness: this.readinessSnapshot(), turn: this.options.turnState?.() }
+      state: { readiness: this.readinessSnapshot(), turn: this.options.turnState?.() },
+      nativeWork: this.nativeWorkState
     };
   }
 

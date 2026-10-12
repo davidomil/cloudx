@@ -249,6 +249,96 @@ describe("TerminalPanel", () => {
     expect(replacementSocket.sent.map((data) => JSON.parse(data))).toContainEqual({ type: "resize", cols: 80, rows: 24 });
   });
 
+  it("keeps a blocked native goal's terminal live through observation updates and reconnection", async () => {
+    vi.useFakeTimers();
+    const codexTab = failedNativeTab();
+    const recover = vi.fn();
+    const renderTab = (current: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: current, active: true, uiScale: 1, onRecover: recover
+    })));
+    renderTab(codexTab);
+    const originalSocket = TestWebSocket.latest!;
+    originalSocket.open();
+    const terminal = terminalPanelMocks.terminals[0]!;
+    expect(host!.textContent).toContain("Goal blocked");
+    expect(host!.textContent).toContain("request-after-http-200");
+    expect(host!.textContent).not.toContain("Terminal recovery");
+    expect(terminal.options.disableStdin).toBe(false);
+
+    renderTab({ ...codexTab, updatedAt: new Date(1000).toISOString(), nativeWork: { ...codexTab.nativeWork!, updatedAt: new Date(1000).toISOString(), recoveryStatus: "awaiting_goal_resume" } });
+    expect(TestWebSocket.instances).toHaveLength(1);
+    terminal.inputHandlers.forEach(handler => handler("/goal resume\r"));
+    expect(inputMessages(originalSocket)).toEqual([{ type: "input", data: "/goal resume\r" }]);
+    originalSocket.close(1001);
+    vi.advanceTimersByTime(500);
+    const reconnect = TestWebSocket.latest!;
+    reconnect.open();
+    reconnect.screen("Blocked goal. Enter /goal resume.");
+    expect(host!.textContent).toContain("request-after-http-200");
+    expect(host!.textContent).toContain("Waiting for explicit goal resume");
+    expect(terminal.disposed).toBe(false);
+    expect(terminal.options.disableStdin).toBe(false);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it.each(["mounted", "cached"])("replaces a %s native client's old socket when its execution changes", viewState => {
+    vi.useFakeTimers();
+    const codexTab = failedNativeTab();
+    const renderTab = (current: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, {
+      tab: current, active: true, uiScale: 1, onRecover: vi.fn()
+    })));
+    renderTab(codexTab);
+    const originalSocket = TestWebSocket.latest!;
+    originalSocket.open();
+    const oldTerminal = terminalPanelMocks.terminals[0]!;
+    originalSocket.output("Original native client");
+    originalSocket.close(1001);
+    if (viewState === "cached") act(() => root!.render(createElement("div")));
+    renderTab({ ...codexTab, nativeWork: { ...codexTab.nativeWork!, executionId: "restarted-execution", recoveryStatus: "awaiting_goal_resume" } });
+    const newSocket = TestWebSocket.latest!;
+    newSocket.open();
+    originalSocket.output("stale old client output");
+    newSocket.output("Restarted native client");
+    terminalPanelMocks.terminals[1]!.inputHandlers.forEach(handler => handler("/goal resume\r"));
+    vi.advanceTimersByTime(10_000);
+
+    expect(oldTerminal.disposed).toBe(true);
+    expect(oldTerminal.writeCalls).toEqual(["Original native client"]);
+    expect(TestWebSocket.instances).toHaveLength(2);
+    expect(terminalPanelMocks.terminals[1]!.writeCalls).toEqual(["Restarted native client"]);
+    expect(inputMessages(newSocket)).toEqual([{ type: "input", data: "/goal resume\r" }]);
+    expect(terminalPanelMocks.terminals[1]!.options.disableStdin).toBe(false);
+  });
+
+  it("restarts only the affected native client's view while a parallel terminal keeps accepting input", async () => {
+    const codexTab = failedNativeTab();
+    const siblingTab = { ...tab, id: "working-sibling" };
+    const recover = vi.fn().mockResolvedValue(undefined);
+    const renderTabs = (current: WorkspaceTab) => act(() => root!.render(createElement("div", null,
+      createElement(TerminalPanel, { key: current.id, tab: current, active: true, uiScale: 1, onRecover: recover }),
+      createElement(TerminalPanel, { key: siblingTab.id, tab: siblingTab, active: false, uiScale: 1 })
+    )));
+    renderTabs(codexTab);
+    const affectedSocket = TestWebSocket.instances[0]!;
+    const siblingSocket = TestWebSocket.instances[1]!;
+    affectedSocket.open();
+    siblingSocket.open();
+    const siblingTerminal = terminalPanelMocks.terminals[1]!;
+    const restart = [...host!.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "Restart this Codex client")!;
+    await act(async () => restart.click());
+    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "restart-native", executionId: "affected-execution", sessionId: "exact-conversation" });
+    renderTabs({ ...codexTab, nativeWork: { ...codexTab.nativeWork!, executionId: "replacement-execution", recoveryStatus: "awaiting_goal_resume" } });
+    siblingSocket.output("parallel turn still working");
+    siblingTerminal.inputHandlers.forEach(handler => handler("parallel prompt\r"));
+
+    expect(affectedSocket.readyState).toBe(TestWebSocket.CLOSED);
+    expect(siblingSocket.readyState).toBe(TestWebSocket.OPEN);
+    expect(siblingTerminal.disposed).toBe(false);
+    expect(siblingTerminal.writeCalls).toEqual(["parallel turn still working"]);
+    expect(inputMessages(siblingSocket)).toEqual([{ type: "input", data: "parallel prompt\r" }]);
+    disposeTerminalView(siblingTab.id);
+  });
+
   it("backs off unavailable terminal connections up to five seconds and resets after reconnecting", () => {
     vi.useFakeTimers();
     act(() => {
@@ -571,6 +661,13 @@ describe("TerminalPanel", () => {
     expect(inputMessages(TestWebSocket.latest!).some((message) => message.data.includes("@.cloudx/pasted-images"))).toBe(false);
   });
 });
+
+function failedNativeTab(): WorkspaceTab {
+  return { ...tab, pluginId: "codex-terminal", title: "Affected Codex", nativeWork: {
+    version: 1, tabId: tab.id, executionId: "affected-execution", threadId: "exact-conversation", updatedAt: tab.updatedAt,
+    turnStatus: "failed", goalStatus: "blocked", lastError: { kind: "terminal", message: "Provider stream processing failed.", requestId: "request-after-http-200", httpStatusCode: 200 }
+  } };
+}
 
 function pasteImageEvent(file: File): ClipboardEvent {
   const event = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;

@@ -617,15 +617,21 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/recover", async (request) => {
     const body = optionalRequestBody(request.body);
-    if (Object.keys(body).some(key => key !== "action" && key !== "sessionId")) throwBadRequest("Unknown recovery field.");
+    if (Object.keys(body).some(key => key !== "action" && key !== "sessionId" && key !== "executionId")) throwBadRequest("Unknown recovery field.");
     const action = body.action;
-    if (action !== "reconnect" && action !== "new-shell" && action !== "resume-conversation" && action !== "select-conversation") throwBadRequest("Unknown recovery action.");
+    if (action !== "reconnect" && action !== "new-shell" && action !== "resume-conversation" && action !== "select-conversation" && action !== "restart-native") throwBadRequest("Unknown recovery action.");
     let sessionId: string | undefined;
     if (body.sessionId !== undefined) {
       sessionId = requiredTrimmedBodyString(body.sessionId, "sessionId");
-      if (action !== "resume-conversation" || !/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) throwBadRequest("sessionId must be an exact conversation ID for resume-conversation.");
+      if (action !== "resume-conversation" && action !== "restart-native" || !/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) throwBadRequest("sessionId must be an exact conversation ID for conversation recovery.");
     }
-    return services.sessions.recoverTab(request.params.tabId, { action, sessionId });
+    let executionId: string | undefined;
+    if (body.executionId !== undefined) {
+      executionId = requiredTrimmedBodyString(body.executionId, "executionId");
+      if (action !== "restart-native" || !/^[a-zA-Z0-9_-]{1,128}$/.test(executionId)) throwBadRequest("executionId must identify the selected native execution.");
+    }
+    if (action === "restart-native" && (!sessionId || !executionId)) throwBadRequest("Native recovery requires an exact execution and conversation ID.");
+    return services.sessions.recoverTab(request.params.tabId, { action, sessionId, ...(executionId ? { executionId } : {}) });
   });
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/switch-agent", async (request) => {

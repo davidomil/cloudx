@@ -8,6 +8,7 @@ import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
 import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 import { forwardNativeOutput } from "./codex-worker-output.mjs";
 import { CodexCommandDetailsCapture, saveCommandDetails } from "./codex-command-details.mjs";
+import { CodexNativeWorkObservation } from "./codex-native-work.mjs";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -171,6 +172,10 @@ export async function runWorkerBridge(launch) {
     try { saveTurnReceipt(launch.activity.receiptPath, value); }
     catch (error) { process.stderr.write(`CloudX turn activity: ${error.message}\n`); }
   }) : undefined;
+  const workHealth = launch.workHealth ? new CodexNativeWorkObservation(launch.workHealth, value => {
+    try { saveTurnReceipt(launch.workHealth.receiptPath, value); }
+    catch (error) { process.stderr.write(`CloudX native work health: ${error.message}\n`); }
+  }, selection) : undefined;
   if (!turn && !selection) throw new Error("A native bridge execution binding is required.");
   let finishing = false;
   const fail = error => {
@@ -209,6 +214,7 @@ export async function runWorkerBridge(launch) {
         const message = JSON.parse(data.toString());
         permissions?.fromClient(message);
         selection?.fromClient(message);
+        workHealth?.fromClient(message);
         turn?.fromClient(message);
         activity?.fromClient(message);
         commands?.fromClient(message);
@@ -257,6 +263,7 @@ export async function runWorkerBridge(launch) {
       void forwardNativeOutput(native.stdout, socket, message => {
         permissions?.fromServer(message);
         selection?.fromServer(message);
+        workHealth?.fromServer(message);
         turn?.fromServer(message);
         activity?.fromServer(message);
         commands?.fromServer(message);
