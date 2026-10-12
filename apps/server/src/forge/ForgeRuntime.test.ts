@@ -1,4 +1,6 @@
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
+import { deflateSync } from "node:zlib";
+import { create as createTar, extract as extractTar } from "tar";
 import { execFile } from "node:child_process";
 import { mkdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -4810,6 +4812,84 @@ describe("Forge completed retained checkout reconciliation", () => {
     };
     return { service: new ForgeWorkflowService(deps), deps, store, reports, provider, attemptId, report, history };
   }
+
+  it("names a partial diagnostic object copy, preserves all 114 objects, then retires the batch through Resume after verified recovery", async () => {
+    const workspace = await prepare(randomUUID());
+    const relative = ".cloudx/forge-evidence/continuation-8d8bf43c/source";
+    const source = path.join(workspace.worktreePath, relative);
+    const objects = new Map<string, string>();
+    await fs.mkdir(path.join(source, ".git/objects"), { recursive: true });
+    await fs.writeFile(path.join(source, "README.md"), "Diagnostic source, including unrecoverable working changes");
+    for (let index = 0; index < 114; index++) {
+      const data = randomBytes(148_000);
+      const object = Buffer.concat([Buffer.from(`blob ${data.length}\0`), data]);
+      const sha = createHash("sha1").update(object).digest("hex");
+      const relativeObject = `.git/objects/${sha.slice(0, 2)}/${sha.slice(2)}`;
+      const bytes = deflateSync(object);
+      await fs.mkdir(path.dirname(path.join(source, relativeObject)), { recursive: true });
+      await fs.writeFile(path.join(source, relativeObject), bytes);
+      objects.set(relativeObject, createHash("sha256").update(bytes).digest("hex"));
+    }
+    expect(await git(source, "rev-parse", "HEAD")).toBe(headSha);
+    await expect(git(source, `--git-dir=${source}/.git`, "rev-parse", "--verify", "HEAD")).rejects.toThrow();
+    const f = await completedWorkflow(workspace, [".cloudx"]);
+    const workers = await f.store.read();
+    workers[0]!.number = 196;
+    workers[0]!.batch = { issues: [196, 197, 198].map(number => ({ number, title: `Closed issue ${number}`, url: `https://example.test/${number}`, state: "closed" })) };
+    await f.store.write(workers);
+    try {
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining(relative) });
+      expect((await f.store.read())[0]!.error).toContain("verified archive outside the checkout");
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      for (const [file, digest] of objects)
+        expect(createHash("sha256").update(await fs.readFile(path.join(source, file))).digest("hex")).toBe(digest);
+
+      const recovery = path.join(root, "recovered-diagnostic.tar");
+      const restored = path.join(root, "verified-recovery");
+      await createTar({ file: recovery, cwd: source }, ["."]);
+      await fs.mkdir(restored);
+      await extractTar({ file: recovery, cwd: restored, strict: true });
+      for (const [file, digest] of objects)
+        expect(createHash("sha256").update(await fs.readFile(path.join(restored, file))).digest("hex")).toBe(digest);
+      expect(await fs.readFile(path.join(restored, "README.md"), "utf8")).toContain("unrecoverable working changes");
+      await fs.rename(source, path.join(root, "relocated-diagnostic"));
+      await f.service.resume(workspace.id, { windowId: "window", paneId: "pane" });
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      for (const [file, digest] of objects)
+        expect(createHash("sha256").update(await fs.readFile(path.join(restored, file))).digest("hex")).toBe(digest);
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+    } finally { await f.service.dispose(); }
+  });
+
+  it("retires a declared source-only copy automatically while retaining downloadable report siblings", async () => {
+    const workspace = await prepare(randomUUID());
+    const snapshot = await runtime.createDiagnosticSnapshot(workspace, randomUUID(), { kind: "source-only", commitSha: headSha });
+    const source = path.join(workspace.worktreePath, snapshot.path);
+    expect(await fs.readFile(path.join(source, "README.md"), "utf8")).toBe(await fs.readFile(path.join(workspace.worktreePath, "README.md"), "utf8"));
+    await expect(fs.lstat(path.join(source, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+    const reportPath = ".cloudx/validation/run.log";
+    await fs.mkdir(path.dirname(path.join(workspace.worktreePath, reportPath)), { recursive: true });
+    await fs.writeFile(path.join(workspace.worktreePath, reportPath), "Snapshot validation passed");
+    const f = await completedWorkflow(workspace, [".cloudx"]);
+    try {
+      runtime = new ForgeRuntime(dependencies());
+      f.deps.runtime = runtime;
+      await f.service.dispose();
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      const evidence = new ForgeCheckoutEvidence(path.join(root, "data"));
+      const [manifest] = await evidence.list();
+      expect(manifest!.files.map(file => file.path)).toEqual([reportPath]);
+      const chunks: Buffer[] = [];
+      for await (const chunk of await evidence.fileStream(manifest!.archiveId, reportPath)) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe("Snapshot validation passed");
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+    } finally { await f.service.dispose(); }
+  });
 
   it.each([false, true])("loads and removes a completed generated-only checkout through authoritative closure (review: %s)", async review => {
     const workspace = await prepare(randomUUID(), review);

@@ -16,7 +16,7 @@ export async function createForgeContainer({ serverUrl, workerId, attemptId, spe
   return result;
 }
 
-function requestEnvironment(url, options) {
+export function requestEnvironment(url, options) {
   const transport = url.protocol === 'https:' ? https : http;
   const loopback = ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
   return new Promise((resolve, reject) => {

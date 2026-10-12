@@ -176,6 +176,41 @@ function fixture(issueNumber = 1) {
 }
 const placement = { windowId: "window", paneId: "pane" };
 
+describe("Worker diagnostic snapshot ownership", () => {
+  it("creates snapshots only through the active worker's recorded checkout", async () => {
+    const f = fixture();
+    const result = { path: ".cloudx/forge-snapshots/owned/source", kind: "source-only" as const, retentionPolicy: "disposable" as const };
+    const create = vi.fn(async () => result);
+    f.deps.runtime.createDiagnosticSnapshot = create;
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const input = { kind: "source-only" as const, commitSha: "a".repeat(40) };
+    expect(await f.service.createDiagnosticSnapshot(worker.id, worker.attemptId!, input)).toEqual(result);
+    expect(create).toHaveBeenCalledExactlyOnceWith({ id: worker.id, repositoryPath: worker.repositoryPath,
+      worktreePath: worker.worktreePath, branch: worker.branch }, worker.attemptId, input);
+    const prompt = f.runtime.launch.mock.calls[0]![0].prompt;
+    expect(prompt).toContain(`forge-snapshot.mjs' ${worker.id} ${worker.attemptId}`);
+    expect(prompt).toContain("Do not create undeclared diagnostic copies");
+  });
+
+  it("rejects stale attempts and inactive worker executions before allocating source copies", async () => {
+    const f = fixture();
+    const create = vi.fn();
+    f.deps.runtime.createDiagnosticSnapshot = create;
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const input = { kind: "repository" as const, commitSha: "a".repeat(40) };
+    await expect(f.service.createDiagnosticSnapshot(worker.id, randomUUID(), input)).rejects.toThrow("current active worker attempt");
+    f.runtime.isActive.mockReturnValue(false);
+    await expect(f.service.createDiagnosticSnapshot(worker.id, worker.attemptId!, input)).rejects.toThrow("current active worker attempt");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("reports an unavailable runtime before promising a diagnostic snapshot", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await expect(f.service.createDiagnosticSnapshot(worker.id, worker.attemptId!, { kind: "source-only", commitSha: "a".repeat(40) })).rejects.toThrow("unavailable in this runtime");
+  });
+});
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason: unknown) => void;

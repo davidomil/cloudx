@@ -53,6 +53,45 @@ archives live under `forge-evidence/<resourceId>`. Container creation requires
 specific evidence paths when evidence retention is requested. Legacy unnamed or
 explicitly kept holds are not silently discarded.
 
+## Diagnostic copies have a separate lifecycle
+
+Create diagnostic copies with the installed `scripts/forge-snapshot.mjs`
+helper using
+`{kind:"source-only"|"repository",commitSha:"<full commit SHA>"}` and
+the current worker and attempt IDs. The trusted snapshot endpoint
+allocates a new `.cloudx/forge-snapshots/<id>/source` directory. Its
+workspace receipt records ownership, origin checkout and Git directory,
+commit, parent and source identities, retention policy, and exact
+contents before retirement.
+
+A source-only snapshot starts from the committed Git archive with Git
+metadata excluded. Creation requires an empty destination and verifies
+every extracted path, file checksum, link target and permission against
+the archive. Retirement verifies provenance, identity and the complete
+saved inventory. Added, modified, missing or explicitly retained source
+requires recovery. Interrupted removal rechecks surviving authorized
+contents, and a replaced or reappeared directory remains protected.
+
+Repository snapshots preserve the complete Git directory, including
+loose objects and private refs, under a recovery policy. Existing
+undeclared repositories and partial object copies remain protected by
+the report archive history guards. Matching an ancestor HEAD cannot
+authorize disposal: origin checks always specify the exact Git
+directory.
+
+Cleanup errors name the blocking repository-relative copy and the
+recovery action. Preserve the complete copy, including source and all
+Git objects, in an archive outside the checkout; verify its recovered
+contents before relocating the copy. Use native Resume after recovery.
+Relocating an entire declared snapshot parent is also recognized without
+deleting the relocated contents. Keep validation reports outside
+snapshot directories so ordinary report archives remain downloadable.
+
+Creation rejects source archives and Git metadata copies above 1 GiB and
+inventories above 100,000 entries. The runtime supplies a 60-second
+cancellation signal. An interrupted or incomplete creation remains
+protected for recovery.
+
 ## Generated Git history survives retirement
 
 Forge-generated `refs/cloudx/before-rebase/<commit>` snapshots are preserved in

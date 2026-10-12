@@ -1353,3 +1353,4 @@ export * from "./workspaceCleanup.js";
 export * from "./forgeResources.js";
 export * from "./forgeCheckoutEvidence.js";
 export * from "./forgeGitHistory.js";
+export * from "./forgeDiagnosticSnapshots.js";
