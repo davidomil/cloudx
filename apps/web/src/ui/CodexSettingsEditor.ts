@@ -11,7 +11,7 @@ export const serviceTiers: { value: ServiceTier; label: string }[] = [
 ];
 export const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export const webSearchModes = ["disabled", "cached", "live", "indexed"] as const;
-export const personalities = ["none", "friendly", "pragmatic"] as const;
+export const personalities = ["none"] as const;
 type NativeSetting = "reasoningEffort" | "webSearch" | "personality";
 
 interface EditorState {
@@ -25,6 +25,9 @@ interface EditorState {
   reasoningEffort: string;
   webSearch: string;
   personality: string;
+  nativeDrafts: Record<string, string>;
+  targetProfile?: string;
+  configProfile: string;
   busy: "loading" | "saving" | null;
   error?: string;
   saved: boolean;
@@ -32,7 +35,7 @@ interface EditorState {
 
 const initialState: EditorState = {
   model: "", serviceTier: "", modeSelected: false, yoloMode: true, autoTrustWorkspace: false,
-  defaultSkills: [], reasoningEffort: "", webSearch: "", personality: "", busy: "loading", saved: false
+  defaultSkills: [], reasoningEffort: "", webSearch: "", personality: "", nativeDrafts: {}, configProfile: "", busy: "loading", saved: false
 };
 
 export class CodexSettingsEditor {
@@ -74,7 +77,28 @@ export class CodexSettingsEditor {
   }
 
   get canSave() {
-    return !this.state.busy && this.validModel && Object.keys(this.changedSettings()).length > 0;
+    return !this.state.busy && this.validModel && !this.nativeError && Object.keys(this.changedSettings()).length > 0;
+  }
+
+  get nativeError(): string | undefined {
+    for (const [family, value] of Object.entries(this.state.nativeDrafts)) {
+      if (!value.trim()) continue;
+      try { JSON.parse(value); } catch { return `Enter valid JSON for ${family}, or use Unset to inherit.`; }
+    }
+  }
+
+  setNativeOption(family: string, value: string): void {
+    if (!this.state.busy) this.update({ nativeDrafts: { ...this.state.nativeDrafts, [family]: value }, saved: false });
+  }
+
+  selectLaunchProfile(configProfile: string): void {
+    if (!this.state.busy) this.update({ configProfile, saved: false });
+  }
+
+  async selectTargetProfile(targetProfile?: string): Promise<void> {
+    if (this.state.busy) return;
+    this.update({ targetProfile });
+    await this.read();
   }
 
   setModel(model: string): void {
@@ -112,7 +136,7 @@ export class CodexSettingsEditor {
   async save(): Promise<void> {
     const { settings } = this.state;
     if (!settings || !this.canSave || !this.callHook) return;
-    const update: CodexGlobalSettingsUpdate = { expectedRevision: settings.revision, ...this.changedSettings() };
+    const update: CodexGlobalSettingsUpdate = { expectedRevision: settings.revision, ...(this.state.targetProfile ? { targetProfile: this.state.targetProfile } : {}), ...this.changedSettings() };
     const version = ++this.requestVersion;
     this.update({ busy: "saving", error: undefined, saved: false });
     try {
@@ -137,7 +161,7 @@ export class CodexSettingsEditor {
     const version = ++this.requestVersion;
     this.update({ busy: "loading", error: undefined, saved: false });
     try {
-      const result = await this.callHook<{ settings: CodexGlobalSettings }>("codex-settings.read", {});
+      const result = await this.callHook<{ settings: CodexGlobalSettings }>("codex-settings.read", this.state.targetProfile ? { targetProfile: this.state.targetProfile } : {});
       if (version === this.requestVersion) this.acceptSettings(result.settings, false);
     } catch (error) {
       if (version === this.requestVersion) this.update({ error: errorMessage(error) });
@@ -150,7 +174,7 @@ export class CodexSettingsEditor {
     this.update({
       settings, model: settings.model ?? "", serviceTier: settings.serviceTier ?? "", modeSelected: false,
       yoloMode: settings.yoloMode, autoTrustWorkspace: settings.autoTrustWorkspace, defaultSkills: settings.defaultSkills,
-      reasoningEffort: settings.reasoningEffort ?? "", webSearch: settings.webSearch ?? "", personality: settings.personality ?? "", saved
+      reasoningEffort: settings.reasoningEffort ?? "", webSearch: settings.webSearch ?? "", personality: settings.personality ?? "", nativeDrafts: {}, configProfile: settings.configProfile ?? "", saved
     });
   }
 
@@ -169,6 +193,12 @@ export class CodexSettingsEditor {
       .filter(skill => settings.defaultSkills.find(saved => saved.id === skill.id)?.enabled !== skill.enabled)
       .map(skill => [skill.id, skill.enabled]));
     if (Object.keys(skillChanges).length) update.defaultSkills = skillChanges;
+    if (!this.state.targetProfile && this.state.configProfile !== (settings.configProfile ?? "")) update.configProfile = this.state.configProfile || null;
+    const nativeOptions = Object.fromEntries(Object.entries(this.state.nativeDrafts).flatMap(([family, draft]) => {
+      const value = draft.trim() ? JSON.parse(draft) : null;
+      return JSON.stringify(value) === JSON.stringify(settings.configuration?.values[family] ?? null) ? [] : [[family, value]];
+    }));
+    if (Object.keys(nativeOptions).length) update.nativeOptions = nativeOptions;
     return update;
   }
 

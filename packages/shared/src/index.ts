@@ -8,6 +8,7 @@ export * from "./forgeConnections.js";
 export * from "./jira.js";
 export * from "./documentationArchive.js";
 export * from "./codexSettings.js";
+export * from "./codexConfiguration.js";
 export * from "./codexCommandDetails.js";
 export * from "./codexNativeWork.js";
 import { isCodexNativeWork, type CodexNativeWork } from "./codexNativeWork.js";
@@ -115,6 +116,8 @@ export interface RecoverTabRequest {
   action: "reconnect" | "new-shell" | "resume-conversation" | "select-conversation" | "restart-native";
   sessionId?: string;
   executionId?: string;
+  all?: boolean;
+  includeNonInteractive?: boolean;
 }
 
 export interface WorkspaceTab {

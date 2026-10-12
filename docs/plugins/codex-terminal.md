@@ -54,6 +54,21 @@ for the latest one, or **Resume ID** and enter a saved session UUID or
 name. Picker and last modes can include **All directories** and
 **Include exec sessions**.
 
+Resume picker, Resume last and recovery default to the original CloudX
+workspace and canonical directory. Conversation ownership is recorded
+separately from cwd, so named workspaces sharing a directory and linked
+Forge worktrees remain distinct.
+
+**All directories** explicitly broadens browsing. **Include exec
+sessions** independently includes exec conversations. Older
+conversations without CloudX ownership records remain accessible through
+All directories or exact-ID resume. Selecting an exact conversation
+preserves its authoritative native binding and original ownership.
+
+Recovery keeps the request attached to its original workspace while it
+is in flight, even if the active workspace changes. The recovery panel
+exposes scope and exec inclusion separately.
+
 Browser reloads and CloudX web-server restarts can reattach the existing
 terminal while the independent terminal service stays running. Stopping
 that service or rebooting stops its processes. Resuming a saved

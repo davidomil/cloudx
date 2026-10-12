@@ -63,7 +63,7 @@ export async function forwardNativeOutput(input, socket, observe, options = {}) 
   const isConnected = () => socket.readyState === WebSocket.OPEN;
   for await (const message of readNativeMessages(input, { ...options, isConnected })) {
     if (!isConnected()) continue;
-    observe(message);
+    if (observe(message) === false) continue;
     const encoded = JSON.stringify(message);
     if (Buffer.byteLength(encoded) > (options.maxMessageBytes ?? MAX_NATIVE_OUTPUT_BYTES))
       throw outputSizeError(options.maxMessageBytes ?? MAX_NATIVE_OUTPUT_BYTES);

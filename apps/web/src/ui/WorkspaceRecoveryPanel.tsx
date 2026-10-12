@@ -16,6 +16,8 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [sessionId, setSessionId] = useState("");
+  const [all, setAll] = useState(false);
+  const [includeNonInteractive, setIncludeNonInteractive] = useState(false);
   const pending = useRef(false);
 
   async function run(action: () => Promise<void>) {
@@ -51,8 +53,8 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
         <p>Conversation: <code>{recovery.conversationId}</code></p>
         <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "resume-conversation" }))}>Resume conversation</ControlButton>
       </> : null}
-      <p>Browse saved conversations by title, preview, and last update in the Codex picker. Your selection confirms the exact conversation for this tab; /status shows its conversation ID.</p>
-      <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "select-conversation" }))}>Select a saved conversation</ControlButton>
+      <p>Browse conversations created in this workspace and directory. Use All directories for other workspaces or older conversations without workspace ownership. Your selection confirms the exact conversation for this tab; /status shows its conversation ID.</p>
+      <ControlButton disabled={busy} onClick={() => void run(() => onRecover({ action: "select-conversation", all, includeNonInteractive }))}>Select a saved conversation</ControlButton>
       <DirectoryOwnershipRecovery key={tab.id} disabled={busy}
         availability={() => tabOwnershipAvailability(tab.id)}
         preview={() => previewTabOwnership(tab.id)}
@@ -66,6 +68,8 @@ export function WorkspaceRecoveryPanel({ tab, recovery, onRecover, onRetire }: {
         </label>
         <ControlButton type="submit" disabled={busy || !sessionId.trim()}>Resume selected conversation</ControlButton>
       </form>
+      <label><input type="checkbox" aria-label="All directories" checked={all} disabled={busy} onChange={event => setAll(event.target.checked)} />All directories</label>
+      <label><input type="checkbox" aria-label="Include exec sessions" checked={includeNonInteractive} disabled={busy} onChange={event => setIncludeNonInteractive(event.target.checked)} />Include exec sessions</label>
     </> : null}
     {busy ? <p role="status">Recovering panel…</p> : null}
   </section>;

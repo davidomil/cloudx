@@ -1,0 +1,1853 @@
+[
+  {
+    "path": "codex --config",
+    "command": "codex",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex --enable",
+    "command": "codex",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex --disable",
+    "command": "codex",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex --remote",
+    "command": "codex",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect the TUI to a remote app server endpoint. Accepted forms: `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`.",
+    "reason": "App-server transport is owned by CloudX for tab and worker launches; remote endpoints are separate native CLI invocations."
+  },
+  {
+    "path": "codex --remote-auth-token-env",
+    "command": "codex",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Name of the environment variable containing the bearer token to send to a remote app server websocket",
+    "reason": "Authentication environment reference for remote CLI transport. CloudX owns its session transport credentials."
+  },
+  {
+    "path": "codex --strict-config",
+    "command": "codex",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex --image",
+    "command": "codex",
+    "flag": "--image",
+    "scope": "launch",
+    "description": "Optional image(s) to attach to the initial prompt",
+    "reason": "Prompt attachment belongs to a specific invocation.",
+    "aliases": [
+      "-i"
+    ]
+  },
+  {
+    "path": "codex --model",
+    "command": "codex",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex --oss",
+    "command": "codex",
+    "flag": "--oss",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex --local-provider",
+    "command": "codex",
+    "flag": "--local-provider",
+    "scope": "launch",
+    "description": "Specify which local provider to use (lmstudio or ollama). If not specified with --oss, will use config default or show selection",
+    "reason": "Use oss_provider in Settings for a persistent local provider. This flag selects a provider for the invocation."
+  },
+  {
+    "path": "codex --profile",
+    "command": "codex",
+    "flag": "--profile",
+    "scope": "launch",
+    "description": "Layer $CODEX_HOME/<name>.config.toml on top of the base user config",
+    "reason": "Names a separate $CODEX_HOME/<name>.config.toml layer. This launch flag differs from legacy profiles in config.toml; select it when launching Codex.",
+    "aliases": [
+      "-p"
+    ]
+  },
+  {
+    "path": "codex --sandbox",
+    "command": "codex",
+    "flag": "--sandbox",
+    "scope": "launch",
+    "description": "Select the sandbox policy to use when executing model-generated shell commands [possible values: read-only, workspace-write, danger-full-access]",
+    "reason": "Use sandbox_mode and permissions in Settings for persistent defaults. This flag selects the sandbox for the invocation.",
+    "aliases": [
+      "-s"
+    ]
+  },
+  {
+    "path": "codex --approve-for-me",
+    "command": "codex",
+    "flag": "--approve-for-me",
+    "scope": "launch",
+    "description": "",
+    "reason": "Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation."
+  },
+  {
+    "path": "codex --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex --dangerously-bypass-hook-trust",
+    "command": "codex",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex --cd",
+    "command": "codex",
+    "flag": "--cd",
+    "scope": "launch",
+    "description": "Tell the agent to use the specified directory as its working root",
+    "reason": "CloudX supplies the tab or Forge checkout working directory for each launch.",
+    "aliases": [
+      "-C"
+    ]
+  },
+  {
+    "path": "codex --worktree",
+    "command": "codex",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex --add-dir",
+    "command": "codex",
+    "flag": "--add-dir",
+    "scope": "launch",
+    "description": "Additional directories that should be writable alongside the primary workspace",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex --ask-for-approval",
+    "command": "codex",
+    "flag": "--ask-for-approval",
+    "scope": "launch",
+    "description": "Configure when the model requires human approval before executing a command Possible values: - on-request: The model decides when to ask the user for approval - never: Never ask for user approval Execution failures are immediately returned to the model",
+    "reason": "Use approval_policy in Settings for a persistent default. This flag selects the policy for the invocation.",
+    "aliases": [
+      "-a"
+    ]
+  },
+  {
+    "path": "codex --search",
+    "command": "codex",
+    "flag": "--search",
+    "scope": "launch",
+    "description": "to the model (no per\u2011call approval)",
+    "reason": "Use web_search in Settings for a persistent default. This flag enables live web search for the invocation."
+  },
+  {
+    "path": "codex --no-alt-screen",
+    "command": "codex",
+    "flag": "--no-alt-screen",
+    "scope": "launch",
+    "description": "Runs the TUI in inline mode, preserving terminal scrollback history.",
+    "reason": "Use tui.alternate_screen in Settings for a persistent default. This flag changes the terminal mode for the invocation."
+  },
+  {
+    "path": "codex --no-daemon",
+    "command": "codex",
+    "flag": "--no-daemon",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX owns the app-server lifecycle; native daemon bypass is a separate CLI invocation option."
+  },
+  {
+    "path": "codex --help",
+    "command": "codex",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex --version",
+    "command": "codex",
+    "flag": "--version",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI version is an inspection action.",
+    "aliases": [
+      "-V"
+    ]
+  },
+  {
+    "path": "codex resume --last",
+    "command": "codex resume",
+    "flag": "--last",
+    "scope": "launch",
+    "description": "",
+    "reason": "Resume last is a launch action; workspace scope is selected separately."
+  },
+  {
+    "path": "codex resume --config",
+    "command": "codex resume",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex resume --all",
+    "command": "codex resume",
+    "flag": "--all",
+    "scope": "launch",
+    "description": "",
+    "reason": "Broader conversation browsing is an explicit Resume scope selection, independent of Include exec sessions."
+  },
+  {
+    "path": "codex resume --enable",
+    "command": "codex resume",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex resume --disable",
+    "command": "codex resume",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex resume --include-non-interactive",
+    "command": "codex resume",
+    "flag": "--include-non-interactive",
+    "scope": "launch",
+    "description": "",
+    "reason": "Include exec sessions is an explicit Resume selection, independent of workspace scope."
+  },
+  {
+    "path": "codex resume --remote",
+    "command": "codex resume",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect the TUI to a remote app server endpoint. Accepted forms: `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`.",
+    "reason": "App-server transport is owned by CloudX for tab and worker launches; remote endpoints are separate native CLI invocations."
+  },
+  {
+    "path": "codex resume --remote-auth-token-env",
+    "command": "codex resume",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Name of the environment variable containing the bearer token to send to a remote app server websocket",
+    "reason": "Authentication environment reference for remote CLI transport. CloudX owns its session transport credentials."
+  },
+  {
+    "path": "codex resume --strict-config",
+    "command": "codex resume",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex resume --image",
+    "command": "codex resume",
+    "flag": "--image",
+    "scope": "launch",
+    "description": "Optional image(s) to attach to the initial prompt",
+    "reason": "Prompt attachment belongs to a specific invocation.",
+    "aliases": [
+      "-i"
+    ]
+  },
+  {
+    "path": "codex resume --model",
+    "command": "codex resume",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex resume --oss",
+    "command": "codex resume",
+    "flag": "--oss",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex resume --local-provider",
+    "command": "codex resume",
+    "flag": "--local-provider",
+    "scope": "launch",
+    "description": "Specify which local provider to use (lmstudio or ollama). If not specified with --oss, will use config default or show selection",
+    "reason": "Use oss_provider in Settings for a persistent local provider. This flag selects a provider for the invocation."
+  },
+  {
+    "path": "codex resume --profile",
+    "command": "codex resume",
+    "flag": "--profile",
+    "scope": "launch",
+    "description": "Layer $CODEX_HOME/<name>.config.toml on top of the base user config",
+    "reason": "Names a separate $CODEX_HOME/<name>.config.toml layer. This launch flag differs from legacy profiles in config.toml; select it when launching Codex.",
+    "aliases": [
+      "-p"
+    ]
+  },
+  {
+    "path": "codex resume --sandbox",
+    "command": "codex resume",
+    "flag": "--sandbox",
+    "scope": "launch",
+    "description": "Select the sandbox policy to use when executing model-generated shell commands [possible values: read-only, workspace-write, danger-full-access]",
+    "reason": "Use sandbox_mode and permissions in Settings for persistent defaults. This flag selects the sandbox for the invocation.",
+    "aliases": [
+      "-s"
+    ]
+  },
+  {
+    "path": "codex resume --approve-for-me",
+    "command": "codex resume",
+    "flag": "--approve-for-me",
+    "scope": "launch",
+    "description": "",
+    "reason": "Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation."
+  },
+  {
+    "path": "codex resume --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex resume",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex resume --dangerously-bypass-hook-trust",
+    "command": "codex resume",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex resume --cd",
+    "command": "codex resume",
+    "flag": "--cd",
+    "scope": "launch",
+    "description": "Tell the agent to use the specified directory as its working root",
+    "reason": "CloudX supplies the tab or Forge checkout working directory for each launch.",
+    "aliases": [
+      "-C"
+    ]
+  },
+  {
+    "path": "codex resume --worktree",
+    "command": "codex resume",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex resume --add-dir",
+    "command": "codex resume",
+    "flag": "--add-dir",
+    "scope": "launch",
+    "description": "Additional directories that should be writable alongside the primary workspace",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex resume --ask-for-approval",
+    "command": "codex resume",
+    "flag": "--ask-for-approval",
+    "scope": "launch",
+    "description": "Configure when the model requires human approval before executing a command Possible values: - on-request: The model decides when to ask the user for approval - never: Never ask for user approval Execution failures are immediately returned to the model",
+    "reason": "Use approval_policy in Settings for a persistent default. This flag selects the policy for the invocation.",
+    "aliases": [
+      "-a"
+    ]
+  },
+  {
+    "path": "codex resume --search",
+    "command": "codex resume",
+    "flag": "--search",
+    "scope": "launch",
+    "description": "to the model (no per\u2011call approval)",
+    "reason": "Use web_search in Settings for a persistent default. This flag enables live web search for the invocation."
+  },
+  {
+    "path": "codex resume --no-alt-screen",
+    "command": "codex resume",
+    "flag": "--no-alt-screen",
+    "scope": "launch",
+    "description": "Runs the TUI in inline mode, preserving terminal scrollback history.",
+    "reason": "Use tui.alternate_screen in Settings for a persistent default. This flag changes the terminal mode for the invocation."
+  },
+  {
+    "path": "codex resume --no-daemon",
+    "command": "codex resume",
+    "flag": "--no-daemon",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX owns the app-server lifecycle; native daemon bypass is a separate CLI invocation option."
+  },
+  {
+    "path": "codex resume --help",
+    "command": "codex resume",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex resume --version",
+    "command": "codex resume",
+    "flag": "--version",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI version is an inspection action.",
+    "aliases": [
+      "-V"
+    ]
+  },
+  {
+    "path": "codex fork --config",
+    "command": "codex fork",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex fork --last",
+    "command": "codex fork",
+    "flag": "--last",
+    "scope": "launch",
+    "description": "",
+    "reason": "Resume last is a launch action; workspace scope is selected separately."
+  },
+  {
+    "path": "codex fork --all",
+    "command": "codex fork",
+    "flag": "--all",
+    "scope": "launch",
+    "description": "",
+    "reason": "Broader conversation browsing is an explicit Resume scope selection, independent of Include exec sessions."
+  },
+  {
+    "path": "codex fork --enable",
+    "command": "codex fork",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex fork --disable",
+    "command": "codex fork",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex fork --remote",
+    "command": "codex fork",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect the TUI to a remote app server endpoint. Accepted forms: `ws://host:port`, `wss://host:port`, `unix://`, or `unix://PATH`.",
+    "reason": "App-server transport is owned by CloudX for tab and worker launches; remote endpoints are separate native CLI invocations."
+  },
+  {
+    "path": "codex fork --remote-auth-token-env",
+    "command": "codex fork",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Name of the environment variable containing the bearer token to send to a remote app server websocket",
+    "reason": "Authentication environment reference for remote CLI transport. CloudX owns its session transport credentials."
+  },
+  {
+    "path": "codex fork --strict-config",
+    "command": "codex fork",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex fork --image",
+    "command": "codex fork",
+    "flag": "--image",
+    "scope": "launch",
+    "description": "Optional image(s) to attach to the initial prompt",
+    "reason": "Prompt attachment belongs to a specific invocation.",
+    "aliases": [
+      "-i"
+    ]
+  },
+  {
+    "path": "codex fork --model",
+    "command": "codex fork",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex fork --oss",
+    "command": "codex fork",
+    "flag": "--oss",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex fork --local-provider",
+    "command": "codex fork",
+    "flag": "--local-provider",
+    "scope": "launch",
+    "description": "Specify which local provider to use (lmstudio or ollama). If not specified with --oss, will use config default or show selection",
+    "reason": "Use oss_provider in Settings for a persistent local provider. This flag selects a provider for the invocation."
+  },
+  {
+    "path": "codex fork --profile",
+    "command": "codex fork",
+    "flag": "--profile",
+    "scope": "launch",
+    "description": "Layer $CODEX_HOME/<name>.config.toml on top of the base user config",
+    "reason": "Names a separate $CODEX_HOME/<name>.config.toml layer. This launch flag differs from legacy profiles in config.toml; select it when launching Codex.",
+    "aliases": [
+      "-p"
+    ]
+  },
+  {
+    "path": "codex fork --sandbox",
+    "command": "codex fork",
+    "flag": "--sandbox",
+    "scope": "launch",
+    "description": "Select the sandbox policy to use when executing model-generated shell commands [possible values: read-only, workspace-write, danger-full-access]",
+    "reason": "Use sandbox_mode and permissions in Settings for persistent defaults. This flag selects the sandbox for the invocation.",
+    "aliases": [
+      "-s"
+    ]
+  },
+  {
+    "path": "codex fork --approve-for-me",
+    "command": "codex fork",
+    "flag": "--approve-for-me",
+    "scope": "launch",
+    "description": "",
+    "reason": "Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation."
+  },
+  {
+    "path": "codex fork --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex fork",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex fork --dangerously-bypass-hook-trust",
+    "command": "codex fork",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex fork --cd",
+    "command": "codex fork",
+    "flag": "--cd",
+    "scope": "launch",
+    "description": "Tell the agent to use the specified directory as its working root",
+    "reason": "CloudX supplies the tab or Forge checkout working directory for each launch.",
+    "aliases": [
+      "-C"
+    ]
+  },
+  {
+    "path": "codex fork --worktree",
+    "command": "codex fork",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex fork --add-dir",
+    "command": "codex fork",
+    "flag": "--add-dir",
+    "scope": "launch",
+    "description": "Additional directories that should be writable alongside the primary workspace",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex fork --ask-for-approval",
+    "command": "codex fork",
+    "flag": "--ask-for-approval",
+    "scope": "launch",
+    "description": "Configure when the model requires human approval before executing a command Possible values: - on-request: The model decides when to ask the user for approval - never: Never ask for user approval Execution failures are immediately returned to the model",
+    "reason": "Use approval_policy in Settings for a persistent default. This flag selects the policy for the invocation.",
+    "aliases": [
+      "-a"
+    ]
+  },
+  {
+    "path": "codex fork --search",
+    "command": "codex fork",
+    "flag": "--search",
+    "scope": "launch",
+    "description": "to the model (no per\u2011call approval)",
+    "reason": "Use web_search in Settings for a persistent default. This flag enables live web search for the invocation."
+  },
+  {
+    "path": "codex fork --no-alt-screen",
+    "command": "codex fork",
+    "flag": "--no-alt-screen",
+    "scope": "launch",
+    "description": "Runs the TUI in inline mode, preserving terminal scrollback history.",
+    "reason": "Use tui.alternate_screen in Settings for a persistent default. This flag changes the terminal mode for the invocation."
+  },
+  {
+    "path": "codex fork --no-daemon",
+    "command": "codex fork",
+    "flag": "--no-daemon",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX owns the app-server lifecycle; native daemon bypass is a separate CLI invocation option."
+  },
+  {
+    "path": "codex fork --help",
+    "command": "codex fork",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex fork --version",
+    "command": "codex fork",
+    "flag": "--version",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI version is an inspection action.",
+    "aliases": [
+      "-V"
+    ]
+  },
+  {
+    "path": "codex exec --config",
+    "command": "codex exec",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex exec --enable",
+    "command": "codex exec",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec --disable",
+    "command": "codex exec",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec --strict-config",
+    "command": "codex exec",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --image",
+    "command": "codex exec",
+    "flag": "--image",
+    "scope": "launch",
+    "description": "Optional image(s) to attach to the initial prompt",
+    "reason": "Prompt attachment belongs to a specific invocation.",
+    "aliases": [
+      "-i"
+    ]
+  },
+  {
+    "path": "codex exec --model",
+    "command": "codex exec",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex exec --oss",
+    "command": "codex exec",
+    "flag": "--oss",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --local-provider",
+    "command": "codex exec",
+    "flag": "--local-provider",
+    "scope": "launch",
+    "description": "Specify which local provider to use (lmstudio or ollama). If not specified with --oss, will use config default or show selection",
+    "reason": "Use oss_provider in Settings for a persistent local provider. This flag selects a provider for the invocation."
+  },
+  {
+    "path": "codex exec --profile",
+    "command": "codex exec",
+    "flag": "--profile",
+    "scope": "launch",
+    "description": "Layer $CODEX_HOME/<name>.config.toml on top of the base user config",
+    "reason": "Names a separate $CODEX_HOME/<name>.config.toml layer. This launch flag differs from legacy profiles in config.toml; select it when launching Codex.",
+    "aliases": [
+      "-p"
+    ]
+  },
+  {
+    "path": "codex exec --sandbox",
+    "command": "codex exec",
+    "flag": "--sandbox",
+    "scope": "launch",
+    "description": "Select the sandbox policy to use when executing model-generated shell commands [possible values: read-only, workspace-write, danger-full-access]",
+    "reason": "Use sandbox_mode and permissions in Settings for persistent defaults. This flag selects the sandbox for the invocation.",
+    "aliases": [
+      "-s"
+    ]
+  },
+  {
+    "path": "codex exec --approve-for-me",
+    "command": "codex exec",
+    "flag": "--approve-for-me",
+    "scope": "launch",
+    "description": "",
+    "reason": "Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation."
+  },
+  {
+    "path": "codex exec --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex exec",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex exec --dangerously-bypass-hook-trust",
+    "command": "codex exec",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex exec --cd",
+    "command": "codex exec",
+    "flag": "--cd",
+    "scope": "launch",
+    "description": "Tell the agent to use the specified directory as its working root",
+    "reason": "CloudX supplies the tab or Forge checkout working directory for each launch.",
+    "aliases": [
+      "-C"
+    ]
+  },
+  {
+    "path": "codex exec --worktree",
+    "command": "codex exec",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex exec --add-dir",
+    "command": "codex exec",
+    "flag": "--add-dir",
+    "scope": "launch",
+    "description": "Additional directories that should be writable alongside the primary workspace",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --thread-source",
+    "command": "codex exec",
+    "flag": "--thread-source",
+    "scope": "launch",
+    "description": "Source classification for newly created or forked threads",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --skip-git-repo-check",
+    "command": "codex exec",
+    "flag": "--skip-git-repo-check",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --ephemeral",
+    "command": "codex exec",
+    "flag": "--ephemeral",
+    "scope": "launch",
+    "description": "",
+    "reason": "Session persistence is selected per native exec invocation."
+  },
+  {
+    "path": "codex exec --ignore-user-config",
+    "command": "codex exec",
+    "flag": "--ignore-user-config",
+    "scope": "launch",
+    "description": "",
+    "reason": "Forge or CLI invocation policy decides whether to load user defaults; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec --ignore-rules",
+    "command": "codex exec",
+    "flag": "--ignore-rules",
+    "scope": "launch",
+    "description": "",
+    "reason": "Invocation policy controls whether rule files are loaded; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec --output-schema",
+    "command": "codex exec",
+    "flag": "--output-schema",
+    "scope": "launch",
+    "description": "Path to a JSON Schema file describing the model's final response shape",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --color",
+    "command": "codex exec",
+    "flag": "--color",
+    "scope": "launch",
+    "description": "Specifies color settings for use in the output [default: auto] [possible values: always, never, auto]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --json",
+    "command": "codex exec",
+    "flag": "--json",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec --output-last-message",
+    "command": "codex exec",
+    "flag": "--output-last-message",
+    "scope": "launch",
+    "description": "Specifies file where the last message from the agent should be written",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliases": [
+      "-o"
+    ]
+  },
+  {
+    "path": "codex exec --help",
+    "command": "codex exec",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex exec --version",
+    "command": "codex exec",
+    "flag": "--version",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI version is an inspection action.",
+    "aliases": [
+      "-V"
+    ]
+  },
+  {
+    "path": "codex exec resume --config",
+    "command": "codex exec resume",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex exec resume --last",
+    "command": "codex exec resume",
+    "flag": "--last",
+    "scope": "launch",
+    "description": "",
+    "reason": "Resume last is a launch action; workspace scope is selected separately."
+  },
+  {
+    "path": "codex exec resume --all",
+    "command": "codex exec resume",
+    "flag": "--all",
+    "scope": "launch",
+    "description": "",
+    "reason": "Broader conversation browsing is an explicit Resume scope selection, independent of Include exec sessions."
+  },
+  {
+    "path": "codex exec resume --enable",
+    "command": "codex exec resume",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec resume --disable",
+    "command": "codex exec resume",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec resume --image",
+    "command": "codex exec resume",
+    "flag": "--image",
+    "scope": "launch",
+    "description": "Optional image(s) to attach to the prompt sent after resuming",
+    "reason": "Prompt attachment belongs to a specific invocation.",
+    "aliases": [
+      "-i"
+    ]
+  },
+  {
+    "path": "codex exec resume --strict-config",
+    "command": "codex exec resume",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec resume --model",
+    "command": "codex exec resume",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex exec resume --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex exec resume",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex exec resume --dangerously-bypass-hook-trust",
+    "command": "codex exec resume",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex exec resume --worktree",
+    "command": "codex exec resume",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex exec resume --thread-source",
+    "command": "codex exec resume",
+    "flag": "--thread-source",
+    "scope": "launch",
+    "description": "Source classification for newly created or forked threads",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec resume --skip-git-repo-check",
+    "command": "codex exec resume",
+    "flag": "--skip-git-repo-check",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec resume --ephemeral",
+    "command": "codex exec resume",
+    "flag": "--ephemeral",
+    "scope": "launch",
+    "description": "",
+    "reason": "Session persistence is selected per native exec invocation."
+  },
+  {
+    "path": "codex exec resume --ignore-user-config",
+    "command": "codex exec resume",
+    "flag": "--ignore-user-config",
+    "scope": "launch",
+    "description": "",
+    "reason": "Forge or CLI invocation policy decides whether to load user defaults; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec resume --ignore-rules",
+    "command": "codex exec resume",
+    "flag": "--ignore-rules",
+    "scope": "launch",
+    "description": "",
+    "reason": "Invocation policy controls whether rule files are loaded; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec resume --output-schema",
+    "command": "codex exec resume",
+    "flag": "--output-schema",
+    "scope": "launch",
+    "description": "Path to a JSON Schema file describing the model's final response shape",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec resume --json",
+    "command": "codex exec resume",
+    "flag": "--json",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec resume --output-last-message",
+    "command": "codex exec resume",
+    "flag": "--output-last-message",
+    "scope": "launch",
+    "description": "Specifies file where the last message from the agent should be written",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliases": [
+      "-o"
+    ]
+  },
+  {
+    "path": "codex exec resume --help",
+    "command": "codex exec resume",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex exec fork --config",
+    "command": "codex exec fork",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex exec fork --image",
+    "command": "codex exec fork",
+    "flag": "--image",
+    "scope": "launch",
+    "description": "Optional image(s) to attach to the prompt sent after forking",
+    "reason": "Prompt attachment belongs to a specific invocation.",
+    "aliases": [
+      "-i"
+    ]
+  },
+  {
+    "path": "codex exec fork --enable",
+    "command": "codex exec fork",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec fork --disable",
+    "command": "codex exec fork",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec fork --strict-config",
+    "command": "codex exec fork",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec fork --model",
+    "command": "codex exec fork",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex exec fork --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex exec fork",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex exec fork --dangerously-bypass-hook-trust",
+    "command": "codex exec fork",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex exec fork --worktree",
+    "command": "codex exec fork",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex exec fork --thread-source",
+    "command": "codex exec fork",
+    "flag": "--thread-source",
+    "scope": "launch",
+    "description": "Source classification for newly created or forked threads",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec fork --skip-git-repo-check",
+    "command": "codex exec fork",
+    "flag": "--skip-git-repo-check",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec fork --ephemeral",
+    "command": "codex exec fork",
+    "flag": "--ephemeral",
+    "scope": "launch",
+    "description": "",
+    "reason": "Session persistence is selected per native exec invocation."
+  },
+  {
+    "path": "codex exec fork --ignore-user-config",
+    "command": "codex exec fork",
+    "flag": "--ignore-user-config",
+    "scope": "launch",
+    "description": "",
+    "reason": "Forge or CLI invocation policy decides whether to load user defaults; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec fork --ignore-rules",
+    "command": "codex exec fork",
+    "flag": "--ignore-rules",
+    "scope": "launch",
+    "description": "",
+    "reason": "Invocation policy controls whether rule files are loaded; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec fork --output-schema",
+    "command": "codex exec fork",
+    "flag": "--output-schema",
+    "scope": "launch",
+    "description": "Path to a JSON Schema file describing the model's final response shape",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec fork --json",
+    "command": "codex exec fork",
+    "flag": "--json",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec fork --output-last-message",
+    "command": "codex exec fork",
+    "flag": "--output-last-message",
+    "scope": "launch",
+    "description": "Specifies file where the last message from the agent should be written",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliases": [
+      "-o"
+    ]
+  },
+  {
+    "path": "codex exec fork --help",
+    "command": "codex exec fork",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex review --config",
+    "command": "codex review",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex review --strict-config",
+    "command": "codex review",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex review --enable",
+    "command": "codex review",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex review --uncommitted",
+    "command": "codex review",
+    "flag": "--uncommitted",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex review --base",
+    "command": "codex review",
+    "flag": "--base",
+    "scope": "launch",
+    "description": "Review changes against the given base branch",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex review --disable",
+    "command": "codex review",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex review --commit",
+    "command": "codex review",
+    "flag": "--commit",
+    "scope": "launch",
+    "description": "Review the changes introduced by a commit",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex review --title",
+    "command": "codex review",
+    "flag": "--title",
+    "scope": "launch",
+    "description": "Optional commit title to display in the review summary",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex review --help",
+    "command": "codex review",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex exec review --config",
+    "command": "codex exec review",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex exec review --uncommitted",
+    "command": "codex exec review",
+    "flag": "--uncommitted",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --base",
+    "command": "codex exec review",
+    "flag": "--base",
+    "scope": "launch",
+    "description": "Review changes against the given base branch",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --enable",
+    "command": "codex exec review",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec review --commit",
+    "command": "codex exec review",
+    "flag": "--commit",
+    "scope": "launch",
+    "description": "Review the changes introduced by a commit",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --disable",
+    "command": "codex exec review",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex exec review --strict-config",
+    "command": "codex exec review",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --title",
+    "command": "codex exec review",
+    "flag": "--title",
+    "scope": "launch",
+    "description": "Optional commit title to display in the review summary",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --model",
+    "command": "codex exec review",
+    "flag": "--model",
+    "scope": "launch",
+    "description": "Model the agent should use",
+    "reason": "Use model in Settings for a persistent default. This flag selects the model for the invocation.",
+    "aliases": [
+      "-m"
+    ]
+  },
+  {
+    "path": "codex exec review --dangerously-bypass-approvals-and-sandbox",
+    "command": "codex exec review",
+    "flag": "--dangerously-bypass-approvals-and-sandbox",
+    "scope": "launch",
+    "description": "DANGEROUS. Intended solely for running in environments that are externally sandboxed",
+    "reason": "CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults."
+  },
+  {
+    "path": "codex exec review --dangerously-bypass-hook-trust",
+    "command": "codex exec review",
+    "flag": "--dangerously-bypass-hook-trust",
+    "scope": "launch",
+    "description": "Intended only for automation that already vets hook sources",
+    "reason": "Native hook-trust bypass is an invocation-only automation action. It is not stored as a user default."
+  },
+  {
+    "path": "codex exec review --worktree",
+    "command": "codex exec review",
+    "flag": "--worktree",
+    "scope": "launch",
+    "description": "",
+    "reason": "CloudX creates and owns tab/Forge checkout resources. Native managed worktree creation is a separate CLI launch action."
+  },
+  {
+    "path": "codex exec review --thread-source",
+    "command": "codex exec review",
+    "flag": "--thread-source",
+    "scope": "launch",
+    "description": "Source classification for newly created or forked threads",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --skip-git-repo-check",
+    "command": "codex exec review",
+    "flag": "--skip-git-repo-check",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --ephemeral",
+    "command": "codex exec review",
+    "flag": "--ephemeral",
+    "scope": "launch",
+    "description": "",
+    "reason": "Session persistence is selected per native exec invocation."
+  },
+  {
+    "path": "codex exec review --ignore-user-config",
+    "command": "codex exec review",
+    "flag": "--ignore-user-config",
+    "scope": "launch",
+    "description": "",
+    "reason": "Forge or CLI invocation policy decides whether to load user defaults; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec review --ignore-rules",
+    "command": "codex exec review",
+    "flag": "--ignore-rules",
+    "scope": "launch",
+    "description": "",
+    "reason": "Invocation policy controls whether rule files are loaded; this is not a persistent setting."
+  },
+  {
+    "path": "codex exec review --output-schema",
+    "command": "codex exec review",
+    "flag": "--output-schema",
+    "scope": "launch",
+    "description": "Path to a JSON Schema file describing the model's final response shape",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --json",
+    "command": "codex exec review",
+    "flag": "--json",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --output-last-message",
+    "command": "codex exec review",
+    "flag": "--output-last-message",
+    "scope": "launch",
+    "description": "Specifies file where the last message from the agent should be written",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliases": [
+      "-o"
+    ]
+  },
+  {
+    "path": "codex exec review --help",
+    "command": "codex exec review",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex app-server --config",
+    "command": "codex app-server",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Override a configuration value that would otherwise be loaded from `~/.codex/config.toml`. Use a dotted path (`foo.bar.baz`) to override nested values. The `value` portion is parsed as TOML. If it fails to parse as TOML, the raw string is used as a literal. Examples: - `-c model=\"o3\"` - `-c 'sandbox_permissions=[\"disk-full-read-access\"]'` - `-c shell_environment_policy.inherit=all`",
+    "reason": "The structured native defaults editor persists these keys. This flag is an invocation override and takes precedence over saved defaults.",
+    "aliases": [
+      "-c"
+    ]
+  },
+  {
+    "path": "codex app-server --enable",
+    "command": "codex app-server",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Enable a feature (repeatable). Equivalent to `-c features.<name>=true`",
+    "reason": "Use the features editor for persistent defaults. This flag enables a feature only for the invocation."
+  },
+  {
+    "path": "codex app-server --disable",
+    "command": "codex app-server",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Disable a feature (repeatable). Equivalent to `-c features.<name>=false`",
+    "reason": "Use the features editor for persistent defaults. This flag disables a feature only for the invocation."
+  },
+  {
+    "path": "codex app-server --code-mode-host",
+    "command": "codex app-server",
+    "flag": "--code-mode-host",
+    "scope": "launch",
+    "description": "Connect to a remote code-mode host instead of starting a local host",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --strict-config",
+    "command": "codex app-server",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Codex",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --listen",
+    "command": "codex app-server",
+    "flag": "--listen",
+    "scope": "launch",
+    "description": "Transport endpoint URL. Supported values: `stdio://` (default), `unix://`, `unix://PATH`, `ws://IP:PORT`, `off` [default: stdio://]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --stdio",
+    "command": "codex app-server",
+    "flag": "--stdio",
+    "scope": "launch",
+    "description": "",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --analytics-default-enabled",
+    "command": "codex app-server",
+    "flag": "--analytics-default-enabled",
+    "scope": "launch",
+    "description": "Analytics are disabled by default for app-server. Users have to explicitly opt in via the `analytics` section in the config.toml file. However, for first-party use cases like the VSCode IDE extension, we default analytics to be enabled by default by setting this flag. Users can still opt out by setting this in their config.toml: ```toml [analytics] enabled = false ``` See https://developers.openai.com/codex/config-advanced/#metrics for more details.",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-auth",
+    "command": "codex app-server",
+    "flag": "--ws-auth",
+    "scope": "launch",
+    "description": "Authentication mode for incoming WebSocket connections [possible values: capability-token, signed-bearer-token]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-token-file",
+    "command": "codex app-server",
+    "flag": "--ws-token-file",
+    "scope": "launch",
+    "description": "Absolute path to the capability-token file",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-token-sha256",
+    "command": "codex app-server",
+    "flag": "--ws-token-sha256",
+    "scope": "launch",
+    "description": "Hex-encoded SHA-256 digest of the capability token",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-shared-secret-file",
+    "command": "codex app-server",
+    "flag": "--ws-shared-secret-file",
+    "scope": "launch",
+    "description": "Absolute path to the shared secret file for signed JWT bearer tokens",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-issuer",
+    "command": "codex app-server",
+    "flag": "--ws-issuer",
+    "scope": "launch",
+    "description": "Expected issuer for signed JWT bearer tokens",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-audience",
+    "command": "codex app-server",
+    "flag": "--ws-audience",
+    "scope": "launch",
+    "description": "Expected audience for signed JWT bearer tokens",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --ws-max-clock-skew-seconds",
+    "command": "codex app-server",
+    "flag": "--ws-max-clock-skew-seconds",
+    "scope": "launch",
+    "description": "Maximum clock skew when validating signed JWT bearer tokens",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex app-server --help",
+    "command": "codex app-server",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "",
+    "reason": "CLI help is a command action.",
+    "aliases": [
+      "-h"
+    ]
+  },
+  {
+    "path": "codex exec --cyber-access-program",
+    "command": "codex exec",
+    "flag": "--cyber-access-program",
+    "scope": "launch",
+    "description": "Request an experimental Cyber access program for this turn (OpenAI provider only). Omit to use server defaults. Not supported with review; fork requires a prompt [possible values: standard, daybreak_blue, daybreak_red]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec resume --cyber-access-program",
+    "command": "codex exec resume",
+    "flag": "--cyber-access-program",
+    "scope": "launch",
+    "description": "Request an experimental Cyber access program for this turn (OpenAI provider only). Omit to use server defaults. Not supported with review; fork requires a prompt [possible values: standard, daybreak_blue, daybreak_red]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec fork --cyber-access-program",
+    "command": "codex exec fork",
+    "flag": "--cyber-access-program",
+    "scope": "launch",
+    "description": "Request an experimental Cyber access program for this turn (OpenAI provider only). Omit to use server defaults. Not supported with review; fork requires a prompt [possible values: standard, daybreak_blue, daybreak_red]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex exec review --cyber-access-program",
+    "command": "codex exec review",
+    "flag": "--cyber-access-program",
+    "scope": "launch",
+    "description": "Request an experimental Cyber access program for this turn (OpenAI provider only). Omit to use server defaults. Not supported with review; fork requires a prompt [possible values: standard, daybreak_blue, daybreak_red]",
+    "reason": "This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference."
+  },
+  {
+    "path": "codex --not-so-yolo",
+    "command": "codex",
+    "flag": "--not-so-yolo",
+    "scope": "launch",
+    "description": "Native alias of --approve-for-me.",
+    "reason": "Native alias of --approve-for-me. Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation.",
+    "aliasOf": "--approve-for-me"
+  },
+  {
+    "path": "codex --yolo",
+    "command": "codex",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex resume --not-so-yolo",
+    "command": "codex resume",
+    "flag": "--not-so-yolo",
+    "scope": "launch",
+    "description": "Native alias of --approve-for-me.",
+    "reason": "Native alias of --approve-for-me. Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation.",
+    "aliasOf": "--approve-for-me"
+  },
+  {
+    "path": "codex resume --yolo",
+    "command": "codex resume",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex fork --not-so-yolo",
+    "command": "codex fork",
+    "flag": "--not-so-yolo",
+    "scope": "launch",
+    "description": "Native alias of --approve-for-me.",
+    "reason": "Native alias of --approve-for-me. Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation.",
+    "aliasOf": "--approve-for-me"
+  },
+  {
+    "path": "codex fork --yolo",
+    "command": "codex fork",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex exec --not-so-yolo",
+    "command": "codex exec",
+    "flag": "--not-so-yolo",
+    "scope": "launch",
+    "description": "Native alias of --approve-for-me.",
+    "reason": "Native alias of --approve-for-me. Use approvals_reviewer, approval_policy and sandbox_mode for persistent defaults. This flag applies their automatic-review preset for one invocation.",
+    "aliasOf": "--approve-for-me"
+  },
+  {
+    "path": "codex exec --yolo",
+    "command": "codex exec",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex exec --experimental-json",
+    "command": "codex exec",
+    "flag": "--experimental-json",
+    "scope": "launch",
+    "description": "Native alias of --json.",
+    "reason": "Native alias of --json. This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliasOf": "--json"
+  },
+  {
+    "path": "codex exec resume --yolo",
+    "command": "codex exec resume",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex exec resume --experimental-json",
+    "command": "codex exec resume",
+    "flag": "--experimental-json",
+    "scope": "launch",
+    "description": "Native alias of --json.",
+    "reason": "Native alias of --json. This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliasOf": "--json"
+  },
+  {
+    "path": "codex exec fork --yolo",
+    "command": "codex exec fork",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex exec fork --experimental-json",
+    "command": "codex exec fork",
+    "flag": "--experimental-json",
+    "scope": "launch",
+    "description": "Native alias of --json.",
+    "reason": "Native alias of --json. This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliasOf": "--json"
+  },
+  {
+    "path": "codex exec review --yolo",
+    "command": "codex exec review",
+    "flag": "--yolo",
+    "scope": "launch",
+    "description": "Native alias of --dangerously-bypass-approvals-and-sandbox.",
+    "reason": "Native alias of --dangerously-bypass-approvals-and-sandbox. CloudX YOLO mode is an explicit launch preference; it overrides persistent sandbox and approval defaults.",
+    "aliasOf": "--dangerously-bypass-approvals-and-sandbox"
+  },
+  {
+    "path": "codex exec review --experimental-json",
+    "command": "codex exec review",
+    "flag": "--experimental-json",
+    "scope": "launch",
+    "description": "Native alias of --json.",
+    "reason": "Native alias of --json. This option selects invocation input/output or the host-owned runtime transport. Use it in the native CLI command or the applicable CloudX launch action; it is not a persistent config.toml preference.",
+    "aliasOf": "--json"
+  },
+  {
+    "path": "codex app-server --remote-control",
+    "command": "codex app-server",
+    "flag": "--remote-control",
+    "scope": "launch",
+    "description": "Enable remote control for this app-server process without changing persistence.",
+    "reason": "Internal native host control. CloudX owns app-server lifecycle and transport; this is not a persistent user preference.",
+    "internal": true
+  },
+  {
+    "path": "codex app-server --managed-daemon",
+    "command": "codex app-server",
+    "flag": "--managed-daemon",
+    "scope": "launch",
+    "description": "Save loaded threads during managed daemon shutdown.",
+    "reason": "Internal native host control. CloudX owns app-server lifecycle and transport; this is not a persistent user preference.",
+    "internal": true
+  }
+]

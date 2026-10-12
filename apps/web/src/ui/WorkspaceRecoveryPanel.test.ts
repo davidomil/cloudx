@@ -35,6 +35,16 @@ afterEach(async () => {
 });
 
 describe("workspace recovery choices", () => {
+  it.each([false, true])("keeps exec inclusion independent from broader workspace browsing (%s)", async all => {
+    await show({ state: "missing", message: "Select a conversation." }, "codex-terminal");
+    expect(container.querySelector<HTMLInputElement>('[aria-label="All directories"]')!.checked).toBe(false);
+    await act(async () => {
+      if (all) container.querySelector<HTMLInputElement>('[aria-label="All directories"]')!.click();
+      container.querySelector<HTMLInputElement>('[aria-label="Include exec sessions"]')!.click();
+    });
+    await click("Select a saved conversation");
+    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "select-conversation", all, includeNonInteractive: true });
+  });
   it("repairs only the inspected tab's source after explicit filesystem verification without starting a conversation", async () => {
     const preview = { fingerprint: "a".repeat(64), directories: [{ path: "/home/me/.codex", device: "64521", currentDevice: "64519", filesystemId: "original-root", filesystemType: "ef53" }] };
     vi.mocked(tabOwnershipAvailability).mockResolvedValueOnce({ status: "available", reason: "A saved directory device changed." }).mockResolvedValue({ status: "not_needed" });
@@ -45,7 +55,7 @@ describe("workspace recovery choices", () => {
     expect(previewTabOwnership).toHaveBeenCalledExactlyOnceWith(tab.id);
     const apply = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent === "Reconcile verified ownership")!;
     expect(apply.disabled).toBe(true);
-    await act(async () => container.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click());
+    await act(async () => Array.from(container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).find(input => input.closest("label")!.textContent!.includes("original device"))!.click());
     await click("Reconcile verified ownership");
     expect(reconcileTabOwnership).toHaveBeenCalledExactlyOnceWith(tab.id, { fingerprint: preview.fingerprint, attestations: [{ device: "64521", filesystemId: "original-root", filesystemType: "ef53" }] });
     expect(recover).not.toHaveBeenCalled();
@@ -105,7 +115,7 @@ describe("workspace recovery choices", () => {
   it("opens the saved-conversation picker without inventing a conversation ID", async () => {
     await show({ state: "missing", message: "Selected identity is unavailable.", canResume: false }, "codex-terminal");
     await click("Select a saved conversation");
-    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "select-conversation" });
+    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "select-conversation", all: false, includeNonInteractive: false });
   });
 
   it("suppresses repeated recovery while pending and displays failures in the same panel", async () => {

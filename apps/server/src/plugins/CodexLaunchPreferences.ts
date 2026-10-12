@@ -7,6 +7,7 @@ export interface CodexLaunchPreferences {
   yoloMode: boolean;
   autoTrustWorkspace: boolean;
   defaultSkills: Record<string, boolean>;
+  configProfile?: string;
 }
 
 const PREFERENCES_COMMENT = " CloudX launch preferences:";
@@ -29,19 +30,21 @@ export function writeCodexLaunchPreferences(text: string, preferences: CodexLaun
 }
 
 function validatePreferences(value: unknown): CodexLaunchPreferences {
-  if (!isRecord(value) || Object.keys(value).some((key) => !["yoloMode", "autoTrustWorkspace", "defaultSkills"].includes(key)))
+  if (!isRecord(value) || Object.keys(value).some((key) => !["yoloMode", "autoTrustWorkspace", "defaultSkills", "configProfile"].includes(key)))
     throw new Error("CloudX launch preferences must contain only supported settings.");
   for (const key of ["yoloMode", "autoTrustWorkspace"]) {
     if (value[key] !== undefined && typeof value[key] !== "boolean")
       throw new Error(`CloudX launch preference ${key} must be a boolean.`);
   }
   const skills = value.defaultSkills === undefined ? {} : value.defaultSkills;
+  if (value.configProfile !== undefined && (typeof value.configProfile !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value.configProfile))) throw new Error("Invalid native Codex configuration profile name.");
   if (!isRecord(skills) || Object.entries(skills).some(([id, enabled]) => !validSkillId(id) || typeof enabled !== "boolean"))
     throw new Error("CloudX default skill preferences must map skill identifiers to booleans.");
   return {
     yoloMode: value.yoloMode as boolean | undefined ?? true,
     autoTrustWorkspace: value.autoTrustWorkspace as boolean | undefined ?? false,
-    defaultSkills: Object.assign(Object.create(null) as Record<string, boolean>, { imagegen: true }, skills)
+    defaultSkills: Object.assign(Object.create(null) as Record<string, boolean>, { imagegen: true }, skills),
+    ...(typeof value.configProfile === "string" ? { configProfile: value.configProfile } : {}),
   };
 }
 

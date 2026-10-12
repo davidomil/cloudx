@@ -19,6 +19,8 @@ import { DEFAULT_CODEX_MODEL, type CloudxRule, type CloudxSkill } from "@cloudx/
 import type { CodexStateSources, ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
 import { discoverCodexDefaultSkills, readCodexLaunchPreferences } from "../plugins/CodexLaunchPreferences.js";
 import { materializeCodexSkillSurface } from "./CodexSkillSurface.js";
+import { mergeCodexConfigurationLayers } from "../plugins/CodexConfigurationDocument.js";
+import { resolveCodexConfigurationPaths } from "../plugins/CodexConfigurationPaths.js";
 import { replaceLink } from "../agents/replaceLink.js";
 
 export interface CodexHomeOverlayOptions {
@@ -45,6 +47,7 @@ export interface CodexHomeOverlay {
   systemRules: CloudxRule[];
   systemSkills: CloudxSkill[];
   yoloMode: boolean;
+  configProfile?: string;
 }
 
 interface SkillMaterializationSource {
@@ -58,8 +61,12 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const baseEnv = options.baseEnv ?? process.env;
   const sourceCodexHome = options.sources.originalHome;
   const sourceConfig = await options.sources.readConfig(options.source);
-  const config = prepareOverlayConfig(sourceConfig, options.source.home);
   const preferences = readCodexLaunchPreferences(sourceConfig);
+  const selectedProfileText = preferences.configProfile ? await options.sources.readConfig(options.source, undefined, preferences.configProfile) : undefined;
+  if (preferences.configProfile && selectedProfileText === undefined) throw new Error("Selected native Codex configuration profile is missing.");
+  const combinedConfig = selectedProfileText === undefined ? prepareOverlayConfig(sourceConfig, options.source.home)
+    : mergeCodexConfigurationLayers(prepareOverlayConfig(sourceConfig, options.source.home), prepareOverlayConfig(selectedProfileText, options.source.home));
+  const config = resolveCodexConfigurationPaths(combinedConfig, options.source.home, baseEnv.HOME);
   if (options.trustedProjectPath !== undefined) {
     const projectPath = options.trustedProjectPath;
     if (!path.isAbsolute(projectPath) || projectPath !== options.cwd || await fsp.realpath(projectPath) !== projectPath) {
@@ -97,6 +104,11 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const disabledSkillPaths = await discoverDisabledSkillPaths(options.cwd, baseEnv.HOME?.trim() || os.homedir());
   const configPath = path.join(codexHome, "config.toml");
   await writeOverlayConfig(config, path.join(staging, "config.toml"), skillPaths, disabledSkillPaths);
+  for (const profile of await options.sources.listConfigProfiles(options.source)) {
+    const text = profile === preferences.configProfile ? selectedProfileText : await options.sources.readConfig(options.source, undefined, profile);
+    if (text !== undefined) await fsp.writeFile(path.join(staging, `${profile}.config.toml`), stringify(resolveCodexConfigurationPaths(prepareOverlayConfig(text, options.source.home), options.source.home, baseEnv.HOME)), { mode: 0o600 });
+  }
+  if (preferences.configProfile && !fs.existsSync(path.join(staging, `${preferences.configProfile}.config.toml`))) throw new Error("Selected native Codex configuration profile is missing.");
   const stagedInstructions = await writeOverlayInstructions(sourceCodexHome, staging, options.resolved, systemRules);
   await options.sources.assertCurrent(options.source);
   await publishGenerated(staging, codexHome, Boolean(stagedInstructions));
@@ -111,12 +123,19 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
     disabledSkillPaths,
     systemRules,
     systemSkills,
-    yoloMode: preferences.yoloMode
+    yoloMode: preferences.yoloMode,
+    configProfile: preferences.configProfile,
   };
   } finally { await fsp.rm(staging, { recursive: true, force: true }); }
 }
 
 async function publishGenerated(staging: string, home: string, hasInstructions: boolean): Promise<void> {
+  const profileNames = (await fsp.readdir(staging)).filter(name => /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.config\.toml$/.test(name));
+  for (const name of profileNames) {
+    const existing = await optionalLstat(path.join(home, name));
+    if (existing && (!existing.isFile() || existing.isSymbolicLink())) throw new Error("Unexpected generated Codex profile type.");
+    await fsp.rename(path.join(staging, name), path.join(home, name));
+  }
   for (const name of ["config.toml", "AGENTS.override.md"]) {
     const target = path.join(home, name);
     const existing = await optionalLstat(target);
@@ -296,21 +315,13 @@ async function writeOverlayConfig(
   if (config.model === undefined) {
     config.model = DEFAULT_CODEX_MODEL;
   }
-  const features = tomlTable(config.features, "features");
-  features.apps = false;
-  features.memories = false;
-  features.plugins = false;
-  config.features = features;
-
-  const memories = tomlTable(config.memories, "memories");
-  memories.generate_memories = false;
-  memories.use_memories = false;
-  config.memories = memories;
-
   const skills = tomlTable(config.skills, "skills");
   skills.bundled = { enabled: false };
+  const nativeSkills = Array.isArray(skills.config) ? skills.config : [];
+  const nativeSkillPaths = new Set(nativeSkills.flatMap(entry => entry && typeof entry === "object" && "path" in entry ? [String(entry.path)] : []));
   skills.config = [
-    ...disabledSkillPaths.map((skillPath) => ({ path: skillPath, enabled: false })),
+    ...nativeSkills.filter(entry => !entry || typeof entry !== "object" || !("path" in entry) || !skillPaths.includes(String(entry.path))),
+    ...disabledSkillPaths.filter(skillPath => !nativeSkillPaths.has(skillPath)).map((skillPath) => ({ path: skillPath, enabled: false })),
     ...skillPaths.map((skillPath) => ({ path: skillPath, enabled: true }))
   ];
   config.skills = skills;

@@ -3699,6 +3699,11 @@ a:hover svg {
 }
 .codex-settings-group { display: flex; flex-direction: column; gap: 16px; min-width: 0; margin: 0; padding: 16px; border: 1px solid var(--color-border); border-radius: 6px; }
 .codex-settings-group legend { padding: 0 6px; font-weight: 600; }
+.codex-native-options { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.codex-native-options summary { cursor: pointer; font-weight: 600; }
+.codex-native-options fieldset { min-width: 0; margin-top: 12px; border: 1px solid var(--color-border); border-radius: 6px; }
+.codex-native-options textarea { width: 100%; box-sizing: border-box; resize: vertical; padding: 10px; font-family: monospace; color: var(--color-foreground); background: var(--color-background); border: 1px solid var(--color-border); border-radius: 6px; }
+.codex-native-options p, .codex-native-options li, .codex-native-options legend { overflow-wrap: anywhere; }
 .codex-settings-form .codex-settings-toggle { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; min-height: 44px; cursor: pointer; }
 .codex-settings-form .codex-settings-toggle input { flex: none; width: 18px; height: 18px; padding: 0; margin: 2px 0 0; accent-color: var(--color-accent); }
 .codex-settings-toggle span { min-width: 0; overflow-wrap: anywhere; }

@@ -1,31 +1,54 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 
 import type { CodexGlobalSettings, CodexGlobalSettingsUpdate } from "@cloudx/shared";
-import { parse } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 import { parseTOML, type AST } from "toml-eslint-parser";
 
 import { discoverCodexDefaultSkills, readCodexLaunchPreferences, writeCodexLaunchPreferences } from "./CodexLaunchPreferences.js";
-import type { CodexStateSources, ResolvedCodexStateSource } from "./CodexStateSources.js";
+import { codexConfigurationFilename, type CodexStateSources, type ResolvedCodexStateSource } from "./CodexStateSources.js";
+import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
+import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
+import { readCodexConfiguration, validateCodexNativeOptions } from "./CodexConfigurationSettings.js";
+import { validateNativeCodexConfiguration } from "./CodexConfigurationProbe.js";
+import { editCodexConfiguration, mergeCodexConfigurationLayers, parseCodexConfiguration, preserveHiddenCodexValues } from "./CodexConfigurationDocument.js";
+import { resolveCodexConfigurationPaths } from "./CodexConfigurationPaths.js";
 
 export class CodexSettingsService {
-  constructor(private readonly sources: CodexStateSources) {}
+  constructor(private readonly sources: CodexStateSources, private readonly env: NodeJS.ProcessEnv = process.env) {}
 
-  async read(signal?: AbortSignal): Promise<CodexGlobalSettings> {
+  async read(signal?: AbortSignal, targetProfile?: string): Promise<CodexGlobalSettings> {
+    codexConfigurationFilename(targetProfile);
     const source = await this.sources.resolve(signal);
-    const text = await this.sources.readConfig(source, signal);
-    return settingsFromConfig(source, text, await discoverCodexDefaultSkills(this.sources.originalHome));
+    const text = await this.sources.readConfig(source, signal, targetProfile);
+    return this.settings(source, text, await discoverCodexDefaultSkills(this.sources.originalHome), signal, targetProfile);
   }
 
   async update(input: CodexGlobalSettingsUpdate, signal?: AbortSignal): Promise<CodexGlobalSettings> {
     validateUpdate(input);
     const source = await this.sources.resolve(signal);
-    const original = await this.sources.readConfig(source, signal);
+    codexConfigurationFilename(input.targetProfile);
+    if (input.targetProfile && [input.yoloMode, input.autoTrustWorkspace, input.defaultSkills, input.configProfile].some(value => value !== undefined)) throw new Error("CloudX launch preferences must be edited in the base user configuration.");
+    const original = await this.sources.readConfig(source, signal, input.targetProfile);
+    const baseOriginal = input.targetProfile ? await this.sources.readConfig(source, signal) : original;
+    const expectedLayers: { profile?: string; content: string | undefined }[] = input.targetProfile ? [{ content: baseOriginal }] : [];
+    const originalProfile = readCodexLaunchPreferences(baseOriginal).configProfile;
+    if (originalProfile && originalProfile !== input.targetProfile)
+      expectedLayers.push({ profile: originalProfile, content: await this.sources.readConfig(source, signal, originalProfile) });
     const defaultSkills = await discoverCodexDefaultSkills(this.sources.originalHome);
-    const current = settingsFromConfig(source, original, defaultSkills);
+    const current = await this.settings(source, original, defaultSkills, signal, input.targetProfile);
     if (input.expectedRevision !== current.revision)
       throw new Error("Shared Codex settings changed. Reload before saving again.");
 
     let text = original ?? "";
+    if (input.nativeOptions !== undefined) {
+      validateCodexNativeOptions(input.nativeOptions, current.configuration!, original ?? "");
+      const stored = parseCodexConfiguration(text);
+      for (const [family, value] of Object.entries(input.nativeOptions)) {
+        const replacement = value === null ? null : preserveHiddenCodexValues(stored[family], current.configuration!.values[family], value);
+        text = editCodexConfiguration(text, family, stored[family], replacement);
+      }
+    }
     if (input.model !== undefined) text = editRootSetting(text, "model", input.model);
     if (input.serviceTier !== undefined) {
       text = editRootSetting(text, "service_tier", input.serviceTier);
@@ -35,10 +58,15 @@ export class CodexSettingsService {
       const value = input[field as keyof typeof nativeSettings];
       if (value !== undefined) text = editRootSetting(text, key, value);
     }
-    if (input.yoloMode !== undefined || input.autoTrustWorkspace !== undefined || input.defaultSkills !== undefined) {
+    if (input.yoloMode !== undefined || input.autoTrustWorkspace !== undefined || input.defaultSkills !== undefined || input.configProfile !== undefined) {
       const preferences = readCodexLaunchPreferences(text);
       if (input.yoloMode !== undefined) preferences.yoloMode = input.yoloMode;
       if (input.autoTrustWorkspace !== undefined) preferences.autoTrustWorkspace = input.autoTrustWorkspace;
+      if (input.configProfile !== undefined) {
+        if (input.configProfile !== null && !(await this.sources.listConfigProfiles(source, signal)).includes(input.configProfile)) throw new Error("Selected native Codex profile file does not exist. Create it before selecting it for launch.");
+        if (input.configProfile === null) delete preferences.configProfile;
+        else preferences.configProfile = input.configProfile;
+      }
       for (const [id, enabled] of Object.entries(input.defaultSkills ?? {})) {
         if (!defaultSkills.some(skill => skill.id === id) && (enabled || !current.defaultSkills.some(skill => skill.id === id)))
           throw new Error("Selected Codex default skill is no longer installed. Reload before saving again.");
@@ -47,8 +75,58 @@ export class CodexSettingsService {
       text = writeCodexLaunchPreferences(text, preferences);
     }
     if (text === (original ?? "")) return current;
-    const settings = settingsFromConfig(source, text, defaultSkills);
-    await this.sources.replaceConfig(source, original, text, signal);
+    const settings = await this.settings(source, text, defaultSkills, signal, input.targetProfile);
+    const nativeChanged = [input.model, input.serviceTier, input.reasoningEffort, input.webSearch, input.personality].some(value => value !== undefined);
+    if (input.nativeOptions !== undefined || input.configProfile !== undefined || nativeChanged) {
+      const name = input.targetProfile ?? settings.configProfile;
+      const profileText = name ? (input.targetProfile ? text : await this.sources.readConfig(source, signal, name)) : undefined;
+      if (name && name !== input.targetProfile && !expectedLayers.some(layer => layer.profile === name)) expectedLayers.push({ profile: name, content: profileText });
+      const modelChoices = [input.model, input.reasoningEffort, input.nativeOptions?.model, input.nativeOptions?.model_reasoning_effort];
+      const checkModel = modelChoices.some(value => value !== undefined && value !== null)
+        || [input.personality, input.nativeOptions?.personality].some(value => value !== undefined && value !== null && value !== "none");
+      const baseCandidate = input.targetProfile ? baseOriginal ?? "" : text;
+      const origin = (value: string) => stringify(resolveCodexConfigurationPaths(parseCodexConfiguration(value), source.home, this.env.HOME));
+      await validateNativeCodexConfiguration(current.configuration!.selectedCommand, origin(baseCandidate), buildToolEnv(this.env), signal, name && profileText !== undefined ? { name, text: origin(profileText) } : undefined, checkModel);
+      const verified = await this.settings(source, original, defaultSkills, signal, input.targetProfile);
+      if (verified.revision !== current.revision)
+        throw new Error("Codex configuration layers or selected executable changed. Reload before saving settings.");
+    }
+    await this.sources.replaceConfig(source, original, text, signal, input.targetProfile, expectedLayers);
+    return this.settings(source, text, defaultSkills, signal, input.targetProfile);
+  }
+
+  private async settings(source: ResolvedCodexStateSource, text: string | undefined, skills: { id: string }[], signal?: AbortSignal, targetProfile?: string): Promise<CodexGlobalSettings> {
+    const settings = settingsFromConfig(source, text, skills);
+    const baseText = targetProfile ? await this.sources.readConfig(source, signal) : text;
+    const preferences = readCodexLaunchPreferences(baseText);
+    if (targetProfile) Object.assign(settings, { yoloMode: preferences.yoloMode, autoTrustWorkspace: preferences.autoTrustWorkspace, defaultSkills: settingsFromConfig(source, baseText, skills).defaultSkills });
+    if (preferences.configProfile) settings.configProfile = preferences.configProfile;
+    const env = buildToolEnv(this.env);
+    const command = resolveAssistantCommand(env);
+    let version: string;
+    try { version = await readCodexVersion(command, { env, signal }); }
+    catch { version = "unavailable"; }
+    if (signal?.aborted) throw new Error("Codex settings read cancelled.");
+    settings.configuration = readCodexConfiguration(text ?? "", version, command, path.join(source.home, codexConfigurationFilename(targetProfile)), settings.yoloMode);
+    settings.configuration.targetProfile = targetProfile ?? null;
+    settings.configuration.profileFiles = await this.sources.listConfigProfiles(source, signal);
+    if (targetProfile) {
+      const base = readCodexConfiguration(baseText ?? "", version, command, path.join(source.home, "config.toml"), settings.yoloMode);
+      settings.configuration.effectiveValues = mergeCodexConfigurationLayers(base.values, settings.configuration.values);
+      settings.configuration.overrides.push(`Editing separate native profile: ${targetProfile}.config.toml; base values are inherited where unset.`);
+    }
+    let selectedProfileText: string | undefined;
+    if (!targetProfile && preferences.configProfile) {
+      const profile = await this.sources.readConfig(source, signal, preferences.configProfile);
+      selectedProfileText = profile;
+      if (profile === undefined) settings.configuration.blockedReason = "The selected native Codex profile file is missing.";
+      else {
+        const selected = readCodexConfiguration(profile, version, command, path.join(source.home, codexConfigurationFilename(preferences.configProfile)), settings.yoloMode);
+        settings.configuration.effectiveValues = mergeCodexConfigurationLayers(settings.configuration.values, selected.values);
+        settings.configuration.overrides.push(`Selected native profile: ${preferences.configProfile}.config.toml`);
+      }
+    }
+    settings.revision = createHash("sha256").update(JSON.stringify([settings.revision, baseText, targetProfile, settings.configuration.profileFiles, selectedProfileText, command, version])).digest("hex");
     return settings;
   }
 }
@@ -61,9 +139,10 @@ const nativeSettings = {
 
 function validateUpdate(input: CodexGlobalSettingsUpdate): void {
   if (!input || typeof input !== "object" || Array.isArray(input)
-    || Object.keys(input).some((key) => !["expectedRevision", "model", "serviceTier", "yoloMode", "autoTrustWorkspace", "defaultSkills", ...Object.keys(nativeSettings)].includes(key))
+    || Object.keys(input).some((key) => !["expectedRevision", "model", "serviceTier", "yoloMode", "autoTrustWorkspace", "defaultSkills", "nativeOptions", "targetProfile", "configProfile", ...Object.keys(nativeSettings)].includes(key))
     || typeof input.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(input.expectedRevision))
     throw new Error("Invalid shared Codex settings update.");
+  for (const profile of [input.targetProfile, input.configProfile]) if (profile !== undefined && profile !== null) codexConfigurationFilename(profile);
   if (input.model !== undefined && input.model !== null
     && (typeof input.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(input.model)))
     throw new Error("Codex model must be a model identifier of at most 128 characters.");

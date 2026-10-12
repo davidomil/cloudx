@@ -212,6 +212,7 @@ export class PluginSessionMissingError extends Error {}
 export interface CreatePluginSessionInput extends PluginSessionLaunchOptions {
   tab: WorkspaceTab;
   cwd: string;
+  workspaceId?: string;
   runtimeContext?: WorkspaceRuntimeContext;
   app?: CloudxAppContext;
   controls: PluginTabControls;

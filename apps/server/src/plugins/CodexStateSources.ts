@@ -29,6 +29,7 @@ interface SourceDependencies {
     | "mkdir"
     | "rename"
     | "unlink"
+    | "readdir"
   >;
   now: () => number;
   uid: () => number;
@@ -145,12 +146,13 @@ export class CodexStateSources {
   async readConfig(
     source: ResolvedCodexStateSource,
     signal?: AbortSignal,
+    profile?: string,
   ): Promise<string | undefined> {
     return this.work(signal, async (check) => {
       await this.requireIdentity(source, check);
       check();
       const config = await this.readText(
-        path.join(source.home, "config.toml"),
+        path.join(source.home, codexConfigurationFilename(profile)),
         1_048_576,
         check,
         true,
@@ -158,6 +160,17 @@ export class CodexStateSources {
       await this.requireIdentity(source, check);
       check();
       return config;
+    });
+  }
+
+  listConfigProfiles(source: ResolvedCodexStateSource, signal?: AbortSignal): Promise<string[]> {
+    return this.work(signal, async check => {
+      await this.requireIdentity(source, check);
+      const entries = await this.dependencies.fs.readdir(source.home);
+      check();
+      const names = entries.filter(name => /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.config\.toml$/.test(name)).map(name => name.slice(0, -".config.toml".length));
+      if (names.length > 128) throw new Error("Codex profile file count exceeds the settings limit.");
+      return names.sort();
     });
   }
 
@@ -176,6 +189,8 @@ export class CodexStateSources {
     expected: string | undefined,
     replacement: string,
     signal?: AbortSignal,
+    profile?: string,
+    expectedLayers: readonly { profile?: string; content: string | undefined }[] = [],
   ): Promise<void> {
     if (Buffer.byteLength(replacement) > 1_048_576)
       return Promise.reject(new Error("Codex configuration exceeds size limit."));
@@ -191,13 +206,20 @@ export class CodexStateSources {
           throw new Error("Shared Codex settings are being edited. Reload before saving again. If a previous writer stopped unexpectedly, remove .cloudx-config.lock from the Codex home after confirming no save is running.");
         throw error;
       }
-      const target = path.join(source.home, "config.toml");
+      const target = path.join(source.home, codexConfigurationFilename(profile));
+      const requireUnchangedLayers = async () => {
+        for (const layer of expectedLayers) {
+          if (await this.readText(path.join(source.home, codexConfigurationFilename(layer.profile)), 1_048_576, check, true) !== layer.content)
+            throw new Error("Codex configuration layers changed. Reload before saving again.");
+        }
+      };
       const staging = path.join(source.home, `.cloudx-config-${randomUUID()}.tmp`);
       let staged = false;
       try {
         check();
         if (await this.readText(target, 1_048_576, check, true) !== expected)
           throw new Error("Shared Codex settings changed. Reload before saving again.");
+        await requireUnchangedLayers();
         const file = await this.dependencies.fs.open(staging, "wx", 0o600);
         staged = true;
         try {
@@ -212,6 +234,7 @@ export class CodexStateSources {
           throw new Error("Codex source changed.");
         if (await this.readText(target, 1_048_576, check, true) !== expected)
           throw new Error("Shared Codex settings changed. Reload before saving again.");
+        await requireUnchangedLayers();
         check();
         await this.dependencies.fs.rename(staging, target);
         staged = false;
@@ -573,4 +596,10 @@ export function sameCodexSource(
   return (
     left.sourceId === right.sourceId && sameDirectoryIdentity({ ...left, path: left.home }, { ...right, path: right.home })
   );
+}
+
+export function codexConfigurationFilename(profile?: string): string {
+  if (profile === undefined) return "config.toml";
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(profile)) throw new Error("Invalid native Codex configuration profile name.");
+  return `${profile}.config.toml`;
 }

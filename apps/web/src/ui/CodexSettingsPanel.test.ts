@@ -108,18 +108,18 @@ describe("global Codex settings editor", () => {
   it("saves only changed permissions, skills, and native defaults", async () => {
     const updated = { ...initial, revision: "second", yoloMode: false, autoTrustWorkspace: true,
       defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: true, available: true }],
-      reasoningEffort: "high", webSearch: "indexed", personality: "friendly" };
+      reasoningEffort: "high", webSearch: "indexed", personality: "none" };
     const { container, calls } = await mount(initial, hook => hook === "codex-settings.read" ? initial : updated);
     await toggle(container, "YOLO mode");
     await toggle(container, "Automatically trust workspace");
     await toggle(container, "Enable browser");
     await fill(select(container, "Reasoning effort"), "high");
     await fill(select(container, "Web search"), "indexed");
-    await fill(select(container, "Personality"), "friendly");
+    await fill(select(container, "Personality"), "none");
     await click(container, "Save Codex settings");
     expect(calls.at(-1)).toEqual({ hook: "codex-settings.update", input: {
       expectedRevision: "first", yoloMode: false, autoTrustWorkspace: true, defaultSkills: { browser: true },
-      reasoningEffort: "high", webSearch: "indexed", personality: "friendly"
+      reasoningEffort: "high", webSearch: "indexed", personality: "none"
     } });
     expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(checkbox(container, "Enable browser").checked).toBe(true);
@@ -149,7 +149,7 @@ describe("global Codex settings editor", () => {
     await toggle(container, "Enable browser");
     await fill(select(container, "Reasoning effort"), "high");
     await fill(select(container, "Web search"), "live");
-    await fill(select(container, "Personality"), "friendly");
+    await fill(select(container, "Personality"), "none");
     settings = { ...initial, revision: "external", defaultSkills: [{ id: "new-skill", enabled: false, available: true }], personality: "pragmatic" };
     await click(container, "Reload");
     expect(checkbox(container, "YOLO mode").checked).toBe(true);

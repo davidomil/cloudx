@@ -14,6 +14,8 @@ import { CodexUpdateService } from "./CodexUpdateService.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 
+vi.mock("./CodexConfigurationProbe.js", () => ({ validateNativeCodexConfiguration: vi.fn(async () => undefined) }));
+
 const roots: string[] = [];
 const sourcesToDispose: CodexStateSources[] = [];
 
@@ -163,7 +165,7 @@ describe("shared Codex settings", () => {
     expect(await fs.readFile(f.configPath, "utf8")).toBe(original.replace("'original-model'", '"chosen-model"'));
     expect(saved).toMatchObject({ model: "chosen-model", serviceTier: "flex", fastModeEnabled: false });
     expect(JSON.stringify(saved)).not.toContain("synthetic-private-token");
-    expect(Object.keys(saved).sort()).toEqual(["autoTrustWorkspace", "defaultSkills", "fastModeEnabled", "model", "personality", "reasoningEffort", "revision", "serviceTier", "webSearch", "yoloMode"]);
+    expect(Object.keys(saved).sort()).toEqual(["autoTrustWorkspace", "configuration", "defaultSkills", "fastModeEnabled", "model", "personality", "reasoningEffort", "revision", "serviceTier", "webSearch", "yoloMode"]);
   });
 
   it.each(["priority", "default", "flex"] as const)("saves service tier %s and enables Codex's fast-mode feature", async (serviceTier) => {

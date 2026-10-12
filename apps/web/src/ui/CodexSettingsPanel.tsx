@@ -5,6 +5,7 @@ import { DEFAULT_CODEX_MODEL } from "@cloudx/shared";
 import { ControlButton } from "./Control.js";
 import { CodexUpdateControl } from "./CodexUpdateControl.js";
 import { CodexConfigRepairControl } from "./CodexConfigRepairControl.js";
+import { CodexNativeOptions } from "./CodexNativeOptions.js";
 import { CodexSettingsEditor, personalities, reasoningEfforts, serviceTiers, webSearchModes } from "./CodexSettingsEditor.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -54,10 +55,10 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
           Disabled turns search off; cached uses stored results; live fetches current results; indexed selects indexed search when supported by Codex.
         </NativeSettingSelect>
         <NativeSettingSelect label="Personality" value={personality} savedValue={settings.personality} options={personalities} disabled={busy !== null} onChange={value => editor.selectNativeSetting("personality", value)}>
-          Set the default communication style for models that support personalities.
+          Deprecated in the reviewed Codex versions: friendly and pragmatic no longer select a communication style. Codex default removes the saved compatibility value.
         </NativeSettingSelect>
       </fieldset>
-      <fieldset className="codex-settings-group" disabled={busy !== null}>
+      <fieldset className="codex-settings-group" disabled={busy !== null || Boolean(editor.getSnapshot().targetProfile)}>
         <legend>Session permissions</legend>
         <label className="codex-settings-toggle">
           <input type="checkbox" aria-label="YOLO mode" checked={yoloMode} disabled={busy !== null} onChange={event => editor.setYoloMode(event.target.checked)} />
@@ -68,7 +69,7 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
           <span>Automatically trust workspace<small>Trusts only the current workspace in the new session’s configuration. Explicitly untrusted workspaces are rejected; your shared trust settings are unchanged.</small></span>
         </label>
       </fieldset>
-      <fieldset className="codex-settings-group" disabled={busy !== null}>
+      <fieldset className="codex-settings-group" disabled={busy !== null || Boolean(editor.getSnapshot().targetProfile)}>
         <legend>Default Codex skills</legend>
         <small>Skills provided by the installed Codex version. Only imagegen is enabled by default; choose which skills new CloudX sessions can use.</small>
         {defaultSkills.map(skill => <label className="codex-settings-toggle" key={skill.id}>
@@ -77,6 +78,7 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
         </label>)}
         {!defaultSkills.length ? <p>No default skills are provided by this Codex installation.</p> : null}
       </fieldset>
+      <CodexNativeOptions editor={editor} />
       <div className="codex-settings-save">
         {saved ? <p role="status">Global Codex settings saved.</p> : null}
         <div className="codex-settings-actions">
