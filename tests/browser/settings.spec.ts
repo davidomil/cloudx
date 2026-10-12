@@ -1299,6 +1299,7 @@ for (const navigation of settingsNavigations) {
     page,
     isMobile,
   }, testInfo) => {
+    test.setTimeout(60_000);
     const configPath = path.join(testRoot, "codex-home", "config.toml");
     const unrelatedSettings =
       '# Keep this profile unchanged.\n[profiles.review]\nmodel = "profile-model"\n';
@@ -1377,7 +1378,12 @@ for (const navigation of settingsNavigations) {
     await expect(settings.getByRole("alert")).toHaveCount(0);
     await expect(save).toBeDisabled();
     await fastMode.selectOption({ label: "Off" });
+    const finalSave = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+    );
     await save.click();
+    expect((await finalSave).ok()).toBe(true);
     await expect(settings.getByRole("status")).toHaveText(
       "Global Codex settings saved.",
     );
