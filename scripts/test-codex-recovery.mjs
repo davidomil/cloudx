@@ -27,6 +27,7 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const requiredSuites = [
   "apps/server/src/plugins/CodexConversationRecovery.native.test.ts",
   "apps/server/src/plugins/CodexWorkerBridge.native.test.ts",
+  "apps/server/src/plugins/CodexCommandDetails.native.test.ts",
   "apps/server/src/plugins/CodexModelDefaults.native.test.ts",
   "apps/server/src/rulesSkills/CodexHomeOverlay.native.test.ts",
   "apps/server/src/plugins/CodexVersionSelection.native.test.ts",

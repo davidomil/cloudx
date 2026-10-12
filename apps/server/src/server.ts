@@ -9,7 +9,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
-import { AGENT_ACCOUNT_ID_PATTERN, isAgentProviderId, isAgentTab, isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState } from "@cloudx/shared";
+import { AGENT_ACCOUNT_ID_PATTERN, isAgentProviderId, isAgentTab, isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState, parseCodexCommandDetailsSnapshot } from "@cloudx/shared";
 import type { HookCallContext } from "@cloudx/plugin-api";
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
@@ -602,6 +602,15 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     const body = tabActionBody(request.body);
     const result = await services.sessions.executePluginAction(request.params.tabId, body.action, body.input);
     return { result };
+  });
+
+  app.get<{ Params: { tabId: string } }>("/api/tabs/:tabId/command-details", async (request, reply) => {
+    const session = services.sessions.getSession(request.params.tabId);
+    if (!isAgentTab(session.tab)) throwBadRequest("Command details require a Codex tab.");
+    reply.header("cache-control", "no-store");
+    const snapshot = parseCodexCommandDetailsSnapshot(await session.handleAction("command_details", {}));
+    if (snapshot.tabId !== request.params.tabId) throw new Error("Command details belong to a different tab.");
+    return snapshot;
   });
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/recover", async (request) => {
