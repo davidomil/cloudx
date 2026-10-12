@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
 import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 import { forwardNativeOutput } from "./codex-worker-output.mjs";
+import { CodexCommandDetailsCapture, saveCommandDetails } from "./codex-command-details.mjs";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -162,6 +163,9 @@ export async function runWorkerBridge(launch) {
   const selection = launch.selection ? new CodexConversationSelection(launch.selection,
     value => saveTurnReceipt(launch.selection.receiptPath, value)) : undefined;
   const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
+  const commands = launch.commandDetails ? new CodexCommandDetailsCapture(launch.commandDetails,
+    value => saveCommandDetails(launch.commandDetails.receiptPath, value),
+    { onError: error => process.stderr.write(`CloudX command details: ${error.message}\n`) }) : undefined;
   // Activity only informs agent switching. A failed write must not end the session.
   const activity = launch.activity ? new CodexTurnActivity(value => {
     try { saveTurnReceipt(launch.activity.receiptPath, value); }
@@ -203,6 +207,7 @@ export async function runWorkerBridge(launch) {
         selection?.fromClient(message);
         turn?.fromClient(message);
         activity?.fromClient(message);
+        commands?.fromClient(message);
         const line = `${JSON.stringify(message)}\n`;
         if (native) forward(line);
         else {
@@ -245,6 +250,7 @@ export async function runWorkerBridge(launch) {
         selection?.fromServer(message);
         turn?.fromServer(message);
         activity?.fromServer(message);
+        commands?.fromServer(message);
       }).catch(fail);
       for (const line of queued) forward(line);
       queued.length = 0;
@@ -255,10 +261,11 @@ export async function runWorkerBridge(launch) {
     "--remote-auth-token-env", TOKEN_ENV, ...launch.tuiArgs
   ], { stdio: "inherit", env: { ...process.env, [TOKEN_ENV]: token } });
   tui.on("error", fail);
-  tui.on("exit", (code, signal) => {
+  tui.on("exit", async (code, signal) => {
     finishing = true;
     // Exiting the bridge returns ownership to the terminal supervisor, which
     // reaps the app server and remaining tools before announcing terminal exit.
+    await commands?.close();
     process.exit(signal ? 1 : code ?? 1);
   });
 }

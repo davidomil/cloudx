@@ -10,7 +10,8 @@ const terminalPanelMocks = vi.hoisted(() => ({
   installMobileScroller: vi.fn(),
   releaseMobileScroller: vi.fn(),
   terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; options: Record<string, unknown>; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
-  uploadFileBrowserFile: vi.fn()
+  uploadFileBrowserFile: vi.fn(),
+  readCodexCommandDetails: vi.fn()
 }));
 
 vi.mock("@xterm/addon-fit", () => ({
@@ -107,7 +108,8 @@ vi.mock("./terminalMobileScroll.js", async (importOriginal) => {
 });
 
 vi.mock("../api.js", () => ({
-  uploadFileBrowserFile: terminalPanelMocks.uploadFileBrowserFile
+  uploadFileBrowserFile: terminalPanelMocks.uploadFileBrowserFile,
+  readCodexCommandDetails: terminalPanelMocks.readCodexCommandDetails
 }));
 
 import { TerminalPanel } from "./TerminalPanel.js";
@@ -136,6 +138,8 @@ describe("TerminalPanel", () => {
     terminalPanelMocks.installMobileScroller.mockReset();
     terminalPanelMocks.installMobileScroller.mockReturnValue(terminalPanelMocks.releaseMobileScroller);
     terminalPanelMocks.uploadFileBrowserFile.mockReset();
+    terminalPanelMocks.readCodexCommandDetails.mockReset();
+    terminalPanelMocks.readCodexCommandDetails.mockImplementation(async (tabId: string) => ({ version: 1, tabId, executionId: "", status: "unavailable", commands: [] }));
     terminalPanelMocks.uploadFileBrowserFile.mockImplementation(async (_tabId: string, relativePath: string, file: Blob) => ({
       path: `/tmp/${relativePath}`,
       relativePath,

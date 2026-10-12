@@ -126,9 +126,10 @@ syncBuiltinESMExports();
 it("lets the complete serial native suite finish beyond two minutes before checking the built verifier", async () => {
   const result = await runNativeValidation({ durationMs: 180_000 });
   expect(result.status, result.stderr).toBe(0);
-  expect(result.commands[1].args.slice(2, 9)).toEqual([
+  expect(result.commands[1].args.slice(2, 10)).toEqual([
     "apps/server/src/plugins/CodexConversationRecovery.native.test.ts",
     "apps/server/src/plugins/CodexWorkerBridge.native.test.ts",
+    "apps/server/src/plugins/CodexCommandDetails.native.test.ts",
     "apps/server/src/plugins/CodexModelDefaults.native.test.ts",
     "apps/server/src/rulesSkills/CodexHomeOverlay.native.test.ts",
     "apps/server/src/plugins/CodexVersionSelection.native.test.ts",

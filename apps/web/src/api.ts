@@ -12,6 +12,7 @@ import type {
   CloudxConfigValues,
   CloudxLogSource,
   CloudxLogsResponse,
+  CodexCommandDetailsSnapshot,
   ForgeConnectionAction,
   ForgeConnections,
   ForgeConnectionStatus,
@@ -44,7 +45,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
+import { parseCodexCommandDetailsSnapshot, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -705,6 +706,10 @@ export async function runTabAction<T>(tabId: string, action: string, input: Reco
     body: JSON.stringify({ action, input })
   });
   return body.result;
+}
+
+export async function readCodexCommandDetails(tabId: string, signal?: AbortSignal): Promise<CodexCommandDetailsSnapshot> {
+  return parseCodexCommandDetailsSnapshot(await fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/command-details`, { signal, cache: "no-store" }));
 }
 
 export async function callHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> {

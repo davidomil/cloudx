@@ -17,6 +17,8 @@ import { legacyCodexConfigKeys } from "./CodexConfigRepairService.js";
 import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery, findCodexTranscript } from "./CodexConversationRecovery.js";
+import { codexCommandDetailsPath, readCodexCommandDetails, unavailableCommandDetails } from "./CodexCommandDetails.js";
+import type { CodexCommandDetailsSnapshot } from "@cloudx/shared";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -73,6 +75,13 @@ export const CODEX_TERMINAL_ACTIONS: PluginActionDefinition[] = terminalActions(
     "Type into an interactive Codex CLI terminal. For voice, send the coding instruction Codex should receive, usually as natural language rather than a shell command.",
   enterTextHandlesUnhandledVoice: true
 }).concat(codexReadinessAction(), {
+  name: "command_details",
+  description: "Read retained native Codex command and output details for this tab's exact execution.",
+  voiceExposed: false,
+  automationExposed: false,
+  updatesTabState: false,
+  inputSchema: { type: "object", properties: {}, additionalProperties: false }
+}, {
   name: "finish",
   description: "Close an owned Codex conversation after its exact native turn completed successfully.",
   voiceExposed: false,
@@ -181,6 +190,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const selection = conversation ? { tabId: input.tab.id, executionId: randomUUID(), receiptPath: conversation.receiptPath } : undefined;
     restoredInput = { ...restoredInput, codexExecutionId: selection?.executionId };
     await conversation?.reset();
+    if (launchTemplate.overlay) await fs.rm(codexCommandDetailsPath(launchTemplate.overlay.codexHome), { force: true });
     if (launchTemplate.overlay) await fs.rm(agentTurnReceiptPath(launchTemplate.overlay.codexHome), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
     const command = launchTemplate.command;
@@ -197,6 +207,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         JSON.stringify({
           ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
+          ...(selection && launchTemplate.overlay ? { commandDetails: { tabId: input.tab.id, executionId: selection.executionId, receiptPath: codexCommandDetailsPath(launchTemplate.overlay.codexHome) } } : {}),
           ...(launchTemplate.overlay ? { activity: { receiptPath: agentTurnReceiptPath(launchTemplate.overlay.codexHome) } } : {}),
           startupPicker: resume?.mode === "picker",
           permissions: {
@@ -230,6 +241,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       turnState: launchTemplate.overlay ? () => readAgentTurnState(agentTurnReceiptPath(launchTemplate.overlay!.codexHome)) : undefined,
       nativeTurn: input.agentTurn,
       restoreInput: () => restoredInput,
+      commandDetails: launchTemplate.overlay ? () => readCodexCommandDetails(launchTemplate.overlay!.codexHome, input.tab.id, restoredInput.codexExecutionId) : undefined,
       onEnded: () => this.providers?.usage?.ended(input.tab.id),
       observeConversation: () => conversation?.observe(identity => {
         if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
@@ -297,6 +309,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceSummary: "Existing interactive Codex CLI session.",
       turnState: this.sources ? () => readAgentTurnState(agentTurnReceiptPath(this.sources!.viewPath(input.tab.id))) : undefined,
       restoreInput: () => restoredInput,
+      commandDetails: this.sources ? () => readCodexCommandDetails(this.sources!.viewPath(input.tab.id), input.tab.id, restoredInput.codexExecutionId) : undefined,
       onEnded: () => this.providers?.usage?.ended(input.tab.id),
       observeConversation: () => conversation?.observe(identity => {
         if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
@@ -777,6 +790,7 @@ interface TerminalSessionOptions {
   // Called once when the agent process has ended or was stopped.
   onEnded?(): void;
   restoreInput?(): Record<string, unknown>;
+  commandDetails?(): Promise<CodexCommandDetailsSnapshot>;
   observeConversation?(): (() => void) | undefined;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
 }
@@ -1123,6 +1137,10 @@ export class CodexTerminalSession implements PluginSession {
   }
 
   handleAction(action: string, input: Record<string, unknown>, context: PluginActionContext = {}): Promise<Record<string, unknown>> | Record<string, unknown> {
+    if (action === "command_details") {
+      if (Object.keys(input).length) throw new Error("Command details do not accept input.");
+      return Promise.resolve(this.options.commandDetails?.() ?? unavailableCommandDetails(this.tab.id)).then(snapshot => ({ ...snapshot }));
+    }
     if (action === "enter_text") {
       const text = requireString(input.text, "text");
       const submit = typeof input.submit === "boolean" ? input.submit : false;
