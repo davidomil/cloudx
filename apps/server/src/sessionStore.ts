@@ -6,7 +6,7 @@ import path from "node:path";
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
 import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, type AgentSwitchRequest } from "@cloudx/shared";
-import type { ConfigValue, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
+import type { CodexNativeWork, ConfigValue, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
 import { PathPolicy } from "./pathPolicy.js";
@@ -65,6 +65,9 @@ export class SessionStore {
   private readonly tabClosures = new Map<string, Promise<void>>();
   private readonly tabOwnershipActions = new Map<string, Promise<unknown>>();
   private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
+  private readonly tabRecoveryRequests = new Map<string, RecoverTabRequest>();
+  private readonly tabRuntimeContextActions = new Map<string, Promise<unknown>>();
+  private readonly restartingNativeTabs = new Set<string>();
   // Tabs whose agent is being switched. Their input and actions are refused
   // so no new turn starts while the switch is prepared.
   private readonly switchingTabs = new Set<string>();
@@ -173,10 +176,26 @@ export class SessionStore {
     if (this.tabClosures.has(tabId)) return Promise.reject(new Error("The tab is closing."));
     if (this.tabOwnershipActions.has(tabId)) return Promise.reject(new Error("Directory ownership recovery is in progress."));
     const pending = this.tabRecoveries.get(tabId);
-    if (pending) return pending;
-    const recovering = this.admitAction(undefined, () => this.recoverTabNow(tabId, request));
+    if (pending) {
+      const current = this.tabRecoveryRequests.get(tabId);
+      if (request.action === "restart-native" || current?.action === "restart-native") {
+        if (current?.action !== request.action || current.executionId !== request.executionId || current.sessionId !== request.sessionId)
+          return Promise.reject(new Error("A different recovery is in progress for this tab. Wait and inspect its current native state."));
+      }
+      return pending;
+    }
+    if (request.action === "restart-native") this.restartingNativeTabs.add(tabId);
+    this.tabRecoveryRequests.set(tabId, { ...request });
+    const recovering = this.admitAction(undefined, () => request.action === "restart-native"
+      ? this.serializeRuntimeContext(tabId, () => this.recoverTabNow(tabId, request))
+      : this.recoverTabNow(tabId, request));
     this.tabRecoveries.set(tabId, recovering);
-    void recovering.then(() => this.tabRecoveries.delete(tabId), () => this.tabRecoveries.delete(tabId));
+    const finished = () => {
+      this.tabRecoveries.delete(tabId);
+      this.tabRecoveryRequests.delete(tabId);
+      this.restartingNativeTabs.delete(tabId);
+    };
+    void recovering.then(finished, finished);
     return recovering;
   }
 
@@ -184,6 +203,7 @@ export class SessionStore {
     const tab = this.getTab(tabId);
     const plugin = this.plugins.get(tab.pluginId);
     if (tab.ownerPluginId || plugin.panelKind !== "terminal") throw new Error("This tab does not support terminal recovery.");
+    if (request.action === "restart-native") return this.restartNativeWork(tab, plugin, request);
     const recoveringConversation = request.action === "resume-conversation" || request.action === "select-conversation";
     if (request.action === "new-shell" && plugin.id !== "standard-terminal" || recoveringConversation && plugin.id !== AGENT_TERMINAL_PLUGIN_ID) {
       throw new Error("The recovery action does not match this terminal.");
@@ -235,6 +255,57 @@ export class SessionStore {
     }
     await this.savedSessions?.flush();
     return this.getTab(tabId);
+  }
+
+  private nativeWorkForRecovery(tabId: string, session: PluginSession | undefined, request: RecoverTabRequest): CodexNativeWork {
+    if (!request.executionId || !request.sessionId) throw new Error("Native recovery requires an exact execution and conversation ID.");
+    if (!session || session.hasExited?.() !== false) throw new Error("Reconnect the live Codex client before restarting native work.");
+    const work = session.nativeWork?.();
+    if (!work || work.tabId !== tabId || work.executionId !== request.executionId || work.threadId !== request.sessionId)
+      throw new Error("The selected native execution or conversation changed. Refresh its state before recovery.");
+    if (work.turnStatus === "running" || !(work.turnStatus === "failed" || work.goalStatus === "blocked"))
+      throw new Error("Native recovery requires a stopped failed turn or blocked goal.");
+    return work;
+  }
+
+  private async restartNativeWork(tab: WorkspaceTab, plugin: WorkspacePlugin, request: RecoverTabRequest): Promise<WorkspaceTab> {
+    if (plugin.id !== AGENT_TERMINAL_PLUGIN_ID || !plugin.prepareNativeRecovery || !plugin.recoverSession)
+      throw new Error("This tab does not support native Codex recovery.");
+    const previous = this.sessions.get(tab.id);
+    const before = structuredClone(this.nativeWorkForRecovery(tab.id, previous, request));
+    if (!previous?.terminate) throw new Error("Native recovery requires confirmed process termination.");
+    const input = await this.sessionInput(tab);
+    input.initialInput = previous.restoreInput?.() ?? input.initialInput;
+    const prepared = await plugin.prepareNativeRecovery(input, request);
+    if (this.sessions.get(tab.id) !== previous)
+      throw new Error("The native client changed while recovery was prepared. Refresh its state before recovery.");
+    const work = this.nativeWorkForRecovery(tab.id, previous, request);
+    if (work.turnId !== before.turnId || work.turnStatus !== before.turnStatus || work.goalStatus !== before.goalStatus)
+      throw new Error("The native work changed while recovery was prepared. Refresh its state before recovery.");
+    try {
+      await previous.terminate();
+      if (previous.hasExited?.() !== true) throw new Error("The native client did not confirm process termination.");
+      this.disposeSessionListeners(tab.id);
+      previous.detach?.();
+      this.sessions.delete(tab.id);
+      this.initialInputs.set(tab.id, structuredClone(prepared.initialInput));
+      this.updateTab(tab.id, { status: "starting", statusMessage: "Restarting the selected Codex client.", recovery: undefined });
+      this.bindSession(tab.id, await plugin.recoverSession(prepared));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.updateTab(tab.id, {
+        nativeWork: { ...work, recoveryStatus: "failed", updatedAt: new Date().toISOString() },
+        ...(this.sessions.has(tab.id) ? {} : {
+          status: "failed" as const, statusMessage: message,
+          recovery: { state: "unavailable" as const, message, conversationId: request.sessionId, canResume: true },
+          indicator: indicatorForStatus("failed", message)
+        })
+      });
+      await this.savedSessions?.flush();
+      throw error;
+    }
+    await this.savedSessions?.flush();
+    return this.getTab(tab.id);
   }
 
   // Relaunches an agent tab on another provider or account. The current run
@@ -549,14 +620,15 @@ export class SessionStore {
     return tab;
   }
 
-  // False while the tab's agent is being switched; terminal input is dropped then.
+  // Terminal input is dropped while the tab's native client is being relaunched.
   acceptsInput(tabId: string): boolean {
-    return !this.switchingTabs.has(tabId);
+    return !this.switchingTabs.has(tabId) && !this.restartingNativeTabs.has(tabId);
   }
 
   // The session for an action that may start work in the tab.
   private actionSession(tabId: string): PluginSession {
     if (this.switchingTabs.has(tabId)) throw new Error("This tab is switching agents. Try again when the switch finishes.");
+    if (this.restartingNativeTabs.has(tabId)) throw new Error("This tab is restarting its native client. Try again when recovery finishes.");
     return this.getSession(tabId);
   }
 
@@ -929,6 +1001,7 @@ export class SessionStore {
   }
 
   async restartTab(tabId: string, reason = "Restarting tab."): Promise<WorkspaceTab> {
+    if (this.restartingNativeTabs.has(tabId)) throw new Error("Native recovery is already in progress for this tab.");
     this.assertSessionOwnershipResolved(tabId);
     const current = this.getTab(tabId);
     if (current.ownerPluginId === "forge") throw new Error("Resume the worker through Forge to start a new execution.");
@@ -989,7 +1062,22 @@ export class SessionStore {
     return restarted;
   }
 
-  async applyRuntimeContext(tabId: string, reason = "Applying runtime context."): Promise<WorkspaceTab> {
+  private serializeRuntimeContext<T>(tabId: string, action: () => Promise<T>): Promise<T> {
+    const previous = this.tabRuntimeContextActions.get(tabId);
+    const pending = previous ? previous.then(action) : action();
+    this.tabRuntimeContextActions.set(tabId, pending);
+    const finished = () => {
+      if (this.tabRuntimeContextActions.get(tabId) === pending) this.tabRuntimeContextActions.delete(tabId);
+    };
+    void pending.then(finished, finished);
+    return pending;
+  }
+
+  applyRuntimeContext(tabId: string, reason = "Applying runtime context."): Promise<WorkspaceTab> {
+    return this.admitAction(undefined, () => this.serializeRuntimeContext(tabId, () => this.applyRuntimeContextNow(tabId, reason)));
+  }
+
+  private async applyRuntimeContextNow(tabId: string, reason: string): Promise<WorkspaceTab> {
     const tab = this.getTab(tabId);
     const session = this.sessions.get(tabId);
     if (!session?.applyRuntimeContext || !this.runtimeContextResolver) {
@@ -1007,12 +1095,8 @@ export class SessionStore {
   }
 
   async applyRuntimeContexts(predicate: (tab: WorkspaceTab) => boolean, reason = "Applying runtime context."): Promise<WorkspaceTab[]> {
-    const tabs = this.listTabs().filter((tab) => this.sessions.has(tab.id) && predicate(tab));
-    const applied: WorkspaceTab[] = [];
-    for (const tab of tabs) {
-      applied.push(await this.applyRuntimeContext(tab.id, reason));
-    }
-    return applied;
+    const tabs = this.listTabs().filter((tab) => (this.sessions.has(tab.id) || this.restartingNativeTabs.has(tab.id)) && predicate(tab));
+    return Promise.all(tabs.map(tab => this.applyRuntimeContext(tab.id, reason)));
   }
 
   private updateTab(tabId: string, patch: Partial<WorkspaceTab>): void {
@@ -1078,7 +1162,7 @@ export class SessionStore {
     const offersRecovery = !session.tab.ownerPluginId && this.plugins.get(session.tab.pluginId).panelKind === "terminal";
     const disposers: Array<() => void> = [];
     const statusDisposer = session.onStatusChange?.((status, statusMessage) => {
-      if (this.tabs.has(tabId)) {
+      if (this.tabs.has(tabId) && this.sessions.get(tabId) === session) {
         const tab = this.getTab(tabId);
         if (offersRecovery && (status === "failed" || status === "completed") && session.hasExited?.()) {
           const update = this.recordRestoreFailure(tab, new PluginSessionMissingError(statusMessage ?? "The terminal process ended."), session);
@@ -1103,6 +1187,12 @@ export class SessionStore {
     if (statusDisposer) {
       disposers.push(statusDisposer);
     }
+    const nativeWorkDisposer = session.onNativeWorkChange?.(nativeWork => {
+      if (this.tabs.has(tabId) && this.sessions.get(tabId) === session && (!nativeWork || nativeWork.tabId === tabId)) {
+        this.updateTab(tabId, { nativeWork: nativeWork ? structuredClone(nativeWork) : undefined });
+      }
+    });
+    if (nativeWorkDisposer) disposers.push(nativeWorkDisposer);
     const dataDisposer = session.onData?.((data) => {
       const current = this.tabs.get(tabId);
       if (current) {
@@ -1121,11 +1211,13 @@ export class SessionStore {
     }
     this.sessionDisposers.set(tabId, disposers);
     const current = session.snapshot();
+    const nativeWork = session.nativeWork?.() ?? current.nativeWork;
     const status = current.status === "starting" ? "running" : current.status;
     const statusMessage = current.status === "starting" ? undefined : current.statusMessage;
     this.updateTab(tabId, {
       status,
       statusMessage,
+      nativeWork: nativeWork?.tabId === tabId ? structuredClone(nativeWork) : undefined,
       recovery: offersRecovery && status === "failed"
         ? { state: "unavailable", message: statusMessage ?? "Check the terminal connection to recover this panel." }
         : undefined,

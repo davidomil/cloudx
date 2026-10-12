@@ -1,6 +1,8 @@
 import {
   UI_RENDERER_STATUS_DOT,
   type AgentSwitchRequest,
+  type CodexNativeWork,
+  type RecoverTabRequest,
   type ConfigFieldDescriptor,
   type ConfigValue,
   type DirectoryOwnershipAvailability,
@@ -105,6 +107,7 @@ export interface PluginSessionSnapshot {
   statusMessage?: string;
   recentOutput?: string;
   state?: Record<string, unknown>;
+  nativeWork?: CodexNativeWork;
 }
 
 export interface PluginVoiceOpenFileContext {
@@ -138,6 +141,8 @@ export interface PluginSession {
   detach?(): void;
   hasExited?(): boolean;
   restoreInput?(): Record<string, unknown> | undefined;
+  nativeWork?(): CodexNativeWork | undefined;
+  onNativeWorkChange?(listener: (state: CodexNativeWork | undefined) => void): () => void;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<Record<string, unknown>> | Record<string, unknown>;
   snapshot(): PluginSessionSnapshot;
   voiceContext(): Promise<PluginVoiceContext> | PluginVoiceContext;
@@ -258,6 +263,7 @@ export interface WorkspacePlugin {
   createSession(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   restoreSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
   recoverSession?(input: CreatePluginSessionInput): Promise<PluginSession> | PluginSession;
+  prepareNativeRecovery?(input: CreatePluginSessionInput, request: RecoverTabRequest): Promise<CreatePluginSessionInput>;
   /**
    * Returns the startup input that relaunches this tab on another agent
    * provider or account. `input.initialInput` is the tab's current restore

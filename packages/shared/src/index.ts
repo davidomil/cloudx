@@ -9,6 +9,8 @@ export * from "./jira.js";
 export * from "./documentationArchive.js";
 export * from "./codexSettings.js";
 export * from "./codexCommandDetails.js";
+export * from "./codexNativeWork.js";
+import { isCodexNativeWork, type CodexNativeWork } from "./codexNativeWork.js";
 export * from "./codexUpdate.js";
 export * from "./cloudxUpdate.js";
 export * from "./cloudxUpdateBackups.js";
@@ -110,8 +112,9 @@ export interface TabRecovery {
 }
 
 export interface RecoverTabRequest {
-  action: "reconnect" | "new-shell" | "resume-conversation" | "select-conversation";
+  action: "reconnect" | "new-shell" | "resume-conversation" | "select-conversation" | "restart-native";
   sessionId?: string;
+  executionId?: string;
 }
 
 export interface WorkspaceTab {
@@ -128,6 +131,7 @@ export interface WorkspaceTab {
   contextPath?: string;
   statusMessage?: string;
   recovery?: TabRecovery;
+  nativeWork?: CodexNativeWork;
 }
 
 export interface PluginActionDescriptor {
@@ -1151,7 +1155,8 @@ export function isCompleteWorkspaceTab(value: unknown): value is WorkspaceTab {
     typeof value.updatedAt === "string" &&
     (value.contextPath === undefined || typeof value.contextPath === "string") &&
     (value.statusMessage === undefined || typeof value.statusMessage === "string") &&
-    (value.recovery === undefined || isTabRecovery(value.recovery))
+    (value.recovery === undefined || isTabRecovery(value.recovery)) &&
+    (value.nativeWork === undefined || isCodexNativeWork(value.nativeWork) && value.nativeWork.tabId === value.id)
   );
 }
 

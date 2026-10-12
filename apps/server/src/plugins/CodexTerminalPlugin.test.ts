@@ -16,6 +16,8 @@ import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
+import { codexNativeWorkPath } from "./CodexNativeWork.js";
+import { AgentAccountStore } from "../agents/AgentAccountStore.js";
 import { readCodexLaunchPreferences, writeCodexLaunchPreferences, type CodexLaunchPreferences } from "./CodexLaunchPreferences.js";
 
 class FakeTerminalProcess implements TerminalProcess {
@@ -70,7 +72,7 @@ class CapturingFactory implements TerminalProcessFactory {
   env: NodeJS.ProcessEnv | undefined;
   process: FakeTerminalProcess | undefined;
 
-  bridgeLaunch(): { command: string; serverArgs: string[]; tuiArgs: string[]; selection: { tabId: string; executionId: string; receiptPath: string }; permissions: { yoloMode: boolean; additionalWritableRoots: string[] } } {
+  bridgeLaunch(): { command: string; serverArgs: string[]; tuiArgs: string[]; selection: { tabId: string; executionId: string; receiptPath: string }; workHealth: { expectedThreadId?: string; recovery?: boolean; previousError?: unknown }; permissions: { yoloMode: boolean; additionalWritableRoots: string[] } } {
     const command = this.args!.at(-1)!;
     return JSON.parse(command.slice(command.indexOf("'{") + 1, -1).replaceAll("'\\''", "'"));
   }
@@ -2097,4 +2099,134 @@ it("keeps the latest bridge blocker bounded after later shutdown output", () => 
   process.emitData("late native stderr\r\n".repeat(300));
   process.exit(1);
   expect(session.snapshot().statusMessage).toBe("Terminal exited with code 1. " + "x".repeat(1024));
+});
+
+describe("targeted native client recovery", () => {
+  const threadId = "01a08470-d118-7b72-b1df-439e72e5c744";
+  const lastError = { message: "The provider reported an internal processing error.", kind: "terminal" as const, code: "internalServerError", requestId: "c7b3f67f-64a0-9617-b3e2-049f9ae48d79", httpStatusCode: 200 };
+
+  it("restarts the exact conversation and saved workspace without replaying the original prompt", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const runtimeContext = { activeWindowId: "saved-window" };
+      const previous = await plugin.createSession({ tab, cwd: root, controls, runtimeContext, initialInput: { prompt: "Never replay this prompt", model: "gpt-6-astra", reasoningEffort: "max" } });
+      const selection = factory.bridgeLaunch().selection;
+      const work = { version: 1 as const, tabId: tab.id, executionId: selection.executionId, threadId, updatedAt: new Date().toISOString(), turnId: "turn-1", turnStatus: "failed" as const, goalStatus: "blocked" as const, lastError };
+      const transcript = path.join(home, "sessions", `rollout-${threadId}.jsonl`);
+      const transcriptContent = JSON.stringify({ type: "session_meta", payload: { id: threadId, cwd: root } }) + "\n";
+      await fs.writeFile(transcript, transcriptContent);
+      await fs.writeFile(path.join(root, "working-file.txt"), "Preserve work");
+      await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: threadId, cwd: root }));
+      await fs.writeFile(codexNativeWorkPath(factory.env!.CODEX_HOME!), JSON.stringify(work));
+      await vi.waitFor(() => expect(previous.nativeWork?.()).toEqual(work));
+      expect(previous.snapshot().status).toBe("running");
+      const prepared = await plugin.prepareNativeRecovery({ tab: { ...tab, nativeWork: work }, cwd: root, controls, initialInput: previous.restoreInput?.() }, { action: "restart-native", executionId: selection.executionId, sessionId: threadId });
+      expect(factory.process!.killed).toBe(false);
+      expect(factory.process!.written).toBe("");
+      await previous.terminate?.();
+      const recovered = await plugin.recoverSession(prepared);
+      try {
+        const launch = factory.bridgeLaunch();
+        expect(launch.tuiArgs.slice(-2)).toEqual(["resume", threadId]);
+        expect(launch.tuiArgs).toContain("gpt-6-astra");
+        expect(launch.workHealth).toMatchObject({ expectedThreadId: threadId, recovery: true, previousError: lastError });
+        expect(launch.selection.executionId).not.toBe(selection.executionId);
+        expect(factory.args!.at(-1)).not.toContain("Never replay");
+        expect(recovered.restoreInput?.()).toMatchObject({ codexRuntimeContext: runtimeContext, resume: { mode: "session", sessionId: threadId } });
+        expect(recovered.restoreInput?.()).not.toHaveProperty("prompt");
+        expect(recovered.restoreInput?.()).not.toHaveProperty("codexNativeRecovery");
+        expect(recovered.nativeWork?.()).toMatchObject({ executionId: launch.selection.executionId, threadId, goalStatus: "blocked", lastError, recoveryStatus: "awaiting_goal_resume" });
+        expect(await fs.readFile(transcript, "utf8")).toBe(transcriptContent);
+        expect(await fs.readFile(path.join(root, "working-file.txt"), "utf8")).toBe("Preserve work");
+        expect(factory.process!.written).toBe("");
+        expect(controls.closeTab).not.toHaveBeenCalled();
+      } finally { await recovered.terminate?.(); }
+    });
+  });
+
+  it.each(["missing-selection", "stale-selection", "stale-work", "missing-transcript", "workspace-mismatch", "running-turn", "completed-turn"])("rejects %s before touching the live client", async failure => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const selection = factory.bridgeLaunch().selection;
+      const work = { version: 1, tabId: tab.id, executionId: selection.executionId, threadId, updatedAt: new Date().toISOString(), turnStatus: "failed", goalStatus: "blocked", lastError };
+      if (failure !== "missing-transcript") await fs.writeFile(path.join(home, "sessions", `rollout-${threadId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: threadId, cwd: root } }) + "\n");
+      if (failure !== "missing-selection") await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: threadId, cwd: failure === "workspace-mismatch" ? home : root, ...(failure === "stale-selection" ? { executionId: threadId } : {}) }));
+      await fs.writeFile(codexNativeWorkPath(factory.env!.CODEX_HOME!), JSON.stringify({ ...work,
+        ...(failure === "stale-work" ? { executionId: threadId } : {}),
+        ...(failure === "running-turn" ? { turnStatus: "running" } : {}),
+        ...(failure === "completed-turn" ? { turnStatus: "completed", goalStatus: "active" } : {})
+      }));
+      await expect(plugin.prepareNativeRecovery({ tab, cwd: root, controls, initialInput: previous.restoreInput?.() }, { action: "restart-native", executionId: selection.executionId, sessionId: threadId })).rejects.toThrow();
+      expect(factory.spawns).toBe(1);
+      expect(factory.process!.killed).toBe(false);
+      expect(factory.process!.written).toBe("");
+      previous.stop?.();
+    });
+  });
+
+  it("keeps the live client when its saved account was deleted", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory }) => {
+      const data = path.join(root, "data");
+      const accounts = new AgentAccountStore(data, { CODEX_HOME: home });
+      const account = await accounts.create({ providerId: "codex", label: "Saved account", kind: "subscription" });
+      const sources = new CodexStateSources(data, { CODEX_HOME: home });
+      const plugin = new CodexTerminalPlugin(factory, undefined, data, sources, process.env, { accounts, claudeSettings: { read: vi.fn() } });
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls, initialInput: { agent: { providerId: "codex", accountId: account.id } } });
+      try {
+        const selection = factory.bridgeLaunch().selection;
+        await fs.writeFile(path.join(home, "sessions", `rollout-${threadId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: threadId, cwd: root } }) + "\n");
+        await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: threadId, cwd: root }));
+        await fs.writeFile(codexNativeWorkPath(factory.env!.CODEX_HOME!), JSON.stringify({ version: 1, tabId: tab.id, executionId: selection.executionId, threadId, updatedAt: new Date().toISOString(), turnStatus: "failed", goalStatus: "blocked" }));
+        await accounts.delete(account.id);
+        await expect(plugin.prepareNativeRecovery({ tab, cwd: root, controls, initialInput: previous.restoreInput?.() }, { action: "restart-native", executionId: selection.executionId, sessionId: threadId })).rejects.toThrow("selected agent account no longer exists");
+        expect(factory.process!.killed).toBe(false);
+        expect(factory.spawns).toBe(1);
+      } finally { previous.stop?.(); await sources.dispose(); }
+    });
+  });
+
+  it("rechecks source receipt authority after asynchronous transcript validation", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const selection = factory.bridgeLaunch().selection;
+      const work = { version: 1, tabId: tab.id, executionId: selection.executionId, threadId, updatedAt: new Date().toISOString(), turnId: "failed-turn", turnStatus: "failed", goalStatus: "blocked" };
+      const workPath = codexNativeWorkPath(factory.env!.CODEX_HOME!);
+      await fs.writeFile(path.join(home, "sessions", `rollout-${threadId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: threadId, cwd: root } }) + "\n");
+      await fs.writeFile(selection.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: threadId, cwd: root }));
+      await fs.writeFile(workPath, JSON.stringify(work));
+      const requireTranscript = CodexConversationRecovery.prototype.requireTranscript;
+      vi.spyOn(CodexConversationRecovery.prototype, "requireTranscript").mockImplementation(async function (this: CodexConversationRecovery, sessionId, sourceHome) {
+        await fs.writeFile(workPath, JSON.stringify({ ...work, turnId: "new-turn", turnStatus: "running", goalStatus: "active" }));
+        return requireTranscript.call(this, sessionId, sourceHome);
+      });
+      await expect(plugin.prepareNativeRecovery({ tab, cwd: root, controls, initialInput: previous.restoreInput?.() }, { action: "restart-native", executionId: selection.executionId, sessionId: threadId })).rejects.toThrow("changed while recovery was prepared");
+      expect(factory.process!.killed).toBe(false);
+      expect(factory.spawns).toBe(1);
+      previous.stop?.();
+    });
+  });
+
+  it("restores durable native diagnostics while reattaching the same live execution", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn() };
+      const previous = await plugin.createSession({ tab, cwd: root, controls });
+      const selection = factory.bridgeLaunch().selection;
+      const work = { version: 1, tabId: tab.id, executionId: selection.executionId, threadId, updatedAt: new Date().toISOString(), turnStatus: "failed", goalStatus: "blocked", lastError };
+      await fs.writeFile(codexNativeWorkPath(factory.env!.CODEX_HOME!), JSON.stringify(work));
+      const initialInput = previous.restoreInput?.();
+      Object.assign(factory.process!, { detach: vi.fn() });
+      previous.detach?.();
+      Object.assign(factory, { attach: vi.fn(async () => factory.process!) });
+      const restored = await plugin.restoreSession({ tab, cwd: root, controls, initialInput });
+      try {
+        expect(restored.nativeWork?.()).toEqual(work);
+        expect(restored.snapshot().nativeWork).toEqual(work);
+        expect(restored.hasExited?.()).toBe(false);
+        expect(factory.spawns).toBe(1);
+      } finally { restored.stop?.(); }
+    });
+  });
 });
