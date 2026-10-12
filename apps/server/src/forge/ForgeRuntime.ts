@@ -891,9 +891,6 @@ export class ForgeRuntime {
       reconciliation.validate(preview, input);
       await this.assertReconciliationQuiescent(owned, tabs);
       await reconciliation.assertCurrent();
-      for (const directory of missing)
-        if (await this.disposableDirectoryExists(directory))
-          throw new Error("A removed worker directory reappeared after inspection. Inspect ownership again before reconciling.");
       if (await this.configHash(owned) !== owned.gitConfigHash)
         throw new Error("Worker Git configuration changed after inspection; its checkout was preserved.");
       const sourceDirectories = new Map<JsonStateFile, OwnedDirectory>();
@@ -912,6 +909,10 @@ export class ForgeRuntime {
             throw new Error("Worker ownership records changed after inspection. Inspect them again before reconciling.");
         }
         for (const directory of sourceDirectories.values()) await directory.assertCurrent();
+        await reconciliation.assertCurrent();
+        for (const directory of missing)
+          if (await this.disposableDirectoryExists(directory))
+            throw new Error("A removed worker directory reappeared after inspection. Inspect ownership again before reconciling.");
         // Every path, record and process is validated before replacing any metadata.
         for (const record of records) {
           const directory = sourceDirectories.get(record.file);
@@ -965,6 +966,26 @@ export class ForgeRuntime {
     owned.repository = await reconciliation.add(owned.repository);
     owned.worktree = await reconciliation.add(owned.worktree);
     owned.gitDirectory = await reconciliation.add(owned.gitDirectory!);
+    for (const snapshot of owned.diagnosticSnapshots ?? []) {
+      snapshot.origin.checkout = await reconciliation.add(snapshot.origin.checkout);
+      snapshot.origin.gitDirectory = await reconciliation.add(snapshot.origin.gitDirectory);
+      snapshot.parentIdentity = await disposable(snapshot.parentIdentity);
+      const retiring = { ...snapshot.identity, path: path.join(snapshot.parentIdentity.path, "retiring-source") };
+      const sourceExists = await this.disposableDirectoryExists(snapshot.identity.path);
+      const retiringExists = await this.disposableDirectoryExists(retiring.path);
+      if (snapshot.state === "removed" && (sourceExists || retiringExists))
+        throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} reappeared after retirement; recover its replacement before Resume.`);
+      if (retiringExists && (snapshot.state !== "removing" || sourceExists))
+        throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} has conflicting removal directories; recover both copies before Resume.`);
+      if (retiringExists) {
+        const identity = await reconciliation.add(retiring);
+        snapshot.identity = { ...identity, path: snapshot.identity.path };
+        missing.add(snapshot.identity.path);
+      } else {
+        snapshot.identity = await disposable(snapshot.identity);
+        missing.add(retiring.path);
+      }
+    }
     if (await this.configHash(owned) !== owned.gitConfigHash)
       throw new Error("Worker Git configuration or origin changed; its checkout was preserved.");
     const tabs: OwnedTab[] = [];

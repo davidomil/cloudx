@@ -406,12 +406,9 @@ export class ForgeWorkflowService {
   createDiagnosticSnapshot(id: string, attemptId: string, input: ForgeDiagnosticSnapshotInput): Promise<ForgeDiagnosticSnapshotResult> {
     validateForgeDiagnosticSnapshotInput(input);
     return this.withRunningWorkerResources(id, attemptId, worker => {
-      if (!worker.repositoryPath || !worker.worktreePath || !worker.branch)
-        throw new Error("The active worker has no owned checkout for diagnostic snapshots.");
       if (!this.deps.runtime.createDiagnosticSnapshot)
         throw new Error("Diagnostic snapshot creation is unavailable in this runtime.");
-      return this.deps.runtime.createDiagnosticSnapshot({ id, repositoryPath: worker.repositoryPath,
-        worktreePath: worker.worktreePath, branch: worker.branch }, attemptId, input);
+      return this.deps.runtime.createDiagnosticSnapshot(workerWorkspace(worker), attemptId, input);
     });
   }
 

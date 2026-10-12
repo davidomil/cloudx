@@ -192,14 +192,36 @@ describe("Worker diagnostic snapshot ownership", () => {
     expect(prompt).toContain("Do not create undeclared diagnostic copies");
   });
 
-  it("rejects stale attempts and inactive worker executions before allocating source copies", async () => {
+  it("creates snapshots through the active reviewer's detached checkout", async () => {
     const f = fixture();
+    f.runtime.prepareWorkspace.mockResolvedValueOnce({ repositoryPath: "/repo/work", worktreePath: "/repo/work", branch: "" });
+    const result = { path: ".cloudx/forge-snapshots/owned/source", kind: "source-only" as const, retentionPolicy: "disposable" as const };
+    const create = vi.fn(async () => result);
+    f.deps.runtime.createDiagnosticSnapshot = create;
+    const reviewer = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(reviewer).toMatchObject({ kind: "review", status: "running", branch: "" });
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ review: true }), expect.any(AbortSignal));
+    const input = { kind: "source-only" as const, commitSha: f.change.headSha };
+    expect(await f.service.createDiagnosticSnapshot(reviewer.id, reviewer.attemptId!, input)).toEqual(result);
+    expect(create).toHaveBeenCalledExactlyOnceWith({ id: reviewer.id, repositoryPath: reviewer.repositoryPath,
+      worktreePath: reviewer.worktreePath, branch: "" }, reviewer.attemptId, input);
+    expect(f.runtime.launch.mock.calls[0]![0].prompt).toContain(`forge-snapshot.mjs' ${reviewer.id} ${reviewer.attemptId}`);
+  });
+
+  it.each(["issue", "review"] as const)("rejects stale attempts and inactive %s executions before allocating source copies", async kind => {
+    const f = fixture();
+    if (kind === "review") f.runtime.prepareWorkspace.mockResolvedValueOnce({ repositoryPath: "/repo/work", worktreePath: "/repo/work", branch: "" });
     const create = vi.fn();
     f.deps.runtime.createDiagnosticSnapshot = create;
-    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const worker = kind === "issue"
+      ? await f.service.startIssue(f.deps.settings().repository, 1, placement)
+      : await f.service.startReview(f.deps.settings().repository, 7, false, placement);
     const input = { kind: "repository" as const, commitSha: "a".repeat(40) };
     await expect(f.service.createDiagnosticSnapshot(worker.id, randomUUID(), input)).rejects.toThrow("current active worker attempt");
     f.runtime.isActive.mockReturnValue(false);
+    await expect(f.service.createDiagnosticSnapshot(worker.id, worker.attemptId!, input)).rejects.toThrow("current active worker attempt");
+    f.runtime.isActive.mockReturnValue(true);
+    await f.service.pause(worker.id);
     await expect(f.service.createDiagnosticSnapshot(worker.id, worker.attemptId!, input)).rejects.toThrow("current active worker attempt");
     expect(create).not.toHaveBeenCalled();
   });

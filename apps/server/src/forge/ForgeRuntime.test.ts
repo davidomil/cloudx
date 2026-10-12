@@ -4813,6 +4813,172 @@ describe("Forge completed retained checkout reconciliation", () => {
     return { service: new ForgeWorkflowService(deps), deps, store, reports, provider, attemptId, report, history };
   }
 
+  async function legacyDiagnosticSnapshot(kind: "source-only" | "repository" = "source-only", state: "ready" | "removing" | "removed" = "ready") {
+    vi.spyOn(filesystemEvidence, "filesystemIdentity").mockResolvedValue({ filesystemType: "ef53", filesystemId: "f00d1234" });
+    const workspace = await prepare(randomUUID());
+    const manifest = path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`);
+    let owned = JSON.parse(await fs.readFile(manifest, "utf8"));
+    for (const identity of [owned.repository, owned.worktree, owned.gitDirectory]) delete identity.durable;
+    await fs.writeFile(manifest, JSON.stringify(owned));
+    const result = await runtime.createDiagnosticSnapshot(workspace, randomUUID(), { kind, commitSha: headSha });
+    const source = path.join(workspace.worktreePath, result.path);
+    const retiring = path.join(path.dirname(source), "retiring-source");
+    owned = JSON.parse(await fs.readFile(manifest, "utf8"));
+    owned.diagnosticSnapshots[0].state = state;
+    if (state === "removing") await fs.rename(source, retiring);
+    if (state === "removed") await fs.rm(source, { recursive: true });
+    const oldDevice = (BigInt(owned.worktree.dev) + 1n).toString();
+    const renumberLegacyIdentities = (value: unknown) => {
+      if (!value || typeof value !== "object") return;
+      const identity = value as Record<string, unknown>;
+      if (typeof identity.dev === "string" && typeof identity.ino === "string") {
+        delete identity.durable;
+        identity.dev = oldDevice;
+      }
+      Object.values(identity).forEach(renumberLegacyIdentities);
+    };
+    renumberLegacyIdentities(owned);
+    await fs.writeFile(manifest, JSON.stringify(owned));
+    const reportPath = ".cloudx/validation/run.log";
+    await fs.mkdir(path.dirname(path.join(workspace.worktreePath, reportPath)), { recursive: true });
+    await fs.writeFile(path.join(workspace.worktreePath, reportPath), "Legacy snapshot validation passed");
+    const f = await completedWorkflow(workspace, [".cloudx"]);
+    return { ...f, workspace, manifest, source, retiring, oldDevice, reportPath };
+  }
+
+  function attestOwnership(preview: DirectoryOwnershipPreview): DirectoryOwnershipReconciliation {
+    return { fingerprint: preview.fingerprint, attestations: preview.directories.map(({ device, filesystemId, filesystemType }) => ({ device, filesystemId, filesystemType })) };
+  }
+
+  it.each(["ready", "removing", "removed", "relocated", "missing-parent"] as const)("reconciles legacy diagnostic snapshot identities and retires through Resume from %s", async state => {
+    const f = await legacyDiagnosticSnapshot("source-only", state === "relocated" || state === "missing-parent" ? "ready" : state);
+    try {
+      const relocated = path.join(root, "recovered-legacy-source");
+      if (state === "relocated") await fs.rename(f.source, relocated);
+      if (state === "missing-parent") await fs.rename(path.dirname(f.source), relocated);
+      if (state === "removing") await fs.unlink(path.join(f.retiring, "README.md"));
+      const parentPresent = state !== "missing-parent";
+      const sourcePresent = state === "ready" || state === "removing";
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("legacy record") });
+      const preview = await f.service.previewOwnership(f.workspace.id);
+      expect(preview.directories.map(directory => directory.path)).toEqual(expect.arrayContaining([
+        ...(parentPresent ? [path.dirname(f.source)] : []), ...(sourcePresent ? [state === "removing" ? f.retiring : f.source] : []),
+      ]));
+      await f.service.reconcileOwnership(f.workspace.id, attestOwnership(preview));
+      const owned = JSON.parse(await fs.readFile(f.manifest, "utf8"));
+      const snapshot = owned.diagnosticSnapshots[0];
+      expect(snapshot.origin.checkout).toEqual(owned.worktree);
+      expect(snapshot.origin.gitDirectory).toEqual(owned.gitDirectory);
+      for (const identity of [...(parentPresent ? [snapshot.parentIdentity] : []), ...(sourcePresent ? [snapshot.identity] : [])]) {
+        expect(identity.dev).not.toBe(f.oldDevice);
+        expect(identity.durable.filesystemId).toBe("f00d1234");
+      }
+      await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace });
+      await f.service.dispose();
+      runtime = new ForgeRuntime(dependencies());
+      f.deps.runtime = runtime;
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.resume(f.workspace.id, { windowId: "window", paneId: "pane" });
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(f.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      const evidence = new ForgeCheckoutEvidence(path.join(root, "data"));
+      const [archive] = await evidence.list();
+      const chunks: Buffer[] = [];
+      for await (const chunk of await evidence.fileStream(archive!.archiveId, f.reportPath)) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe("Legacy snapshot validation passed");
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      if (state === "relocated" || state === "missing-parent")
+        expect(await fs.readFile(path.join(relocated, state === "missing-parent" ? "source/README.md" : "README.md"), "utf8")).toBe("Initial content\n");
+    } finally { await f.service.dispose(); }
+  });
+
+  it("reconciles a legacy repository snapshot while preserving its objects until verified recovery and Resume", async () => {
+    const f = await legacyDiagnosticSnapshot("repository");
+    try {
+      await f.service.poll();
+      const preview = await f.service.previewOwnership(f.workspace.id);
+      await f.service.reconcileOwnership(f.workspace.id, attestOwnership(preview));
+      await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace });
+      await f.service.resume(f.workspace.id, { windowId: "window", paneId: "pane" });
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("requires recovery") });
+      const archive = path.join(root, "legacy-snapshot-recovery.tar");
+      const restored = path.join(root, "verified-legacy-recovery");
+      await createTar({ file: archive, cwd: f.source }, ["."]);
+      await fs.mkdir(restored);
+      await extractTar({ file: archive, cwd: restored, strict: true });
+      const objectNames = (await git(f.source, `--git-dir=${f.source}/.git`, "rev-list", "--objects", "--all")).split("\n").map(line => line.split(" ")[0]!);
+      expect(objectNames.length).toBeGreaterThan(0);
+      for (const object of objectNames) {
+        const relative = path.join(".git", "objects", object.slice(0, 2), object.slice(2));
+        expect(await fs.readFile(path.join(restored, relative))).toEqual(await fs.readFile(path.join(f.source, relative)));
+      }
+      await fs.rename(f.source, path.join(root, "relocated-legacy-snapshot"));
+      await f.service.resume(f.workspace.id, { windowId: "window", paneId: "pane" });
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(f.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await git(restored, `--git-dir=${restored}/.git`, "rev-parse", "HEAD")).toBe(headSha);
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+    } finally { await f.service.dispose(); }
+  });
+
+  it.each(["parent", "source", "retiring-source"])("rejects a replaced diagnostic %s before changing ownership metadata", async target => {
+    const f = await legacyDiagnosticSnapshot("source-only", target === "retiring-source" ? "removing" : "ready");
+    try {
+      const preview = await runtime.previewOwnership(f.workspace.id);
+      const before = await fs.readFile(f.manifest, "utf8");
+      const directory = target === "parent" ? path.dirname(f.source) : target === "source" ? f.source : f.retiring;
+      await fs.rename(directory, `${directory}-original`);
+      await fs.mkdir(directory);
+      await fs.writeFile(path.join(directory, "investigation.txt"), "Preserve replacement source");
+      await expect(runtime.reconcileOwnership(f.workspace.id, attestOwnership(preview))).rejects.toThrow(/ownership changed/);
+      expect(await fs.readFile(f.manifest, "utf8")).toBe(before);
+      expect(await fs.readFile(path.join(directory, "investigation.txt"), "utf8")).toBe("Preserve replacement source");
+      expect(await fs.readFile(path.join(`${directory}-original`, target === "parent" ? "source/README.md" : "README.md"), "utf8")).toBe("Initial content\n");
+    } finally { await f.service.dispose(); }
+  });
+
+  it.each(["replaced", "reappeared"])("rejects a diagnostic source that is %s during the final ownership record read", async change => {
+    const f = await legacyDiagnosticSnapshot("source-only", change === "reappeared" ? "removed" : "ready");
+    try {
+      const preview = await runtime.previewOwnership(f.workspace.id);
+      const before = await fs.readFile(f.manifest, "utf8");
+      const open = fs.open;
+      let manifestReads = 0;
+      vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        if (String(args[0]) === f.manifest && ++manifestReads === 2) {
+          if (change === "replaced") await fs.rename(f.source, `${f.source}-original`);
+          await fs.mkdir(f.source);
+          await fs.writeFile(path.join(f.source, "investigation.txt"), "Preserve late source");
+        }
+        return handle;
+      });
+      await expect(runtime.reconcileOwnership(f.workspace.id, attestOwnership(preview))).rejects.toThrow(/ownership changed|reappeared after inspection/);
+      expect(manifestReads).toBe(2);
+      expect(await fs.readFile(f.manifest, "utf8")).toBe(before);
+      expect(await fs.readFile(path.join(f.source, "investigation.txt"), "utf8")).toBe("Preserve late source");
+    } finally { await f.service.dispose(); }
+  });
+
+  it.each(["creating", "modified"])("reconciles identities while preserving a %s diagnostic copy for recovery", async state => {
+    const f = await legacyDiagnosticSnapshot();
+    try {
+      if (state === "creating") {
+        const owned = JSON.parse(await fs.readFile(f.manifest, "utf8"));
+        owned.diagnosticSnapshots[0].state = "creating";
+        await fs.writeFile(f.manifest, JSON.stringify(owned));
+      } else await fs.writeFile(path.join(f.source, "README.md"), "Preserve diagnostic investigation\n");
+      await f.service.poll();
+      const preview = await f.service.previewOwnership(f.workspace.id);
+      await f.service.reconcileOwnership(f.workspace.id, attestOwnership(preview));
+      await f.service.resume(f.workspace.id, { windowId: "window", paneId: "pane" });
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining(state === "creating" ? "requires recovery" : "modified, missing or additional source") });
+      expect(await fs.readFile(path.join(f.source, "README.md"), "utf8")).toBe(state === "creating" ? "Initial content\n" : "Preserve diagnostic investigation\n");
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+    } finally { await f.service.dispose(); }
+  });
+
   it("names a partial diagnostic object copy, preserves all 114 objects, then retires the batch through Resume after verified recovery", async () => {
     const workspace = await prepare(randomUUID());
     const relative = ".cloudx/forge-evidence/continuation-8d8bf43c/source";
