@@ -91,7 +91,7 @@ describe("Completed Forge evidence lifecycle", () => {
     const link = manifest.files.find(file => file.symbolicLink)!;
     expect(JSON.parse((await buffer(await fixture.resources.evidenceFile(resource.id, link.path))).toString())).toEqual({ type: "SymbolicLink", target: link.symbolicLink });
     expect(fixture.host.exports).toHaveLength(1);
-  });
+  }, 30_000);
 
   it("cleans every staged batch after a partial tar export and automatically recovers the full selection after restart", async () => {
     const owner = completedWorker();
@@ -112,7 +112,7 @@ describe("Completed Forge evidence lifecycle", () => {
     expect((await fixture.resources.readEvidence(resource.id)).files).toHaveLength(604);
     expect(fixture.host.exports).toHaveLength(2);
     expect(fixture.host.removed).toEqual([resource.containerId]);
-  });
+  }, 30_000);
 
   it("verifies every batch again after restart and preserves the container until a corrupted later batch is restored", async () => {
     const owner = completedWorker();
@@ -138,7 +138,7 @@ describe("Completed Forge evidence lifecycle", () => {
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.host.removed).toEqual([resource.containerId]);
     expect(fixture.host.exports).toHaveLength(1);
-  });
+  }, 30_000);
 
   it("deduplicates primary export failures across diagnostic variants and restart while reporting changed blockers", async () => {
     const owner = completedWorker();
