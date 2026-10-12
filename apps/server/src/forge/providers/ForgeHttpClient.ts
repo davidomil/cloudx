@@ -8,7 +8,7 @@ import { ForgeProviderError, forgeRequestTimeoutMs, type ForgeDiagnosticObserver
 import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
 import { list } from "./validation.js";
 import { readBoundedBody } from "./responseBody.js";
-import { readCiLog } from "./ciEvidence.js";
+import { readCiLog, type CiLogEvidence } from "./ciEvidence.js";
 
 interface ForgeRequestOptions {
   method?: string;
@@ -39,13 +39,17 @@ export class ForgeHttpClient {
   }
 
   async ciLog(path: string): Promise<string> {
+    return (await this.ciLogEvidence(path)).log;
+  }
+
+  async ciLogEvidence(path: string): Promise<CiLogEvidence> {
     const prefix = this.repository.provider === "github"
       ? `/repos/${this.repository.projectPath.split("/").map(encodeURIComponent).join("/")}/actions/jobs/`
       : `/projects/${encodeURIComponent(this.repository.projectPath)}/jobs/`;
     if (!path.startsWith(prefix) || !/^\d+\/(?:logs|trace)$/.test(path.slice(prefix.length)) ||
         !path.endsWith(this.repository.provider === "github" ? "/logs" : "/trace"))
       throw new ForgeProviderError("CI logs require a job in the configured repository.");
-    return String((await this.performRequest(path, {}, true)).body);
+    return (await this.performRequest(path, {}, true)).body as CiLogEvidence;
   }
 
   private async performRequest(
@@ -152,7 +156,7 @@ export class ForgeHttpClient {
     }
     try {
       if (ciLog) {
-        const text = await readCiLog(response, secrets);
+        const text = await readCiLog(response, secrets, this.repository.projectPath);
         if (signal.aborted) throw signal.reason;
         return { body: text, headers: response.headers };
       }

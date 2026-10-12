@@ -34,6 +34,15 @@ beforeEach(() => {
         console.error('synthetic-private-runtime-detail: selected conversation was not saved');
         process.exit(1);
       }
+      if (process.env.CLOUDX_TEST_FAILURE?.startsWith('snapshot-')) {
+        console.log('Selected conversation saved before any model prompt.');
+        console.log('Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.');
+        console.log('Resumed Forge turn matched the selected thread, native completion and final shutdown.');
+        const diagnostic = { stage: 'snapshot', code: process.env.CLOUDX_TEST_FAILURE === 'snapshot-size' ? 'database-size' : 'snapshot-budget', observedBytes: 8589934593, limitBytes: 8589934592 };
+        console.error('CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify(diagnostic));
+        console.error('Codex native runtime verification failed: shared-state snapshot preparation failed: 8589934593 bytes; the limit is 8589934592 bytes.');
+        process.exit(1);
+      }
     `;
     return spawn(command, [...args.slice(0, verifier), "-e", source, "--", ...args.slice(verifier + 1)], options);
   });
@@ -239,6 +248,31 @@ describe("server-owned Codex updates", () => {
     const retry = f.service();
     await retry.start(f.env.CLOUDX_TEST_LATEST!);
     expect(await finished(retry)).toMatchObject({ phase: "succeeded", outcome: current ? "current" : "updated", installedVersion: current ? "1.0.0" : "1.1.0" });
+  });
+
+  it.each(["snapshot-size", "snapshot-budget"])("persists the specific %s cause in status and the private log without changing the active selection", async failure => {
+    const f = await installation();
+    const initial = f.service();
+    await initial.start("1.0.0");
+    expect(await finished(initial)).toMatchObject({ phase: "succeeded", activeVersion: "1.0.0" });
+    const selectionPath = path.join(f.env.CLOUDX_NPM_GLOBAL_DIR!, ".cloudx-codex-selection.json");
+    const before = await fs.readFile(selectionPath);
+    f.env.CLOUDX_TEST_FAILURE = failure;
+    const updates = f.service();
+
+    await updates.start("1.1.0");
+    const failed = await finished(updates);
+
+    expect(failed).toMatchObject({ phase: "failed", installedVersion: "1.1.0", activeVersion: "1.0.0", outcome: null, message: expect.stringContaining("snapshot preparation failed") });
+    expect(failed.message).toContain("8589934593 bytes; the limit is 8589934592 bytes");
+    expect(failed.message).not.toContain("failed CloudX tab launch");
+    expect(await fs.readFile(selectionPath)).toEqual(before);
+    expect(await updates.read()).toEqual(failed);
+    expect(await f.service().read()).toEqual(failed);
+    const log = await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8");
+    expect(log).toContain("Resumed Forge turn matched the selected thread");
+    expect(log).toContain('"observedBytes":8589934593');
+    expect(log).toContain("8589934593 bytes; the limit is 8589934592 bytes");
   });
 
   it("marks a retained unfinished job interrupted after restart and checks the executable before displaying its version", async () => {

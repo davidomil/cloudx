@@ -10,6 +10,7 @@ import { registerTerminalView, unregisterTerminalView } from "./terminalViewStor
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
 import { uploadFileBrowserFile } from "../api.js";
 import { TerminalSelectionCopy } from "./terminalSelectionCopy.js";
+import { TerminalClipboardRequest } from "./terminalClipboardRequest.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 
 interface TerminalView {
@@ -31,6 +32,7 @@ interface TerminalView {
   releaseMobileScroll?: () => void;
   releaseImagePaste?: () => void;
   selectionCopy?: TerminalSelectionCopy;
+  clipboardRequest?: TerminalClipboardRequest;
   uiScale: number;
   connectionError?: TerminalConnectionError;
   onConnectionError?: (error: TerminalConnectionError) => void;
@@ -103,6 +105,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
 
     const view = getTerminalView(tab, containerRef.current, uiScale);
     viewRef.current = view;
+    view.clipboardRequest?.setActive(activeRef.current);
     view.terminal.options.disableStdin = preserveOutput;
     if (preserveOutput) {
       window.clearTimeout(view.reconnectTimer);
@@ -146,6 +149,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     const view = viewRef.current;
     if (view) {
       if (!active) view.selectionCopy?.clear();
+      view.clipboardRequest?.setActive(active);
       scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active, trigger: "activation" }));
     }
   }, [active]);
@@ -190,6 +194,7 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
     cursorBlink: true,
     fontFamily: "JetBrains Mono, SFMono-Regular, Consolas, monospace",
     fontSize: responsiveTerminalFontSize(container, uiScale),
+    macOptionClickForcesSelection: true,
     lineHeight: 1.25,
     theme: readTerminalColorTheme()
   });
@@ -324,7 +329,9 @@ function attachTerminalView(view: TerminalView, container: HTMLDivElement): void
 
 function installSelectionCopyForView(view: TerminalView, container: HTMLDivElement): void {
   view.selectionCopy?.dispose();
+  view.clipboardRequest?.dispose();
   view.selectionCopy = new TerminalSelectionCopy(view.terminal, container);
+  view.clipboardRequest = new TerminalClipboardRequest(view.terminal, container);
 }
 
 function removeInactiveTerminalElements(container: HTMLDivElement, activeElement: HTMLElement | undefined): void {
@@ -347,6 +354,8 @@ function installMobileScrollForView(view: TerminalView, container: HTMLDivElemen
 function releaseTerminalContainerBindings(view: TerminalView): void {
   view.selectionCopy?.dispose();
   view.selectionCopy = undefined;
+  view.clipboardRequest?.dispose();
+  view.clipboardRequest = undefined;
   view.releaseMobileScroll?.();
   view.releaseMobileScroll = undefined;
   view.releaseImagePaste?.();

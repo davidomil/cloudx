@@ -1520,6 +1520,7 @@ a:hover svg {
 }
 
 .terminal-saved-selection,
+.terminal-clipboard-request,
 .terminal-selection-menu {
   position: absolute;
   z-index: 8;
@@ -1532,9 +1533,16 @@ a:hover svg {
   background: var(--color-background);
   box-shadow: 0 4px 20px #0008;
 }
-.terminal-saved-selection textarea { display: block; width: 100%; margin: 8px 0; font-family: monospace; white-space: pre; resize: vertical; max-height: 35vh; }
-.terminal-saved-selection > div { display: flex; gap: 8px; }
-.terminal-saved-selection [role="status"] { font-size: var(--font-size-xs); }
+.terminal-saved-selection textarea,
+.terminal-clipboard-request textarea { display: block; width: 100%; margin: 8px 0; font-family: monospace; white-space: pre; resize: vertical; max-height: 35vh; }
+.terminal-saved-selection > div,
+.terminal-clipboard-request > div { display: flex; gap: 8px; }
+.terminal-saved-selection [role="status"],
+.terminal-clipboard-request [role="status"] { font-size: var(--font-size-xs); }
+.terminal-clipboard-request { top: 44px; bottom: auto; }
+.terminal-copy-help { position: absolute; z-index: 8; top: 8px; right: 12px; max-width: min(480px, calc(100% - 24px)); padding: 4px 8px; border-radius: 6px; background: var(--color-background); font-size: var(--font-size-xs); }
+.terminal-copy-help summary { cursor: pointer; }
+.terminal-copy-help p { margin: 8px 0 4px; }
 .terminal-selection-menu { width: auto; bottom: 180px; }
 
 .workspace-recovery-panel {

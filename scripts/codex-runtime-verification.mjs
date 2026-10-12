@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { CODEX_STATE_ERROR_PREFIX, CodexStateVerificationError } from "./codex-state-errors.mjs";
 
 export async function verifyCodexRuntime(options) {
   let runtime;
@@ -29,6 +30,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     await verifyCodexRuntime(options);
   } catch (error) {
+    if (error instanceof CodexStateVerificationError) console.error(`${CODEX_STATE_ERROR_PREFIX}${JSON.stringify(error.diagnostic)}`);
     console.error(`Codex native runtime verification failed: ${error.message}`);
     process.exitCode = 1;
   }

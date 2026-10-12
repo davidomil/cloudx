@@ -1,38 +1,90 @@
 """Bounded, read-only snapshots for native Codex schema compatibility checks."""
 from contextlib import closing
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import time
 
-DEADLINE = time.monotonic() + 20
-MAX_BYTES = 1024 * 1024 * 1024
+DEADLINE = time.monotonic() + 60
+MAX_BYTES = 8 * 1024 * 1024 * 1024
 MAX_DIRECTORY_BYTES = 16 * 1024 * 1024
+COPY_CHUNK_BYTES = 1024 * 1024
+
+
+class SnapshotPreparationError(ValueError):
+    def __init__(self, code, observed_bytes=None, limit_bytes=None):
+        super().__init__(code)
+        self.code = code
+        self.observed_bytes = observed_bytes
+        self.limit_bytes = limit_bytes
+
+    def diagnostic(self):
+        result = {"stage": "snapshot", "code": self.code}
+        if self.observed_bytes is not None:
+            result.update(observedBytes=self.observed_bytes, limitBytes=self.limit_bytes)
+        return result
+
+
+def check_budget(observed_bytes, code="snapshot-budget"):
+    if observed_bytes > MAX_BYTES:
+        raise SnapshotPreparationError(code, observed_bytes, MAX_BYTES)
+
+
+def check_disk_space(required_bytes, destination):
+    space = os.statvfs(destination)
+    available_bytes = space.f_bavail * space.f_frsize
+    if required_bytes > available_bytes:
+        raise SnapshotPreparationError("disk-space", required_bytes, available_bytes)
+
+
+def transcript_hash(file):
+    digest = hashlib.sha256()
+    with open(file, "rb") as stream:
+        while chunk := stream.read(COPY_CHUNK_BYTES):
+            check_progress()
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def copy_transcript(original, isolated, total_bytes):
+    digest = hashlib.sha256()
+    with open(original, "rb") as source, open(isolated, "xb") as target:
+        while chunk := source.read(COPY_CHUNK_BYTES):
+            check_progress()
+            total_bytes += len(chunk)
+            check_budget(total_bytes, "transcript-budget")
+            target.write(chunk)
+            digest.update(chunk)
+    isolated.chmod(0o600)
+    return total_bytes, digest.hexdigest()
 
 
 def read_directories(file):
     with open(file, "rb") as stream:
         data = stream.read(MAX_DIRECTORY_BYTES + 1)
     if len(data) > MAX_DIRECTORY_BYTES:
-        raise ValueError("Codex snapshot directory list exceeds the 16 MiB limit")
+        raise SnapshotPreparationError("directory-list")
     directories = json.loads(data)
     if not isinstance(directories, list) or len(directories) > 10003 or any(not isinstance(directory, str) for directory in directories):
-        raise ValueError("Invalid Codex snapshot directory list")
+        raise SnapshotPreparationError("directory-list")
     return directories
 
 
 def check_progress(_status=0, _remaining=0, total=0):
     if time.monotonic() > DEADLINE:
-        raise ValueError("Codex state snapshot exceeded its time limit")
+        raise SnapshotPreparationError("time-limit")
 
 
 def open_state(file):
     info = file.lstat()
-    if not file.is_file() or file.is_symlink() or info.st_uid != os.getuid() or info.st_size > MAX_BYTES:
-        raise ValueError("Codex database must be an owned regular file within the size limit")
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise SnapshotPreparationError("database-file")
+    check_budget(info.st_size, "database-size")
     connection = sqlite3.connect(file.as_uri() + "?mode=ro", uri=True, timeout=1)
     connection.set_progress_handler(lambda: int(time.monotonic() > DEADLINE), 1000)
     return connection
@@ -52,10 +104,10 @@ def snapshot(directories, destination):
         if not source.exists():
             continue
         if source.is_symlink() or not source.is_dir() or source.stat().st_uid != os.getuid():
-            raise ValueError("Codex database home must be an owned real directory")
+            raise SnapshotPreparationError("database-home")
         files = sorted(source.glob("*.sqlite"))
         if len(files) > 32:
-            raise ValueError("Too many Codex databases to verify")
+            raise SnapshotPreparationError("database-count")
         if not files:
             continue
         signature = []
@@ -70,7 +122,7 @@ def snapshot(directories, destination):
             continue
         seen.add(fingerprint)
         if len(seen) > 16:
-            raise ValueError("Too many distinct Codex database schemas; inspect shared state before switching")
+            raise SnapshotPreparationError("database-count")
         target = Path(destination) / str(len(results))
         target.mkdir(mode=0o700)
         retained = {"threads": {}, "transcripts": {}}
@@ -81,14 +133,14 @@ def snapshot(directories, destination):
 
                 def reserve_pages(status, remaining, total):
                     check_progress()
-                    if budget_before + total * page_size > MAX_BYTES:
-                        raise ValueError("Codex snapshots exceed the 1 GiB limit")
+                    check_budget(budget_before + total * page_size)
 
                 reserve_pages(0, 0, connection.execute("PRAGMA page_count").fetchone()[0])
+                check_disk_space(connection.execute("PRAGMA page_count").fetchone()[0] * page_size, target)
                 connection.backup(copied, pages=256, progress=reserve_pages, sleep=0.01)
-                total_bytes += (target / file.name).stat().st_size
-                if total_bytes > MAX_BYTES:
-                    raise ValueError("Codex snapshots exceed the 1 GiB limit")
+                database_bytes = (target / file.name).stat().st_size
+                total_bytes += database_bytes
+                check_budget(total_bytes)
                 columns = {row[1] for row in copied.execute("PRAGMA table_info(threads)")}
                 if "rollout_path" in columns:
                     # The native process must never follow a copied row back into production history.
@@ -100,21 +152,22 @@ def snapshot(directories, destination):
                         isolated = transcripts / (str(index) + ".jsonl")
                         original = Path(rollout).resolve()
                         if not any(parent in original.parents for parent in allowed) or original.suffix != ".jsonl":
-                            raise ValueError("Retained conversation path is outside the shared session store")
+                            raise SnapshotPreparationError("transcript-path")
                         if original.exists():
                             info = original.lstat()
-                            total_bytes += info.st_size
-                            if not original.is_file() or info.st_uid != os.getuid() or total_bytes > MAX_BYTES:
-                                raise ValueError("Retained conversation exceeds the snapshot limits")
-                            isolated.write_bytes(original.read_bytes())
-                            isolated.chmod(0o600)
-                            retained["transcripts"][str(isolated)] = hashlib.sha256(isolated.read_bytes()).hexdigest()
+                            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                                raise SnapshotPreparationError("transcript-file")
+                            check_budget(total_bytes + info.st_size, "transcript-budget")
+                            check_disk_space(info.st_size, target)
+                            total_bytes, retained["transcripts"][str(isolated)] = copy_transcript(original, isolated, total_bytes)
                         copied.execute("UPDATE threads SET rollout_path = ? WHERE id = ?", (str(isolated), identity))
                     copied.commit()
                 if "id" in columns and file.name.startswith("state_"):
                     retained["threads"][file.name] = {}
                     for identity, in copied.execute("SELECT id FROM threads"):
                         retained["threads"][file.name][identity] = copied.execute("SELECT rollout_path FROM threads WHERE id = ?", (identity,)).fetchone()[0] if "rollout_path" in columns else None
+            total_bytes += (target / file.name).stat().st_size - database_bytes
+            check_budget(total_bytes)
             os.chmod(target / file.name, 0o600)
         receipt = target / "retained-identities.json"
         receipt.write_text(json.dumps(retained))
@@ -144,7 +197,7 @@ def verify(directory, session_id):
                 if table and connection.execute("SELECT id FROM threads WHERE id = ?", (session_id,)).fetchone():
                     found = True
     for file, expected_hash in retained["transcripts"].items():
-        if hashlib.sha256(Path(file).read_bytes()).hexdigest() != expected_hash:
+        if transcript_hash(file) != expected_hash:
             raise ValueError("Candidate changed a retained conversation transcript")
     if not found:
         raise ValueError("Candidate did not persist its native conversation in the isolated SQLite state; a migration may have failed")
@@ -159,7 +212,18 @@ if __name__ == "__main__":
             print(json.dumps(verify(sys.argv[2], sys.argv[3])))
         else:
             raise ValueError("Unknown Codex state verification operation")
-    except Exception:
-        # Do not print stored data, SQLite statements or user configuration.
-        print("Codex shared-state compatibility check failed; inspect state ownership, database health, schema compatibility and snapshot limits.", file=sys.stderr)
+    except Exception as error:
+        # Never print stored data, SQLite statements, paths or user configuration.
+        diagnostic = error.diagnostic() if sys.argv[1] == "snapshot" and isinstance(error, SnapshotPreparationError) else {
+            "stage": "snapshot" if sys.argv[1] == "snapshot" else "verify",
+            "code": "unavailable" if sys.argv[1] == "snapshot" else "candidate-state",
+        }
+        if diagnostic["stage"] == "snapshot" and not isinstance(error, SnapshotPreparationError):
+            if time.monotonic() > DEADLINE:
+                diagnostic["code"] = "time-limit"
+            elif getattr(error, "errno", None) in (errno.ENOSPC, errno.EDQUOT) or getattr(error, "sqlite_errorname", None) == "SQLITE_FULL":
+                diagnostic["code"] = "disk-full"
+            elif getattr(error, "errno", None) in (errno.EACCES, errno.EPERM):
+                diagnostic["code"] = "permission"
+        print(json.dumps(diagnostic), file=sys.stderr)
         sys.exit(1)

@@ -403,12 +403,25 @@ function parseCiDiagnostic(value: unknown, worker: ForgeWorker): ForgeCiDiagnost
     const url = nonblankText(job.url, "CI job URL", 4096);
     if (!["http:", "https:"].includes(new URL(url).protocol))
       throw new Error("CI job links must use HTTP or HTTPS.");
+    let requiredGate: ForgeCiDiagnostic["jobs"][number]["requiredGate"];
+    if (job.requiredGate !== undefined) {
+      const gate = object(job.requiredGate);
+      const gateUrl = nonblankText(gate.url, "CI required gate URL", 4096);
+      if (new URL(gateUrl).protocol !== "https:") throw new Error("CI required gate links must use HTTPS.");
+      requiredGate = {
+        jobId: nonblankText(gate.jobId, "CI required gate identity", 256),
+        name: nonblankText(gate.name, "CI required gate name", 4096), url: gateUrl,
+        log: nonblankText(gate.log, "CI required gate log", 32_000),
+      };
+      if (requiredGate.jobId === job.jobId) throw new Error("CI producers must differ from their required gate.");
+    }
     return {
       runId: nonblankText(job.runId, "CI run identity", 256), runAttempt: Number(job.runAttempt),
       jobId: nonblankText(job.jobId, "CI job identity", 256), name: nonblankText(job.name, "CI job name", 4096),
       url, conclusion: nonblankText(job.conclusion, "CI job conclusion", 128),
       ...(job.testedSha === undefined ? {} : { testedSha: commitSha(job.testedSha, "CI job tested commit") }), classification,
       ...(job.log === undefined ? {} : { log: text(job.log, "CI job log", 32_000) }),
+      ...(requiredGate ? { requiredGate } : {}),
     };
   });
   const jobIdentities = jobs.map(job => JSON.stringify([job.runId, job.runAttempt, job.jobId]));

@@ -341,24 +341,7 @@ export class LifecycleBrowserProfile {
       "The seeded shell must report its real PID.",
     );
 
-    await this.page
-      .locator(".workspace-pane.active")
-      .getByTitle("Add tab to this pane")
-      .click();
-    await this.page
-      .getByLabel("Plugin")
-      .selectOption({ label: "Codex Terminal" });
-    await this.page.getByLabel("Title").fill("Lifecycle preserved Codex");
-    const [response] = await Promise.all([
-      this.page.waitForResponse(
-        (response) =>
-          response.request().method() === "POST" &&
-          new URL(response.url()).pathname === "/api/tabs",
-      ),
-      this.page.getByRole("button", { name: "Create", exact: true }).click(),
-    ]);
-    assert.equal(response.status(), 201);
-    const codex = (await response.json()).tab;
+    const codex = await this.createCodexTab();
     this.seeded = {
       settings,
       windowId: window.id,
@@ -408,6 +391,27 @@ export class LifecycleBrowserProfile {
       `${JSON.stringify(this.seeded, null, 2)}\n`,
     );
     return this.seeded;
+  }
+
+  async createCodexTab() {
+    await this.page
+      .locator(".workspace-pane.active")
+      .getByTitle("Add tab to this pane")
+      .click();
+    await this.page
+      .getByLabel("Plugin")
+      .selectOption({ label: "Codex Terminal" });
+    await this.page.getByLabel("Title").fill("Lifecycle preserved Codex");
+    const [response] = await Promise.all([
+      this.page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/tabs",
+      ),
+      this.page.getByRole("button", { name: "Create", exact: true }).click(),
+    ]);
+    assert.equal(response.status(), 201);
+    return (await response.json()).tab;
   }
 
   async readSelectedConversation() {

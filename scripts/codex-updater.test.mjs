@@ -27,6 +27,14 @@ beforeEach(() => {
       if (process.env.TEST_MODE === 'runtime') {
         console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
       }
+      if (['snapshot-size', 'snapshot-budget', 'candidate-state', 'invalid-state-diagnostic'].includes(process.env.TEST_MODE)) {
+        const diagnostic = process.env.TEST_MODE === 'candidate-state' ? { stage: 'verify', code: 'candidate-state' }
+          : { stage: 'snapshot', code: process.env.TEST_MODE === 'snapshot-size' ? 'database-size' : 'snapshot-budget', observedBytes: 8589934593, limitBytes: 8589934592 };
+        if (process.env.TEST_MODE === 'invalid-state-diagnostic') diagnostic.limitBytes = 'SECRET-TOKEN';
+        diagnostic.message = 'SECRET-TOKEN';
+        console.error('CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify(diagnostic));
+        process.exit(1);
+      }
       if (process.env.TEST_MODE === 'previous-state-incompatible' && process.argv.includes('--previous-bin')) {
         console.error('The existing CLI cannot read candidate-migrated state'); process.exit(1);
       }
@@ -558,6 +566,32 @@ describe("shared Codex update", () => {
     expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toContain(version === "1.1.0" ? fixture.assistantBin : ".cloudx-codex/1.1.0-");
     expect(fs.readFileSync(fixture.env.TEST_VERSION_LOG, "utf8").trim().split("\n")).toHaveLength(version === "1.1.0" ? 1 : 2);
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
+  });
+
+  it.each(["snapshot-size", "snapshot-budget"])("preserves the verified selection and reports the precise %s preparation cause", async mode => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const selectionBefore = fs.readFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"));
+    fixture.env.TEST_MODE = mode;
+    const output = [];
+
+    const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
+
+    expect(error).toMatchObject({ code: "snapshot-preparation", usableVersion: "1.0.0", message: expect.stringContaining("snapshot preparation failed") });
+    expect(error.message).toContain("8589934593 bytes; the limit is 8589934592 bytes");
+    expect(error.message).not.toContain("SECRET-TOKEN");
+    expect(output.join("")).toContain('"observedBytes":8589934593');
+    expect(fs.readFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"))).toEqual(selectionBefore);
+    expect(await readCodexVersion(resolveSelectedCodexCommand(fixture.assistantBin), { env: fixture.env })).toBe("1.0.0");
+  });
+
+  it("reports candidate state incompatibility distinctly and rejects malformed diagnostic details", async () => {
+    const fixture = installation({ mode: "candidate-state" });
+    await expect(updateCodexInstallation(fixture)).rejects.toMatchObject({ code: "state-compatibility", message: expect.stringContaining("shared-state compatibility verification failed") });
+    fixture.env.TEST_MODE = "invalid-state-diagnostic";
+    const error = await updateCodexInstallation(fixture).catch(error => error);
+    expect(error).toMatchObject({ code: "runtime-verification" });
+    expect(error.message).not.toContain("SECRET-TOKEN");
   });
 
   it("reaps candidate verifier descendants on timeout and preserves the active CLI", async () => {

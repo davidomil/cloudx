@@ -43,7 +43,7 @@ export async function verifyCodexRuntime(options: CodexRuntimeVerificationOption
       let preserveOriginal = Boolean(options.previousAssistantBin && options.previousAssistantBin !== options.assistantBin);
       if (preserveOriginal && options.allowStartupRecovery) {
         const pristine = path.join(directory, "pristine");
-        await fs.cp(sqliteHome, pristine, { recursive: true, force: false, errorOnExist: true });
+        await compatibility.preserveSnapshot(sqliteHome, pristine);
         try {
           const baselineSessionId = await verifyIsolatedCodexRuntime({ ...options, assistantBin: options.previousAssistantBin! }, sqliteHome);
           await compatibility.verifyConversation(sqliteHome, baselineSessionId);

@@ -26,6 +26,7 @@ export interface ForgeCiDiagnostic {
     testedSha?: string;
     classification: "code" | "infrastructure" | "credentials" | "policy" | "unknown";
     log?: string;
+    requiredGate?: { jobId: string; name: string; url: string; log: string };
   }>;
 }
 export interface ForgeCiRepair {

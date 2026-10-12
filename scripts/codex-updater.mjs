@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isExactCodexVersion as isVersion, readCodexSelection } from "./codex-selection.mjs";
+import { CODEX_STATE_ERROR_PREFIX, CodexStateVerificationError, parseCodexStateDiagnostic } from "./codex-state-errors.mjs";
 
 const UPDATE_TIMEOUT_MS = 180_000;
 const OUTPUT_LIMIT = 512 * 1024;
@@ -497,13 +498,28 @@ async function verifyCodexLaunch(assistantBin, options, previousAssistantBin, al
   if (options.env.CLOUDX_DATA_DIR) args.push("--cloudx-data-dir", options.env.CLOUDX_DATA_DIR);
   if (previousAssistantBin && previousAssistantBin !== assistantBin) args.push("--previous-bin", previousAssistantBin);
   if (allowStartupRecovery) args.push("--allow-startup-recovery", "true");
+  let diagnosticTail = "";
   try {
     await runCommand(process.execPath, args, {
       ...options,
       timeoutMs: 120_000,
+      onOutput: text => {
+        diagnosticTail = (diagnosticTail + text).slice(-8192);
+        options.onOutput?.(text);
+      },
     });
   } catch (error) {
     if (["cancelled", "timeout", "output-limit", "log-unavailable", "cleanup-incomplete", "supervision-unavailable"].includes(error.code)) throw error;
+    const records = diagnosticTail.split(/\r?\n/).filter(line => line.startsWith(CODEX_STATE_ERROR_PREFIX));
+    if (records.length === 1) {
+      let diagnostic;
+      try { diagnostic = parseCodexStateDiagnostic(JSON.parse(records[0].slice(CODEX_STATE_ERROR_PREFIX.length))); }
+      catch { /* Malformed output does not grant authority to expose private runtime errors. */ }
+      if (diagnostic) throw new CodexUpdateError(
+        diagnostic.stage === "snapshot" ? "snapshot-preparation" : "state-compatibility",
+        new CodexStateVerificationError(diagnostic).message,
+      );
+    }
     throw new CodexUpdateError(
       "runtime-verification",
       "The candidate Codex CLI failed CloudX tab launch, conversation selection, Forge turn, or shared-state compatibility verification. The active selection is unchanged. Check the private update log or installer output for the failed step before selecting a supported release.",

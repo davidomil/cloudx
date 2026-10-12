@@ -23,6 +23,7 @@ export class TerminalSelectionCopy {
   private readonly preview = document.createElement("textarea");
   private readonly status = document.createElement("span");
   private readonly menu = document.createElement("div");
+  private readonly help = document.createElement("details");
   private readonly events = new AbortController();
   private readonly selectionListener;
   private readonly writeListener;
@@ -62,8 +63,15 @@ export class TerminalSelectionCopy {
     const copy = this.button("Copy saved selection", () => void this.copy());
     copy.setAttribute("role", "menuitem");
     this.menu.append(copy);
+    this.help.className = "terminal-copy-help";
+    const helpLabel = document.createElement("summary");
+    helpLabel.textContent = "Copy help";
+    const guidance = document.createElement("p");
+    const modifier = /Mac/u.test(navigator.platform) ? "Option" : "Shift";
+    guidance.textContent = `Hold ${modifier} and drag to select terminal text, then use Ctrl/Cmd+C or Copy selection. Fullscreen applications own normal dragging: use the application's Copy action and confirm its clipboard request here.`;
+    this.help.append(helpLabel, guidance);
     this.panel.hidden = this.menu.hidden = true;
-    container.append(this.panel, this.menu);
+    container.append(this.panel, this.menu, this.help);
 
     const capture = { capture: true, signal: this.events.signal };
     container.addEventListener("keydown", this.onKeyDown, capture);
@@ -115,6 +123,7 @@ export class TerminalSelectionCopy {
     this.clear();
     this.panel.remove();
     this.menu.remove();
+    this.help.remove();
   }
 
   private button(label: string, action: () => void): HTMLButtonElement {
