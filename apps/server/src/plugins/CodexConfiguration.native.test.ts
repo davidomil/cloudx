@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { expect, it } from "vitest";
-import { parse } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 import type { WorkspaceTab } from "@cloudx/shared";
 import type { PluginSession } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
@@ -413,6 +413,127 @@ it.skipIf(!codex)("an advertised model with no default main reasoning effort sav
     expect(saved.configuration?.values).not.toHaveProperty("model_reasoning_effort");
     expect(saved.configuration?.values).not.toHaveProperty("plan_mode_reasoning_effort");
   } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex).each(["local-none-default", "vendor/local-none-default-preview"])("rejects the unsupported literal none default for %s before saving", async model => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models.push({ ...catalog.models[0], slug: "local-none-default", default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "low", description: "low" }] });
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    const original = await fixture.settings.read();
+    await expect(fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model } })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    expect((await fixture.settings.read()).revision).toBe(original.revision);
+    await expect(fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model, model_reasoning_effort: "none" } })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model, model_reasoning_effort: "low" } });
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model, reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("rejects unsetting main effort when it exposes an unsupported literal none default", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models[0].default_reasoning_level = "none";
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const original = await fixture.settings.read();
+    const saved = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model_reasoning_effort: "low" } });
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: saved.revision, nativeOptions: { model_reasoning_effort: null } })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    expect((await fixture.settings.read()).revision).toBe(saved.revision);
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("a supported literal none default remains an actual inherited effort", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models.push({ ...catalog.models[0], slug: "supported-none", default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "none", description: "none" }] });
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const original = await fixture.settings.read();
+    await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "supported-none" } });
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model: "supported-none", reasoning: { effort: "none" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("a null default remains absent even when low effort is supported", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const catalogPath = path.join(fixture.home, "models.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    catalog.models.push({ ...catalog.models[0], slug: "optional-low", default_reasoning_level: null });
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+    const original = await fixture.settings.read();
+    const saved = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "optional-low" } });
+    const configPath = path.join(fixture.home, "config.toml");
+    const text = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: saved.revision, nativeOptions: { model_reasoning_effort: "none" } })).rejects.toThrow(/reasoning effort/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]?.reasoning).not.toHaveProperty("effort");
+    await fixture.settings.update({ expectedRevision: saved.revision, nativeOptions: { model_reasoning_effort: "low" } });
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[1]).toMatchObject({ model: "optional-low", reasoning: { effort: "low" } });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
+it.skipIf(!codex)("an ambiguous provider default cannot be replaced by bundled metadata for the same model", async () => {
+  const fixture = await NativeConfigurationSession.create();
+  const catalog = JSON.parse(await fs.readFile(path.join(fixture.home, "models.json"), "utf8"));
+  catalog.models[0].default_reasoning_level = "none";
+  catalog.models[0].supported_reasoning_levels = [{ effort: "low", description: "low" }];
+  const requests: string[] = [];
+  const provider = createServer((request, response) => {
+    requests.push(request.url!);
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(catalog));
+  });
+  try {
+    await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
+    const configPath = path.join(fixture.home, "config.toml");
+    const originalText = await fs.readFile(configPath, "utf8");
+    const config = parse(originalText);
+    delete config.model_catalog_json;
+    config.features = { api_key_model_discovery: true };
+    const definition = (config.model_providers as Record<string, Record<string, unknown>>)["cloudx-native"]!;
+    definition.model_catalog_url = `http://127.0.0.1:${(provider.address() as { port: number }).port}/models`;
+    definition.experimental_bearer_token = "synthetic-noncredential";
+    definition.supports_websockets = false;
+    await fs.writeFile(configPath, `${originalText.split("\n")[0]}\n${stringify(config)}`);
+    const original = await fixture.settings.read();
+    const text = await fs.readFile(configPath, "utf8");
+    await expect(fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "gpt-6.1-sol-preview" } }))
+      .rejects.toThrow(/does not distinguish.*Configure model_catalog_json/);
+    expect(await fs.readFile(configPath, "utf8")).toBe(text);
+    expect((await fixture.settings.read()).revision).toBe(original.revision);
+    expect(requests).toContain(`/models?client_version=${original.configuration!.selectedVersion}`);
+    expect(fixture.requests).toHaveLength(0);
+    await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "gpt-6.1-sol-preview", model_reasoning_effort: "low" } });
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model: "gpt-6.1-sol-preview", reasoning: { effort: "low" } });
+  } finally {
+    provider.closeAllConnections();
+    await new Promise<void>(resolve => provider.close(() => resolve()));
+    await fixture.dispose();
+  }
 }, 30_000);
 
 interface ConfigurationRequest {

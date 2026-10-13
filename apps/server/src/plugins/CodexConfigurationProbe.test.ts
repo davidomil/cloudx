@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { parse } from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { validateNativeCodexConfiguration } from "./CodexConfigurationProbe.js";
 
@@ -12,12 +13,25 @@ function model(name: string, efforts = ["low"], defaultEffort = efforts[0] ?? "n
   return { model: name, supportedReasoningEfforts: efforts.map(reasoningEffort => ({ reasoningEffort })), defaultReasoningEffort: defaultEffort, supportsPersonality: false };
 }
 
-async function validate(config: string, models: unknown[], previous: Record<string, unknown> = { model: "previous-model" }) {
+async function validate(config: string, models: ReturnType<typeof model>[], previous: Record<string, unknown> = { model: "previous-model" }, options: { catalog?: unknown; inspection?: string; signal?: AbortSignal; remoteCatalog?: boolean } = {}) {
   const command = path.join(root, "codex");
   const calls = path.join(root, "calls.json");
+  const catalog = options.catalog ?? { models: models.map(item => ({ slug: item.model,
+    default_reasoning_level: item.defaultReasoningEffort === "none" ? null : item.defaultReasoningEffort,
+    supported_reasoning_levels: item.supportedReasoningEfforts.map(item => ({ effort: item.reasoningEffort })) })) };
   await fs.writeFile(command, `#!/usr/bin/env node
 const fs = require("node:fs");
 const readline = require("node:readline");
+if (process.argv[2] === "debug") {
+  fs.writeFileSync(${JSON.stringify(path.join(root, "inspection.json"))}, JSON.stringify({ pid: process.pid, args: process.argv.slice(2), config: fs.readFileSync(process.env.CODEX_HOME + "/config.toml", "utf8") }));
+  const behavior = ${JSON.stringify(options.inspection)};
+  if (behavior === "error") { console.error("Synthetic private diagnostic."); process.exit(1); }
+  if (behavior === "blocked") { setInterval(() => {}, 1000); }
+  else if (behavior === "oversized") process.stdout.write("x".repeat(2097153), () => process.exit(0));
+  else console.log(${JSON.stringify(typeof catalog === "string" ? catalog : JSON.stringify(catalog))});
+  if (behavior !== "blocked" && behavior !== "oversized") process.exit(0);
+  return;
+}
 const calls = [];
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const request = JSON.parse(line);
@@ -34,7 +48,9 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   console.log(JSON.stringify({ id: request.id, result: results[request.method] }));
 });
 `, { mode: 0o700 });
-  return validateNativeCodexConfiguration(command, config, { PATH: process.env.PATH }, undefined, undefined, previous, false);
+  const catalogConfig = options.remoteCatalog || parse(config).model_catalog_json !== undefined ? config : `model_catalog_json="models.json"\n${config}`;
+  return validateNativeCodexConfiguration(command, catalogConfig, { PATH: process.env.PATH }, options.signal, undefined,
+    options.remoteCatalog ? previous : { model_catalog_json: "models.json", ...previous }, false);
 }
 
 describe("native model identity rules", () => {
@@ -96,4 +112,89 @@ describe("absent native reasoning defaults", () => {
     await expect(validate('model="optional-reasoning"', [model("optional-reasoning", ["medium"], "none")], { model: "optional-reasoning", plan_mode_reasoning_effort: "low" }))
       .resolves.toBeUndefined();
   });
+});
+
+describe("optional native main defaults", () => {
+  it("rejects a literal none default that is not a supported effort", async () => {
+    await expect(validate('model="literal-none"', [model("literal-none", ["low"], "none")], undefined,
+      { catalog: { models: [{ slug: "literal-none", default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "low" }] }] } }))
+      .rejects.toThrow(/chosen reasoning effort/);
+  });
+
+  it("accepts a supported literal none default as an effort", async () => {
+    await expect(validate('model="literal-none"', [model("literal-none", ["none"], "none")], undefined,
+      { catalog: { models: [{ slug: "literal-none", default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "none" }] }] } }))
+      .resolves.toBeUndefined();
+  });
+
+  it.each([null, undefined])("accepts the absent %s raw default independently of supported low effort", async defaultEffort => {
+    await expect(validate('model="optional-low"', [model("optional-low", ["low"], "none")], undefined,
+      { catalog: { models: [{ slug: "optional-low", default_reasoning_level: defaultEffort, supported_reasoning_levels: [{ effort: "low" }] }] } }))
+      .resolves.toBeUndefined();
+  });
+
+  it("uses original raw order when picker priority reverses duplicate model entries", async () => {
+    await expect(validate('model="duplicate"', [model("duplicate", [], "none"), model("duplicate", ["low"], "none")], undefined,
+      { catalog: { models: [
+        { slug: "duplicate", default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "low" }], priority: 10 },
+        { slug: "duplicate", default_reasoning_level: null, supported_reasoning_levels: [], priority: 0 }
+      ] } })).rejects.toThrow(/chosen reasoning effort/);
+  });
+
+  it("rejects raw model identity that differs from the advertised metadata", async () => {
+    await expect(validate('model="version-preview"', [model("version", [], "none")], undefined,
+      { catalog: { models: [{ slug: "version-preview", supported_reasoning_levels: [] }] } })).rejects.toThrow(/capabilities.*not advertised/);
+  });
+
+  it("limits custom-catalog inspection to its descriptor without user integrations or provider authentication", async () => {
+    await expect(validate('model="optional"\nmodel_catalog_json="models.json"\n[mcp_servers.private]\ncommand="synthetic-tool"\n[model_providers.private]\nhttp_headers={Authorization="synthetic-secret"}', [model("optional", [])]))
+      .resolves.toBeUndefined();
+    const inspection = JSON.parse(await fs.readFile(path.join(root, "inspection.json"), "utf8"));
+    expect(inspection.args).toEqual(["debug", "models"]);
+    expect(parse(inspection.config)).toEqual({ model_catalog_json: "models.json" });
+  });
+
+  it("rejects an ambiguous provider default without substituting bundled metadata for the same model", async () => {
+    await expect(validate('model="gpt-6.1-sol"', [model("gpt-6.1-sol", ["low"], "none")], undefined, { remoteCatalog: true }))
+      .rejects.toThrow(/does not distinguish.*Configure model_catalog_json/);
+    await expect(fs.access(path.join(root, "inspection.json"))).rejects.toThrow();
+  });
+
+  it("accepts a supported explicit effort when the provider default is ambiguous", async () => {
+    await expect(validate('model="gpt-6.1-sol"\nmodel_reasoning_effort="low"', [model("gpt-6.1-sol", ["low"], "none")], undefined, { remoteCatalog: true }))
+      .resolves.toBeUndefined();
+    await expect(fs.access(path.join(root, "inspection.json"))).rejects.toThrow();
+  });
+
+  it.each(["not-json", {}, { models: [{ slug: "optional", default_reasoning_level: 42, supported_reasoning_levels: [] }] }])("rejects malformed native metadata %j", async catalog => {
+    await expect(validate('model="optional"', [model("optional", [])], undefined, { catalog })).rejects.toThrow(/could not inspect native model defaults/);
+  });
+
+  it("does not publish private native diagnostics when inspection fails", async () => {
+    await expect(validate('model="optional"', [model("optional", [])], undefined, { inspection: "error" })).rejects.toThrow("Selected Codex could not inspect native model defaults.");
+  });
+
+  it("bounds native metadata output", async () => {
+    await expect(validate('model="optional"', [model("optional", [])], undefined, { inspection: "oversized" })).rejects.toThrow(/metadata response exceeded/);
+  });
+
+  it("cancels and reaps a blocked metadata inspector before returning", async () => {
+    const controller = new AbortController();
+    const validating = validate('model="optional"', [model("optional", [])], undefined, { inspection: "blocked", signal: controller.signal });
+    const rejected = expect(validating).rejects.toThrow(/validation cancelled/);
+    await expect.poll(async () => fs.readFile(path.join(root, "inspection.json"), "utf8").catch(() => "")).not.toBe("");
+    const { pid } = JSON.parse(await fs.readFile(path.join(root, "inspection.json"), "utf8"));
+    controller.abort();
+    await rejected;
+    expect(() => process.kill(pid, 0)).toThrow();
+  });
+
+  it("reaps a metadata inspector that exceeds its deadline", async () => {
+    const validating = validate('model="optional"', [model("optional", [])], undefined, { inspection: "blocked" });
+    const rejected = expect(validating).rejects.toThrow(/inspect native model defaults within 10 seconds/);
+    await expect.poll(async () => fs.readFile(path.join(root, "inspection.json"), "utf8").catch(() => "")).not.toBe("");
+    const { pid } = JSON.parse(await fs.readFile(path.join(root, "inspection.json"), "utf8"));
+    await rejected;
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 15_000);
 });

@@ -8,7 +8,7 @@ import { mergeCodexConfigurationLayers, parseCodexConfiguration, withCodexLaunch
 interface NativeModelCapabilities {
   model: string;
   supportedReasoningEfforts: { reasoningEffort: string }[];
-  defaultReasoningEffort: string;
+  defaultReasoningEffort?: string;
   supportsPersonality: boolean;
 }
 
@@ -34,6 +34,44 @@ function resolveNativeModelCapabilities(models: NativeModelCapabilities[], reque
   return namespaced ? longestModelPrefix(models, namespaced[1]!) : undefined;
 }
 
+async function readNativeModelCatalog(command: string, home: string, env: NodeJS.ProcessEnv, signal: AbortSignal | undefined): Promise<NativeModelCapabilities[]> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, ["debug", "models"], {
+      cwd: home, env: { PATH: env.PATH, HOME: home, CODEX_HOME: home, RUST_LOG: "off" }, stdio: ["ignore", "pipe", "ignore"],
+    });
+    let output = "";
+    let bytes = 0;
+    let failure: Error | undefined;
+    const stop = (message: string) => { failure ??= new Error(message); child.kill("SIGKILL"); };
+    const aborted = () => stop("Codex settings validation cancelled.");
+    const timeout = setTimeout(() => stop("Selected Codex did not inspect native model defaults within 10 seconds."), 10_000);
+    signal?.addEventListener("abort", aborted, { once: true });
+    child.once("error", () => stop("Selected Codex could not inspect native model defaults."));
+    child.stdout.on("data", (chunk: Buffer) => {
+      bytes += chunk.length;
+      if (bytes > 2_097_152) stop("Native model metadata response exceeded the validation limit.");
+      else output += chunk.toString("utf8");
+    });
+    child.once("close", code => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", aborted);
+      if (failure) { reject(failure); return; }
+      try {
+        const catalog = JSON.parse(output);
+        if (code !== 0 || !Array.isArray(catalog.models)) throw new Error();
+        resolve(catalog.models.map((item: { slug: string; default_reasoning_level?: string | null; supported_reasoning_levels: { effort: string }[] }) => {
+          if (typeof item?.slug !== "string" || !Array.isArray(item.supported_reasoning_levels)
+            || item.supported_reasoning_levels.some(level => typeof level?.effort !== "string")
+            || item.default_reasoning_level != null && typeof item.default_reasoning_level !== "string") throw new Error();
+          return { model: item.slug, defaultReasoningEffort: item.default_reasoning_level ?? undefined,
+            supportedReasoningEfforts: item.supported_reasoning_levels.map(level => ({ reasoningEffort: level.effort })), supportsPersonality: false };
+        }));
+      } catch { reject(new Error("Selected Codex could not inspect native model defaults.")); }
+    });
+    if (signal?.aborted) aborted();
+  });
+}
+
 /** Parse the candidate with the selected native executable, without using its credentials or state. */
 export async function validateNativeCodexConfiguration(command: string, config: string, env: NodeJS.ProcessEnv, signal: AbortSignal | undefined, profile: { name: string; text: string } | undefined, previous: Readonly<Record<string, unknown>>, checkPersonality: boolean): Promise<void> {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-validation-"));
@@ -49,6 +87,7 @@ export async function validateNativeCodexConfiguration(command: string, config: 
     const needsCapabilities = selectionChanged || checkPersonality
       || candidate.model_reasoning_effort !== previous.model_reasoning_effort || candidate.plan_mode_reasoning_effort !== previous.plan_mode_reasoning_effort
       || candidate.model_reasoning_effort !== undefined || candidate.plan_mode_reasoning_effort !== undefined;
+    let ambiguousMainDefault: NativeModelCapabilities | undefined;
     await fs.writeFile(path.join(home, "config.toml"), effective, { mode: 0o600 });
     if (profile) await fs.writeFile(path.join(home, `${profile.name}.config.toml`), profile.text, { mode: 0o600 });
     await new Promise<void>((resolve, reject) => {
@@ -94,9 +133,10 @@ export async function validateNativeCodexConfiguration(command: string, config: 
             const mainInherited = candidate.model_reasoning_effort === undefined && (selectionChanged || previous.model_reasoning_effort !== undefined);
             const planInherited = candidate.plan_mode_reasoning_effort === undefined && previous.plan_mode_reasoning_effort !== undefined;
             const effort = mainInherited ? advertised?.defaultReasoningEffort : candidate.model_reasoning_effort;
-            const inheritsNoMainEffort = mainInherited && effort === "none";
+            const needsMainDefaultInspection = mainInherited && effort === "none";
+            if (needsMainDefaultInspection) ambiguousMainDefault = advertised;
             if (message.error || !advertised) stop(new Error("Selected model capabilities are not advertised by native Codex. Configure a model catalog before changing model-specific defaults."));
-            else if ((mainInherited || effort !== undefined) && !inheritsNoMainEffort && !supportsReasoningEffort(advertised, effort)) stop(new Error("Selected model does not advertise the chosen reasoning effort."));
+            else if ((mainInherited || effort !== undefined) && !needsMainDefaultInspection && !supportsReasoningEffort(advertised, effort)) stop(new Error("Selected model does not advertise the chosen reasoning effort."));
             else if (candidate.plan_mode_reasoning_effort !== undefined && !supportsReasoningEffort(advertised, candidate.plan_mode_reasoning_effort)) stop(new Error("Selected model does not advertise the chosen Plan reasoning effort."));
             else if (checkPersonality && candidate.personality !== undefined && candidate.personality !== "none" && advertised.supportsPersonality !== true) stop(new Error("Selected model does not advertise personality support."));
             else if (planInherited) child.stdin.write(`${JSON.stringify({ id: 4, method: "collaborationMode/list", params: {} })}\n`);
@@ -113,5 +153,16 @@ export async function validateNativeCodexConfiguration(command: string, config: 
       if (signal?.aborted) aborted();
       else child.stdin.write(`${JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "cloudx_settings_validation", version: "1.0.0" }, capabilities: { experimentalApi: true } } })}\n`);
     });
+    if (ambiguousMainDefault) {
+      if (candidate.model_catalog_json === undefined)
+        throw new Error("Selected native catalog does not distinguish an absent reasoning default from literal none. Configure model_catalog_json or choose an explicit supported main reasoning effort.");
+      await fs.writeFile(path.join(home, "config.toml"), stringify({ model_catalog_json: candidate.model_catalog_json }), { mode: 0o600 });
+      const catalog = await readNativeModelCatalog(command, home, env, signal);
+      const inherited = resolveNativeModelCapabilities(catalog, candidate.model);
+      if (!inherited || inherited.model !== ambiguousMainDefault.model)
+        throw new Error("Selected model capabilities are not advertised by native Codex. Check the native catalog model identity.");
+      if (inherited.defaultReasoningEffort !== undefined && !supportsReasoningEffort(inherited, inherited.defaultReasoningEffort))
+        throw new Error("Selected model does not advertise the chosen reasoning effort.");
+    }
   } finally { await fs.rm(home, { recursive: true, force: true }); }
 }
