@@ -36,6 +36,24 @@ describe("workspace recovery across server updates", () => {
     }
   });
 
+  it("validates independent picker scope flags at the HTTP boundary", async () => {
+    const fixture = await recoveryFixture();
+    try {
+      const { app } = await fixture.startServer();
+      for (const payload of [
+        { action: "select-conversation", all: "true" },
+        { action: "select-conversation", includeNonInteractive: null },
+        { action: "resume-conversation", sessionId: "exact-id", all: true },
+        { action: "reconnect", includeNonInteractive: false }
+      ]) {
+        const response = await app.inject({ method: "POST", url: "/api/tabs/unused/recover", headers: { host: "localhost" }, payload });
+        expect(response.statusCode, response.body).toBe(400);
+        expect(response.body).toContain("must be a boolean for select-conversation");
+      }
+      expect(fixture.spawn).not.toHaveBeenCalled();
+    } finally { await fixture.close(); }
+  });
+
   it.skipIf(process.platform !== "linux")("opens one replacement shell only on request after a fresh broker, preserving both windows and other panels", async () => {
     const fixture = await recoveryFixture();
     try {
@@ -223,7 +241,12 @@ describe("workspace recovery across server updates", () => {
     }
   }, 15_000);
 
-  it.skipIf(process.platform !== "linux").each([false, true].flatMap(restoreWeb => ["resume-conversation", "select-conversation"].map(action => ({ restoreWeb, action }))))("retains a Codex panel for $action after broker shutdown (web restored: $restoreWeb)", async ({ restoreWeb, action }) => {
+  it.skipIf(process.platform !== "linux").each([false, true].flatMap(restoreWeb => [
+    { action: "resume-conversation", all: false, includeNonInteractive: false },
+    { action: "select-conversation", all: false, includeNonInteractive: false },
+    { action: "select-conversation", all: false, includeNonInteractive: true },
+    { action: "select-conversation", all: true, includeNonInteractive: false }
+  ].map(choice => ({ restoreWeb, ...choice }))))("retains a Codex panel for $action after broker shutdown (web restored: $restoreWeb, all: $all, exec: $includeNonInteractive)", async ({ restoreWeb, action, all, includeNonInteractive }) => {
     const fixture = await recoveryFixture();
     let releaseShutdown = () => {};
     let stopping: Promise<void> | undefined;
@@ -265,7 +288,7 @@ describe("workspace recovery across server updates", () => {
       const savedSessions = new SessionStateStore(fixture.config.dataDir);
       const originalInput = (await savedSessions.read())!.sessions.find(saved => saved.tab.id === tab.id)!.initialInput;
       expect(originalInput).toMatchObject({
-        model: "gpt-6-astra", reasoningEffort: "max", codexRecovered: false,
+        model: "gpt-6-astra", reasoningEffort: "max", codexRecovered: false, codexWorkspaceId: main.id,
         codexRuntimeContext: { activeWindowId: main.id, pluginRuntime: { "rules-skills": { personalityTemplate: { template: { id: "default-codex" } } } } }
       });
 
@@ -295,7 +318,7 @@ describe("workspace recovery across server updates", () => {
       await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: fixture.root } }) + "\n");
       const recover = () => app.inject({
         method: "POST", url: `/api/tabs/${tab.id}/recover`, headers: { host: "localhost" },
-        payload: action === "select-conversation" ? { action } : { action, sessionId: conversationId }
+        payload: action === "select-conversation" ? { action, ...(all || includeNonInteractive ? { all, includeNonInteractive } : {}) } : { action, sessionId: conversationId }
       });
       const bindingPath = path.join(fixture.config.dataDir, "codex-launches", tab.id, ".cloudx-source.json");
       const legacySource = JSON.parse(await fs.readFile(bindingPath, "utf8"));
@@ -339,10 +362,13 @@ describe("workspace recovery across server updates", () => {
       const [, args, options] = fixture.spawn.mock.calls[2]!;
       const launch = JSON.parse(args[1]!) as { tuiArgs: string[] };
       if (action === "select-conversation") {
-        expect(launch.tuiArgs).toEqual(expect.arrayContaining(["resume", "--all"]));
+        expect(launch.tuiArgs).toContain("resume");
+        expect(launch.tuiArgs.includes("--all")).toBe(all);
+        expect(launch.tuiArgs.includes("--include-non-interactive")).toBe(includeNonInteractive);
         expect(launch.tuiArgs).not.toContain(conversationId);
         expect(launch).toMatchObject({ startupPicker: true });
       } else expect(launch.tuiArgs).toContain(conversationId);
+      expect(launch).toMatchObject({ workspace: { workspaceId: main.id, cwd: fixture.root, owned: false, all, includeNonInteractive } });
       expect(launch.tuiArgs).toContain("gpt-6-astra");
       expect(launch.tuiArgs).toContain('model_reasoning_effort="max"');
       expect(launch.tuiArgs).not.toContain("Do not repeat this work");
@@ -359,7 +385,7 @@ describe("workspace recovery across server updates", () => {
       expect(after.tabs.map(current => current.id)).toEqual(before.tabs.map(current => current.id));
       expect(after.tabs.find(current => current.pluginId === "local-web")).toEqual(before.tabs.find(current => current.pluginId === "local-web"));
       expect((await savedSessions.read())!.sessions.find(saved => saved.tab.id === tab.id)!.initialInput).toMatchObject({
-        codexRuntimeContext: originalInput!.codexRuntimeContext, resume: action === "select-conversation" ? { mode: "picker", all: true } : { mode: "session", sessionId: conversationId }, codexRecovered: true
+        codexRuntimeContext: originalInput!.codexRuntimeContext, resume: action === "select-conversation" ? { mode: "picker", all, includeNonInteractive } : { mode: "session", sessionId: conversationId }, codexRecovered: true
       });
     } finally {
       releaseShutdown();

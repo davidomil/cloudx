@@ -11,8 +11,12 @@ export const serviceTiers: { value: ServiceTier; label: string }[] = [
 ];
 export const reasoningEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export const webSearchModes = ["disabled", "cached", "live", "indexed"] as const;
-export const personalities = ["none", "friendly", "pragmatic"] as const;
+export const personalities = ["none"] as const;
 type NativeSetting = "reasoningEffort" | "webSearch" | "personality";
+const quickSettings = {
+  model: "model", serviceTier: "service_tier", reasoningEffort: "model_reasoning_effort", webSearch: "web_search", personality: "personality"
+} as const;
+type QuickSetting = keyof typeof quickSettings;
 
 interface EditorState {
   settings?: CodexGlobalSettings;
@@ -25,6 +29,9 @@ interface EditorState {
   reasoningEffort: string;
   webSearch: string;
   personality: string;
+  nativeDrafts: Record<string, string>;
+  targetProfile?: string;
+  configProfile: string;
   busy: "loading" | "saving" | null;
   error?: string;
   saved: boolean;
@@ -32,7 +39,7 @@ interface EditorState {
 
 const initialState: EditorState = {
   model: "", serviceTier: "", modeSelected: false, yoloMode: true, autoTrustWorkspace: false,
-  defaultSkills: [], reasoningEffort: "", webSearch: "", personality: "", busy: "loading", saved: false
+  defaultSkills: [], reasoningEffort: "", webSearch: "", personality: "", nativeDrafts: {}, configProfile: "", busy: "loading", saved: false
 };
 
 export class CodexSettingsEditor {
@@ -60,29 +67,42 @@ export class CodexSettingsEditor {
     return serviceTiers.find(tier => tier.value === this.state.serviceTier)?.value;
   }
 
-  get validModel() {
-    return !this.state.model || /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(this.state.model);
-  }
-
-  private get modelChanged() {
-    return Boolean(this.state.settings && this.state.model !== (this.state.settings.model ?? ""));
-  }
-
-  private get modeChanged() {
-    const { settings, serviceTier, modeSelected } = this.state;
-    return Boolean(settings && (serviceTier !== (settings.serviceTier ?? "") || (modeSelected && this.selectedTier && settings.fastModeEnabled === false)));
-  }
-
   get canSave() {
-    return !this.state.busy && this.validModel && Object.keys(this.changedSettings()).length > 0;
+    return !this.state.busy && !this.nativeError && Object.keys(this.changedSettings()).length > 0;
+  }
+
+  get nativeError(): string | undefined {
+    for (const [family, value] of Object.entries(this.state.nativeDrafts)) {
+      if (!value.trim()) continue;
+      try {
+        const parsed = JSON.parse(value);
+        if (Object.values(quickSettings).some(key => key === family) && parsed !== null && typeof parsed !== "string")
+          return `${family} must be a JSON string, or use Unset to inherit.`;
+      } catch { return `Enter valid JSON for ${family}, or use Unset to inherit.`; }
+    }
+  }
+
+  setNativeOption(family: string, value: string): void {
+    if (this.state.busy) return;
+    this.update({ nativeDrafts: { ...this.state.nativeDrafts, [family]: value }, ...(family === "service_tier" ? { modeSelected: true } : {}), saved: false });
+  }
+
+  selectLaunchProfile(configProfile: string): void {
+    if (!this.state.busy) this.update({ configProfile, saved: false });
+  }
+
+  async selectTargetProfile(targetProfile?: string): Promise<void> {
+    if (this.state.busy) return;
+    this.update({ targetProfile });
+    await this.read();
   }
 
   setModel(model: string): void {
-    if (!this.state.busy) this.update({ model, saved: false });
+    this.setNativeOption("model", model ? JSON.stringify(model) : "");
   }
 
   selectMode(serviceTier: string): void {
-    if (!this.state.busy) this.update({ serviceTier, modeSelected: true, saved: false });
+    this.setNativeOption("service_tier", serviceTier ? JSON.stringify(serviceTier) : "");
   }
 
   enableFastMode(): void {
@@ -102,7 +122,7 @@ export class CodexSettingsEditor {
   }
 
   selectNativeSetting(field: NativeSetting, value: string): void {
-    if (!this.state.busy) this.update({ [field]: value, saved: false });
+    this.setNativeOption(quickSettings[field], value ? JSON.stringify(value) : "");
   }
 
   async reload(): Promise<void> {
@@ -112,7 +132,7 @@ export class CodexSettingsEditor {
   async save(): Promise<void> {
     const { settings } = this.state;
     if (!settings || !this.canSave || !this.callHook) return;
-    const update: CodexGlobalSettingsUpdate = { expectedRevision: settings.revision, ...this.changedSettings() };
+    const update: CodexGlobalSettingsUpdate = { expectedRevision: settings.revision, ...(this.state.targetProfile ? { targetProfile: this.state.targetProfile } : {}), ...this.changedSettings() };
     const version = ++this.requestVersion;
     this.update({ busy: "saving", error: undefined, saved: false });
     try {
@@ -137,7 +157,7 @@ export class CodexSettingsEditor {
     const version = ++this.requestVersion;
     this.update({ busy: "loading", error: undefined, saved: false });
     try {
-      const result = await this.callHook<{ settings: CodexGlobalSettings }>("codex-settings.read", {});
+      const result = await this.callHook<{ settings: CodexGlobalSettings }>("codex-settings.read", this.state.targetProfile ? { targetProfile: this.state.targetProfile } : {});
       if (version === this.requestVersion) this.acceptSettings(result.settings, false);
     } catch (error) {
       if (version === this.requestVersion) this.update({ error: errorMessage(error) });
@@ -150,32 +170,56 @@ export class CodexSettingsEditor {
     this.update({
       settings, model: settings.model ?? "", serviceTier: settings.serviceTier ?? "", modeSelected: false,
       yoloMode: settings.yoloMode, autoTrustWorkspace: settings.autoTrustWorkspace, defaultSkills: settings.defaultSkills,
-      reasoningEffort: settings.reasoningEffort ?? "", webSearch: settings.webSearch ?? "", personality: settings.personality ?? "", saved
+      reasoningEffort: settings.reasoningEffort ?? "", webSearch: settings.webSearch ?? "", personality: settings.personality ?? "", nativeDrafts: {}, configProfile: settings.configProfile ?? "", saved
     });
   }
 
   private changedSettings(): Omit<CodexGlobalSettingsUpdate, "expectedRevision"> {
-    const { settings, model, yoloMode, autoTrustWorkspace, defaultSkills, reasoningEffort, webSearch, personality } = this.state;
+    const { settings, yoloMode, autoTrustWorkspace, defaultSkills } = this.state;
     if (!settings) return {};
     const update: Omit<CodexGlobalSettingsUpdate, "expectedRevision"> = {};
-    if (this.modelChanged) update.model = model || null;
-    if (this.modeChanged) update.serviceTier = this.selectedTier ?? null;
     if (yoloMode !== settings.yoloMode) update.yoloMode = yoloMode;
     if (autoTrustWorkspace !== settings.autoTrustWorkspace) update.autoTrustWorkspace = autoTrustWorkspace;
-    if (reasoningEffort !== (settings.reasoningEffort ?? "")) update.reasoningEffort = reasoningEfforts.find(value => value === reasoningEffort) ?? null;
-    if (webSearch !== (settings.webSearch ?? "")) update.webSearch = webSearchModes.find(value => value === webSearch) ?? null;
-    if (personality !== (settings.personality ?? "")) update.personality = personalities.find(value => value === personality) ?? null;
     const skillChanges = Object.fromEntries(defaultSkills
       .filter(skill => settings.defaultSkills.find(saved => saved.id === skill.id)?.enabled !== skill.enabled)
       .map(skill => [skill.id, skill.enabled]));
     if (Object.keys(skillChanges).length) update.defaultSkills = skillChanges;
+    if (!this.state.targetProfile && this.state.configProfile !== (settings.configProfile ?? "")) update.configProfile = this.state.configProfile || null;
+    const nativeOptions: NonNullable<CodexGlobalSettingsUpdate["nativeOptions"]> = {};
+    for (const [family, draft] of Object.entries(this.state.nativeDrafts)) {
+      const value = draft.trim() ? JSON.parse(draft) : null;
+      const field = (Object.keys(quickSettings) as QuickSetting[]).find(field => quickSettings[field] === family);
+      const original = field ? settings[field] : settings.configuration?.values[family] ?? null;
+      if (JSON.stringify(value) === JSON.stringify(original)) continue;
+      if (field && supportedQuickValue(field, value)) Object.assign(update, { [field]: value });
+      else nativeOptions[family] = value;
+    }
+    if (this.state.modeSelected && this.selectedTier && settings.fastModeEnabled === false) update.serviceTier = this.selectedTier;
+    if (Object.keys(nativeOptions).length) update.nativeOptions = nativeOptions;
     return update;
   }
 
   private update(change: Partial<EditorState>): void {
     this.state = { ...this.state, ...change };
+    for (const field of Object.keys(quickSettings) as QuickSetting[]) {
+      const draft = this.state.nativeDrafts[quickSettings[field]];
+      let value: unknown = this.state.settings?.[field];
+      if (draft !== undefined) {
+        try { value = draft.trim() ? JSON.parse(draft) : null; }
+        catch { value = null; }
+      }
+      this.state[field] = typeof value === "string" ? value : "";
+    }
     this.listeners.forEach(listener => listener());
   }
+}
+
+function supportedQuickValue(field: QuickSetting, value: unknown): boolean {
+  if (value === null) return true;
+  if (field === "model") return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value);
+  const options = field === "serviceTier" ? serviceTiers.map(tier => tier.value)
+    : field === "reasoningEffort" ? reasoningEfforts : field === "webSearch" ? webSearchModes : personalities;
+  return typeof value === "string" && options.some(option => option === value);
 }
 
 function errorMessage(error: unknown): string {

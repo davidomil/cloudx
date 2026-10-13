@@ -152,7 +152,8 @@ describe("CodexTerminalPlugin", () => {
         expect(factory.spawns).toBe(0);
         expect(launch).toMatchObject({ tabId: tab.id, cwd: root, command: "/usr/bin/codex" });
         expect(await fs.realpath(path.join(launch.env.CODEX_HOME!, "sessions"))).toBe(path.join(home, "sessions"));
-        expect(launch.configurationArgs).toContain("--disable");
+        expect(launch.configurationArgs).toContain("skills.bundled.enabled=false");
+        expect(launch.configurationArgs).not.toContain("--disable");
         expect(launch.configurationArgs).not.toContain("--yolo");
         expect(launch.configurationArgs).not.toContain("--add-dir");
         return ready;
@@ -598,7 +599,7 @@ describe("CodexTerminalPlugin", () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 
-  it.each(["../state/./db", "state", "/absolute/state", "~", "~/state"])("normalizes only ordinary relative source sqlite_home %s", async (sqliteHome) => {
+  it.each(["../state/./db", "state", "/absolute/state", "~", "~/state"])("preserves native path meaning for source sqlite_home %s", async (sqliteHome) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-sqlite-config-"));
     const home = path.join(root, "home");
     await seedImagegenSkill(home);
@@ -607,7 +608,7 @@ describe("CodexTerminalPlugin", () => {
     try {
       const launch = await materializeCodexTemplate(undefined, { CODEX_HOME: home, CODEX_SQLITE_HOME: " caller-relative " }, { dataDir: path.join(root, "data"), tabId: "selected" });
       expect(launch.env.CODEX_SQLITE_HOME).toBe(" caller-relative ");
-      const expected = path.isAbsolute(sqliteHome) || sqliteHome.startsWith("~") ? sqliteHome : path.resolve(await fs.realpath(home), sqliteHome);
+      const expected = sqliteHome === "~" ? os.homedir() : sqliteHome.startsWith("~/") ? path.resolve(os.homedir(), sqliteHome.slice(2)) : path.resolve(await fs.realpath(home), sqliteHome);
       expect(parse(await fs.readFile(path.join(launch.overlay!.codexHome, "config.toml"), "utf8")).sqlite_home).toBe(expected);
       expect(await fs.readFile(path.join(home, "config.toml"), "utf8")).toBe(original);
     } finally { await fs.rm(root, { recursive: true, force: true }); }
@@ -708,6 +709,7 @@ describe("CodexTerminalPlugin", () => {
   }, 120_000);
 
   it("launches Codex through the user's login shell", async () => {
+    vi.stubEnv("CODEX_HOME", "");
     vi.stubEnv("SHELL", "/bin/bash");
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
     const factory = new CapturingFactory();
@@ -716,10 +718,11 @@ describe("CodexTerminalPlugin", () => {
     await plugin.createSession({ tab, cwd: "/tmp", controls: { setTabIndicator: () => undefined, closeTab: () => undefined } });
 
     expect(factory.command).toBe("/bin/bash");
-    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")}`]);
+    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} --cd /tmp`]);
   });
 
   it("launches Codex resume for requested sessions", async () => {
+    vi.stubEnv("CODEX_HOME", "");
     vi.stubEnv("SHELL", "/bin/bash");
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
     const factory = new CapturingFactory();
@@ -732,10 +735,11 @@ describe("CodexTerminalPlugin", () => {
       initialInput: { resume: { mode: "last", all: true, includeNonInteractive: true } }
     });
 
-    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} resume --last --all --include-non-interactive`]);
+    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} --cd /tmp resume --last --all --include-non-interactive`]);
   });
 
   it("quotes Codex resume session names through the login shell", async () => {
+    vi.stubEnv("CODEX_HOME", "");
     vi.stubEnv("SHELL", "/bin/bash");
     vi.stubEnv("CLOUDX_ASSISTANT_BIN", "/usr/bin/codex");
     const factory = new CapturingFactory();
@@ -748,7 +752,7 @@ describe("CodexTerminalPlugin", () => {
       initialInput: { resume: { mode: "session", sessionId: "release fix thread" } }
     });
 
-    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} resume 'release fix thread'`]);
+    expect(factory.args).toEqual(["-lc", `exec /usr/bin/codex ${CLOUDX_CODEX_DEFAULT_ARGS.join(" ")} --cd /tmp resume 'release fix thread'`]);
   });
 
   it("launches resolved template rules and skills through a Codex home overlay", async () => {
@@ -872,7 +876,6 @@ describe("CodexTerminalPlugin", () => {
         ...parse(sourceConfig),
         model: model ?? "gpt-6.1-sol",
         model_reasoning_effort: "xhigh",
-        features: { apps: false, memories: false, plugins: false },
       });
       // CapturingFactory proves projection, not native loading or model availability.
       expect(factory.args?.join(" ")).not.toMatch(/--profile|--model|(?:^| )-m(?: |$)/u);
@@ -1024,8 +1027,7 @@ describe("CodexTerminalPlugin", () => {
     expect(parse(overlayConfig).model_reasoning_effort).toBe("high");
     expect(overlayConfig).toContain("skills/cloudx/reviewer/SKILL.md");
     expect(overlayConfig).toContain("skills/cloudx/testing/SKILL.md");
-    expect(overlayConfig).not.toContain("documentation-answer");
-    expect(overlayConfig).not.toContain("/stale/cloudx-system");
+    expect(overlayConfig).toContain('/stale/cloudx-system/documentation-answer/SKILL.md');
     await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/reviewer/SKILL.md");
     await expect(fs.readFile(path.join(launch.overlay!.codexHome, "skills", "cloudx", "testing", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/testing/SKILL.md");
     expect(launch.env).toMatchObject({
@@ -1078,7 +1080,6 @@ describe("CodexTerminalPlugin", () => {
     expect(parse(await fs.readFile(path.join(second.overlay!.codexHome, "config.toml"), "utf8"))).toMatchObject({
       model: "gpt-5.3-codex",
       model_reasoning_effort: "xhigh",
-      features: { apps: false, memories: false, plugins: false },
     });
     await expect(fs.readFile(path.join(second.overlay!.codexHome, "skills", "cloudx", "tester", "SKILL.md"), "utf8")).resolves.toContain("rules-skills/skills/tester/SKILL.md");
     await expect(fs.stat(path.join(second.overlay!.codexHome, "skills", "cloudx", "reviewer", "SKILL.md"))).rejects.toThrow();
@@ -1247,8 +1248,8 @@ describe("CodexTerminalPlugin", () => {
     expect(launch.args).toEqual([...CLOUDX_CODEX_DEFAULT_ARGS, "--add-dir", path.join(dataDir, "rules-skills")]);
     const config = parse(await fs.readFile(launch.overlay!.configPath, "utf8"));
     expect(config.model).toBe("gpt-5.6");
-    expect(config.features).toMatchObject({ apps: false, memories: false, plugins: false });
-    expect(config.memories).toMatchObject({ generate_memories: false, use_memories: false });
+    expect(config.features).toMatchObject({ apps: true, memories: true, plugins: true });
+    expect(config.memories).toMatchObject({ generate_memories: true, use_memories: true });
     expect(config.skills).toMatchObject({ bundled: { enabled: false } });
     const skillConfig = (config.skills as { config: Array<{ path: string; enabled: boolean }> }).config;
     expect(skillConfig).toEqual(expect.arrayContaining([
@@ -1258,7 +1259,7 @@ describe("CodexTerminalPlugin", () => {
       { path: await fs.realpath(projectConfigSkill), enabled: false },
       { path: path.join(launch.overlay!.codexHome, "skills", "cloudx-exceptions", "imagegen", "SKILL.md"), enabled: true }
     ]));
-    expect(skillConfig).not.toContainEqual(expect.objectContaining({ name: "unwanted" }));
+    expect(skillConfig).toContainEqual(expect.objectContaining({ name: "unwanted", enabled: true }));
     await expect(fs.readFile(path.join(codexHome, "skills", ".system", "imagegen", "scripts", "image_gen.py"), "utf8")).resolves.toContain("imagegen helper");
   });
 

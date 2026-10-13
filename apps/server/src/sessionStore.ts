@@ -126,7 +126,7 @@ export class SessionStore {
     const cwd = await this.pathPolicy.ensureDirectory(tab.cwd, false);
     const window = this.workspace?.findWindowForTab(tab.id);
     return {
-      tab: this.getTab(tab.id), cwd, initialInput: this.initialInputs.get(tab.id),
+      tab: this.getTab(tab.id), cwd, workspaceId: window?.id, initialInput: this.initialInputs.get(tab.id),
       runtimeContext: await this.runtimeContextResolver?.runtimeContextFor(tab, window),
       app: this.createAppContext(plugin.id, tab.id), controls: this.createControls(tab.id),
       config: this.configProvider.getPluginConfig(plugin.id),
@@ -240,7 +240,7 @@ export class SessionStore {
         if (!sessionId) throw new Error("Select an exact Codex conversation ID to resume.");
         input.initialInput = { ...input.initialInput, resume: { mode: "session", sessionId } };
       }
-      if (request.action === "select-conversation") input.initialInput = { ...input.initialInput, resume: { mode: "picker", all: true } };
+      if (request.action === "select-conversation") input.initialInput = { ...input.initialInput, resume: { mode: "picker", all: request.all ?? false, includeNonInteractive: request.includeNonInteractive ?? false } };
       const session = request.action === "new-shell"
         ? await plugin.createSession(input)
         : await plugin.recoverSession!(input);
@@ -502,6 +502,7 @@ export class SessionStore {
       const session = await plugin.createSession({
         tab,
         cwd,
+        workspaceId: window?.id,
         runtimeContext,
         app: this.createAppContext(plugin.id, id),
         controls: this.createControls(id),
@@ -1026,6 +1027,7 @@ export class SessionStore {
       const session = await plugin.createSession({
         tab,
         cwd: tab.cwd,
+        workspaceId: window?.id,
         authorizeProjectTrust: this.launchOptions.get(tabId)?.authorizeProjectTrust,
         prepareAgentSession: this.launchOptions.get(tabId)?.prepareAgentSession,
         prepareTerminalExecution: this.launchOptions.get(tabId)?.prepareTerminalExecution,

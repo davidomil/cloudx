@@ -52,7 +52,7 @@ describe("Codex conversation identity", () => {
     expect(save).not.toHaveBeenCalled();
     selection.fromClient({ id: 4, method: "thread/resume", params: {} });
     selection.fromServer({ id: 4, result: { thread } });
-    expect(save).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId: firstId, authority: "selected" }));
+    expect(save).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ sessionId: firstId, authority: "selected" }), { created: false });
   });
 
   it("ignores background child activity without granting it foreground authority", () => {

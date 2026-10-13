@@ -79,6 +79,38 @@ async function fixture() {
 }
 
 describe("workspace recovery after server updates", () => {
+  it("keeps the original workspace when selection changes while recovery is in flight", async () => {
+    const { running, factory, createStore, root } = await fixture();
+    const store = createStore();
+    const terminal = new StandardTerminalPlugin(factory);
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve; });
+    const recoverSession = vi.fn(async (input: Parameters<StandardTerminalPlugin["createSession"]>[0]) => {
+      await waiting;
+      return terminal.createSession(input);
+    });
+    const plugin = { ...terminal.descriptor(), id: "codex-terminal", actions: [],
+      descriptor: () => ({ ...terminal.descriptor(), id: "codex-terminal" }),
+      createSession: terminal.createSession.bind(terminal), restoreSession: terminal.restoreSession.bind(terminal), recoverSession };
+    store.plugins.register(plugin);
+    try {
+      const { tab, window } = await store.open("codex-terminal");
+      const other = await store.workspace.createWindow({ name: "Same cwd, other workspace", defaultCwd: root });
+      await store.workspace.selectWindow(window.id);
+      running.get(tab.id)!.exit(1);
+      await vi.waitFor(() => expect(store.sessions.getTab(tab.id).recovery?.state).toBe("missing"));
+      running.clear();
+      const recovering = store.sessions.recoverTab(tab.id, { action: "select-conversation", includeNonInteractive: true });
+      await vi.waitFor(() => expect(recoverSession).toHaveBeenCalledOnce());
+      await store.workspace.selectWindow(other.id);
+      expect(recoverSession).toHaveBeenCalledWith(expect.objectContaining({ workspaceId: window.id, cwd: root,
+        initialInput: { resume: { mode: "picker", all: false, includeNonInteractive: true } } }));
+      release();
+      expect(await recovering).toMatchObject({ id: tab.id, cwd: root, status: "running" });
+      expect(store.workspace.getActiveWindow().id).toBe(other.id);
+      expect(store.workspace.findWindowForTab(tab.id)!.id).toBe(window.id);
+    } finally { release(); await store.sessions.dispose(); }
+  });
   it("reconciles an explicitly inspected stopped source without resuming, and rechecks broker ownership", async () => {
     const { running, factory, createStore } = await fixture();
     const terminal = new StandardTerminalPlugin(factory);
@@ -230,7 +262,7 @@ describe("workspace recovery after server updates", () => {
     const recovered = await after.sessions.recoverTab(tab.id, action === "select-conversation" ? { action } : { action, sessionId: "conversation-b" });
     expect(recovered).toMatchObject({ id: tab.id, status: "running", recovery: undefined });
     expect(recoverSession).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-      initialInput: { resume: action === "select-conversation" ? { mode: "picker", all: true } : { mode: "session", sessionId: "conversation-b" } }
+      initialInput: { resume: action === "select-conversation" ? { mode: "picker", all: false, includeNonInteractive: false } : { mode: "session", sessionId: "conversation-b" } }
     }));
     expect(factory.spawn).toHaveBeenCalledTimes(2);
     await after.sessions.dispose();

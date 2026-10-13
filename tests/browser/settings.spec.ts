@@ -99,10 +99,9 @@ test.beforeEach(async ({ page }) => {
   serverLogs = "";
   testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-"));
   const codex = path.join(testRoot, "codex");
-  await fs.writeFile(
+  await fs.symlink(
+    path.join(repoRoot, "tests/browser/fixtures/settings-codex.mjs"),
     codex,
-    '#!/bin/sh\n[ "$1" = "--version" ] || exit 1\nprintf "codex-cli 0.160.0\\n"\n',
-    { mode: 0o755 },
   );
   const codexHome = path.join(testRoot, "codex-home");
   const imagegen = path.join(codexHome, "skills", ".system", "imagegen");
@@ -476,11 +475,29 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   page,
   isMobile,
 }, testInfo) => {
+  test.setTimeout(60_000);
   const configPath = path.join(testRoot, "codex-home", "config.toml");
+  const initialRead = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.read",
+  );
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const settings = await openCodexSettings(page, isMobile);
+  const initialRevision = (await (await initialRead).json()).result.settings
+    .revision;
   const model = settings.getByRole("textbox", { name: "Default model" });
   const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+  const nativeSearch = settings.getByRole("searchbox", {
+    name: "Search Codex options",
+  });
+  const tui = settings.getByRole("textbox", {
+    name: "Native tui",
+    exact: true,
+  });
+  const terminalDefaults = {
+    resume_cwd: "session",
+    notifications: ["agent-turn-complete"],
+  };
   const save = settings.getByRole("button", {
     name: "Save Codex settings",
     exact: true,
@@ -491,8 +508,22 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
 
   await model.fill("browser-fixture-model");
   await fastMode.selectOption({ label: "On" });
+  await nativeSearch.fill("resume_cwd");
+  await tui.fill(JSON.stringify(terminalDefaults));
   await expectCodexSettingsFits(page);
+  const saved = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  const savedResponse = await saved;
+  expect(savedResponse.ok()).toBe(true);
+  expect(savedResponse.request().postDataJSON().input).toEqual({
+    expectedRevision: initialRevision,
+    model: "browser-fixture-model",
+    serviceTier: "priority",
+    nativeOptions: { tui: terminalDefaults },
+  });
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
@@ -500,6 +531,7 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
     model: "browser-fixture-model",
     service_tier: "priority",
     features: { fast_mode: true },
+    tui: terminalDefaults,
   });
   await captureSample(page, testInfo, "codex-settings-saved");
 
@@ -508,9 +540,19 @@ test("Codex Settings saves shared defaults, keeps them after reload, and can res
   await expect(model).toHaveValue("browser-fixture-model");
   await expect(fastMode).toHaveValue("priority");
   await expect(save).toBeDisabled();
+  await nativeSearch.fill("resume_cwd");
+  expect(JSON.parse(await tui.inputValue())).toEqual(terminalDefaults);
   await model.fill("");
   await fastMode.selectOption({ label: "Model default" });
+  await settings
+    .getByRole("button", { name: "Unset tui", exact: true })
+    .click();
+  const restored = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  expect((await restored).ok()).toBe(true);
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
@@ -527,7 +569,12 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   page,
   isMobile,
 }, testInfo) => {
+  test.setTimeout(60_000);
   const home = path.join(testRoot, "codex-home");
+  await fs.writeFile(
+    path.join(home, "config.toml"),
+    'personality = "pragmatic"\n',
+  );
   const slides = path.join(home, "skills", ".system", "slides");
   await fs.mkdir(slides, { recursive: true });
   await fs.writeFile(
@@ -572,6 +619,14 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   await expect(trust).not.toBeChecked();
   await expect(imagegen).toBeChecked();
   await expect(slideSkill).not.toBeChecked();
+  await expect(personality).toHaveValue("pragmatic");
+  await expect(personality.locator('option[value="pragmatic"]')).toHaveText(
+    "Saved value: pragmatic",
+  );
+  await expect(personality.locator("..")).toContainText(
+    "friendly and pragmatic no longer select a communication style",
+  );
+  await expect(personality.locator('option[value="friendly"]')).toHaveCount(0);
   const yoloControl = await yolo.boundingBox();
   const yoloLabel = await yolo.locator("..").locator("span").boundingBox();
   expect(yoloControl!.width).toBeLessThanOrEqual(24);
@@ -581,7 +636,7 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   ).toBeGreaterThanOrEqual(44);
   await reasoning.selectOption("high");
   await search.selectOption("live");
-  await personality.selectOption("pragmatic");
+  await personality.selectOption("none");
   await yolo.uncheck();
   await trust.check();
   await imagegen.uncheck();
@@ -591,7 +646,12 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   await expect(trust).toBeChecked();
   await expect(slideSkill).toBeChecked();
   await expectCodexSettingsFits(page);
+  const saved = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  expect((await saved).ok()).toBe(true);
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
@@ -600,7 +660,7 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   ).toEqual({
     model_reasoning_effort: "high",
     web_search: "live",
-    personality: "pragmatic",
+    personality: "none",
   });
   expect(
     readCodexLaunchPreferences(
@@ -621,13 +681,19 @@ test("Codex Settings saves permissions, installed skills, and behavior defaults 
   await expect(slideSkill).toBeChecked();
   await expect(reasoning).toHaveValue("high");
   await expect(search).toHaveValue("live");
-  await expect(personality).toHaveValue("pragmatic");
+  await expect(personality).toHaveValue("none");
+  await expect(personality.locator('option[value="pragmatic"]')).toHaveCount(0);
   await expect(save).toBeDisabled();
   await reasoning.selectOption("");
   await search.selectOption("");
   await personality.selectOption("");
   await trust.uncheck();
+  const restored = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+  );
   await save.click();
+  expect((await restored).ok()).toBe(true);
   await expect(settings.getByRole("status")).toHaveText(
     "Global Codex settings saved.",
   );
@@ -699,6 +765,7 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   page,
   isMobile,
 }, testInfo) => {
+  test.setTimeout(60_000);
   let update = installedCodex;
   let connected = true;
   const starts: unknown[] = [];
@@ -1249,6 +1316,7 @@ for (const navigation of settingsNavigations) {
     page,
     isMobile,
   }, testInfo) => {
+    test.setTimeout(60_000);
     const configPath = path.join(testRoot, "codex-home", "config.toml");
     const unrelatedSettings =
       '# Keep this profile unchanged.\n[profiles.review]\nmodel = "profile-model"\n';
@@ -1327,7 +1395,12 @@ for (const navigation of settingsNavigations) {
     await expect(settings.getByRole("alert")).toHaveCount(0);
     await expect(save).toBeDisabled();
     await fastMode.selectOption({ label: "Off" });
+    const finalSave = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/hooks/codex-settings.update",
+    );
     await save.click();
+    expect((await finalSave).ok()).toBe(true);
     await expect(settings.getByRole("status")).toHaveText(
       "Global Codex settings saved.",
     );

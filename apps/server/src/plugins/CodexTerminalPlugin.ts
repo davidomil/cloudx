@@ -54,12 +54,6 @@ export const CODEX_READY_TIMEOUT_MS = 30_000;
 export const CODEX_READY_MAX_TIMEOUT_MS = 10 * 60 * 1000;
 export const CODEX_READY_MAX_QUIET_MS = 10_000;
 export const CLOUDX_CODEX_CONFIGURATION_ARGS = [
-  "--disable",
-  "apps",
-  "--disable",
-  "memories",
-  "--disable",
-  "plugins",
   "--config",
   "skills.bundled.enabled=false"
 ] as const;
@@ -176,7 +170,9 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
-    let restoredInput: Record<string, unknown> = { ...input.initialInput, ...(codexAgent ? { agent: codexAgent } : {}), codexRuntimeContext: input.runtimeContext, codexRecovered: recovering };
+    const workspaceId = recovering && typeof input.initialInput?.codexWorkspaceId === "string" ? input.initialInput.codexWorkspaceId : input.workspaceId;
+    let restoredInput: Record<string, unknown> = { ...input.initialInput, ...(codexAgent ? { agent: codexAgent } : {}),
+      ...(workspaceId ? { codexWorkspaceId: workspaceId } : {}), codexRuntimeContext: input.runtimeContext, codexRecovered: recovering };
     if (input.prepareAgentSession) {
       const sessionId = await input.prepareAgentSession({
         tabId: input.tab.id,
@@ -201,9 +197,15 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     await input.controls.setRestoreInput?.(restoredInput);
     const command = launchTemplate.command;
     const useBridge = Boolean(input.agentTurn || selection);
-    const sessionArgs = [...(recovering ? ["--cd", input.cwd] : []), ...initialArgs];
+    const sessionArgs = ["--cd", input.cwd, ...initialArgs];
     const launchArgs = useBridge ? buildCodexRemoteTuiArgs(launchTemplate.args, sessionArgs) : [...launchTemplate.args, ...sessionArgs];
     const resume = codexResumeInput(restoredInput);
+    const provenanceDirectory = this.dataDir ? path.join(this.dataDir, "codex-workspaces") : undefined;
+    if (provenanceDirectory) {
+      await fs.mkdir(provenanceDirectory, { recursive: true, mode: 0o700 });
+      const stat = await fs.lstat(provenanceDirectory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Codex workspace provenance must be a real directory.");
+    }
     // The tab's CODEX_HOME overlay wins over one the user's profile exports.
     const codexHome = launchTemplate.env.CODEX_HOME;
     const enforced: EnforcedEnv = { set: codexHome ? { CODEX_HOME: codexHome } : {}, unset: [] };
@@ -218,6 +220,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
             ...(targetedRecovery ? { expectedThreadId: input.tab.nativeWork!.threadId, recovery: true,
               previousError: input.tab.nativeWork?.lastError, previousGoalStatus: input.tab.nativeWork?.goalStatus } : {})
           } } : {}),
+          ...(provenanceDirectory ? { workspace: { workspaceId, cwd: await fs.realpath(input.cwd), provenanceDirectory,
+            owned: Boolean(input.tab.ownerPluginId), all: resume?.all ?? false, includeNonInteractive: resume?.includeNonInteractive ?? false } } : {}),
           ...(selection && launchTemplate.overlay ? { commandDetails: { tabId: input.tab.id, executionId: selection.executionId, receiptPath: codexCommandDetailsPath(launchTemplate.overlay.codexHome) } } : {}),
           ...(launchTemplate.overlay ? { activity: { receiptPath: agentTurnReceiptPath(launchTemplate.overlay.codexHome) } } : {}),
           startupPicker: resume?.mode === "picker",
@@ -637,6 +641,7 @@ export async function materializeCodexTemplate(
     env.CLOUDX_PERSONALITY_INJECTION = "codex-home-overlay";
     env.CLOUDX_SYSTEM_RULE_IDS = overlay.systemRules.map((rule) => rule.id).join(",");
     args.push("--add-dir", overlay.rulesSkillsRoot);
+    if (overlay.configProfile) args.push("--profile", overlay.configProfile);
   }
   if (resolved) {
     env.CLOUDX_PERSONALITY_TEMPLATE_ID = resolved.template.id;

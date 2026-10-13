@@ -1,0 +1,1741 @@
+{
+  "0.160.0": {
+    "analytics_plan_history": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "daemon_auto_start": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "transcript_v2": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "undo": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "shell_tool": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "view_image": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "sleep_tool": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "secret_auth_storage": {
+      "stage": "Stable",
+      "default": null,
+      "defaultDescription": "Native feature default: enabled on Windows; disabled on other platforms."
+    },
+    "unified_exec": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "unified_exec_tty": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "shell_zsh_fork": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "unified_exec_zsh_fork": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "shell_snapshot": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "powershell_shell_version": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "shell_snapshot_v2": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "deferred_executor": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "cwd_relative_turn_diffs": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "js_repl": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "content_item_kinds": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "executed_tool_call_metadata": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_buffered_exec": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_host": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "code_mode_prewarm": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_interrupt": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "instant_interrupt": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_only": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "js_repl_tools_only": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "terminal_resize_reflow": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "web_search_request": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "web_search_cached": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "standalone_web_search": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "search_tool": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "codex_git_commit": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "runtime_metrics": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "sqlite": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "memories": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "external_agent_memory_import": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "local_thread_store_compression": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "local_thread_store_shared_compression": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "background_paginated_rollout_migration": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "chronicle": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apply_patch_freeform": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apply_patch_streaming_events": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apply_patch_preserve_line_endings": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "exec_permission_approvals": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "write_stdin_approval": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "hooks": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "request_permissions_tool": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_linux_sandbox_bwrap": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_legacy_landlock": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "request_rule": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "experimental_windows_sandbox": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "elevated_windows_sandbox": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "windows_sandbox_service": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "prefer_mxc": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "remote_models": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "api_key_model_discovery": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "enable_request_compression": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "unbounded_connection_retries": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "network_proxy": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "worktrees": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "respect_system_proxy": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "system_proxy_fallback": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "multi_agent": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "multi_agent_v2": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "defer_mailbox_preemption": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "agent_message_board": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "multi_agent_mode": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "enable_fanout": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apps": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "psp": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "enable_mcp_apps": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "mcp_2026_07_28": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "codex_apps_mcp_2026_07_28": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "mcp_oauth_refresh_coordination": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_xaa": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apps_mcp_path_override": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tool_search": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tool_search_always_defer_mcp_tools": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "deferred_tool_world_state": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "non_prefixed_mcp_tool_names": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "unavailable_dummy_tools": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tool_suggest": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "recommended_plugins": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "plugins": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "executor_capability_discovery": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "skip_host_skill_discovery": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "plugin_hooks": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "in_app_browser": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_chat": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_dictation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_local_automation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_updates": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_use": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_use_full_cdp_access": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_use_external": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "computer_use": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "remote_plugin": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "plugin_sharing": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "external_migration": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "image_generation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "omit_app_server_notification_media": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "image_resize_notice": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "unified_image_budget": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "resize_all_images": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "item_ids": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "concurrent_reasoning_summaries": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "skill_mcp_dependency_install": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "skill_search": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "skill_env_var_dependency_prompt": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "mentions_v2": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "steer": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "default_mode_request_user_input": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "send_async_message": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "send_message_to_user_async": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "terminal_visualization_instructions": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_approval": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "guardianv2.thread_context": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_reuse_parent_compaction": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "guardian_root_handoff_context": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_enhanced_node_repl_transcripts": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_node_repl_transcript_images": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_conversation_history_tools": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardianv2": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_ext": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "goals": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "token_budget": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "context_management": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "rollout_budget": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "reasoning_effort_override": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "current_time_reminder": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "nonfatal_clock_read_errors": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "collaboration_modes": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "tool_call_mcp_elicitation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "auth_elicitation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "bedrock_setup_wizard": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "personality": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "artifact": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "fast_mode": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "step_model_switching": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "realtime_conversation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "remote_control": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "image_detail_original": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tui_app_server": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "workspace_owner_usage_nudge": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "responses_websockets": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "responses_websockets_v2": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "remote_compaction_v2": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "compaction_image_budget": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "retain_client_developer_messages": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_agent_identity": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "workspace_dependencies": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "connectors": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.apps."
+    },
+    "enable_experimental_windows_sandbox": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.experimental_windows_sandbox."
+    },
+    "experimental_use_unified_exec_tool": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.unified_exec."
+    },
+    "request_permissions": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.exec_permission_approvals."
+    },
+    "web_search": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.web_search_request."
+    },
+    "imagegenext": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.image_generation."
+    },
+    "collab": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.multi_agent."
+    },
+    "memory_tool": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.memories."
+    },
+    "telepathy": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.chronicle."
+    },
+    "codex_hooks": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.hooks."
+    },
+    "prevent_idle_sleep": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false. Experimental on macOS, Linux and Windows; under development on other platforms."
+    },
+    "tool_registry": {
+      "stage": "Stable",
+      "default": null,
+      "defaultDescription": "Native tool-registry options error_on_tool_collisions and turn_metadata_includes_tool_info default to false."
+    }
+  },
+  "0.162.1": {
+    "analytics_plan_history": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "daemon_auto_start": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "transcript_v2": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "undo": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "shell_tool": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "view_image": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "sleep_tool": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "secret_auth_storage": {
+      "stage": "Stable",
+      "default": null,
+      "defaultDescription": "Native feature default: enabled on Windows; disabled on other platforms."
+    },
+    "unified_exec": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "unified_exec_tty": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "shell_zsh_fork": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "unified_exec_zsh_fork": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "shell_snapshot": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "login_shell_package_path": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "powershell_shell_version": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "shell_snapshot_v2": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "deferred_executor": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "cwd_relative_turn_diffs": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "js_repl": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "content_item_kinds": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "executed_tool_call_metadata": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "stable_environment_tools": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_tool_search": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_buffered_exec": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_host": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "code_mode_prewarm": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_interrupt": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "instant_interrupt": {
+      "stage": "UnderDevelopment",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "code_mode_only": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "code_mode_only_strict_3p_tools": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "js_repl_tools_only": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "terminal_resize_reflow": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "web_search_request": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "web_search_cached": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "standalone_web_search": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "search_tool": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "codex_git_commit": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "runtime_metrics": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "sqlite": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "memories": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "external_agent_memory_import": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "local_thread_store_compression": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "local_thread_store_shared_compression": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "background_paginated_rollout_migration": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "chronicle": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apply_patch_freeform": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apply_patch_streaming_events": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apply_patch_preserve_line_endings": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "exec_permission_approvals": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "write_stdin_approval": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "hooks": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "request_permissions_tool": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_linux_sandbox_bwrap": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_legacy_landlock": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "request_rule": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "experimental_windows_sandbox": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "elevated_windows_sandbox": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "windows_sandbox_service": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "prefer_mxc": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "remote_models": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "api_key_model_discovery": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "cli_daybreak": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "api_key_cyber_access_programs": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "enable_request_compression": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "unbounded_connection_retries": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "network_proxy": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "worktrees": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "respect_system_proxy": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "system_proxy_fallback": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "multi_agent": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "multi_agent_v2": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "model_catalog_in_context": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "multi_agent_v2_dynamic_tools": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "defer_mailbox_preemption": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "agent_message_board": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "multi_agent_mode": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "enable_fanout": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apps": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "psp": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "enable_mcp_apps": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "mcp_2026_07_28": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "codex_apps_mcp_2026_07_28": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "mcp_oauth_refresh_coordination": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_xaa": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "apps_mcp_path_override": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tool_search": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tool_search_always_defer_mcp_tools": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "deferred_tool_world_state": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "incremental_tools": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "non_prefixed_mcp_tool_names": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "unavailable_dummy_tools": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tool_suggest": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "recommended_plugins": {
+      "stage": "Stable",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "plugins": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "executor_capability_discovery": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "skip_host_skill_discovery": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "plugin_hooks": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "in_app_browser": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_annotation_api": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_chat": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_dictation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_voice": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_local_automation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "in_app_updates": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_use": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_use_full_cdp_access": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "browser_use_external": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "computer_use": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "remote_plugin": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "plugin_sharing": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "external_migration": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "image_generation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "omit_app_server_notification_media": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "image_resize_notice": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "unified_image_budget": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "resize_all_images": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "item_ids": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "concurrent_reasoning_summaries": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "skill_mcp_dependency_install": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "skill_search": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "skill_env_var_dependency_prompt": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "mentions_v2": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "steer": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "default_mode_request_user_input": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "send_async_message": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "send_message_to_user_async": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "terminal_visualization_instructions": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_approval": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "guardianv2.thread_context": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_reuse_parent_compaction": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "guardian_root_handoff_context": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_enhanced_node_repl_transcripts": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_node_repl_transcript_images": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_conversation_history_tools": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardianv2": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardianv2_decisions_comparison": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "guardian_ext": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "goals": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "token_budget": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "context_management": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "rollout_budget": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "reasoning_effort_override": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "current_time_reminder": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "nonfatal_clock_read_errors": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "collaboration_modes": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "tool_call_mcp_elicitation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "auth_elicitation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "bedrock_setup_wizard": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "personality": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "artifact": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "fast_mode": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "ultrafast_mode": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "step_model_switching": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "realtime_conversation": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "remote_control": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "image_detail_original": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "tui_app_server": {
+      "stage": "Removed",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "workspace_owner_usage_nudge": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "responses_websockets": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "responses_websockets_v2": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "remote_compaction_v2": {
+      "stage": "Removed",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "compaction_image_budget": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "retain_client_developer_messages": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "use_agent_identity": {
+      "stage": "UnderDevelopment",
+      "default": false,
+      "defaultDescription": "Native feature default: false."
+    },
+    "workspace_dependencies": {
+      "stage": "Stable",
+      "default": true,
+      "defaultDescription": "Native feature default: true."
+    },
+    "connectors": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.apps."
+    },
+    "enable_experimental_windows_sandbox": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.experimental_windows_sandbox."
+    },
+    "experimental_use_unified_exec_tool": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.unified_exec."
+    },
+    "request_permissions": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.exec_permission_approvals."
+    },
+    "web_search": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.web_search_request."
+    },
+    "imagegenext": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.image_generation."
+    },
+    "collab": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.multi_agent."
+    },
+    "memory_tool": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.memories."
+    },
+    "telepathy": {
+      "stage": "Deprecated",
+      "default": false,
+      "defaultDescription": "Native feature default: false.",
+      "reason": "Legacy feature alias; use features.chronicle."
+    },
+    "codex_hooks": {
+      "stage": "Deprecated",
+      "default": true,
+      "defaultDescription": "Native feature default: true.",
+      "reason": "Legacy feature alias; use features.hooks."
+    },
+    "prevent_idle_sleep": {
+      "stage": "Experimental",
+      "default": false,
+      "defaultDescription": "Native feature default: false. Experimental on macOS, Linux and Windows; under development on other platforms."
+    },
+    "tool_registry": {
+      "stage": "Stable",
+      "default": null,
+      "defaultDescription": "Native tool-registry options error_on_tool_collisions and turn_metadata_includes_tool_info default to false."
+    }
+  }
+}

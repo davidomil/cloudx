@@ -1,3 +1,19 @@
+export type CodexConfigurationValue = string | number | boolean | CodexConfigurationValue[] | { [key: string]: CodexConfigurationValue };
+
+export interface CodexConfigurationSnapshot {
+  selectedVersion: string;
+  baselineVersion: string;
+  selectedCommand: string;
+  sourcePath: string;
+  blockedReason: string | null;
+  values: Record<string, CodexConfigurationValue>;
+  effectiveValues: Record<string, CodexConfigurationValue>;
+  overrides: string[];
+  layers: string[];
+  targetProfile?: string | null;
+  profileFiles?: string[];
+}
+
 export interface CodexGlobalSettings {
   revision: string;
   model: string | null;
@@ -5,10 +21,12 @@ export interface CodexGlobalSettings {
   fastModeEnabled: boolean | null;
   yoloMode: boolean;
   autoTrustWorkspace: boolean;
+  configProfile?: string | null;
   defaultSkills: { id: string; enabled: boolean; available: boolean }[];
   reasoningEffort: string | null;
   webSearch: string | null;
   personality: string | null;
+  configuration?: CodexConfigurationSnapshot;
 }
 
 export interface CodexGlobalSettingsUpdate {
@@ -17,10 +35,13 @@ export interface CodexGlobalSettingsUpdate {
   serviceTier?: "priority" | "default" | "flex" | null;
   yoloMode?: boolean;
   autoTrustWorkspace?: boolean;
+  configProfile?: string | null;
+  targetProfile?: string;
   defaultSkills?: Record<string, boolean>;
   reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null;
   webSearch?: "disabled" | "cached" | "indexed" | "live" | null;
   personality?: "none" | "friendly" | "pragmatic" | null;
+  nativeOptions?: Record<string, CodexConfigurationValue | null>;
 }
 
 export interface CodexConfigRepairPreview {

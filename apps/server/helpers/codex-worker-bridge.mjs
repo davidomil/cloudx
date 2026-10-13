@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer, WebSocket } from "ws";
 import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
+import { CodexWorkspaceScope } from "./codex-workspace-scope.mjs";
 import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 import { forwardNativeOutput } from "./codex-worker-output.mjs";
 import { CodexCommandDetailsCapture, saveCommandDetails } from "./codex-command-details.mjs";
@@ -161,8 +162,12 @@ export async function runWorkerBridge(launch) {
   const turn = launch.binding ? new CodexWorkerTurn(launch.binding,
     value => saveTurnReceipt(launch.binding.receiptPath, value),
     value => saveTurnReceipt(`${launch.binding.receiptPath}.final.json`, value)) : undefined;
+  const workspace = launch.workspace ? new CodexWorkspaceScope(launch.workspace) : undefined;
   const selection = launch.selection ? new CodexConversationSelection(launch.selection,
-    value => saveTurnReceipt(launch.selection.receiptPath, value)) : undefined;
+    (value, origin) => {
+      workspace?.recordSelection(value, origin);
+      saveTurnReceipt(launch.selection.receiptPath, value);
+    }) : undefined;
   const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
   const commands = launch.commandDetails ? new CodexCommandDetailsCapture(launch.commandDetails,
     value => saveCommandDetails(launch.commandDetails.receiptPath, value),
@@ -212,6 +217,7 @@ export async function runWorkerBridge(launch) {
     socket.on("message", data => {
       try {
         const message = JSON.parse(data.toString());
+        workspace?.fromClient(message);
         permissions?.fromClient(message);
         selection?.fromClient(message);
         workHealth?.fromClient(message);
@@ -230,6 +236,7 @@ export async function runWorkerBridge(launch) {
     socket.on("close", () => {
       try {
         if (picker && !selection?.selectedThreadId && !selection?.pending.size && !turn?.request) {
+          workspace?.pending.clear();
           phase = "handoff";
           frontend = undefined;
           retiring = true;
@@ -261,6 +268,7 @@ export async function runWorkerBridge(launch) {
         if (!finishing && !retiring) fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`));
       });
       void forwardNativeOutput(native.stdout, socket, message => {
+        if (workspace?.fromServer(message, next => forward(`${JSON.stringify(next)}\n`)) === false) return false;
         permissions?.fromServer(message);
         selection?.fromServer(message);
         workHealth?.fromServer(message);

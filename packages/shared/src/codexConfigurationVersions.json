@@ -1,0 +1,30 @@
+{
+  "0.160.0": {
+    "schemaUrl": "https://raw.githubusercontent.com/openai/codex/rust-v0.160.0/codex-rs/core/config.schema.json",
+    "schemaSha256": "7ce31bde1ed6ef15c53a96ba460bb1d0fb7b99fd9ab719b567c94c474f62b023",
+    "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.160.0",
+    "featureRegistryUrl": "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/features/src/lib.rs",
+    "permissionsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/config/src/permissions_toml.rs",
+    "cliSourceUrls": [
+      "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/cli/src/main.rs",
+      "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/tui/src/cli.rs",
+      "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/utils/cli/src/shared_options.rs",
+      "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/exec/src/cli.rs"
+    ],
+    "nativeCliVersion": "0.160.0"
+  },
+  "0.162.1": {
+    "schemaUrl": "https://raw.githubusercontent.com/openai/codex/rust-v0.162.1/codex-rs/core/config.schema.json",
+    "schemaSha256": "7933a70506e753a6e98c16800d2a76770b2af2b7295491f8f0b8e713e952027e",
+    "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.162.1",
+    "featureRegistryUrl": "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/features/src/lib.rs",
+    "permissionsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/config/src/permissions_toml.rs",
+    "cliSourceUrls": [
+      "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/cli/src/main.rs",
+      "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/tui/src/cli.rs",
+      "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/utils/cli/src/shared_options.rs",
+      "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/exec/src/cli.rs"
+    ],
+    "nativeCliVersion": "0.162.1"
+  }
+}

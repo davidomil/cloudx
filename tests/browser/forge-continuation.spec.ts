@@ -1488,7 +1488,10 @@ test("Codex recovery keeps conversation controls and offers ownership repair onl
   await expect(
     page.getByRole("button", { name: "Reconcile verified ownership" }),
   ).toBeDisabled();
-  await page.getByRole("checkbox").check();
+  await page
+    .getByRole("region", { name: "Directory ownership recovery" })
+    .getByRole("checkbox", { name: /^I verified that original device 1 / })
+    .check();
   await page
     .getByRole("button", { name: "Reconcile verified ownership" })
     .click();
@@ -1522,4 +1525,55 @@ test("Codex recovery keeps conversation controls and offers ownership repair onl
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   ).toBe(true);
+});
+
+test("Codex recovery keeps workspace scope independent from exec inclusion", async ({
+  page,
+}) => {
+  const resumes: unknown[] = [];
+  await page.route("**/api/tabs/codex-recovery/ownership", (route) =>
+    route.fulfill({ json: { status: "not_needed" } }),
+  );
+  await page.route("**/fixture-recover", (route) => {
+    resumes.push(route.request().postDataJSON());
+    return route.fulfill({ json: {} });
+  });
+  await page.goto(`${baseUrl}?codex-recovery`);
+  const allDirectories = page.getByRole("checkbox", {
+    name: "All directories",
+  });
+  const includeExec = page.getByRole("checkbox", {
+    name: "Include exec sessions",
+  });
+  await expect(allDirectories).not.toBeChecked();
+  await expect(includeExec).not.toBeChecked();
+
+  for (const scope of [
+    { all: false, includeNonInteractive: false },
+    { all: false, includeNonInteractive: true },
+    { all: true, includeNonInteractive: false },
+    { all: true, includeNonInteractive: true },
+  ]) {
+    await allDirectories.setChecked(scope.all);
+    await includeExec.setChecked(scope.includeNonInteractive);
+    const response = page.waitForResponse("**/fixture-recover");
+    await page
+      .getByRole("button", { name: "Select a saved conversation" })
+      .click();
+    await response;
+    expect(resumes.at(-1)).toEqual({ action: "select-conversation", ...scope });
+  }
+
+  await page
+    .getByRole("textbox", { name: "Conversation session ID" })
+    .fill("selected-conversation");
+  const response = page.waitForResponse("**/fixture-recover");
+  await page
+    .getByRole("button", { name: "Resume selected conversation" })
+    .click();
+  await response;
+  expect(resumes.at(-1)).toEqual({
+    action: "resume-conversation",
+    sessionId: "selected-conversation",
+  });
 });

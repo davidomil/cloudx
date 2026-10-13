@@ -617,7 +617,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/recover", async (request) => {
     const body = optionalRequestBody(request.body);
-    if (Object.keys(body).some(key => key !== "action" && key !== "sessionId" && key !== "executionId")) throwBadRequest("Unknown recovery field.");
+    if (Object.keys(body).some(key => !["action", "sessionId", "executionId", "all", "includeNonInteractive"].includes(key))) throwBadRequest("Unknown recovery field.");
     const action = body.action;
     if (action !== "reconnect" && action !== "new-shell" && action !== "resume-conversation" && action !== "select-conversation" && action !== "restart-native") throwBadRequest("Unknown recovery action.");
     let sessionId: string | undefined;
@@ -631,7 +631,14 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       if (action !== "restart-native" || !/^[a-zA-Z0-9_-]{1,128}$/.test(executionId)) throwBadRequest("executionId must identify the selected native execution.");
     }
     if (action === "restart-native" && (!sessionId || !executionId)) throwBadRequest("Native recovery requires an exact execution and conversation ID.");
-    return services.sessions.recoverTab(request.params.tabId, { action, sessionId, ...(executionId ? { executionId } : {}) });
+    for (const key of ["all", "includeNonInteractive"] as const) {
+      if (body[key] !== undefined && (action !== "select-conversation" || typeof body[key] !== "boolean"))
+        throwBadRequest(`${key} must be a boolean for select-conversation.`);
+    }
+    return services.sessions.recoverTab(request.params.tabId, { action, sessionId,
+      ...(executionId ? { executionId } : {}),
+      ...(body.all !== undefined ? { all: body.all as boolean } : {}),
+      ...(body.includeNonInteractive !== undefined ? { includeNonInteractive: body.includeNonInteractive as boolean } : {}) });
   });
 
   app.post<{ Params: { tabId: string }; Body: unknown }>("/api/tabs/:tabId/switch-agent", async (request) => {

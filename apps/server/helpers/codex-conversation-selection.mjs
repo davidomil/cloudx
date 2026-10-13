@@ -33,7 +33,7 @@ export class CodexConversationSelection {
     if (message.id == null) throw new Error("Native conversation selection is missing its request identity.");
     if (this.pending.has(message.id)) throw new Error("Native conversation selection reused a pending request identity.");
     if (this.pending.size >= MAX_PENDING_SELECTIONS) throw new Error("Native conversation selection exceeded its pending request limit.");
-    this.pending.set(message.id, { expectedThreadId, unsubscribe: message.method === "thread/unsubscribe" ? message.params.threadId : undefined });
+    this.pending.set(message.id, { expectedThreadId, created: ["thread/start", "thread/fork"].includes(message.method), unsubscribe: message.method === "thread/unsubscribe" ? message.params.threadId : undefined });
   }
 
   fromServer(message) {
@@ -65,7 +65,7 @@ export class CodexConversationSelection {
       version: 2, authority: "selected", tabId: this.binding.tabId, executionId: this.binding.executionId,
       sessionId: thread.id, cwd: thread.cwd,
       ...(typeof thread.path === "string" ? { transcriptPath: thread.path } : {})
-    });
+    }, { created: request.created });
     this.selectedThreadId = thread.id;
     this.subscribedSelections.add(thread.id);
   }

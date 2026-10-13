@@ -108,18 +108,18 @@ describe("global Codex settings editor", () => {
   it("saves only changed permissions, skills, and native defaults", async () => {
     const updated = { ...initial, revision: "second", yoloMode: false, autoTrustWorkspace: true,
       defaultSkills: [{ id: "imagegen", enabled: true, available: true }, { id: "browser", enabled: true, available: true }],
-      reasoningEffort: "high", webSearch: "indexed", personality: "friendly" };
+      reasoningEffort: "high", webSearch: "indexed", personality: "none" };
     const { container, calls } = await mount(initial, hook => hook === "codex-settings.read" ? initial : updated);
     await toggle(container, "YOLO mode");
     await toggle(container, "Automatically trust workspace");
     await toggle(container, "Enable browser");
     await fill(select(container, "Reasoning effort"), "high");
     await fill(select(container, "Web search"), "indexed");
-    await fill(select(container, "Personality"), "friendly");
+    await fill(select(container, "Personality"), "none");
     await click(container, "Save Codex settings");
     expect(calls.at(-1)).toEqual({ hook: "codex-settings.update", input: {
       expectedRevision: "first", yoloMode: false, autoTrustWorkspace: true, defaultSkills: { browser: true },
-      reasoningEffort: "high", webSearch: "indexed", personality: "friendly"
+      reasoningEffort: "high", webSearch: "indexed", personality: "none"
     } });
     expect(button(container, "Save Codex settings").disabled).toBe(true);
     expect(checkbox(container, "Enable browser").checked).toBe(true);
@@ -149,7 +149,7 @@ describe("global Codex settings editor", () => {
     await toggle(container, "Enable browser");
     await fill(select(container, "Reasoning effort"), "high");
     await fill(select(container, "Web search"), "live");
-    await fill(select(container, "Personality"), "friendly");
+    await fill(select(container, "Personality"), "none");
     settings = { ...initial, revision: "external", defaultSkills: [{ id: "new-skill", enabled: false, available: true }], personality: "pragmatic" };
     await click(container, "Reload");
     expect(checkbox(container, "YOLO mode").checked).toBe(true);
@@ -305,13 +305,13 @@ describe("global Codex settings editor", () => {
     expect(button(container, "Enable fast mode support").disabled).toBe(false);
   });
 
-  it.each(["not a model", "-starts-with-hyphen", "x".repeat(129)])("rejects an invalid model identifier %s", async value => {
+  it.each(["local/model@preview", "-starts-with-hyphen", "x".repeat(129)])("routes the native model string %s through native schema validation", async value => {
     const { container, calls } = await mount();
     await fill(model(container), value);
-    expect(model(container).getAttribute("aria-invalid")).toBe("true");
-    expect(button(container, "Save Codex settings").disabled).toBe(true);
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Enter a model identifier");
-    expect(calls).toHaveLength(1);
+    expect(model(container).getAttribute("aria-invalid")).toBeNull();
+    expect(button(container, "Save Codex settings").disabled).toBe(false);
+    await click(container, "Save Codex settings");
+    expect(calls.at(-1)?.input).toEqual({ expectedRevision: "first", nativeOptions: { model: value } });
   });
 
   it("keeps a failed save's draft and revision until Reload reads the shared file", async () => {

@@ -114,3 +114,47 @@ comments and reject changes made since the editor last loaded the file.
 If another editor changed the shared configuration, use **Reload**,
 reapply your edit, and save. Reload discards unsaved edits. Invalid TOML
 must be corrected before this editor can save.
+
+## Native configuration editor
+
+Use **Search Codex options** to find native configuration families and
+nested paths. Groups show descriptions, types, enum choices, declared
+defaults, experimental status and platform scope. The inventory is
+pinned to Codex 0.160.0 and 0.162.1; an unreviewed executable blocks
+native edits. Launch-only CLI options are listed separately.
+
+Each family has a structured JSON editor. Strings need quotes, tables
+use objects and lists use arrays. **Unset** removes the selected family
+so it inherits native defaults; removing an entry also removes
+credentials stored inside that entry. Edits to retained entries preserve
+hidden authentication values and unrelated comments. Use environment or
+credential-store references for secrets.
+
+**Configuration target** chooses base `config.toml` or a separate
+`name.config.toml` profile. Enter **New profile name**, select **Edit
+profile**, change an option and save to create a profile. Changing
+targets discards unsaved edits. Return to the base target and select
+**Launch configuration profile** to use that profile for new tabs and
+Forge workers.
+
+Codex rejects the legacy `profile = "name"` selector in the reviewed
+versions. CloudX layers separate profile files into the generated
+backend configuration and selects the profile for the terminal. Base and
+profile files retain their original content; generated path values
+retain their source-file meaning. Running sessions keep their launch
+configuration.
+
+The layer display identifies the target, effective base/profile values,
+administrator requirements, project configuration and CloudX overrides.
+Trusted project values and explicit model or reasoning selections can
+override saved defaults. CloudX manages its generated skills and
+bundled-skill selection; YOLO overrides native sandbox and approval
+defaults when enabled. Scoped resume supplies the requested directory
+with `--cd`, which takes precedence over `tui.resume_cwd`.
+
+Saves validate the selected version schema and initialize the selected
+native executable in an isolated validation home before replacing
+advanced settings. Changed reasoning effort and personality defaults are
+checked against native model-advertised capabilities. A changed
+configuration, selected profile or executable requires **Reload** before
+saving again.
