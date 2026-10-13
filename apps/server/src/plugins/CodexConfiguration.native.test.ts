@@ -497,44 +497,58 @@ it.skipIf(!codex)("a null default remains absent even when low effort is support
 
 it.skipIf(!codex)("an ambiguous provider default cannot be replaced by bundled metadata for the same model", async () => {
   const fixture = await NativeConfigurationSession.create();
-  const catalog = JSON.parse(await fs.readFile(path.join(fixture.home, "models.json"), "utf8"));
-  catalog.models[0].default_reasoning_level = "none";
-  catalog.models[0].supported_reasoning_levels = [{ effort: "low", description: "low" }];
-  const requests: string[] = [];
-  const provider = createServer((request, response) => {
-    requests.push(request.url!);
-    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(catalog));
-  });
   try {
-    await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
+    await fixture.useProviderCatalog("none", ["low"]);
     const configPath = path.join(fixture.home, "config.toml");
-    const originalText = await fs.readFile(configPath, "utf8");
-    const config = parse(originalText);
-    delete config.model_catalog_json;
-    config.features = { api_key_model_discovery: true };
-    const definition = (config.model_providers as Record<string, Record<string, unknown>>)["cloudx-native"]!;
-    definition.model_catalog_url = `http://127.0.0.1:${(provider.address() as { port: number }).port}/models`;
-    definition.experimental_bearer_token = "synthetic-noncredential";
-    definition.supports_websockets = false;
-    await fs.writeFile(configPath, `${originalText.split("\n")[0]}\n${stringify(config)}`);
     const original = await fixture.settings.read();
     const text = await fs.readFile(configPath, "utf8");
     await expect(fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "gpt-6.1-sol-preview" } }))
       .rejects.toThrow(/does not distinguish.*Configure model_catalog_json/);
     expect(await fs.readFile(configPath, "utf8")).toBe(text);
     expect((await fixture.settings.read()).revision).toBe(original.revision);
-    expect(requests).toContain(`/models?client_version=${original.configuration!.selectedVersion}`);
+    expect(fixture.catalogRequests).toContain(`/models?client_version=${original.configuration!.selectedVersion}`);
     expect(fixture.requests).toHaveLength(0);
     await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model: "gpt-6.1-sol-preview", model_reasoning_effort: "low" } });
     await fixture.launch();
     await fixture.completeTurn();
     expect(fixture.requests[0]).toMatchObject({ model: "gpt-6.1-sol-preview", reasoning: { effort: "low" } });
-  } finally {
-    provider.closeAllConnections();
-    await new Promise<void>(resolve => provider.close(() => resolve()));
-    await fixture.dispose();
-  }
+  } finally { await fixture.dispose(); }
 }, 30_000);
+
+it.skipIf(!codex).each(["none", null])("a provider that supports none allows model selection and main-effort unset with raw default %s", async defaultEffort => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const model = "gpt-6.1-sol-preview";
+    await fixture.useProviderCatalog(defaultEffort, ["none", "low"], model);
+    const original = await fixture.settings.read();
+    const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { model } });
+    expect(selected.revision).not.toBe(original.revision);
+    expect(selected.configuration?.values).not.toHaveProperty("model_catalog_json");
+    expect(selected.configuration?.values).not.toHaveProperty("model_reasoning_effort");
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[0]).toMatchObject({ model });
+    if (defaultEffort === null) expect(fixture.requests[0]?.reasoning).not.toHaveProperty("effort");
+    else expect(fixture.requests[0]?.reasoning).toHaveProperty("effort", "none");
+
+    const explicit = await fixture.settings.update({ expectedRevision: selected.revision, nativeOptions: { model_reasoning_effort: "none" } });
+    expect(explicit.configuration?.values.model_reasoning_effort).toBe("none");
+    const inherited = await fixture.settings.update({ expectedRevision: explicit.revision, nativeOptions: { model_reasoning_effort: null } });
+    expect(inherited.revision).not.toBe(explicit.revision);
+    expect(inherited.configuration?.values).not.toHaveProperty("model_reasoning_effort");
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(fixture.requests[1]).toMatchObject({ model });
+    if (defaultEffort === null) expect(fixture.requests[1]?.reasoning).not.toHaveProperty("effort");
+    else expect(fixture.requests[1]?.reasoning).toHaveProperty("effort", "none");
+    expect(fixture.catalogRequests).toContain(`/models?client_version=${selected.configuration!.selectedVersion}`);
+    const persisted = parse(await fs.readFile(path.join(fixture.home, "config.toml"), "utf8"));
+    expect(persisted.model).toBe(model);
+    expect(persisted).not.toHaveProperty("model_catalog_json");
+    expect(persisted).not.toHaveProperty("model_reasoning_effort");
+    expect(persisted).not.toHaveProperty("plan_mode_reasoning_effort");
+  } finally { await fixture.dispose(); }
+}, 40_000);
 
 interface ConfigurationRequest {
   text?: { verbosity?: string };
@@ -550,9 +564,11 @@ class NativeConfigurationSession {
   readonly receiptPath: string;
   readonly overlayConfigPath: string;
   readonly requests: ConfigurationRequest[] = [];
+  readonly catalogRequests: string[] = [];
   session?: PluginSession;
   private readonly env: NodeJS.ProcessEnv;
   private readonly provider;
+  private catalog?: unknown;
 
   private constructor(readonly root: string) {
     this.home = path.join(root, "home");
@@ -564,6 +580,11 @@ class NativeConfigurationSession {
     this.receiptPath = path.join(root, "turn.json");
     this.overlayConfigPath = path.join(this.sources.viewPath("configuration"), "config.toml");
     this.provider = createServer((request, response) => {
+      if (request.method === "GET" && request.url?.split("?")[0] === "/models" && this.catalog) {
+        this.catalogRequests.push(request.url);
+        response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(this.catalog));
+        return;
+      }
       if (request.method !== "POST" || request.url !== "/v1/responses") { response.writeHead(404).end(); return; }
       let body = "";
       request.setEncoding("utf8");
@@ -615,6 +636,24 @@ class NativeConfigurationSession {
       ].join("\n"));
       return fixture;
     } catch (error) { await fixture.dispose(); throw error; }
+  }
+
+  async useProviderCatalog(defaultEffort: string | null, efforts: string[], model = "gpt-6.1-sol") {
+    const catalog = JSON.parse(await fs.readFile(path.join(this.home, "models.json"), "utf8"));
+    catalog.models[0].slug = model;
+    catalog.models[0].default_reasoning_level = defaultEffort;
+    catalog.models[0].supported_reasoning_levels = efforts.map(effort => ({ effort, description: effort }));
+    this.catalog = catalog;
+    const configPath = path.join(this.home, "config.toml");
+    const original = await fs.readFile(configPath, "utf8");
+    const config = parse(original);
+    delete config.model_catalog_json;
+    config.features = { api_key_model_discovery: true };
+    const provider = (config.model_providers as Record<string, Record<string, unknown>>)["cloudx-native"]!;
+    provider.model_catalog_url = `http://127.0.0.1:${(this.provider.address() as { port: number }).port}/models`;
+    provider.experimental_bearer_token = "synthetic-noncredential";
+    provider.supports_websockets = false;
+    await fs.writeFile(configPath, `${original.split("\n")[0]}\n${stringify(config)}`);
   }
 
   async launch(forge = false) {

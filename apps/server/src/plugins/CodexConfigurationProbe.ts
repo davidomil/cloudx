@@ -133,7 +133,8 @@ export async function validateNativeCodexConfiguration(command: string, config: 
             const mainInherited = candidate.model_reasoning_effort === undefined && (selectionChanged || previous.model_reasoning_effort !== undefined);
             const planInherited = candidate.plan_mode_reasoning_effort === undefined && previous.plan_mode_reasoning_effort !== undefined;
             const effort = mainInherited ? advertised?.defaultReasoningEffort : candidate.model_reasoning_effort;
-            const needsMainDefaultInspection = mainInherited && effort === "none";
+            const needsMainDefaultInspection = mainInherited && effort === "none"
+              && (candidate.model_catalog_json !== undefined || !supportsReasoningEffort(advertised, effort));
             if (needsMainDefaultInspection) ambiguousMainDefault = advertised;
             if (message.error || !advertised) stop(new Error("Selected model capabilities are not advertised by native Codex. Configure a model catalog before changing model-specific defaults."));
             else if ((mainInherited || effort !== undefined) && !needsMainDefaultInspection && !supportsReasoningEffort(advertised, effort)) stop(new Error("Selected model does not advertise the chosen reasoning effort."));

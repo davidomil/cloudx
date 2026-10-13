@@ -133,8 +133,8 @@ describe("optional native main defaults", () => {
       .resolves.toBeUndefined();
   });
 
-  it("uses original raw order when picker priority reverses duplicate model entries", async () => {
-    await expect(validate('model="duplicate"', [model("duplicate", [], "none"), model("duplicate", ["low"], "none")], undefined,
+  it.each([{ efforts: [] }, { efforts: ["none"] }])("uses original raw order when picker priority advertises duplicate efforts %j", async ({ efforts }) => {
+    await expect(validate('model="duplicate"', [model("duplicate", efforts, "none"), model("duplicate", ["low"], "none")], undefined,
       { catalog: { models: [
         { slug: "duplicate", default_reasoning_level: "none", supported_reasoning_levels: [{ effort: "low" }], priority: 10 },
         { slug: "duplicate", default_reasoning_level: null, supported_reasoning_levels: [], priority: 0 }
@@ -163,6 +163,24 @@ describe("optional native main defaults", () => {
   it("accepts a supported explicit effort when the provider default is ambiguous", async () => {
     await expect(validate('model="gpt-6.1-sol"\nmodel_reasoning_effort="low"', [model("gpt-6.1-sol", ["low"], "none")], undefined, { remoteCatalog: true }))
       .resolves.toBeUndefined();
+    await expect(fs.access(path.join(root, "inspection.json"))).rejects.toThrow();
+  });
+
+  it("can select a provider model that supports its inherited none without a local descriptor", async () => {
+    await expect(validate('model="gpt-6.1-sol-preview"', [model("gpt-6.1-sol", ["none"], "none")], undefined, { remoteCatalog: true }))
+      .resolves.toBeUndefined();
+    await expect(fs.access(path.join(root, "inspection.json"))).rejects.toThrow();
+  });
+
+  it("can unset a main override when the provider supports inherited none without a local descriptor", async () => {
+    await expect(validate('model="gpt-6.1-sol-preview"', [model("gpt-6.1-sol", ["none"], "none")],
+      { model: "gpt-6.1-sol-preview", model_reasoning_effort: "none" }, { remoteCatalog: true })).resolves.toBeUndefined();
+    await expect(fs.access(path.join(root, "inspection.json"))).rejects.toThrow();
+  });
+
+  it("still validates Plan effort when the provider supports inherited main none", async () => {
+    await expect(validate('model="gpt-6.1-sol-preview"\nplan_mode_reasoning_effort="low"', [model("gpt-6.1-sol", ["none"], "none")], undefined, { remoteCatalog: true }))
+      .rejects.toThrow(/chosen Plan reasoning effort/);
     await expect(fs.access(path.join(root, "inspection.json"))).rejects.toThrow();
   });
 
