@@ -775,8 +775,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       const reportError = completion.reportError === undefined ? undefined : nonblankText(completion.reportError, "completion report error", 100_000);
       const readyAt = completion.readyAt === undefined ? undefined : isoTimestamp(completion.readyAt, "completion handoff timestamp");
       const continuationRequired = completion.continuationRequired === undefined ? undefined : nonblankText(completion.continuationRequired, "required worker continuation", MAX_FORGE_WORKFLOW_TEXT_LENGTH);
-      if (continuationRequired && (worker.kind !== "issue" || !report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || worker.pendingPublication !== undefined))
-        throw new Error("Required continuation needs a successful issue completion without pending publication.");
+      if (continuationRequired && (!report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || worker.pendingPublication !== undefined))
+        throw new Error("Required continuation needs a successful worker completion without pending publication.");
       if (report && reportError || readyAt && (!report || !isForgeTurnCompletion(turn) || turn.status !== "completed" || Date.parse(readyAt) >= Date.parse(deadlineAt)))
         throw new Error("A completion handoff requires a valid report and successful native turn before its deadline.");
       if (report && (report.kind !== worker.kind || worker.attemptId !== undefined && report.kind === "review" && report.headSha !== worker.headSha))
@@ -789,6 +789,9 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
           throw new Error("Saved review scope must match the review attempt and report.");
         parsed.completion.reviewScope = scope;
       }
+      if (continuationRequired && worker.kind === "review" && (!parsed.completion.reviewScope || report?.kind !== "review" ||
+          report.headSha !== worker.headSha || parsed.completion.reviewScope.current.headSha !== worker.headSha))
+        throw new Error("Required reviewer continuation needs a report and comparison matching the pinned review revision.");
     }
     if (worker.retainedWorkspace !== undefined) {
       const retained = object(worker.retainedWorkspace);

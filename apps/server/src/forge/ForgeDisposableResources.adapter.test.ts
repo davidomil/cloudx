@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DisposableResource, ForgeWorker } from "@cloudx/shared";
-import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableCleanupError, ForgeDisposableResources } from "./ForgeDisposableResources.js";
+import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableCleanupError, ForgeDisposableResources, ForgeEvidenceCompletenessError } from "./ForgeDisposableResources.js";
 import { Header } from "tar";
 
 const execute = vi.hoisted(() => vi.fn());
@@ -161,11 +161,41 @@ describe("Docker creation rejection receipts", () => {
     expect(files).toEqual(["work/evidence/report.log"]);
   });
 
-  it("preserves Docker's missing-source diagnostic when its tar output is empty", async () => {
+  it("identifies the exact missing source after Docker closes its empty tar output", async () => {
     const child = dockerChild(Readable.from([]), 1);
     spawn.mockReturnValue(child);
     queueMicrotask(() => child.stderr.end("Could not find the file /work/evidence in container"));
-    await expect(host.readEvidence("a".repeat(64), ["/work/evidence"], async () => {})).rejects.toThrow("Could not find the file");
+    await expect(host.readEvidence("a".repeat(64), ["/work/evidence"], async () => {})).rejects.toMatchObject({
+      missingPaths: ["/work/evidence"], message: expect.stringContaining("Required container evidence is missing"),
+    });
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it("reads every available source and reports every missing required path", async () => {
+    spawn.mockImplementation((_command: string, args: string[]) => {
+      const source = args[2]!.split(":")[1]!;
+      const present = source.endsWith("result.log");
+      const child = dockerChild(Readable.from(present ? [evidenceTar([{ path: "result.log", data: "passes" }])] : []), present ? 0 : 1);
+      queueMicrotask(() => child.stderr.end(present ? "" : `Error response from daemon: Could not find the file ${source} in container ${"a".repeat(64)}`));
+      return child;
+    });
+    const files: string[] = [];
+    const failure = await host.readEvidence("a".repeat(64), ["/work/missing.log", "/work/result.log", "/work/focused-tests.log"], async (file, data) => {
+      expect(await text(Readable.from(data))).toBe("passes"); files.push(file);
+    }).catch(error => error);
+    expect(failure).toBeInstanceOf(ForgeEvidenceCompletenessError);
+    expect(failure.missingPaths).toEqual(["/work/missing.log", "/work/focused-tests.log"]);
+    expect(files).toEqual(["work/result.log"]);
+    expect(spawn).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(["permission denied", "Could not find the file /another/path in container"])("keeps %s distinct from a missing selected source", async diagnostic => {
+    const child = dockerChild(Readable.from([]), 1);
+    spawn.mockReturnValue(child);
+    queueMicrotask(() => child.stderr.end(diagnostic));
+    const failure = await host.readEvidence("a".repeat(64), ["/work/evidence"], async () => {}).catch(error => error);
+    expect(failure).not.toBeInstanceOf(ForgeEvidenceCompletenessError);
+    expect(failure.message).toContain(diagnostic);
   });
 
   it("persists one primary blocker across Docker cancellation diagnostics and restart, then distinguishes a changed rejection", async () => {

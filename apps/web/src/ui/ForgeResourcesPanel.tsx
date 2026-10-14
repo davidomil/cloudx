@@ -31,7 +31,7 @@ export function ForgeResourcesPanel({ revision }: { revision: number }) {
       {resource.evidence?.state === "verified" ? <SavedEvidence workerId={resource.owner.workerId} attemptId={resource.owner.attemptId} commitSha={resource.evidence.commitSha}
         bytes={resource.evidence.bytes} exportedAt={resource.evidence.exportedAt} files={resource.evidence.files ?? []}
         manifestUrl={`/api/forge/resources/${encodeURIComponent(resource.id)}/evidence`} fileUrl={path => forgeEvidenceFileUrl(resource.id, path)} />
-        : <p role="status">{resource.state === "failed" || resource.state === "blocked" ? "Automatic cleanup is blocked to protect evidence. See the worker error." : "Saving evidence before automatic cleanup…"}</p>}
+        : <p role="status">{resource.evidence?.state === "incomplete" ? resource.reason : resource.state === "failed" || resource.state === "blocked" ? "Automatic cleanup is blocked to protect evidence. See the worker error." : "Saving evidence before automatic cleanup…"}</p>}
     </article>)}
     {evidence?.archives.map(archive => <article key={archive.archiveId} className="forge-worker" aria-label={`Saved evidence for worker ${archive.workerId}`}>
       <strong>Worker <code>{archive.workerId}</code></strong>

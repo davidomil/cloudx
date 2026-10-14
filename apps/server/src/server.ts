@@ -1494,6 +1494,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     cleanupDisposableResources: worker => forgeResources.retire(worker),
+    validateEvidenceHandoff: worker => forgeResources.validateEvidenceHandoff(worker),
     notify: (title, body) => { notifications.send({ title, body }); }
   });
   const pendingRulesSkillsUpdates = new Set<Promise<void>>();

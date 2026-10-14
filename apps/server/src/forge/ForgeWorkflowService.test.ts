@@ -3,6 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { text as streamText } from "node:stream/consumers";
 import { MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY } from "@cloudx/shared";
 import type { ForgeCiDiagnostic, ForgeIssueCompletionReport, ForgeIssueDetail, ForgeChangeRequest, ForgeReviewPublication, ForgeReviewRevision, ForgeReviewScope, ForgeReviewSubmission, ForgeTurnCompletion, ForgeWorker, ForgeWorkerHistory } from "@cloudx/shared";
 import {
@@ -12,6 +14,7 @@ import {
 import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { ForgeDisposableResources, ForgeEvidenceCompletenessError, type ContainerIdentity, type DisposableContainerHost } from "./ForgeDisposableResources.js";
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
 import { PluginDataStore } from "../plugins/PluginDataStore.js";
 import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
@@ -175,6 +178,141 @@ function fixture(issueNumber = 1) {
   };
 }
 const placement = { windowId: "window", paneId: "pane" };
+
+describe("Container evidence completion handoff", () => {
+  it.each(["issue", "review"] as const)("keeps a %s report recoverable when required evidence is missing before tab finish", async kind => {
+    const f = fixture();
+    const validate = vi.fn(async () => { throw new Error("Required container evidence is missing: /work/evidence/focused-tests.log. Produce the required artifacts or explicitly correct the evidence selection."); });
+    f.deps.validateEvidenceHandoff = validate;
+    const worker = kind === "issue"
+      ? await f.service.startIssue(f.deps.settings().repository, 1, placement)
+      : await f.service.startReview(f.deps.settings().repository, f.change.number, false, placement);
+    const report = kind === "issue" ? { kind, title: "Fix", body: "Validation passed" }
+      : { kind, headSha: f.change.headSha, event: "approve", body: "Validation passed", comments: [] };
+    f.reports.read.mockResolvedValue(report);
+    await f.service.poll();
+    expect(validate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id, attemptId: worker.attemptId }));
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: expect.stringContaining("/work/evidence/focused-tests.log"), completion: { report } });
+    expect(f.runtime.finish).not.toHaveBeenCalled();
+    expect(f.runtime.preparePublication).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.retainReviewBaseline).not.toHaveBeenCalled();
+    expect(f.stored()[0]?.completion?.continuationRequired).toContain("Use Continue with message");
+    await f.service.dispose();
+  });
+
+  it("accepts a fresh handoff after restart and intentional continuation fixes the evidence", async () => {
+    const f = fixture();
+    const validate = vi.fn(async () => {});
+    validate.mockRejectedValueOnce(new Error("Required container evidence is missing: /work/evidence/focused-tests.log."));
+    f.deps.validateEvidenceHandoff = validate;
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validation passed" });
+    await f.service.poll();
+    await f.service.dispose();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.continueWorker(worker.id, "Produce and validate the required focused test log.", placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "The required log exists and validation passed" });
+    await restarted.poll();
+    expect(validate).toHaveBeenCalledTimes(2);
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review" });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.finish).toHaveBeenCalledOnce();
+    await restarted.dispose();
+  });
+
+  it.each(["unchanged", "advanced"])("persists reviewer evidence failure through the real store, resumes at the %s head and verifies corrected evidence before retirement", async revision => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-review-evidence-recovery-"));
+    const f = fixture();
+    const reports = new ForgeWorkerReports(directory);
+    let store = new ForgeWorkflowStore(new PluginDataStore(directory));
+    let workflow = f.service;
+    const activeTabs = new Set<string>();
+    const containers = new Map<string, ContainerIdentity>();
+    const artifacts = new Map([["/work/evidence/validation.log", "Measured validation passed\n"]]);
+    const host: DisposableContainerHost = {
+      engineId: async () => "review-evidence-engine",
+      create: async (_input, labels) => {
+        const id = randomUUID().replaceAll("-", "").repeat(2);
+        containers.set(id, { id, labels, created: new Date().toISOString(), running: true, writableBytes: 8192 });
+        return id;
+      },
+      find: async resourceId => [...containers.values()].filter(item => item.labels["cloudx.forge.resource"] === resourceId).map(item => item.id),
+      inspect: async id => structuredClone(containers.get(id)),
+      stop: async id => { containers.get(id)!.running = false; },
+      remove: vi.fn(async id => {
+        const manifest = await resources.readEvidence(resource.id);
+        expect(manifest.paths).toEqual(["/work/evidence/validation.log"]);
+        expect(await streamText(await resources.evidenceFile(resource.id, "work/evidence/validation.log"))).toBe(artifacts.get("/work/evidence/validation.log"));
+        containers.delete(id);
+      }),
+      readEvidence: async (_id, paths, write) => {
+        const missing: string[] = [];
+        for (const source of paths) {
+          const contents = artifacts.get(source);
+          if (contents === undefined) { missing.push(source); continue; }
+          const bytes = Buffer.from(contents);
+          await write(source.slice(1), Readable.from([bytes]), bytes.length);
+        }
+        if (missing.length) throw new ForgeEvidenceCompletenessError(missing);
+      },
+    };
+    let resources = new ForgeDisposableResources(directory, () => store.read(), host);
+    f.deps.store = store;
+    f.deps.reports = reports;
+    f.deps.validateEvidenceHandoff = worker => resources.validateEvidenceHandoff(worker);
+    f.deps.cleanupDisposableResources = worker => resources.retire(worker);
+    f.runtime.launch.mockImplementation(async input => {
+      const tab = `tab-${input.attemptId}`;
+      activeTabs.add(tab);
+      return tab;
+    });
+    f.deps.runtime.isActive = tab => activeTabs.has(tab);
+    f.deps.runtime.close = async tab => { activeTabs.delete(tab); };
+    f.runtime.finish.mockImplementation(async tab => { activeTabs.delete(tab); });
+    f.runtime.readTurnCompletion.mockImplementation(async (workerId, attemptId) => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`,
+      status: await reports.read(attemptId) ? "completed" : "running" }));
+    onTestFinished(async () => { await workflow.dispose(); await fs.rm(directory, { recursive: true, force: true }); });
+    const reviewer = await workflow.startReview(f.deps.settings().repository, f.change.number, false, placement);
+    const resource = await resources.create(reviewer, { name: "required-review-evidence", image: "fixture", command: ["true"],
+      evidencePaths: ["/work/evidence/validation.log", "/work/evidence/focused-tests.log"] });
+    const report = { kind: "review", headSha: f.change.headSha, event: "approve", body: "Review requirements passed", comments: [] };
+    const writeReport = async (attemptId: string, current = report) => fs.writeFile(path.join(directory, "forge-reports", `${attemptId}.json`), JSON.stringify(current));
+    await writeReport(reviewer.attemptId!);
+    await workflow.poll();
+    const failed = (await store.read()).find(worker => worker.id === reviewer.id)!;
+    expect(failed).toMatchObject({ status: "failed", error: expect.stringContaining("/work/evidence/focused-tests.log"),
+      completion: { report, turn: { status: "completed" }, continuationRequired: expect.stringContaining("Continue with message") } });
+    expect(failed.tabId).toBeUndefined();
+    expect(await reports.read(reviewer.attemptId!)).toEqual(report);
+    expect((await resources.records())[0]).toMatchObject({ evidence: { state: "incomplete", missingPaths: ["/work/evidence/focused-tests.log"] } });
+    expect(host.remove).not.toHaveBeenCalled();
+    const sibling = await workflow.startIssue(f.deps.settings().repository, f.issue.number, placement);
+    expect((await store.read()).find(worker => worker.id === sibling.id)?.status).toBe("running");
+    await workflow.dispose();
+    store = new ForgeWorkflowStore(new PluginDataStore(directory));
+    resources = new ForgeDisposableResources(directory, () => store.read(), host);
+    f.deps.store = store;
+    workflow = new ForgeWorkflowService(f.deps);
+    if (revision === "advanced") f.change.headSha = "c".repeat(40);
+    const resumed = await workflow.continueWorker(reviewer.id, "Correct the evidence selection to the actual measured validation log.", placement);
+    expect(resumed.attemptId).not.toBe(reviewer.attemptId);
+    await workflow.withRunningWorkerResources(reviewer.id, resumed.attemptId!, current => resources.updateEvidenceSelection(current, resource.id,
+      { evidencePaths: ["/work/evidence/validation.log"] }));
+    await writeReport(resumed.attemptId!, { ...report, headSha: f.change.headSha });
+    await workflow.poll();
+    expect((await store.read()).find(worker => worker.id === reviewer.id)).toMatchObject({ status: "completed", draft: { event: "approve", headSha: f.change.headSha } });
+    expect(host.remove).not.toHaveBeenCalled();
+    f.change.state = "merged";
+    f.change.merged = true;
+    await workflow.reconcileResourceCleanup();
+    expect((await store.read()).some(worker => worker.id === reviewer.id)).toBe(false);
+    expect((await resources.records())[0]).toMatchObject({ state: "deleted", evidence: { state: "verified" } });
+    expect(host.remove).toHaveBeenCalledOnce();
+  });
+});
 
 describe("Worker diagnostic snapshot ownership", () => {
   it("creates snapshots only through the active worker's recorded checkout", async () => {

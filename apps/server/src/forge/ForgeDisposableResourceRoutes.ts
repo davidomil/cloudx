@@ -48,4 +48,19 @@ export function registerForgeDisposableResourceRoutes(app: FastifyInstance, reso
       return reply.code(201).send(result);
     } catch (error) { return reply.code(409).send({ error: (error as Error).message }); }
   });
+  app.post<{ Params: { workerId: string; resourceId: string } }>("/api/forge/workers/:workerId/resources/:resourceId/evidence-selection", { bodyLimit: 100_000 }, async (request, reply) => {
+    if (!request.headers.origin || !trustedOrigins.includes(request.headers.origin)) return reply.code(403).send({ error: "Correct owned evidence from a trusted CloudX origin." });
+    const body = request.body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return reply.code(400).send({ error: "A current attempt and specific evidence selection are required." });
+    const { attemptId, ...selection } = body as Record<string, unknown>;
+    try {
+      if (typeof attemptId !== "string" || !/^[a-f0-9-]{36}$/u.test(attemptId)) throw new Error("A current Forge attempt ID is required.");
+      validateEvidenceDecision({ ...selection, action: "export" });
+      if (!Array.isArray(selection.evidencePaths) || Object.keys(selection).some(key => !["evidencePaths", "commitSha"].includes(key))) throw new Error("Specific evidence paths and optional commit SHA are required.");
+    } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
+    try {
+      return await workflow.withRunningWorkerResources(request.params.workerId, attemptId as string, worker =>
+        resources.updateEvidenceSelection(worker, request.params.resourceId, selection as { evidencePaths: string[]; commitSha?: string }));
+    } catch (error) { return reply.code(409).send({ error: (error as Error).message }); }
+  });
 }

@@ -6,7 +6,7 @@ import { pipeline } from "node:stream/promises";
 import { Parser, type ReadEntry } from "tar";
 import type { DisposableResource, ForgeEvidenceManifest, ForgeResourceEvidence } from "@cloudx/shared";
 import { JsonStateFile, requireSafeDirectory } from "../jsonStateFile.js";
-import { isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
+import { isForgeDependencyOrBuildPath, isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
 import { evidenceLinkContents, ForgeEvidenceFiles, maxEvidenceBytes, maxEvidenceFiles, maxEvidenceCollectionBytes, maxEvidenceCollectionFiles } from "./ForgeEvidenceFiles.js";
 
 export type EvidenceSink = (filePath: string, data: AsyncIterable<Uint8Array>, expectedBytes: number, symbolicLink?: string) => Promise<void>;
@@ -16,10 +16,15 @@ const namespace = "forge-evidence";
 const legacyMaxEvidenceBytes = 16 * 1024 * 1024;
 
 export function validEvidencePaths(value: unknown, allowEmpty = false): value is string[] {
+  return validRecordedEvidencePaths(value, allowEmpty) && value.every(item => !generatedEvidencePath(item));
+}
+
+/** Saved receipts keep their path contract when the policy for future exports excludes more generated files. */
+export function validRecordedEvidencePaths(value: unknown, allowEmpty = false): value is string[] {
   return Array.isArray(value) && (allowEmpty || value.length > 0) && value.length <= 32 && value.every(item =>
     typeof item === "string" && item.length <= 1024 && item.startsWith("/") && item !== "/" &&
     !item.includes("\\") && !/[\u0000-\u001f]/u.test(item) && path.posix.normalize(item) === item &&
-    !item.endsWith("/") && !generatedEvidencePath(item) && !item.split("/").includes(".git")) &&
+    !item.endsWith("/") && !isForgeDependencyOrBuildPath(item) && !item.split("/").includes(".git")) &&
     value.every((item, index) => value.every((other, otherIndex) => index === otherIndex || item !== other && !item.startsWith(`${other}/`)));
 }
 
@@ -111,7 +116,7 @@ export class ForgeContainerEvidence {
     const writer = await this.storage.beginCollection(namespace, resource.id);
     try {
       await source(async (filePath, data, expectedBytes, symbolicLink) => {
-        if (!selectedEvidenceKey(filePath, evidence.paths)) throw new Error("Evidence source returned a path outside its declared selection.");
+        if (!selectedEvidenceKey(filePath, evidence.paths) || generatedEvidencePath(filePath)) throw new Error("Evidence source returned a path outside its declared selection.");
         await writer.add(filePath, data, expectedBytes, symbolicLink);
       });
       const files = writer.files.sort((left, right) => left.path.localeCompare(right.path));
@@ -195,7 +200,7 @@ function verifyLegacyContents(archive: EvidenceArchive): void {
   if (bytes !== archive.manifest.bytes || keys.size !== Object.keys(archive.contents!).length) throw new Error("Evidence archive size or file inventory changed.");
 }
 function generatedEvidencePath(value: string): boolean { return isGeneratedForgePath(value) || /(?:^|\/)[^/]+\.tsbuildinfo$/u.test(value); }
-function selectedEvidenceKey(value: unknown, selections: string[]): value is string { return typeof value === "string" && value.length <= 4096 && validEvidencePaths([`/${value}`]) && selections.some(source => value === source.slice(1) || value.startsWith(`${source.slice(1)}/`)); }
+function selectedEvidenceKey(value: unknown, selections: string[]): value is string { return typeof value === "string" && value.length <= 4096 && validRecordedEvidencePaths([`/${value}`]) && selections.some(source => value === source.slice(1) || value.startsWith(`${source.slice(1)}/`)); }
 function archivePath(id: string): string { validId(id); return `${namespace}/${id}/manifest.json`; }
 function legacyArchivePath(id: string): string { validId(id); return `${namespace}/${id}.json`; }
 function validId(id: string): void { if (!/^[a-f0-9-]{36}$/u.test(id)) throw new Error("Evidence resource identity is invalid."); }

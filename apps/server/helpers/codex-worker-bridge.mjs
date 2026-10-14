@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { constants, closeSync, fsyncSync, openSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 import { WebSocketServer, WebSocket } from "ws";
 import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
 import { CodexWorkspaceScope } from "./codex-workspace-scope.mjs";
@@ -10,6 +11,7 @@ import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 import { forwardNativeOutput } from "./codex-worker-output.mjs";
 import { CodexCommandDetailsCapture, saveCommandDetails } from "./codex-command-details.mjs";
 import { CodexNativeWorkObservation } from "./codex-native-work.mjs";
+import { CodexBackendDiagnostics } from "./codex-backend-diagnostics.mjs";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -148,6 +150,19 @@ export function saveTurnReceipt(receiptPath, value) {
 
 /** The enclosing terminal subreaper owns this bridge, both Codex processes, and every descendant. */
 export async function runWorkerBridge(launch) {
+  if (!launch.binding && !launch.selection) throw new Error("A native bridge execution binding is required.");
+  const diagnostics = new CodexBackendDiagnostics((launch.selection ?? launch.binding).receiptPath);
+  diagnostics.append(`\nCloudX native bridge started ${new Date().toISOString()}\n`);
+  process.once("exit", () => diagnostics.close());
+  let diagnosticsFailed = false;
+  const recordDiagnostic = chunk => {
+    if (diagnosticsFailed) return;
+    try { diagnostics.append(chunk); }
+    catch {
+      diagnosticsFailed = true;
+      fail(new Error("Private Codex backend diagnostics could not be saved."));
+    }
+  };
   if (launch.configurationNotice) process.stderr.write(`${launch.configurationNotice}\n`);
   const token = randomBytes(32).toString("hex");
   let frontend;
@@ -171,21 +186,36 @@ export async function runWorkerBridge(launch) {
   const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
   const commands = launch.commandDetails ? new CodexCommandDetailsCapture(launch.commandDetails,
     value => saveCommandDetails(launch.commandDetails.receiptPath, value),
-    { onError: error => process.stderr.write(`CloudX command details: ${error.message}\n`) }) : undefined;
+    { onError: error => recordDiagnostic(`CloudX command details: ${error.message}\n`) }) : undefined;
   // Activity only informs agent switching. A failed write must not end the session.
   const activity = launch.activity ? new CodexTurnActivity(value => {
     try { saveTurnReceipt(launch.activity.receiptPath, value); }
-    catch (error) { process.stderr.write(`CloudX turn activity: ${error.message}\n`); }
+    catch (error) { recordDiagnostic(`CloudX turn activity: ${error.message}\n`); }
   }) : undefined;
   const workHealth = launch.workHealth ? new CodexNativeWorkObservation(launch.workHealth, value => {
     try { saveTurnReceipt(launch.workHealth.receiptPath, value); }
-    catch (error) { process.stderr.write(`CloudX native work health: ${error.message}\n`); }
+    catch (error) { recordDiagnostic(`CloudX native work health: ${error.message}\n`); }
   }, selection) : undefined;
   if (!turn && !selection) throw new Error("A native bridge execution binding is required.");
   let finishing = false;
+  let failure;
+  let failureTimer;
+  let tui;
+  const showFailure = () => {
+    clearTimeout(failureTimer);
+    const message = stripVTControlCharacters(failure.message).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 512);
+    const diagnosticPath = stripVTControlCharacters(diagnostics.path).replace(/[\x00-\x1f\x7f]/g, " ");
+    process.stderr.write(`\r\nCloudX native worker bridge: ${message}\r\n${diagnosticsFailed ? "Backend diagnostics could not be saved; inspect retained file" : "Private backend diagnostics"}: ${diagnosticPath}\r\n`, () => process.exit(1));
+  };
   const fail = error => {
-    console.error(`CloudX native worker bridge: ${error.message}`);
-    process.exit(1);
+    if (failure) return;
+    failure = error;
+    recordDiagnostic(`CloudX native worker bridge: ${error.message}\n`);
+    if (!tui?.pid || tui.exitCode !== null || tui.signalCode !== null) showFailure();
+    else {
+      tui.kill("SIGTERM");
+      failureTimer = setTimeout(() => tui.kill("SIGKILL"), 1_000);
+    }
   };
   const awaitVisibleExit = () => {
     if (finishing) return;
@@ -255,7 +285,9 @@ export async function runWorkerBridge(launch) {
       clearTimeout(handoffTimer);
       // The remote TUI has initialized its local state before connecting. Start
       // the backend here so their first SQLite migrations cannot race.
-      native = spawn(launch.command, launch.serverArgs, { stdio: ["pipe", "pipe", "inherit"] });
+      native = spawn(launch.command, launch.serverArgs, { stdio: ["pipe", "pipe", "pipe"] });
+      native.stderr.on("data", recordDiagnostic);
+      native.stderr.on("error", fail);
       native.on("error", fail);
       native.stdin.on("error", error => {
         // Pending writes can outlive the client's close handshake. Its visible
@@ -264,7 +296,13 @@ export async function runWorkerBridge(launch) {
         fail(error);
       });
       native.stdout.on("error", fail);
+      let backendExitTimer;
       native.on("exit", (code, signal) => {
+        if (!finishing && !retiring)
+          backendExitTimer = setTimeout(() => fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`)), 250);
+      });
+      native.on("close", (code, signal) => {
+        clearTimeout(backendExitTimer);
         if (!finishing && !retiring) fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`));
       });
       void forwardNativeOutput(native.stdout, socket, message => {
@@ -280,12 +318,13 @@ export async function runWorkerBridge(launch) {
       queued.length = 0;
     }).catch(fail);
   });
-  const tui = spawn(launch.command, [
+  tui = spawn(launch.command, [
     "--remote", `ws://127.0.0.1:${server.address().port}`,
     "--remote-auth-token-env", TOKEN_ENV, ...launch.tuiArgs
   ], { stdio: "inherit", env: { ...process.env, [TOKEN_ENV]: token } });
   tui.on("error", fail);
   tui.on("exit", async (code, signal) => {
+    if (failure) { showFailure(); return; }
     finishing = true;
     // Exiting the bridge returns ownership to the terminal supervisor, which
     // reaps the app server and remaining tools before announcing terminal exit.

@@ -95,6 +95,20 @@ describe("Saved Forge evidence", () => {
     expect(container.textContent).not.toContain("Archive verification failed.");
     expect(container.querySelector("a, button, input, textarea, select, fieldset")).toBeNull();
   });
+  it("shows the exact missing required path and the intentional recovery action while keeping verified reports downloadable", async () => {
+    const missingPath = "/work/evidence/focused-tests.log";
+    const reason = `Required container evidence is missing: ${missingPath}. Available artifacts remain in the owned environment. Produce the required artifacts or explicitly correct the evidence selection before exporting again.`;
+    vi.mocked(getForgeResources).mockResolvedValue([resource, { ...resource, id: "incomplete", name: "incomplete-evidence", state: "blocked", reason,
+      evidence: { state: "incomplete", paths: ["/work/evidence/test.log", missingPath], missingPaths: [missingPath] } }]);
+    await render();
+    const incomplete = container.querySelector('[aria-label="Saved evidence for incomplete-evidence"]')!;
+    expect(incomplete.querySelector('[role="status"]')?.textContent).toBe(reason);
+    expect(incomplete.textContent).toContain(missingPath);
+    expect(incomplete.textContent).toContain("Produce the required artifacts or explicitly correct the evidence selection");
+    expect(incomplete.querySelector("a, button, input, textarea, select, fieldset")).toBeNull();
+    expect(container.querySelectorAll("a[download]")).toHaveLength(2);
+    expect(container.querySelector('a[href*="evidence-file"]')?.getAttribute("href")).toBe("/api/forge/resources/resource-1/evidence-file?path=evidence%2Ftest+log.txt");
+  });
   it.each(["container", "checkout", "Git history"])("preserves available downloads when %s evidence cannot load", async source => {
     vi.mocked(getForgeResources).mockResolvedValue([resource]);
     vi.mocked(getForgeCheckoutEvidence).mockResolvedValue([archive]);
