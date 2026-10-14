@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import type { ForgeWorker, WorkspaceCleanupCandidate, DisposableContainerInput, DisposableResource, ForgeResourceConsumer as Consumer, EvidenceDecision, ForgeEvidenceManifest } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
-import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, type EvidenceSink } from "./ForgeContainerEvidence.js";
+import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, validRecordedEvidencePaths, type EvidenceSink } from "./ForgeContainerEvidence.js";
 import { maxEvidenceCollectionBytes, maxEvidenceCollectionFiles, writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 
 export type { DisposableContainerInput, DisposableResource, EvidenceDecision } from "@cloudx/shared";
@@ -385,10 +385,10 @@ export class ForgeDisposableResources {
   private async preserveEvidence(resource: DisposableResource, state: ResourceJournal, present: boolean): Promise<void> {
     if (!resource.evidence || ["kept", "discarded", "missing", "incomplete"].includes(resource.evidence.state)) return;
     if (resource.evidence.state === "verified") { await this.evidenceArchive.read(resource); return; }
-    if (!validEvidencePaths(resource.evidence.paths)) return;
     await this.recordEvidenceCommit(resource);
     const recovered = await this.evidenceArchive.recover(resource);
     if (recovered) { resource.evidence = recovered; await this.write(state); return; }
+    if (!validEvidencePaths(resource.evidence.paths)) return;
     if (!present) throw new Error("The container disappeared before evidence export; required evidence is unavailable.");
     if (!this.host.readEvidence) throw new Error("The container host does not support evidence export.");
     const identity = await this.assertQuiescentConsumers(resource, state);
@@ -560,8 +560,8 @@ function validResource(item: DisposableResource): boolean {
     (item.removalStartedAt === undefined || Number.isFinite(Date.parse(item.removalStartedAt))) && Number.isFinite(Date.parse(item.updatedAt)));
 }
 function validEvidence(value: DisposableResource["evidence"]): boolean {
-  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing", "incomplete"].includes(value.state) && validEvidencePaths(value.paths, true) &&
-    (value.missingPaths === undefined || validEvidencePaths(value.missingPaths) && value.missingPaths.every(source => value.paths.includes(source))) &&
+  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing", "incomplete"].includes(value.state) && validRecordedEvidencePaths(value.paths, true) &&
+    (value.missingPaths === undefined || validRecordedEvidencePaths(value.missingPaths) && value.missingPaths.every(source => value.paths.includes(source))) &&
     (value.state !== "incomplete" || value.missingPaths?.length) &&
     (value.commitSha === undefined || validCommit(value.commitSha)) &&
     (value.commitSource === undefined || ["worker", "declared"].includes(value.commitSource)) &&
@@ -569,7 +569,7 @@ function validEvidence(value: DisposableResource["evidence"]): boolean {
     (value.manifestSha256 === undefined || typeof value.manifestSha256 === "string" && /^[a-f0-9]{64}$/u.test(value.manifestSha256)) &&
     (value.bytes === undefined || Number.isSafeInteger(value.bytes) && value.bytes >= 0) &&
     (value.exportedAt === undefined || Number.isFinite(Date.parse(value.exportedAt))) &&
-    (value.files === undefined || Array.isArray(value.files) && value.files.every(file => file && typeof file.path === "string" && validEvidencePaths([`/${file.path}`]) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && /^[a-f0-9]{64}$/u.test(file.sha256) &&
+    (value.files === undefined || Array.isArray(value.files) && value.files.every(file => file && typeof file.path === "string" && validRecordedEvidencePaths([`/${file.path}`]) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && /^[a-f0-9]{64}$/u.test(file.sha256) &&
       (file.symbolicLink === undefined || typeof file.symbolicLink === "string" && file.symbolicLink.length > 0 && file.symbolicLink.length <= 4096 && !/[\u0000-\u001f]/u.test(file.symbolicLink)))) &&
     (value.state !== "verified" || value.archivePath && value.manifestSha256 && value.files?.length && value.bytes !== undefined && value.exportedAt));
 }

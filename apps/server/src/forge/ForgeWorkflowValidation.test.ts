@@ -970,6 +970,29 @@ describe("Saved native worker completion", () => {
     expect(parseWorkers([saved])[0]).toEqual(saved);
   });
 
+  const reviewReport = { kind: "review", headSha, event: "approve", body: "Review passed", comments: [] };
+  const reviewScope = { kind: "initial", current: { headSha, baseSha: "b".repeat(40), mergeBaseSha: "b".repeat(40) } };
+  const reviewer = { ...worker, kind: "review", headSha, attemptId,
+    completion: { ...completion, report: reviewReport, reviewScope, continuationRequired: "Produce the missing /work/evidence/focused-tests.log before completing this review." } };
+
+  it.each(["running", "failed"])("preserves required evidence recovery for a %s reviewer at its successful pinned revision", status => {
+    const saved = { ...reviewer, status };
+    expect(parseWorkers([saved])[0]).toEqual(saved);
+  });
+
+  it.each([
+    { headSha: "c".repeat(40) },
+    { completion: { ...reviewer.completion, reviewScope: undefined } },
+    { completion: { ...reviewer.completion, reviewScope: { ...reviewScope, current: { ...reviewScope.current, headSha: "c".repeat(40) } } } },
+    { completion: { ...reviewer.completion, turn: { ...turn, status: "interrupted" } } },
+    { completion: { ...reviewer.completion, report: undefined } },
+    { completion: { ...reviewer.completion, report } },
+    { completion: { ...reviewer.completion, reportError: "Malformed report" } },
+    { pendingPublication: { report, repliedDiscussionIds: [] } },
+  ])("rejects reviewer recovery without matching successful turn, report and comparison evidence %#", fields => {
+    expect(() => parseWorkers([{ ...reviewer, ...fields }])).toThrow();
+  });
+
   it.each([
     { completion: { ...completion, continuationRequired: " " } },
     { completion: { ...completion, continuationRequired: "x".repeat(100_001) } },
@@ -978,7 +1001,7 @@ describe("Saved native worker completion", () => {
     { completion: { ...completion, continuationRequired: "Finish", report: undefined } },
     { completion: { ...completion, continuationRequired: "Finish" }, pendingPublication: { report, repliedDiscussionIds: [] } },
     { kind: "review", completion: { ...completion, continuationRequired: "Finish", report: { kind: "review", headSha, event: "comment", body: "Review", comments: [] } } },
-  ])("rejects a continuation blocker without successful issue evidence or with publication underway %#", fields => {
+  ])("rejects a continuation blocker without successful evidence or with publication underway %#", fields => {
     expect(() => parseWorkers([{ ...worker, ...fields }])).toThrow(/continuation/);
   });
 

@@ -943,6 +943,7 @@ export class ForgeWorkflowService {
         await this.recoverResources(member);
         await this.quiesce(member, { retainReport: Boolean(member.completion && !member.completion.readyAt) });
         member.attemptId = undefined;
+        if (member.kind === "review" && member.completion?.continuationRequired) member.completion = undefined;
       }
       if (!worker.worktreePath) {
         if (worker.kind === "review" && change) {

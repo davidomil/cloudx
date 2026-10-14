@@ -48,7 +48,7 @@ if (backend) {
   for (let index = 0; index < 5000; index++) {
     if (!process.stderr.write(diagnostic)) await once(process.stderr, 'drain');
   }
-  process.stderr.write('BACKEND_FINAL_DIAGNOSTIC\\n');
+  await new Promise(resolve => process.stderr.write('BACKEND_FINAL_DIAGNOSTIC\\n', resolve));
   if (${JSON.stringify(outcome)} === 'startup-exit') process.exit(9);
   else for await (const line of readline.createInterface({ input: process.stdin })) {
     const request = JSON.parse(line);

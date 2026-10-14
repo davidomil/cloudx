@@ -3,8 +3,11 @@ import path from "node:path";
 const generatedDirectories = new Set(["node_modules", "dist", "build", ".venv", "__pycache__", ".pytest_cache", ".vite", ".cache"]);
 
 export function isGeneratedForgePath(relative: string): boolean {
-  const parts = relative.split("/");
-  return parts.some(part => generatedDirectories.has(part)) || relative.endsWith(".tsbuildinfo") || isNativeCodexPluginCache(parts);
+  return isForgeDependencyOrBuildPath(relative) || isNativeCodexPluginCache(relative.split("/"));
+}
+
+export function isForgeDependencyOrBuildPath(relative: string): boolean {
+  return relative.split("/").some(part => generatedDirectories.has(part)) || relative.endsWith(".tsbuildinfo");
 }
 
 function isNativeCodexPluginCache(parts: string[]): boolean {
