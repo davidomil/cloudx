@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import type { ForgeWorker, WorkspaceCleanupCandidate, DisposableContainerInput, DisposableResource, ForgeResourceConsumer as Consumer, EvidenceDecision, ForgeEvidenceManifest } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
 import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, type EvidenceSink } from "./ForgeContainerEvidence.js";
-import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
+import { maxEvidenceCollectionBytes, maxEvidenceCollectionFiles, writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 
 export type { DisposableContainerInput, DisposableResource, EvidenceDecision } from "@cloudx/shared";
 
@@ -40,6 +40,11 @@ export class ForgeDisposableCleanupError extends Error {
 export class ForgeEvidenceExportError extends Error {
   constructor(readonly primaryReason: string, diagnostic: string, cause?: unknown) {
     super(`${primaryReason} Docker evidence export: ${diagnostic}`, { cause });
+  }
+}
+export class ForgeEvidenceCompletenessError extends Error {
+  constructor(readonly missingPaths: string[]) {
+    super(`Required container evidence is missing: ${missingPaths.join(", ")}. Available artifacts remain in the owned environment. Produce the required artifacts or explicitly correct the evidence selection before exporting again.`);
   }
 }
 
@@ -99,6 +104,79 @@ export class ForgeDisposableResources {
 
   async records(): Promise<DisposableResource[]> { return structuredClone((await this.read()).resources); }
 
+  updateEvidenceSelection(worker: ForgeWorker, resourceId: string, selection: Pick<DisposableContainerInput, "evidencePaths" | "commitSha">): Promise<DisposableResource> {
+    return this.serial(async () => {
+      validateEvidenceDecision({ action: "export", ...selection });
+      if (!validEvidencePaths(selection.evidencePaths)) throw new Error("Specific evidence paths are required.");
+      const state = await this.read();
+      const resource = state.resources.find(item => item.id === resourceId);
+      if (!resource || resource.owner.workerId !== worker.id || !worker.attemptId || !["running", "starting"].includes(worker.status))
+        throw new Error("Only the current active owner attempt can correct its evidence selection.");
+      if (resource.state === "deleted" || resource.evidence?.manifestSha256) throw new Error("Removed environments and archived evidence cannot be changed.");
+      if (!await this.currentIdentity(resource)) throw new Error("The owned evidence environment is unavailable.");
+      resource.evidence = { ...resource.evidence, state: "pending", paths: selection.evidencePaths, missingPaths: undefined,
+        ...(selection.commitSha ? { commitSha: selection.commitSha, commitSource: "declared" as const } : {}) };
+      resource.state = "owned";
+      resource.cleanupFailure = undefined;
+      resource.reason = "The current owner corrected the required evidence selection; completion will validate it.";
+      resource.updatedAt = now();
+      await this.write(state);
+      return structuredClone(resource);
+    });
+  }
+
+  /** Read-only validation before the workflow accepts a report or closes the native tab. */
+  validateEvidenceHandoff(worker: ForgeWorker): Promise<void> {
+    return this.serial(async () => {
+      const state = await this.read();
+      for (const resource of state.resources.filter(item => item.state !== "deleted" && (item.owner.workerId === worker.id || item.consumers.some(consumer =>
+        consumer.workerId === worker.id && consumer.attemptId === worker.attemptId)))) {
+        if (!resource.evidence || ["verified", "discarded", "kept"].includes(resource.evidence.state)) continue;
+        if (!validEvidencePaths(resource.evidence.paths)) throw new Error("Select specific required evidence before completing this worker.");
+        const identity = await this.currentIdentity(resource);
+        if (!identity) throw new Error("The required evidence environment is unavailable; inspect its recorded ownership before completing.");
+        if (!this.host.readEvidence) throw new Error("The container host does not support evidence validation.");
+        const missing: string[] = [];
+        let files = 0;
+        let bytes = 0;
+        for (const source of resource.evidence.paths) {
+          try {
+            const previousFiles = files;
+            await this.host.readEvidence(identity.id, [source], async (file, data, expectedBytes) => {
+              if (file !== source.slice(1) && !file.startsWith(`${source.slice(1)}/`)) throw new Error("Evidence source returned a path outside its declared selection.");
+              if (++files > maxEvidenceCollectionFiles || bytes + expectedBytes > maxEvidenceCollectionBytes) throw new Error("Evidence exceeds the bounded collection limit (1 GiB / 4096 files); the environment was preserved.");
+              let received = 0;
+              for await (const chunk of data) {
+                received += chunk.length;
+                if (received > expectedBytes) throw new Error("Evidence source exceeded its declared size.");
+              }
+              if (received !== expectedBytes) throw new Error("Evidence source ended before its declared size.");
+              bytes += received;
+            });
+            if (files === previousFiles) throw new Error(`Evidence source ${source} has no exportable files or fixture links; select specific valuable data.`);
+          } catch (error) {
+            if (!(error instanceof ForgeEvidenceCompletenessError)) throw error;
+            missing.push(...error.missingPaths);
+          }
+        }
+        if (!await this.currentIdentity(resource)) throw new Error("The required evidence environment disappeared during completion validation.");
+        if (missing.length) {
+          const error = new ForgeEvidenceCompletenessError(missing);
+          this.recordIncompleteEvidence(resource, error);
+          await this.write(state);
+          throw error;
+        }
+        resource.evidence.state = "pending";
+        resource.evidence.missingPaths = undefined;
+        resource.state = "owned";
+        resource.cleanupFailure = undefined;
+        resource.reason = "All required evidence sources were read successfully at completion handoff.";
+        resource.updatedAt = now();
+        await this.write(state);
+      }
+    });
+  }
+
   decideEvidence(resourceId: string, decision: EvidenceDecision): Promise<DisposableResource> {
     return this.serial(async () => {
       validateEvidenceDecision(decision);
@@ -116,6 +194,7 @@ export class ForgeDisposableResources {
         return structuredClone(resource);
       }
       resource.evidence ??= { state: "pending", paths: [] };
+      resource.evidence.missingPaths = undefined;
       if (decision.action === "discard") resource.evidence.state = "discarded";
       else {
         if (decision.evidencePaths) resource.evidence.paths = decision.evidencePaths;
@@ -128,7 +207,7 @@ export class ForgeDisposableResources {
       resource.updatedAt = now();
       await this.write(state);
       await this.removeRecorded(resource, state);
-      if (decision.action === "export" && resource.state === "failed") throw new Error(resource.reason);
+      if (decision.action === "export" && ["failed", "blocked"].includes(resource.state)) throw new Error(resource.reason);
       return structuredClone(resource);
     });
   }
@@ -195,6 +274,7 @@ export class ForgeDisposableResources {
       consumers: resource.consumers.map(consumer => ({ workerId: consumer.workerId, attemptId: consumer.attemptId }))
         .sort((a, b) => a.workerId.localeCompare(b.workerId) || a.attemptId.localeCompare(b.attemptId)),
       retentionReason: resource.retentionReason, paths: [...(resource.evidence?.paths ?? [])].sort(),
+      missingPaths: [...(resource.evidence?.missingPaths ?? [])].sort(),
       commitSha: resource.evidence?.commitSha, commitSource: resource.evidence?.commitSource,
       blocker: resource.reason === this.evidenceProtection(resource)
         ? "evidence-retention"
@@ -257,13 +337,23 @@ export class ForgeDisposableResources {
       resource.state = "deleted";
       resource.reason = "Exact owned container removed; writable-layer bytes reclaimed. Shared volumes and images preserved.";
     } catch (error) {
-      resource.state = "failed";
-      resource.reason = message(error);
-      resource.cleanupFailure = error instanceof ForgeEvidenceExportError ? error.primaryReason : resource.reason;
+      if (error instanceof ForgeEvidenceCompletenessError) this.recordIncompleteEvidence(resource, error);
+      else {
+        resource.state = "failed";
+        resource.reason = message(error);
+        resource.cleanupFailure = error instanceof ForgeEvidenceExportError ? error.primaryReason : resource.reason;
+      }
     } finally {
       resource.updatedAt = now();
       await this.write(state);
     }
+  }
+
+  private recordIncompleteEvidence(resource: DisposableResource, error: ForgeEvidenceCompletenessError): void {
+    resource.evidence = { ...resource.evidence!, state: "incomplete", missingPaths: error.missingPaths };
+    resource.state = "blocked";
+    resource.reason = resource.cleanupFailure = error.message;
+    resource.updatedAt = now();
   }
 
   private async assertRemovable(resource: DisposableResource, state: ResourceJournal): Promise<ContainerIdentity | undefined> {
@@ -282,6 +372,7 @@ export class ForgeDisposableResources {
     if (!resource.retentionReason && !resource.evidence) return undefined;
     if (resource.evidence?.state === "verified" || resource.evidence?.state === "discarded" || resource.evidence?.state === "missing") return undefined;
     if (resource.evidence?.state === "kept") return `Evidence hold explicitly kept for review: ${resource.retentionReason ?? resource.evidence.paths.join(", ")}. Idle container is stopped; export or confirm discard to release it.`;
+    if (resource.evidence?.state === "incomplete") return new ForgeEvidenceCompletenessError(resource.evidence.missingPaths!).message;
     if (!resource.evidence?.paths.length) return `Explicit evidence retention requires review: ${resource.retentionReason}. Select specific paths to export, keep the hold or confirm discard. Idle container is stopped after all consumers close.`;
     return `Specific evidence export pending: ${resource.evidence.paths.join(", ")}. ${resource.retentionReason ?? ""}`;
   }
@@ -292,7 +383,7 @@ export class ForgeDisposableResources {
     return identity;
   }
   private async preserveEvidence(resource: DisposableResource, state: ResourceJournal, present: boolean): Promise<void> {
-    if (!resource.evidence || ["kept", "discarded", "missing"].includes(resource.evidence.state)) return;
+    if (!resource.evidence || ["kept", "discarded", "missing", "incomplete"].includes(resource.evidence.state)) return;
     if (resource.evidence.state === "verified") { await this.evidenceArchive.read(resource); return; }
     if (!validEvidencePaths(resource.evidence.paths)) return;
     await this.recordEvidenceCommit(resource);
@@ -416,7 +507,15 @@ export class DockerDisposableContainerHost implements DisposableContainerHost {
   async remove(id: string): Promise<void> { await docker(["container", "rm", id]); }
   async readEvidence(id: string, paths: string[], write: EvidenceSink): Promise<void> {
     if (!/^[a-f0-9]{64}$/u.test(id) || !validEvidencePaths(paths)) throw new Error("Evidence export requires an exact container identity and specific absolute paths.");
-    for (const source of paths) await streamDockerEvidence(id, source, write);
+    const missing: string[] = [];
+    for (const source of paths) {
+      try { await streamDockerEvidence(id, source, write); }
+      catch (error) {
+        if (!(error instanceof ForgeEvidenceCompletenessError)) throw error;
+        missing.push(...error.missingPaths);
+      }
+    }
+    if (missing.length) throw new ForgeEvidenceCompletenessError(missing);
   }
 
 }
@@ -461,7 +560,9 @@ function validResource(item: DisposableResource): boolean {
     (item.removalStartedAt === undefined || Number.isFinite(Date.parse(item.removalStartedAt))) && Number.isFinite(Date.parse(item.updatedAt)));
 }
 function validEvidence(value: DisposableResource["evidence"]): boolean {
-  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing"].includes(value.state) && validEvidencePaths(value.paths, true) &&
+  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing", "incomplete"].includes(value.state) && validEvidencePaths(value.paths, true) &&
+    (value.missingPaths === undefined || validEvidencePaths(value.missingPaths) && value.missingPaths.every(source => value.paths.includes(source))) &&
+    (value.state !== "incomplete" || value.missingPaths?.length) &&
     (value.commitSha === undefined || validCommit(value.commitSha)) &&
     (value.commitSource === undefined || ["worker", "declared"].includes(value.commitSource)) &&
     (value.archivePath === undefined || typeof value.archivePath === "string" && /^forge-evidence\/[a-f0-9-]{36}(?:\.json|\/manifest\.json)$/u.test(value.archivePath)) &&
@@ -486,6 +587,12 @@ async function streamDockerEvidence(id: string, source: string, write: EvidenceS
   const child = spawn("docker", ["container", "cp", `${id}:${source}`, "-"], { stdio: ["ignore", "pipe", "pipe"] });
   let stderr = "";
   let failure: Error | undefined;
+  let receivedBytes = 0;
+  let exitCode: number | null = null;
+  let exitSignal: string | null = null;
+  async function* archive() {
+    for await (const chunk of child.stdout) { receivedBytes += chunk.length; yield chunk; }
+  }
   const fail = (error: Error) => { failure ??= error; child.kill("SIGKILL"); };
   child.stderr.on("data", (chunk: Buffer) => {
     if (Buffer.byteLength(stderr) + chunk.length > 64 * 1024) fail(new Error("Docker evidence export exceeded the diagnostic output limit."));
@@ -494,6 +601,8 @@ async function streamDockerEvidence(id: string, source: string, write: EvidenceS
   const completion = new Promise<void>((resolve, reject) => {
     child.on("error", error => { failure ??= error; });
     child.on("close", (code, signal) => {
+      exitCode = code;
+      exitSignal = signal;
       if (failure) reject(failure);
       else if (code !== 0) reject(new Error(`Docker evidence export failed (${signal ?? code}): ${stderr.trim()}`));
       else resolve();
@@ -501,10 +610,13 @@ async function streamDockerEvidence(id: string, source: string, write: EvidenceS
   });
   completion.catch(() => undefined);
   const timeout = setTimeout(() => fail(new Error("Docker evidence export timed out after 60 seconds.")), 60_000);
-  try { await readContainerEvidenceTar(source, child.stdout, write); await completion; }
+  try { await readContainerEvidenceTar(source, archive(), write); await completion; }
   catch (error) {
-    fail(error instanceof Error ? error : new Error(String(error)));
+    // Empty stdout can end before Docker closes and reports the missing source.
+    if (receivedBytes) fail(error instanceof Error ? error : new Error(String(error)));
     await completion.catch(() => undefined);
+    if (!receivedBytes && !failure && exitCode !== null && exitCode !== 0 && !exitSignal &&
+        stderr.includes(`Could not find the file ${source} in container`)) throw new ForgeEvidenceCompletenessError([source]);
     if (stderr.trim()) throw new ForgeEvidenceExportError(message(error), stderr.trim(), error);
     throw error;
   }

@@ -176,6 +176,51 @@ function fixture(issueNumber = 1) {
 }
 const placement = { windowId: "window", paneId: "pane" };
 
+describe("Container evidence completion handoff", () => {
+  it.each(["issue", "review"] as const)("keeps a %s report recoverable when required evidence is missing before tab finish", async kind => {
+    const f = fixture();
+    const validate = vi.fn(async () => { throw new Error("Required container evidence is missing: /work/evidence/focused-tests.log. Produce the required artifacts or explicitly correct the evidence selection."); });
+    f.deps.validateEvidenceHandoff = validate;
+    const worker = kind === "issue"
+      ? await f.service.startIssue(f.deps.settings().repository, 1, placement)
+      : await f.service.startReview(f.deps.settings().repository, f.change.number, false, placement);
+    const report = kind === "issue" ? { kind, title: "Fix", body: "Validation passed" }
+      : { kind, headSha: f.change.headSha, event: "approve", body: "Validation passed", comments: [] };
+    f.reports.read.mockResolvedValue(report);
+    await f.service.poll();
+    expect(validate).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id, attemptId: worker.attemptId }));
+    expect(f.stored()[0]).toMatchObject({ status: "failed", error: expect.stringContaining("/work/evidence/focused-tests.log"), completion: { report } });
+    expect(f.runtime.finish).not.toHaveBeenCalled();
+    expect(f.runtime.preparePublication).not.toHaveBeenCalled();
+    expect(f.runtime.publishBranch).not.toHaveBeenCalled();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.retainReviewBaseline).not.toHaveBeenCalled();
+    expect(f.stored()[0]?.completion?.continuationRequired).toContain("Use Continue with message");
+    await f.service.dispose();
+  });
+
+  it("accepts a fresh handoff after restart and intentional continuation fixes the evidence", async () => {
+    const f = fixture();
+    const validate = vi.fn(async () => {});
+    validate.mockRejectedValueOnce(new Error("Required container evidence is missing: /work/evidence/focused-tests.log."));
+    f.deps.validateEvidenceHandoff = validate;
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Validation passed" });
+    await f.service.poll();
+    await f.service.dispose();
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.continueWorker(worker.id, "Produce and validate the required focused test log.", placement);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "The required log exists and validation passed" });
+    await restarted.poll();
+    expect(validate).toHaveBeenCalledTimes(2);
+    expect(f.stored()[0]).toMatchObject({ status: "awaiting_review" });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.runtime.finish).toHaveBeenCalledOnce();
+    await restarted.dispose();
+  });
+});
+
 describe("Worker diagnostic snapshot ownership", () => {
   it("creates snapshots only through the active worker's recorded checkout", async () => {
     const f = fixture();

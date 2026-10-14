@@ -22,6 +22,45 @@ const evidenceBytes = Buffer.from("validation passed\n");
 const writableBytes = 4 * 1024 * 1024;
 
 describe("Completed Forge evidence lifecycle", () => {
+  it.each(["plugins", "plugins-clone-QkqfBY"])("archives useful fixtures among 4200 native %s cache files before retiring every earlier reviewer attempt", async cache => {
+    const owner = completedWorker("review");
+    const resources = [savedEnvironment(owner, true), savedEnvironment(owner, true)];
+    for (const resource of resources) resource.evidence!.paths = ["/work/evidence"];
+    const fixture = await EvidenceLifecycleFixture.create([owner], resources);
+    const profile = "evidence/settings-profile/data/codex-launches/model-scope";
+    const useful = [
+      { path: "evidence/validation.log", data: evidenceBytes.toString() },
+      { path: `${profile}/config.toml`, data: 'model = "fixture-model"\n' },
+      { path: `${profile}/.tmp/diagnostics.log`, data: "native startup passed\n" },
+      { path: "evidence/reproduction/input.ts", data: "export const reproduction = true;\n" },
+      { path: "evidence/reproduction/native-tool", type: "SymbolicLink" as const, linkpath: "/opt/codex/bin/codex" },
+    ];
+    fixture.host.archives = { "/work/evidence": [
+      ...useful.slice(0, 2),
+      ...Array.from({ length: 4200 }, (_, index) => ({ path: `${profile}/.tmp/${cache}/plugins/example/cache-${index}.json`, data: "generated plugin clone" })),
+      ...useful.slice(2),
+    ] };
+    fixture.host.beforeRemove = async containerId => {
+      const resource = resources.find(item => item.containerId === containerId)!;
+      const manifest = await fixture.resources.readEvidence(resource.id);
+      expect(manifest).toMatchObject({ owner: resource.owner, consumers: resource.consumers, commitSha: committedHead, paths: ["/work/evidence"] });
+      expect(manifest.files.map(file => file.path).sort()).toEqual(useful.map(file => `work/${file.path}`).sort());
+      for (const file of useful.filter(file => file.data))
+        expect(await buffer(await fixture.resources.evidenceFile(resource.id, `work/${file.path}`))).toEqual(Buffer.from(file.data!));
+      expect(JSON.parse((await buffer(await fixture.resources.evidenceFile(resource.id, "work/evidence/reproduction/native-tool"))).toString()))
+        .toEqual({ type: "SymbolicLink", target: "/opt/codex/bin/codex" });
+    };
+    await fixture.workflow.poll();
+    expect(await fixture.store.read()).toEqual([]);
+    expect(fixture.host.removed.sort()).toEqual(resources.map(resource => resource.containerId).sort());
+    expect(fixture.host.exports).toHaveLength(2);
+    expect(fixture.notifications.list()).toEqual([]);
+    await fixture.restart();
+    await fixture.workflow.poll();
+    for (const resource of resources) expect((await fixture.resources.readEvidence(resource.id)).files).toHaveLength(5);
+    expect(fixture.host.exports).toHaveLength(2);
+  }, 30_000);
+
   it("publishes 2100 long-target fixture links and verifies the reopened archive before automatic retirement", async () => {
     const owner = completedWorker("review");
     const resource = savedEnvironment(owner, true);
@@ -503,7 +542,7 @@ class SavedContainerHost implements DisposableContainerHost {
   archives?: Record<string, TarFixtureEntry[]>;
   tarFailureAfter?: number;
   exportError?: Error;
-  beforeRemove?: () => Promise<void>;
+  beforeRemove?: (id: string) => Promise<void>;
   async *reportStream() {
     let remaining = this.reportBytes!;
     while (remaining) {
@@ -522,7 +561,7 @@ class SavedContainerHost implements DisposableContainerHost {
   async remove(id: string): Promise<void> {
     this.events.push(`remove:${id}`);
     if (this.failure === "remove") throw new Error("remove interrupted");
-    await this.beforeRemove?.();
+    await this.beforeRemove?.(id);
     this.containers.delete(id); this.removed.push(id);
   }
   async readEvidence(id: string, paths: string[], write: EvidenceSink) {

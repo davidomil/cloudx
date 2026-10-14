@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { NodePtyTerminalProcessFactory } from "../../../apps/server/src/terminal/NodePtyTerminalProcess.js";
 import type { TerminalProducer } from "../../../apps/server/src/terminal/TerminalProcess.js";
 
@@ -10,7 +11,10 @@ export class NativeCodexCopySession {
   readonly answer = "Native selected answer with café.";
   output = "";
   requestCount = 0;
+  readonly prompts: string[] = [];
+  readonly toolOutputs: string[] = [];
   private native?: TerminalProducer;
+  private diagnosticBurst = 0;
   private readonly home: string;
   private readonly provider = createServer((request, response) => {
     if (request.method !== "POST" || request.url !== "/v1/responses") {
@@ -25,18 +29,39 @@ export class NativeCodexCopySession {
     request.on("end", () => {
       const input = JSON.parse(body);
       const title = Boolean(input.text?.format?.schema?.properties?.title);
-      if (!title) this.requestCount++;
+      if (!title) {
+        this.requestCount++;
+        this.prompts.push(JSON.stringify(input.input));
+        this.toolOutputs.push(
+          ...input.input
+            .filter((item: { type: string }) =>
+              item.type.endsWith("_call_output"),
+            )
+            .map((item: { output: unknown }) => JSON.stringify(item.output)),
+        );
+      }
       const text = title
         ? '{"title":"Native clipboard validation"}'
         : this.answer;
-      const item = {
-        type: "message",
-        id: "msg_copy",
-        role: "assistant",
-        phase: "final_answer",
-        status: "completed",
-        content: [{ type: "output_text", text, annotations: [] }],
-      };
+      const toolFailure =
+        this.bridgeDiagnostics && !title && this.requestCount === 1;
+      const item = toolFailure
+        ? {
+            type: "custom_tool_call",
+            id: "patch_failure",
+            call_id: "call_patch_failure",
+            name: "apply_patch",
+            input:
+              "*** Begin Patch\n*** Update File: missing-regression-source.txt\n@@\n-old\n+new\n*** End Patch",
+          }
+        : {
+            type: "message",
+            id: "msg_copy",
+            role: "assistant",
+            phase: "final_answer",
+            status: "completed",
+            content: [{ type: "output_text", text, annotations: [] }],
+          };
       response.writeHead(200, { "content-type": "text/event-stream" });
       for (const event of [
         {
@@ -48,13 +73,17 @@ export class NativeCodexCopySession {
           output_index: 0,
           item: { ...item, status: "in_progress", content: [] },
         },
-        {
-          type: "response.output_text.delta",
-          item_id: item.id,
-          output_index: 0,
-          content_index: 0,
-          delta: text,
-        },
+        ...(toolFailure
+          ? []
+          : [
+              {
+                type: "response.output_text.delta",
+                item_id: item.id,
+                output_index: 0,
+                content_index: 0,
+                delta: text,
+              },
+            ]),
         { type: "response.output_item.done", output_index: 0, item },
         {
           type: "response.completed",
@@ -76,14 +105,19 @@ export class NativeCodexCopySession {
   private constructor(
     private readonly codex: string,
     private readonly root: string,
+    private readonly bridgeDiagnostics: boolean,
   ) {
     this.home = path.join(root, "home");
   }
 
-  static async create(codex: string): Promise<NativeCodexCopySession> {
+  static async create(
+    codex: string,
+    bridgeDiagnostics = false,
+  ): Promise<NativeCodexCopySession> {
     const fixture = new NativeCodexCopySession(
       codex,
       await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-browser-copy-")),
+      bridgeDiagnostics,
     );
     try {
       await new Promise<void>((resolve) =>
@@ -125,9 +159,50 @@ export class NativeCodexCopySession {
     dimensions: { cols: number; rows: number },
     output: (chunk: string) => void,
   ): Promise<void> {
+    let command = this.codex;
+    let args: string[] = [];
+    if (this.bridgeDiagnostics) {
+      const wrapper = path.join(this.root, "codex-diagnostics.mjs");
+      await fs.writeFile(
+        wrapper,
+        `#!/usr/bin/env node
+import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+const child = spawn(${JSON.stringify(this.codex)}, process.argv.slice(2), { stdio: 'inherit' });
+child.on('error', error => { throw error; });
+child.on('exit', (code, signal) => process.exit(signal ? 1 : code));
+if (process.argv.includes('app-server')) setInterval(() => {
+  if (!fs.existsSync(${JSON.stringify(path.join(this.root, "emit-diagnostics"))})) return;
+  const sequence = fs.readFileSync(${JSON.stringify(path.join(this.root, "emit-diagnostics"))}, 'utf8');
+  fs.unlinkSync(${JSON.stringify(path.join(this.root, "emit-diagnostics"))});
+  process.stderr.write(('\\x1b[31mBACKEND_DIAGNOSTIC_ONLY\\x1b[0m\\npatch hunk café 界\\n').repeat(8000) + 'DIAGNOSTIC_BURST_COMPLETE ' + sequence + '\\n');
+}, 20);
+`,
+        { mode: 0o700 },
+      );
+      command = process.execPath;
+      args = [
+        fileURLToPath(
+          new URL(
+            "../../../apps/server/helpers/codex-worker-bridge.mjs",
+            import.meta.url,
+          ),
+        ),
+        JSON.stringify({
+          selection: {
+            tabId: "copy-tab",
+            executionId: "01a08470-d118-7b72-b1df-439e72e5c745",
+            receiptPath: path.join(this.root, "selected.json"),
+          },
+          command: wrapper,
+          serverArgs: ["app-server", "--listen", "stdio://"],
+          tuiArgs: [],
+        }),
+      ];
+    }
     this.native = await new NodePtyTerminalProcessFactory().spawn(
-      this.codex,
-      [],
+      command,
+      args,
       {
         cwd: this.root,
         ...dimensions,
@@ -145,6 +220,19 @@ export class NativeCodexCopySession {
       this.output = (this.output + chunk).slice(-256_000);
       output(chunk);
     });
+  }
+
+  async emitBackendDiagnostics(): Promise<string> {
+    const sequence = String(++this.diagnosticBurst);
+    await fs.writeFile(path.join(this.root, "emit-diagnostics"), sequence);
+    return `DIAGNOSTIC_BURST_COMPLETE ${sequence}`;
+  }
+
+  async backendDiagnostics(): Promise<string> {
+    return fs.readFile(
+      path.join(this.root, "cloudx-codex-backend.log"),
+      "utf8",
+    );
   }
 
   input(event: {

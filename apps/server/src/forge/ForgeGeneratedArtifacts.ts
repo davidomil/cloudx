@@ -3,7 +3,13 @@ import path from "node:path";
 const generatedDirectories = new Set(["node_modules", "dist", "build", ".venv", "__pycache__", ".pytest_cache", ".vite", ".cache"]);
 
 export function isGeneratedForgePath(relative: string): boolean {
-  return relative.split("/").some(part => generatedDirectories.has(part)) || relative.endsWith(".tsbuildinfo");
+  const parts = relative.split("/");
+  return parts.some(part => generatedDirectories.has(part)) || relative.endsWith(".tsbuildinfo") || isNativeCodexPluginCache(parts);
+}
+
+function isNativeCodexPluginCache(parts: string[]): boolean {
+  return parts.some((part, index) => part === "codex-launches" && !!parts[index + 1] && parts[index + 2] === ".tmp" &&
+    (parts[index + 3] === "plugins" || /^plugins-clone-.+/u.test(parts[index + 3] ?? "")));
 }
 
 export function isGeneratedForgeLink(relative: string, target: string): boolean {
