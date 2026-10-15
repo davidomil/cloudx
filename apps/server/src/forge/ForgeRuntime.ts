@@ -863,10 +863,7 @@ export class ForgeRuntime {
       owned.quiescent = true;
       await this.tabManifest(tabId).write(owned);
     }
-    await this.dependencies.workspace.state(
-      this.dependencies.sessions.listTabs(),
-      this.dependencies.sessions.getActiveTabId(),
-    );
+    await this.dependencies.workspace.state(() => ({ tabs: this.dependencies.sessions.listTabs(), activeTabId: this.dependencies.sessions.getActiveTabId() }));
     if (owned && !owned.closed) {
       if (owned.context) await this.removeContext(owned.context);
       if (owned.launch) {

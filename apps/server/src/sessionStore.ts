@@ -657,10 +657,10 @@ export class SessionStore {
   }
 
   async snapshot(): Promise<WorkspaceSnapshot> {
-    const workspace = this.workspace ? await this.workspace.state(this.listTabs(), this.activeTabId) : undefined;
+    const workspace = this.workspace ? await this.workspace.state(() => ({ tabs: this.listTabs(), activeTabId: this.activeTabId })) : undefined;
     return {
-      activeTabId: this.activeTabId,
-      tabs: this.listTabs(),
+      activeTabId: workspace ? workspace.activeTabId : this.activeTabId,
+      tabs: workspace ? workspace.tabs : this.listTabs(),
       plugins: this.plugins.list(),
       activeWindowId: workspace?.activeWindowId,
       windows: workspace?.windows,
@@ -707,11 +707,11 @@ export class SessionStore {
       })
     );
 
-    const workspace = this.workspace ? await this.workspace.state(this.listTabs(), targetActiveTabId) : undefined;
+    const workspace = this.workspace ? await this.workspace.state(() => ({ tabs: this.listTabs(), activeTabId: activeTabId ?? this.activeTabId })) : undefined;
 
     return {
-      activeTabId: targetActiveTabId,
-      tabs: this.listTabs(),
+      activeTabId: workspace ? workspace.activeTabId : targetActiveTabId,
+      tabs: workspace ? workspace.tabs : this.listTabs(),
       activeWindowId: workspace?.activeWindowId,
       windows: workspace?.windows,
       templates: workspace?.templates,
@@ -1404,7 +1404,7 @@ export class SessionStore {
     if (!this.workspace) {
       throw new Error("Workspace windows are not available.");
     }
-    const workspace = await this.workspace.state(this.listTabs(), this.activeTabId);
+    const workspace = await this.workspace.state(() => ({ tabs: this.listTabs(), activeTabId: this.activeTabId }));
     const windowId = typeof input.windowId === "string" && input.windowId.trim() ? input.windowId.trim() : undefined;
     if (windowId) {
       const window = workspace.windows.find((candidate) => candidate.id === windowId);

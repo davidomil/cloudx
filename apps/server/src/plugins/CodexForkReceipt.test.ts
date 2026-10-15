@@ -32,7 +32,7 @@ it("delivers each confirmed fork once and stops observing with its session", asy
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(open).toHaveBeenCalledOnce();
     expect(failed).not.toHaveBeenCalled();
-  } finally { stop(); }
+  } finally { stop.stop(); }
   await writeReceipt(JSON.stringify(journal([{ sessionId: executionId, cwd: home }])));
   await new Promise(resolve => setTimeout(resolve, 250));
   expect(open).toHaveBeenCalledOnce();
@@ -49,7 +49,7 @@ it("reports a placement failure without automatically trying that fork again", a
     await writeReceipt(JSON.stringify(journal([child])));
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(open).toHaveBeenCalledOnce();
-  } finally { stop(); }
+  } finally { stop.stop(); }
 });
 
 it("does not update a detached source when an in-flight placement later fails", async () => {
@@ -59,9 +59,30 @@ it("does not update a detached source when an in-flight placement later fails", 
   const failed = vi.fn();
   const stop = forks.observe("parent", executionId, open, failed);
   await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
-  stop();
+  stop.stop();
   reject(new Error("Source closed during placement"));
   await new Promise(resolve => setImmediate(resolve));
+  expect(failed).not.toHaveBeenCalled();
+});
+
+it("finishes with a final journal read and drains pending placements once before stopping", async () => {
+  const first = { sessionId: childId, cwd: home };
+  const second = { sessionId: executionId, cwd: home };
+  let release!: () => void;
+  const open = vi.fn(async (fork: { sessionId: string }) => {
+    if (fork.sessionId === childId) await new Promise<void>(resolve => { release = resolve; });
+  });
+  const failed = vi.fn();
+  const observation = forks.observe("parent", executionId, open, failed);
+  await writeReceipt(JSON.stringify(journal([first])));
+  await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+  await writeReceipt(JSON.stringify(journal([first, second])));
+  const finishing = observation.finish();
+  expect(observation.finish()).toBe(finishing);
+  expect(open).toHaveBeenCalledOnce();
+  release();
+  await finishing;
+  expect(open.mock.calls.map(([fork]) => fork.sessionId)).toEqual([childId, executionId]);
   expect(failed).not.toHaveBeenCalled();
 });
 

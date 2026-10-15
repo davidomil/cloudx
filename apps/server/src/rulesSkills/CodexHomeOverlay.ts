@@ -22,6 +22,9 @@ import { materializeCodexSkillSurface } from "./CodexSkillSurface.js";
 import { mergeCodexConfigurationLayers, withCodexLaunchModelDefault } from "../plugins/CodexConfigurationDocument.js";
 import { resolveCodexConfigurationPaths } from "../plugins/CodexConfigurationPaths.js";
 import { replaceLink } from "../agents/replaceLink.js";
+import { captureCodexSkillOverrides, resolveCodexSkillOverrides, type CodexSkillOverride } from "./CodexSkillOverrides.js";
+
+export { parseCodexSkillOverrides, type CodexSkillOverride } from "./CodexSkillOverrides.js";
 
 export interface CodexHomeOverlayOptions {
   dataDir: string;
@@ -35,6 +38,7 @@ export interface CodexHomeOverlayOptions {
   source: ResolvedCodexStateSource;
   // Home whose credentials this tab uses. Defaults to the shared Codex home.
   authHome?: string;
+  nativeSkillOverrides?: CodexSkillOverride[];
 }
 
 export interface CodexHomeOverlay {
@@ -103,7 +107,8 @@ export async function materializeCodexHomeOverlay(options: CodexHomeOverlayOptio
   const skillPaths = stagedSkillPaths.map((skillPath) => path.join(codexHome, path.relative(staging, skillPath)));
   const disabledSkillPaths = await discoverDisabledSkillPaths(options.cwd, baseEnv.HOME?.trim() || os.homedir());
   const configPath = path.join(codexHome, "config.toml");
-  await writeOverlayConfig(config, path.join(staging, "config.toml"), skillPaths, disabledSkillPaths);
+  await writeOverlayConfig(config, path.join(staging, "config.toml"), skillPaths, disabledSkillPaths,
+    resolveCodexSkillOverrides(options.nativeSkillOverrides ?? [], codexHome, skillPaths));
   for (const profile of await options.sources.listConfigProfiles(options.source)) {
     const text = profile === preferences.configProfile ? selectedProfileText : await options.sources.readConfig(options.source, undefined, profile);
     if (text !== undefined) await fsp.writeFile(path.join(staging, `${profile}.config.toml`), stringify(resolveCodexConfigurationPaths(prepareOverlayConfig(text, options.source.home), options.source.home, baseEnv.HOME)), { mode: 0o600 });
@@ -234,6 +239,10 @@ export function resolveCodexHome(env: NodeJS.ProcessEnv = process.env): string {
   return env.CODEX_HOME?.trim() || path.join(env.HOME?.trim() || os.homedir(), ".codex");
 }
 
+export async function readCodexSkillOverrides(codexHome: string, options: { cwd?: string; homeDir?: string } = {}): Promise<CodexSkillOverride[]> {
+  return captureCodexSkillOverrides(codexHome, await discoverDisabledSkillPaths(options.cwd, options.homeDir ?? os.homedir()));
+}
+
 async function materializeSelectedSkills(
   sourceCodexHome: string,
   codexHome: string,
@@ -310,7 +319,8 @@ async function writeOverlayConfig(
   config: TomlTable,
   targetConfigPath: string,
   skillPaths: string[],
-  disabledSkillPaths: string[]
+  disabledSkillPaths: string[],
+  nativeOverrides: TomlTable[]
 ): Promise<void> {
   const skills = tomlTable(config.skills, "skills");
   skills.bundled = { enabled: false };
@@ -321,6 +331,11 @@ async function writeOverlayConfig(
     ...disabledSkillPaths.filter(skillPath => !nativeSkillPaths.has(skillPath)).map((skillPath) => ({ path: skillPath, enabled: false })),
     ...skillPaths.map((skillPath) => ({ path: skillPath, enabled: true }))
   ];
+  for (const override of nativeOverrides) {
+    skills.config = skills.config.filter(entry => !entry || typeof entry !== "object" ||
+      (override.path !== undefined ? !("path" in entry) || entry.path !== override.path : !("name" in entry) || entry.name !== override.name));
+    skills.config.push(override);
+  }
   config.skills = skills;
 
   const rendered = stringify(config);

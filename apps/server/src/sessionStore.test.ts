@@ -339,7 +339,7 @@ describe("SessionStore voice actions", () => {
       expect(plugin.lastInput?.authorizeProjectTrust).toBe(authorizeProjectTrust);
       expect(store.getActiveTabId()).toBe(parent.tab.id);
       expect(workspace!.getActiveWindow().id).toBe(original.id);
-      const state = await workspace!.state(store.listTabs(), store.getActiveTabId());
+      const state = await workspace!.state(() => ({ tabs: store.listTabs(), activeTabId: store.getActiveTabId() }));
       expect(state.tabs.map(tab => tab.id)).toEqual([parent.tab.id, worker.tab.id]);
       expect(workspace!.findWindowForTab(worker.tab.id)).toBeUndefined();
       expect(() => store.setActiveTab(worker.tab.id)).toThrow(/embedded/);
@@ -1513,7 +1513,7 @@ describe("SessionStore voice actions", () => {
     });
 
     expect(result).toMatchObject({ activeWindowId: target.id, layoutInstruction: { type: "select_window", windowId: target.id } });
-    await expect(workspace!.state([], undefined)).resolves.toMatchObject({ activeWindowId: target.id });
+    await expect(workspace!.state(() => ({ tabs: [], activeTabId: undefined }))).resolves.toMatchObject({ activeWindowId: target.id });
   });
 
   it("treats a plugin id in voice targetTabId as the active tab for that plugin", async () => {

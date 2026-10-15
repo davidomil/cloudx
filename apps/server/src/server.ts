@@ -1717,7 +1717,7 @@ function automationAllowedRoots(pathPolicy: PathPolicy): string[] {
 }
 
 async function workspaceState(services: AppServices): Promise<WorkspaceStateResponse> {
-  const state = await services.workspace!.state(services.sessions.listTabs(), services.sessions.getActiveTabId());
+  const state = await services.workspace!.state(() => ({ tabs: services.sessions.listTabs(), activeTabId: services.sessions.getActiveTabId() }));
   return { ...state, persistence: persistenceStatuses(services) };
 }
 

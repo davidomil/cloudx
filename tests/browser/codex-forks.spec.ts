@@ -43,12 +43,14 @@ test.afterAll(async () => {
   );
 });
 
-async function submit(page: Page, text: string) {
+async function submit(page: Page, fixture: CodexForkWorkspace, text: string) {
   await page
     .locator(".pane-tab-panel:not([hidden]) .xterm-helper-textarea")
     .focus();
   await page.keyboard.insertText(text);
   await expectTerminalText(page, text);
+  // Visible paste text can precede native Codex's Enter suppression window ending.
+  await ready(fixture, fixture.store.getActiveTabId()!);
   await page.keyboard.press("Enter");
 }
 
@@ -93,7 +95,7 @@ async function completeTurn(
 ) {
   await ready(fixture, tabId);
   const count = fixture.requests.length;
-  await submit(page, text);
+  await submit(page, fixture, text);
   await expect
     .poll(() => fixture.requests.length, { timeout: 15_000 })
     .toBe(count + 1);
@@ -136,12 +138,12 @@ test.describe("native Codex forks in the production workspace", () => {
       const sourcePane = listTabLayoutPanes(sourceWindow.layout.root).find(
         (pane) => pane.tabIds.includes(source),
       )!;
-      await submit(page, "/permissions");
+      await submit(page, fixture, "/permissions");
       await expectTerminalText(page, "Ask for approval");
       await page.keyboard.press("1");
       await ready(fixture, source);
       const requestsBeforeFork = fixture.requests.length;
-      await submit(page, "/fork");
+      await submit(page, fixture, "/fork");
       await expect
         .poll(() => fixture.store.listTabs().length, { timeout: 20_000 })
         .toBe(2);
@@ -192,7 +194,7 @@ test.describe("native Codex forks in the production workspace", () => {
       expect(await fixture.transcript(child.id)).not.toContain(
         "Only the original continues here.",
       );
-      await submit(page, "/fork");
+      await submit(page, fixture, "/fork");
       await expect
         .poll(() => fixture.store.listTabs().length, { timeout: 20_000 })
         .toBe(3);
@@ -236,6 +238,7 @@ test.describe("native Codex forks in the production workspace", () => {
       expect(fixture.store.listTabs()).toHaveLength(3);
       expect(fixture.errors).toEqual([]);
     } finally {
+      await page.goto("about:blank");
       await fixture.dispose();
     }
   });
@@ -263,7 +266,7 @@ test.describe("native Codex forks in the production workspace", () => {
       expect(fixture.store.listTabs()).toHaveLength(1);
       expect(fixture.identity(source)!.sessionId).toBe(parentId);
       await fixture.rejectNextFork();
-      await submit(page, "/fork");
+      await submit(page, fixture, "/fork");
       await expectTerminalText(page, "Deliberate native fork rejection");
       expect(fixture.store.listTabs()).toHaveLength(1);
       expect(fixture.identity(source)!.sessionId).toBe(parentId);
@@ -280,6 +283,7 @@ test.describe("native Codex forks in the production workspace", () => {
       expect(fixture.store.listTabs()).toHaveLength(1);
       expect(fixture.errors).toEqual([]);
     } finally {
+      await page.goto("about:blank");
       await fixture.dispose();
     }
   });

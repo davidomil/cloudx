@@ -110,8 +110,9 @@ export class WorkspaceLayoutStore {
     return this.serializeWorkspaceAccess(() => this.persist(true));
   }
 
-  async state(tabs: WorkspaceTab[], activeTabId?: string): Promise<WorkspaceStateResponse> {
+  async state(readSessionState: () => Pick<WorkspaceStateResponse, "tabs" | "activeTabId">): Promise<WorkspaceStateResponse> {
     return this.serializeWorkspaceAccess(async () => {
+      const { tabs, activeTabId } = readSessionState();
       const changed = this.reconcileTabs(tabs);
       if (changed) {
         await this.persist();

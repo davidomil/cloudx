@@ -11,6 +11,11 @@ export interface CodexConversationFork {
   transcriptPath?: string;
 }
 
+export interface CodexForkObservation {
+  stop(): void;
+  finish(): Promise<void>;
+}
+
 /** Confirmed native forks awaiting placement, independent of the parent's selected receipt. */
 export class CodexConversationForks {
   readonly receiptPath: string;
@@ -41,10 +46,11 @@ export class CodexConversationForks {
     return value.forks;
   }
 
-  observe(tabId: string, executionId: unknown, onFork: (fork: CodexConversationFork) => Promise<void>, onError: (error: unknown) => void): () => void {
+  observe(tabId: string, executionId: unknown, onFork: (fork: CodexConversationFork) => Promise<void>, onError: (error: unknown) => void): CodexForkObservation {
     const seen = new Set<string>();
     let stopped = false;
     let pending = Promise.resolve();
+    let finishing: Promise<void> | undefined;
     const refresh = () => {
       pending = pending.then(async () => {
         if (stopped) return;
@@ -54,10 +60,20 @@ export class CodexConversationForks {
           await onFork(fork);
         }
       }).catch(error => { if (!stopped) onError(error); });
+      return pending;
     };
     watchFile(this.receiptPath, { persistent: false, interval: 200 }, refresh);
     refresh();
-    return () => { stopped = true; unwatchFile(this.receiptPath, refresh); };
+    return {
+      stop: () => { stopped = true; unwatchFile(this.receiptPath, refresh); },
+      finish: () => {
+        if (!finishing) {
+          unwatchFile(this.receiptPath, refresh);
+          finishing = refresh().finally(() => { stopped = true; });
+        }
+        return finishing;
+      }
+    };
   }
 }
 

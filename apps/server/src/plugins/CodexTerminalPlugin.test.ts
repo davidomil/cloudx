@@ -230,7 +230,7 @@ describe("CodexTerminalPlugin", () => {
       vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
       factory.process!.exit(0);
 
-      expect(closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly.");
+      await vi.waitFor(() => expect(closeTab).toHaveBeenCalledExactlyOnceWith("Codex exited cleanly."));
     });
   });
 
@@ -1832,7 +1832,8 @@ describe("Codex conversation recovery after process loss", () => {
       await fs.writeFile(`${forks.receiptPath}.tmp`, JSON.stringify(value));
       await fs.rename(`${forks.receiptPath}.tmp`, forks.receiptPath);
       await vi.waitFor(() => expect(openSiblingTab).toHaveBeenCalledExactlyOnceWith({ key: child, cwd: root,
-        initialInput: { resume: { mode: "session", sessionId: child }, agent: undefined, codexForkSourceTabId: tab.id, codexRuntimeContext: runtimeContext } }));
+        initialInput: { resume: { mode: "session", sessionId: child }, agent: undefined, codexForkSourceTabId: tab.id, codexRuntimeContext: runtimeContext,
+          codexNativeSkillOverrides: expect.any(Array) } }));
       expect(session.restoreInput?.()).toMatchObject({ resume: { sessionId: conversationId }, codexOpenedForks: [child] });
       expect(factory.process!.written).toBe("");
       Object.assign(factory.process!, { detach: vi.fn() });
@@ -1885,6 +1886,51 @@ describe("Codex conversation recovery after process loss", () => {
       expect(child.restoreInput?.()?.codexExecutionId).not.toBe(source.restoreInput?.()?.codexExecutionId);
       child.stop?.();
       source.stop?.();
+    });
+  });
+
+  it("opens a confirmed fork once across source exit and recovery before the journal poll", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn(), openSiblingTab: vi.fn(async () => undefined) };
+      const session = await plugin.createSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: conversationId } } });
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: root } }) + "\n");
+      await new Promise(resolve => setImmediate(resolve));
+      const selection = factory.bridgeLaunch().selection;
+      const forks = new CodexConversationForks(factory.env!.CODEX_HOME!);
+      const child = "01a08470-d118-7b72-b1df-439e72e5c745";
+      await fs.writeFile(`${forks.receiptPath}.tmp`, JSON.stringify({ version: 1, tabId: tab.id, executionId: selection.executionId,
+        forks: [{ sessionId: child, cwd: root }] }));
+      await fs.rename(`${forks.receiptPath}.tmp`, forks.receiptPath);
+      factory.process!.exit(1);
+      await vi.waitFor(() => expect(controls.openSiblingTab).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ key: child })));
+      expect(session.restoreInput?.()).toMatchObject({ codexOpenedForks: [child] });
+      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput: session.restoreInput?.() });
+      expect(controls.openSiblingTab).toHaveBeenCalledOnce();
+      expect(recovered.restoreInput?.()).toMatchObject({ codexOpenedForks: [child], resume: { sessionId: conversationId } });
+      expect(factory.process!.written).toBe("");
+      recovered.stop?.();
+      session.stop?.();
+    });
+  });
+
+  it("opens an unread previous-execution fork before recovery resets its journal", async () => {
+    await withProjectTrustFixture(async ({ root, home, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn(), openSiblingTab: vi.fn(async () => undefined) };
+      const session = await plugin.createSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: conversationId } } });
+      const oldInput = session.restoreInput?.();
+      const oldExecution = factory.bridgeLaunch().selection.executionId;
+      const forks = new CodexConversationForks(factory.env!.CODEX_HOME!);
+      session.stop?.();
+      await fs.writeFile(path.join(home, "sessions", `rollout-${conversationId}.jsonl`), JSON.stringify({ type: "session_meta", payload: { id: conversationId, cwd: root } }) + "\n");
+      const child = "01a08470-d118-7b72-b1df-439e72e5c745";
+      await fs.writeFile(forks.receiptPath, JSON.stringify({ version: 1, tabId: tab.id, executionId: oldExecution,
+        forks: [{ sessionId: child, cwd: root }] }));
+      const recovered = await plugin.recoverSession({ tab, cwd: root, controls, initialInput: oldInput });
+      expect(controls.openSiblingTab).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ key: child }));
+      expect(recovered.restoreInput?.()).toMatchObject({ codexOpenedForks: [child], resume: { sessionId: conversationId } });
+      expect(recovered.restoreInput?.()?.codexExecutionId).not.toBe(oldExecution);
+      expect(forks.read(tab.id, oldExecution)).toEqual([]);
+      recovered.stop?.();
     });
   });
 

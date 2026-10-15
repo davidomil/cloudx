@@ -30,6 +30,7 @@ const requiredSuites = [
   "apps/server/src/plugins/CodexCommandDetails.native.test.ts",
   "apps/server/src/plugins/CodexModelDefaults.native.test.ts",
   "apps/server/src/rulesSkills/CodexHomeOverlay.native.test.ts",
+  "apps/server/src/rulesSkills/CodexSkillOverrides.native.test.ts",
   "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
   "apps/server/src/plugins/CodexFirstSelection.native.test.ts",
   "scripts/codex-updater.native.test.mjs"

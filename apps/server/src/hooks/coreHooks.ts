@@ -407,7 +407,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace, workspaceCommands
           createDirectory: optionalBoolean(input.createDirectory, "createDirectory"),
           pluginMetadata: mergeTemplateMetadata(optionalPluginMetadata(input.pluginMetadata, "pluginMetadata"), optionalString(input.templateId, "templateId"))
         });
-        return { window, workspace: await workspace.state(sessions.listTabs(), sessions.getActiveTabId()) };
+        return { window, workspace: await workspace.state(() => ({ tabs: sessions.listTabs(), activeTabId: sessions.getActiveTabId() })) };
       }
     },
     {
@@ -439,7 +439,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace, workspaceCommands
         const pluginId = requireString(input.pluginId, "pluginId");
         const window = await workspace.updateWindow(windowId, { pluginMetadata: { [pluginId]: optionalNullableRecord(input.metadata, "metadata") } });
         await sessions.refreshRuntimeIndicators(window.id);
-        return { window, workspace: await workspace.state(sessions.listTabs(), sessions.getActiveTabId()) };
+        return { window, workspace: await workspace.state(() => ({ tabs: sessions.listTabs(), activeTabId: sessions.getActiveTabId() })) };
       }
     },
     {
@@ -474,7 +474,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace, workspaceCommands
           windowId: optionalString(input.windowId, "windowId"),
           name: optionalString(input.name, "name")
         });
-        return { window: result.window, workspace: await workspace.state(sessions.listTabs(), sessions.getActiveTabId()) };
+        return { window: result.window, workspace: await workspace.state(() => ({ tabs: sessions.listTabs(), activeTabId: sessions.getActiveTabId() })) };
       }
     },
     {
@@ -559,7 +559,7 @@ function coreHooks({ sessions, plugins, pathPolicy, workspace, workspaceCommands
 }
 
 async function findWindowForSwitch(input: Record<string, unknown>, sessions: SessionStore, workspace: WorkspaceLayoutStore) {
-  const state = await workspace.state(sessions.listTabs(), sessions.getActiveTabId());
+  const state = await workspace.state(() => ({ tabs: sessions.listTabs(), activeTabId: sessions.getActiveTabId() }));
   const windowId = optionalString(input.windowId, "windowId");
   if (windowId) {
     const window = state.windows.find((candidate) => candidate.id === windowId);

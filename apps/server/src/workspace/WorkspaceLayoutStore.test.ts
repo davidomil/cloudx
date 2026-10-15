@@ -17,7 +17,7 @@ describe("WorkspaceLayoutStore", () => {
       const window = store.getActiveWindow();
       await store.updateWindow(window.id, { layout: layoutWithTab("worker") });
       const worker = { ...tab("worker", root), ownerPluginId: "forge" };
-      const state = await store.state([worker], worker.id);
+      const state = await store.state(() => ({ tabs: [worker], activeTabId: worker.id }));
       expect(state.tabs).toEqual([worker]);
       expect(state.activeTabId).toBeUndefined();
       expect(store.tabIdsForWindow(window.id)).toEqual([]);
@@ -56,13 +56,13 @@ describe("WorkspaceLayoutStore", () => {
     await store.selectWindow(created.id);
 
     const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
-    const state = await reloaded.state([tab("tab-1", root)], "tab-1");
+    const state = await reloaded.state(() => ({ tabs: [tab("tab-1", root)], activeTabId: "tab-1" }));
     expect(state.activeWindowId).toBe(created.id);
     expect(state.windows.find((window) => window.id === created.id)).toMatchObject({ name: "Feature A", defaultCwd: root });
     expect((await fs.readdir(path.join(root, ".cloudx"))).some((entry) => entry.endsWith(".tmp"))).toBe(false);
 
     await reloaded.deleteWindow(created.id);
-    const afterDelete = await reloaded.state([], undefined);
+    const afterDelete = await reloaded.state(() => ({ tabs: [], activeTabId: undefined }));
     expect(afterDelete.windows.some((window) => window.id === created.id)).toBe(false);
     expect(afterDelete.windows.length).toBeGreaterThan(0);
   });
@@ -110,7 +110,7 @@ describe("WorkspaceLayoutStore", () => {
     await Promise.all([defaultCwdUpdate, rename]);
     ensureDirectory.mockRestore();
 
-    const state = await store.state([], undefined);
+    const state = await store.state(() => ({ tabs: [], activeTabId: undefined }));
     expect(state.windows.find((window) => window.id === created.id)).toMatchObject({ name: "Renamed", defaultCwd: next });
   });
 
@@ -141,7 +141,7 @@ describe("WorkspaceLayoutStore", () => {
 
     workspaceFile.write = originalWrite;
     const reloaded = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
-    const names = (await reloaded.state([], undefined)).windows.map((window) => window.name);
+    const names = (await reloaded.state(() => ({ tabs: [], activeTabId: undefined }))).windows.map((window) => window.name);
     expect(names).toEqual(expect.arrayContaining(["First", "Second"]));
   });
 
@@ -180,7 +180,7 @@ describe("WorkspaceLayoutStore", () => {
     expect(memoryWindow.layout.root).toMatchObject({ type: "pane", pane: { tabIds: ["tab-1"] } });
 
     const reloaded = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
-    const persistedWindow = (await reloaded.state([tab("tab-1", root)], "tab-1")).windows.find((candidate) => candidate.id === window.id);
+    const persistedWindow = (await reloaded.state(() => ({ tabs: [tab("tab-1", root)], activeTabId: "tab-1" }))).windows.find((candidate) => candidate.id === window.id);
     expect(persistedWindow).toMatchObject({ name: "Renamed", layout: { root: { type: "pane", pane: { tabIds: ["tab-1"] } } } });
   });
 
@@ -253,7 +253,7 @@ describe("WorkspaceLayoutStore", () => {
     const dispose = store.onPersistenceStatusChange((status) => statuses.push(status.state));
 
     const created = await store.createWindow({ name: "Live", defaultCwd: root });
-    const degraded = await store.state([tab("tab-live", root)], "tab-live");
+    const degraded = await store.state(() => ({ tabs: [tab("tab-live", root)], activeTabId: "tab-live" }));
 
     expect(degraded.windows.find((window) => window.id === created.id)).toMatchObject({ name: "Live" });
     expect(degraded.tabs).toEqual([expect.objectContaining({ id: "tab-live" })]);
@@ -261,7 +261,7 @@ describe("WorkspaceLayoutStore", () => {
     await expect(fs.access(path.join(dataDir, "workspace.json"))).rejects.toMatchObject({ code: "ENOENT" });
 
     await store.updateWindow(created.id, { name: "Recovered" });
-    const recovered = await store.state([], undefined);
+    const recovered = await store.state(() => ({ tabs: [], activeTabId: undefined }));
     dispose();
     workspaceFile.write = originalWrite;
 
@@ -349,7 +349,7 @@ describe("WorkspaceLayoutStore", () => {
     await fs.writeFile(path.join(dataDir, "workspace.json"), JSON.stringify({ activeWindowId: "missing", windows: "not-an-array", templates: { id: "not-an-array" } }), "utf8");
 
     const store = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
-    const state = await store.state([], undefined);
+    const state = await store.state(() => ({ tabs: [], activeTabId: undefined }));
 
     expect(state.windows).toHaveLength(1);
     expect(state.windows[0]?.name).toBe("Main");
@@ -363,7 +363,7 @@ describe("WorkspaceLayoutStore", () => {
     await fs.writeFile(path.join(dataDir, "workspace.json"), "{not-json", "utf8");
 
     const store = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
-    const state = await store.state([], undefined);
+    const state = await store.state(() => ({ tabs: [], activeTabId: undefined }));
 
     expect(state.windows).toHaveLength(1);
     expect(state.windows[0]?.name).toBe("Main");
@@ -396,7 +396,7 @@ describe("WorkspaceLayoutStore", () => {
     );
 
     const store = new WorkspaceLayoutStore(dataDir, new PathPolicy([root]));
-    const state = await store.state([], undefined);
+    const state = await store.state(() => ({ tabs: [], activeTabId: undefined }));
     expect(state.windows.map((window) => window.id)).not.toContain("window-bad");
 
     const created = await store.createWindow({ name: "Strict", defaultCwd: root });
@@ -452,7 +452,7 @@ describe("WorkspaceLayoutStore", () => {
 
     const deleted = await store.deleteTemplate(template.id);
     expect(deleted.id).toBe(template.id);
-    const afterDelete = await store.state([], undefined);
+    const afterDelete = await store.state(() => ({ tabs: [], activeTabId: undefined }));
     expect(afterDelete.templates).toEqual([]);
   });
 
@@ -502,7 +502,7 @@ describe("WorkspaceLayoutStore", () => {
     );
     const targetWindow = await store.createWindow({ name: "Target", defaultCwd: root });
     await store.updateWindow(targetWindow.id, { layout: layoutWithTab("tab-old") });
-    const before = await store.state([tab("tab-old", root)], "tab-old");
+    const before = await store.state(() => ({ tabs: [tab("tab-old", root)], activeTabId: "tab-old" }));
 
     const prepared = await store.prepareTemplateApplication(template.id, {
       projectPath: nextProject,
@@ -511,7 +511,7 @@ describe("WorkspaceLayoutStore", () => {
     });
     const remapped = store.remapTemplateLayout(prepared.template, new Map([["tab-source", "tab-new"]]));
     const { window: updated } = await store.commitTemplateAndPublish(prepared, remapped, "Target Applied", () => undefined);
-    const after = await store.state([tab("tab-old", root), tab("tab-new", path.join(nextProject, "apps", "web"))], "tab-new");
+    const after = await store.state(() => ({ tabs: [tab("tab-old", root), tab("tab-new", path.join(nextProject, "apps", "web"))], activeTabId: "tab-new" }));
 
     expect(prepared).toMatchObject({ createdWindow: false, projectPath: nextProject, window: { id: targetWindow.id } });
     expect(after.windows).toHaveLength(before.windows.length);
@@ -546,7 +546,7 @@ describe("WorkspaceLayoutStore", () => {
     expect(cleared.pluginMetadata?.["rules-skills"]).toBeUndefined();
 
     const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
-    const state = await reloaded.state([], undefined);
+    const state = await reloaded.state(() => ({ tabs: [], activeTabId: undefined }));
     expect(state.windows.find((window) => window.id === created.id)?.pluginMetadata?.["rules-skills"]).toBeUndefined();
   });
 
@@ -558,7 +558,7 @@ describe("WorkspaceLayoutStore", () => {
     await store.applyLayoutInstruction({ type: "open_tab_in_new_pane", windowId: window.id, tabId: "tab-2", splitDirection: "row" });
 
     const reloaded = new WorkspaceLayoutStore(path.join(root, ".cloudx"), new PathPolicy([root]));
-    const state = await reloaded.state([tab("tab-1", root), tab("tab-2", root)], "tab-2");
+    const state = await reloaded.state(() => ({ tabs: [tab("tab-1", root), tab("tab-2", root)], activeTabId: "tab-2" }));
     const updated = state.windows.find((candidate) => candidate.id === window.id)!;
 
     expect(state.activeWindowId).toBe(window.id);
@@ -577,7 +577,7 @@ describe("WorkspaceLayoutStore", () => {
 
     await store.applyLayoutInstruction({ type: "add_tab_to_active_pane", windowId: second.id, tabId: "tab-1" });
 
-    const state = await store.state([tab("tab-1", root), tab("tab-2", root)], "tab-1");
+    const state = await store.state(() => ({ tabs: [tab("tab-1", root), tab("tab-2", root)], activeTabId: "tab-1" }));
     expect(state.windows.find((window) => window.id === first.id)?.layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
     expect(state.windows.find((window) => window.id === second.id)?.layout.root).toMatchObject({ type: "pane", pane: { tabIds: ["tab-2", "tab-1"], activeTabId: "tab-1" } });
   });
@@ -593,7 +593,7 @@ describe("WorkspaceLayoutStore", () => {
     await store.applyLayoutInstruction({ type: "select_pane", paneId: "pane-first", tabId: "tab-1" } as never);
     await store.applyLayoutInstruction({ type: "split_pane", windowId: first.id, tabId: "tab-1" } as never);
 
-    const state = await store.state([tab("tab-1", root), tab("tab-2", root)], "tab-1");
+    const state = await store.state(() => ({ tabs: [tab("tab-1", root), tab("tab-2", root)], activeTabId: "tab-1" }));
     expect(state.windows.find((window) => window.id === second.id)?.layout.root).toMatchObject({ type: "pane", pane: { tabIds: ["tab-1"], activeTabId: "tab-1" } });
   });
 

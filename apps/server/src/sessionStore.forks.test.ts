@@ -100,6 +100,48 @@ it("does not reopen a closed child when the same receipt is observed again", asy
   expect(f.sessions.listTabs().map(tab => tab.id)).toEqual([f.source.id]);
 });
 
+it("keeps a confirmed fork visible and focused when a workspace read queues during its durable placement", async () => {
+  const f = await fixture();
+  const window = f.workspace.findWindowForTab(f.source.id)!;
+  const workspaceFile = (f.workspace as unknown as { workspaceFile: { write(value: unknown): Promise<void> } }).workspaceFile;
+  const originalWrite = workspaceFile.write.bind(workspaceFile);
+  let notifyWriteStarted!: () => void;
+  let releaseWrite!: () => void;
+  const writeStarted = new Promise<void>(resolve => { notifyWriteStarted = resolve; });
+  const writeReleased = new Promise<void>(resolve => { releaseWrite = resolve; });
+  workspaceFile.write = vi.fn(originalWrite).mockImplementationOnce(async value => {
+    notifyWriteStarted();
+    await writeReleased;
+    await originalWrite(value);
+  });
+  const placement = f.sourceInput.controls.openSiblingTab!({
+    key: "fork-during-workspace-read", cwd: f.root,
+    initialInput: { resume: { mode: "session", sessionId: "child" } }
+  });
+  let snapshot: ReturnType<SessionStore["snapshot"]> | undefined;
+  try {
+    await writeStarted;
+    expect(f.sessions.listTabs().map(tab => tab.id)).toEqual([f.source.id]);
+    snapshot = f.sessions.snapshot();
+    releaseWrite();
+    await placement;
+    const state = await snapshot;
+    const child = f.sessions.listTabs().find(tab => tab.id !== f.source.id)!;
+    expect(f.sessions.getSession(child.id).restoreInput?.()).toMatchObject({ resume: { sessionId: "child" } });
+    expect(state.tabs.map(tab => tab.id)).toEqual([f.source.id, child.id]);
+    expect(state.activeTabId).toBe(child.id);
+    const pane = listTabLayoutPanes(state.windows!.find(candidate => candidate.id === window.id)!.layout.root)[0]!;
+    expect(pane).toMatchObject({ tabIds: [f.source.id, child.id], activeTabId: child.id });
+    const persisted = new WorkspaceLayoutStore(path.dirname(f.workspace.workspacePath), new PathPolicy([f.root]));
+    expect(listTabLayoutPanes(persisted.getWindow(window.id).layout.root)[0]).toMatchObject({ tabIds: [f.source.id, child.id], activeTabId: child.id });
+    expect((await f.saved.read())!.sessions.map(entry => entry.tab.id)).toEqual([f.source.id, child.id]);
+  } finally {
+    releaseWrite();
+    await Promise.allSettled([placement, snapshot]);
+    workspaceFile.write = originalWrite;
+  }
+});
+
 it("leaves no empty tab after a failed fork launch and does not replay it", async () => {
   const f = await fixture();
   f.createSession.mockImplementationOnce(() => { throw new Error("Child launch failed"); });

@@ -1423,9 +1423,7 @@ describe("buildServer", () => {
     const originalState = services.workspace!.state.bind(services.workspace!);
     vi.spyOn(services.workspace!, "state")
       .mockRejectedValueOnce(new Error("workspace state failed"))
-      .mockImplementation((tabs, activeTabId) =>
-        originalState(tabs, activeTabId),
-      );
+      .mockImplementation(originalState);
     const app = await buildServer(config, services);
     let client: WebSocket | undefined;
     try {
