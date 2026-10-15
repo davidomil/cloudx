@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, type AgentSwitchRequest } from "@cloudx/shared";
+import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, isRecord, listTabLayoutPanes, type AgentSwitchRequest } from "@cloudx/shared";
 import type { CodexNativeWork, ConfigValue, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
@@ -76,6 +76,7 @@ export class SessionStore {
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
   private readonly initialInputs = new Map<string, Record<string, unknown> | undefined>();
+  private readonly siblingOpenings = new Map<string, Promise<void>>();
   private restoring = false;
   private preservingSessions = false;
 
@@ -656,10 +657,10 @@ export class SessionStore {
   }
 
   async snapshot(): Promise<WorkspaceSnapshot> {
-    const workspace = this.workspace ? await this.workspace.state(this.listTabs(), this.activeTabId) : undefined;
+    const workspace = this.workspace ? await this.workspace.state(() => ({ tabs: this.listTabs(), activeTabId: this.activeTabId })) : undefined;
     return {
-      activeTabId: this.activeTabId,
-      tabs: this.listTabs(),
+      activeTabId: workspace ? workspace.activeTabId : this.activeTabId,
+      tabs: workspace ? workspace.tabs : this.listTabs(),
       plugins: this.plugins.list(),
       activeWindowId: workspace?.activeWindowId,
       windows: workspace?.windows,
@@ -706,11 +707,11 @@ export class SessionStore {
       })
     );
 
-    const workspace = this.workspace ? await this.workspace.state(this.listTabs(), targetActiveTabId) : undefined;
+    const workspace = this.workspace ? await this.workspace.state(() => ({ tabs: this.listTabs(), activeTabId: activeTabId ?? this.activeTabId })) : undefined;
 
     return {
-      activeTabId: targetActiveTabId,
-      tabs: this.listTabs(),
+      activeTabId: workspace ? workspace.activeTabId : targetActiveTabId,
+      tabs: workspace ? workspace.tabs : this.listTabs(),
       activeWindowId: workspace?.activeWindowId,
       windows: workspace?.windows,
       templates: workspace?.templates,
@@ -1245,6 +1246,7 @@ export class SessionStore {
         this.persistSessions();
         return this.savedSessions?.flush();
       },
+      openSiblingTab: input => this.openSiblingTab(tabId, input),
       closeTab: (reason) => {
         if (this.unpublishedTabIds.has(tabId)) {
           if (!this.preparedTabFailures.has(tabId)) {
@@ -1256,6 +1258,41 @@ export class SessionStore {
         }
       }
     };
+  }
+
+  private openSiblingTab(sourceTabId: string, input: { key: string; cwd: string; initialInput: Record<string, unknown> }): Promise<void> {
+    const key = JSON.stringify([sourceTabId, input.key]);
+    const opening = this.siblingOpenings.get(key);
+    if (opening) return opening;
+    const pending = this.admitAction(undefined, async () => {
+      if (!input.key || input.key.length > 256) throw new Error("A bounded sibling tab identity is required.");
+      for (const initialInput of this.initialInputs.values()) {
+        const origin = initialInput?.cloudxSibling;
+        if (isRecord(origin) && origin.sourceTabId === sourceTabId && origin.key === input.key) return;
+      }
+      const source = this.getTab(sourceTabId);
+      if (source.ownerPluginId || this.unpublishedTabIds.has(sourceTabId)) throw new Error("Only published interactive tabs can open a sibling.");
+      const window = this.workspace?.findWindowForTab(sourceTabId);
+      const pane = window && listTabLayoutPanes(window.layout.root).find(pane => pane.tabIds.includes(sourceTabId));
+      if (!window || !pane || !this.workspace) throw new Error("The source tab no longer has a workspace pane.");
+      const tab = await this.prepareTab({
+        pluginId: source.pluginId, cwd: input.cwd, windowId: window.id,
+        initialInput: { ...input.initialInput, cloudxSibling: { sourceTabId, key: input.key } }
+      });
+      try {
+        this.getTab(sourceTabId);
+        await this.workspace.placeTabAndPublish({ tabId: tab.id, windowId: window.id, paneId: pane.id }, () => this.publishPreparedTab(tab.id));
+      } catch (error) {
+        await this.discardPreparedTab(tab.id);
+        throw error;
+      }
+      await this.savedSessions?.flush();
+      this.workspace.notifyChange();
+    });
+    this.siblingOpenings.set(key, pending);
+    // Re-observing a receipt must neither repeat a failed launch nor reopen a closed child.
+    void pending.catch(() => undefined);
+    return pending;
   }
 
   private emitTabsChange(): void {
@@ -1367,7 +1404,7 @@ export class SessionStore {
     if (!this.workspace) {
       throw new Error("Workspace windows are not available.");
     }
-    const workspace = await this.workspace.state(this.listTabs(), this.activeTabId);
+    const workspace = await this.workspace.state(() => ({ tabs: this.listTabs(), activeTabId: this.activeTabId }));
     const windowId = typeof input.windowId === "string" && input.windowId.trim() ? input.windowId.trim() : undefined;
     if (windowId) {
       const window = workspace.windows.find((candidate) => candidate.id === windowId);

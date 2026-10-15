@@ -59,7 +59,7 @@ it.skipIf(process.platform !== "linux")("plans the missing web receipt migration
   await installation.startBroker();
   const restored = await new SessionStateStore(installation.dataDir).read();
   const workspace = new WorkspaceLayoutStore(installation.dataDir, new PathPolicy([installation.root]));
-  const reconciled = await workspace.state(restored.sessions.map(({ tab }) => tab), restored.activeTabId);
+  const reconciled = await workspace.state(() => ({ tabs: restored.sessions.map(({ tab }) => tab), activeTabId: restored.activeTabId }));
   expect(reconciled.windows).toMatchObject(JSON.parse(saved.originals.get("workspace.json")).windows);
   expect(workspace.tabIdsForWindow("window-1")).toEqual(["saved-shell", "saved-codex"]);
   await expect(installation.terminals.attach(options.sessionId)).rejects.toThrow("It was not restarted");

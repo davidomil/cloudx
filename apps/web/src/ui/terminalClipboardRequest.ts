@@ -62,6 +62,9 @@ export class TerminalClipboardRequest {
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") this.clear();
     }, { signal: this.events.signal });
+    window.addEventListener("pointerdown", event => {
+      if (!this.panel.hidden && !event.composedPath().includes(this.panel)) this.clear();
+    }, { capture: true, signal: this.events.signal });
   }
 
   setActive(active: boolean): void {

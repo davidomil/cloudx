@@ -977,23 +977,22 @@ test("Codex version selection searches releases, previews a downgrade, and expli
   page,
   isMobile,
 }) => {
+  let update = installedCodex;
   const starts: unknown[] = [];
+  await page.route("**/api/hooks/codex-update.read", (route) =>
+    route.fulfill({ json: { result: { update } } }),
+  );
   await page.route("**/api/hooks/codex-update.start", async (route) => {
     starts.push(route.request().postDataJSON());
-    await route.fulfill({
-      json: {
-        result: {
-          update: {
-            ...installedCodex,
-            jobId: "downgrade",
-            phase: "checking",
-            requestedVersion: "0.9.0",
-            message: "Verifying selected Codex 0.9.0 before activation.",
-            startedAt: "2026-09-22T00:00:00Z",
-          },
-        },
-      },
-    });
+    update = {
+      ...installedCodex,
+      jobId: "downgrade",
+      phase: "checking",
+      requestedVersion: "0.9.0",
+      message: "Verifying selected Codex 0.9.0 before activation.",
+      startedAt: "2026-09-22T00:00:00Z",
+    };
+    await route.fulfill({ json: { result: { update } } });
   });
   await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
   const settings = await openCodexSettings(page, isMobile);
@@ -1038,10 +1037,24 @@ test("Codex version selection searches releases, previews a downgrade, and expli
   await expect(control).toContainText("active 1.0.0 → requested 0.9.0");
   expect(starts).toEqual([]);
   await apply.click();
+  const polledUpdate = await page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === "/api/hooks/codex-update.read",
+  );
+  expect(await polledUpdate.json()).toMatchObject({
+    result: {
+      update: {
+        jobId: "downgrade",
+        phase: "checking",
+        requestedVersion: "0.9.0",
+      },
+    },
+  });
   await expect(control).toContainText("Requested version: 0.9.0");
   await expect(control).toContainText(
     "Active for new tabs and Forge workers: 1.0.0",
   );
+  await expect(apply).toBeDisabled();
   expect(starts).toEqual([{ input: { version: "0.9.0" } }]);
   await settings
     .getByRole("textbox", { name: "Default model" })
@@ -1588,9 +1601,8 @@ async function expectCodexSettingsFits(page: Page) {
     settings.getByRole("button", { name: "Save Codex settings", exact: true }),
     settings.getByRole("button", { name: "Reload", exact: true }),
   ]) {
-    await control.scrollIntoViewIfNeeded();
-    await expect(control).toBeInViewport({ ratio: 1 });
     await control.click({ trial: true });
+    await expect(control).toBeInViewport({ ratio: 1 });
     expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   }
 }

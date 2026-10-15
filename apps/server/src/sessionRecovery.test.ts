@@ -169,7 +169,7 @@ describe("workspace recovery after server updates", () => {
 
     const after = createStore();
     await after.sessions.restore();
-    const state = await after.workspace.state(after.sessions.listTabs(), terminal.tab.id);
+    const state = await after.workspace.state(() => ({ tabs: after.sessions.listTabs(), activeTabId: terminal.tab.id }));
     expect(state.tabs.map(tab => tab.id)).toEqual([terminal.tab.id, viewer.tab.id]);
     expect(state.windows).toEqual(layout.windows);
     expect(state.activeWindowId).toBe(layout.activeWindowId);
@@ -184,7 +184,7 @@ describe("workspace recovery after server updates", () => {
     const { root, running, factory, createStore } = await fixture();
     const before = createStore();
     const { tab } = await before.open("standard-terminal");
-    const layout = await before.workspace.state(before.sessions.listTabs());
+    const layout = await before.workspace.state(() => ({ tabs: before.sessions.listTabs() }));
     await before.sessions.dispose();
     running.clear();
     const after = createStore();
@@ -197,7 +197,7 @@ describe("workspace recovery after server updates", () => {
     await after.sessions.recoverTab(tab.id, { action: "new-shell" });
     expect(factory.spawn).toHaveBeenCalledTimes(2);
     expect(factory.spawn.mock.calls[1]![2]).toMatchObject({ cwd: root, sessionId: tab.id });
-    expect((await after.workspace.state(after.sessions.listTabs())).windows).toEqual(layout.windows);
+    expect((await after.workspace.state(() => ({ tabs: after.sessions.listTabs() }))).windows).toEqual(layout.windows);
     expect((await after.persistence.read())?.sessions[0]?.tab.recovery).toBeUndefined();
     await after.sessions.dispose();
   });
@@ -393,7 +393,7 @@ describe("workspace recovery after server updates", () => {
     const after = createStore();
     await after.sessions.restore();
     expect(after.sessions.listTabs()).toEqual([]);
-    const state = await after.workspace.state([]);
+    const state = await after.workspace.state(() => ({ tabs: [] }));
     expect(state.windows.flatMap(window => listTabLayoutPanes(window.layout.root).flatMap(pane => pane.tabIds))).toEqual([]);
     await after.sessions.dispose();
   });
@@ -460,7 +460,7 @@ describe("workspace recovery after server updates", () => {
     const after = createStore();
     await after.sessions.restore();
     expect(after.sessions.getTab(tab.id).status).toBe("running");
-    const state = await after.workspace.state(after.sessions.listTabs());
+    const state = await after.workspace.state(() => ({ tabs: after.sessions.listTabs() }));
     expect(listTabLayoutPanes(state.windows[0]!.layout.root)[0]!.tabIds).toEqual([tab.id]);
     await after.sessions.dispose();
   });
@@ -490,7 +490,7 @@ describe("workspace recovery after server updates", () => {
     const after = createStore();
     await after.sessions.restore();
     expect(after.sessions.getTab(tab.id)).toMatchObject({ status: "failed", statusMessage: expect.stringContaining("running terminal is unavailable") });
-    const state = await after.workspace.state(after.sessions.listTabs());
+    const state = await after.workspace.state(() => ({ tabs: after.sessions.listTabs() }));
     expect(listTabLayoutPanes(state.windows[0]!.layout.root)[0]!.tabIds).toEqual([tab.id]);
     expect(factory.spawn).toHaveBeenCalledOnce();
     await after.sessions.closeTab(tab.id);

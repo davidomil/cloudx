@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { WebSocketServer, WebSocket } from "ws";
 import { CodexConversationSelection } from "./codex-conversation-selection.mjs";
+import { CodexConversationForks } from "./codex-conversation-forks.mjs";
 import { CodexWorkspaceScope } from "./codex-workspace-scope.mjs";
 import { CodexRemotePermissions } from "./codex-remote-permissions.mjs";
 import { forwardNativeOutput } from "./codex-worker-output.mjs";
@@ -183,7 +184,10 @@ export async function runWorkerBridge(launch) {
       workspace?.recordSelection(value, origin);
       saveTurnReceipt(launch.selection.receiptPath, value);
     }) : undefined;
-  const permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
+  const forks = launch.forks ? new CodexConversationForks(launch.forks, selection,
+    value => saveTurnReceipt(launch.forks.receiptPath, value)) : undefined;
+  if (forks && turn) throw new Error("Owned Codex workers cannot hand off interactive forks.");
+  let permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
   const commands = launch.commandDetails ? new CodexCommandDetailsCapture(launch.commandDetails,
     value => saveCommandDetails(launch.commandDetails.receiptPath, value),
     { onError: error => recordDiagnostic(`CloudX command details: ${error.message}\n`) }) : undefined;
@@ -201,6 +205,7 @@ export async function runWorkerBridge(launch) {
   let failure;
   let failureTimer;
   let tui;
+  const retiringTuis = new Set();
   const showFailure = () => {
     clearTimeout(failureTimer);
     const message = stripVTControlCharacters(failure.message).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 512);
@@ -245,11 +250,14 @@ export async function runWorkerBridge(launch) {
       fail(error);
     });
     socket.on("message", data => {
+      if (finishing || retiring) return;
       try {
         const message = JSON.parse(data.toString());
+        const fork = forks?.fromClient(message);
+        if (fork?.error) { socket.send(JSON.stringify({ id: message.id, error: fork.error })); return; }
         workspace?.fromClient(message);
         permissions?.fromClient(message);
-        selection?.fromClient(message);
+        if (!fork) selection?.fromClient(message);
         workHealth?.fromClient(message);
         turn?.fromClient(message);
         activity?.fromClient(message);
@@ -264,6 +272,7 @@ export async function runWorkerBridge(launch) {
       } catch (error) { fail(error); }
     });
     socket.on("close", () => {
+      if (retiring) return;
       try {
         if (picker && !selection?.selectedThreadId && !selection?.pending.size && !turn?.request) {
           workspace?.pending.clear();
@@ -305,7 +314,47 @@ export async function runWorkerBridge(launch) {
         clearTimeout(backendExitTimer);
         if (!finishing && !retiring) fail(new Error(`Codex app-server exited before its visible worker (${signal ?? code}).`));
       });
+      const handOffFork = async fork => {
+        retiring = true;
+        phase = "fork-handoff";
+        const oldTui = tui;
+        retiringTuis.add(oldTui);
+        const stoppedTui = new Promise(resolve => oldTui.once("close", resolve));
+        const stoppedBackend = new Promise(resolve => native.once("close", (code, signal) => resolve({ code, signal })));
+        const deadline = setTimeout(() => fail(new Error("Native fork source did not stop within 5 seconds.")), 5_000);
+        try {
+          // Hold the successful reply: the old TUI must never adopt the child.
+          oldTui.kill("SIGTERM");
+          native.stdin.end();
+          socket.close();
+          const [, backendExit] = await Promise.all([stoppedTui, stoppedBackend]);
+          if (failure) return;
+          if (backendExit.signal || backendExit.code !== 0)
+            throw new Error(`Native fork backend failed during retirement (${backendExit.signal ?? backendExit.code}).`);
+          // Backend close flushes the actual native fork and releases ownership
+          // before another tab can resume it. The journal is durable and bounded.
+          workspace?.recordSelection({ authority: "selected", ...fork }, { created: true });
+          forks.publish(fork);
+          workspace?.pending.clear();
+          selection.pending.clear();
+          selection.subscribedSelections.clear();
+          forks.pending.clear();
+          workHealth?.pending.clear();
+          activity?.requests.clear();
+          activity?.running.clear();
+          commands?.resumeRequests.clear();
+          commands?.historyRequests.clear();
+          permissions = launch.permissions ? new CodexRemotePermissions(launch.permissions) : undefined;
+          frontend = undefined;
+          phase = "conversation";
+          startTui([...launch.forks.resumeArgs, "--cd", fork.sourceCwd, "resume", fork.sourceId]);
+        } finally { clearTimeout(deadline); retiringTuis.delete(oldTui); }
+      };
       void forwardNativeOutput(native.stdout, socket, message => {
+        if (retiring) return false;
+        const fork = forks?.fromServer(message);
+        if (fork === false) return false;
+        if (fork) { void handOffFork(fork).catch(fail); return false; }
         if (workspace?.fromServer(message, next => forward(`${JSON.stringify(next)}\n`)) === false) return false;
         permissions?.fromServer(message);
         selection?.fromServer(message);
@@ -318,19 +367,24 @@ export async function runWorkerBridge(launch) {
       queued.length = 0;
     }).catch(fail);
   });
-  tui = spawn(launch.command, [
-    "--remote", `ws://127.0.0.1:${server.address().port}`,
-    "--remote-auth-token-env", TOKEN_ENV, ...launch.tuiArgs
-  ], { stdio: "inherit", env: { ...process.env, [TOKEN_ENV]: token } });
-  tui.on("error", fail);
-  tui.on("exit", async (code, signal) => {
-    if (failure) { showFailure(); return; }
-    finishing = true;
-    // Exiting the bridge returns ownership to the terminal supervisor, which
-    // reaps the app server and remaining tools before announcing terminal exit.
-    await commands?.close();
-    process.exit(signal ? 1 : code ?? 1);
-  });
+  const startTui = args => {
+    const child = spawn(launch.command, [
+      "--remote", `ws://127.0.0.1:${server.address().port}`,
+      "--remote-auth-token-env", TOKEN_ENV, ...args
+    ], { stdio: "inherit", env: { ...process.env, [TOKEN_ENV]: token } });
+    tui = child;
+    child.on("error", fail);
+    child.on("exit", async (code, signal) => {
+      if (retiringTuis.has(child) && !failure) return;
+      if (failure) { showFailure(); return; }
+      finishing = true;
+      // Exiting the bridge returns ownership to the terminal supervisor, which
+      // reaps the app server and remaining tools before announcing terminal exit.
+      await commands?.close();
+      process.exit(signal ? 1 : code ?? 1);
+    });
+  };
+  startTui(launch.tuiArgs);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

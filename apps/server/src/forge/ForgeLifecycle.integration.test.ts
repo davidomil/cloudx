@@ -2278,7 +2278,7 @@ class LifecycleFixture {
     }
     expect(await fs.readFile(path.join(receipt.codexHome, "auth.json"), "utf8")).toBe(sourceAuth);
     expect(await fs.readFile(path.join(this.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
-    const state = await this.workspace.state(this.sessions.listTabs(), this.sessions.getActiveTabId());
+    const state = await this.workspace.state(() => ({ tabs: this.sessions.listTabs(), activeTabId: this.sessions.getActiveTabId() }));
     expect(state.tabs.find(tab => tab.id === worker.tabId)).toMatchObject({ ownerPluginId: "forge" });
     expect(state.windows[0]!.layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
     expect(this.sessions.getActiveTabId()).toBeUndefined();

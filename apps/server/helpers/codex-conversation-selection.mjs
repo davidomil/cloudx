@@ -67,6 +67,7 @@ export class CodexConversationSelection {
       ...(typeof thread.path === "string" ? { transcriptPath: thread.path } : {})
     }, { created: request.created });
     this.selectedThreadId = thread.id;
+    this.selectedCwd = thread.cwd;
     this.subscribedSelections.add(thread.id);
   }
 

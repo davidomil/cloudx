@@ -232,6 +232,7 @@ export interface CloudxAppContext {
 export interface PluginTabControls {
   setTabIndicator(indicator: TabIndicatorUpdate): void;
   setRestoreInput?(input: Record<string, unknown>): void | Promise<void>;
+  openSiblingTab?(input: { key: string; cwd: string; initialInput: Record<string, unknown> }): Promise<void>;
   closeTab(reason?: string): void;
 }
 

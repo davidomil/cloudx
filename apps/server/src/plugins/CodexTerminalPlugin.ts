@@ -12,11 +12,12 @@ import type {
 import { PluginSessionMissingError, PluginSessionNotStartedError } from "@cloudx/plugin-api";
 import { AGENT_TERMINAL_PLUGIN_ID, MODEL_ID_PATTERN, CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, readAgentSelection, type AgentSelection, type AgentSwitchRequest, type DirectoryOwnershipAvailability, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
-import { materializeCodexHomeOverlay, resolveCodexHome, type CodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
+import { materializeCodexHomeOverlay, parseCodexSkillOverrides, readCodexSkillOverrides, resolveCodexHome, type CodexHomeOverlay, type CodexSkillOverride } from "../rulesSkills/CodexHomeOverlay.js";
 import { legacyCodexConfigKeys } from "./CodexConfigRepairService.js";
 import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery, findCodexTranscript } from "./CodexConversationRecovery.js";
+import { CodexConversationForks, type CodexConversationFork, type CodexForkObservation } from "./CodexConversationForks.js";
 import { codexCommandDetailsPath, readCodexCommandDetails, unavailableCommandDetails } from "./CodexCommandDetails.js";
 import type { CodexCommandDetailsSnapshot } from "@cloudx/shared";
 import type { CodexNativeWork, RecoverTabRequest } from "@cloudx/shared";
@@ -150,7 +151,21 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   private async startSession(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
     const agent = readAgentSelection(input.initialInput?.agent);
     if (agent?.providerId === "claude") return this.requireClaude().start(input, recovering, agent);
-    const template = templateFromRuntimeContext(input.runtimeContext);
+    if (recovering && this.sources && !input.tab.ownerPluginId) {
+      let previous: Record<string, unknown> = { ...input.initialInput, codexRuntimeContext: input.runtimeContext };
+      const forks = new CodexConversationForks(this.sources.viewPath(input.tab.id));
+      for (const fork of forks.read(input.tab.id, previous.codexExecutionId)) {
+        try { await this.openFork(input, fork, () => previous, value => { previous = value; }); }
+        catch (error) { this.reportForkFailure(input, error, () => previous, value => { previous = value; }); }
+      }
+      input = { ...input, initialInput: previous };
+    }
+    const runtimeContext = !recovering && input.initialInput?.codexForkSourceTabId
+      ? input.initialInput.codexRuntimeContext as WorkspaceRuntimeContext | undefined : input.runtimeContext;
+    const nativeSkillOverrides = recovering && input.initialInput?.codexForkSourceTabId && this.sources
+      ? await readCodexSkillOverrides(this.sources.viewPath(input.tab.id), { cwd: input.cwd, homeDir: this.env.HOME })
+      : input.initialInput?.codexNativeSkillOverrides === undefined ? undefined : parseCodexSkillOverrides(input.initialInput.codexNativeSkillOverrides);
+    const template = templateFromRuntimeContext(runtimeContext);
     const baseEnv = { ...this.env };
     let launchTemplate: MaterializedCodexTemplate;
     let initialArgs: string[];
@@ -158,6 +173,13 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     let codexAgent: AgentSelection | undefined;
     try {
       ({ authHome, agent: codexAgent } = await this.codexAccount(agent));
+      if (input.initialInput?.codexForkSourceTabId !== undefined && this.sources && !await this.sources.readBinding(input.tab.id)) {
+        const sourceTabId = input.initialInput.codexForkSourceTabId;
+        if (typeof sourceTabId !== "string") throw new Error("A fork requires its source tab identity.");
+        const source = await this.sources.readBinding(sourceTabId);
+        if (!source) throw new Error("The fork's Codex source binding is missing.");
+        await this.sources.bind(input.tab.id, source);
+      }
       initialArgs = buildCodexLaunchArgs([], input.initialInput);
       launchTemplate = await materializeCodexTemplate(template, baseEnv, {
         dataDir: this.dataDir,
@@ -165,14 +187,16 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         cwd: input.cwd,
         authorizeProjectTrust: input.authorizeProjectTrust,
         sources: this.sources,
-        authHome
+        authHome,
+        nativeSkillOverrides
       });
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
     const workspaceId = recovering && typeof input.initialInput?.codexWorkspaceId === "string" ? input.initialInput.codexWorkspaceId : input.workspaceId;
     let restoredInput: Record<string, unknown> = { ...input.initialInput, ...(codexAgent ? { agent: codexAgent } : {}),
-      ...(workspaceId ? { codexWorkspaceId: workspaceId } : {}), codexRuntimeContext: input.runtimeContext, codexRecovered: recovering };
+      ...(workspaceId ? { codexWorkspaceId: workspaceId } : {}), codexRuntimeContext: runtimeContext, codexRecovered: recovering,
+      ...(nativeSkillOverrides ? { codexNativeSkillOverrides: nativeSkillOverrides } : {}) };
     if (input.prepareAgentSession) {
       const sessionId = await input.prepareAgentSession({
         tabId: input.tab.id,
@@ -186,11 +210,14 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     }
     const conversation = launchTemplate.overlay ? new CodexConversationRecovery(launchTemplate.overlay.codexHome) : undefined;
     const selection = conversation ? { tabId: input.tab.id, executionId: randomUUID(), receiptPath: conversation.receiptPath } : undefined;
+    const forks = selection && launchTemplate.overlay && !input.tab.ownerPluginId
+      ? new CodexConversationForks(launchTemplate.overlay.codexHome) : undefined;
     const work = launchTemplate.overlay ? new CodexNativeWorkReceipt(launchTemplate.overlay.codexHome) : undefined;
     const targetedRecovery = input.initialInput?.codexNativeRecovery === true;
     delete restoredInput.codexNativeRecovery;
     restoredInput = { ...restoredInput, codexExecutionId: selection?.executionId };
     await conversation?.reset();
+    if (forks) await fs.rm(forks.receiptPath, { force: true });
     if (work) await fs.rm(work.receiptPath, { force: true });
     if (launchTemplate.overlay) await fs.rm(codexCommandDetailsPath(launchTemplate.overlay.codexHome), { force: true });
     if (launchTemplate.overlay) await fs.rm(agentTurnReceiptPath(launchTemplate.overlay.codexHome), { force: true });
@@ -215,6 +242,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         JSON.stringify({
           ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
+          ...(forks && selection ? { forks: { ...selection, receiptPath: forks.receiptPath,
+            resumeArgs: buildCodexRemoteTuiArgs(launchTemplate.args, []) } } : {}),
           ...(selection && work ? { workHealth: {
             tabId: input.tab.id, executionId: selection.executionId, receiptPath: work.receiptPath,
             ...(targetedRecovery ? { expectedThreadId: input.tab.nativeWork!.threadId, recovery: true,
@@ -256,6 +285,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       turnState: launchTemplate.overlay ? () => readAgentTurnState(agentTurnReceiptPath(launchTemplate.overlay!.codexHome)) : undefined,
       nativeTurn: input.agentTurn,
       restoreInput: () => restoredInput,
+      observeForks: () => this.observeForks(input, forks, () => restoredInput, value => { restoredInput = value; }),
       initialNativeWork: targetedRecovery && selection ? {
         version: 1, tabId: input.tab.id, executionId: selection.executionId, threadId: input.tab.nativeWork!.threadId,
         updatedAt: new Date().toISOString(), goalStatus: input.tab.nativeWork?.goalStatus, lastError: input.tab.nativeWork?.lastError,
@@ -306,14 +336,19 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     if (agent?.providerId === "claude") return this.requireClaude().restore(input);
     const terminal = await this.factory.attach(input.tab.id);
     let restoredInput = { ...input.initialInput };
+    const runtimeContext = input.initialInput?.codexForkSourceTabId
+      ? input.initialInput.codexRuntimeContext as WorkspaceRuntimeContext | undefined : input.runtimeContext;
     let authHome: string | undefined;
     if (this.dataDir) {
       try {
         ({ authHome } = await this.codexAccount(agent));
-        await materializeCodexTemplate(templateFromRuntimeContext(input.runtimeContext), { ...this.env }, {
-          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources, authHome
+        const nativeSkillOverrides = input.initialInput?.codexForkSourceTabId && this.sources
+          ? await readCodexSkillOverrides(this.sources.viewPath(input.tab.id), { cwd: input.cwd, homeDir: this.env.HOME }) : undefined;
+        await materializeCodexTemplate(templateFromRuntimeContext(runtimeContext), { ...this.env }, {
+          dataDir: this.dataDir, tabId: input.tab.id, cwd: input.cwd, resetOverlay: false, sources: this.sources, authHome, nativeSkillOverrides
         });
-        restoredInput = { ...restoredInput, codexRuntimeContext: input.runtimeContext };
+        restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext,
+          ...(nativeSkillOverrides ? { codexNativeSkillOverrides: nativeSkillOverrides } : {}) };
         await input.controls.setRestoreInput?.(restoredInput);
       } catch (error) {
         terminal.detach?.();
@@ -322,6 +357,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     }
     const conversation = this.sources ? new CodexConversationRecovery(this.sources.viewPath(input.tab.id)) : undefined;
     const work = this.sources ? new CodexNativeWorkReceipt(this.sources.viewPath(input.tab.id)) : undefined;
+    const forks = this.sources && !input.tab.ownerPluginId
+      ? new CodexConversationForks(this.sources.viewPath(input.tab.id)) : undefined;
     let initialNativeWork: CodexNativeWork | undefined;
     try { initialNativeWork = work?.readForExecution(input.tab.id, restoredInput.codexExecutionId); }
     catch { /* An unverified receipt cannot authorize native recovery. */ }
@@ -334,6 +371,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       voiceSummary: "Existing interactive Codex CLI session.",
       turnState: this.sources ? () => readAgentTurnState(agentTurnReceiptPath(this.sources!.viewPath(input.tab.id))) : undefined,
       restoreInput: () => restoredInput,
+      observeForks: () => this.observeForks(input, forks, () => restoredInput, value => { restoredInput = value; }),
       initialNativeWork,
       observeNativeWork: work ? listener => work.observe(input.tab.id, restoredInput.codexExecutionId, listener) : undefined,
       commandDetails: this.sources ? () => readCodexCommandDetails(this.sources!.viewPath(input.tab.id), input.tab.id, restoredInput.codexExecutionId) : undefined,
@@ -366,6 +404,45 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         };
       }
     });
+  }
+
+  private observeForks(input: CreatePluginSessionInput, forks: CodexConversationForks | undefined,
+    current: () => Record<string, unknown>, update: (value: Record<string, unknown>) => void): CodexForkObservation | undefined {
+    return forks?.observe(input.tab.id, current().codexExecutionId,
+      fork => this.openFork(input, fork, current, update),
+      error => this.reportForkFailure(input, error, current, update));
+  }
+
+  private async openFork(input: CreatePluginSessionInput, fork: CodexConversationFork,
+    current: () => Record<string, unknown>, update: (value: Record<string, unknown>) => void): Promise<void> {
+    const handled = current().codexOpenedForks;
+    if (Array.isArray(handled) && handled.includes(fork.sessionId)) return;
+    try {
+      if (!input.controls.openSiblingTab) throw new Error("Opening a native fork requires CloudX workspace tab controls.");
+      if (!this.sources) throw new Error("Opening a native fork requires a bound Codex source.");
+      const nativeSkillOverrides = await readCodexSkillOverrides(this.sources.viewPath(input.tab.id), { cwd: input.cwd, homeDir: this.env.HOME });
+      await input.controls.openSiblingTab({
+        key: fork.sessionId, cwd: fork.cwd,
+        initialInput: {
+          resume: { mode: "session", sessionId: fork.sessionId },
+          agent: current().agent,
+          codexForkSourceTabId: input.tab.id,
+          codexRuntimeContext: current().codexRuntimeContext,
+          codexNativeSkillOverrides: nativeSkillOverrides
+        }
+      });
+    } finally {
+      update({ ...current(), codexOpenedForks: [...(Array.isArray(handled) ? handled : []), fork.sessionId].slice(-128) });
+      await input.controls.setRestoreInput?.(current());
+    }
+  }
+
+  private reportForkFailure(input: CreatePluginSessionInput, error: unknown,
+    current: () => Record<string, unknown>, update: (value: Record<string, unknown>) => void): void {
+    const message = `Could not open the confirmed Codex fork: ${error instanceof Error ? error.message : String(error)}`;
+    update({ ...current(), codexForkError: message });
+    input.controls.setTabIndicator({ color: "yellow", label: "Fork needs attention", message });
+    void Promise.resolve(input.controls.setRestoreInput?.(current())).catch(() => undefined);
   }
 
   async describeRecovery(input: CreatePluginSessionInput): Promise<{ message: string; conversationId?: string; canResume: boolean; startupFailed?: boolean }> {
@@ -608,6 +685,7 @@ export interface MaterializeCodexTemplateOptions extends PluginSessionLaunchOpti
   resetOverlay?: boolean;
   sources?: CodexStateSources;
   authHome?: string;
+  nativeSkillOverrides?: CodexSkillOverride[];
 }
 
 export async function materializeCodexTemplate(
@@ -632,7 +710,7 @@ export async function materializeCodexTemplate(
     : undefined;
   if (!env.CODEX_SQLITE_HOME?.trim()) env.CODEX_SQLITE_HOME = source?.home ?? path.resolve(resolveCodexHome(baseEnv));
   const overlay = dataDir && options.tabId
-    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source!, authHome: options.authHome })
+    ? await materializeCodexHomeOverlay({ dataDir, tabId: options.tabId, resolved, baseEnv: env, cwd: options.cwd, trustedProjectPath, resetCodexHome: options.resetOverlay, sources: sources!, source: source!, authHome: options.authHome, nativeSkillOverrides: options.nativeSkillOverrides })
     : undefined;
   if (overlay) {
     if (!overlay.yoloMode) args.splice(args.indexOf("--yolo"), 1);
@@ -845,6 +923,7 @@ interface TerminalSessionOptions {
   restoreInput?(): Record<string, unknown>;
   commandDetails?(): Promise<CodexCommandDetailsSnapshot>;
   observeConversation?(): (() => void) | undefined;
+  observeForks?(): CodexForkObservation | undefined;
   initialNativeWork?: CodexNativeWork;
   observeNativeWork?(listener: (work: CodexNativeWork | undefined) => void): () => void;
   applyRuntimeContext?(runtimeContext?: WorkspaceRuntimeContext): Promise<CodexRuntimeContextUpdate> | CodexRuntimeContextUpdate;
@@ -937,6 +1016,7 @@ export class CodexTerminalSession implements PluginSession {
   private terminalClosed = false;
   private readonly terminalSubscriptions: Array<() => void> = [];
   private stopObservingConversation: (() => void) | undefined;
+  private forkObservation: CodexForkObservation | undefined;
   private stopObservingNativeWork: (() => void) | undefined;
   private nativeWorkState: CodexNativeWork | undefined;
   private readonly nativeWorkListeners = new Set<(work: CodexNativeWork | undefined) => void>();
@@ -950,6 +1030,7 @@ export class CodexTerminalSession implements PluginSession {
     this.status = tab.status;
     this.replayBytes = options.replayBytes ?? DEFAULT_TERMINAL_REPLAY_BYTES;
     this.stopObservingConversation = options.observeConversation?.();
+    this.forkObservation = options.observeForks?.();
     this.nativeWorkState = options.initialNativeWork;
     this.stopObservingNativeWork = options.observeNativeWork?.(work => {
       this.nativeWorkState = work;
@@ -988,6 +1069,7 @@ export class CodexTerminalSession implements PluginSession {
     if (screenSubscription) this.terminalSubscriptions.push(screenSubscription);
     this.terminalSubscriptions.push(this.terminalProcess.onExit((event) => {
       this.stopObservingConversation?.();
+      const pendingForks = this.forkObservation?.finish();
       this.stopObservingNativeWork?.();
       this.terminalClosed = true;
       this.clearPendingSubmitTimers();
@@ -1010,7 +1092,8 @@ export class CodexTerminalSession implements PluginSession {
         const message = completed ? "Codex exited cleanly." : this.withBridgeFailure(`Codex exited ${event.signal ? `from signal ${event.signal}` : `with code ${event.exitCode}`}.`);
         const closeAfterMs = this.options.closeOnExitAfterMs ?? 0;
         if (completed && Date.now() - this.startedAt >= closeAfterMs) {
-          this.controls.closeTab(message);
+          if (pendingForks) void pendingForks.then(() => this.controls.closeTab(message));
+          else this.controls.closeTab(message);
           return;
         }
         this.setStatus(completed ? "completed" : "failed", message);
@@ -1074,6 +1157,7 @@ export class CodexTerminalSession implements PluginSession {
 
   stop(): void {
     this.stopObservingConversation?.();
+    this.forkObservation?.stop();
     this.stopObservingNativeWork?.();
     this.stopped = true;
     this.terminalClosed = true;
@@ -1088,6 +1172,7 @@ export class CodexTerminalSession implements PluginSession {
   detach(): void {
     if (!this.terminalProcess.detach) throw new Error("This terminal cannot survive server shutdown.");
     this.stopObservingConversation?.();
+    this.forkObservation?.stop();
     this.stopObservingNativeWork?.();
     this.clearPendingSubmitTimers();
     this.clearReadyQuietTimer();
@@ -1137,6 +1222,7 @@ export class CodexTerminalSession implements PluginSession {
     if (this.stopped) throw new Error("Codex completion was cancelled.");
     this.terminalClosed = true;
     this.stopObservingConversation?.();
+    this.forkObservation?.stop();
     this.stopObservingNativeWork?.();
     this.setReadiness("closed", "Codex turn completed.");
     this.setStatus("completed", "Codex turn completed.");
@@ -1155,6 +1241,7 @@ export class CodexTerminalSession implements PluginSession {
     }
     this.terminalClosed = true;
     this.stopObservingConversation?.();
+    await this.forkObservation?.finish();
     this.stopObservingNativeWork?.();
     this.setReadiness("closed", "Terminal was stopped.");
     this.setStatus("stopped", "Terminal was stopped.");
