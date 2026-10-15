@@ -149,6 +149,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   private async startSession(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
+    const preparationStarted = performance.now();
     const agent = readAgentSelection(input.initialInput?.agent);
     if (agent?.providerId === "claude") return this.requireClaude().start(input, recovering, agent);
     if (recovering && this.sources && !input.tab.ownerPluginId) {
@@ -240,6 +241,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ? buildEnforcedLoginShellLaunch(process.execPath, [
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
         JSON.stringify({
+          preparationMs: performance.now() - preparationStarted,
           ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
           ...(forks && selection ? { forks: { ...selection, receiptPath: forks.receiptPath,

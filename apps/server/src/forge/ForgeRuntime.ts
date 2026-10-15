@@ -68,6 +68,11 @@ export interface ForgeWorkspace {
   retireEvidence?: { attemptId: string; commitSha: string; paths: string[] };
 }
 
+export interface ForgePublicationLease {
+  purpose: "ci_repair" | "rebase";
+  expectedRemoteHeadSha: string;
+}
+
 export interface ForgeRuntimeDependencies {
   logger?: ForgeLogger;
   sessions: Pick<
@@ -185,7 +190,7 @@ interface OwnedWorkspace extends ForgeWorkspace {
   publicationAttemptId?: string;
   publicationHandoffs?: Record<string, OwnedPublicationHandoff>;
   retainedWorkspace?: ForgeRetainedWorkspace;
-  branchPublication?: { headSha: string; confirmed: boolean };
+  branchPublication?: { headSha: string; confirmed: boolean; lease?: ForgePublicationLease };
 }
 
 interface OwnedTab {
@@ -1216,13 +1221,26 @@ export class ForgeRuntime {
     workspace: ForgeWorkspace,
     signal?: AbortSignal,
     expectedHeadSha?: string,
-    expectedRemoteHeadSha?: string,
+    lease?: ForgePublicationLease,
   ): Promise<string> {
+    if (lease !== undefined) {
+      if (!isPublicationLease(lease)) throw new Error("Publication requires an explicit purpose and exact source lease.");
+      lease = { purpose: lease.purpose, expectedRemoteHeadSha: lease.expectedRemoteHeadSha };
+    }
     return this.serialize(workspace.id, "publishBranch", signal, async () => {
       signal?.throwIfAborted();
       const owned = await this.matchOwned(workspace);
-      if (expectedRemoteHeadSha !== undefined)
-        return this.publishRebasedBranch(owned, expectedHeadSha, expectedRemoteHeadSha, signal);
+      if (lease?.purpose === "rebase")
+        return this.publishRebasedBranch(owned, expectedHeadSha, lease.expectedRemoteHeadSha, signal);
+      const saved = owned.branchPublication;
+      const requestedHeadSha = expectedHeadSha ?? this.publicationHandoff(owned)?.headSha ?? saved?.headSha;
+      if (saved && (saved.headSha === requestedHeadSha || !saved.confirmed) &&
+          (saved.lease?.purpose !== lease?.purpose || saved.lease?.expectedRemoteHeadSha !== lease?.expectedRemoteHeadSha))
+        throw new Error("The saved publication source lease changed or was omitted. Resume with its exact publication purpose and source.");
+      if (lease && (!isCommitSha(expectedHeadSha) || this.publicationHandoff(owned)?.headSha !== expectedHeadSha))
+        throw new Error("CI repair publication requires the saved exact completed repair head and matching completion handoff.");
+      if (saved && !saved.confirmed && saved.headSha !== requestedHeadSha)
+        throw new Error("Resume the saved exact publication head before publishing another commit.");
       if (!owned.branchOwned || !owned.branch || owned.cleaned)
         throw new Error("Only an owned issue branch can be published.");
       if (owned.issueRebase && !owned.issueRebase.publication?.confirmed)
@@ -1236,6 +1254,9 @@ export class ForgeRuntime {
       await this.verifyPublicationHead(owned, intendedHeadSha, signal, owned.branchPublication?.headSha !== intendedHeadSha);
       if (expectedHeadSha && headSha !== expectedHeadSha)
         throw new Error("Worker head differs from the recorded branch update.");
+      if (lease && (intendedHeadSha === lease.expectedRemoteHeadSha ||
+          !await this.isAncestor(owned, lease.expectedRemoteHeadSha, intendedHeadSha, signal)))
+        throw new Error("The completed CI repair must advance its exact diagnostic source commit.");
       const access = await this.access(
         owned.expectedRepository,
         "worker",
@@ -1246,20 +1267,27 @@ export class ForgeRuntime {
           "Repository origin changed while the worker was running.",
         );
       await this.verifyPublicationHead(owned, intendedHeadSha, signal, owned.branchPublication?.headSha !== intendedHeadSha);
-      if (owned.branchPublication?.headSha === headSha && await this.publishedBranchHeadOrMissing(owned, access, signal) === headSha) {
+      const remoteHead = lease || owned.branchPublication?.headSha === headSha
+        ? await this.publishedBranchHeadOrMissing(owned, access, signal) : undefined;
+      if (owned.branchPublication?.headSha === headSha && remoteHead === headSha) {
         owned.branchPublication.confirmed = true;
         await this.settleRecoveredBaseUpdate(owned, headSha, signal);
         await this.manifest(owned.id).write(owned);
         return headSha;
       }
-      owned.branchPublication = { headSha, confirmed: false };
+      if (lease && (remoteHead !== lease.expectedRemoteHeadSha || saved?.headSha === headSha && saved.confirmed))
+        throw new Error("The published branch changed during CI repair. The exact-head lease was rejected; concurrent remote work was preserved.");
+      owned.branchPublication = { headSha, confirmed: false, ...(lease ? { lease: { ...lease } } : {}) };
       await this.manifest(owned.id).write(owned);
       await this.runOwnedGit(
         owned,
-        ["push", access.cloneUrl, `${headSha}:refs/heads/${owned.branch}`],
+        ["push", ...(lease ? [`--force-with-lease=refs/heads/${owned.branch}:${lease.expectedRemoteHeadSha}`] : []),
+          access.cloneUrl, `${headSha}:refs/heads/${owned.branch}`],
         signal,
         access.authorization,
       );
+      if (lease && await this.publishedBranchHead(owned, access, signal) !== headSha)
+        throw new Error("The repaired published head could not be confirmed. Its publication intent and local work were preserved.");
       await this.verifyPublicationHead(owned, headSha, signal);
       owned.branchPublication.confirmed = true;
       await this.settleRecoveredBaseUpdate(owned, headSha, signal);
@@ -2443,7 +2471,8 @@ export class ForgeRuntime {
       (value.explicitRetainedPaths !== undefined && !isRetainedPaths(value.explicitRetainedPaths)) ||
       (value.branchPublication !== undefined &&
         (value.role !== "worker" || !value.branchPublication || !isCommitSha(value.branchPublication.headSha) ||
-          typeof value.branchPublication.confirmed !== "boolean")) ||
+          typeof value.branchPublication.confirmed !== "boolean" ||
+          value.branchPublication.lease !== undefined && !isPublicationLease(value.branchPublication.lease))) ||
       (value.retainedWorkspace !== undefined &&
         (!value.cleaned || !value.retainedWorkspace || value.retainedWorkspace.worktreePath !== value.worktreePath ||
           (value.retainedWorkspace.reason !== undefined && (typeof value.retainedWorkspace.reason !== "string" || !value.retainedWorkspace.reason.trim() || value.retainedWorkspace.reason.length > 4096)) ||
@@ -3103,4 +3132,8 @@ function isClaudeConversationBinding(value: unknown, role: unknown): value is Cl
     (value.key === "reviewConversation" && role === "reviewer" || value.key === "batchConversation" && role === "worker") &&
     typeof value.sessionId === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu.test(value.sessionId) &&
     Object.keys(value).length === 2;
+}
+
+function isPublicationLease(value: unknown): value is ForgePublicationLease {
+  return isRecord(value) && ["ci_repair", "rebase"].includes(String(value.purpose)) && isCommitSha(value.expectedRemoteHeadSha);
 }

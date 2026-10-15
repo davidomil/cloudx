@@ -22,7 +22,7 @@ const evidenceBytes = Buffer.from("validation passed\n");
 const writableBytes = 4 * 1024 * 1024;
 
 describe("Completed Forge evidence lifecycle", () => {
-  it.each(["plugins", "plugins-clone-QkqfBY"])("archives useful fixtures among 4200 native %s cache files before retiring every earlier reviewer attempt", async cache => {
+  it.each(["plugins", "plugins-clone-QkqfBY"])("archives useful fixtures among 9000 native %s cache files before retiring every earlier reviewer attempt", async cache => {
     const owner = completedWorker("review");
     const resources = [savedEnvironment(owner, true), savedEnvironment(owner, true)];
     for (const resource of resources) resource.evidence!.paths = ["/work/evidence"];
@@ -37,7 +37,7 @@ describe("Completed Forge evidence lifecycle", () => {
     ];
     fixture.host.archives = { "/work/evidence": [
       ...useful.slice(0, 2),
-      ...Array.from({ length: 4200 }, (_, index) => ({ path: `${profile}/.tmp/${cache}/plugins/example/cache-${index}.json`, data: "generated plugin clone" })),
+      ...Array.from({ length: 9000 }, (_, index) => ({ path: `${profile}/.tmp/${cache}/plugins/example/cache-${index}.json`, data: "generated plugin clone" })),
       ...useful.slice(2),
     ] };
     fixture.host.beforeRemove = async containerId => {
@@ -50,6 +50,16 @@ describe("Completed Forge evidence lifecycle", () => {
       expect(JSON.parse((await buffer(await fixture.resources.evidenceFile(resource.id, "work/evidence/reproduction/native-tool"))).toString()))
         .toEqual({ type: "SymbolicLink", target: "/opt/codex/bin/codex" });
     };
+    fixture.host.failure = "remove";
+    await fixture.workflow.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ id: owner.id, status: "completed" });
+    expect((await fixture.resources.records()).every(resource => resource.evidence?.state === "verified")).toBe(true);
+    expect(fixture.host.removed).toEqual([]);
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(fixture.host.exports).toHaveLength(2);
+    await fixture.restart();
+    fixture.host.failure = undefined;
+    fixture.notifications.dismissAll();
     await fixture.workflow.poll();
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.host.removed.sort()).toEqual(resources.map(resource => resource.containerId).sort());

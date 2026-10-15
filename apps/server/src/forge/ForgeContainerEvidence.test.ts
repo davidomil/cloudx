@@ -2,11 +2,12 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { setImmediate } from "node:timers/promises";
 import { ForgeEvidenceFiles } from "./ForgeEvidenceFiles.js";
 import { Readable } from "node:stream";
 import { Header, type types } from "tar";
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { readContainerEvidenceTar as streamEvidenceTar, validEvidencePaths } from "./ForgeContainerEvidence.js";
 
 function evidenceTar(entries: { path: string; data?: string; type?: types.EntryTypeName; linkpath?: string; size?: number }[]): Buffer {
@@ -64,6 +65,67 @@ describe("specific bounded Docker evidence archive parsing", () => {
     expect(files).toHaveLength(600);
     expect(files[599]?.data.toString()).toBe("599");
   });
+  it.each(["plugins/plugins/example", "plugins-clone-example"])("discards more than 8192 %s cache entries before preserving useful evidence", async layout => {
+    const archive = evidenceTar([
+      ...Array.from({ length: 9000 }, (_, index) => ({ path: `evidence/codex-launches/example/.tmp/${layout}/${index}`, data: "" })),
+      { path: "evidence/validation.log", data: "validation passed\n" },
+      { path: "evidence/config/settings.json", data: "{}" },
+      { path: "evidence/fixture/tool", type: "SymbolicLink", linkpath: "/opt/codex/bin/codex" },
+    ]);
+    const files = await readContainerEvidenceTar("/work/evidence", archive);
+    expect(files.map(file => [file.path, file.data.toString()])).toEqual([
+      ["work/evidence/validation.log", "validation passed\n"],
+      ["work/evidence/config/settings.json", "{}"],
+      ["work/evidence/fixture/tool", JSON.stringify({ type: "SymbolicLink", target: "/opt/codex/bin/codex" })],
+    ]);
+  });
+  it("bounds discarded generated bodies before consuming them", async () => {
+    await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([
+      { path: "evidence/codex-launches/example/.tmp/plugins/large", size: 64 * 1024 * 1024 },
+    ]))).rejects.toThrow("generated archive traversal limit");
+  });
+  it("charges extended path headers to generated traversal instead of the useful entry inventory", async () => {
+    const archive = evidenceTar([
+      ...Array.from({ length: 9000 }, (_, index) => [
+        { path: "././@LongLink", type: "NextFileHasLongPath" as const, data: `evidence/codex-launches/example/.tmp/plugins/${"x".repeat(100)}/${index}\0` },
+        { path: "placeholder", data: "" },
+      ]).flat(),
+      { path: "evidence/log", data: "passed" },
+    ]);
+    expect((await readContainerEvidenceTar("/work/evidence", archive)).map(file => file.data.toString())).toEqual(["passed"]);
+  });
+  it("bounds the number of empty discarded entries through their serialized header bytes", async () => {
+    const header = new Header({ path: "evidence/node_modules/empty", type: "File", size: 0, mode: 0o600 }); header.encode();
+    async function* generated() { for (let index = 0; index <= 64 * 1024 * 1024 / 512; index++) yield header.block!; }
+    await expect(streamEvidenceTar("/work/evidence", generated(), async () => {})).rejects.toThrow("generated archive traversal limit");
+  });
+  it("retains the 8192-entry ceiling for non-generated directory inventories", async () => {
+    await expect(readContainerEvidenceTar("/work/evidence", evidenceTar(Array.from({ length: 8193 }, (_, index) =>
+      ({ path: `evidence/fixture/${index}`, type: "Directory" }))))).rejects.toThrow("too many entries");
+  });
+  it("bounds metadata accumulated before any regular entry", async () => {
+    await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([
+      ...Array.from({ length: 9 }, () => ({ path: "pax", type: "GlobalExtendedHeader" as const, data: "x".repeat(1024 * 1024) })),
+      { path: "evidence/log", data: "must stay protected" },
+    ]))).rejects.toThrow("metadata traversal limit");
+  });
+  it("bounds synchronous archive traversal time even when the event loop cannot run its Docker timeout", async () => {
+    const clock = vi.spyOn(performance, "now").mockReturnValueOnce(0).mockReturnValue(60_001);
+    try {
+      await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([{ path: "evidence/log", data: "log" }]))).rejects.toThrow("traversal timed out");
+    } finally { clock.mockRestore(); }
+  });
+  it("checks the traversal deadline for input chunks that contain no entries", async () => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+    async function* padding() {
+      yield Buffer.alloc(512);
+      clock.mockReturnValue(60_001);
+      yield Buffer.alloc(512);
+    }
+    try {
+      await expect(streamEvidenceTar("/work/evidence", padding(), async () => {})).rejects.toThrow("traversal timed out");
+    } finally { clock.mockRestore(); }
+  });
   it("rejects archive entries beneath a fixture link and duplicate directory paths", async () => {
     await expect(readContainerEvidenceTar("/review/repro", evidenceTar([
       { path: "repro/projects", type: "SymbolicLink", linkpath: "/private" },
@@ -72,6 +134,10 @@ describe("specific bounded Docker evidence archive parsing", () => {
     await expect(readContainerEvidenceTar("/review/repro", evidenceTar([
       { path: "repro", type: "Directory" }, { path: "repro", type: "Directory" },
     ]))).rejects.toThrow("duplicate");
+    await expect(readContainerEvidenceTar("/work/evidence", evidenceTar([
+      { path: "evidence/fixture", type: "SymbolicLink", linkpath: "/private" },
+      { path: "evidence/fixture/node_modules/generated", data: "must not be copied" },
+    ]))).rejects.toThrow("link parent");
   });
   it("keeps an aggregate file-count ceiling even when individual storage batches fit", async () => {
     await expect(readContainerEvidenceTar("/review/repro", evidenceTar(Array.from({ length: 4097 }, (_, index) =>

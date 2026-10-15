@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import type { CodexNativeWork, RecoverTabRequest, WorkspaceTab } from "@cloudx/shared";
+import { isCodexNativeWork, type CodexNativeWork, type RecoverTabRequest, type WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 
@@ -20,6 +20,20 @@ function NativeWork({ tab, work, onRecover }: {
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string>();
+  const detailsId = useId();
+  const presentationKey = `cloudx.nativeWork.presentation:${JSON.stringify([tab.id, work.executionId, work.threadId])}`;
+  const [presentation, setPresentation] = useState(() => {
+    const previous = readCollapsedWork(presentationKey);
+    return { work, expanded: !previous || hasNewFailure(previous, work) };
+  });
+  if (presentation.work !== work) setPresentation({ work, expanded: presentation.expanded || hasNewFailure(presentation.work, work) });
+  const { expanded } = presentation;
+  useEffect(() => {
+    try {
+      if (presentation.expanded) sessionStorage.removeItem(presentationKey);
+      else sessionStorage.setItem(presentationKey, JSON.stringify(presentation.work));
+    } catch { /* Browser storage is optional; the presentation still works in memory. */ }
+  }, [presentationKey, presentation]);
   const pending = useRef(false);
   const disposed = useRef(false);
   useEffect(() => {
@@ -55,31 +69,53 @@ function NativeWork({ tab, work, onRecover }: {
     }
   }
 
-  const stopped = work.goalStatus === "blocked" || work.turnStatus === "failed" || work.recoveryStatus === "failed";
+  const needsAttention = work.goalStatus === "blocked" || work.turnStatus === "failed" || work.recoveryStatus === "failed";
+  const heading = work.turnStatus === "running" ? "Native turn running"
+    : work.turnStatus === "failed" ? "Native turn failed"
+    : work.recoveryStatus === "failed" ? "Native recovery failed" : "Codex native work";
   return <section className="codex-native-work" aria-label={`Native work for ${tab.title}`} aria-busy={busy}>
-    <h2>{stopped ? <AlertTriangle size={16} aria-hidden="true" /> : null}{work.goalStatus === "blocked" ? "Goal blocked — native work stopped" : work.turnStatus === "failed" ? "Native turn failed" : "Codex native work"}</h2>
+    <div className="codex-native-heading">
+      <h2>{needsAttention ? <AlertTriangle size={16} aria-hidden="true" /> : null}{heading}{work.goalStatus === "blocked" ? " · Goal blocked" : ""}</h2>
+      <ControlButton size="compact" aria-expanded={expanded} aria-controls={detailsId} onClick={() => setPresentation({ work, expanded: !expanded })}>{expanded ? "Hide native work details" : "Show native work details"}</ControlButton>
+    </div>
     <p className="codex-native-status">Terminal process: {statusLabel(tab.status)} · Native turn: {work.turnStatus ? statusLabel(work.turnStatus) : "Not observed"} · Goal: {work.goalStatus ? statusLabel(work.goalStatus) : "Not observed"}</p>
-    {work.recoveryStatus ? <p role="status">{recoveryMessage(work.recoveryStatus)}</p> : null}
-    {work.lastError ? <details open={stopped || work.lastError.kind === "retry"}>
-      <summary>{work.lastError.kind === "retry" ? "Provider retry notice" : "Last terminal provider error"}</summary>
-      <p>{work.lastError.message}</p>
-      <p className="codex-native-diagnostics">
-        {work.lastError.code ? <span>Error code: <code>{work.lastError.code}</code></span> : null}
-        {work.lastError.requestId ? <span>Request ID: <code>{work.lastError.requestId}</code></span> : null}
-        {work.lastError.httpStatusCode !== undefined ? <span>HTTP status: {work.lastError.httpStatusCode}; a transport response does not establish native completion.</span> : null}
-      </p>
-    </details> : null}
-    {stopped || recoveryPending || busy || submitted ? <>
-      <p>Restart only this client in the saved conversation and workspace. This resets local client transport state; it is not a proven fix for provider failures.</p>
-      {goalNeedsResume ? <p>After restart, enter <code>/goal resume</code> in this terminal to explicitly reactivate the saved goal with its existing objective, budget and token/time accounting. Conversation resume alone leaves a blocked goal inactive.</p>
-        : work.recoveryStatus === "awaiting_turn" ? <p>Send your next message in this terminal. Recovery is confirmed after the native turn completes.</p> : null}
-      <details><summary>Recovery target</summary><p>Conversation: <code>{work.threadId}</code><br />Execution: <code>{work.executionId}</code><br />Workspace: <code>{tab.cwd}</code></p></details>
-    </> : null}
-    {stopped && !recoveryPending && !submitted ? <ControlButton size="compact" disabled={busy || Boolean(restartUnavailable)} onClick={() => void restart()}>Restart this Codex client</ControlButton> : null}
-    {stopped && restartUnavailable ? <p className="codex-native-unavailable">{restartUnavailable}</p> : null}
-    {busy ? <p role="status">Restarting this client…</p> : submitted && !recoveryPending ? <p role="status">Client restart requested. Waiting for recorded native state.</p> : null}
-    {error ? <p role="alert">{error}</p> : null}
+    <div id={detailsId} hidden={!expanded}>
+      {work.recoveryStatus ? <p role="status">{recoveryMessage(work.recoveryStatus)}</p> : null}
+      {work.lastError ? <details open={needsAttention || work.lastError.kind === "retry"}>
+        <summary>{work.lastError.kind === "retry" ? "Provider retry notice" : "Last terminal provider error"}</summary>
+        <p>{work.lastError.message}</p>
+        <p className="codex-native-diagnostics">
+          {work.lastError.code ? <span>Error code: <code>{work.lastError.code}</code></span> : null}
+          {work.lastError.requestId ? <span>Request ID: <code>{work.lastError.requestId}</code></span> : null}
+          {work.lastError.httpStatusCode !== undefined ? <span>HTTP status: {work.lastError.httpStatusCode}; a transport response does not establish native completion.</span> : null}
+        </p>
+      </details> : null}
+      {needsAttention || recoveryPending || busy || submitted ? <>
+        <p>Restart only this client in the saved conversation and workspace. This resets local client transport state; it is not a proven fix for provider failures.</p>
+        {goalNeedsResume ? <p>{work.turnStatus === "running" ? "After the running turn finishes, enter " : "Enter "}<code>/goal resume</code> in this terminal to explicitly reactivate the saved goal with its existing objective, budget and token/time accounting. Conversation resume alone leaves a blocked goal inactive. Hiding these details does not require a restart or change the goal.</p>
+          : work.recoveryStatus === "awaiting_turn" ? <p>Send your next message in this terminal. Recovery is confirmed after the native turn completes.</p> : null}
+        <details><summary>Recovery target</summary><p>Conversation: <code>{work.threadId}</code><br />Execution: <code>{work.executionId}</code><br />Workspace: <code>{tab.cwd}</code></p></details>
+      </> : null}
+      {needsAttention && !recoveryPending && !submitted ? <ControlButton size="compact" disabled={busy || Boolean(restartUnavailable)} onClick={() => void restart()}>Restart this Codex client</ControlButton> : null}
+      {needsAttention && restartUnavailable ? <p className="codex-native-unavailable">{restartUnavailable}</p> : null}
+      {busy ? <p role="status">Restarting this client…</p> : submitted && !recoveryPending ? <p role="status">Client restart requested. Waiting for recorded native state.</p> : null}
+      {error ? <p role="alert">{error}</p> : null}
+    </div>
   </section>;
+}
+
+function readCollapsedWork(key: string): CodexNativeWork | undefined {
+  try {
+    const value: unknown = JSON.parse(sessionStorage.getItem(key) ?? "null");
+    return isCodexNativeWork(value) ? value : undefined;
+  } catch { return undefined; }
+}
+
+function hasNewFailure(previous: CodexNativeWork, current: CodexNativeWork): boolean {
+  return current.turnStatus === "failed" && (previous.turnStatus !== "failed" || previous.turnId !== current.turnId) ||
+    current.goalStatus === "blocked" && previous.goalStatus !== "blocked" ||
+    current.recoveryStatus === "failed" && previous.recoveryStatus !== "failed" ||
+    current.lastError !== undefined && JSON.stringify(current.lastError) !== JSON.stringify(previous.lastError);
 }
 
 function statusLabel(status: string): string {

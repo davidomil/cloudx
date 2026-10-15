@@ -31,7 +31,7 @@ import type {
 } from "@cloudx/shared";
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { MAX_FORGE_WORKFLOW_TEXT_LENGTH, parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
-import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
+import { ForgeBranchConflictError, ForgeHandoffError, type ForgePublicationLease } from "./ForgeRuntime.js";
 import { directoryOwnershipAvailability } from "../directoryOwnershipReconciliation.js";
 import { ForgeWorkQueue } from "./ForgeWorkQueue.js";
 import { ForgeMergeQueue } from "./ForgeMergeQueue.js";
@@ -160,7 +160,7 @@ interface Runtime {
     },
     signal?: AbortSignal,
     expectedHeadSha?: string,
-    expectedRemoteHeadSha?: string,
+    lease?: ForgePublicationLease,
   ): Promise<string>;
   prepareIssueRebase(
     workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
@@ -2381,14 +2381,14 @@ export class ForgeWorkflowService {
       } else if (worker.rebaseRecovery?.phase === "publishing") {
         const rebase = worker.rebaseRecovery;
         this.requireIdleReviewers(worker);
-        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal, rebase.headSha, rebase.expectedHeadSha);
+        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal, rebase.headSha, { purpose: "rebase", expectedRemoteHeadSha: rebase.expectedHeadSha });
         if (publication.headSha !== rebase.headSha)
           throw new Error("The published rebase does not match its saved completed commit.");
       } else {
         let headSha: string;
         try {
           headSha = this.isCiRepairPublication(worker)
-            ? await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha, worker.ciRepair!.diagnostic!.sourceHeadSha)
+            ? await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha, { purpose: "ci_repair", expectedRemoteHeadSha: worker.ciRepair!.diagnostic!.sourceHeadSha })
             : await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha);
         } catch (error) {
           if (error instanceof ForgeHandoffError && error.publicationNotStarted)

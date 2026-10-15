@@ -222,6 +222,31 @@ describe("GitHub required CI diagnostics", () => {
   ])("does not fetch logs for $patch", async ({ patch, state }) => {
     const fixture = githubFixture({ checks: [{ ...check, ...patch }] });
     expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state, jobs: [] });
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+  });
+
+  it.each([
+    { run: { status: "in_progress", conclusion: null }, state: "pending" },
+    { run: { status: "queued", conclusion: null }, state: "pending" },
+    { run: { status: "completed", conclusion: "failure" }, state: "blocked" },
+    { run: { status: "completed", conclusion: "cancelled" }, state: "blocked" },
+    { run: { status: "in_progress", head_sha: stale }, state: "obsolete" },
+    { run: { status: "in_progress", run_attempt: 3 }, state: "obsolete" },
+    { run: { status: "in_progress", pull_requests: [{ number: 8, head: { sha: source } }] }, state: "obsolete" },
+  ])("waits for missing required gates only in the exact active current run: $run", async ({ run, state }) => {
+    const fixture = githubFixture({ checks: [
+      { ...check, isRequired: false },
+      { ...check, databaseId: 902, name: "TypeScript", conclusion: "SUCCESS" },
+    ], run });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state, jobs: [] });
+    expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/actions/runs/100"))).toHaveLength(1);
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+  });
+
+  it("bounds workflow-run inspection while required gates are absent", async () => {
+    const fixture = githubFixture({ checks: Array.from({ length: 9 }, (_, index) => ({ ...check, databaseId: 901 + index, isRequired: false,
+      checkSuite: { workflowRun: { databaseId: 100 + index, runAttempt: 2 } } })) });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [], reason: expect.stringContaining("Too many current CI runs") });
     expect(fixture.fetcher.mock.calls.some(([url]) => String(url).includes("/actions/"))).toBe(false);
   });
 

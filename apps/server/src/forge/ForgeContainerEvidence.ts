@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { Parser, type ReadEntry } from "tar";
@@ -36,15 +37,19 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
   let files = 0;
   let bytes = 0;
   let archiveBytes = 0;
-  let entries = 0;
+  const traversal = new ContainerEvidenceTraversal();
   const root = path.posix.basename(source);
   const parser = new Parser({ strict: true });
+  let archiveComplete = false;
   const pendingEntries = new Set<ReadEntry>();
   let tail = Promise.resolve();
   const destination = new Writable({
     write(chunk: Buffer, _encoding, callback) {
       archiveBytes += chunk.length;
       if (archiveBytes > maxEvidenceCollectionBytes * 2 + 8 * 1024 * 1024) { callback(new Error("Container evidence tar exceeds its bounded input limit; the environment was preserved.")); return; }
+      try { traversal.checkTime(); } catch (error) { callback(error as Error); return; }
+      // tar buffers input after EOF; charge trailing input without accumulating it.
+      if (archiveComplete) { callback(); return; }
       if (parser.write(chunk)) callback();
       else parser.once("drain", callback);
     },
@@ -56,19 +61,25 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
   });
   // Consume rejection immediately even if source input fails before finalization.
   completion.catch(error => { destination.destroy(error as Error); });
+  parser.on("eof", () => { archiveComplete = true; });
   parser.on("ignoredEntry", () => parser.abort(new Error("Container evidence archive contains unsupported entries or oversized metadata.")));
+  parser.on("meta", value => {
+    try { traversal.recordMetadata(value); } catch (error) { parser.abort(error as Error); }
+  });
   parser.on("entry", entry => {
     const fail = (reason: string) => parser.abort(new Error(reason));
-    if (++entries > 8192) { fail("Container evidence tar has too many entries; select narrower paths."); return; }
     const name = entry.path.replace(/^\.\//u, "").replace(/\/$/u, "");
     if (!name || name.length > 4096 || name.includes("\\") || /[\u0000-\u001f]/u.test(name) || path.posix.isAbsolute(name) || path.posix.normalize(name) !== name || name.split("/")[0] !== root) {
       fail("Container evidence archive contains an unsafe or unexpected path."); return;
     }
     const filePath = source.slice(1) + name.slice(root.length);
+    const discarded = generatedEvidencePath(filePath) || filePath.split("/").includes(".git");
+    try { traversal.recordEntry(entry, discarded); } catch (error) { parser.abort(error as Error); return; }
+    if (hasLinkParent(filePath, links)) { fail("Container evidence archive contains a symbolic-link parent."); return; }
+    if (discarded) { entry.resume(); return; }
     if (keys.has(filePath)) { fail("Container evidence archive contains duplicate paths."); return; }
-    if ([...links].some(link => filePath.startsWith(`${link}/`))) { fail("Container evidence archive contains a symbolic-link parent."); return; }
     keys.add(filePath);
-    if (generatedEvidencePath(filePath) || filePath.split("/").includes(".git") || entry.type === "Directory") { entry.resume(); return; }
+    if (entry.type === "Directory") { entry.resume(); return; }
     let linkData: Buffer | undefined;
     if (entry.type === "SymbolicLink") {
       if (entry.size !== 0 || [...keys].some(key => key.startsWith(`${filePath}/`))) { fail("Container evidence archive contains an invalid symbolic-link parent or body."); return; }
@@ -104,6 +115,47 @@ export async function readContainerEvidenceTar(source: string, tar: AsyncIterabl
     throw error;
   }
   if (!files) throw new Error(`Evidence source ${source} has no exportable files or fixture links; select specific valuable data.`);
+}
+
+/** Docker's stopped-container archive API cannot exclude paths at the producer. */
+class ContainerEvidenceTraversal {
+  private readonly deadline = performance.now() + 60_000;
+  private entries = 0;
+  private generatedBytes = 0;
+  private metadataBytes = 0;
+  private metadataEntries = 0;
+
+  recordMetadata(value: string): void {
+    this.checkTime();
+    this.metadataBytes += 512 + Math.ceil(Buffer.byteLength(value) / 512) * 512;
+    this.metadataEntries++;
+    if (this.metadataBytes > 8 * 1024 * 1024) throw new Error("Container evidence tar exceeds its metadata traversal limit; select narrower paths.");
+  }
+
+  recordEntry(entry: ReadEntry, discarded: boolean): void {
+    this.checkTime();
+    if (discarded) {
+      if (!Number.isSafeInteger(entry.startBlockSize) || entry.startBlockSize < 0) throw new Error("Container evidence tar contains an invalid generated entry size.");
+      this.generatedBytes += 512 + entry.startBlockSize + this.metadataBytes;
+      if (this.generatedBytes > 64 * 1024 * 1024) throw new Error("Container evidence tar exceeds its generated archive traversal limit (64 MiB including headers); select narrower evidence paths. The environment was preserved.");
+    } else {
+      this.entries += 1 + this.metadataEntries;
+      if (this.entries > 8192) throw new Error("Container evidence tar has too many entries; select narrower paths.");
+    }
+    this.metadataBytes = 0;
+    this.metadataEntries = 0;
+  }
+
+  checkTime(): void {
+    if (performance.now() > this.deadline) throw new Error("Container evidence tar traversal timed out after 60 seconds; the environment was preserved.");
+  }
+}
+
+function hasLinkParent(filePath: string, links: Set<string>): boolean {
+  for (let end = filePath.lastIndexOf("/"); end > 0; end = filePath.lastIndexOf("/", end - 1)) {
+    if (links.has(filePath.slice(0, end))) return true;
+  }
+  return false;
 }
 
 export class ForgeContainerEvidence {
