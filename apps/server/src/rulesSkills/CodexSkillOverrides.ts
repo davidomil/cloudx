@@ -42,12 +42,12 @@ export async function captureCodexSkillOverrides(codexHome: string, defaultDisab
   const overriddenPaths = new Set(entries.flatMap(entry => "path" in entry ? [entry.path] : []));
   const canonicalHome = await fs.realpath(codexHome);
   return parseCodexSkillOverrides([
+    ...defaultDisabledPaths.filter(skillPath => !overriddenPaths.has(skillPath)).map(skillPath => ({ path: skillPath, enabled: true })),
     ...entries.map(entry => {
       if (!("path" in entry)) return entry;
       const relative = path.relative(canonicalHome, entry.path);
       return isGeneratedSkillPath(relative) ? { generatedPath: relative, enabled: entry.enabled } : entry;
-    }),
-    ...defaultDisabledPaths.filter(skillPath => !overriddenPaths.has(skillPath)).map(skillPath => ({ path: skillPath, enabled: true }))
+    })
   ]);
 }
 

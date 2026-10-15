@@ -73,6 +73,26 @@ it("carries native enabled project skills and disabled generated skills into a s
   } finally { await sources.dispose(); }
 });
 
+it.each(["name only", "path then name", "name then path"])("preserves native %s rule precedence over inferred defaults", async order => {
+  const { sources, options, projectSkill, home } = await fixture();
+  try {
+    const parent = await materializeCodexHomeOverlay({ ...options, tabId: "parent" });
+    const nameRule = { name: "project", enabled: false };
+    const pathRule = { path: projectSkill, enabled: true };
+    const nativeRules = order === "name only" ? [nameRule] : order === "path then name" ? [pathRule, nameRule] : [nameRule, pathRule];
+    const config = parse(await fs.readFile(parent.configPath, "utf8"));
+    (config.skills as TomlTable).config = nativeRules;
+    await fs.writeFile(parent.configPath, stringify(config));
+
+    const captured = await readCodexSkillOverrides(parent.codexHome, { cwd: options.cwd, homeDir: home });
+    const expected = order === "name only" ? [pathRule, nameRule] : nativeRules;
+    expect(captured).toEqual(expected);
+    const child = await materializeCodexHomeOverlay({ ...options, tabId: "child", nativeSkillOverrides: captured });
+    const childRules = (parse(await fs.readFile(child.configPath, "utf8")).skills as TomlTable).config as TomlTable[];
+    expect(childRules.filter(entry => entry.path === projectSkill || entry.name === "project")).toEqual(expected);
+  } finally { await sources.dispose(); }
+});
+
 it("drops generated overrides for skills absent from the child's selected catalog", () => {
   const child = "/views/child";
   expect(resolveCodexSkillOverrides([

@@ -57,7 +57,8 @@ export class CodexConversationForks {
         for (const fork of this.read(tabId, executionId)) {
           if (stopped || seen.has(fork.sessionId)) continue;
           seen.add(fork.sessionId);
-          await onFork(fork);
+          try { await onFork(fork); }
+          catch (error) { if (!stopped) onError(error); }
         }
       }).catch(error => { if (!stopped) onError(error); });
       return pending;

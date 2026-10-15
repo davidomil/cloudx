@@ -10,7 +10,7 @@ import type { ResolvedPersonalityTemplate } from "./RulesSkillsCatalogService.js
 
 const codex = process.env.CLOUDX_NATIVE_CODEX;
 
-it.skipIf(!codex)("preserves real native enabled and disabled skills across fork handoff and child process loss", async () => {
+it.skipIf(!codex).each(["path", "path then name"])("preserves real native %s skill choices across fork handoff and child process loss", async selector => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-fork-skills-"));
   const home = path.join(root, "home");
   const cwd = path.join(root, "workspace");
@@ -60,8 +60,9 @@ it.skipIf(!codex)("preserves real native enabled and disabled skills across fork
     const started = await parent.client.request("thread/start", { cwd, persistExtendedHistory: true }) as { thread: { id: string } };
     await parent.client.request("thread/inject_items", { threadId: started.thread.id, items: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Shared native fork history." }] }] });
     await parent.client.request("skills/config/write", { path: projectSkill, enabled: true });
+    if (selector === "path then name") await parent.client.request("skills/config/write", { name: "project-choice", enabled: false });
     await parent.client.request("skills/config/write", { path: selectedPath(parent.overlay), enabled: false });
-    await expectChoices(parent.client, parent.overlay, true, false);
+    await expectChoices(parent.client, parent.overlay, selector === "path", false);
     const fork = await parent.client.request("thread/fork", { threadId: started.thread.id, cwd, persistExtendedHistory: true }) as { thread: { id: string } };
     expect(fork.thread.id).not.toBe(started.thread.id);
     const inherited = await readCodexSkillOverrides(parent.overlay.codexHome, { cwd, homeDir: home });
@@ -69,9 +70,9 @@ it.skipIf(!codex)("preserves real native enabled and disabled skills across fork
     await parent.stopped;
     const child = await launch("child", inherited);
     expect(await child.client.request("thread/resume", { threadId: fork.thread.id, cwd })).toMatchObject({ thread: { id: fork.thread.id } });
-    await expectChoices(child.client, child.overlay, true, false);
-    // Flip both choices in the child and recover after losing its native process.
-    await child.client.request("skills/config/write", { path: projectSkill, enabled: false });
+    await expectChoices(child.client, child.overlay, selector === "path", false);
+    // Keep the name-based disable while changing the selected skill before process loss.
+    if (selector === "path") await child.client.request("skills/config/write", { path: projectSkill, enabled: false });
     await child.client.request("skills/config/write", { path: selectedPath(child.overlay), enabled: true });
     await expectChoices(child.client, child.overlay, false, true);
     const recoveredChoices = await readCodexSkillOverrides(child.overlay.codexHome, { cwd, homeDir: home });

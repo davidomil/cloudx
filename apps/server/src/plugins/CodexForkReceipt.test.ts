@@ -86,6 +86,26 @@ it("finishes with a final journal read and drains pending placements once before
   expect(failed).not.toHaveBeenCalled();
 });
 
+it("continues the final drain after a failed placement without retrying either fork", async () => {
+  const first = { sessionId: childId, cwd: home };
+  const second = { sessionId: executionId, cwd: home };
+  const failure = new Error("The first fork directory was removed");
+  const open = vi.fn(async (fork: { sessionId: string }) => {
+    if (fork.sessionId === childId) throw failure;
+  });
+  const failed = vi.fn();
+  const observation = forks.observe("parent", executionId, open, failed);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    await writeReceipt(JSON.stringify(journal([first, second, first, second])));
+    await observation.finish();
+    expect(open.mock.calls.map(([fork]) => fork.sessionId)).toEqual([childId, executionId]);
+    expect(failed).toHaveBeenCalledExactlyOnceWith(failure);
+    await observation.finish();
+    expect(open).toHaveBeenCalledTimes(2);
+  } finally { observation.stop(); }
+});
+
 it.each([
   { ...journal([]), tabId: "another-tab" },
   { ...journal([]), executionId: childId },
