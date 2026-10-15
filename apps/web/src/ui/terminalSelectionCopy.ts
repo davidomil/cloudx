@@ -81,6 +81,7 @@ export class TerminalSelectionCopy {
     }
     terminal.element!.addEventListener("mousedown", this.onMouseDown, capture);
     terminal.element!.addEventListener("mousedown", this.captureClickedRange, { signal: this.events.signal });
+    window.addEventListener("pointerdown", this.onOutsidePointerDown, capture);
     window.addEventListener("mousemove", this.onMouseMove, capture);
     window.addEventListener("mouseup", this.onMouseUp, capture);
     this.selectionListener = terminal.onSelectionChange(() => {
@@ -168,6 +169,14 @@ export class TerminalSelectionCopy {
       if (this.clicks === 1 && this.terminal.buffer.active.getLine(start.y)?.getCell(start.x)?.getWidth() === 0) start.x++;
       this.dragStart = this.dragEnd = start;
     }
+  };
+
+  private onOutsidePointerDown = (event: PointerEvent): void => {
+    if (!this.text || this.selecting) return;
+    const path = event.composedPath();
+    if (path.includes(this.panel) || path.includes(this.menu)) return;
+    if (event.button === 2 && path.includes(this.terminal.element!)) return;
+    this.clear();
   };
 
   private pointerPosition(event: Pick<MouseEvent, "clientX" | "clientY">, viewportY: number): IBufferCellPosition {

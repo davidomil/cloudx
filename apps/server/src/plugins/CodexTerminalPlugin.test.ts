@@ -16,6 +16,7 @@ import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
+import { CodexConversationForks } from "./CodexConversationForks.js";
 import { codexNativeWorkPath } from "./CodexNativeWork.js";
 import { AgentAccountStore } from "../agents/AgentAccountStore.js";
 import { readCodexLaunchPreferences, writeCodexLaunchPreferences, type CodexLaunchPreferences } from "./CodexLaunchPreferences.js";
@@ -1813,6 +1814,79 @@ describe("Codex terminal update recovery", () => {
 describe("Codex conversation recovery after process loss", () => {
   const conversationId = "01a08470-d118-7b72-b1df-439e72e5c744";
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("opens a confirmed fork once with its cwd and runtime while preserving the parent binding", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const openSiblingTab = vi.fn(async () => undefined);
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn(), openSiblingTab };
+      const runtimeContext = { activeWindowId: "original-window" };
+      const session = await plugin.createSession({ tab, cwd: root, controls, runtimeContext,
+        initialInput: { prompt: "Do not replay", model: "gpt-6-astra", reasoningEffort: "max" } });
+      const selection = factory.bridgeLaunch().selection;
+      const child = "01a08470-d118-7b72-b1df-439e72e5c745";
+      const receipt = new CodexConversationRecovery(factory.env!.CODEX_HOME!);
+      const forks = new CodexConversationForks(factory.env!.CODEX_HOME!);
+      await fs.writeFile(receipt.receiptPath, JSON.stringify({ version: 2, authority: "selected", ...selection, sessionId: conversationId, cwd: root }));
+      await vi.waitFor(() => expect(session.restoreInput?.()).toMatchObject({ resume: { sessionId: conversationId } }));
+      const value = { version: 1, tabId: tab.id, executionId: selection.executionId, forks: [{ sessionId: child, cwd: root }] };
+      await fs.writeFile(`${forks.receiptPath}.tmp`, JSON.stringify(value));
+      await fs.rename(`${forks.receiptPath}.tmp`, forks.receiptPath);
+      await vi.waitFor(() => expect(openSiblingTab).toHaveBeenCalledExactlyOnceWith({ key: child, cwd: root,
+        initialInput: { resume: { mode: "session", sessionId: child }, agent: undefined, codexForkSourceTabId: tab.id, codexRuntimeContext: runtimeContext } }));
+      expect(session.restoreInput?.()).toMatchObject({ resume: { sessionId: conversationId }, codexOpenedForks: [child] });
+      expect(factory.process!.written).toBe("");
+      Object.assign(factory.process!, { detach: vi.fn() });
+      Object.assign(factory, { attach: async () => factory.process! });
+      const initialInput = session.restoreInput?.();
+      session.detach?.();
+      const restored = await plugin.restoreSession({ tab, cwd: root, controls, runtimeContext, initialInput });
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(openSiblingTab).toHaveBeenCalledOnce();
+      expect(restored.restoreInput?.()).toMatchObject({ resume: { sessionId: conversationId } });
+      restored.stop?.();
+    });
+  });
+
+  it("surfaces failed fork placement without clearing the source's recoverable identity or retrying", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn(),
+        openSiblingTab: vi.fn(async () => { throw new Error("Source pane closed"); }) };
+      const session = await plugin.createSession({ tab, cwd: root, controls, initialInput: { resume: { mode: "session", sessionId: conversationId } } });
+      const selection = factory.bridgeLaunch().selection;
+      const child = "01a08470-d118-7b72-b1df-439e72e5c745";
+      const forks = new CodexConversationForks(factory.env!.CODEX_HOME!);
+      const value = { version: 1, tabId: tab.id, executionId: selection.executionId, forks: [{ sessionId: child, cwd: root }] };
+      await fs.writeFile(`${forks.receiptPath}.tmp`, JSON.stringify(value));
+      await fs.rename(`${forks.receiptPath}.tmp`, forks.receiptPath);
+      await vi.waitFor(() => expect(controls.setTabIndicator).toHaveBeenCalledWith(expect.objectContaining({ label: "Fork needs attention" })));
+      expect(session.restoreInput?.()).toMatchObject({ resume: { sessionId: conversationId }, codexOpenedForks: [child], codexForkError: expect.stringContaining("Source pane closed") });
+      await fs.writeFile(`${forks.receiptPath}.tmp`, JSON.stringify(value));
+      await fs.rename(`${forks.receiptPath}.tmp`, forks.receiptPath);
+      await new Promise(resolve => setTimeout(resolve, 300));
+      expect(controls.openSiblingTab).toHaveBeenCalledOnce();
+      session.stop?.();
+    });
+  });
+
+  it("launches a fork with the source template and its own exact resume without inheriting the old prompt or model override", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const controls = { closeTab: vi.fn(), setTabIndicator: vi.fn(), setRestoreInput: vi.fn() };
+      const runtimeContext = { pluginRuntime: { "rules-skills": { personalityTemplate: { source: "tab", template: { id: "source-template", name: "Source", color: "green", ruleIds: [], skillIds: [] }, rules: [], skills: [] } } } };
+      const source = await plugin.createSession({ tab, cwd: root, controls, runtimeContext,
+        initialInput: { prompt: "Do not replay", model: "gpt-6-astra", reasoningEffort: "max" } });
+      const childId = "01a08470-d118-7b72-b1df-439e72e5c745";
+      const child = await plugin.createSession({ tab: { ...tab, id: "child-tab" }, cwd: root, controls,
+        runtimeContext: {}, initialInput: { resume: { mode: "session", sessionId: childId }, codexForkSourceTabId: tab.id, codexRuntimeContext: runtimeContext } });
+      expect(factory.bridgeLaunch().tuiArgs.slice(-2)).toEqual(["resume", childId]);
+      expect(factory.bridgeLaunch().tuiArgs).not.toContain("gpt-6-astra");
+      expect(factory.bridgeLaunch().tuiArgs).not.toContain("Do not replay");
+      expect(factory.env!.CLOUDX_PERSONALITY_TEMPLATE_ID).toBe("source-template");
+      expect(child.restoreInput?.()).toMatchObject({ resume: { sessionId: childId }, codexRuntimeContext: runtimeContext });
+      expect(child.restoreInput?.()?.codexExecutionId).not.toBe(source.restoreInput?.()?.codexExecutionId);
+      child.stop?.();
+      source.stop?.();
+    });
+  });
 
   it("persists native conversation changes while keeping the launch model and runtime", async () => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {

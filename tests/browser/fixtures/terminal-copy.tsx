@@ -30,7 +30,10 @@ Terminal.prototype.open = function (parent) {
 
 function TerminalCopyFixture() {
   const [tabId, setTabId] = useState("copy-tab");
+  const [sidebarClicks, setSidebarClicks] = useState(0);
   const view = new URLSearchParams(window.location.search).get("view");
+  const split =
+    new URLSearchParams(window.location.search).get("split") === "true";
   const tab: WorkspaceTab = {
     id: tabId,
     pluginId: view === "terminal" ? "standard-terminal" : "codex-terminal",
@@ -93,9 +96,45 @@ function TerminalCopyFixture() {
       >
         Switch tab
       </button>
-      <div style={{ flex: 1, minHeight: 0 }}>
-        <TerminalPanel tab={tab} active uiScale={1} />
+      {split && (
+        <aside aria-label="Sidebar">
+          <button onClick={() => setSidebarClicks((clicks) => clicks + 1)}>
+            Sidebar action
+          </button>
+          <output aria-label="Sidebar clicks">{sidebarClicks}</output>
+        </aside>
+      )}
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        <section aria-label="Source pane" style={{ flex: 1, minWidth: 0 }}>
+          <TerminalPanel tab={tab} active uiScale={1} />
+        </section>
+        {split && (
+          <section
+            aria-label="Other pane"
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              flex: 1,
+              minWidth: 0,
+            }}
+          >
+            <input
+              aria-label="Other pane input"
+              style={{ width: "100%", boxSizing: "border-box" }}
+            />
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <TerminalPanel
+                tab={{ ...tab, id: "other-pane", title: "Other terminal" }}
+                active
+                uiScale={1}
+              />
+            </div>
+          </section>
+        )}
       </div>
+      {split && (
+        <div aria-label="Empty workbench space" style={{ height: 32 }} />
+      )}
     </div>
   );
 }

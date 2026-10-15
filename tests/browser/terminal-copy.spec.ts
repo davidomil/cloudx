@@ -43,25 +43,30 @@ test.afterAll(async () => {
   );
 });
 
-async function terminalStream(page: Page, pausedClock = false, view = "codex") {
+async function terminalStream(
+  page: Page,
+  pausedClock = false,
+  view = "codex",
+  split = false,
+) {
   let socket: WebSocketRoute;
   const input: string[] = [];
   let connections = 0;
   await page.routeWebSocket("**/ws/terminal/*", (connection) => {
-    socket = connection;
+    if (!split || !connections) socket = connection;
     connections++;
     connection.onMessage((message) => {
       const event = JSON.parse(String(message));
       if (event.type === "input") input.push(event.data);
     });
   });
-  await page.goto(`${baseUrl}?view=${view}`);
+  await page.goto(`${baseUrl}?view=${view}&split=${split}`);
   if (pausedClock) {
     await expect(page.locator(".xterm")).toBeVisible();
     await page.clock.runFor(50);
   }
-  await expect.poll(() => connections).toBe(1);
-  await expect(page.locator(".xterm-rows")).toContainText("Cloudx tab");
+  await expect.poll(() => connections).toBe(split ? 2 : 1);
+  await expect(page.locator(".xterm-rows").first()).toContainText("Cloudx tab");
   return {
     input,
     connections: () => connections,
@@ -73,20 +78,24 @@ async function terminalStream(page: Page, pausedClock = false, view = "codex") {
 }
 
 async function cells(page: Page) {
-  return page.locator(".xterm-screen").evaluate((element) => {
-    const screen = element.getBoundingClientRect();
-    const row = element
-      .querySelector(".xterm-rows > div")!
-      .getBoundingClientRect();
-    const measure = document.querySelector(".xterm-char-measure-element")!;
-    return {
-      x: screen.x,
-      y: screen.y,
-      width: screen.width,
-      cell: measure.getBoundingClientRect().width / measure.textContent!.length,
-      height: row.height,
-    };
-  });
+  return page
+    .locator(".xterm-screen")
+    .first()
+    .evaluate((element) => {
+      const screen = element.getBoundingClientRect();
+      const row = element
+        .querySelector(".xterm-rows > div")!
+        .getBoundingClientRect();
+      const measure = document.querySelector(".xterm-char-measure-element")!;
+      return {
+        x: screen.x,
+        y: screen.y,
+        width: screen.width,
+        cell:
+          measure.getBoundingClientRect().width / measure.textContent!.length,
+        height: row.height,
+      };
+    });
 }
 
 async function dragSelection(
@@ -1179,6 +1188,170 @@ test("Shift-drag selects while mouse reporting is active and copy does not reach
   expect(stream.input).toEqual([]);
   await page.mouse.click(size.x + 20, size.y + size.height / 2);
   await expect.poll(() => stream.input.join("")).toMatch(/\x1b\[<0;/u);
+});
+
+for (const [target, selector] of [
+  ["source terminal", '[aria-label="Source pane"] .xterm-screen'],
+  ["other terminal", '[aria-label="Other pane"] .xterm-screen'],
+  ["sidebar", '[aria-label="Sidebar"] button'],
+  ["other pane input", '[aria-label="Other pane input"]'],
+  ["empty workbench", '[aria-label="Empty workbench space"]'],
+] as const) {
+  test(`outside clicks in ${target} dismiss both terminal copy previews without taking the click or copying stale text`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "desktop-chromium",
+      "Desktop mouse selection.",
+    );
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    const stream = await terminalStream(page, false, "codex", true);
+    const source = page.getByRole("region", { name: "Source pane" });
+    const saved = source.getByLabel("Saved terminal selection");
+    const outside = page.locator(selector);
+    await page.evaluate(() =>
+      navigator.clipboard.writeText("clipboard sentinel"),
+    );
+    stream.data("\x1bcsaved text");
+    await expect(source.locator(".xterm-rows")).toContainText("saved text");
+    await select(page, [0, 0], [10, 0]);
+    await expect(saved.getByRole("textbox")).toHaveValue("saved text");
+    await saved.getByRole("textbox").click();
+    await expect(saved).toBeVisible();
+    const size = await cells(page);
+    await page.mouse.click(size.x + 20, size.y + size.height / 2, {
+      button: "right",
+    });
+    await expect(
+      page.getByRole("menuitem", { name: "Copy saved selection" }),
+    ).toBeVisible();
+
+    await outside.click();
+    await expect(saved).toBeHidden();
+    await expect(page.getByRole("menu", { exact: true })).toBeHidden();
+    if (target === "sidebar") {
+      await expect(page.getByLabel("Sidebar clicks")).toHaveText("1");
+      await expect(outside).toBeFocused();
+    } else if (target === "other pane input") {
+      await expect(outside).toBeFocused();
+      await page.keyboard.type("next action");
+      await expect(outside).toHaveValue("next action");
+    } else if (target.endsWith("terminal")) {
+      const pane = page.getByRole("region", {
+        name: target === "source terminal" ? "Source pane" : "Other pane",
+      });
+      await expect(pane.locator(".xterm-helper-textarea")).toBeFocused();
+    }
+    await source.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.press("Control+c");
+    await expect.poll(() => stream.input.join("")).toBe("\x03");
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+      "clipboard sentinel",
+    );
+
+    await select(page, [0, 0], [10, 0]);
+    await expect(saved.getByRole("textbox")).toHaveValue("saved text");
+    await saved.getByRole("button", { name: "Clear selection" }).click();
+    await expect(saved).toBeHidden();
+    const application = "application text";
+    const request = source.getByLabel("Application clipboard request");
+    stream.data(`\x1b]52;c;${Buffer.from(application).toString("base64")}\x07`);
+    await expect(request.getByRole("textbox")).toHaveValue(application);
+    await request.getByRole("textbox").click();
+    await expect(request).toBeVisible();
+    await outside.click();
+    await expect(request).toBeHidden();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+      "clipboard sentinel",
+    );
+
+    stream.data(`\x1b]52;c;${Buffer.from(application).toString("base64")}\x07`);
+    await expect(request.getByRole("textbox")).toHaveValue(application);
+    await request
+      .getByRole("button", { name: "Copy application text" })
+      .click();
+    await expect(request).toBeHidden();
+    await expect
+      .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+      .toBe(application);
+  });
+}
+
+test("finishing a selection outside its terminal keeps the preview until a later outside click", async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name !== "desktop-chromium",
+    "Desktop mouse selection.",
+  );
+  const stream = await terminalStream(page, false, "codex", true);
+  stream.data("\x1bcsaved text");
+  await expect(
+    page.getByRole("region", { name: "Source pane" }).locator(".xterm-rows"),
+  ).toContainText("saved text");
+  await dragSelection(page, [0, 0], [10, 0]);
+  stream.data("\x1b[1;1H\x1b[2Kredrawn text");
+  const source = page.getByRole("region", { name: "Source pane" });
+  const saved = source.getByLabel("Saved terminal selection");
+  await expect(saved.getByRole("textbox")).toHaveValue("saved text");
+  const input = page.getByRole("textbox", { name: "Other pane input" });
+  const bounds = (await page
+    .getByRole("region", { name: "Other pane" })
+    .locator(".xterm-screen")
+    .boundingBox())!;
+  await page.mouse.move(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2,
+    { steps: 8 },
+  );
+  await expect(saved).toBeVisible();
+  await page.mouse.up();
+  await expect(saved).toBeVisible();
+  await expect(saved.getByRole("textbox")).not.toHaveValue("");
+  await input.click();
+  await expect(saved).toBeHidden();
+  await expect(input).toBeFocused();
+});
+
+test("touch taps inside terminal previews preserve them and outside taps dismiss without approving copy", async ({
+  page,
+  context,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "Touchscreen input.");
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page, false, "codex", true);
+  stream.data("\x1bcsaved");
+  await expect(
+    page.getByRole("region", { name: "Source pane" }).locator(".xterm-rows"),
+  ).toContainText("saved");
+  await page.evaluate(() =>
+    navigator.clipboard.writeText("clipboard sentinel"),
+  );
+  await select(page, [0, 0], [5, 0]);
+  const source = page.getByRole("region", { name: "Source pane" });
+  const saved = source.getByLabel("Saved terminal selection");
+  await expect(saved.getByRole("textbox")).toHaveValue("saved");
+  await saved.getByRole("textbox").tap();
+  await expect(saved).toBeVisible();
+  await page.getByRole("button", { name: "Sidebar action" }).tap();
+  await expect(saved).toBeHidden();
+  await expect(page.getByLabel("Sidebar clicks")).toHaveText("1");
+  await select(page, [0, 0], [5, 0]);
+  await expect(saved.getByRole("textbox")).toHaveValue("saved");
+  await saved.getByRole("button", { name: "Clear selection" }).tap();
+  await expect(saved).toBeHidden();
+  const request = source.getByLabel("Application clipboard request");
+  stream.data("\x1b]52;c;c2F2ZWQ=\x07");
+  await expect(request.getByRole("textbox")).toHaveValue("saved");
+  await request.getByRole("textbox").tap();
+  await expect(request).toBeVisible();
+  await page.getByRole("button", { name: "Sidebar action" }).tap();
+  await expect(request).toBeHidden();
+  await expect(page.getByLabel("Sidebar clicks")).toHaveText("2");
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+    "clipboard sentinel",
+  );
 });
 
 test("keeps one saved selection through bounded scrollback churn and clears it deliberately", async ({

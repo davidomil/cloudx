@@ -13,8 +13,8 @@ import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
-import { completedVerificationTurn } from "./CodexVerificationTranscript.js";
-import type { PluginSession } from "@cloudx/plugin-api";
+import { completedVerificationTurn, readVerificationTranscript } from "./CodexVerificationTranscript.js";
+import type { PluginSession, PluginTabControls } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcess, NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import { SessionStateStore } from "../workspace/SessionStateStore.js";
 
@@ -105,7 +105,6 @@ it.skipIf(!codexBinary)("requires selection after native resume changes conversa
 
 it.skipIf(!codexBinary).each([
   { name: "preserves launch permissions and native conversation evidence through new, idle resume, process loss and migration", transition: "new" },
-  { name: "preserves native permission changes through fork and process loss", transition: "fork" },
   { name: "preserves native permission changes through first-prompt editing and process loss", transition: "edit" },
   { name: "preserves native permission changes through new and process loss", transition: "restricted-new" },
   { name: "preserves configured permissions and roots through native new and process loss", transition: "configured" }
@@ -233,7 +232,7 @@ it.skipIf(!codexBinary).each([
         terminal!.write!("\u001b");
         await new Promise(resolve => setTimeout(resolve, 150));
         terminal!.write!("\r");
-      } else submit(transition === "fork" ? "/fork" : "/new");
+      } else submit("/new");
       if (transition === "edit") {
         await expect.poll(visibleOutput, { timeout: 5_000 }).toContain("Conversationrevertedtothispoint.");
         expect(recovery.read()?.sessionId).toBe(original);
@@ -572,3 +571,158 @@ it.skipIf(!codexBinary)("requires explicit recovery after cached child-to-Main n
     await fs.rm(root, { recursive: true, force: true });
   }
 }, 30_000);
+
+it.skipIf(!codexBinary)("opens confirmed native forks independently while source history, permissions and recovery remain intact", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-fork-"));
+  const home = path.join(root, "home");
+  const data = path.join(root, "data");
+  const configuredRoot = path.join(root, "configured-workspace");
+  const skills = path.join(data, "rules-skills");
+  const sources = new CodexStateSources(data, { CODEX_HOME: home });
+  const requests: Array<{ model?: string; input?: unknown; text?: { format?: { schema?: { properties?: { title?: unknown } } } } }> = [];
+  const answer = "The native fork branch completed its own turn.";
+  const provider = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", chunk => { body += chunk; });
+    request.on("end", () => {
+      const input = JSON.parse(body);
+      requests.push(input);
+      const text = input.text?.format?.schema?.properties?.title ? '{"title":"Native fork recovery"}' : answer;
+      const item = { type: "message", id: "msg_fork", role: "assistant", phase: "final_answer", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        { type: "response.created", response: { id: "resp_fork", status: "in_progress", output: [] } },
+        { type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", content: [] } },
+        { type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text },
+        { type: "response.output_item.done", output_index: 0, item },
+        { type: "response.completed", response: { id: "resp_fork", status: "completed", output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } }
+      ]) response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      response.end();
+    });
+  });
+  await new Promise<void>(resolve => provider.listen(0, "127.0.0.1", resolve));
+  const port = (provider.address() as { port: number }).port;
+  const sessions = new Set<PluginSession>();
+  type Branch = { tab: WorkspaceTab; terminal: PluginSession; recovery: CodexConversationRecovery; output: string };
+  const branches: Branch[] = [];
+  const env = { PATH: process.env.PATH, HOME: home, CODEX_HOME: home, CLOUDX_ASSISTANT_BIN: codexBinary, SHELL: "/bin/sh", TERM: "xterm-256color" };
+  const production = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env);
+  const controls: PluginTabControls = {
+    closeTab: () => undefined,
+    setTabIndicator: () => undefined,
+    openSiblingTab: vi.fn(async input => {
+      const branch = await launch(`native-fork-${branches.length + 1}`, input.initialInput, input.cwd);
+      branches.push(branch);
+    })
+  };
+  const launch = async (id: string, initialInput?: Record<string, unknown>, cwd = root): Promise<Branch> => {
+    const tab: WorkspaceTab = { id, pluginId: "codex-terminal", title: id, cwd, status: "failed", createdAt: "", updatedAt: "",
+      indicator: { color: "red", label: "Exited", updatedAt: "" } };
+    const terminal = await production.createSession({ tab, cwd, workspaceId: "native-fork-workspace", initialInput, controls });
+    sessions.add(terminal);
+    const branch = { tab, terminal, recovery: new CodexConversationRecovery(sources.viewPath(tab.id)), output: "" };
+    terminal.onData!(chunk => {
+      branch.output = (branch.output + chunk).slice(-65_536);
+      if (chunk.includes("\u001b[6n")) terminal.write!("\u001b[1;1R");
+    });
+    return branch;
+  };
+  const transcript = (branch: Branch) => readVerificationTranscript(branch.recovery.read()?.transcriptPath);
+  const conversationRequests = () => requests.filter(request => !request.text?.format?.schema?.properties?.title);
+  const visible = (branch: Branch) => stripVTControlCharacters(branch.output).replace(/\s+/gu, "");
+  const complete = async (branch: Branch, text: string) => {
+    await branch.terminal.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    const firstNewEvent = (await transcript(branch)).length;
+    const threadId = branch.recovery.read()!.sessionId;
+    await branch.terminal.handleAction("enter_text", { text, submit: true });
+    await expect.poll(async () => completedVerificationTurn(await transcript(branch), firstNewEvent, threadId, answer), { timeout: 10_000 })
+      .toMatchObject({ threadId, turnId: expect.any(String) });
+    await branch.terminal.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    return transcript(branch);
+  };
+  const expectRestricted = (events: Awaited<ReturnType<typeof transcript>>) => {
+    expect(events.filter(item => item.type === "turn_context").at(-1)?.payload).toMatchObject({
+      model: "cloudx-native", approval_policy: "on-request", active_permission_profile: { id: ":workspace" },
+      sandbox_policy: { type: "workspace-write", writable_roots: expect.arrayContaining([skills]) },
+      workspace_roots: expect.arrayContaining([root, configuredRoot, skills])
+    });
+  };
+  try {
+    await fs.mkdir(home, { mode: 0o700 });
+    await fs.mkdir(configuredRoot);
+    await fs.writeFile(path.join(home, "config.toml"), [
+      '# CloudX launch preferences: {"yoloMode":true,"defaultSkills":{"imagegen":false}}',
+      'model = "cloudx-native"', 'model_provider = "cloudx-native"', 'check_for_update_on_startup = false',
+      'approval_policy = "on-request"', 'sandbox_mode = "read-only"',
+      '[sandbox_workspace_write]', `writable_roots = [${JSON.stringify(configuredRoot)}]`,
+      '[model_providers.cloudx-native]', 'name = "CloudX native forks"',
+      `base_url = "http://127.0.0.1:${port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
+      `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
+    ].join("\n"));
+    const source = await launch("native-fork-source");
+    await expect.poll(() => source.recovery.read()?.sessionId ?? source.output, { timeout: 15_000 }).toMatch(/^[a-f0-9-]{36}$/u);
+    const original = source.recovery.read()!.sessionId;
+    const executionId = source.terminal.restoreInput!()!.codexExecutionId;
+    const originalTranscript = await complete(source, "This message is shared history at the native fork point.");
+    expect(originalTranscript.filter(item => item.type === "turn_context").at(-1)?.payload).toMatchObject({
+      approval_policy: "never", sandbox_policy: { type: "danger-full-access" }
+    });
+    source.output = "";
+    source.terminal.write!("\u001b[200~/permissions\u001b[201~\r");
+    await expect.poll(() => visible(source)).toContain("1.Askforapproval");
+    source.output = "";
+    source.terminal.write!("1");
+    await expect.poll(() => visible(source)).toContain("Permissionselectionrequested:Askforapproval");
+    await source.terminal.handleAction("wait_until_ready", { timeoutMs: 10_000 });
+    source.terminal.write!("\u001b[200~/fork\u001b[201~\r");
+    await expect.poll(() => branches.length, { timeout: 15_000 }).toBe(1);
+    const child = branches[0]!;
+    await expect.poll(() => child.recovery.read()?.sessionId ?? child.output, { timeout: 10_000 }).toMatch(/^[a-f0-9-]{36}$/u);
+    const childId = child.recovery.read()!.sessionId;
+    expect(childId).not.toBe(original);
+    expect(child.terminal.restoreInput!()!.codexExecutionId).not.toBe(executionId);
+    expect(source.recovery.read()).toMatchObject({ sessionId: original, selection: { tabId: source.tab.id, executionId } });
+    expect(source.terminal.restoreInput!()).toMatchObject({ codexExecutionId: executionId, resume: { mode: "session", sessionId: original } });
+    expect(child.terminal.restoreInput!()).toMatchObject({ resume: { mode: "session", sessionId: childId } });
+    expect(conversationRequests()).toHaveLength(1);
+    const childTranscript = await complete(child, "This message belongs only to the child branch.");
+    expectRestricted(childTranscript);
+    expect(childTranscript[0]?.payload).toMatchObject({ forked_from_id: original });
+    expect(JSON.stringify(conversationRequests().at(-1)?.input).includes("This message is shared history at the native fork point.")).toBe(true);
+    expect(JSON.stringify(await transcript(source))).not.toContain("This message belongs only to the child branch.");
+    const sourceTranscript = await complete(source, "This message belongs only to the original source.");
+    expectRestricted(sourceTranscript);
+    expect(JSON.stringify(await transcript(child))).not.toContain("This message belongs only to the original source.");
+    source.terminal.write!("\u001b[200~/fork\u001b[201~\r");
+    await expect.poll(() => branches.length, { timeout: 15_000 }).toBe(2);
+    const second = branches[1]!;
+    await expect.poll(() => second.recovery.read()?.sessionId ?? second.output, { timeout: 10_000 }).toMatch(/^[a-f0-9-]{36}$/u);
+    const secondId = second.recovery.read()!.sessionId;
+    expect([original, childId]).not.toContain(secondId);
+    expect(controls.openSiblingTab).toHaveBeenCalledTimes(2);
+    expect(conversationRequests()).toHaveLength(3);
+    const saved = [source, child, second].map(branch => ({ branch, identity: branch.recovery.read()!, input: branch.terminal.restoreInput!()! }));
+    for (const { branch } of saved) { await branch.terminal.terminate!(); sessions.delete(branch.terminal); }
+    for (const { branch, identity, input } of saved) {
+      expect(branch.recovery.read()).toEqual(identity);
+      expect(await production.describeRecovery({ tab: branch.tab, cwd: root, initialInput: input, controls }))
+        .toMatchObject({ canResume: true, conversationId: identity.sessionId });
+      const restored = await launch(branch.tab.id, input);
+      await expect.poll(() => restored.recovery.read()?.sessionId ?? restored.output, { timeout: 10_000 }).toBe(identity.sessionId);
+      expect(restored.terminal.restoreInput!()!.codexExecutionId).not.toBe(identity.selection!.executionId);
+      const restoredTranscript = await complete(restored, `Continue the restored ${branch.tab.id} independently.`);
+      expectRestricted(restoredTranscript);
+      if (identity.sessionId === childId) expect(JSON.stringify(restoredTranscript)).not.toContain("This message belongs only to the original source.");
+      else expect(JSON.stringify(restoredTranscript)).not.toContain("This message belongs only to the child branch.");
+    }
+    expect(conversationRequests()).toHaveLength(6);
+    expect(controls.openSiblingTab).toHaveBeenCalledTimes(2);
+  } finally {
+    await Promise.all([...sessions].map(session => session.terminate?.()));
+    provider.closeAllConnections();
+    await new Promise<void>(resolve => provider.close(() => resolve()));
+    await sources.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 90_000);
