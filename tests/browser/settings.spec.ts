@@ -1601,9 +1601,8 @@ async function expectCodexSettingsFits(page: Page) {
     settings.getByRole("button", { name: "Save Codex settings", exact: true }),
     settings.getByRole("button", { name: "Reload", exact: true }),
   ]) {
-    await control.scrollIntoViewIfNeeded();
-    await expect(control).toBeInViewport({ ratio: 1 });
     await control.click({ trial: true });
+    await expect(control).toBeInViewport({ ratio: 1 });
     expect((await control.boundingBox())!.height).toBeGreaterThanOrEqual(44);
   }
 }
