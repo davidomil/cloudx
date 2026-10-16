@@ -4,6 +4,7 @@ import type { DisposableResource, ForgeCheckoutEvidenceManifest, ForgeEvidenceFi
 import { getForgeResources, forgeEvidenceFileUrl } from "../forgeResourcesApi.js";
 import { checkoutEvidenceFileUrl, checkoutEvidenceManifestUrl, getForgeCheckoutEvidence } from "../forgeCheckoutEvidenceApi.js";
 import { getForgeGitHistory, gitHistoryBundleUrl, gitHistoryManifestUrl } from "../forgeGitHistoryApi.js";
+import { ForgeDiagnosticSnapshotsPanel } from "./ForgeDiagnosticSnapshotsPanel.js";
 
 export function ForgeResourcesPanel({ revision }: { revision: number }) {
   const [evidence, setEvidence] = useState<{ resources: DisposableResource[]; archives: ForgeCheckoutEvidenceManifest[]; history: ForgeGitHistoryManifest[]; errors: string[] }>();
@@ -44,6 +45,7 @@ export function ForgeResourcesPanel({ revision }: { revision: number }) {
         files={archive.files} manifestUrl={gitHistoryManifestUrl(archive.archiveId)} fileUrl={() => gitHistoryBundleUrl(archive.archiveId)} />
       <details><summary>Preserved snapshots ({archive.refs.length})</summary><ul>{archive.refs.map(ref => <li key={ref.name}><code>{ref.name}</code> · <code>{ref.commitSha}</code></li>)}</ul></details>
     </article>)}
+    <ForgeDiagnosticSnapshotsPanel revision={revision} />
   </section>;
 }
 

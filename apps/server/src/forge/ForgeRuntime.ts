@@ -15,6 +15,7 @@ import {
   validateForgeDiagnosticSnapshotInput,
   type ForgeDiagnosticSnapshotInput,
   type ForgeDiagnosticSnapshotResult,
+  type ForgeDiagnosticSnapshotStatus,
   type CodexReasoningEffort,
   type ForgeRepository,
   type ForgeReviewRevision,
@@ -56,6 +57,8 @@ import { ForgeGitHistory, generatedGitHistoryCommit, isGitHistoryReceipt } from 
 import { writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
 import { captureForgeRemovalContents, assertForgeRemovalContents, isForgeRemovalContents, type ForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 import { ForgeDiagnosticSnapshots, isOwnedDiagnosticSnapshot, type OwnedDiagnosticSnapshot } from "./ForgeDiagnosticSnapshots.js";
+import { ForgeDiagnosticSnapshotRecovery } from "./ForgeDiagnosticSnapshotRecovery.js";
+import { diagnosticSnapshotStatus } from "./ForgeDiagnosticSnapshotInventory.js";
 
 export interface ForgeWorkspace {
   id: string;
@@ -153,6 +156,7 @@ export class ForgeHandoffError extends Error {
 
 interface OwnedWorkspace extends ForgeWorkspace {
   diagnosticSnapshots?: OwnedDiagnosticSnapshot[];
+  snapshotRetirement?: true;
   repository: DirectoryIdentity;
   explicitRetainedPaths?: string[];
   evidenceRetirement?: { attemptId: string; commitSha: string; paths: string[] };
@@ -227,6 +231,37 @@ export class ForgeRuntime {
 
   async pendingCheckoutRemoval(id: string): Promise<boolean> {
     return Boolean((await this.readOwned(id)).cleanupRemoval);
+  }
+
+  async pendingSnapshotRecovery(id: string): Promise<boolean> {
+    return (await this.readOwned(id)).diagnosticSnapshots?.some(snapshot => snapshot.state !== "removed" && !snapshot.hold) ?? false;
+  }
+
+  async diagnosticSnapshots(id: string): Promise<ForgeDiagnosticSnapshotStatus[]> {
+    return ((await this.readOwned(id)).diagnosticSnapshots ?? []).map(diagnosticSnapshotStatus);
+  }
+
+  async diagnosticSnapshotArchive(id: string, snapshotPath: string) {
+    const owned = await this.readOwned(id);
+    const snapshot = owned.diagnosticSnapshots?.find(snapshot => snapshot.path === snapshotPath);
+    if (!snapshot) throw new Error("Unknown registered diagnostic snapshot.");
+    return new ForgeDiagnosticSnapshotRecovery(this.dependencies.dataDir).fileStream(snapshot);
+  }
+
+  recoverDiagnosticSnapshot(id: string, snapshotPath: string): Promise<void> {
+    const signal = AbortSignal.timeout(60_000);
+    return this.serialize(id, "recover diagnostic snapshot", signal, async () => {
+      const owned = await this.readOwned(id);
+      if (!(owned.evidenceRetirement || owned.snapshotRetirement) || owned.cleanupRemoval || !owned.prepared)
+        throw new Error("Snapshot recovery requires an authoritative completed worker with its original checkout.");
+      await this.assertCleanupQuiescent(owned);
+      await this.requireSettledWorkspaceOperations(owned);
+      await this.assertCheckout(owned);
+      const snapshot = owned.diagnosticSnapshots?.find(snapshot => snapshot.path === snapshotPath);
+      if (!snapshot) throw new Error("Unknown registered diagnostic snapshot.");
+      await new ForgeDiagnosticSnapshots(new ForgeDiagnosticSnapshotRecovery(this.dependencies.dataDir)).recover(owned.worktree, snapshot,
+        () => writeEvidenceReceipt(this.manifest(id), owned), signal);
+    });
   }
 
   isActive(tabId: string): boolean {
@@ -1778,7 +1813,7 @@ export class ForgeRuntime {
         owned.id, attemptId, input, args => this.runGit(owned.worktreePath, args, signal), async snapshot => {
           owned.diagnosticSnapshots ??= [];
           if (!owned.diagnosticSnapshots.includes(snapshot)) owned.diagnosticSnapshots.push(snapshot);
-          await this.manifest(owned.id).write(owned);
+          await writeEvidenceReceipt(this.manifest(owned.id), owned);
         }, signal);
       return { path: snapshot.path, kind: snapshot.kind, retentionPolicy: snapshot.retentionPolicy };
     });
@@ -1804,6 +1839,10 @@ export class ForgeRuntime {
         owned.evidenceRetirement = retirement;
         await this.manifest(owned.id).write(owned);
       }
+      if (workspace.issueClosed || owned.evidenceRetirement) {
+        owned.snapshotRetirement = true;
+        await writeEvidenceReceipt(this.manifest(owned.id), owned);
+      }
       if (owned.branchOwned && !owned.cleanupRemoval && (!owned.cleaned || owned.retainedWorkspace)) {
         if (!workspace.expectedHeadSha && !workspace.issueClosed)
           throw new Error("Issue cleanup requires the published head commit.");
@@ -1812,6 +1851,7 @@ export class ForgeRuntime {
           const headSha = await this.requireBranchHead(owned, signal);
           if (workspace.issueClosed && headSha !== (workspace.expectedHeadSha ?? owned.baseCommit)) {
             await this.assertCheckout(owned);
+            await this.retireDiagnosticSnapshots(owned, signal);
             const retainedPaths = [...new Set([".git", ...await this.filesRequiringRetention(owned, signal, owned.explicitRetainedPaths)])].sort();
             owned.retainedWorkspace = { worktreePath: owned.worktreePath, retainedPaths,
               reason: "The assigned issue closed before these commits were published. Recover the unpublished Git history before discarding this checkout." };
@@ -2067,10 +2107,8 @@ export class ForgeRuntime {
         (await this.runGit(owned.worktreePath, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim() !== owned.evidenceRetirement.commitSha)
         throw new Error("Review checkout differs from its evidence commit; its files were preserved.");
       owned.cleanupHeadSha = expectedHeadSha;
+      await this.retireDiagnosticSnapshots(owned, signal);
       if (owned.prepared && owned.evidenceRetirement) {
-        await new ForgeDiagnosticSnapshots().retire(owned.worktree, owned.diagnosticSnapshots ?? [],
-          publicationFiles(owned.explicitRetainedPaths ?? [], this.publicationHandoff(owned)?.retainedEvidencePaths ?? []),
-          () => this.manifest(owned.id).write(owned), args => this.runGit(owned.worktreePath, args, signal), signal);
         await this.handoffCheckoutEvidence(owned, signal);
         explicitRetainedPaths = owned.explicitRetainedPaths;
       }
@@ -2169,6 +2207,13 @@ export class ForgeRuntime {
     await this.manifest(owned.id).write(owned);
   }
 
+  private async retireDiagnosticSnapshots(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
+    if (!owned.prepared || !(owned.evidenceRetirement || owned.snapshotRetirement)) return;
+    await new ForgeDiagnosticSnapshots(new ForgeDiagnosticSnapshotRecovery(this.dependencies.dataDir)).retire(owned.worktree, owned.diagnosticSnapshots ?? [],
+      publicationFiles(owned.explicitRetainedPaths ?? [], this.publicationHandoff(owned)?.retainedEvidencePaths ?? []),
+      () => writeEvidenceReceipt(this.manifest(owned.id), owned), args => this.runGit(owned.worktreePath, args, signal), signal);
+  }
+
   private async assertPublicationEvidence(owned: OwnedWorkspace, signal?: AbortSignal): Promise<void> {
     const handoff = this.publicationHandoff(owned);
     if (handoff?.retainedEvidencePaths?.length &&
@@ -2226,6 +2271,9 @@ export class ForgeRuntime {
 
   private async finishCheckoutRemoval(owned: OwnedWorkspace, signal?: AbortSignal): Promise<boolean> {
     const removal = owned.cleanupRemoval!;
+    for (const snapshot of owned.diagnosticSnapshots ?? [])
+      if (snapshot.recovery || snapshot.retentionPolicy === "recover")
+        await new ForgeDiagnosticSnapshotRecovery(this.dependencies.dataDir).verify(snapshot, signal);
     for (const receipt of [owned.checkoutEvidence, ...owned.additionalCheckoutEvidence ?? []])
       if (receipt) await new ForgeCheckoutEvidence(this.dependencies.dataDir).read(receipt.archiveId);
     if (owned.gitHistory) await new ForgeGitHistory(this.dependencies.dataDir).read(owned.gitHistory.archiveId);
@@ -2409,6 +2457,7 @@ export class ForgeRuntime {
       typeof value.gitPending !== "boolean" ||
       typeof value.branchOwned !== "boolean" ||
       typeof value.cleaned !== "boolean" ||
+      (value.snapshotRetirement !== undefined && value.snapshotRetirement !== true) ||
       (value.diagnosticSnapshots !== undefined && (!Array.isArray(value.diagnosticSnapshots) ||
         value.diagnosticSnapshots.length > 100 || value.diagnosticSnapshots.some(snapshot => !isOwnedDiagnosticSnapshot(snapshot, id, value.worktree)) ||
         new Set(value.diagnosticSnapshots.map(snapshot => snapshot.path)).size !== value.diagnosticSnapshots.length)) ||

@@ -388,7 +388,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     registerForgeDisposableResourceRoutes(app, services.forgeResources, services.forge, config.trustedOrigins);
     registerForgeCheckoutEvidenceRoutes(app, config.dataDir);
     registerForgeGitHistoryRoutes(app, config.dataDir);
-    registerForgeDiagnosticSnapshotRoutes(app, services.forge, config.trustedOrigins);
+    registerForgeDiagnosticSnapshotRoutes(app, services.forge, config.trustedOrigins, config.dataDir);
   }
   const installationRoot = path.resolve(import.meta.dirname, "../../..");
   services.workspaceCleanup ??= new WorkspaceCleanupService({
