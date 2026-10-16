@@ -5067,30 +5067,29 @@ describe("Forge completed retained checkout reconciliation", () => {
     } finally { await f.service.dispose(); }
   });
 
-  it("reconciles a legacy repository snapshot while preserving its objects until verified recovery and Resume", async () => {
+  it("automatically preserves a legacy repository snapshot after ownership reconciliation and Resume", async () => {
     const f = await legacyDiagnosticSnapshot("repository");
     try {
       await f.service.poll();
       const preview = await f.service.previewOwnership(f.workspace.id);
       await f.service.reconcileOwnership(f.workspace.id, attestOwnership(preview));
       await expect(runtime.recover(f.workspace.id)).resolves.toMatchObject({ workspace: f.workspace });
-      await f.service.resume(f.workspace.id, { windowId: "window", paneId: "pane" });
-      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining("requires recovery") });
-      const archive = path.join(root, "legacy-snapshot-recovery.tar");
-      const restored = path.join(root, "verified-legacy-recovery");
-      await createTar({ file: archive, cwd: f.source }, ["."]);
-      await fs.mkdir(restored);
-      await extractTar({ file: archive, cwd: restored, strict: true });
       const objectNames = (await git(f.source, `--git-dir=${f.source}/.git`, "rev-list", "--objects", "--all")).split("\n").map(line => line.split(" ")[0]!);
-      expect(objectNames.length).toBeGreaterThan(0);
-      for (const object of objectNames) {
+      const objects = new Map(await Promise.all(objectNames.map(async object => {
         const relative = path.join(".git", "objects", object.slice(0, 2), object.slice(2));
-        expect(await fs.readFile(path.join(restored, relative))).toEqual(await fs.readFile(path.join(f.source, relative)));
-      }
-      await fs.rename(f.source, path.join(root, "relocated-legacy-snapshot"));
+        return [relative, await fs.readFile(path.join(f.source, relative))] as const;
+      })));
+      expect(objects.size).toBeGreaterThan(0);
       await f.service.resume(f.workspace.id, { windowId: "window", paneId: "pane" });
       expect(await f.store.read()).toEqual([]);
       await expect(fs.lstat(f.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      const snapshot = JSON.parse(await fs.readFile(f.manifest, "utf8")).diagnosticSnapshots[0];
+      expect(snapshot).toMatchObject({ state: "removed", recovery: { state: "verified" } });
+      expect(snapshot.recovery.archivePath.startsWith(`${f.workspace.worktreePath}/`)).toBe(false);
+      const restored = path.join(root, "verified-legacy-recovery");
+      await fs.mkdir(restored);
+      await extractTar({ file: snapshot.recovery.archivePath, cwd: restored, strict: true });
+      for (const [relative, bytes] of objects) expect(await fs.readFile(path.join(restored, relative))).toEqual(bytes);
       expect(await git(restored, `--git-dir=${restored}/.git`, "rev-parse", "HEAD")).toBe(headSha);
       expect(await f.reports.read(f.attemptId)).toEqual(f.report);
     } finally { await f.service.dispose(); }
@@ -5228,6 +5227,149 @@ describe("Forge completed retained checkout reconciliation", () => {
       for await (const chunk of await evidence.fileStream(manifest!.archiveId, reportPath)) chunks.push(chunk);
       expect(Buffer.concat(chunks).toString()).toBe("Snapshot validation passed");
       expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+    } finally { await f.service.dispose(); }
+  });
+
+  it.each([false, true])("retires every registered snapshot across attempts after authoritative completion (review: %s)", async review => {
+    const workspace = await prepare(randomUUID(), review);
+    const manifestPath = path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`);
+    await fs.mkdir(path.join(workspace.worktreePath, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(workspace.worktreePath, ".git/info/exclude"), "\nnode_modules/\n");
+    const attempts = [randomUUID(), randomUUID()];
+    const sourceOnly = await runtime.createDiagnosticSnapshot(workspace, attempts[0]!, { kind: "source-only", commitSha: headSha });
+    const dependencyPath = path.join(workspace.worktreePath, "node_modules");
+    await fs.mkdir(dependencyPath);
+    await fs.writeFile(path.join(dependencyPath, "generated.bin"), "Disposable installed dependencies");
+    await fs.symlink(dependencyPath, path.join(workspace.worktreePath, sourceOnly.path, "node_modules"));
+    const repositoryCopies: { path: string; object: string; bytes: Buffer; ref: string }[] = [];
+    for (let index = 0; index < 3; index++) {
+      const objectFile = path.join(root, `diagnostic-object-${index}`);
+      await fs.writeFile(objectFile, `Unpublished object unique to diagnostic copy ${index}\n`);
+      const object = await git(workspace.worktreePath, "hash-object", "-w", objectFile);
+      const ref = `refs/diagnostic/object-${index}`;
+      await git(workspace.worktreePath, "update-ref", ref, object);
+      const snapshot = await runtime.createDiagnosticSnapshot(workspace, attempts[index % 2]!, { kind: "repository", commitSha: headSha });
+      const relativeObject = path.join(".git", "objects", object.slice(0, 2), object.slice(2));
+      repositoryCopies.push({ path: snapshot.path, object, bytes: await fs.readFile(path.join(workspace.worktreePath, snapshot.path, relativeObject)), ref });
+      await git(workspace.worktreePath, "update-ref", "-d", ref);
+    }
+    const reportPath = ".cloudx/validation/snapshot-completion.log";
+    await fs.mkdir(path.dirname(path.join(workspace.worktreePath, reportPath)), { recursive: true });
+    await fs.writeFile(path.join(workspace.worktreePath, reportPath), "All diagnostic attempts validated");
+    const f = await completedWorkflow(workspace, [".cloudx", "node_modules"], review);
+    try {
+      await f.service.dispose();
+      runtime = new ForgeRuntime(dependencies());
+      f.deps.runtime = runtime;
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      const owned = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+      expect(owned.diagnosticSnapshots).toHaveLength(4);
+      expect(owned.diagnosticSnapshots.every((snapshot: { state: string }) => snapshot.state === "removed")).toBe(true);
+      for (const [index, copy] of repositoryCopies.entries()) {
+        const snapshot = owned.diagnosticSnapshots.find((entry: { path: string }) => entry.path === copy.path);
+        expect(snapshot).toMatchObject({ attemptId: attempts[index % 2], recovery: { state: "verified" } });
+        expect(snapshot.recovery.archivePath.startsWith(`${workspace.worktreePath}/`)).toBe(false);
+        const restored = path.join(root, `verified-attempt-${index}`);
+        await fs.mkdir(restored);
+        await extractTar({ file: snapshot.recovery.archivePath, cwd: restored, strict: true });
+        const relativeObject = path.join(".git", "objects", copy.object.slice(0, 2), copy.object.slice(2));
+        expect(await fs.readFile(path.join(restored, relativeObject))).toEqual(copy.bytes);
+        expect(await fs.readFile(path.join(restored, ".git", copy.ref), "utf8")).toBe(`${copy.object}\n`);
+        expect(await git(restored, `--git-dir=${restored}/.git`, "rev-parse", "HEAD")).toBe(headSha);
+      }
+      const evidence = new ForgeCheckoutEvidence(path.join(root, "data"));
+      const [archive] = await evidence.list();
+      const chunks: Buffer[] = [];
+      for await (const chunk of await evidence.fileStream(archive!.archiveId, reportPath)) chunks.push(chunk);
+      expect(Buffer.concat(chunks).toString()).toBe("All diagnostic attempts validated");
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+      expect(await f.service.workerHistory(workspace.id)).toEqual(f.history);
+      await f.service.poll();
+      expect(await f.store.read()).toEqual([]);
+    } finally { await f.service.dispose(); }
+  });
+
+  it("reports all changed diagnostic copies while preserving other repositories and retiring verified source", async () => {
+    const workspace = await prepare(randomUUID());
+    const attemptId = randomUUID();
+    const changed = await runtime.createDiagnosticSnapshot(workspace, attemptId, { kind: "source-only", commitSha: headSha });
+    const added = await runtime.createDiagnosticSnapshot(workspace, attemptId, { kind: "source-only", commitSha: headSha });
+    const foreign = await runtime.createDiagnosticSnapshot(workspace, attemptId, { kind: "source-only", commitSha: headSha });
+    const verified = await runtime.createDiagnosticSnapshot(workspace, randomUUID(), { kind: "source-only", commitSha: headSha });
+    const repository = await runtime.createDiagnosticSnapshot(workspace, randomUUID(), { kind: "repository", commitSha: headSha });
+    await fs.writeFile(path.join(workspace.worktreePath, changed.path, "README.md"), "Preserve changed diagnostic source\n");
+    await fs.writeFile(path.join(workspace.worktreePath, added.path, "investigation.txt"), "Preserve unknown diagnostic addition\n");
+    const foreignDependencies = path.join(root, "foreign-node_modules");
+    await fs.mkdir(foreignDependencies);
+    await fs.writeFile(path.join(foreignDependencies, "owned-elsewhere.txt"), "Preserve foreign dependencies\n");
+    await fs.symlink(foreignDependencies, path.join(workspace.worktreePath, foreign.path, "node_modules"));
+    const f = await completedWorkflow(workspace, [".cloudx"]);
+    try {
+      await f.service.poll();
+      const [held] = await f.store.read();
+      expect(held).toMatchObject({ status: "cleanup_failed" });
+      for (const snapshot of [changed, added, foreign]) expect(held!.error).toContain(snapshot.path);
+      const manifest = JSON.parse(await fs.readFile(path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
+      for (const snapshot of [changed, added, foreign])
+        expect(manifest.diagnosticSnapshots.find((entry: { path: string }) => entry.path === snapshot.path)).toMatchObject({ state: "ready", hold: expect.any(String) });
+      expect(manifest.diagnosticSnapshots.find((entry: { path: string }) => entry.path === verified.path)).toMatchObject({ state: "removed" });
+      expect(manifest.diagnosticSnapshots.find((entry: { path: string }) => entry.path === repository.path)).toMatchObject({ state: "removed", recovery: { state: "verified" } });
+      expect(await runtime.diagnosticSnapshots(workspace.id)).toEqual(expect.arrayContaining([
+        ...[changed, added, foreign].map(snapshot => expect.objectContaining({ path: snapshot.path, hold: expect.any(String) })),
+        expect.objectContaining({ path: repository.path, state: "removed", recovery: { state: "verified", archivePath: expect.any(String) } }),
+      ]));
+      expect(await fs.readFile(path.join(workspace.worktreePath, changed.path, "README.md"), "utf8")).toBe("Preserve changed diagnostic source\n");
+      expect(await fs.readFile(path.join(workspace.worktreePath, added.path, "investigation.txt"), "utf8")).toBe("Preserve unknown diagnostic addition\n");
+      expect(await fs.readlink(path.join(workspace.worktreePath, foreign.path, "node_modules"))).toBe(foreignDependencies);
+      expect(await fs.readFile(path.join(foreignDependencies, "owned-elsewhere.txt"), "utf8")).toBe("Preserve foreign dependencies\n");
+      expect(await f.reports.read(f.attemptId)).toEqual(f.report);
+    } finally { await f.service.dispose(); }
+  });
+
+  it("preserves a changed repository and partial Git store through explicit recovery before completed worker retirement", async () => {
+    const workspace = await prepare(randomUUID());
+    const snapshot = await runtime.createDiagnosticSnapshot(workspace, randomUUID(), { kind: "repository", commitSha: headSha });
+    const source = path.join(workspace.worktreePath, snapshot.path);
+    await git(source, "config", "user.name", "Diagnostic investigation");
+    await git(source, "config", "user.email", "diagnostic@example.test");
+    await fs.writeFile(path.join(source, "README.md"), "Unpublished diagnostic history\n");
+    await git(source, "add", "README.md");
+    await git(source, "commit", "-m", "Preserve unpublished diagnostic history");
+    const unpublishedHead = await git(source, "rev-parse", "HEAD");
+    await git(source, "update-ref", "refs/diagnostic/unpublished", unpublishedHead);
+    await fs.writeFile(path.join(source, "working.txt"), "Uncommitted diagnostic work\n");
+    await fs.unlink(path.join(source, ".git", "HEAD"));
+    const relativeObject = path.join(".git", "objects", unpublishedHead.slice(0, 2), unpublishedHead.slice(2));
+    const objectBytes = await fs.readFile(path.join(source, relativeObject));
+    await expect(runtime.recoverDiagnosticSnapshot(workspace.id, snapshot.path)).rejects.toThrow("authoritative completed worker");
+    const f = await completedWorkflow(workspace, [".cloudx"]);
+    try {
+      await f.service.poll();
+      expect((await f.store.read())[0]).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining(snapshot.path) });
+      expect(await fs.readFile(path.join(source, "working.txt"), "utf8")).toBe("Uncommitted diagnostic work\n");
+      await expect(runtime.recoverDiagnosticSnapshot(workspace.id, ".cloudx/forge-snapshots/unknown/source")).rejects.toThrow("Unknown registered diagnostic snapshot");
+      await runtime.recoverDiagnosticSnapshot(workspace.id, snapshot.path);
+      await f.service.dispose();
+      runtime = new ForgeRuntime(dependencies());
+      f.deps.runtime = runtime;
+      f.service = new ForgeWorkflowService(f.deps);
+      await f.service.resume(workspace.id, { windowId: "window", paneId: "pane" });
+      expect(await f.store.read()).toEqual([]);
+      await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+      const manifest = JSON.parse(await fs.readFile(path.join(root, "data", "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
+      const recovered = manifest.diagnosticSnapshots[0];
+      expect(recovered).toMatchObject({ state: "removed", recovery: { state: "verified" } });
+      const restored = path.join(root, "verified-partial-repository");
+      await fs.mkdir(restored);
+      await extractTar({ file: recovered.recovery.archivePath, cwd: restored, strict: true });
+      expect(await fs.readFile(path.join(restored, relativeObject))).toEqual(objectBytes);
+      expect(await fs.readFile(path.join(restored, ".git", "refs/diagnostic/unpublished"), "utf8")).toBe(`${unpublishedHead}\n`);
+      expect(await fs.readFile(path.join(restored, "README.md"), "utf8")).toBe("Unpublished diagnostic history\n");
+      expect(await fs.readFile(path.join(restored, "working.txt"), "utf8")).toBe("Uncommitted diagnostic work\n");
+      await expect(fs.lstat(path.join(restored, ".git", "HEAD"))).rejects.toMatchObject({ code: "ENOENT" });
     } finally { await f.service.dispose(); }
   });
 

@@ -9,6 +9,14 @@ export interface ForgeDiagnosticSnapshotResult {
   retentionPolicy: "disposable" | "recover";
 }
 
+export interface ForgeDiagnosticSnapshotStatus extends ForgeDiagnosticSnapshotResult {
+  workerId: string;
+  attemptId: string;
+  state: "creating" | "ready" | "removing" | "removed";
+  hold?: string;
+  recovery?: { state: "archiving" | "verified"; archivePath: string };
+}
+
 export function validateForgeDiagnosticSnapshotInput(value: unknown): asserts value is ForgeDiagnosticSnapshotInput {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("A diagnostic snapshot kind and source commit are required.");
