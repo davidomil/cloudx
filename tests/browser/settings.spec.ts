@@ -894,14 +894,16 @@ test("Codex update is keyboard and touch accessible, preserves drafts, and recon
   expect(current.tabs).toEqual(original.tabs);
 });
 
+const repairableCodexConfig =
+  '# Keep this comment and model.\nmodel = "original-model"\nhide_full_access_warning = true\n[features]\nghost_commit = true\nstreamable_shell = false\nfast_mode = true\n';
+
 for (const sourceChanged of [false, true]) {
   test(`Codex configuration repair ${sourceChanged ? "requires a new review when the source changes" : "applies only after an explicit review"}`, async ({
     page,
     isMobile,
   }, testInfo) => {
     const configPath = path.join(testRoot, "codex-home", "config.toml");
-    const original =
-      '# Keep this comment and model.\nmodel = "original-model"\nhide_full_access_warning = true\n[features]\nghost_commit = true\nstreamable_shell = false\nfast_mode = true\n';
+    const original = repairableCodexConfig;
     await fs.writeFile(configPath, original);
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
     const settings = await openCodexSettings(page, isMobile);
@@ -967,11 +969,36 @@ for (const sourceChanged of [false, true]) {
     });
     expect(repaired).toContain("# Keep this comment and model.");
     await expect(model).toHaveValue("unsaved-repair-draft");
-    await expectCodexSettingsFits(page);
     await control.scrollIntoViewIfNeeded();
     await captureSample(page, testInfo, "codex-config-repair-applied");
   });
 }
+
+test("Codex configuration repair keeps settings controls reachable after applying", async ({
+  page,
+  isMobile,
+}, testInfo) => {
+  const configPath = path.join(testRoot, "codex-home", "config.toml");
+  await fs.writeFile(configPath, repairableCodexConfig);
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  await model.fill("unsaved-repair-draft");
+  const control = settings.getByRole("region", {
+    name: "Shared Codex configuration repair",
+    exact: true,
+  });
+  await control
+    .getByRole("button", { name: "Repair shared config", exact: true })
+    .click();
+  await expect(control.getByRole("status")).toHaveText(
+    "Shared Codex configuration repaired.",
+  );
+  await expect(model).toHaveValue("unsaved-repair-draft");
+  await expectCodexSettingsFits(page);
+  await control.scrollIntoViewIfNeeded();
+  await captureSample(page, testInfo, "codex-config-repair-layout");
+});
 
 test("Codex version selection searches releases, previews a downgrade, and explicitly restores the previous version", async ({
   page,
