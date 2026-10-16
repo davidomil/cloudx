@@ -243,6 +243,25 @@ describe("GitHub required CI diagnostics", () => {
     expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
   });
 
+  it.each(["SUCCESS", "SKIPPED", "NEUTRAL"])("waits for absent gates alongside a %s required sibling in an active run", async conclusion => {
+    const fixture = githubFixture({ checks: [
+      { ...check, isRequired: false },
+      { ...check, databaseId: 902, name: "TypeScript", conclusion },
+    ], run: { status: "in_progress", conclusion: null } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "pending", jobs: [] });
+    expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/actions/runs/100"))).toHaveLength(1);
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+  });
+
+  it.each(["CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"])("preserves %s required-check blockers with an active run and absent gates", async conclusion => {
+    const fixture = githubFixture({ checks: [
+      { ...check, isRequired: false },
+      { ...check, databaseId: 902, name: "required sibling", conclusion },
+    ], run: { status: "in_progress", conclusion: null } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [] });
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).includes("/actions/"))).toBe(false);
+  });
+
   it("bounds workflow-run inspection while required gates are absent", async () => {
     const fixture = githubFixture({ checks: Array.from({ length: 9 }, (_, index) => ({ ...check, databaseId: 901 + index, isRequired: false,
       checkSuite: { workflowRun: { databaseId: 100 + index, runAttempt: 2 } } })) });

@@ -21,6 +21,20 @@ describe("native work contracts", () => {
     expect(JSON.stringify(projected)).not.toContain("private");
   });
 
+  it.each(["incident-1", "a".repeat(128)])("retains a bounded incident identity while excluding unknown error content (%s)", incidentId => {
+    const incident = { ...work, lastError: { ...work.lastError!, incidentId } };
+    expect(isCodexNativeWork(incident)).toBe(true);
+    const projected = parseCodexNativeWork({ ...incident, lastError: { ...incident.lastError, transcript: "private content" } });
+    expect(projected).toEqual(incident);
+    expect(JSON.stringify(projected)).not.toContain("private content");
+  });
+
+  it.each(["", "../incident", "incident with spaces", "a".repeat(129), 1, null])("rejects a malformed incident identity: %j", incidentId => {
+    const incident = { ...work, lastError: { ...work.lastError!, incidentId } };
+    expect(isCodexNativeWork(incident)).toBe(false);
+    expect(() => parseCodexNativeWork(incident)).toThrow("Invalid Codex native work");
+  });
+
   it.each([
     { version: 2 }, { tabId: "../tab" }, { executionId: "" }, { threadId: null }, { updatedAt: "unknown" },
     { turnStatus: "idle" }, { goalStatus: "failed" }, { recoveryStatus: "ready" },

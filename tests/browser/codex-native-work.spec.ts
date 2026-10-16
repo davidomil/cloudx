@@ -339,6 +339,9 @@ test("collapses blocked-goal details across refresh, reconnect and tabs while in
   await expect(
     panel.getByRole("button", { name: "Show native work details" }),
   ).toBeVisible();
+  await expect(panel.getByRole("heading")).toHaveText(
+    "Native turn running · Goal blocked",
+  );
   // The fixture starts failed on reload; dismiss that exact failure first.
   await observe(page, { turnStatus: "failed" });
   await panel.getByRole("button", { name: "Hide native work details" }).click();
@@ -379,4 +382,84 @@ test("collapses blocked-goal details across refresh, reconnect and tabs while in
     panel.getByRole("button", { name: "Restart this Codex client" }),
   ).toHaveCount(0);
   expect(requests).toHaveLength(0);
+});
+
+test("shows rejected recovery outside collapsed details and distinguishes identical rejected-start incidents", async ({
+  page,
+}) => {
+  const requests: Array<{ path: string; body: unknown }> = [];
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/api/tabs/*/recover", async (route) => {
+    requests.push({
+      path: new URL(route.request().url()).pathname,
+      body: route.request().postDataJSON(),
+    });
+    await released;
+    await route.fulfill({
+      status: 409,
+      json: { message: "The exact conversation binding became stale." },
+    });
+  });
+  const { input } = await openFixture(page);
+  const panel = page.getByRole("region", {
+    name: "Native work for Affected Codex",
+  });
+  await panel
+    .getByRole("button", { name: "Restart this Codex client" })
+    .click();
+  await expect.poll(() => requests.length).toBe(1);
+  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  release();
+  await expect(panel.getByRole("alert")).toHaveText(
+    "The exact conversation binding became stale.",
+  );
+  await expect(panel.getByRole("alert")).toBeVisible();
+  await expect(
+    panel.getByRole("button", { name: "Show native work details" }),
+  ).toBeVisible();
+  expect(requests).toEqual([
+    {
+      path: "/api/tabs/affected/recover",
+      body: {
+        action: "restart-native",
+        executionId: "affected-execution",
+        sessionId: "exact-conversation",
+      },
+    },
+  ]);
+  await page.locator('[data-tab="affected"] .xterm-helper-textarea').focus();
+  await page.keyboard.type("inspect rejected recovery");
+  await expect
+    .poll(() => input.affected.join(""))
+    .toBe("inspect rejected recovery");
+
+  const sameError = {
+    kind: "terminal" as const,
+    code: "badRequest",
+    message: "The provider rejected the request.",
+  };
+  await observe(page, {
+    lastError: { ...sameError, incidentId: "first-rejected-start" },
+  });
+  await expect(
+    panel.getByText(sameError.message, { exact: true }),
+  ).toBeVisible();
+  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await observe(page, { updatedAt: "2026-10-16T00:20:00Z" });
+  await expect(
+    panel.getByRole("button", { name: "Show native work details" }),
+  ).toBeVisible();
+  await observe(page, {
+    lastError: { ...sameError, incidentId: "second-rejected-start" },
+  });
+  await expect(
+    panel.getByRole("button", { name: "Hide native work details" }),
+  ).toBeVisible();
+  await expect(
+    panel.getByText(sameError.message, { exact: true }),
+  ).toBeVisible();
+  expect(requests).toHaveLength(1);
 });

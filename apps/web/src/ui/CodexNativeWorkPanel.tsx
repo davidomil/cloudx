@@ -99,8 +99,8 @@ function NativeWork({ tab, work, onRecover }: {
       {needsAttention && !recoveryPending && !submitted ? <ControlButton size="compact" disabled={busy || Boolean(restartUnavailable)} onClick={() => void restart()}>Restart this Codex client</ControlButton> : null}
       {needsAttention && restartUnavailable ? <p className="codex-native-unavailable">{restartUnavailable}</p> : null}
       {busy ? <p role="status">Restarting this client…</p> : submitted && !recoveryPending ? <p role="status">Client restart requested. Waiting for recorded native state.</p> : null}
-      {error ? <p role="alert">{error}</p> : null}
     </div>
+    <div role="alert" aria-atomic="true">{error ? <p>{error}</p> : null}</div>
   </section>;
 }
 

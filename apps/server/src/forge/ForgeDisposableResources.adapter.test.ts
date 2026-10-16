@@ -12,13 +12,25 @@ import { Header, type types } from "tar";
 
 const execute = vi.hoisted(() => vi.fn());
 const spawn = vi.hoisted(() => vi.fn());
-function evidenceTar(entries: { path: string; data?: string; type?: types.EntryTypeName; linkpath?: string }[]): Buffer {
+interface TarEntry { path: string; data?: string | Buffer; type?: types.EntryTypeName; linkpath?: string }
+function evidenceTar(entries: TarEntry[]): Buffer {
   return Buffer.concat([...entries.flatMap(entry => {
     const data = Buffer.from(entry.data ?? "");
     const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, mode: 0o600, linkpath: entry.linkpath });
     header.encode();
     return [header.block!, data, Buffer.alloc((512 - data.length % 512) % 512)];
   }), Buffer.alloc(1024)]);
+}
+async function* streamedEvidenceTar(entries: Iterable<TarEntry>) {
+  for (const entry of entries) {
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data ?? "");
+    const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, mode: 0o600, linkpath: entry.linkpath });
+    header.encode();
+    yield header.block!;
+    for (let offset = 0; offset < data.length; offset += 64 * 1024) yield data.subarray(offset, offset + 64 * 1024);
+    yield Buffer.alloc((512 - data.length % 512) % 512);
+  }
+  yield Buffer.alloc(1024);
 }
 vi.mock("node:child_process", async importOriginal => {
   const original = await importOriginal<typeof import("node:child_process")>();
@@ -161,7 +173,7 @@ describe("Docker creation rejection receipts", () => {
     expect(files).toEqual(["work/evidence/report.log"]);
   });
 
-  it.each(["plugins/plugins/example", "plugins-clone-example"])("retires the exact owned container across restart after exporting useful evidence beside 9000 %s generated entries", async layout => {
+  it.each(["plugins/plugins/example", "plugins-clone-example"])("retires the exact owned container across restart after exporting useful evidence beside 9000 %s generated entries with 8 KiB bodies", async layout => {
     const id = "a".repeat(64);
     const created = new Date().toISOString();
     let labels: Record<string, string> = {};
@@ -208,11 +220,12 @@ describe("Docker creation rejection receipts", () => {
     });
     spawn.mockImplementation((_command: string, args: string[]) => {
       expect(args).toEqual(["container", "cp", `${id}:/work/evidence`, "-"]);
-      return dockerChild(Readable.from([evidenceTar([
-        ...Array.from({ length: 9000 }, (_, index) => ({ path: `evidence/codex-launches/example/.tmp/${layout}/${index}`, data: "" })),
+      const cache = Buffer.alloc(8 * 1024, 0x61);
+      return dockerChild(Readable.from(streamedEvidenceTar([
+        ...Array.from({ length: 9000 }, (_, index) => ({ path: `evidence/codex-launches/example/.tmp/${layout}/${index}`, data: cache })),
         { path: "evidence/validation.log", data: log }, ...fixtures,
         { path: "evidence/fixture/tool", type: "SymbolicLink", linkpath: link },
-      ])]));
+      ])));
     });
     worker.headSha = "b".repeat(40);
     resource = await reopen().create(worker, { ...input, image: "node:22", evidencePaths: ["/work/evidence"] });

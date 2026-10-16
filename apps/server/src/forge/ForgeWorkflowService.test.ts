@@ -5165,9 +5165,9 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it("stops waiting for CI diagnosis when the tested identity never progresses", async () => {
+  it("keeps obsolete CI identity observation bounded by the metadata timeout", async () => {
     const f = await approvedIssue();
-    const diagnostic = failedCi(f, { state: "pending", reason: "Waiting for the current tested merge identity." });
+    const diagnostic = failedCi(f, { state: "obsolete", reason: "Waiting for the current tested merge identity." });
     await f.poll();
     f.advanceTime(120_001);
     await f.poll();
@@ -5179,6 +5179,56 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("retains the original CI wait deadline across restart %s and pauses with guidance after two hours", async restart => {
+    const f = await approvedIssue();
+    failedCi(f, { state: "pending", reason: "The current run is still producing required gates." });
+    await f.poll();
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+    expect(ciWait).toEqual({ headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha, startedAt: new Date(Date.now()).toISOString() });
+    expect(f.currentIssue().autoReview!.waitingSince).toBeUndefined();
+    f.advanceTime(60 * 60_000);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, mergeQueue: { phase: "waiting_ci" }, ciRepair: { attempts: 0 } });
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    f.advanceTime(60 * 60_000);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/two hours.*Inspect.*Resume/), ciRepair: { attempts: 0, attemptedHeads: [] } });
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("uses the same CI deadline for pending check rollups and absent-gate diagnostics", async () => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "pending", url: `${f.change.url}/checks` };
+    await f.poll();
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+    f.advanceTime(10 * 60_000);
+    failedCi(f, { state: "pending", reason: "The active run still has no required aggregate." });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, ciRepair: { attempts: 0 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts a new CI deadline when the target changes and clears it when CI waiting ends", async () => {
+    const f = await approvedIssue();
+    failedCi(f, { state: "pending" });
+    await f.poll();
+    const previous = f.currentIssue().autoReview!.ciWait;
+    f.advanceTime(60 * 60_000);
+    f.change.targetHeadSha = "f".repeat(40);
+    failedCi(f, { state: "pending" });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait: {
+      headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha, startedAt: new Date(Date.now()).toISOString(),
+    } } });
+    expect(f.currentIssue().autoReview!.ciWait?.startedAt).not.toBe(previous?.startedAt);
+    f.change.checks!.state = "unknown";
+    await f.poll();
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
   it.each(["pending", "unknown", "skipped"] as const)("does not diagnose %s checks as terminal failures", async state => {
@@ -5570,23 +5620,30 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])("waits for an absent required aggregate then launches exactly one proved producer repair (restart: %s)", async restart => {
+  it.each(["SUCCESS", "SKIPPED", "NEUTRAL"].flatMap(conclusion => [false, true].map(restart => ({ conclusion, restart }))))(
+    "waits beyond the metadata timeout for an absent aggregate with a $conclusion sibling, then repairs once (restart: $restart)", async ({ conclusion, restart }) => {
     const f = await approvedIssue(1, "github");
     const evidence = realCiDiagnostics(f, "github", "AssertionError: upgrade migration fails\n", "Installed previous-version upgrade", true);
     const aggregate = { ...evidence.checks[0] };
     evidence.checks.splice(0, 1,
       { ...aggregate, databaseId: 9, name: "Installed previous-version upgrade", isRequired: false },
-      { ...aggregate, databaseId: 12, name: "TypeScript", conclusion: "SUCCESS" });
+      { ...aggregate, databaseId: 12, name: "TypeScript", conclusion });
     evidence.run.status = "in_progress";
     await f.poll();
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { phase: "diagnosing", attempts: 0, attemptedHeads: [], diagnostic: { state: "pending", jobs: [] } } });
     expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    const ciWait = f.currentIssue().autoReview!.ciWait;
 
     const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
-    f.advanceTime(5_000);
+    f.advanceTime(120_001);
     await service.poll();
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { attempts: 0 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    f.advanceTime(8 * 60_000);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, mergeQueue: { phase: "waiting_ci" }, ciRepair: { attempts: 0, attemptedHeads: [] } });
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
     evidence.run.status = "completed";
     evidence.checks.push(aggregate);
     f.advanceTime(5_000);
@@ -5595,7 +5652,22 @@ describe("Forge issue auto review", () => {
     expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1, attemptedHeads: [evidence.sourceHead],
       diagnostic: { state: "actionable", jobs: [{ jobId: "9", requiredGate: { jobId: "10", name: "CI aggregate" } }] } } });
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
     expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/11/logs"))).toBe(false);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"])("preserves the %s required-check blocker while its run is active", async conclusion => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: optional shard fails\n", "optional", true);
+    evidence.checks.push({ ...evidence.checks[0], databaseId: 12, name: "required sibling", conclusion });
+    evidence.checks[0].isRequired = false;
+    evidence.run.status = "in_progress";
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { attempts: 0, attemptedHeads: [], diagnostic: { state: "blocked", jobs: [] } } });
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
@@ -5644,6 +5716,7 @@ describe("Forge issue auto review", () => {
     await f.poll();
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.currentIssue().ciRepair?.attempts).toBe(0);
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 

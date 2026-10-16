@@ -5,6 +5,7 @@ export interface CodexNativeError {
   kind: "retry" | "terminal";
   code?: string;
   requestId?: string;
+  incidentId?: string;
   httpStatusCode?: number;
 }
 
@@ -36,6 +37,7 @@ export function isCodexNativeWork(value: unknown): value is CodexNativeWork {
   return error === undefined || isRecord(error) && typeof error.message === "string" && error.message.length > 0 && error.message.length <= 1024 &&
     (error.kind === "retry" || error.kind === "terminal") &&
     (error.code === undefined || identity(error.code)) && (error.requestId === undefined || identity(error.requestId)) &&
+    (error.incidentId === undefined || identity(error.incidentId)) &&
     (error.httpStatusCode === undefined || typeof error.httpStatusCode === "number" && Number.isInteger(error.httpStatusCode) && error.httpStatusCode >= 100 && error.httpStatusCode <= 599);
 }
 
@@ -52,6 +54,7 @@ export function parseCodexNativeWork(value: unknown): CodexNativeWork {
       message: value.lastError.message, kind: value.lastError.kind,
       ...(value.lastError.code === undefined ? {} : { code: value.lastError.code }),
       ...(value.lastError.requestId === undefined ? {} : { requestId: value.lastError.requestId }),
+      ...(value.lastError.incidentId === undefined ? {} : { incidentId: value.lastError.incidentId }),
       ...(value.lastError.httpStatusCode === undefined ? {} : { httpStatusCode: value.lastError.httpStatusCode })
     } })
   };

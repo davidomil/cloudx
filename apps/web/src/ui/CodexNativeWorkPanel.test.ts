@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 import { act, createElement } from "react";
+import { pathToFileURL } from "node:url";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexNativeWork, WorkspaceTab } from "@cloudx/shared";
 
 import { CodexNativeWorkPanel } from "./CodexNativeWorkPanel.js";
+
+const { CodexNativeWorkObservation } = await import(pathToFileURL(`${process.cwd()}/apps/server/helpers/codex-native-work.mjs`).href);
 
 const nativeWork: CodexNativeWork = {
   version: 1, tabId: "affected", executionId: "affected-execution", threadId: "exact-conversation",
@@ -230,6 +233,52 @@ describe("Codex native work recovery", () => {
     expect(siblingRecover).not.toHaveBeenCalled();
     expect(host.textContent).not.toContain("Original conversation binding changed.");
     expect(host.textContent).toContain("Native turn: Running");
+  });
+
+  it("shows a restart rejection that arrives after the user collapses its pending details", async () => {
+    let reject!: (error: Error) => void;
+    recover.mockReturnValueOnce(new Promise<void>((_resolve, fail) => { reject = fail; }));
+    await show(tab);
+    const liveAlert = host.querySelector('[role="alert"]')!;
+    expect(liveAlert.textContent).toBe("");
+    expect(liveAlert.getAttribute("aria-atomic")).toBe("true");
+    await act(async () => restartButton().click());
+    await toggleDetails();
+    expect(details().hidden).toBe(true);
+    await act(async () => reject(new Error("The exact conversation binding became stale.")));
+    const alert = host.querySelector('[role="alert"]')!;
+    expect(alert).toBe(liveAlert);
+    expect(alert.textContent).toContain("exact conversation binding became stale");
+    expect(alert.closest("[hidden]")).toBeNull();
+    expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "restart-native", executionId: nativeWork.executionId, sessionId: nativeWork.threadId });
+  });
+
+  it("reopens identical rejected native turn starts while routine observations stay collapsed", async () => {
+    const observed: CodexNativeWork[] = [];
+    const threadId = "00000000-0000-4000-8000-000000000002";
+    const observer = new CodexNativeWorkObservation({ tabId: tab.id, executionId: "00000000-0000-4000-8000-000000000001", receiptPath: "/work/native-receipt" },
+      (work: CodexNativeWork) => observed.push(work), { selectedThreadId: threadId });
+    const error = { code: "badRequest", message: "Identical private request rejection" };
+    async function rejectStart(id: number) {
+      observer.fromClient({ id, method: "turn/start", params: { threadId } });
+      observer.fromServer({ id, error });
+      await show({ ...tab, nativeWork: observed.at(-1)! });
+    }
+    await rejectStart(1);
+    const firstError = observed.at(-1)!.lastError!;
+    expect(firstError.incidentId).toEqual(expect.any(String));
+    expect(details().hidden).toBe(false);
+    await toggleDetails();
+    expect(details().hidden).toBe(true);
+    observer.fromServer({ method: "thread/goal/updated", params: { threadId, goal: { threadId, status: "active" } } });
+    await show({ ...tab, nativeWork: observed.at(-1)! });
+    expect(details().hidden).toBe(true);
+    await rejectStart(2);
+    const nextError = observed.at(-1)!.lastError!;
+    expect(nextError.incidentId).not.toBe(firstError.incidentId);
+    expect({ ...nextError, incidentId: undefined }).toEqual({ ...firstError, incidentId: undefined });
+    expect(details().hidden).toBe(false);
+    expect(recover).not.toHaveBeenCalled();
   });
 
   it("shows a rejected stale binding and permits a deliberate retry without a loop", async () => {

@@ -15,6 +15,10 @@ export type ContainerEvidenceSource = (write: EvidenceSink) => Promise<void>;
 interface EvidenceArchive { manifest: ForgeEvidenceManifest; contents?: Record<string, string> }
 const namespace = "forge-evidence";
 const legacyMaxEvidenceBytes = 16 * 1024 * 1024;
+// Observed generated archives reach 265,222,144 serialized bytes; retain headroom
+// without allowing the larger byte budget to expand empty-header work.
+const maxGeneratedArchiveBytes = 512 * 1024 * 1024;
+const maxGeneratedArchiveEntries = 65_536;
 
 export function validEvidencePaths(value: unknown, allowEmpty = false): value is string[] {
   return validRecordedEvidencePaths(value, allowEmpty) && value.every(item => !generatedEvidencePath(item));
@@ -122,6 +126,7 @@ class ContainerEvidenceTraversal {
   private readonly deadline = performance.now() + 60_000;
   private entries = 0;
   private generatedBytes = 0;
+  private generatedEntries = 0;
   private metadataBytes = 0;
   private metadataEntries = 0;
 
@@ -136,8 +141,10 @@ class ContainerEvidenceTraversal {
     this.checkTime();
     if (discarded) {
       if (!Number.isSafeInteger(entry.startBlockSize) || entry.startBlockSize < 0) throw new Error("Container evidence tar contains an invalid generated entry size.");
+      this.generatedEntries += 1 + this.metadataEntries;
+      if (this.generatedEntries > maxGeneratedArchiveEntries) throw new Error("Container evidence tar exceeds its generated archive entry limit (65536 headers); select narrower evidence paths. The environment was preserved.");
       this.generatedBytes += 512 + entry.startBlockSize + this.metadataBytes;
-      if (this.generatedBytes > 64 * 1024 * 1024) throw new Error("Container evidence tar exceeds its generated archive traversal limit (64 MiB including headers); select narrower evidence paths. The environment was preserved.");
+      if (this.generatedBytes > maxGeneratedArchiveBytes) throw new Error("Container evidence tar exceeds its generated archive traversal limit (512 MiB including headers); select narrower evidence paths. The environment was preserved.");
     } else {
       this.entries += 1 + this.metadataEntries;
       if (this.entries > 8192) throw new Error("Container evidence tar has too many entries; select narrower paths.");

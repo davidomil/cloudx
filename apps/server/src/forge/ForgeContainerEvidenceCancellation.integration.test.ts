@@ -20,7 +20,7 @@ function header(filePath: string, bytes: number): Buffer {
 
 async function* reportTar(failure: ExportFailure | undefined, firstReportChunk: Promise<void>): AsyncGenerator<Buffer> {
   const chunk = Buffer.alloc(chunkBytes, 0x61);
-  if (failure === "generated-limit") yield header("evidence/node_modules/generated.bin", 64 * 1024 * 1024);
+  if (failure === "generated-limit") yield header("evidence/node_modules/generated.bin", 512 * 1024 * 1024);
   const reportBytes = chunkBytes * 2;
   yield header("evidence/report.json", reportBytes);
   for (let bytes = 0; bytes < reportBytes; bytes += chunkBytes) {

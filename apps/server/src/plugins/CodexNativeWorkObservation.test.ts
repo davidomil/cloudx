@@ -168,6 +168,35 @@ it("still fails recovery when the native turn start is rejected", () => {
   expect(tab.last()).toMatchObject({ turnStatus: "failed", recoveryStatus: "failed", lastError: { kind: "terminal", requestId } });
 });
 
+it("identifies each rejected native start once while keeping routine and duplicate observations stable", () => {
+  const tab = conversation();
+  const rejected = (id: number) => {
+    tab.fromClient({ id, method: "turn/start", params: { threadId } });
+    tab.fromServer({ id, error: providerError });
+    return tab.last().lastError;
+  };
+  const first = rejected(71);
+  expect(first.incidentId).toMatch(/^[a-f0-9-]{36}$/);
+  expect(tab.last().turnId).toBeUndefined();
+  tab.goal("blocked");
+  expect(tab.last().lastError).toEqual(first);
+  const count = tab.saved.length;
+  tab.fromServer({ id: 71, error: providerError });
+  expect(tab.saved).toHaveLength(count);
+  const next = rejected(72);
+  expect(next.incidentId).not.toBe(first.incidentId);
+  expect({ ...next, incidentId: undefined }).toEqual({ ...first, incidentId: undefined });
+  expect(tab.last().turnId).toBeUndefined();
+  expect(conversation(true, threadId, next).last().lastError).toEqual(next);
+  expect(JSON.stringify(tab.saved)).not.toMatch(/credential|private|Authorization/);
+});
+
+it("does not accept native incident identities or restore malformed identities", () => {
+  expect(nativeWorkError({ ...providerError, incidentId: "provider-identity" }, "terminal")).not.toHaveProperty("incidentId");
+  const restored = conversation(true, threadId, { ...nativeWorkError(providerError, "terminal"), incidentId: "../invalid" });
+  expect(restored.last().lastError).not.toHaveProperty("incidentId");
+});
+
 it.each(["terminal", "retry"])("preserves the complete saved other processing-error diagnostic on exact resume for %s receipts", kind => {
   const savedError = nativeWorkError({ ...providerError, codexErrorInfo: "other", httpStatusCode: 200 }, kind);
   expect(savedError).toEqual({ message: "The provider reported an internal processing error.", kind, code: "other", requestId, httpStatusCode: 200 });

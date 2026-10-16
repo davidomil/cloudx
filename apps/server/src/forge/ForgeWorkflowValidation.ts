@@ -111,6 +111,7 @@ function parseAutoReview(value: unknown, workerId: string): ForgeAutoReview {
   if (typeof input.enabled !== "boolean" || typeof input.phase !== "string" || !["implementing", "reviewing", "merging"].includes(input.phase))
     throw new Error("Invalid automatic review state.");
   const placement = object(input.placement);
+  const ciWait = input.ciWait === undefined ? undefined : object(input.ciWait);
   if (input.mergeAttempted !== undefined)
     throw new Error("Saved merge attempts must belong to the issue worker, independently of automatic review. Reconcile the existing attempt before loading it.");
   return {
@@ -122,6 +123,11 @@ function parseAutoReview(value: unknown, workerId: string): ForgeAutoReview {
     },
     ...(input.reviewWorkerId !== undefined ? { reviewWorkerId: workerLink(input.reviewWorkerId, workerId) } : {}),
     ...(input.waitingSince !== undefined ? { waitingSince: isoTimestamp(input.waitingSince, "automatic review observation timestamp") } : {}),
+    ...(ciWait ? { ciWait: {
+      headSha: commitSha(ciWait.headSha, "CI wait source head"),
+      ...(ciWait.targetHeadSha === undefined ? {} : { targetHeadSha: commitSha(ciWait.targetHeadSha, "CI wait target head") }),
+      startedAt: isoTimestamp(ciWait.startedAt, "CI wait timestamp"),
+    } } : {}),
   };
 }
 

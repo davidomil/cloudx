@@ -179,7 +179,7 @@ export class GitHubCiDiagnostics {
     const failures: RequiredFailure[] = [];
     let cursor: string | null = null;
     let pending = false;
-    let terminalRequired = false;
+    let cancelledRequired = false;
     const observedRuns = new Map<number, WorkflowRunIdentity>();
     for (let page = 0; page < 20; page++) {
       const response = record((await this.http.request("/graphql", {
@@ -226,7 +226,7 @@ export class GitHubCiDiagnostics {
         if (["ACTION_REQUIRED", "STARTUP_FAILURE"].includes(String(context.conclusion)))
           throw new ForgeProviderError("Required CI needs policy or infrastructure intervention.");
         if (!["FAILURE", "TIMED_OUT"].includes(String(context.conclusion))) {
-          terminalRequired ||= ["CANCELLED", "SKIPPED", "NEUTRAL"].includes(String(context.conclusion));
+          cancelledRequired ||= context.conclusion === "CANCELLED";
           continue;
         }
         const run = record(record(context.checkSuite).workflowRun);
@@ -238,7 +238,7 @@ export class GitHubCiDiagnostics {
       if (!next || next === cursor || page === 19) throw new ForgeProviderError("Required CI context evidence exceeds the supported bound.");
       cursor = next;
     }
-    if (!failures.length && !pending && !terminalRequired) {
+    if (!failures.length && !pending && !cancelledRequired) {
       if (observedRuns.size > maxCiFailureJobs)
         throw new ForgeProviderError("Too many current CI runs to inspect safely.");
       for (const observed of observedRuns.values()) {
