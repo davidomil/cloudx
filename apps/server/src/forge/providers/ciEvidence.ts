@@ -38,11 +38,17 @@ export function finishCiDiagnostic(diagnostic: ForgeCiDiagnostic): ForgeCiDiagno
 }
 
 export function classifyCiLog(log: string): CiJob["classification"] {
-  const operationalLog = log.split(/\r?\n/).filter(line =>
-    !/assertion(?:error| failed)|\bexpected\b.*\b(?:received|actual|equal)\b|\bFAIL(?:ED)?\b.*(?:test|spec)/i.test(line),
-  ).join("\n");
-  for (const classification of ["credentials", "policy", "infrastructure"] as const)
-    if (operationalCiBlockers[classification].test(operationalLog)) return classification;
+  const classifier = new CiLogClassifier();
+  for (const line of log.split(/\r?\n/)) classifier.add(ciLogLine(line), line);
+  classifier.finishRun();
+  return classifier.classification;
+}
+
+function classifyCiLine(log: string): CiJob["classification"] {
+  const assertion = /assertion(?:error| failed)|\bexpected\b.*\b(?:received|actual|equal)\b|\bFAIL(?:ED)?\b.*(?:test|spec)/i.test(log);
+  if (!assertion)
+    for (const classification of ["credentials", "policy", "infrastructure"] as const)
+      if (operationalCiBlockers[classification].test(log)) return classification;
   if (/assertion(?:error| failed)|\bFAIL(?:ED)?\b.*(?:test|spec)|(?:test|spec).*(?:failed|failure|timed out)|\b(?:TypeError|SyntaxError|ReferenceError|CompileError)\b|\berror TS\d+\b|\berror\[E\d+\]|compilation failed|lint.*(?:error|failed)|eslint|prettier|\bexpected\b.*\b(?:received|actual|equal)\b|\blocator\.\w+:\s*(?:Timeout \d+ms exceeded|.*(?:failed|timed out))|\b(?:Error|TimeoutError):\s*expect\([^\r\n]*\)\.[^\r\n]*(?:failed|timed out|timeout)/i.test(log)) return "code";
   return "unknown";
 }
@@ -150,13 +156,127 @@ export async function readCiLog(response: Response, secrets: string[], projectPa
   } finally { await reader.cancel(); }
 }
 
+type OperationalClassification = keyof typeof operationalCiBlockers;
+const ciClassifications: CiJob["classification"][] = ["unknown", "code", "infrastructure", "policy", "credentials"];
+type BlockerEvidence = Map<OperationalClassification, string>;
+
+class CiLogClassifier {
+  classification: CiJob["classification"] = "unknown";
+  readonly blockers: BlockerEvidence = new Map();
+  private run?: { output: Map<string, BlockerEvidence>; failedTests: Set<string>; reporting: boolean; consoleTest?: string };
+
+  add(line: string, clean: string): void {
+    if (/^RUN\s+v\d+\./.test(line)) {
+      this.finishRun();
+      this.run = { output: new Map(), failedTests: new Set(), reporting: false };
+    } else if (/^(?:##\[(?:end)?group\]|section_(?:start|end):)/.test(line)) this.finishRun();
+
+    const consoleTest = /^(?:stdout|stderr) \| (.+)$/.exec(line);
+    const failedTest = /^FAIL\s+(.+\.(?:test|spec)\.[^ >]+(?: > .+)?)$/.exec(line);
+    if (this.run) {
+      if (!line || /^##\[(?:error|warning)\]/.test(line)) delete this.run.consoleTest;
+      if (consoleTest) this.run.consoleTest = consoleTest[1];
+      if (failedTest) {
+        this.run.reporting = true;
+        this.run.failedTests.add(failedTest[1]);
+        delete this.run.consoleTest;
+      }
+    }
+    if (consoleTest && this.run) return;
+    const applicationError = applicationErrorCause(line);
+    const jobControl = applicationError === undefined ? undefined : classifyJobControlCause(applicationError);
+    const classification = jobControl ?? classifyCiLine(line);
+    if (classification === "unknown") return;
+    if (classification === "code") {
+      this.record(classification);
+      // Only a completed report can disassociate application output from the failure.
+      const summary = /^Tests\s+(\d+) failed\b/.exec(line);
+      if (summary) this.finishRun(Number(summary[1]) > 0 && Number(summary[1]) === this.run?.failedTests.size);
+      return;
+    }
+    const match = operationalCiBlockers[classification].exec(clean);
+    const context = match ? clean.slice(Math.max(0, match.index - 300), match.index + 700).trim() : "[REDACTED blocker text]";
+    const evidence = `[${classification}] ${context}\n`;
+    if (this.run && !jobControl && (this.run.consoleTest || !this.run.reporting && applicationError !== undefined)) {
+      const test = this.run.consoleTest ?? "";
+      let output = this.run.output.get(test);
+      if (!output) this.run.output.set(test, output = new Map());
+      if (!output.has(classification)) output.set(classification, evidence);
+    } else this.record(classification, evidence);
+  }
+
+  finishRun(complete = false): void {
+    if (!this.run) return;
+    for (const [test, output] of this.run.output) {
+      const failed = test && [...this.run.failedTests].some(name => testOutputMatchesFailure(test, name));
+      if (!complete || failed)
+        for (const [classification, evidence] of output) this.record(classification, evidence);
+    }
+    this.run = undefined;
+  }
+
+  private record(classification: CiJob["classification"], evidence?: string): void {
+    if (ciClassifications.indexOf(classification) > ciClassifications.indexOf(this.classification))
+      this.classification = classification;
+    if (evidence && classification !== "code" && classification !== "unknown" && !this.blockers.has(classification))
+      this.blockers.set(classification, evidence);
+  }
+}
+
+function ciLogLine(raw: string): string {
+  const badge = /\x1b\[30m\x1b\[(?:4[0-7]|10[0-7])m ([^\x1b\r\n]+) \x1b\[49m\x1b\[39m/.exec(raw);
+  if (badge && /^(?:FAIL|(?:stdout|stderr) \|)$/.test(ciLogText(raw.slice(0, badge.index))))
+    raw = raw.slice(0, badge.index) + `|${badge[1]}|` + raw.slice(badge.index + badge[0].length);
+  return ciLogText(raw);
+}
+
+function ciLogText(raw: string): string {
+  return raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim().replace(/^[·✓×↓x*\s-]+/, "");
+}
+
+function testOutputMatchesFailure(output: string, failure: string): boolean {
+  const test = vitestTaskIdentity(output);
+  const failed = vitestTaskIdentity(failure);
+  return (!test.project || !failed.project || test.project === failed.project) &&
+    (failed.task === test.task || failed.task.startsWith(`${test.task} > `));
+}
+
+function vitestTaskIdentity(name: string): { project?: string; task: string } {
+  const project = /^\|([^|]+)\|\s+/.exec(name);
+  return { project: project?.[1], task: project ? name.slice(project[0].length) : name };
+}
+
+function applicationErrorCause(line: string): string | undefined {
+  if (!line.startsWith("{")) return;
+  try {
+    const record: unknown = JSON.parse(line);
+    if (record && typeof record === "object" &&
+      "level" in record && typeof record.level === "number" &&
+      "msg" in record && typeof record.msg === "string" &&
+      "err" in record && !!record.err && typeof record.err === "object" &&
+      "type" in record.err && typeof record.err.type === "string" &&
+      "message" in record.err && typeof record.err.message === "string" &&
+      "stack" in record.err && typeof record.err.stack === "string") {
+      if (record.err.type === "AssertionError") return record.msg.split(record.err.message).join("");
+      return [record.msg, record.err.type, record.err.message, record.err.stack].join("\n");
+    }
+  } catch { return; }
+}
+
+function classifyJobControlCause(cause: string): OperationalClassification | undefined {
+  for (const classification of ["credentials", "policy"] as const)
+    if (operationalCiBlockers[classification].test(cause)) return classification;
+  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device/i.test(cause))
+    return "infrastructure";
+}
+
 class CiLogExcerpts {
   private complete = "";
   private shortened = false;
   private prefix = "";
   private tail = "";
   private checkoutLog = "";
-  private blockerLog = new Map<CiJob["classification"], string>();
+  private readonly classifier = new CiLogClassifier();
   private repository = "";
   private awaitingSha = false;
   private privateKey = false;
@@ -166,19 +286,9 @@ class CiLogExcerpts {
   constructor(private readonly secrets: string[], private readonly projectPath: string, private readonly evidence: CiLogEvidence) {}
 
   add(raw: string): void {
-    const line = raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim();
-    const classification = classifyCiLog(line);
+    const line = ciLogLine(raw);
     const clean = this.redact(raw);
-    const priorities: CiJob["classification"][] = ["unknown", "code", "infrastructure", "policy", "credentials"];
-    if (priorities.indexOf(classification) > priorities.indexOf(this.evidence.classification))
-      this.evidence.classification = classification;
-    if ((classification === "credentials" || classification === "policy" || classification === "infrastructure") && !this.blockerLog.has(classification)) {
-      const match = operationalCiBlockers[classification].exec(clean);
-      const context = match
-        ? clean.slice(Math.max(0, match.index - 300), match.index + 700).trim()
-        : "[REDACTED blocker text]";
-      this.blockerLog.set(classification, `[${classification}] ${context}\n`);
-    }
+    this.classifier.add(line, clean);
     this.checkout(line, clean);
     if (!this.shortened) {
       this.complete += clean;
@@ -189,11 +299,13 @@ class CiLogExcerpts {
   }
 
   finish(): void {
+    this.classifier.finishRun();
+    this.evidence.classification = this.classifier.classification;
     if (this.awaitingSha) this.evidence.checkout.invalid = true;
     this.evidence.log = this.shortened ? [
       this.prefix, "[CI log truncated; full stream scanned]",
       this.checkoutLog && `[Checkout evidence]\n${this.checkoutLog}`,
-      this.blockerLog.size && `[Operational blocker evidence]\n${[...this.blockerLog.values()].join("")}`,
+      this.classifier.blockers.size && `[Operational blocker evidence]\n${[...this.classifier.blockers.values()].join("")}`,
       `[Failure tail]\n${this.tail}`,
     ].filter(Boolean).join("\n").slice(0, maxCiLogCharacters) : this.complete;
   }
