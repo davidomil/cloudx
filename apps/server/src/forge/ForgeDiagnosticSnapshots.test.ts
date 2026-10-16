@@ -388,6 +388,78 @@ describe("Owned Forge diagnostic snapshots", () => {
     expect(await fs.readFile(path.join(state.checkout, "source.txt"), "utf8")).toBe("Committed source\n");
   });
 
+  it.each(["before", "after"])("recovers changed owned source after restart when removal stopped %s rename", async interruption => {
+    const state = await fixture();
+    const snapshot = await state.create();
+    const journal = path.join(state.root, "snapshot.json");
+    let source = snapshot.identity.path;
+    if (interruption === "before") {
+      const rename = vi.spyOn(fs, "rename").mockRejectedValueOnce(Object.assign(new Error("Injected rename EIO"), { code: "EIO" }));
+      await expect(state.retire(snapshot, [], async () => { await fs.writeFile(journal, JSON.stringify(snapshot)); }))
+        .rejects.toThrow("Injected rename EIO");
+      rename.mockRestore();
+    } else {
+      source = await interruptRemoval(state, snapshot);
+      await fs.writeFile(journal, JSON.stringify(snapshot));
+    }
+    const resumed: OwnedDiagnosticSnapshot = JSON.parse(await fs.readFile(journal, "utf8"));
+    expect(resumed.state).toBe("removing");
+    expect(resumed.recovery).toBeUndefined();
+    await fs.writeFile(path.join(source, "investigation.log"), "Evidence added during the hold\n");
+    await fs.writeFile(path.join(source, "source.txt"), "Source changed during the hold\n");
+    const recovery = new ForgeDiagnosticSnapshotRecovery(path.join(state.root, "durable-data"));
+    const restarted = new ForgeDiagnosticSnapshots(recovery);
+    const save = async () => { await fs.writeFile(journal, JSON.stringify(resumed)); };
+    await expect(restarted.retire(state.checkoutIdentity, [resumed], [], save, state.git)).rejects.toThrow("new or modified contents");
+    await restarted.recover(state.checkoutIdentity, resumed, save);
+    expect(resumed.recovery?.state).toBe("verified");
+    expect(resumed.hold).toBeUndefined();
+    await recovery.verify(resumed);
+    const restored = path.join(state.root, "restored");
+    await fs.mkdir(restored);
+    await extract({ file: resumed.recovery!.archivePath, cwd: restored });
+    expect(await fs.readFile(path.join(restored, "investigation.log"), "utf8")).toBe("Evidence added during the hold\n");
+    expect(await fs.readFile(path.join(restored, "source.txt"), "utf8")).toBe("Source changed during the hold\n");
+    const recovered: OwnedDiagnosticSnapshot = JSON.parse(await fs.readFile(journal, "utf8"));
+    await new ForgeDiagnosticSnapshots(recovery).retire(state.checkoutIdentity, [recovered], [], async () => {}, state.git);
+    expect(recovered.state).toBe("removed");
+    await expect(fs.lstat(source)).rejects.toMatchObject({ code: "ENOENT" });
+    await recovery.verify(recovered);
+    expect(await fs.readFile(path.join(state.checkout, "source.txt"), "utf8")).toBe("Committed source\n");
+  });
+
+  it.each(["ready", "removing"] as const)("preserves conflicting recovery directories in %s state", async status => {
+    const state = await fixture();
+    const snapshot = await state.create();
+    snapshot.state = status;
+    const retiring = path.join(path.dirname(snapshot.identity.path), "retiring-source");
+    await fs.mkdir(retiring);
+    await fs.writeFile(path.join(retiring, "investigation.log"), "Conflicting recovery evidence\n");
+    const save = vi.fn(async () => {});
+    await expect(state.snapshots.recover(state.checkoutIdentity, snapshot, save)).rejects.toThrow("conflicting recovery directories");
+    expect(await fs.readFile(path.join(snapshot.identity.path, "source.txt"), "utf8")).toBe("Committed source\n");
+    expect(await fs.readFile(path.join(retiring, "investigation.log"), "utf8")).toBe("Conflicting recovery evidence\n");
+    expect(snapshot.recovery).toBeUndefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "retiring-source"])("rejects a replaced %s directory during recovery", async directory => {
+    const state = await fixture();
+    const snapshot = await state.create();
+    snapshot.state = "removing";
+    const original = path.join(state.root, "original-source");
+    await fs.rename(snapshot.identity.path, original);
+    const replacement = path.join(path.dirname(snapshot.identity.path), directory);
+    await fs.mkdir(replacement);
+    await fs.writeFile(path.join(replacement, "investigation.log"), "Replacement evidence\n");
+    const save = vi.fn(async () => {});
+    await expect(state.snapshots.recover(state.checkoutIdentity, snapshot, save)).rejects.toThrow("ownership changed");
+    expect(await fs.readFile(path.join(replacement, "investigation.log"), "utf8")).toBe("Replacement evidence\n");
+    expect(await fs.readFile(path.join(original, "source.txt"), "utf8")).toBe("Committed source\n");
+    expect(snapshot.recovery).toBeUndefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
   it.each(["added evidence", "modified source", "partial .git"])("preserves %s when interrupted removal is resumed", async change => {
     const state = await fixture();
     const snapshot = await state.create();

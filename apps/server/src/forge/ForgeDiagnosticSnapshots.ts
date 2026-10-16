@@ -228,10 +228,11 @@ export class ForgeDiagnosticSnapshots {
       throw new Error("The diagnostic snapshot parent is missing; its contents cannot be recovered automatically.");
     const parent = await openOwnedDirectoryNoFollow(path.dirname(parentPath), parentPath, "Diagnostic snapshot parent", snapshot.parentIdentity);
     try {
-      const removing = snapshot.state === "removing";
-      const identity = { ...snapshot.identity, path: path.join(parentPath, removing ? "retiring-source" : "source") };
-      if (await exists(parent.childPath(removing ? "source" : "retiring-source")))
+      const sourceExists = await exists(parent.childPath("source"));
+      const removalExists = await exists(parent.childPath("retiring-source"));
+      if (sourceExists && removalExists)
         throw new Error("Diagnostic snapshot has conflicting recovery directories; both copies were preserved.");
+      const identity = { ...snapshot.identity, path: path.join(parentPath, sourceExists ? "source" : "retiring-source") };
       await assertIdentity(identity);
       // A verified receipt is immutable. Changed source after preservation stays protected.
       if (!snapshot.recovery) {
