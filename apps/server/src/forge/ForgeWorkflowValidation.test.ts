@@ -727,6 +727,23 @@ describe("Saved automatic review loops", () => {
     expect(parseWorkers([parsed])[0].autoReview!.waitingSince).toBe(worker.startedAt);
   });
 
+  it.each([undefined, "b".repeat(40)])("round-trips a CI deadline scoped to the source and target %s", targetHeadSha => {
+    const ciWait = { headSha, ...(targetHeadSha ? { targetHeadSha } : {}), startedAt: worker.startedAt };
+    const saved = { ...worker, autoReview: { ...autoReview, ciWait } };
+    const [parsed] = parseWorkers([saved]);
+    expect(parsed).toEqual(saved);
+    expect(parsed.autoReview!.ciWait).not.toBe(ciWait);
+  });
+
+  it.each([
+    null, [], {}, { headSha: "invalid", startedAt: worker.startedAt },
+    { headSha, targetHeadSha: "invalid", startedAt: worker.startedAt },
+    { headSha, startedAt: "yesterday" }, { headSha, startedAt: "2026-09-08T00:00:00Z" },
+    { headSha, startedAt: 7 },
+  ])("rejects a malformed saved CI wait %#", ciWait => {
+    expect(() => parseWorkers([{ ...worker, autoReview: { ...autoReview, ciWait } }])).toThrow();
+  });
+
   it.each(["paused", "failed", "cleanup_failed", "stopped"] as const)("keeps a %s loop's disabled preference, review link, and merge latch", status => {
     const saved = { ...worker, status, changeNumber: 12, headSha, mergeAttempted: true, autoReview: { ...autoReview, enabled: false, phase: "merging", reviewWorkerId } };
     expect(parseWorkers([saved])).toEqual([saved]);

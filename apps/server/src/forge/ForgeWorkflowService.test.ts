@@ -5098,7 +5098,7 @@ describe("Forge issue auto review", () => {
     expect(f.provider.getCiFailure).toHaveBeenCalledOnce();
     const repairedHead = "c".repeat(40);
     await publishCiRepair({ ...f, diagnostic }, repairedHead);
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, sourceHead);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, { purpose: "ci_repair", expectedRemoteHeadSha: sourceHead });
     expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
     expect(f.currentReview()).toMatchObject({ id: firstReviewer.id, headSha: repairedHead, status: "running", reviewHistory: [expect.objectContaining({ headSha: sourceHead })] });
     expect(f.currentIssue().ciRepair).toMatchObject({ phase: "reviewing", repairedHeadSha: repairedHead });
@@ -5165,9 +5165,9 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
-  it("stops waiting for CI diagnosis when the tested identity never progresses", async () => {
+  it("keeps obsolete CI identity observation bounded by the metadata timeout", async () => {
     const f = await approvedIssue();
-    const diagnostic = failedCi(f, { state: "pending", reason: "Waiting for the current tested merge identity." });
+    const diagnostic = failedCi(f, { state: "obsolete", reason: "Waiting for the current tested merge identity." });
     await f.poll();
     f.advanceTime(120_001);
     await f.poll();
@@ -5179,6 +5179,56 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("retains the original CI wait deadline across restart %s and pauses with guidance after two hours", async restart => {
+    const f = await approvedIssue();
+    failedCi(f, { state: "pending", reason: "The current run is still producing required gates." });
+    await f.poll();
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+    expect(ciWait).toEqual({ headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha, startedAt: new Date(Date.now()).toISOString() });
+    expect(f.currentIssue().autoReview!.waitingSince).toBeUndefined();
+    f.advanceTime(60 * 60_000);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, mergeQueue: { phase: "waiting_ci" }, ciRepair: { attempts: 0 } });
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    f.advanceTime(60 * 60_000);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/two hours.*Inspect.*Resume/), ciRepair: { attempts: 0, attemptedHeads: [] } });
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("uses the same CI deadline for pending check rollups and absent-gate diagnostics", async () => {
+    const f = await approvedIssue();
+    f.change.checks = { state: "pending", url: `${f.change.url}/checks` };
+    await f.poll();
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+    f.advanceTime(10 * 60_000);
+    failedCi(f, { state: "pending", reason: "The active run still has no required aggregate." });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, ciRepair: { attempts: 0 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("starts a new CI deadline when the target changes and clears it when CI waiting ends", async () => {
+    const f = await approvedIssue();
+    failedCi(f, { state: "pending" });
+    await f.poll();
+    const previous = f.currentIssue().autoReview!.ciWait;
+    f.advanceTime(60 * 60_000);
+    f.change.targetHeadSha = "f".repeat(40);
+    failedCi(f, { state: "pending" });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait: {
+      headSha: f.change.headSha, targetHeadSha: f.change.targetHeadSha, startedAt: new Date(Date.now()).toISOString(),
+    } } });
+    expect(f.currentIssue().autoReview!.ciWait?.startedAt).not.toBe(previous?.startedAt);
+    f.change.checks!.state = "unknown";
+    await f.poll();
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
   });
 
   it.each(["pending", "unknown", "skipped"] as const)("does not diagnose %s checks as terminal failures", async state => {
@@ -5364,7 +5414,7 @@ describe("Forge issue auto review", () => {
     f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = repairedHead; f.change.checks = { state: "pending", url: `${f.change.url}/checks` }; return repairedHead; });
     const restarted = new ForgeWorkflowService(f.deps);
     await restarted.poll();
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, f.diagnostic.sourceHeadSha);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, { purpose: "ci_repair", expectedRemoteHeadSha: f.diagnostic.sourceHeadSha });
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", headSha: repairedHead, ciRepair: { phase: "reviewing", attempts: 1 } });
     expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
     expect(f.runtime.preparePublication).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(String), expect.objectContaining({ retainedPaths: ["failure-reproduction.txt"] }), expect.any(AbortSignal));
@@ -5380,7 +5430,7 @@ describe("Forge issue auto review", () => {
     f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = repairedHead; f.change.checks = { state: "pending", url: `${f.change.url}/checks` }; return repairedHead; });
     const restarted = new ForgeWorkflowService(f.deps);
     await restarted.resume(f.issue.id, placement);
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, f.diagnostic.sourceHeadSha);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, { purpose: "ci_repair", expectedRemoteHeadSha: f.diagnostic.sourceHeadSha });
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", ciRepair: { phase: "reviewing", attempts: 1 } });
     expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
     expect(f.provider.merge).not.toHaveBeenCalled();
@@ -5402,7 +5452,7 @@ describe("Forge issue auto review", () => {
     f.change.targetHeadSha = f.diagnostic.targetHeadSha;
     f.runtime.publishBranch.mockImplementation(async () => { f.change.headSha = repairedHead; f.change.checks = { state: "pending", url: `${f.change.url}/checks` }; return repairedHead; });
     await f.service.resume(f.issue.id, placement);
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, f.diagnostic.sourceHeadSha);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, { purpose: "ci_repair", expectedRemoteHeadSha: f.diagnostic.sourceHeadSha });
     expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === f.issue.id)).toHaveLength(2);
     expect(f.provider.merge).not.toHaveBeenCalled();
     expect(f.runtime.cleanup).not.toHaveBeenCalled();
@@ -5461,7 +5511,7 @@ describe("Forge issue auto review", () => {
       return repairedHead;
     });
     await f.poll();
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, sourceHead);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead, { purpose: "ci_repair", expectedRemoteHeadSha: sourceHead });
     expect(f.currentReview()).toMatchObject({ id: firstReviewer.id, status: "running", headSha: repairedHead });
     expect(f.currentIssue().ciRepair).toMatchObject({ phase: "reviewing", attempts: 1 });
     f.report({ kind: "review", headSha: repairedHead, event: "approve", body: "Regression is covered", comments: [] });
@@ -5495,6 +5545,7 @@ describe("Forge issue auto review", () => {
     const gate = { ...job, id: 10, name: "CI aggregate", check_run_url: "https://api.github.com/repos/a/b/check-runs/10", html_url: "https://github.com/a/b/actions/runs/42/job/10" };
     const optional = { ...job, id: 11, name: "Unrelated optional", check_run_url: "https://api.github.com/repos/a/b/check-runs/11", html_url: "https://github.com/a/b/actions/runs/42/job/11" };
     const workflow = Buffer.from(`jobs:\n  aggregate:\n    name: CI aggregate\n    needs: upgrade\n  upgrade:\n    name: ${jobName}\n  optional:\n    name: Unrelated optional\n`);
+    const checks = [{ __typename: "CheckRun", databaseId: aggregate ? 10 : 9, name: aggregate ? "CI aggregate" : jobName, status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }];
     const pipeline = { id: 42, project_id: 1, sha: sourceHead, status: "failed" };
     const labJob = { id: 9, name: jobName, status: "failed", allow_failure: false, failure_reason: "script_failure",
       web_url: "https://gitlab.example/a/b/-/jobs/9", commit: { id: sourceHead }, pipeline };
@@ -5505,7 +5556,7 @@ describe("Forge issue auto review", () => {
       if (pathname === "/graphql") body = { data: { repository: { pullRequest: {
         number: 7, state: "OPEN", headRefOid: sourceHead, headRefName: f.change.headBranch, baseRefOid: targetHead, baseRefName: "main",
         headRef: { target: { oid: sourceHead, statusCheckRollup: { contexts: {
-          nodes: [{ __typename: "CheckRun", databaseId: aggregate ? 10 : 9, name: aggregate ? "CI aggregate" : jobName, status: "COMPLETED", conclusion: "FAILURE", isRequired: true, checkSuite: { workflowRun: { databaseId: 42, runAttempt: 1 } } }],
+          nodes: checks,
           pageInfo: { hasNextPage: false },
         } } } },
       } } } };
@@ -5536,7 +5587,7 @@ describe("Forge issue auto review", () => {
     f.provider.getCiFailure.mockImplementation(change => provider.getCiFailure(change));
     f.change.checks = { state: "failed", url: `${f.change.url}/checks` };
     f.reports.read.mockResolvedValue(undefined);
-    return { repository, sourceHead, targetHead, testedMerge, token, fetcher };
+    return { repository, sourceHead, targetHead, testedMerge, token, fetcher, run, checks };
   }
 
   it.each(["github", "gitlab"] as const)("collects real %s adapter diagnostics through the repair workflow and redacts credentials", async providerKind => {
@@ -5566,6 +5617,106 @@ describe("Forge issue auto review", () => {
         log: expect.stringContaining("locator.selectOption"), requiredGate: { jobId: "10", name: "CI aggregate" } }] } } });
     expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/11/logs"))).toBe(false);
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["SUCCESS", "SKIPPED", "NEUTRAL"].flatMap(conclusion => [false, true].map(restart => ({ conclusion, restart }))))(
+    "waits beyond the metadata timeout for an absent aggregate with a $conclusion sibling, then repairs once (restart: $restart)", async ({ conclusion, restart }) => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: upgrade migration fails\n", "Installed previous-version upgrade", true);
+    const aggregate = { ...evidence.checks[0] };
+    evidence.checks.splice(0, 1,
+      { ...aggregate, databaseId: 9, name: "Installed previous-version upgrade", isRequired: false },
+      { ...aggregate, databaseId: 12, name: "TypeScript", conclusion });
+    evidence.run.status = "in_progress";
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { phase: "diagnosing", attempts: 0, attemptedHeads: [], diagnostic: { state: "pending", jobs: [] } } });
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    f.advanceTime(120_001);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { attempts: 0 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    f.advanceTime(8 * 60_000);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, mergeQueue: { phase: "waiting_ci" }, ciRepair: { attempts: 0, attemptedHeads: [] } });
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+    evidence.run.status = "completed";
+    evidence.checks.push(aggregate);
+    f.advanceTime(5_000);
+    await service.poll(); await service.poll();
+
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1, attemptedHeads: [evidence.sourceHead],
+      diagnostic: { state: "actionable", jobs: [{ jobId: "9", requiredGate: { jobId: "10", name: "CI aggregate" } }] } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/11/logs"))).toBe(false);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"])("preserves the %s required-check blocker while its run is active", async conclusion => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: optional shard fails\n", "optional", true);
+    evidence.checks.push({ ...evidence.checks[0], databaseId: 12, name: "required sibling", conclusion });
+    evidence.checks[0].isRequired = false;
+    evidence.run.status = "in_progress";
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { attempts: 0, attemptedHeads: [], diagnostic: { state: "blocked", jobs: [] } } });
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("leaves the CI wait without repair when late required gates pass", async () => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: unrelated optional failure\n", "optional", true);
+    evidence.checks[0].isRequired = false;
+    evidence.run.status = "in_progress";
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRepair: { attempts: 0, diagnostic: { state: "pending" } } });
+    evidence.run.status = "completed";
+    evidence.checks[0].conclusion = "SUCCESS";
+    evidence.checks[0].isRequired = true;
+    f.change.checks!.state = "passed";
+    f.change.mergeable = true;
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("keeps a terminal unrelated optional failure explicit after waiting for absent gates", async () => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: unrelated optional failure\n", "optional", true);
+    evidence.checks[0].isRequired = false;
+    evidence.run.status = "in_progress";
+    await f.poll();
+    evidence.run.status = "completed";
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { attempts: 0, attemptedHeads: [], diagnostic: { state: "blocked", jobs: [] } } });
+    expect(f.currentIssue().error).toContain("optional jobs do not trigger repair");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/logs"))).toBe(false);
+  });
+
+  it("does not repair an old source when its head changes during the absent-gate wait", async () => {
+    const f = await approvedIssue(1, "github");
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: old source\n", "Installed previous-version upgrade", true);
+    evidence.checks[0].isRequired = false;
+    evidence.run.status = "in_progress";
+    await f.poll();
+    const changedHead = "f".repeat(40);
+    f.change.headSha = changedHead;
+    evidence.run.status = "completed";
+    evidence.checks[0].isRequired = true;
+    await f.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.currentIssue().ciRepair?.attempts).toBe(0);
+    expect(f.currentIssue().autoReview!.ciWait).toBeUndefined();
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
@@ -6405,7 +6556,7 @@ describe("Forge issue auto review", () => {
     })]);
     f.resolvedReport(); f.publishRebase();
     await f.poll();
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), "c".repeat(40), previousHead);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), "c".repeat(40), { purpose: "rebase", expectedRemoteHeadSha: previousHead });
     expect(f.change.approved).toBe(true);
     expect(f.currentIssue()).toMatchObject({ headSha: "c".repeat(40), rebaseRecovery: { phase: "reviewing" } });
     expect(f.currentReview()).toMatchObject({ id: f.oldReview.id, headSha: "c".repeat(40), status: "running", reviewHistory: [f.oldReview.draft] });
@@ -6529,7 +6680,7 @@ describe("Forge issue auto review", () => {
     const restarted = new ForgeWorkflowService(f.deps);
     await restarted.resume(f.issue.id, placement);
     expect(f.runtime.completeIssueRebase).toHaveBeenCalledOnce();
-    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), "c".repeat(40), lease);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), "c".repeat(40), { purpose: "rebase", expectedRemoteHeadSha: lease });
     expect(f.currentIssue()).toMatchObject({ status: "awaiting_review", rebaseRecovery: { phase: "reviewing" } });
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
     expect(f.provider.merge).not.toHaveBeenCalled();

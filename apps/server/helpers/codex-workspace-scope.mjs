@@ -5,6 +5,7 @@ import path from "node:path";
 const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 const MAX_PENDING = 32;
 const MAX_PAGES = 1000;
+const MAX_LISTINGS = 32;
 
 /** CloudX workspace ownership is independent of Codex's Git worktree grouping. */
 export class CodexWorkspaceScope {
@@ -17,6 +18,7 @@ export class CodexWorkspaceScope {
     this.binding = binding;
     this.cwd = realpathSync(binding.cwd);
     this.pending = new Map();
+    this.listings = new Map();
   }
 
   recordSelection(identity, { created = false } = {}) {
@@ -54,7 +56,23 @@ export class CodexWorkspaceScope {
     message.params.cwd = this.cwd;
     const limit = message.params.limit ?? 25;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error("Invalid Codex workspace listing limit.");
-    this.pending.set(message.id, { params: { ...message.params }, limit, data: [], cursors: new Set(), pages: 0 });
+    if (limit === 1) {
+      // --last must compare the authoritative filesystem order, even when the
+      // native index has not yet discovered a newer rollout.
+      message.params.useStateDbOnly = false;
+      this.pending.set(message.id, { params: { ...message.params }, limit, cursors: new Set(), pages: 0 });
+      return;
+    }
+    const query = JSON.stringify(Object.entries(message.params).filter(([key]) => !["cursor", "useStateDbOnly"].includes(key)).sort());
+    let listing;
+    if (message.params.cursor != null) {
+      listing = this.listings.get(message.params.cursor);
+      if (!listing || listing.query !== query) throw new Error("Codex workspace listing cursor is expired or belongs to a different query.");
+      this.listings.delete(message.params.cursor);
+    } else listing = { query, indexed: true, cursor: null, pages: 0, seen: new Set(), cursors: new Set() };
+    message.params.cursor = listing.cursor;
+    message.params.useStateDbOnly = listing.indexed;
+    this.pending.set(message.id, { params: { ...message.params }, listing });
   }
 
   fromServer(message, nextPage) {
@@ -63,21 +81,49 @@ export class CodexWorkspaceScope {
     if (!request) return;
     if (message.error) { this.pending.delete(message.id); return; }
     if (!Array.isArray(message.result?.data)) throw new Error("Codex workspace listing returned invalid data.");
-    request.data.push(...message.result.data.filter(thread => this.belongsToWorkspace(thread)));
+    const data = message.result.data.filter(thread => this.belongsToWorkspace(thread));
     const cursor = message.result.nextCursor;
     if (cursor != null && typeof cursor !== "string") throw new Error("Codex workspace listing returned an invalid cursor.");
-    if (request.data.length < request.limit && cursor != null) {
+    if (request.listing) {
+      const listing = request.listing;
+      if (++listing.pages > MAX_PAGES || cursor != null && listing.cursors.has(`${listing.indexed}:${cursor}`))
+        throw new Error("Codex workspace listing did not finish within its pagination limit.");
+      if (cursor != null) listing.cursors.add(`${listing.indexed}:${cursor}`);
+      message.result.data = data.filter(thread => {
+        if (listing.seen.has(thread.id)) return false;
+        listing.seen.add(thread.id);
+        return true;
+      });
+      this.pending.delete(message.id);
+      // Deliver indexed rows immediately. Continuing after the index exhausts
+      // reconciles rollouts through the native scan-and-repair path. The native
+      // picker requests each page itself, keeping cancellation and search live.
+      const reconcile = listing.indexed && cursor == null;
+      if (reconcile) listing.indexed = false;
+      listing.cursor = cursor ?? null;
+      message.result.nextCursor = cursor != null || reconcile ? this.continueListing(listing) : null;
+      return;
+    }
+    if (!data.length && cursor != null) {
       if (request.cursors.has(cursor) || ++request.pages > MAX_PAGES)
         throw new Error("Codex workspace listing did not finish within its pagination limit.");
       request.cursors.add(cursor);
       // Continue the same bounded query until its page contains eligible rows.
       // This is pagination, including --last's one-row page, rather than a retry.
       nextPage({ id: message.id, method: "thread/list", params: { ...request.params,
-        cursor, limit: request.limit - request.data.length } });
+        cursor, limit: request.limit } });
       return false;
     }
-    message.result.data = request.data;
+    message.result.data = data;
     this.pending.delete(message.id);
+  }
+
+  continueListing(listing) {
+    const cursor = `cloudx-workspace:${randomBytes(16).toString("hex")}`;
+    this.listings.set(cursor, listing);
+    // Abandoned picker/search queries do not retain unbounded cursor state.
+    if (this.listings.size > MAX_LISTINGS) this.listings.delete(this.listings.keys().next().value);
+    return cursor;
   }
 
   belongsToWorkspace(thread) {

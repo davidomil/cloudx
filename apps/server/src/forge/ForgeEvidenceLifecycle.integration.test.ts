@@ -22,12 +22,13 @@ const evidenceBytes = Buffer.from("validation passed\n");
 const writableBytes = 4 * 1024 * 1024;
 
 describe("Completed Forge evidence lifecycle", () => {
-  it.each(["plugins", "plugins-clone-QkqfBY"])("archives useful fixtures among 4200 native %s cache files before retiring every earlier reviewer attempt", async cache => {
+  it.each(["plugins", "plugins-clone-QkqfBY"])("archives useful fixtures among 15207 native %s cache files with 17 KiB bodies before retiring every earlier reviewer attempt", async cache => {
     const owner = completedWorker("review");
     const resources = [savedEnvironment(owner, true), savedEnvironment(owner, true)];
     for (const resource of resources) resource.evidence!.paths = ["/work/evidence"];
     const fixture = await EvidenceLifecycleFixture.create([owner], resources);
     const profile = "evidence/settings-profile/data/codex-launches/model-scope";
+    const generatedBody = Buffer.alloc(17 * 1024, 0x61);
     const useful = [
       { path: "evidence/validation.log", data: evidenceBytes.toString() },
       { path: `${profile}/config.toml`, data: 'model = "fixture-model"\n' },
@@ -37,7 +38,7 @@ describe("Completed Forge evidence lifecycle", () => {
     ];
     fixture.host.archives = { "/work/evidence": [
       ...useful.slice(0, 2),
-      ...Array.from({ length: 4200 }, (_, index) => ({ path: `${profile}/.tmp/${cache}/plugins/example/cache-${index}.json`, data: "generated plugin clone" })),
+      ...Array.from({ length: 15207 }, (_, index) => ({ path: `${profile}/.tmp/${cache}/plugins/example/cache-${index}.json`, data: generatedBody })),
       ...useful.slice(2),
     ] };
     fixture.host.beforeRemove = async containerId => {
@@ -50,6 +51,16 @@ describe("Completed Forge evidence lifecycle", () => {
       expect(JSON.parse((await buffer(await fixture.resources.evidenceFile(resource.id, "work/evidence/reproduction/native-tool"))).toString()))
         .toEqual({ type: "SymbolicLink", target: "/opt/codex/bin/codex" });
     };
+    fixture.host.failure = "remove";
+    await fixture.workflow.poll();
+    expect((await fixture.store.read())[0]).toMatchObject({ id: owner.id, status: "completed" });
+    expect((await fixture.resources.records()).every(resource => resource.evidence?.state === "verified")).toBe(true);
+    expect(fixture.host.removed).toEqual([]);
+    await fixture.workflow.reconcileResourceCleanup();
+    expect(fixture.host.exports).toHaveLength(2);
+    await fixture.restart();
+    fixture.host.failure = undefined;
+    fixture.notifications.dismissAll();
     await fixture.workflow.poll();
     expect(await fixture.store.read()).toEqual([]);
     expect(fixture.host.removed.sort()).toEqual(resources.map(resource => resource.containerId).sort());
@@ -577,15 +588,15 @@ class SavedContainerHost implements DisposableContainerHost {
   }
 }
 
-interface TarFixtureEntry { path: string; data?: string; type?: types.EntryTypeName; linkpath?: string }
+interface TarFixtureEntry { path: string; data?: string | Buffer; type?: types.EntryTypeName; linkpath?: string }
 async function* fixtureTar(entries: TarFixtureEntry[], interruptAfter?: number) {
   for (const [index, entry] of entries.entries()) {
-    const data = Buffer.from(entry.data ?? "");
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data ?? "");
     const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, linkpath: entry.linkpath, mode: 0o600 });
     header.encode();
     if (header.needPax) yield new Pax({ path: entry.path, linkpath: entry.linkpath }).encode();
     yield header.block!;
-    if (data.length) yield data;
+    for (let offset = 0; offset < data.length; offset += 64 * 1024) yield data.subarray(offset, offset + 64 * 1024);
     yield Buffer.alloc((512 - data.length % 512) % 512);
     if (index === interruptAfter) throw new Error("reproduction tar interrupted");
   }

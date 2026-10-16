@@ -7,10 +7,13 @@ import { ciDiagnostic, ciEvidenceFailure, ciId, ciJobName, ciSha, ciUrl, classif
 
 import { GitHubWorkflowDependencies } from "./GitHubWorkflowDependencies.js";
 
-interface RequiredFailure {
-  checkId: number;
+interface WorkflowRunIdentity {
   runId: number;
   runAttempt: number;
+}
+
+interface RequiredFailure extends WorkflowRunIdentity {
+  checkId: number;
   name: string;
   conclusion: string;
 }
@@ -176,6 +179,8 @@ export class GitHubCiDiagnostics {
     const failures: RequiredFailure[] = [];
     let cursor: string | null = null;
     let pending = false;
+    let cancelledRequired = false;
+    const observedRuns = new Map<number, WorkflowRunIdentity>();
     for (let page = 0; page < 20; page++) {
       const response = record((await this.http.request("/graphql", {
         method: "POST", graphql: true, body: {
@@ -197,7 +202,19 @@ export class GitHubCiDiagnostics {
       const contexts = record(record(commit.statusCheckRollup).contexts);
       for (const value of list(contexts.nodes)) {
         const context = record(value);
-        if (!boolean(context.isRequired)) continue;
+        const required = boolean(context.isRequired);
+        if (context.__typename === "CheckRun" && context.checkSuite !== null) {
+          const workflowRun = record(context.checkSuite).workflowRun;
+          if (workflowRun !== null && workflowRun !== undefined) {
+            const run = record(workflowRun);
+            const identity = { runId: ciId(run.databaseId), runAttempt: ciId(run.runAttempt) };
+            const previous = observedRuns.get(identity.runId);
+            if (previous && previous.runAttempt !== identity.runAttempt)
+              throw new ForgeProviderError("CI contexts contain conflicting workflow run attempts.");
+            observedRuns.set(identity.runId, identity);
+          }
+        }
+        if (!required) continue;
         if (context.__typename === "StatusContext") {
           if (["FAILURE", "ERROR"].includes(string(context.state)))
             throw new ForgeProviderError("A required external CI status has no supported job-log identity.");
@@ -208,7 +225,10 @@ export class GitHubCiDiagnostics {
         if (context.status !== "COMPLETED") { pending = true; continue; }
         if (["ACTION_REQUIRED", "STARTUP_FAILURE"].includes(String(context.conclusion)))
           throw new ForgeProviderError("Required CI needs policy or infrastructure intervention.");
-        if (!["FAILURE", "TIMED_OUT"].includes(String(context.conclusion))) continue;
+        if (!["FAILURE", "TIMED_OUT"].includes(String(context.conclusion))) {
+          cancelledRequired ||= context.conclusion === "CANCELLED";
+          continue;
+        }
         const run = record(record(context.checkSuite).workflowRun);
         failures.push({ checkId: ciId(context.databaseId), runId: ciId(run.databaseId), runAttempt: ciId(run.runAttempt), name: string(context.name), conclusion: string(context.conclusion) });
       }
@@ -218,16 +238,28 @@ export class GitHubCiDiagnostics {
       if (!next || next === cursor || page === 19) throw new ForgeProviderError("Required CI context evidence exceeds the supported bound.");
       cursor = next;
     }
+    if (!failures.length && !pending && !cancelledRequired) {
+      if (observedRuns.size > maxCiFailureJobs)
+        throw new ForgeProviderError("Too many current CI runs to inspect safely.");
+      for (const observed of observedRuns.values()) {
+        const run = record((await this.http.request(`${this.path}/actions/runs/${observed.runId}`)).body);
+        if (!this.currentRun(run, observed, change)) {
+          diagnostic.state = "obsolete"; diagnostic.reason = "CI run no longer matches the current source or run attempt.";
+          return;
+        }
+        pending ||= run.status !== "completed";
+      }
+    }
     if (!failures.length) {
       diagnostic.state = pending ? "pending" : "blocked";
-      diagnostic.reason = pending ? "Required CI is pending." : "No current required failed or timed-out CI job was found; cancelled, skipped, and optional jobs do not trigger repair.";
+      diagnostic.reason = pending ? "Required CI is pending; the current run may still be producing required gates." : "No current required failed or timed-out CI job was found; cancelled, skipped, and optional jobs do not trigger repair.";
     }
     if (new Set(failures.map(failure => failure.checkId)).size !== failures.length)
       throw new ForgeProviderError("GitHub returned duplicate failed check identities.");
     return failures.sort((a, b) => a.checkId - b.checkId);
   }
 
-  private currentRun(run: Record<string, unknown>, failure: RequiredFailure, change: ForgeChangeRequest): boolean {
+  private currentRun(run: Record<string, unknown>, failure: WorkflowRunIdentity, change: ForgeChangeRequest): boolean {
     if (ciId(run.id) !== failure.runId || ciId(run.run_attempt) !== failure.runAttempt || !failure.runAttempt ||
         ciSha(run.head_sha) !== change.headSha || record(run.repository).full_name !== this.http.repository.projectPath) return false;
     const requests = list(run.pull_requests);

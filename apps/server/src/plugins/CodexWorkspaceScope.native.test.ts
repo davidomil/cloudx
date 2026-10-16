@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { stripVTControlCharacters } from "node:util";
 import { expect, it } from "vitest";
+import headless from "@xterm/headless";
 import type { PluginSession } from "@cloudx/plugin-api";
 import type { WorkspaceTab } from "@cloudx/shared";
 import { AppServerClient, StdioAppServerTransport } from "../appServer/AppServerClient.js";
@@ -33,6 +34,7 @@ it.skipIf(!codexBinary)("scopes the native production picker and last selection 
   let client: AppServerClient | undefined;
   let stopped: Promise<unknown> | undefined;
   const sessions: PluginSession[] = [];
+  const screens: Array<{ dispose(): void }> = [];
   let modelRequests = 0;
   const provider = createServer((request, response) => {
     request.resume();
@@ -102,26 +104,69 @@ it.skipIf(!codexBinary)("scopes the native production picker and last selection 
     const shared = await seed("workspace-b", project, "Shared-cwd-workspace-B");
     await seed("workspace-b", other, "Unrelated-workspace-B");
     await seed("workspace-a", forge, "Linked-Forge-worker", true);
-    const inventory = await client.request("thread/list", { limit: 100, sourceKinds: ["cli", "vscode", "exec", "appServer"], modelProviders: ["cloudx-native"] }) as { data: Array<{ id: string; cwd: string }> };
+    const inventory = await client.request("thread/list", { limit: 100, sourceKinds: ["cli", "vscode", "exec", "appServer"], modelProviders: ["cloudx-native"] }) as { data: Array<{ id: string; cwd: string; path: string }> };
     expect(inventory.data.map(thread => thread.id)).toEqual(expect.arrayContaining([mine, shared]));
+    const template = await fs.readFile(inventory.data.find(thread => thread.id === mine)!.path, "utf8");
+    const olderHistory = path.join(home, "sessions", "2020", "01", "01");
+    await fs.mkdir(olderHistory, { recursive: true });
+    const rolloutFiles = 5633;
+    await Promise.all(Array.from({ length: rolloutFiles - 6 }, async (_, index) => {
+      const id = randomUUID();
+      const contents = template.split("\n").filter(Boolean).map(line => {
+        const record = JSON.parse(line.replaceAll(mine, id).replaceAll("Owned-workspace-A", `Historical-unproven-${index}`));
+        record.timestamp = "2020-01-01T00:00:00.000Z";
+        if (record.type === "session_meta") record.payload.timestamp = record.timestamp;
+        return JSON.stringify(record);
+      }).join("\n") + "\n";
+      const target = path.join(olderHistory, `rollout-2020-01-01T00-00-00-${id}.jsonl`);
+      await fs.writeFile(target, contents);
+      await fs.utimes(target, new Date("2020-01-01"), new Date("2020-01-01"));
+    }));
+    const measurements: Array<Record<string, unknown>> = [];
     const requestsAfterSeeding = modelRequests;
     client.close();
     client = undefined;
     await stopped;
+    const unindexedId = randomUUID();
+    const unindexedPath = path.join(olderHistory, `rollout-2021-01-01T00-00-00-${unindexedId}.jsonl`);
+    await fs.writeFile(unindexedPath, template.replaceAll(mine, unindexedId).replaceAll("Owned-workspace-A", "Unindexed-owned-session"));
+    await fs.utimes(unindexedPath, new Date("2021-01-01"), new Date("2021-01-01"));
+    new CodexWorkspaceScope({ workspaceId: "workspace-a", cwd: project, provenanceDirectory,
+      owned: false, all: false, includeNonInteractive: false })
+      .recordSelection({ authority: "selected", sessionId: unindexedId, cwd: project }, { created: true });
+    const indexBeforeLaunch = await promisify(execFile)("python3", ["-I", "-S", "-c", `
+import pathlib, sqlite3, sys
+count = 0
+for file in pathlib.Path(sys.argv[1]).glob("state_*.sqlite"):
+    with sqlite3.connect(file.as_uri() + "?mode=ro", uri=True) as connection:
+        count += connection.execute("SELECT count(*) FROM threads WHERE id = ?", (sys.argv[2],)).fetchone()[0]
+print(count)
+`, home, unindexedId]);
+    expect(indexBeforeLaunch.stdout.trim()).toBe("0");
     const plugin = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, data, sources, env);
-    async function launch(resume: Record<string, unknown>, recovering = false) {
+    async function launch(resume: Record<string, unknown>, recovering = false, workspaceId = "workspace-a") {
+      const launchedAt = performance.now();
       const tab: WorkspaceTab = { id: randomUUID(), pluginId: "codex-terminal", title: "Workspace resume", cwd: project,
         status: "failed", createdAt: "", updatedAt: "", indicator: { color: "red", label: "Exited", updatedAt: "" } };
-      const input = { tab, cwd: project, workspaceId: "workspace-a", initialInput: { resume },
+      const input = { tab, cwd: project, workspaceId, initialInput: { resume },
         controls: { closeTab: () => undefined, setTabIndicator: () => undefined } };
       const session = await (recovering ? plugin.recoverSession(input) : plugin.createSession(input));
       sessions.push(session);
+      const screen = new headless.Terminal({ cols: 100, rows: 30, allowProposedApi: true });
+      screens.push(screen);
       let output = "";
+      let firstRowsMs: number | undefined;
+      const visibleText = () => Array.from({ length: screen.buffer.active.length }, (_, index) => screen.buffer.active.getLine(index)?.translateToString(true)).join("\n");
       session.onData!(chunk => {
+        screen.write(chunk, () => {
+          if (firstRowsMs === undefined && visibleText().includes("Owned-workspace-A")) firstRowsMs = Math.round(performance.now() - launchedAt);
+        });
         output = (output + chunk).slice(-131072);
         if (chunk.includes("\u001b[6n")) session.write!("\u001b[1;1R");
       });
-      return { session, text: () => stripVTControlCharacters(output),
+      return { session, text: () => stripVTControlCharacters(output), clearOutput: () => { output = ""; }, firstRowsMs: () => firstRowsMs,
+        visibleText,
+        diagnostics: () => fs.readFile(path.join(sources.viewPath(tab.id), "cloudx-codex-backend.log"), "utf8"),
         identity: () => new CodexConversationRecovery(sources.viewPath(tab.id)).readForExecution(tab.id, session.restoreInput!()!.codexExecutionId) };
     }
     for (const recovering of [false, true]) {
@@ -131,12 +176,40 @@ it.skipIf(!codexBinary)("scopes the native production picker and last selection 
       expect(picker.text()).not.toContain("Shared-cwd-workspace-B");
       expect(picker.text()).not.toContain("Linked-Forge-worker");
       expect(picker.text()).not.toContain("Unrelated-workspace-B");
+      await expect.poll(picker.text, { timeout: 15000 }).toContain("Unindexed-owned-session");
+      const timingEvents = (await picker.diagnostics()).split("\n").filter(line => line.startsWith("CloudX resume timing "))
+        .map(line => JSON.parse(line.slice("CloudX resume timing ".length)));
+      expect(timingEvents).toEqual(expect.arrayContaining([
+        expect.objectContaining({ event: "launch_prepared" }), expect.objectContaining({ event: "native_initialized", failed: false }),
+        expect.objectContaining({ event: "first_usable_rows", backendPages: expect.any(Number) })
+      ]));
+      expect(timingEvents.filter(event => event.event === "list_page").every(event => event.delivered)).toBe(true);
+      if (!recovering) expect(timingEvents).toContainEqual(expect.objectContaining({ event: "list_page", indexed: false, rows: 1 }));
+      expect(picker.firstRowsMs()).toBeLessThan(15000);
+      measurements.push({ recovering, rolloutFiles, firstRenderedRowsMs: picker.firstRowsMs(), timingEvents });
       await picker.session.terminate!();
     }
     const interactive = await launch({ mode: "picker", all: false, includeNonInteractive: false });
     await expect.poll(interactive.text, { timeout: 15000 }).toContain("Owned-workspace-A");
     expect(interactive.text()).not.toContain("Exec-workspace-A");
+    interactive.clearOutput();
+    interactive.session.write!("Unfindable-resume-session");
+    await expect.poll(interactive.visibleText, { timeout: 15000 }).toContain("No results for your search");
+    interactive.clearOutput();
+    interactive.session.write!("\x15Owned-workspace-A");
+    await expect.poll(interactive.visibleText, { timeout: 15000 }).toContain("Owned-workspace-A");
+    const cancellationStarted = performance.now();
     await interactive.session.terminate!();
+    expect(performance.now() - cancellationStarted).toBeLessThan(5000);
+    const empty = await launch({ mode: "picker", all: false, includeNonInteractive: false }, false, "empty-workspace");
+    await expect.poll(empty.visibleText, { timeout: 15000 }).toContain("No sessions yet");
+    await empty.session.terminate!();
+    const cancelled = await launch({ mode: "picker", all: false, includeNonInteractive: false }, false, "empty-workspace");
+    await expect.poll(cancelled.text, { timeout: 15000 }).toContain("Loading sessions");
+    const nativeCancellationStarted = performance.now();
+    cancelled.session.write!("\x03");
+    await expect.poll(() => cancelled.session.hasExited?.(), { timeout: 5000 }).toBe(true);
+    measurements.push({ nativeCancelMs: Math.round(performance.now() - nativeCancellationStarted), pendingHistoryRows: rolloutFiles });
     const last = await launch({ mode: "last", all: false, includeNonInteractive: true });
     await expect.poll(() => last.identity()?.sessionId, { timeout: 15000 }).toBe(mine);
     await last.session.terminate!();
@@ -150,10 +223,15 @@ it.skipIf(!codexBinary)("scopes the native production picker and last selection 
     expect(new CodexWorkspaceScope({ workspaceId: "workspace-a", cwd: project, provenanceDirectory,
       owned: false, all: false, includeNonInteractive: false }).readOwnership(shared).workspaceId).toBe("workspace-b");
     expect(modelRequests).toBe(requestsAfterSeeding);
+    if (process.env.CLOUDX_RESUME_EVIDENCE_DIR) {
+      await fs.mkdir(process.env.CLOUDX_RESUME_EVIDENCE_DIR, { recursive: true });
+      await fs.writeFile(path.join(process.env.CLOUDX_RESUME_EVIDENCE_DIR, "native-resume-timings.json"), JSON.stringify({ measurements }, null, 2));
+    }
   } finally {
     client?.close();
     await stopped;
     await Promise.all(sessions.map(session => session.terminate?.()));
+    screens.forEach(screen => screen.dispose());
     await sources.dispose();
     await new Promise<void>(resolve => provider.close(() => resolve()));
     await fs.rm(root, { recursive: true, force: true });

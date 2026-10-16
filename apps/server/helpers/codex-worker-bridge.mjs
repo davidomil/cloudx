@@ -13,6 +13,7 @@ import { forwardNativeOutput } from "./codex-worker-output.mjs";
 import { CodexCommandDetailsCapture, saveCommandDetails } from "./codex-command-details.mjs";
 import { CodexNativeWorkObservation } from "./codex-native-work.mjs";
 import { CodexBackendDiagnostics } from "./codex-backend-diagnostics.mjs";
+import { CodexResumeTimings } from "./codex-resume-timings.mjs";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -164,6 +165,7 @@ export async function runWorkerBridge(launch) {
       fail(new Error("Private Codex backend diagnostics could not be saved."));
     }
   };
+  const timings = new CodexResumeTimings(recordDiagnostic, launch.preparationMs);
   if (launch.configurationNotice) process.stderr.write(`${launch.configurationNotice}\n`);
   const token = randomBytes(32).toString("hex");
   let frontend;
@@ -256,6 +258,7 @@ export async function runWorkerBridge(launch) {
         const fork = forks?.fromClient(message);
         if (fork?.error) { socket.send(JSON.stringify({ id: message.id, error: fork.error })); return; }
         workspace?.fromClient(message);
+        timings.fromClient(message);
         permissions?.fromClient(message);
         if (!fork) selection?.fromClient(message);
         workHealth?.fromClient(message);
@@ -272,6 +275,8 @@ export async function runWorkerBridge(launch) {
       } catch (error) { fail(error); }
     });
     socket.on("close", () => {
+      timings.disconnected();
+      workspace?.listings.clear();
       if (retiring) return;
       try {
         if (picker && !selection?.selectedThreadId && !selection?.pending.size && !turn?.request) {
@@ -295,6 +300,7 @@ export async function runWorkerBridge(launch) {
       // The remote TUI has initialized its local state before connecting. Start
       // the backend here so their first SQLite migrations cannot race.
       native = spawn(launch.command, launch.serverArgs, { stdio: ["pipe", "pipe", "pipe"] });
+      timings.record("native_spawned");
       native.stderr.on("data", recordDiagnostic);
       native.stderr.on("error", fail);
       native.on("error", fail);
@@ -355,7 +361,9 @@ export async function runWorkerBridge(launch) {
         const fork = forks?.fromServer(message);
         if (fork === false) return false;
         if (fork) { void handOffFork(fork).catch(fail); return false; }
-        if (workspace?.fromServer(message, next => forward(`${JSON.stringify(next)}\n`)) === false) return false;
+        const delivered = workspace?.fromServer(message, next => forward(`${JSON.stringify(next)}\n`)) !== false;
+        timings.fromServer(message, delivered);
+        if (!delivered) return false;
         permissions?.fromServer(message);
         selection?.fromServer(message);
         workHealth?.fromServer(message);

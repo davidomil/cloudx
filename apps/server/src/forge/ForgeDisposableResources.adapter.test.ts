@@ -1,24 +1,36 @@
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable } from "node:stream";
 import { text } from "node:stream/consumers";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DisposableResource, ForgeWorker } from "@cloudx/shared";
 import { ContainerCreationRejectedError, DockerDisposableContainerHost, ForgeDisposableCleanupError, ForgeDisposableResources, ForgeEvidenceCompletenessError } from "./ForgeDisposableResources.js";
-import { Header } from "tar";
+import { Header, type types } from "tar";
 
 const execute = vi.hoisted(() => vi.fn());
 const spawn = vi.hoisted(() => vi.fn());
-function evidenceTar(entries: { path: string; data: string }[]): Buffer {
+interface TarEntry { path: string; data?: string | Buffer; type?: types.EntryTypeName; linkpath?: string }
+function evidenceTar(entries: TarEntry[]): Buffer {
   return Buffer.concat([...entries.flatMap(entry => {
-    const data = Buffer.from(entry.data);
-    const header = new Header({ path: entry.path, type: "File", size: data.length, mode: 0o600 });
+    const data = Buffer.from(entry.data ?? "");
+    const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, mode: 0o600, linkpath: entry.linkpath });
     header.encode();
     return [header.block!, data, Buffer.alloc((512 - data.length % 512) % 512)];
   }), Buffer.alloc(1024)]);
+}
+async function* streamedEvidenceTar(entries: Iterable<TarEntry>) {
+  for (const entry of entries) {
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data ?? "");
+    const header = new Header({ path: entry.path, type: entry.type ?? "File", size: data.length, mode: 0o600, linkpath: entry.linkpath });
+    header.encode();
+    yield header.block!;
+    for (let offset = 0; offset < data.length; offset += 64 * 1024) yield data.subarray(offset, offset + 64 * 1024);
+    yield Buffer.alloc((512 - data.length % 512) % 512);
+  }
+  yield Buffer.alloc(1024);
 }
 vi.mock("node:child_process", async importOriginal => {
   const original = await importOriginal<typeof import("node:child_process")>();
@@ -159,6 +171,74 @@ describe("Docker creation rejection receipts", () => {
       await text(Readable.from(stream)); files.push(filePath);
     })).rejects.toThrow("evidence copy denied");
     expect(files).toEqual(["work/evidence/report.log"]);
+  });
+
+  it.each(["plugins/plugins/example", "plugins-clone-example"])("retires the exact owned container across restart after exporting useful evidence beside 9000 %s generated entries with 8 KiB bodies", async layout => {
+    const id = "a".repeat(64);
+    const created = new Date().toISOString();
+    let labels: Record<string, string> = {};
+    let running = true;
+    let removed = false;
+    let firstRemoval = true;
+    let resource: DisposableResource;
+    const fixtures = Array.from({ length: 40 }, (_, index) => ({ path: `evidence/fixture-${index}/config.json`, data: JSON.stringify({ fixture: index }) }));
+    const log = "validation passed\n";
+    const link = "/opt/codex/bin/codex";
+    const useful = [...fixtures, { path: "evidence/validation.log", data: log },
+      { path: "evidence/fixture/tool", data: JSON.stringify({ type: "SymbolicLink", target: link }) }];
+    const verifyEvidence = async () => {
+      const manifest = await reopen().readEvidence(resource.id);
+      expect(manifest.files).toHaveLength(42);
+      expect(manifest.files.map(file => [file.path, file.bytes, file.sha256])).toEqual(useful
+        .map(file => [`work/${file.path}`, Buffer.byteLength(file.data), createHash("sha256").update(file.data).digest("hex")])
+        .sort((left, right) => String(left[0]).localeCompare(String(right[0]))));
+      expect(await text(await reopen().evidenceFile(resource.id, "work/evidence/validation.log"))).toBe(log);
+      expect(await text(await reopen().evidenceFile(resource.id, "work/evidence/fixture/tool"))).toBe(JSON.stringify({ type: "SymbolicLink", target: link }));
+      expect(await text(await reopen().evidenceFile(resource.id, "work/evidence/fixture-39/config.json"))).toBe(fixtures[39]!.data);
+    };
+    execute.mockImplementation(async (_command: string, args: string[]) => {
+      if (args[0] === "info") return { stdout: "same-engine\n" };
+      if (args[0] === "create") {
+        labels = Object.fromEntries(args.flatMap((arg, index) => arg === "--label" ? [args[index + 1]!.split("=")] : []));
+        return { stdout: `${id}\n` };
+      }
+      if (args[1] === "inspect") {
+        expect(args[3]).toBe(id);
+        if (removed) throw Object.assign(new Error("absent"), { stderr: `Error: No such container: ${id}` });
+        return { stdout: JSON.stringify([{ Id: id, Created: created, Config: { Labels: labels }, State: { Running: running }, SizeRw: 5_000_000 }]) };
+      }
+      if (args[1] === "stop") { expect(args[4]).toBe(id); running = false; return { stdout: id }; }
+      if (args[1] === "rm") {
+        expect(args).toEqual(["container", "rm", id]);
+        expect(running).toBe(false);
+        await verifyEvidence();
+        if (firstRemoval) { firstRemoval = false; throw new Error("Simulated interrupted removal"); }
+        removed = true;
+        return { stdout: id };
+      }
+      throw new Error(`Unexpected Docker operation: ${args.join(" ")}`);
+    });
+    spawn.mockImplementation((_command: string, args: string[]) => {
+      expect(args).toEqual(["container", "cp", `${id}:/work/evidence`, "-"]);
+      const cache = Buffer.alloc(8 * 1024, 0x61);
+      return dockerChild(Readable.from(streamedEvidenceTar([
+        ...Array.from({ length: 9000 }, (_, index) => ({ path: `evidence/codex-launches/example/.tmp/${layout}/${index}`, data: cache })),
+        { path: "evidence/validation.log", data: log }, ...fixtures,
+        { path: "evidence/fixture/tool", type: "SymbolicLink", linkpath: link },
+      ])));
+    });
+    worker.headSha = "b".repeat(40);
+    resource = await reopen().create(worker, { ...input, image: "node:22", evidencePaths: ["/work/evidence"] });
+    worker.status = "completed";
+    await expect(reopen().retire(worker)).rejects.toThrow("Simulated interrupted removal");
+    expect((await reopen().records())[0]).toMatchObject({ id: resource.id, state: "failed", evidence: { state: "verified" } });
+    await verifyEvidence();
+    await reopen().retire(worker);
+    await reopen().retire(worker);
+    expect((await reopen().records())[0]).toMatchObject({ id: resource.id, containerId: id, state: "deleted", evidence: { state: "verified" } });
+    await verifyEvidence();
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls.filter(([, args]) => args[1] === "rm")).toHaveLength(2);
   });
 
   it("identifies the exact missing source after Docker closes its empty tar output", async () => {

@@ -250,6 +250,7 @@ export interface ForgeAutoReview {
   placement: ForgePlacement;
   reviewWorkerId?: string;
   waitingSince?: string;
+  ciWait?: { headSha: string; targetHeadSha?: string; startedAt: string };
 }
 export interface ForgeDashboard {
   configured: boolean;

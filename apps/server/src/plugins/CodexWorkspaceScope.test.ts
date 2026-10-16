@@ -72,26 +72,84 @@ describe("Codex workspace conversation scope", () => {
     owner.fromClient({ id: 1, method: "thread/list", params: { limit: 1, sortKey: "updated_at", cwd: [root, "/foreign"] } });
     const nextPage = vi.fn();
     expect(owner.fromServer({ id: 1, result: { data: [foreign], nextCursor: "older" } }, nextPage)).toBe(false);
-    expect(nextPage).toHaveBeenCalledExactlyOnceWith({ id: 1, method: "thread/list", params: { limit: 1, sortKey: "updated_at", cwd: root, cursor: "older" } });
+    expect(nextPage).toHaveBeenCalledExactlyOnceWith({ id: 1, method: "thread/list", params: { limit: 1, sortKey: "updated_at", cwd: root, cursor: "older", useStateDbOnly: false } });
     const response = { id: 1, result: { data: [mine], nextCursor: null } };
     owner.fromServer(response, nextPage);
     expect(response.result.data).toEqual([mine]);
     expect(owner.pending.size).toBe(0);
   });
 
-  it("preserves native page order and filters while refilling partially eligible picker pages", () => {
+  it("delivers partial indexed rows immediately and reconciles filesystem history through native pagination", () => {
     const owner = scope();
     const first = created();
     const older = created();
     const oldest = created();
     const params = { cwd: root, limit: 3, modelProviders: ["openai"], sourceKinds: ["cli"], archived: true, sortKey: "updated_at", searchTerm: "fix" };
-    owner.fromClient({ id: 1, method: "thread/list", params });
+    owner.fromClient({ id: 1, method: "thread/list", params: { ...params } });
     const next = vi.fn();
-    owner.fromServer({ id: 1, result: { data: [created(scope("workspace-b")), first], nextCursor: "older" } }, next);
-    expect(next).toHaveBeenCalledWith({ id: 1, method: "thread/list", params: { ...params, limit: 2, cursor: "older" } });
-    const response = { id: 1, result: { data: [older, oldest], nextCursor: "more" } };
-    owner.fromServer(response, next);
-    expect(response.result).toEqual({ data: [first, older, oldest], nextCursor: "more" });
+    const initial = { id: 1, result: { data: [created(scope("workspace-b")), first], nextCursor: null } };
+    owner.fromServer(initial, next);
+    expect(initial.result.data).toEqual([first]);
+    expect(initial.result.nextCursor).toMatch(/^cloudx-workspace:/);
+    expect(next).not.toHaveBeenCalled();
+    const continuation = { id: 2, method: "thread/list", params: { ...params, cursor: initial.result.nextCursor } };
+    owner.fromClient(continuation);
+    expect(continuation.params).toEqual({ ...params, cursor: null, useStateDbOnly: false });
+    const reconciled = { id: 2, result: { data: [first, older, oldest], nextCursor: "more" } };
+    owner.fromServer(reconciled, next);
+    expect(reconciled.result.data).toEqual([older, oldest]);
+    const final = { id: 3, method: "thread/list", params: { ...params, cursor: reconciled.result.nextCursor } };
+    owner.fromClient(final);
+    expect(final.params).toEqual({ ...params, cursor: "more", useStateDbOnly: false });
+    const end = { id: 3, result: { data: [oldest], nextCursor: null } };
+    owner.fromServer(end, next);
+    expect(end.result).toEqual({ data: [], nextCursor: null });
+  });
+
+  it("returns each of nine sparse backend pages instead of hiding eight responses", () => {
+    const owner = scope();
+    const mine = Array.from({ length: 4 }, () => created());
+    let cursor: string | null = null;
+    const next = vi.fn();
+    for (let page = 0; page < 9; page++) {
+      const request = { id: page, method: "thread/list", params: { cwd: root, cursor, limit: 25 } };
+      owner.fromClient(request);
+      expect(request.params).toMatchObject({ useStateDbOnly: true });
+      const response = { id: page, result: { data: page === 8 ? mine : Array.from({ length: 25 }, () => ({ id: randomUUID(), cwd: root })), nextCursor: page === 8 ? null : `page-${page}` } };
+      expect(owner.fromServer(response, next)).toBeUndefined();
+      expect(response.result.data).toEqual(page === 8 ? mine : []);
+      cursor = response.result.nextCursor;
+      expect(cursor).toMatch(/^cloudx-workspace:/);
+    }
+    expect(next).not.toHaveBeenCalled();
+    expect(owner.pending.size).toBe(0);
+  });
+
+  it("keeps search queries independent and rejects stale or mismatched cursors", () => {
+    const owner = scope();
+    const first = list(owner, [created()], { cwd: root, searchTerm: "camera" });
+    expect(() => owner.fromClient({ id: 2, method: "thread/list", params: { cwd: root, searchTerm: "other", cursor: first.response.result.nextCursor } })).toThrow("different query");
+    const next = { id: 3, method: "thread/list", params: { cwd: root, searchTerm: "camera", cursor: first.response.result.nextCursor } };
+    owner.fromClient(next);
+    const failure = { id: 3, error: { code: -32603, message: "History unavailable" } };
+    owner.fromServer(failure, () => {});
+    expect(owner.pending.size).toBe(0);
+    expect(() => owner.fromClient({ id: 4, method: "thread/list", params: { cwd: root, searchTerm: "camera", cursor: first.response.result.nextCursor } })).toThrow("expired");
+  });
+
+  it("bounds abandoned queries and discovers owned rollouts absent from the index", () => {
+    const owner = scope();
+    const cursors: string[] = [];
+    for (let index = 0; index < 33; index++) cursors.push(list(owner, []).response.result.nextCursor!);
+    expect(owner.listings.size).toBe(32);
+    expect(() => owner.fromClient({ id: 2, method: "thread/list", params: { cwd: root, cursor: cursors[0] } })).toThrow("expired");
+    const request = { id: 3, method: "thread/list", params: { cwd: root, cursor: cursors.at(-1) } };
+    owner.fromClient(request);
+    expect(request.params).toMatchObject({ cursor: null, useStateDbOnly: false });
+    const mine = created();
+    const response = { id: 3, result: { data: [mine], nextCursor: null } };
+    owner.fromServer(response, () => {});
+    expect(response.result).toEqual({ data: [mine], nextCursor: null });
   });
 
   it("honors the native picker's explicit All toggle and return to workspace scope", () => {

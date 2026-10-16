@@ -31,7 +31,7 @@ import type {
 } from "@cloudx/shared";
 import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { MAX_FORGE_WORKFLOW_TEXT_LENGTH, parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
-import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
+import { ForgeBranchConflictError, ForgeHandoffError, type ForgePublicationLease } from "./ForgeRuntime.js";
 import { directoryOwnershipAvailability } from "../directoryOwnershipReconciliation.js";
 import { ForgeWorkQueue } from "./ForgeWorkQueue.js";
 import { ForgeMergeQueue } from "./ForgeMergeQueue.js";
@@ -160,7 +160,7 @@ interface Runtime {
     },
     signal?: AbortSignal,
     expectedHeadSha?: string,
-    expectedRemoteHeadSha?: string,
+    lease?: ForgePublicationLease,
   ): Promise<string>;
   prepareIssueRebase(
     workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
@@ -219,6 +219,7 @@ export interface ForgeWorkflowDependencies {
 const PROVIDER_RECOVERY_DELAYS = [5_000, 15_000, 30_000, 60_000];
 const PROVIDER_RECOVERY_WINDOW = 5 * 60_000;
 const PUBLICATION_INITIAL_WINDOW = 2 * 60_000;
+const CI_WAIT_WINDOW = 2 * 60 * 60_000;
 
 interface ProviderRecovery {
   firstFailureAt: number;
@@ -1757,6 +1758,11 @@ export class ForgeWorkflowService {
     const signal = this.operations.get(worker.id)?.signal;
     const change = await this.observeProvider(worker, "getChangeRequest", () => provider.getChangeRequest(worker.changeNumber!));
     signal?.throwIfAborted();
+    const ciWait = worker.autoReview?.ciWait;
+    const awaitingCi = ["pending", "failed"].includes(change.checks?.state ?? "") ||
+      worker.ciRepair?.phase === "reviewing" && change.checks?.state !== "passed";
+    if (ciWait && (ciWait.headSha !== change.headSha || ciWait.targetHeadSha !== change.targetHeadSha || !awaitingCi))
+      worker.autoReview!.ciWait = undefined;
     this.observeMergeConflict(worker, change);
     if (await this.reconcileMergedChange(worker, { change, signal })) return;
     requirePublicationRequest(worker, change);
@@ -1786,14 +1792,31 @@ export class ForgeWorkflowService {
   }
   private async waitForAutoReview(worker: ForgeWorker, reason: string, startedAt?: string): Promise<void> {
     const loop = worker.autoReview!;
+    loop.ciWait = undefined;
     loop.waitingSince ??= startedAt ?? new Date(Date.now()).toISOString();
     if (Date.now() - Date.parse(loop.waitingSince) >= 120_000)
       throw new Error(`${reason} Inspect the provider and resume when it is ready.`);
     worker.error = reason;
     await this.persist();
   }
+  private async waitForCi(worker: ForgeWorker, change: ForgeChangeRequest, reason: string): Promise<void> {
+    const loop = worker.autoReview!;
+    if (loop.ciWait?.headSha !== change.headSha || loop.ciWait.targetHeadSha !== change.targetHeadSha)
+      loop.ciWait = { headSha: change.headSha, targetHeadSha: change.targetHeadSha, startedAt: new Date(Date.now()).toISOString() };
+    loop.waitingSince = undefined;
+    this.mergeQueue.phase(worker, worker.mergeAttempted ? "merging" : "waiting_ci", reason);
+    if (Date.now() - Date.parse(loop.ciWait.startedAt) >= CI_WAIT_WINDOW) {
+      const expired = `CI has not finished within two hours for this source and target. Inspect ${change.checks?.url ?? change.url}, then Resume when the required CI results are available. The checkout and diagnosis are retained.`;
+      this.mergeQueue.block(worker, expired);
+      await this.pauseAutoReview(worker, expired);
+      return;
+    }
+    worker.error = reason;
+    await this.persist();
+  }
   private async startAutoReview(worker: ForgeWorker): Promise<void> {
     const loop = worker.autoReview!;
+    loop.ciWait = undefined;
     this.mergeQueue.phase(worker, "reviewing");
     loop.phase = "reviewing";
     loop.waitingSince = undefined;
@@ -1803,6 +1826,7 @@ export class ForgeWorkflowService {
     await this.createWorker(worker.repository, "review", worker.changeNumber!, true, loop.placement, false, worker);
   }
   private async pauseAutoReview(worker: ForgeWorker, reason: string): Promise<void> {
+    if (worker.autoReview) worker.autoReview.ciWait = undefined;
     worker.status = "paused";
     worker.error = reason;
     await this.persist();
@@ -2000,6 +2024,11 @@ export class ForgeWorkflowService {
       change.checks?.state === "failed" ? `CI checks failed. Inspect ${change.checks.url}, resolve the failure, then Resume the issue loop.` :
       worker.ciRepair?.phase === "reviewing" && change.checks?.state !== "passed" ? `Waiting for fresh passing CI on the repaired commit. Inspect ${change.checks?.url ?? change.url}.` :
       `Waiting for the provider's merge requirements. Inspect ${worker.changeUrl ?? change.url}.`;
+    if (change.checks?.state === "pending" || worker.ciRepair?.phase === "reviewing" && change.checks?.state !== "passed" && change.checks?.state !== "failed") {
+      await this.waitForCi(worker, change, worker.error);
+      return;
+    }
+    if (worker.autoReview) worker.autoReview.ciWait = undefined;
     if (change.checks?.state === "failed") {
       worker.status = "paused";
       this.mergeQueue.block(worker, worker.error);
@@ -2143,7 +2172,6 @@ export class ForgeWorkflowService {
     worker.ciRepair = {
       phase: "diagnosing", attempts: saved?.attempts ?? 0, attemptedHeads: saved?.attemptedHeads ?? [],
     };
-    worker.autoReview.waitingSince ??= new Date(Date.now()).toISOString();
     this.mergeQueue.block(worker, "Diagnosing failed CI before rejoining the merge queue.");
     await this.persist();
     const repair = worker.ciRepair;
@@ -2173,7 +2201,9 @@ export class ForgeWorkflowService {
       return true;
     }
     if (diagnostic.state !== "actionable") {
-      await this.waitForAutoReview(worker, diagnostic.reason ?? "Waiting for CI evidence for the current merge identity.");
+      const reason = diagnostic.reason ?? "Waiting for CI evidence for the current merge identity.";
+      if (diagnostic.state === "pending") await this.waitForCi(worker, change, reason);
+      else await this.waitForAutoReview(worker, reason);
       return true;
     }
     repair.phase = "ready";
@@ -2192,7 +2222,8 @@ export class ForgeWorkflowService {
       diagnostic.state = "obsolete";
       diagnostic.reason = "CI changed while collecting logs. Waiting for fresh results before repairing.";
       worker.error = "CI changed while collecting logs. Waiting for fresh results before repairing.";
-      await this.waitForAutoReview(worker, worker.error);
+      if (latest.checks?.state === "pending") await this.waitForCi(worker, latest, worker.error);
+      else await this.waitForAutoReview(worker, worker.error);
       return true;
     }
     const currentIssue = await provider.getIssue(worker.number);
@@ -2208,6 +2239,7 @@ export class ForgeWorkflowService {
     repair.phase = "launching";
     worker.autoReview.phase = "implementing";
     worker.autoReview.waitingSince = undefined;
+    worker.autoReview.ciWait = undefined;
     worker.status = "starting";
     worker.error = undefined;
     await this.persist();
@@ -2381,14 +2413,14 @@ export class ForgeWorkflowService {
       } else if (worker.rebaseRecovery?.phase === "publishing") {
         const rebase = worker.rebaseRecovery;
         this.requireIdleReviewers(worker);
-        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal, rebase.headSha, rebase.expectedHeadSha);
+        publication.headSha = await this.deps.runtime.publishBranch(workspace, signal, rebase.headSha, { purpose: "rebase", expectedRemoteHeadSha: rebase.expectedHeadSha });
         if (publication.headSha !== rebase.headSha)
           throw new Error("The published rebase does not match its saved completed commit.");
       } else {
         let headSha: string;
         try {
           headSha = this.isCiRepairPublication(worker)
-            ? await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha, worker.ciRepair!.diagnostic!.sourceHeadSha)
+            ? await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha, { purpose: "ci_repair", expectedRemoteHeadSha: worker.ciRepair!.diagnostic!.sourceHeadSha })
             : await this.deps.runtime.publishBranch(workspace, signal, publication.handoff!.headSha);
         } catch (error) {
           if (error instanceof ForgeHandoffError && error.publicationNotStarted)

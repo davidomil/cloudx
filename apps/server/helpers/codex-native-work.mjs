@@ -1,4 +1,5 @@
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 const ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 const TURN_ID = /^[a-zA-Z0-9_-]{1,128}$/u;
@@ -48,6 +49,7 @@ export function nativeWorkError(error, kind) {
 function restoredNativeWorkError(error) {
   const restored = nativeWorkError(error, error.kind === "retry" ? "retry" : "terminal");
   if (Object.values(ERROR_MESSAGES).includes(error.message)) restored.message = error.message;
+  if (typeof error.incidentId === "string" && TURN_ID.test(error.incidentId)) restored.incidentId = error.incidentId;
   return restored;
 }
 
@@ -116,7 +118,7 @@ export class CodexNativeWorkObservation {
       if (!request || request.threadId !== this.state.threadId) return;
       this.pending.delete(message.id);
       if (message.error) {
-        if (request.method === "turn/start") this.recordError(message.error, "terminal");
+        if (request.method === "turn/start") this.recordError(message.error, "terminal", true, randomUUID());
       } else if (request.method === "turn/start") {
         this.startTurn(message.result?.turn?.id);
       } else if (Object.hasOwn(message.result ?? {}, "goal")) {
@@ -192,8 +194,8 @@ export class CodexNativeWorkObservation {
     return [...this.pending.values()].some(request => request.resumeGoal && request.threadId === this.state.threadId);
   }
 
-  recordError(error, kind, affectsTurn = true) {
-    this.state.lastError = nativeWorkError(error, kind);
+  recordError(error, kind, affectsTurn = true, incidentId) {
+    this.state.lastError = { ...nativeWorkError(error, kind), ...(incidentId ? { incidentId } : {}) };
     if (kind === "terminal") {
       if (affectsTurn) this.state.turnStatus = "failed";
       if (this.recovering) this.state.recoveryStatus = "failed";
