@@ -264,6 +264,97 @@ describe("failure-scoped CI evidence", () => {
     expect(diagnostic.state).toBe(failedOutput ? "blocked" : "actionable");
   });
 
+  const projectBadge = (name: string) => `\x1b[30m\x1b[42m ${name} \x1b[49m\x1b[39m`;
+  // Captured from a Vitest 4.1.11 named-project timeout with FORCE_COLOR=1.
+  const coloredFailure = (project: string, task = failingTest) =>
+    `\x1b[41m\x1b[1m FAIL \x1b[22m\x1b[49m ${projectBadge(project)} ${task}\nError: Test timed out in 25ms.\n`;
+
+  it.each(["test", "suite", "file"])("associates %s console output with a genuine colored-project failure", async scope => {
+    const task = scope === "file" ? failingTest.split(" > ")[0] : scope === "suite" ? failingTest.split(" > ").slice(0, 2).join(" > ") : failingTest;
+    const output = `\x1b[90mstderr\x1b[2m | ${task}\n\x1b[22m\x1b[39mservice unavailable\n\n`;
+    const log = (checkout() + testRun + output + coloredFailure("unit") + testSummary).split("\n")
+      .map(line => `2026-10-16T02:01:55.4500139Z ${line}`).join("\r\n");
+    const { evidence, diagnostic } = await diagnoseStream(log, 1);
+    expect(evidence.classification).toBe("infrastructure");
+    expect(diagnostic.state).toBe("blocked");
+  });
+
+  it.each([
+    { project: "unit", output: failingTest, classification: "infrastructure" },
+    { project: "unit integration", output: failingTest, classification: "infrastructure" },
+    { project: "unit", output: `|browser| ${failingTest}`, classification: "code" },
+    { project: "unit", output: `${projectBadge("browser")} ${failingTest}`, classification: "code" },
+    { project: "unit", output: `${projectBadge("unit")} ${failingTest}`, classification: "infrastructure" },
+    { project: "unit", output: `${failingTest} with a passing fixture`, classification: "code" },
+  ])("keeps colored project identities separate: $project / $output", async ({ project, output, classification }) => {
+    const log = checkout() + testRun + noise + `x-*stderr | ${output}\nservice unavailable\n\n` + noise + coloredFailure(project) + testSummary;
+    const { evidence, diagnostic } = await diagnoseStream(log, 7);
+    expect(evidence.classification).toBe(classification);
+    expect(diagnostic.state).toBe(classification === "code" ? "actionable" : "blocked");
+    expect(evidence.log).toContain("full stream scanned");
+  });
+
+  it("counts identical failures in different colored projects separately", async () => {
+    const log = checkout() + testRun + fixtureOutput + coloredFailure("unit") + coloredFailure("browser") +
+      testSummary.replaceAll("1 failed", "2 failed");
+    const { evidence, diagnostic } = await diagnoseStream(log);
+    expect(evidence.classification).toBe("code");
+    expect(diagnostic.state).toBe("actionable");
+  });
+
+  it("preserves double spaces in an unlabelled task path", async () => {
+    const task = "directory  with spaces/named.test.ts > test";
+    const log = checkout() + testRun + `stderr | ${task}\nservice unavailable\n\n` +
+      failedTests.replace(failingTest, task) + testSummary;
+    expect((await diagnoseStream(log)).diagnostic.state).toBe("blocked");
+  });
+
+  it("preserves colored values inside task names", async () => {
+    const task = `${failingTest} with ${projectBadge("unit")} output`;
+    const log = checkout() + testRun + `stderr | ${task}\nservice unavailable\n\n` + coloredFailure("browser", task) + testSummary;
+    expect((await diagnoseStream(log)).diagnostic.state).toBe("blocked");
+  });
+
+  it.each(["HTTP 403", "approval required", "runner offline"])("keeps serialized assertion comparisons containing %s actionable", async actual => {
+    let assertion: Error | undefined;
+    try { expect(actual).toBe("expected fixture value"); }
+    catch (error) { if (error instanceof Error) assertion = error; else throw error; }
+    expect(assertion?.name).toBe("AssertionError");
+    const err = { type: assertion!.name, message: assertion!.message, stack: assertion!.stack };
+    for (const msg of ["Caught assertion fixture.", err.message, `${err.type}: ${err.message}`, `Caught assertion fixture: ${err.message} (comparison)`]) {
+      const output = JSON.stringify({ level: 50, msg, err }) + "\n";
+      for (const header of ["", "x-*stdout | passing.test.ts > catches a comparison\n"]) {
+        const log = checkout() + testRun + noise + header + output + "\n" + noise + failedTests + testSummary;
+        const { evidence, diagnostic } = await diagnoseStream(log, 7);
+        expect(evidence.classification, msg + header).toBe("code");
+        expect(diagnostic.state).toBe("actionable");
+        expect(evidence.log).not.toContain("[Operational blocker evidence]");
+      }
+    }
+  });
+
+  it.each([
+    ["credentials", "fatal: authentication failed"],
+    ["policy", "Workflow is disabled; approval required"],
+    ["infrastructure", "Runner lost communication with the server"],
+    ["infrastructure", "no space left on device"],
+  ])("preserves independent %s controls alongside a serialized assertion", async (classification, blocker) => {
+    const assertion = { type: "AssertionError", message: "expected 'runner offline' to be 'runner online' // Object.is equality",
+      stack: "AssertionError: expected 'runner offline' to be 'runner online' // Object.is equality\n    at fixture" };
+    for (const controls of [
+      [{ level: 50, msg: blocker, err: assertion }],
+      [{ level: 50, msg: `${blocker}: ${assertion.message}`, err: assertion }],
+      [{ level: 50, msg: "Caught assertion fixture.", err: assertion },
+        { level: 50, msg: "CI execution failed while reporting AssertionError.", err: { type: "Error", message: blocker, stack: `Error: ${blocker}` } }],
+      [{ level: 50, msg: "CI execution failed.", err: { type: "Error", message: `${blocker} while reporting AssertionError.`, stack: `Error: ${blocker}` } }],
+    ]) {
+      const log = checkout() + testRun + controls.map(record => JSON.stringify(record) + "\n").join("") + failedTests + testSummary;
+      const { evidence, diagnostic } = await diagnoseStream(log, 1);
+      expect(evidence.classification).toBe(classification);
+      expect(diagnostic.state).toBe("blocked");
+    }
+  });
+
   it.each([
     ["credentials", "fatal: authentication failed"],
     ["policy", "Workflow is disabled; approval required"],

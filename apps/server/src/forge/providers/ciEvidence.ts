@@ -224,6 +224,13 @@ class CiLogClassifier {
 }
 
 function ciLogLine(raw: string): string {
+  const badge = /\x1b\[30m\x1b\[(?:4[0-7]|10[0-7])m ([^\x1b\r\n]+) \x1b\[49m\x1b\[39m/.exec(raw);
+  if (badge && /^(?:FAIL|(?:stdout|stderr) \|)$/.test(ciLogText(raw.slice(0, badge.index))))
+    raw = raw.slice(0, badge.index) + `|${badge[1]}|` + raw.slice(badge.index + badge[0].length);
+  return ciLogText(raw);
+}
+
+function ciLogText(raw: string): string {
   return raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim().replace(/^[·✓×↓x*\s-]+/, "");
 }
 
@@ -249,8 +256,10 @@ function applicationErrorCause(line: string): string | undefined {
       "err" in record && !!record.err && typeof record.err === "object" &&
       "type" in record.err && typeof record.err.type === "string" &&
       "message" in record.err && typeof record.err.message === "string" &&
-      "stack" in record.err && typeof record.err.stack === "string")
+      "stack" in record.err && typeof record.err.stack === "string") {
+      if (record.err.type === "AssertionError") return record.msg.split(record.err.message).join("");
       return [record.msg, record.err.type, record.err.message, record.err.stack].join("\n");
+    }
   } catch { return; }
 }
 
