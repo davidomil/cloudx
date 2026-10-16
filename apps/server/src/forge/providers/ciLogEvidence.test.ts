@@ -229,6 +229,41 @@ describe("failure-scoped CI evidence", () => {
     expect((await diagnoseStream(log)).diagnostic.state).toBe("actionable");
   });
 
+  it.each(["x", "-", "*", "·x-*✓×↓"])("recognizes mixed reporter statuses %s before fixture records and console headers", async prefix => {
+    const output = prefix + fixtureOutput.slice(2) + `${prefix}stderr | apps/server/src/server.test.ts > passing fixture\nservice unavailable\n\n`;
+    const log = (checkout() + testRun + noise + output + noise + failedTests + testSummary).split("\n")
+      .map(line => `2026-10-16T02:01:55.4500139Z \x1b[31m${line}\x1b[39m`).join("\r\n");
+    const { evidence, diagnostic } = await diagnoseStream(log, 7);
+    expect(evidence.classification).toBe("code");
+    expect(diagnostic.state).toBe("actionable");
+    expect(evidence.log).toContain("full stream scanned");
+  });
+
+  it.each([
+    { output: failingTest, failure: `|unit| ${failingTest}`, classification: "infrastructure" },
+    { output: failingTest.split(" > ")[0], failure: `|unit| ${failingTest}`, classification: "infrastructure" },
+    { output: failingTest.split(" > ").slice(0, 2).join(" > "), failure: `|unit| ${failingTest}`, classification: "infrastructure" },
+    { output: `|unit| ${failingTest}`, failure: `|unit| ${failingTest}`, classification: "infrastructure" },
+    { output: `|unit| ${failingTest}`, failure: failingTest, classification: "infrastructure" },
+    { output: `|browser| ${failingTest}`, failure: `|unit| ${failingTest}`, classification: "code" },
+    { output: `${failingTest} with a passing fixture`, failure: `|unit| ${failingTest}`, classification: "code" },
+  ])("matches named-project console output conservatively: $output / $failure", async ({ output, failure, classification }) => {
+    const log = checkout() + testRun + `stderr | ${output}\nservice unavailable\n\n` + failedTests.replace(failingTest, failure) + testSummary;
+    const { evidence, diagnostic } = await diagnoseStream(log, 1);
+    expect(evidence.classification).toBe(classification);
+    expect(diagnostic.state).toBe(classification === "code" ? "actionable" : "blocked");
+  });
+
+  it.each([true, false])("counts identical failures in different projects separately with ambiguous console output: %s", async failedOutput => {
+    const output = failedOutput ? failingTest : `${failingTest} with a passing fixture`;
+    const failures = failedTests.replace(failingTest, `|unit| ${failingTest}`) + failedTests.replace(failingTest, `|browser| ${failingTest}`);
+    const log = checkout() + testRun + fixtureOutput + `stderr | ${output}\nservice unavailable\n\n` +
+      failures + testSummary.replaceAll("1 failed", "2 failed");
+    const { evidence, diagnostic } = await diagnoseStream(log);
+    expect(evidence.classification).toBe(failedOutput ? "infrastructure" : "code");
+    expect(diagnostic.state).toBe(failedOutput ? "blocked" : "actionable");
+  });
+
   it.each([
     ["credentials", "fatal: authentication failed"],
     ["policy", "Workflow is disabled; approval required"],
@@ -264,6 +299,48 @@ describe("failure-scoped CI evidence", () => {
   ])("keeps structured %s job controls authoritative", async (classification, blocker) => {
     const control = JSON.stringify({ level: 50, msg: blocker, err: { type: "Error", message: blocker, stack: `Error: ${blocker}\n    at runner` } }) + "\n";
     const { evidence, diagnostic } = await diagnoseStream(checkout() + testRun + fixtureOutput + control + failedTests + testSummary);
+    expect(evidence.classification).toBe(classification);
+    expect(diagnostic.state).toBe("blocked");
+  });
+
+  it.each([
+    ["credentials", "fatal: authentication failed"],
+    ["policy", "Workflow is disabled; approval required"],
+    ["infrastructure", "Runner lost communication with the server"],
+    ["infrastructure", "no space left on device"],
+  ])("preserves %s causes inside generic structured errors", async (classification, blocker) => {
+    for (const field of ["type", "message", "stack"]) {
+      const control = JSON.stringify({ level: 50, msg: "CI execution failed.",
+        err: { type: "Error", message: "CI execution failed.", stack: "Error: CI execution failed.", [field]: blocker } }) + "\n";
+      for (const consoleHeader of ["", "stderr | apps/server/src/server.test.ts > passing fixture\n"]) {
+        const log = checkout() + testRun + noise + fixtureOutput + consoleHeader + control + "\n" + noise + failedTests + testSummary;
+        const { evidence, diagnostic } = await diagnoseStream(log, 1024);
+        expect(evidence.classification, field + consoleHeader).toBe(classification);
+        expect(diagnostic.state, field + consoleHeader).toBe("blocked");
+        expect(evidence.log).toContain(blocker);
+        expect(evidence.log).toContain("[Operational blocker evidence]");
+      }
+    }
+  });
+
+  it("keeps ordinary Vitest runner stack frames from making fixture output authoritative", async () => {
+    const output = fixtureOutput.replace("at DocumentationClient.fetchService", "at /work/node_modules/@vitest/runner/dist/index.js:123:1");
+    const { evidence, diagnostic } = await diagnoseStream(checkout() + testRun + output + failedTests + testSummary);
+    expect(evidence.classification).toBe("code");
+    expect(diagnostic.state).toBe("actionable");
+  });
+
+  it.each([
+    ["credentials", "fatal: authentication failed"],
+    ["policy", "Workflow is disabled; approval required"],
+    ["infrastructure", "Runner lost communication with the server"],
+    ["infrastructure", "failed to prepare environment"],
+    ["infrastructure", "system failure"],
+    ["infrastructure", "no space left on device"],
+  ])("keeps structured %s causes authoritative despite assertion wording in the wrapper", async (classification, blocker) => {
+    const control = JSON.stringify({ level: 50, msg: "CI execution failed while reporting AssertionError.",
+      err: { type: "Error", message: blocker, stack: `Error: ${blocker}` } }) + "\n";
+    const { evidence, diagnostic } = await diagnoseStream(checkout() + testRun + control + failedTests + testSummary);
     expect(evidence.classification).toBe(classification);
     expect(diagnostic.state).toBe("blocked");
   });

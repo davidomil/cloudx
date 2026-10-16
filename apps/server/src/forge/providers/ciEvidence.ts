@@ -183,7 +183,9 @@ class CiLogClassifier {
       }
     }
     if (consoleTest && this.run) return;
-    const classification = classifyCiLine(line);
+    const applicationError = applicationErrorCause(line);
+    const jobControl = applicationError === undefined ? undefined : classifyJobControlCause(applicationError);
+    const classification = jobControl ?? classifyCiLine(line);
     if (classification === "unknown") return;
     if (classification === "code") {
       this.record(classification);
@@ -195,7 +197,7 @@ class CiLogClassifier {
     const match = operationalCiBlockers[classification].exec(clean);
     const context = match ? clean.slice(Math.max(0, match.index - 300), match.index + 700).trim() : "[REDACTED blocker text]";
     const evidence = `[${classification}] ${context}\n`;
-    if (this.run && (this.run.consoleTest || !this.run.reporting && isApplicationError(line))) {
+    if (this.run && !jobControl && (this.run.consoleTest || !this.run.reporting && applicationError !== undefined)) {
       const test = this.run.consoleTest ?? "";
       let output = this.run.output.get(test);
       if (!output) this.run.output.set(test, output = new Map());
@@ -206,7 +208,7 @@ class CiLogClassifier {
   finishRun(complete = false): void {
     if (!this.run) return;
     for (const [test, output] of this.run.output) {
-      const failed = test && [...this.run.failedTests].some(name => name === test || name.startsWith(`${test} > `));
+      const failed = test && [...this.run.failedTests].some(name => testOutputMatchesFailure(test, name));
       if (!complete || failed)
         for (const [classification, evidence] of output) this.record(classification, evidence);
     }
@@ -222,23 +224,41 @@ class CiLogClassifier {
 }
 
 function ciLogLine(raw: string): string {
-  return raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim().replace(/^[·✓×↓\s]+/, "");
+  return raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim().replace(/^[·✓×↓x*\s-]+/, "");
 }
 
-function isApplicationError(line: string): boolean {
-  if (!line.startsWith("{")) return false;
+function testOutputMatchesFailure(output: string, failure: string): boolean {
+  const test = vitestTaskIdentity(output);
+  const failed = vitestTaskIdentity(failure);
+  return (!test.project || !failed.project || test.project === failed.project) &&
+    (failed.task === test.task || failed.task.startsWith(`${test.task} > `));
+}
+
+function vitestTaskIdentity(name: string): { project?: string; task: string } {
+  const project = /^\|([^|]+)\|\s+/.exec(name);
+  return { project: project?.[1], task: project ? name.slice(project[0].length) : name };
+}
+
+function applicationErrorCause(line: string): string | undefined {
+  if (!line.startsWith("{")) return;
   try {
     const record: unknown = JSON.parse(line);
-    return !!record && typeof record === "object" &&
+    if (record && typeof record === "object" &&
       "level" in record && typeof record.level === "number" &&
       "msg" in record && typeof record.msg === "string" &&
-      !["credentials", "policy"].includes(classifyCiLine(record.msg)) &&
-      !/\brunner\b|lost communication with|system failure|no space left on device/i.test(record.msg) &&
       "err" in record && !!record.err && typeof record.err === "object" &&
       "type" in record.err && typeof record.err.type === "string" &&
       "message" in record.err && typeof record.err.message === "string" &&
-      "stack" in record.err && typeof record.err.stack === "string";
-  } catch { return false; }
+      "stack" in record.err && typeof record.err.stack === "string")
+      return [record.msg, record.err.type, record.err.message, record.err.stack].join("\n");
+  } catch { return; }
+}
+
+function classifyJobControlCause(cause: string): OperationalClassification | undefined {
+  for (const classification of ["credentials", "policy"] as const)
+    if (operationalCiBlockers[classification].test(cause)) return classification;
+  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device/i.test(cause))
+    return "infrastructure";
 }
 
 class CiLogExcerpts {
