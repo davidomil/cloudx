@@ -1,6 +1,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 import type {
   DisposableResource,
+  ForgeDiagnosticSnapshotStatus,
   ForgeGitHistoryManifest,
 } from "@cloudx/shared";
 import react from "@vitejs/plugin-react";
@@ -53,6 +54,7 @@ async function savedEvidence(
   page: Page,
   count = 18,
   history: ForgeGitHistoryManifest[] = [],
+  snapshots: ForgeDiagnosticSnapshotStatus[] = [],
 ) {
   const repository = {
     provider: "github",
@@ -113,6 +115,9 @@ async function savedEvidence(
   await page.route("**/api/forge/git-history", (route) =>
     route.fulfill({ json: { archives: history } }),
   );
+  await page.route("**/api/forge/diagnostic-snapshots", (route) =>
+    route.fulfill({ json: { snapshots, errors: [] } }),
+  );
   await page.route("**/api/forge/resources/*/evidence-file?*", (route) =>
     route.fulfill({
       body: "saved validation report",
@@ -130,7 +135,11 @@ async function savedEvidence(
   );
   await expect(
     body.locator("button, input, textarea, select, fieldset"),
-  ).toHaveCount(0);
+  ).toHaveCount(
+    snapshots.filter(
+      (snapshot) => snapshot.hold && snapshot.state !== "removed",
+    ).length,
+  );
   return { body, requests, errors };
 }
 
@@ -353,5 +362,107 @@ test("saved Git snapshots remain downloadable without retaining a completed work
       /workspace-cleanup|evidence-decision/.test(request),
     ),
   ).toBe(false);
+  expect(errors).toEqual([]);
+});
+
+test("recovers one held diagnostic copy while keeping every attempt and verified archive accessible", async ({
+  page,
+}, testInfo) => {
+  await page.setViewportSize({ width: 420, height: 640 });
+  const changed: ForgeDiagnosticSnapshotStatus = {
+    workerId: "issue-worker",
+    attemptId: "first-attempt",
+    kind: "repository",
+    retentionPolicy: "recover",
+    state: "ready",
+    path: ".cloudx/forge-snapshots/11111111-1111-4111-8111-111111111111/source",
+    hold: "Diagnostic copy has changed source; preserve its complete Git objects and working files before cleanup.",
+  };
+  const foreign: ForgeDiagnosticSnapshotStatus = {
+    ...changed,
+    attemptId: "second-attempt",
+    path: ".cloudx/forge-snapshots/22222222-2222-4222-8222-222222222222/source",
+    hold: "Dependency link belongs to another checkout; this copy remains protected.",
+  };
+  const recovered: ForgeDiagnosticSnapshotStatus = {
+    ...changed,
+    workerId: "reviewer",
+    attemptId: "review-attempt",
+    path: ".cloudx/forge-snapshots/33333333-3333-4333-8333-333333333333/source",
+    state: "removed",
+    hold: undefined,
+    recovery: {
+      state: "verified",
+      archivePath: "/private/archive/snapshot.tar",
+    },
+  };
+  const snapshots = [changed, foreign, recovered];
+  const recoveries: unknown[] = [];
+  await page.route(
+    "**/api/forge/workers/issue-worker/snapshots/recover",
+    async (route) => {
+      recoveries.push(route.request().postDataJSON());
+      snapshots[0] = {
+        ...changed,
+        state: "removed",
+        hold: undefined,
+        recovery: {
+          state: "verified",
+          archivePath: "/private/archive/recovered.tar",
+        },
+      };
+      await route.fulfill({ json: {} });
+    },
+  );
+  await page.route("**/api/forge/workers/*/snapshots/archive?*", (route) =>
+    route.fulfill({
+      body: "verified complete diagnostic archive",
+      contentType: "application/x-tar",
+      headers: { "content-disposition": "attachment" },
+    }),
+  );
+  const { body, errors } = await savedEvidence(page, 0, [], snapshots);
+  const firstCopy = body.getByRole("article", {
+    name: `Diagnostic snapshot ${changed.path}`,
+    exact: true,
+  });
+  const secondCopy = body.getByRole("article", {
+    name: `Diagnostic snapshot ${foreign.path}`,
+    exact: true,
+  });
+  await expect(firstCopy).toContainText(changed.hold!);
+  await expect(secondCopy).toContainText(foreign.hold!);
+  for (const snapshot of snapshots)
+    await expect(body).toContainText(snapshot.attemptId);
+  await firstCopy
+    .getByRole("button", { name: "Recover snapshot", exact: true })
+    .click();
+  const archive = firstCopy.getByRole("link", {
+    name: "Download recovered snapshot",
+    exact: true,
+  });
+  await expect(archive).toBeVisible();
+  await expect(firstCopy.getByRole("button")).toHaveCount(0);
+  await expect(
+    secondCopy.getByRole("button", { name: "Recover snapshot", exact: true }),
+  ).toBeEnabled();
+  expect(recoveries).toEqual([{ path: changed.path }]);
+  await expect(
+    body.getByRole("link", {
+      name: "Download recovered snapshot",
+      exact: true,
+    }),
+  ).toHaveCount(2);
+  await expect(body).not.toContainText("/private/archive");
+  const download = page.waitForEvent("download");
+  await archive.click();
+  expect((await download).suggestedFilename()).toBe("diagnostic-snapshot.tar");
+  await expect(body).toContainText(foreign.hold!);
+  const screenshot = testInfo.outputPath("diagnostic-snapshot-recovery.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("diagnostic-snapshot-recovery", {
+    path: screenshot,
+    contentType: "image/png",
+  });
   expect(errors).toEqual([]);
 });

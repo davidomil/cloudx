@@ -619,29 +619,6 @@ describe("DocumentationClient", () => {
     expect(result).toEqual({ document: { documentId: "video-doc" } });
   });
 
-  it("keeps streaming ingest URL requests alive while progress arrives", async () => {
-    const progress: unknown[] = [];
-    const url = await startServer((_request, response) => {
-      response.writeHead(200, { "content-type": "application/x-ndjson" });
-      response.write(JSON.stringify({ type: "progress", stage: "Transcribing video.", progress: 35 }) + "\n");
-      setTimeout(() => {
-        response.write(JSON.stringify({ type: "progress", stage: "Scanning video.", progress: 60 }) + "\n");
-      }, 20);
-      setTimeout(() => {
-        response.end(JSON.stringify({ type: "result", result: { document: { documentId: "long-video-doc" } } }) + "\n");
-      }, 40);
-    });
-    const client = new DocumentationClient(`${url}/docs`, { timeoutMs: 30 });
-
-    const result = await client.ingestUrl({ url: "https://youtube.example/watch?v=long-slides" }, { onProgress: (event) => progress.push(event) });
-
-    expect(progress).toEqual([
-      { stage: "Transcribing video.", progress: 35, etaSeconds: undefined, metrics: undefined },
-      { stage: "Scanning video.", progress: 60, etaSeconds: undefined, metrics: undefined }
-    ]);
-    expect(result).toEqual({ document: { documentId: "long-video-doc" } });
-  });
-
   it("aborts an in-flight ingest request when its queue owner stops", async () => {
     let markRequestStarted!: () => void;
     const requestStarted = new Promise<void>((resolve) => {

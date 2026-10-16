@@ -58,39 +58,47 @@ explicitly kept holds are not silently discarded.
 Create diagnostic copies with the installed `scripts/forge-snapshot.mjs`
 helper using
 `{kind:"source-only"|"repository",commitSha:"<full commit SHA>"}` and
-the current worker and attempt IDs. The trusted snapshot endpoint
-allocates a new `.cloudx/forge-snapshots/<id>/source` directory. Its
-workspace receipt records ownership, origin checkout and Git directory,
-commit, parent and source identities, retention policy, and exact
-contents before retirement.
+the current worker and attempt IDs. CloudX allocates
+`.cloudx/forge-snapshots/<id>/source` and records the origin, directory
+identities and exact contents.
 
-A source-only snapshot starts from the committed Git archive with Git
-metadata excluded. Creation requires an empty destination and verifies
-every extracted path, file checksum, link target and permission against
-the archive. Retirement verifies provenance, identity and the complete
-saved inventory. Added, modified, missing or explicitly retained source
-requires recovery. Interrupted removal rechecks surviving authorized
-contents, and a replaced or reappeared directory remains protected.
+A source-only copy contains verified committed source. Retirement
+requires the same source contents and ownership. Added `node_modules`
+links to the corresponding dependency tree in the same worker checkout
+are disposable; CloudX records the links without following their
+targets. Other additions, edits and missing files remain protected.
 
-Repository snapshots preserve the complete Git directory, including
-loose objects and private refs, under a recovery policy. Existing
-undeclared repositories and partial object copies remain protected by
-the report archive history guards. Matching an ancestor HEAD cannot
-authorize disposal: origin checks always specify the exact Git
-directory.
+On authoritative completion, unchanged repository copies are preserved
+automatically outside the disposable checkout under
+`forge-snapshot-recovery/<worker>/<attempt>/<snapshot>/`. The tar
+archive retains source files, Git objects, refs, working files,
+permissions, links and empty directories. Verification compares the full
+source inventory and archive checksums before removal; matching HEAD is
+insufficient. Git metadata that depends on external object storage
+remains protected.
 
-Cleanup errors name the blocking repository-relative copy and the
-recovery action. Preserve the complete copy, including source and all
-Git objects, in an archive outside the checkout; verify its recovered
-contents before relocating the copy. Use native Resume after recovery.
-Relocating an entire declared snapshot parent is also recognized without
-deleting the relocated contents. Keep validation reports outside
-snapshot directories so ordinary report archives remain downloadable.
+Durable ownership receipts record archive progress before source
+removal. Interrupted archive creation resumes from unchanged source, and
+published archives are verified and reused. Interrupted removal checks
+every surviving entry against the authorized inventory and verified
+archive. Changed, replaced or reappeared directories remain protected.
 
-Creation rejects source archives and Git metadata copies above 1 GiB and
-inventories above 100,000 entries. The runtime supplies a 60-second
-cancellation signal. An interrupted or incomplete creation remains
-protected for recovery.
+Forge processes every registered snapshot across attempts and reports
+every hold. Open Saved evidence to inspect held copies and choose
+**Recover snapshot** to preserve the current contents of an owned
+changed or incomplete copy. CloudX verifies that archive and reconciles
+completion. Directory identity mismatches still require ownership
+review; unregistered copies remain protected.
+
+Recovered archives remain downloadable from Saved evidence after worker
+cards and disposable checkouts retire. Reports should stay outside
+diagnostic copies so ordinary report archives remain separate. A closed
+issue can retire registered snapshots while the worker checkout still
+protects unpublished history.
+
+Creation and recovery bound source contents to 1 GiB and 100,000
+entries. Runtime snapshot operations use a 60-second cancellation
+signal. Incomplete creation stays protected until recovery.
 
 ## Generated Git history survives retirement
 

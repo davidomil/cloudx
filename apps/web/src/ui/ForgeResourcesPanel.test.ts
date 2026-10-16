@@ -7,6 +7,7 @@ import { ForgeResourcesPanel } from "./ForgeResourcesPanel.js";
 import { getForgeResources } from "../forgeResourcesApi.js";
 import { getForgeCheckoutEvidence } from "../forgeCheckoutEvidenceApi.js";
 import { getForgeGitHistory } from "../forgeGitHistoryApi.js";
+import { getForgeDiagnosticSnapshots } from "../forgeDiagnosticSnapshotsApi.js";
 
 vi.mock("../forgeResourcesApi.js", () => ({
   getForgeResources: vi.fn(),
@@ -21,6 +22,9 @@ vi.mock("../forgeGitHistoryApi.js", () => ({
   getForgeGitHistory: vi.fn(),
   gitHistoryManifestUrl: (id: string) => `/api/forge/git-history/${id}`,
   gitHistoryBundleUrl: (id: string) => `/api/forge/git-history/${id}/file`,
+}));
+vi.mock("../forgeDiagnosticSnapshotsApi.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../forgeDiagnosticSnapshotsApi.js")>(), getForgeDiagnosticSnapshots: vi.fn(),
 }));
 const resource: DisposableResource = {
   id: "resource-1", kind: "container", engineId: "engine", name: "regression-env",
@@ -46,6 +50,7 @@ beforeEach(() => {
   vi.mocked(getForgeResources).mockResolvedValue([]);
   vi.mocked(getForgeCheckoutEvidence).mockResolvedValue([]);
   vi.mocked(getForgeGitHistory).mockResolvedValue([]);
+  vi.mocked(getForgeDiagnosticSnapshots).mockResolvedValue({ snapshots: [], errors: [] });
   container = document.createElement("div"); document.body.append(container); root = createRoot(container);
 });
 afterEach(async () => {
@@ -142,10 +147,12 @@ describe("Saved Forge evidence", () => {
     const resourcesSignal = vi.mocked(getForgeResources).mock.calls[0]![0]!;
     const archivesSignal = vi.mocked(getForgeCheckoutEvidence).mock.calls[0]![0]!;
     const historySignal = vi.mocked(getForgeGitHistory).mock.calls[0]![0]!;
+    const snapshotsSignal = vi.mocked(getForgeDiagnosticSnapshots).mock.calls[0]![0]!;
     await act(async () => root!.unmount()); root = undefined;
     await act(async () => finish([resource]));
     expect(resourcesSignal.aborted).toBe(true); expect(archivesSignal.aborted).toBe(true);
     expect(historySignal.aborted).toBe(true);
+    expect(snapshotsSignal.aborted).toBe(true);
     expect(container.textContent).toBe("");
   });
 });

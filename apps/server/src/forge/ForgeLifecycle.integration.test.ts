@@ -66,6 +66,115 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Codex tabs", () => {
+  it("retires held issue and reviewer snapshots across attempts after merge and restart", async () => {
+    const fixture = await LifecycleFixture.create();
+    const issue = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const implementation = await fixture.completedAssistantTurn(issue);
+    await fs.mkdir(path.join(issue.worktreePath!, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(issue.worktreePath!, ".git/info/exclude"), "\n.cloudx/\nnode_modules/\n");
+    const source = await fixture.workflow.createDiagnosticSnapshot(issue.id, issue.attemptId!,
+      { kind: "source-only", commitSha: implementation.headSha });
+    await fs.mkdir(path.join(issue.worktreePath!, "node_modules"));
+    await fs.symlink(path.join(issue.worktreePath!, "node_modules"), path.join(issue.worktreePath!, source.path, "node_modules"));
+    await fixture.workflow.createDiagnosticSnapshot(issue.id, issue.attemptId!, { kind: "repository", commitSha: implementation.headSha });
+    await fixture.workflow.poll();
+
+    const firstReview = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    const firstReceipt = await fixture.completedAssistantTurn(firstReview);
+    await fs.mkdir(path.join(firstReview.worktreePath!, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(firstReview.worktreePath!, ".git/info/exclude"), "\n.cloudx/\n");
+    await fixture.workflow.createDiagnosticSnapshot(firstReview.id, firstReview.attemptId!, { kind: "repository", commitSha: firstReceipt.headSha });
+    await fixture.workflow.poll();
+    const secondReview = await fixture.workflow.startReview(repository, 7, false, fixture.placement);
+    expect(secondReview.id).toBe(firstReview.id);
+    expect(secondReview.attemptId).not.toBe(firstReview.attemptId);
+    const secondReceipt = await fixture.completedAssistantTurn(secondReview);
+    await fixture.workflow.createDiagnosticSnapshot(secondReview.id, secondReview.attemptId!, { kind: "repository", commitSha: secondReceipt.headSha });
+    await fixture.workflow.poll();
+
+    await fixture.workflow.dispose();
+    await fixture.store.write((await fixture.store.read()).map(worker => ({ ...worker,
+      status: "cleanup_failed", tabId: undefined, error: "Diagnostic snapshot requires recovery." })));
+    await fixture.provider.mergeExternally(7);
+    await fixture.restartWorkflow();
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    await expectMissing(issue.worktreePath!);
+    await expectMissing(firstReview.worktreePath!);
+    for (const owner of [issue, firstReview]) {
+      const snapshots = await fixture.workflow.diagnosticSnapshots(owner.id);
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots.every(snapshot => snapshot.state === "removed")).toBe(true);
+      for (const snapshot of snapshots.filter(snapshot => snapshot.kind === "repository")) {
+        expect(snapshot.recovery).toMatchObject({ state: "verified", archivePath: expect.any(String) });
+        expect((await fs.stat(snapshot.recovery!.archivePath)).size).toBeGreaterThan(1024);
+      }
+    }
+    expect(fixture.provider.submissions).toEqual([]);
+    expect(fixture.factory.processes).toHaveLength(3);
+    await fixture.restartWorkflow();
+    await fixture.workflow.poll();
+    expect((await fixture.workflow.dashboard()).workers).toEqual([]);
+    for (const owner of [issue, firstReview]) {
+      for (const snapshot of (await fixture.workflow.diagnosticSnapshots(owner.id)).filter(snapshot => snapshot.recovery)) {
+        let bytes = 0;
+        for await (const chunk of await fixture.workflow.diagnosticSnapshotArchive(owner.id, snapshot.path)) bytes += chunk.length;
+        expect(bytes).toBe((await fs.stat(snapshot.recovery!.archivePath)).size);
+      }
+    }
+  }, 30_000);
+
+  it.each([false, true])("retires snapshots of an externally closed unpublished issue while retaining its Git history (changed copy: %s)", async changed => {
+    vi.stubEnv("FORGE_FIXTURE_HOLD_COMPLETION", "true");
+    const fixture = await LifecycleFixture.create();
+    const worker = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(worker, false);
+    await fs.mkdir(path.join(worker.worktreePath!, ".git/info"), { recursive: true });
+    await fs.appendFile(path.join(worker.worktreePath!, ".git/info/exclude"), "\n.cloudx/\n");
+    const source = await fixture.workflow.createDiagnosticSnapshot(worker.id, worker.attemptId!,
+      { kind: "source-only", commitSha: receipt.headSha });
+    const repositoryCopy = await fixture.workflow.createDiagnosticSnapshot(worker.id, worker.attemptId!,
+      { kind: "repository", commitSha: receipt.headSha });
+    if (changed) await fs.writeFile(path.join(worker.worktreePath!, repositoryCopy.path, "investigation.txt"), "Unpublished investigation evidence.\n");
+    expect((await fixture.worker(worker.id)).headSha).toBeUndefined();
+    fixture.provider.issue.state = "closed";
+
+    await fixture.workflow.poll();
+
+    if (changed) {
+      expect(await fixture.worker(worker.id)).toMatchObject({ status: "cleanup_failed", error: expect.stringContaining(repositoryCopy.path) });
+      expect((await fixture.workflow.diagnosticSnapshots(worker.id)).find(snapshot => snapshot.path === repositoryCopy.path))
+        .toMatchObject({ state: "ready", hold: expect.stringContaining("additional source") });
+      await fixture.workflow.recoverDiagnosticSnapshot(worker.id, repositoryCopy.path);
+    }
+    const completed = await fixture.worker(worker.id);
+    expect(completed).toMatchObject({ status: "completed", retainedWorkspace: {
+      worktreePath: worker.worktreePath, retainedPaths: expect.arrayContaining([".git"]), reason: expect.stringContaining("unpublished Git history"),
+    } });
+    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(fixture.provider.changes.size).toBe(0);
+    expect(fixture.gitPushes).toEqual([]);
+    expect(await processIsRunning(receipt.pid)).toBe(false);
+    for (const snapshot of [source, repositoryCopy]) await expectMissing(path.join(worker.worktreePath!, snapshot.path));
+    const snapshots = await fixture.workflow.diagnosticSnapshots(worker.id);
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots.every(snapshot => snapshot.state === "removed")).toBe(true);
+    const recovered = snapshots.find(snapshot => snapshot.path === repositoryCopy.path)!;
+    expect(recovered.recovery).toMatchObject({ state: "verified", archivePath: expect.any(String) });
+    expect((await fs.stat(recovered.recovery!.archivePath)).size).toBeGreaterThan(1024);
+
+    await fixture.restartWorkflow();
+    fixture.advanceCleanupInterval();
+    await fixture.workflow.poll();
+    expect(await fixture.worker(worker.id)).toMatchObject({ status: "completed", retainedWorkspace: completed.retainedWorkspace });
+    expect(await git(worker.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    let archiveBytes = 0;
+    for await (const chunk of await fixture.workflow.diagnosticSnapshotArchive(worker.id, repositoryCopy.path)) archiveBytes += chunk.length;
+    expect(archiveBytes).toBe((await fs.stat(recovered.recovery!.archivePath)).size);
+  }, 20_000);
+
   it("publishes named ignored evidence and serves its archive after automatic retirement and restart", async () => {
     const fixture = await LifecycleFixture.create();
     const { resources, host } = await disposableEnvironments(fixture);

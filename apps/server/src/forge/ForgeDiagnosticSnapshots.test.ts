@@ -4,8 +4,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { extract } from "tar";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
+import { ForgeDiagnosticSnapshotRecovery } from "./ForgeDiagnosticSnapshotRecovery.js";
 import { ForgeDiagnosticSnapshots, isOwnedDiagnosticSnapshot, type OwnedDiagnosticSnapshot } from "./ForgeDiagnosticSnapshots.js";
 
 const execute = promisify(execFile);
@@ -24,6 +26,7 @@ async function fixture() {
   await git(["init", "--initial-branch=main", "--template="]);
   await git(["config", "user.name", "Snapshot test"]);
   await git(["config", "user.email", "snapshot@example.invalid"]);
+  await git(["config", "tar.umask", "0022"]);
   await fs.writeFile(path.join(checkout, ".gitignore"), ".cloudx/\n*.log\n");
   await fs.writeFile(path.join(checkout, "source.txt"), "Committed source\n");
   await fs.writeFile(path.join(checkout, "nested", "child.txt"), "Committed child\n");
@@ -32,14 +35,15 @@ async function fixture() {
   const commitSha = (await git(["rev-parse", "HEAD"])).trim();
   const checkoutIdentity = await readDirectoryIdentity(checkout);
   const gitDirectory = await readDirectoryIdentity(path.join(checkout, ".git"));
-  const snapshots = new ForgeDiagnosticSnapshots();
+  const recovery = new ForgeDiagnosticSnapshotRecovery(path.join(root, "durable-data"));
+  const snapshots = new ForgeDiagnosticSnapshots(recovery);
   const journal: OwnedDiagnosticSnapshot[] = [];
   const save = async (snapshot: OwnedDiagnosticSnapshot) => { journal.push(structuredClone(snapshot)); };
   const create = (kind: "source-only" | "repository" = "source-only") => snapshots.create(checkoutIdentity, gitDirectory, url,
     workerId, attemptId, { kind, commitSha }, git, save);
   const retire = (snapshot: OwnedDiagnosticSnapshot, protectedPaths: string[] = [], saveRemoval = async () => {}, signal?: AbortSignal) =>
     snapshots.retire(checkoutIdentity, [snapshot], protectedPaths, saveRemoval, git, signal);
-  return { root, checkout, checkoutIdentity, gitDirectory, git, commitSha, snapshots, journal, save, create, retire };
+  return { root, checkout, checkoutIdentity, gitDirectory, git, commitSha, snapshots, recovery, journal, save, create, retire };
 }
 
 async function interruptRemoval(state: Awaited<ReturnType<typeof fixture>>, snapshot: OwnedDiagnosticSnapshot): Promise<string> {
@@ -133,7 +137,7 @@ describe("Owned Forge diagnostic snapshots", () => {
     expect(await fs.readFile(path.join(state.checkout, "source.txt"), "utf8")).toBe("Committed source\n");
   });
 
-  it("keeps repository copies and their unique unpublished refs under recovery policy", async () => {
+  it("preserves repository copies and their unique unpublished refs in a verified archive before retirement", async () => {
     const state = await fixture();
     const tree = (await state.git(["rev-parse", "HEAD^{tree}"])).trim();
     const unpublished = (await state.git(["commit-tree", tree, "-m", "Unpublished diagnostic history"])).trim();
@@ -143,9 +147,14 @@ describe("Owned Forge diagnostic snapshots", () => {
     expect(snapshot.retentionPolicy).toBe("recover");
     expect((await state.git([...gitArgs, "rev-parse", "refs/private/investigation"])).trim()).toBe(unpublished);
     expect(await state.git([...gitArgs, "cat-file", "-p", unpublished])).toContain("Unpublished diagnostic history");
-    await expect(state.retire(snapshot)).rejects.toThrow("requires recovery");
-    expect(await state.git([...gitArgs, "cat-file", "-p", unpublished])).toContain("Unpublished diagnostic history");
-    expect(snapshot.state).toBe("ready");
+    await state.retire(snapshot);
+    expect(snapshot.state).toBe("removed");
+    expect(snapshot.recovery?.state).toBe("verified");
+    const restored = path.join(state.root, "restored-repository");
+    await fs.mkdir(restored);
+    await extract({ file: snapshot.recovery!.archivePath, cwd: restored });
+    expect(await state.git([`--git-dir=${path.join(restored, ".git")}`, "cat-file", "-p", unpublished])).toContain("Unpublished diagnostic history");
+    await state.recovery.verify(snapshot);
   });
 
   it.each(["directory", "symbolic link"])("preserves a replacement %s when source ownership changes while saving the creation receipt", async replacement => {
@@ -235,7 +244,7 @@ describe("Owned Forge diagnostic snapshots", () => {
     const snapshot = await state.create();
     const transitions: string[] = [];
     await state.retire(snapshot, [], async () => { transitions.push(snapshot.state); });
-    expect(transitions).toEqual(["removing", "removed"]);
+    expect(transitions).toEqual(["ready", "removing", "removed"]);
     await expect(fs.lstat(snapshot.identity.path)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readFile(path.join(state.checkout, "source.txt"), "utf8")).toBe("Committed source\n");
     expect((await state.git(["rev-parse", "HEAD"])).trim()).toBe(state.commitSha);
@@ -266,7 +275,9 @@ describe("Owned Forge diagnostic snapshots", () => {
     await expect(state.retire(snapshot, [], save)).rejects.toThrow(/contents were preserved|repository history/u);
     expect(await fs.readFile(protectedFile)).toEqual(before);
     expect(snapshot.state).toBe("ready");
-    expect(save).not.toHaveBeenCalled();
+    expect(save).toHaveBeenCalledOnce();
+    expect(snapshot.hold).toBeTruthy();
+    expect(snapshot.removalContents).toBeUndefined();
   });
 
   it.each(["copy", "parent", "child"])("respects explicit retention of the snapshot %s", async selection => {
@@ -297,6 +308,8 @@ describe("Owned Forge diagnostic snapshots", () => {
     expect(await fs.readFile(path.join(snapshot.identity.path, "source.txt"), "utf8")).toBe("Committed source\n");
     expect(snapshot.state).toBe("ready");
     expect(save).not.toHaveBeenCalled();
+    expect(snapshot.hold).toBeUndefined();
+    expect(snapshot.removalContents).toBeUndefined();
   });
 
   it.each(["directory", "symbolic link"])("preserves a replacement source %s and the relocated original", async replacement => {
@@ -351,7 +364,8 @@ describe("Owned Forge diagnostic snapshots", () => {
     await expect(state.retire(snapshot, [], save)).rejects.toThrow("reappeared");
     expect(await fs.readFile(path.join(reappeared, "investigation.log"), "utf8")).toBe("New source evidence\n");
     expect(snapshot.state).toBe("removed");
-    expect(save).not.toHaveBeenCalled();
+    expect(save).toHaveBeenCalledOnce();
+    expect(snapshot.hold).toContain("reappeared after retirement");
   });
 
   it("accepts an already removed snapshot while both source paths remain absent", async () => {
@@ -362,6 +376,7 @@ describe("Owned Forge diagnostic snapshots", () => {
     await state.retire(snapshot, [], save);
     expect(snapshot.state).toBe("removed");
     expect(save).not.toHaveBeenCalled();
+    expect(snapshot.hold).toBeUndefined();
   });
 
   it("resumes interrupted removal of surviving authorized bytes", async () => {
@@ -371,6 +386,78 @@ describe("Owned Forge diagnostic snapshots", () => {
     await new ForgeDiagnosticSnapshots().retire(state.checkoutIdentity, [structuredClone(snapshot)], [], async () => {}, state.git);
     await expect(fs.lstat(retiring)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readFile(path.join(state.checkout, "source.txt"), "utf8")).toBe("Committed source\n");
+  });
+
+  it.each(["before", "after"])("recovers changed owned source after restart when removal stopped %s rename", async interruption => {
+    const state = await fixture();
+    const snapshot = await state.create();
+    const journal = path.join(state.root, "snapshot.json");
+    let source = snapshot.identity.path;
+    if (interruption === "before") {
+      const rename = vi.spyOn(fs, "rename").mockRejectedValueOnce(Object.assign(new Error("Injected rename EIO"), { code: "EIO" }));
+      await expect(state.retire(snapshot, [], async () => { await fs.writeFile(journal, JSON.stringify(snapshot)); }))
+        .rejects.toThrow("Injected rename EIO");
+      rename.mockRestore();
+    } else {
+      source = await interruptRemoval(state, snapshot);
+      await fs.writeFile(journal, JSON.stringify(snapshot));
+    }
+    const resumed: OwnedDiagnosticSnapshot = JSON.parse(await fs.readFile(journal, "utf8"));
+    expect(resumed.state).toBe("removing");
+    expect(resumed.recovery).toBeUndefined();
+    await fs.writeFile(path.join(source, "investigation.log"), "Evidence added during the hold\n");
+    await fs.writeFile(path.join(source, "source.txt"), "Source changed during the hold\n");
+    const recovery = new ForgeDiagnosticSnapshotRecovery(path.join(state.root, "durable-data"));
+    const restarted = new ForgeDiagnosticSnapshots(recovery);
+    const save = async () => { await fs.writeFile(journal, JSON.stringify(resumed)); };
+    await expect(restarted.retire(state.checkoutIdentity, [resumed], [], save, state.git)).rejects.toThrow("new or modified contents");
+    await restarted.recover(state.checkoutIdentity, resumed, save);
+    expect(resumed.recovery?.state).toBe("verified");
+    expect(resumed.hold).toBeUndefined();
+    await recovery.verify(resumed);
+    const restored = path.join(state.root, "restored");
+    await fs.mkdir(restored);
+    await extract({ file: resumed.recovery!.archivePath, cwd: restored });
+    expect(await fs.readFile(path.join(restored, "investigation.log"), "utf8")).toBe("Evidence added during the hold\n");
+    expect(await fs.readFile(path.join(restored, "source.txt"), "utf8")).toBe("Source changed during the hold\n");
+    const recovered: OwnedDiagnosticSnapshot = JSON.parse(await fs.readFile(journal, "utf8"));
+    await new ForgeDiagnosticSnapshots(recovery).retire(state.checkoutIdentity, [recovered], [], async () => {}, state.git);
+    expect(recovered.state).toBe("removed");
+    await expect(fs.lstat(source)).rejects.toMatchObject({ code: "ENOENT" });
+    await recovery.verify(recovered);
+    expect(await fs.readFile(path.join(state.checkout, "source.txt"), "utf8")).toBe("Committed source\n");
+  });
+
+  it.each(["ready", "removing"] as const)("preserves conflicting recovery directories in %s state", async status => {
+    const state = await fixture();
+    const snapshot = await state.create();
+    snapshot.state = status;
+    const retiring = path.join(path.dirname(snapshot.identity.path), "retiring-source");
+    await fs.mkdir(retiring);
+    await fs.writeFile(path.join(retiring, "investigation.log"), "Conflicting recovery evidence\n");
+    const save = vi.fn(async () => {});
+    await expect(state.snapshots.recover(state.checkoutIdentity, snapshot, save)).rejects.toThrow("conflicting recovery directories");
+    expect(await fs.readFile(path.join(snapshot.identity.path, "source.txt"), "utf8")).toBe("Committed source\n");
+    expect(await fs.readFile(path.join(retiring, "investigation.log"), "utf8")).toBe("Conflicting recovery evidence\n");
+    expect(snapshot.recovery).toBeUndefined();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "retiring-source"])("rejects a replaced %s directory during recovery", async directory => {
+    const state = await fixture();
+    const snapshot = await state.create();
+    snapshot.state = "removing";
+    const original = path.join(state.root, "original-source");
+    await fs.rename(snapshot.identity.path, original);
+    const replacement = path.join(path.dirname(snapshot.identity.path), directory);
+    await fs.mkdir(replacement);
+    await fs.writeFile(path.join(replacement, "investigation.log"), "Replacement evidence\n");
+    const save = vi.fn(async () => {});
+    await expect(state.snapshots.recover(state.checkoutIdentity, snapshot, save)).rejects.toThrow("ownership changed");
+    expect(await fs.readFile(path.join(replacement, "investigation.log"), "utf8")).toBe("Replacement evidence\n");
+    expect(await fs.readFile(path.join(original, "source.txt"), "utf8")).toBe("Committed source\n");
+    expect(snapshot.recovery).toBeUndefined();
+    expect(save).not.toHaveBeenCalled();
   });
 
   it.each(["added evidence", "modified source", "partial .git"])("preserves %s when interrupted removal is resumed", async change => {
@@ -411,29 +498,110 @@ describe("Owned Forge diagnostic snapshots", () => {
     expect(snapshot.state).toBe("ready");
   });
 
-  it("records external recovery only after both source and interrupted removal paths are absent", async () => {
+  it("keeps a missing repository snapshot held until its external recovery has verified provenance", async () => {
     const state = await fixture();
     const snapshot = await state.create("repository");
     const recovered = path.join(state.root, "recovered-repository");
     await fs.rename(snapshot.identity.path, recovered);
-    await state.retire(snapshot);
-    expect(snapshot.state).toBe("removed");
+    await expect(state.retire(snapshot)).rejects.toThrow("receipt does not belong");
+    expect(snapshot.state).toBe("ready");
+    expect(snapshot.recovery).toBeUndefined();
     expect((await state.git([`--git-dir=${path.join(recovered, ".git")}`, "rev-parse", "HEAD"])).trim()).toBe(state.commitSha);
     expect(await fs.readFile(path.join(recovered, "source.txt"), "utf8")).toBe("Committed source\n");
   });
 
-  it.each(["source-only", "repository"] as const)("records external recovery after the entire %s snapshot parent is relocated", async kind => {
+  it.each(["source-only", "repository"] as const)("keeps relocated %s snapshot records until their required recovery proof is available", async kind => {
     const state = await fixture();
     const snapshot = await state.create(kind);
     const recoveredParent = path.join(state.root, "recovered-snapshot");
     await fs.rename(path.dirname(snapshot.identity.path), recoveredParent);
     const save = vi.fn(async () => {});
-    await state.retire(snapshot, [], save);
-    expect(snapshot.state).toBe("removed");
+    if (kind === "repository") {
+      await expect(state.retire(snapshot, [], save)).rejects.toThrow("receipt does not belong");
+      expect(snapshot.state).toBe("ready");
+      expect(snapshot.recovery).toBeUndefined();
+    } else {
+      await state.retire(snapshot, [], save);
+      expect(snapshot.state).toBe("removed");
+    }
     expect(save).toHaveBeenCalledOnce();
     expect(await fs.readFile(path.join(recoveredParent, "source", "source.txt"), "utf8")).toBe("Committed source\n");
     if (kind === "repository") expect((await state.git([`--git-dir=${path.join(recoveredParent, "source", ".git")}`, "rev-parse", "HEAD"])).trim()).toBe(state.commitSha);
     await expect(fs.lstat(snapshot.identity.path)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("resumes repository removal after restart using the same verified archive of the complete original copy", async () => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    const retiring = await interruptRemoval(state, snapshot);
+    expect(snapshot.recovery?.state).toBe("verified");
+    const receipt = structuredClone(snapshot.recovery!);
+    const archiveInode = (await fs.stat(receipt.archivePath)).ino;
+    const restored = path.join(state.root, "original-before-partial-removal");
+    await fs.mkdir(restored);
+    await extract({ file: receipt.archivePath, cwd: restored });
+    expect(await fs.readFile(path.join(restored, "nested", "child.txt"), "utf8")).toBe("Committed child\n");
+    await expect(fs.lstat(path.join(retiring, "nested", "child.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    const resumed = structuredClone(snapshot);
+    const recovery = new ForgeDiagnosticSnapshotRecovery(path.join(state.root, "durable-data"));
+    const restarted = new ForgeDiagnosticSnapshots(recovery);
+    await restarted.retire(state.checkoutIdentity, [resumed], [], async () => {}, state.git);
+    expect(resumed.state).toBe("removed");
+    expect(resumed.hold).toBeUndefined();
+    expect(resumed.recovery).toEqual(receipt);
+    expect((await fs.stat(receipt.archivePath)).ino).toBe(archiveInode);
+    expect((await fs.readdir(receipt.directory.path)).sort()).toEqual(["ownership.json", "snapshot.tar"]);
+    await recovery.verify(resumed);
+    await expect(fs.lstat(retiring)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["added working file", "changed working file", "new Git object"])("protects %s in pending repository removal after restart", async change => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    const retiring = await interruptRemoval(state, snapshot);
+    const receipt = structuredClone(snapshot.recovery!);
+    const archiveInode = (await fs.stat(receipt.archivePath)).ino;
+    const relative = change === "changed working file" ? "source.txt" : change === "new Git object" ? ".git/objects/ab/unpublished" : "investigation.txt";
+    const protectedFile = path.join(retiring, relative);
+    await fs.mkdir(path.dirname(protectedFile), { recursive: true });
+    await fs.writeFile(protectedFile, "New evidence after the preserved copy\n");
+    const resumed = structuredClone(snapshot);
+    const recovery = new ForgeDiagnosticSnapshotRecovery(path.join(state.root, "durable-data"));
+    await expect(new ForgeDiagnosticSnapshots(recovery).retire(state.checkoutIdentity, [resumed], [], async () => {}, state.git))
+      .rejects.toThrow("new or modified contents");
+    expect(resumed.state).toBe("removing");
+    expect(await fs.readFile(protectedFile, "utf8")).toBe("New evidence after the preserved copy\n");
+    expect((await fs.stat(receipt.archivePath)).ino).toBe(archiveInode);
+    await recovery.verify(resumed);
+  });
+
+  it.each(["ready", "removing", "removed"] as const)("holds an absent %s repository snapshot without an archive receipt despite matching origin HEAD", async status => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    await fs.rm(snapshot.identity.path, { recursive: true });
+    snapshot.state = status;
+    expect((await state.git(["rev-parse", "HEAD"])).trim()).toBe(state.commitSha);
+    await expect(state.retire(snapshot)).rejects.toThrow("receipt does not belong");
+    expect(snapshot.state).toBe(status);
+    expect(snapshot.recovery).toBeUndefined();
+    expect(snapshot.hold).toContain("receipt does not belong");
+  });
+
+  it.each(["directory", "symbolic link"])("protects the changed repository replacement %s and the original copy", async replacement => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    const original = path.join(state.root, "original-repository");
+    await fs.rename(snapshot.identity.path, original);
+    if (replacement === "directory") {
+      await fs.mkdir(snapshot.identity.path);
+      await fs.writeFile(path.join(snapshot.identity.path, "investigation.txt"), "Replacement evidence\n");
+    } else await fs.symlink(original, snapshot.identity.path);
+    await expect(state.retire(snapshot)).rejects.toThrow(/ownership changed|symbolic link/u);
+    expect(snapshot.state).toBe("ready");
+    expect(snapshot.recovery).toBeUndefined();
+    expect(await fs.readFile(path.join(original, "source.txt"), "utf8")).toBe("Committed source\n");
+    if (replacement === "directory") expect(await fs.readFile(path.join(snapshot.identity.path, "investigation.txt"), "utf8")).toBe("Replacement evidence\n");
+    else expect(await fs.readlink(snapshot.identity.path)).toBe(original);
   });
 
   it("rejects malformed or mismatched serialized ownership without granting a disposable lifecycle", async () => {

@@ -369,6 +369,114 @@ describe("Worker diagnostic snapshot ownership", () => {
     const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
     await expect(f.service.createDiagnosticSnapshot(worker.id, worker.attemptId!, { kind: "source-only", commitSha: "a".repeat(40) })).rejects.toThrow("unavailable in this runtime");
   });
+
+  it.each(["issue", "review"] as const)("protects an active %s snapshot from recovery", async kind => {
+    const f = fixture();
+    const recover = vi.fn(async () => {});
+    f.deps.runtime.recoverDiagnosticSnapshot = recover;
+    const worker = kind === "issue"
+      ? await f.service.startIssue(f.deps.settings().repository, 1, placement)
+      : await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+
+    await expect(f.service.recoverDiagnosticSnapshot(worker.id, ".cloudx/forge-snapshots/owned/source"))
+      .rejects.toThrow("active or unfinished consumer");
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("recovers a held snapshot explicitly before reconciling completed checkout retirement", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service.dispose();
+    await f.deps.store.write(f.stored().map(saved => ({ ...saved, status: "cleanup_failed" as const,
+      tabId: undefined, error: "Changed snapshot requires explicit recovery." })));
+    const recover = vi.fn(async () => {});
+    f.deps.runtime.recoverDiagnosticSnapshot = recover;
+    f.deps.runtime.pendingSnapshotRecovery = async () => true;
+    f.change.merged = true;
+    f.service = new ForgeWorkflowService(f.deps);
+
+    await f.service.recoverDiagnosticSnapshot(worker.id, ".cloudx/forge-snapshots/owned/source");
+
+    expect(recover).toHaveBeenCalledExactlyOnceWith(worker.id, ".cloudx/forge-snapshots/owned/source");
+    expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id }));
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+  });
+
+  it("preserves an explicit recovery hold when its archive fails", async () => {
+    const f = fixture();
+    const worker = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service.dispose();
+    await f.deps.store.write(f.stored().map(saved => ({ ...saved, status: "cleanup_failed" as const,
+      tabId: undefined, error: "Changed snapshot requires explicit recovery." })));
+    f.deps.runtime.recoverDiagnosticSnapshot = async () => { throw new Error("Archive verification failed."); };
+    f.change.merged = true;
+    f.service = new ForgeWorkflowService(f.deps);
+
+    await expect(f.service.recoverDiagnosticSnapshot(worker.id, ".cloudx/forge-snapshots/owned/source"))
+      .rejects.toThrow("Archive verification failed");
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.stored()).toMatchObject([{ id: worker.id, status: "cleanup_failed", error: "Changed snapshot requires explicit recovery." }]);
+  });
+
+  it.each([true, false])("requires confirmed publication before explicit snapshot recovery (confirmed: %s)", async confirmed => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    await f.service.dispose();
+    const report = { kind: "issue" as const, title: "Fix", body: "Ready", discussionReplies: [], resolvedDiscussionIds: [] };
+    await f.deps.store.write(f.stored().map(saved => ({ ...saved, status: "cleanup_failed" as const, tabId: undefined,
+      changeNumber: 7, pendingPublication: { headSha: f.change.headSha, confirmed: confirmed || undefined, report, repliedDiscussionIds: [] } })));
+    const recover = vi.fn(async () => {});
+    f.deps.runtime.recoverDiagnosticSnapshot = recover;
+    f.deps.runtime.pendingSnapshotRecovery = async () => true;
+    f.change.merged = true;
+    f.issue.state = "closed";
+    f.service = new ForgeWorkflowService(f.deps);
+
+    const recovery = f.service.recoverDiagnosticSnapshot(worker.id, ".cloudx/forge-snapshots/owned/source");
+    if (confirmed) {
+      await recovery;
+      expect(recover).toHaveBeenCalledExactlyOnceWith(worker.id, ".cloudx/forge-snapshots/owned/source");
+      expect(f.stored()).toEqual([]);
+    } else {
+      await expect(recovery).rejects.toThrow("active or unfinished consumer");
+      expect(recover).not.toHaveBeenCalled();
+      expect(f.runtime.cleanup).not.toHaveBeenCalled();
+      expect(f.stored()).toMatchObject([{ id: worker.id, status: "cleanup_failed", pendingPublication: { headSha: f.change.headSha } }]);
+    }
+  });
+
+  it("shows every snapshot and its saved recovery hold for a known worker", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const snapshots = [
+      { path: ".cloudx/forge-snapshots/first/source", workerId: worker.id, attemptId: worker.attemptId!,
+        kind: "repository" as const, retentionPolicy: "recover" as const, state: "ready" as const, hold: "Changed source requires recovery." },
+      { path: ".cloudx/forge-snapshots/second/source", workerId: worker.id, attemptId: randomUUID(),
+        kind: "repository" as const, retentionPolicy: "recover" as const, state: "ready" as const, recovery: { archivePath: "/archive/second", state: "verified" as const } },
+    ];
+    const inventory = vi.fn(async () => snapshots);
+    f.deps.runtime.diagnosticSnapshots = inventory;
+
+    expect(await f.service.diagnosticSnapshots(worker.id)).toEqual(snapshots);
+    expect(inventory).toHaveBeenCalledExactlyOnceWith(worker.id);
+    await expect(f.service.diagnosticSnapshots("../other-worker")).rejects.toThrow("Invalid worker ID");
+    expect(inventory).toHaveBeenCalledOnce();
+  });
+
+  it("serves preserved snapshot archives after their worker has retired", async () => {
+    const f = fixture();
+    const workerId = randomUUID();
+    const archive = Readable.from("verified archive");
+    const readArchive = vi.fn(async () => archive);
+    f.deps.runtime.diagnosticSnapshotArchive = readArchive;
+
+    expect(await f.service.diagnosticSnapshotArchive(workerId, ".cloudx/forge-snapshots/owned/source")).toBe(archive);
+    expect(readArchive).toHaveBeenCalledExactlyOnceWith(workerId, ".cloudx/forge-snapshots/owned/source");
+    await expect(f.service.diagnosticSnapshotArchive("../other-worker", ".cloudx/forge-snapshots/owned/source"))
+      .rejects.toThrow("Invalid worker ID");
+    expect(readArchive).toHaveBeenCalledOnce();
+  });
 });
 
 function deferred<T>() {
@@ -3890,6 +3998,84 @@ describe("Forge merged request cleanup", () => {
     expect(f.runtime.cleanup).toHaveBeenCalledTimes(2);
     expect(f.runtime.launch).toHaveBeenCalledTimes(2);
     expect(f.reports.remove).not.toHaveBeenCalledWith(running.attemptId);
+  });
+
+  it("recovers registered snapshots for every held issue and reviewer after restart", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const review = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service.dispose();
+    const savedReview = f.stored().find(worker => worker.id === review.id)!;
+    const previousReview: ForgeWorker = { ...savedReview, id: randomUUID(), attemptId: randomUUID(), completion: undefined };
+    const workers = [...f.stored(), previousReview].map(worker => ({ ...worker,
+      status: "cleanup_failed" as const, tabId: undefined, error: "Diagnostic snapshot requires recovery." }));
+    await f.deps.store.write(workers);
+    const recovery = vi.fn(async (_id: string) => true);
+    f.deps.runtime.pendingSnapshotRecovery = recovery;
+    mergeAndClose(f);
+    f.service = new ForgeWorkflowService(f.deps);
+
+    await f.service.poll();
+
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.cleanup.mock.calls.map(([input]) => input.id).sort()).toEqual([coding.id, review.id, previousReview.id].sort());
+    expect(recovery.mock.calls.map(([id]) => id)).toEqual(expect.arrayContaining(workers.map(worker => worker.id)));
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("finishes recoverable peers behind protected snapshots and leaves new holds idle", async () => {
+    const f = fixture();
+    const coding = await publishedIssue(f);
+    const review = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service.dispose();
+    const savedReview = f.stored().find(worker => worker.id === review.id)!;
+    const failedReview: ForgeWorker = { ...savedReview, id: randomUUID(), attemptId: randomUUID(), completion: undefined };
+    const recoverableReview: ForgeWorker = { ...failedReview, id: randomUUID(), attemptId: randomUUID() };
+    const workers = [...f.stored(), failedReview, recoverableReview].map(worker => ({ ...worker,
+      status: "cleanup_failed" as const, tabId: undefined, error: "Diagnostic snapshot requires recovery." }));
+    await f.deps.store.write(workers);
+    const recoverable = new Set([coding.id, failedReview.id, recoverableReview.id]);
+    f.deps.runtime.pendingSnapshotRecovery = async id => recoverable.has(id);
+    f.runtime.cleanup.mockImplementation(async input => {
+      recoverable.delete(input.id);
+      if (input.id === failedReview.id) throw new Error("Changed snapshot source requires user recovery. Use Resume after preserving it.");
+    });
+    mergeAndClose(f);
+    f.service = new ForgeWorkflowService(f.deps);
+
+    await f.service.poll();
+
+    expect(f.stored()).toMatchObject([
+      { id: review.id, status: "cleanup_failed", error: "Diagnostic snapshot requires recovery." },
+      { id: failedReview.id, status: "cleanup_failed", error: expect.stringContaining("Changed snapshot source") },
+    ]);
+    expect(f.runtime.cleanup.mock.calls.map(([input]) => input.id).sort()).toEqual([coding.id, failedReview.id, recoverableReview.id].sort());
+    await nextCompletionCheck(f);
+    await nextCompletionCheck(f);
+    expect(f.runtime.cleanup).toHaveBeenCalledTimes(3);
+    expect(f.provider.postReview).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for authoritative completion before resuming snapshot recovery", async () => {
+    const f = fixture();
+    const review = await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    await f.service.dispose();
+    await f.deps.store.write(f.stored().map(worker => ({ ...worker, status: "cleanup_failed" as const,
+      tabId: undefined, error: "Diagnostic snapshot requires recovery." })));
+    f.deps.runtime.pendingSnapshotRecovery = async () => true;
+    f.service = new ForgeWorkflowService(f.deps);
+
+    await f.service.poll();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.stored()).toMatchObject([{ id: review.id, status: "cleanup_failed" }]);
+
+    f.change.merged = true;
+    await nextCompletionCheck(f);
+    expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: review.id }));
+    expect(f.stored()).toEqual([]);
   });
 
   it("cleans other associated runners when one checkout cannot be removed", async () => {
