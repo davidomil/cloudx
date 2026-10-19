@@ -156,6 +156,7 @@ async function legacyInstallation({ current = false } = {}) {
   expect(legacyFactory).not.toContain("JSON.stringify(options.execution");
   fs.writeFileSync(factoryPath, legacyFactory);
   fs.copyFileSync(source("TerminalSupervisor"), path.join(modules, "TerminalSupervisor.ts"));
+  fs.copyFileSync(new URL("../apps/server/src/statePersistence.ts", import.meta.url), path.join(root, "src", "statePersistence.ts"));
   const helper = path.join(root, "helpers", "terminal-supervisor.py");
   const currentHelper = fs.readFileSync(new URL("../apps/server/helpers/terminal-supervisor.py", import.meta.url), "utf8");
   fs.writeFileSync(helper, `${currentHelper.slice(0, currentHelper.indexOf('if __name__ == "__main__":'))}
