@@ -570,6 +570,42 @@ export class LifecycleBrowserProfile {
     });
   }
 
+  async confirmInterruption(panel, status, targetSha) {
+    assert.equal(status.confirmation.targetCommit, targetSha);
+    assert.equal(
+      status.confirmation.restoreSnapshotRunId,
+      undefined,
+      "Forward acceptance must not restore a downgrade snapshot.",
+    );
+    await panel
+      .getByLabel(
+        "I understand that affected terminal sessions and running work will be interrupted.",
+      )
+      .check();
+    const [confirmed] = await Promise.all([
+      this.page.waitForResponse(
+        (response) =>
+          new URL(response.url()).pathname === "/api/system/update" &&
+          response.request().method() === "POST",
+      ),
+      panel
+        .getByRole("button", {
+          name: "Confirm interruption and continue",
+          exact: true,
+        })
+        .click(),
+    ]);
+    const resumed = await confirmed.json();
+    assert.equal(
+      resumed.run?.state,
+      "running",
+      `Settings did not launch the update: ${JSON.stringify(resumed)}`,
+    );
+    assert.equal(resumed.run.targetCommit, targetSha);
+    this.interruptionConfirmed = true;
+    return resumed;
+  }
+
   async update({ targetSha, timeoutMs = 40 * 60_000 }) {
     const [previewResponse, panel] = await Promise.all([
       this.page.waitForResponse(
@@ -600,32 +636,7 @@ export class LifecycleBrowserProfile {
     ]);
     let status = await launched.json();
     if (status.confirmation) {
-      assert.equal(status.confirmation.targetCommit, targetSha);
-      assert.equal(
-        status.confirmation.restoreSnapshotRunId,
-        undefined,
-        "Forward acceptance must not restore a downgrade snapshot.",
-      );
-      await panel
-        .getByLabel(
-          "I understand that affected terminal sessions and running work will be interrupted.",
-        )
-        .check();
-      const [confirmed] = await Promise.all([
-        this.page.waitForResponse(
-          (response) =>
-            new URL(response.url()).pathname === "/api/system/update" &&
-            response.request().method() === "POST",
-        ),
-        panel
-          .getByRole("button", {
-            name: "Confirm interruption and continue",
-            exact: true,
-          })
-          .click(),
-      ]);
-      status = await confirmed.json();
-      this.interruptionConfirmed = true;
+      status = await this.confirmInterruption(panel, status, targetSha);
     }
     assert.equal(
       status.run?.state,
@@ -670,6 +681,28 @@ export class LifecycleBrowserProfile {
           this.updateRunId,
           "The durable update record changed identity.",
         );
+        assert.equal(
+          current.run.targetCommit,
+          targetSha,
+          "The durable update target changed identity.",
+        );
+        if (
+          current.run.state === "failed" &&
+          current.run.phase === "prepare" &&
+          current.run.component === "terminals" &&
+          current.run.resumable === true &&
+          current.available === true &&
+          current.confirmation &&
+          !this.interruptionConfirmed
+        ) {
+          const resumed = await this.confirmInterruption(panel, current, targetSha);
+          assert.equal(
+            resumed.run.id,
+            this.updateRunId,
+            "The durable update record changed identity.",
+          );
+          return false;
+        }
         assert.notEqual(
           current.run.state,
           "failed",
