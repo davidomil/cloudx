@@ -2,6 +2,7 @@
 
 from collections import deque
 import ctypes
+import errno
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import time
 import tempfile
 
 
-CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"
+CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v2"
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_SIGNALS = (
@@ -32,6 +33,7 @@ class TerminalSupervisor:
         self.worker = None
         self.worker_status = None
         self.stopping = False
+        self.receipt_requested = False
         self.began = time.monotonic()
         self.events = deque(maxlen=64)
 
@@ -60,13 +62,53 @@ class TerminalSupervisor:
             raise
         event = self.command_exit()
         self.record("children-reaped", **event)
-        self.write_receipt("complete", {**self.identity, **event})
+        self.publish_completion({**self.identity, **event})
         if self.execution is None:
             self.remove_ephemeral_receipts()
         else:
             self.record("durable-receipts-retained")
         self.retain_diagnostics()
         return event["exitCode"]
+
+    def publish_completion(self, completion):
+        while True:
+            self.receipt_requested = False
+            try:
+                self.write_receipt("complete", completion)
+                return
+            except OSError as error:
+                if error.errno not in (errno.ENOSPC, errno.EDQUOT):
+                    raise
+                self.record("completion-storage-blocked", errno=error.errno)
+                message = (
+                    f"Terminal completion receipt could not be saved: {error}. "
+                    "All descendants were reaped; the supervisor retains ownership evidence in memory. "
+                    "Free disk space or quota, then retry close or native-client restart."
+                )
+                try:
+                    self.write_receipt("error", {**self.identity, "message": message,
+                                                "diagnostics": self.events[-1]})
+                except OSError as receipt_error:
+                    if receipt_error.errno not in (errno.ENOSPC, errno.EDQUOT):
+                        raise
+                    self.record("error-receipt-storage-blocked", errno=receipt_error.errno)
+                try:
+                    print(message, file=sys.stderr, flush=True)
+                except OSError:
+                    # A detached PTY must not discard the only quiescence proof.
+                    pass
+                # The live host requests publication through explicit termination.
+                while not self.receipt_requested and os.getppid() == self.parent:
+                    time.sleep(0.01)
+                if os.getppid() != self.parent:
+                    if self.execution is None:
+                        # No consumer survives. ECHILD already proved cleanup;
+                        # ephemeral receipts can be removed even while full.
+                        self.record("parent-exited-with-unpublished-completion")
+                        return
+                    # After owner loss, this process alone holds durable proof.
+                    # Check capacity until it can publish for restarted recovery.
+                    time.sleep(1)
 
     def remove_ephemeral_receipts(self):
         self.record("awaiting-receipt-acknowledgement")
@@ -150,6 +192,7 @@ class TerminalSupervisor:
 
     def request_stop(self, _number, _frame):
         self.stopping = True
+        self.receipt_requested = True
 
     def launch_command(self):
         read_gate, write_gate = os.pipe()

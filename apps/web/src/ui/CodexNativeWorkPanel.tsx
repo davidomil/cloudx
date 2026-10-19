@@ -20,13 +20,19 @@ function NativeWork({ tab, work, onRecover }: {
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string>();
+  const incidentResolved = Boolean(work.incidentResolvedByTurnId);
+  const recoveryFailed = work.recoveryStatus === "failed" && !incidentResolved;
+  const needsAttention = work.goalStatus === "blocked" || work.turnStatus === "failed" || recoveryFailed;
+  const recoveryPending = work.recoveryStatus === "awaiting_goal_resume" || work.recoveryStatus === "awaiting_turn" || work.recoveryStatus === "running";
+  const resolutionNeedsNoAction = incidentResolved && !needsAttention && !recoveryPending;
   const detailsId = useId();
   const presentationKey = `cloudx.nativeWork.presentation:${JSON.stringify([tab.id, work.executionId, work.threadId])}`;
   const [presentation, setPresentation] = useState(() => {
     const previous = readCollapsedWork(presentationKey);
-    return { work, expanded: !previous || hasNewFailure(previous, work) };
+    return { work, expanded: !resolutionNeedsNoAction && (!previous || hasNewFailure(previous, work)) };
   });
-  if (presentation.work !== work) setPresentation({ work, expanded: presentation.expanded || hasNewFailure(presentation.work, work) });
+  if (presentation.work !== work) setPresentation({ work, expanded: hasNewFailure(presentation.work, work) ||
+    presentation.expanded && !(resolutionNeedsNoAction && !presentation.work.incidentResolvedByTurnId) });
   const { expanded } = presentation;
   useEffect(() => {
     try {
@@ -41,7 +47,6 @@ function NativeWork({ tab, work, onRecover }: {
     return () => { disposed.current = true; };
   }, []);
 
-  const recoveryPending = work.recoveryStatus === "awaiting_goal_resume" || work.recoveryStatus === "awaiting_turn" || work.recoveryStatus === "running";
   const goalNeedsResume = work.goalStatus === "blocked" || work.recoveryStatus === "awaiting_goal_resume";
   const restartUnavailable = tab.ownerPluginId ? "This client belongs to a managed worker; use its owner's controls."
     : tab.status !== "running" || tab.recovery ? "Restore the terminal process before restarting native work."
@@ -69,10 +74,9 @@ function NativeWork({ tab, work, onRecover }: {
     }
   }
 
-  const needsAttention = work.goalStatus === "blocked" || work.turnStatus === "failed" || work.recoveryStatus === "failed";
   const heading = work.turnStatus === "running" ? "Native turn running"
     : work.turnStatus === "failed" ? "Native turn failed"
-    : work.recoveryStatus === "failed" ? "Native recovery failed" : "Codex native work";
+    : recoveryFailed ? "Native recovery failed" : "Codex native work";
   return <section className="codex-native-work" aria-label={`Native work for ${tab.title}`} aria-busy={busy}>
     <div className="codex-native-heading">
       <h2>{needsAttention ? <AlertTriangle size={16} aria-hidden="true" /> : null}{heading}{work.goalStatus === "blocked" ? " · Goal blocked" : ""}</h2>
@@ -80,9 +84,10 @@ function NativeWork({ tab, work, onRecover }: {
     </div>
     <p className="codex-native-status">Terminal process: {statusLabel(tab.status)} · Native turn: {work.turnStatus ? statusLabel(work.turnStatus) : "Not observed"} · Goal: {work.goalStatus ? statusLabel(work.goalStatus) : "Not observed"}</p>
     <div id={detailsId} hidden={!expanded}>
-      {work.recoveryStatus ? <p role="status">{recoveryMessage(work.recoveryStatus)}</p> : null}
-      {work.lastError ? <details open={needsAttention || work.lastError.kind === "retry"}>
-        <summary>{work.lastError.kind === "retry" ? "Provider retry notice" : "Last terminal provider error"}</summary>
+      {work.recoveryStatus === "failed" && incidentResolved ? <p>Previous recovery attempt failed. A later native turn completed and resolved the provider incident.</p>
+        : work.recoveryStatus ? <p role="status">{recoveryMessage(work.recoveryStatus)}</p> : null}
+      {work.lastError ? <details open={!incidentResolved && (needsAttention || work.lastError.kind === "retry")}>
+        <summary>{incidentResolved ? "Resolved provider incident diagnostics" : work.lastError.kind === "retry" ? "Provider retry notice" : "Last terminal provider error"}</summary>
         <p>{work.lastError.message}</p>
         <p className="codex-native-diagnostics">
           {work.lastError.code ? <span>Error code: <code>{work.lastError.code}</code></span> : null}
@@ -114,8 +119,8 @@ function readCollapsedWork(key: string): CodexNativeWork | undefined {
 function hasNewFailure(previous: CodexNativeWork, current: CodexNativeWork): boolean {
   return current.turnStatus === "failed" && (previous.turnStatus !== "failed" || previous.turnId !== current.turnId) ||
     current.goalStatus === "blocked" && previous.goalStatus !== "blocked" ||
-    current.recoveryStatus === "failed" && previous.recoveryStatus !== "failed" ||
-    current.lastError !== undefined && JSON.stringify(current.lastError) !== JSON.stringify(previous.lastError);
+    current.recoveryStatus === "failed" && !current.incidentResolvedByTurnId && previous.recoveryStatus !== "failed" ||
+    current.lastError !== undefined && (Boolean(previous.incidentResolvedByTurnId) && !current.incidentResolvedByTurnId || JSON.stringify(current.lastError) !== JSON.stringify(previous.lastError));
 }
 
 function statusLabel(status: string): string {

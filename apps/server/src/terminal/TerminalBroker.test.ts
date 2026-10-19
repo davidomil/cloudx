@@ -96,6 +96,50 @@ describe("durable terminal broker", () => {
     await restored.terminate();
   });
 
+  it("retries failed receipt publication on the same attachment while other sessions remain usable", async () => {
+    const { factory, process, spawn } = await fixture();
+    const affected = await factory.spawn("codex", [], options("receipt-storage-full"));
+    const healthy = new FakeTerminal();
+    spawn.mockResolvedValueOnce(healthy);
+    const sibling = await factory.spawn("shell", [], options("healthy-sibling"));
+    const disconnected = vi.fn();
+    affected.onDisconnect!(disconnected);
+    process.terminate.mockRejectedValueOnce(new Error("ENOSPC: free disk space, then retry close."));
+    process.terminate.mockRejectedValueOnce(new Error("EDQUOT: free disk quota, then retry close."));
+
+    for (const code of ["ENOSPC", "EDQUOT"]) {
+      await expect(affected.terminate()).rejects.toThrow(code);
+      const attached = await factory.attach("receipt-storage-full");
+      attached.detach!();
+      sibling.write(`STILL_RUNNING_AFTER_${code}\n`);
+      await vi.waitFor(() => expect(healthy.write).toHaveBeenCalledWith(`STILL_RUNNING_AFTER_${code}\n`));
+      expect(disconnected).not.toHaveBeenCalled();
+      expect(healthy.terminate).not.toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledTimes(2);
+    }
+
+    await affected.terminate();
+    expect(process.terminate).toHaveBeenCalledTimes(3);
+    await expect(factory.attach("receipt-storage-full")).rejects.toThrow("not restarted");
+    expect(disconnected).not.toHaveBeenCalled();
+    sibling.write("STILL_RUNNING_AFTER_RECONCILIATION\n");
+    await vi.waitFor(() => expect(healthy.write).toHaveBeenCalledWith("STILL_RUNNING_AFTER_RECONCILIATION\n"));
+    expect(healthy.terminate).not.toHaveBeenCalled();
+    await sibling.terminate();
+  });
+
+  it("reports a rejected fire-and-forget kill to its attachment", async () => {
+    const { factory, process } = await fixture();
+    const terminal = await factory.spawn("shell", [], options("rejected-kill"));
+    const disconnected = vi.fn();
+    terminal.onDisconnect!(disconnected);
+    process.terminate.mockRejectedValueOnce(new Error("Descendant ownership remains unconfirmed."));
+    terminal.kill();
+    await vi.waitFor(() => expect(disconnected).toHaveBeenCalledWith(expect.objectContaining({ message: "Descendant ownership remains unconfirmed." })));
+    const attached = await factory.attach("rejected-kill");
+    await attached.terminate();
+  });
+
   it("identifies broker-induced exits before disconnecting its clients", async () => {
     const { factory, process, broker } = await fixture();
     const terminal = await factory.spawn("shell", [], options("broker-shutdown"));
@@ -115,6 +159,12 @@ describe("durable terminal broker", () => {
     [undefined, true], ["broker-shutdown", true], ["unknown", false], [null, false], [1, false]
   ])("validates an exit reason of %s before delivering the event", (reason, valid) => {
     expect(isTerminalResponse({ type: "exit", event: { exitCode: 0, reason } })).toBe(valid);
+  });
+
+  it.each([
+    ["ENOSPC: free disk space, then retry close.", true], [undefined, false], [null, false], [125, false], [{ message: "ENOSPC" }, false]
+  ])("validates a retryable termination failure message of %s", (message, valid) => {
+    expect(isTerminalResponse({ type: "termination-failed", message })).toBe(valid);
   });
 
   it("retains the broker shutdown reason when attachment receives the exit before its listener subscribes", async () => {

@@ -25,8 +25,8 @@ export function assertPinnedTerminalRuntime({ dataDir, role, service, state, rea
     }
     const receipt = JSON.parse(readFile(path.join(dataDir, "terminal-runtime", `${role}.json`), "utf8"));
     if (receipt.version !== 1 || receipt.role !== role || !Number.isSafeInteger(receipt.pid) || receipt.pid <= 0
-      || receipt.brokerProtocol !== 1 || receipt.supervisor?.pinned !== true
-      || receipt.supervisor.contract !== "execution-json-v1" || !/^[a-f0-9]{64}$/.test(receipt.supervisor.sourceSha256)) {
+      || receipt.brokerProtocol !== 2 || receipt.supervisor?.pinned !== true
+      || receipt.supervisor.contract !== "execution-json-v2" || !/^[a-f0-9]{64}$/.test(receipt.supervisor.sourceSha256)) {
       throw new Error("Running terminal runtime has no compatible pinned helper receipt.");
     }
     const stat = readFile(`/proc/${receipt.pid}/stat`, "utf8");
@@ -112,7 +112,7 @@ export function prepareRuntimeUpdate(options) {
 }
 
 function supportsPinnedRuntime(runtime) {
-  return runtime?.brokerProtocol === 1 && runtime.supervisorContract === "execution-json-v1" && runtime.persistentSessions === true;
+  return runtime?.brokerProtocol === 2 && runtime.supervisorContract === "execution-json-v2" && runtime.persistentSessions === true;
 }
 
 function serviceIsRunning(state) {

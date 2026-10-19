@@ -1092,7 +1092,7 @@ export async function runInstaller(options = {}) {
     inspectUpdateCheckout(commands, root);
     prepareRuntimeUpdate({
       paths, commands, target: updateTarget, dryRun,
-      targetRuntime: { brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true },
+      targetRuntime: { brokerProtocol: 2, supervisorContract: "execution-json-v2", persistentSessions: true },
       migrateTerminals: options.migrateTerminals && !env.CLOUDX_INSTALL_UPDATED_COMMIT,
     });
     const updatedCommit = updateCheckout(commands, {

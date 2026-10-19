@@ -463,3 +463,80 @@ test("shows rejected recovery outside collapsed details and distinguishes identi
   ).toBeVisible();
   expect(requests).toHaveLength(1);
 });
+
+test("clears resolved recovery guidance automatically while preserving history and new-failure attention", async ({
+  page,
+}, testInfo) => {
+  const { sockets, input } = await openFixture(page);
+  const panel = page.getByRole("region", {
+    name: "Native work for Affected Codex",
+  });
+  await observe(page, {
+    recoveryStatus: "failed",
+    goalStatus: "active",
+    turnId: "failed-recovery",
+  });
+  await expect(
+    panel.getByText("Recovery failed:", { exact: false }),
+  ).toBeVisible();
+  await observe(page, { turnId: "later-turn", turnStatus: "running" });
+  await expect(
+    panel.getByRole("button", { name: "Restart this Codex client" }),
+  ).toBeDisabled();
+  await observe(page, {
+    turnStatus: "completed",
+    incidentResolvedByTurnId: "later-turn",
+  });
+  await expect(panel.getByRole("heading")).toHaveText("Codex native work");
+  await expect(
+    panel.getByRole("button", { name: "Show native work details" }),
+  ).toHaveAttribute("aria-expanded", "false");
+  await expect(
+    panel.getByRole("button", { name: "Restart this Codex client" }),
+  ).toHaveCount(0);
+  await expect(
+    panel.getByText("Restart only this client", { exact: false }),
+  ).toHaveCount(0);
+  await sockets.affected[0].close({ code: 1001 });
+  await expect.poll(() => sockets.affected.length).toBe(2);
+  await expect(panel.getByRole("heading")).toHaveText("Codex native work");
+  const evidenceDirectory = path.join(repoRoot, "test-results/issue230");
+  await mkdir(evidenceDirectory, { recursive: true });
+  const screenshot = path.join(
+    evidenceDirectory,
+    `${testInfo.project.name}-resolved.png`,
+  );
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("resolved-native-incident", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await panel.getByRole("button", { name: "Show native work details" }).click();
+  await expect(
+    panel.getByText("Previous recovery attempt failed.", { exact: false }),
+  ).toBeVisible();
+  await panel
+    .getByText("Resolved provider incident diagnostics", { exact: true })
+    .click();
+  await expect(
+    panel.getByText("request-after-http-200", { exact: false }),
+  ).toBeVisible();
+  await page.locator('[data-tab="affected"] .xterm-helper-textarea').focus();
+  await page.keyboard.type("continue after successful turn");
+  await expect
+    .poll(() => input.affected.join(""))
+    .toBe("continue after successful turn");
+  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await observe(page, {
+    turnId: "new-failure",
+    turnStatus: "failed",
+    incidentResolvedByTurnId: undefined,
+  });
+  await expect(panel.getByRole("heading")).toHaveText("Native turn failed");
+  await expect(
+    panel.getByRole("button", { name: "Hide native work details" }),
+  ).toBeVisible();
+  await expect(
+    panel.getByRole("button", { name: "Restart this Codex client" }),
+  ).toBeEnabled();
+});

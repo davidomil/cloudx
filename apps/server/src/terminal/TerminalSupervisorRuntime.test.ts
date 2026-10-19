@@ -14,7 +14,7 @@ afterEach(async () => { for (const directory of directories.splice(0)) await fs.
 describe("terminal supervisor runtime", () => {
   it("pins the helper and its identity when imported, before any terminal launches", async () => {
     const fixture = await runtimeFixture();
-    const source = 'CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"\n';
+    const source = 'CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v2"\n';
     await fs.writeFile(fixture.helper, source);
     const { stdout } = await execute(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
       import fs from 'node:fs';
@@ -25,14 +25,14 @@ describe("terminal supervisor runtime", () => {
     `]);
     expect(JSON.parse(stdout)).toEqual({
       source,
-      runtime: { contract: "execution-json-v1", sourceSha256: createHash("sha256").update(source).digest("hex"), pinned: true }
+      runtime: { contract: "execution-json-v2", sourceSha256: createHash("sha256").update(source).digest("hex"), pinned: true }
     });
   });
 
   it.each([
     [undefined, "bundled terminal-supervisor.py helper is required"],
     ["", "helper declares no contract"],
-    ['CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v2"\n', "helper declares execution-json-v2"]
+    ['CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"\n', "helper declares execution-json-v1"]
   ])("refuses startup with a missing or incompatible helper: %s", async (source, message) => {
     const fixture = await runtimeFixture();
     if (source !== undefined) await fs.writeFile(fixture.helper, source);

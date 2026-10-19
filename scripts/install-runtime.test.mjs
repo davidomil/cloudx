@@ -8,9 +8,9 @@ const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 const state = { LoadState: "loaded", ActiveState: "active", MainPID: "123", InvocationID: "1".repeat(32), ControlGroup: "/user/cloudx.service", WorkingDirectory: "/repo", KillMode: "control-group", SendSIGKILL: "yes" };
 function fixture(role = "broker") {
-  const receipt = { version: 1, role, pid: 123, invocationId: "1".repeat(32), started: "456", bootId: "boot", brokerProtocol: 1,
+  const receipt = { version: 1, role, pid: 123, invocationId: "1".repeat(32), started: "456", bootId: "boot", brokerProtocol: 2,
     ...(role === "broker" ? { attachmentExitBeforeReady: true } : {}),
-    supervisor: { pinned: true, contract: "execution-json-v1", sourceSha256: "a".repeat(64) } };
+    supervisor: { pinned: true, contract: "execution-json-v2", sourceSha256: "a".repeat(64) } };
   const files = {
     [`/data/terminal-runtime/${role}.json`]: JSON.stringify(receipt),
     "/proc/123/stat": `123 (a name) ${["S", ...Array(18).fill("0"), "456"].join(" ")}`,
@@ -32,7 +32,8 @@ it.each([
   ["stale start", { started: "455" }],
   ["old boot", { bootId: "old" }],
   ["previous invocation", { invocationId: "2".repeat(32) }],
-  ["wrong wire protocol", { brokerProtocol: 2 }],
+  ["wrong wire protocol", { brokerProtocol: 1 }],
+  ["old helper with the current wire protocol", { supervisor: { pinned: true, contract: "execution-json-v1", sourceSha256: "a".repeat(64) } }],
   ["mutable helper", { supervisor: { pinned: false } }],
 ])("rejects %s before any mutations", (_reason, change) => {
   const test = fixture();
@@ -151,7 +152,7 @@ it.each(["/", "/user/external.scope", "/user/cloudx-terminal.service-other", "/u
   },
 );
 
-const currentRuntime = { brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true };
+const currentRuntime = { brokerProtocol: 2, supervisorContract: "execution-json-v2", persistentSessions: true };
 
 function plannedRuntime() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-runtime-plan-")); roots.push(root);
@@ -203,6 +204,25 @@ it("preserves compatible services even when interruption was previously confirme
   expect(f.actions).toEqual([]);
 });
 
+it("requires coordinated replacement of abb7269 owners before activating receipt-capacity recovery", () => {
+  const f = plannedRuntime();
+  for (const role of ["web", "broker"]) {
+    const file = `/data/terminal-runtime/${role}.json`;
+    const receipt = JSON.parse(f.files[file]);
+    f.files[file] = JSON.stringify({ ...receipt, brokerProtocol: 1,
+      supervisor: { ...receipt.supervisor, contract: "execution-json-v1" } });
+  }
+  const plan = inspectRuntimeUpdate(f.options);
+  expect(plan.requiresInterruption).toBe(true);
+  expect(plan.blockers).toEqual([]);
+  expect(plan.reasons.map(reason => reason.role)).toEqual(["web", "broker"]);
+  expect(plan.stopServices).toEqual(["cloudx.service", "cloudx-terminal.service"]);
+  expect(() => prepareRuntimeUpdate(f.options)).toThrow("Confirm terminal interruption");
+  expect(f.actions).toEqual([]);
+  prepareRuntimeUpdate({ ...f.options, interruptionConfirmed: true });
+  expect(f.actions).toEqual(["cloudx.service", "cloudx-terminal.service"]);
+});
+
 it.each([undefined, false])("requires managed confirmation before replacing a broker without ordered attachment exits: %s", capability => {
   const f = plannedRuntime();
   const receipt = JSON.parse(f.files["/data/terminal-runtime/broker.json"]);
@@ -218,7 +238,7 @@ it.each([undefined, false])("requires managed confirmation before replacing a br
   expect(f.actions).toEqual(["cloudx.service", "cloudx-terminal.service"]);
 });
 
-it.each([undefined, { ...currentRuntime, persistentSessions: false }, { ...currentRuntime, brokerProtocol: 2 }, { ...currentRuntime, supervisorContract: "old" }])(
+it.each([undefined, { ...currentRuntime, persistentSessions: false }, { ...currentRuntime, brokerProtocol: 1 }, { ...currentRuntime, supervisorContract: "old" }])(
   "requires interruption when the selected target cannot use the live runtime: %j", targetRuntime => {
     const f = plannedRuntime();
     const plan = inspectRuntimeUpdate({ ...f.options, targetRuntime });

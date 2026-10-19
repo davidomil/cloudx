@@ -109,7 +109,7 @@ function bridgeExecutables(args: string[]): string[] {
     args[1] === "-I" &&
     args[2] === "-S" &&
     args[3] === "-c" &&
-    /^CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"$/mu.test(
+    /^CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v2"$/mu.test(
       args[4] ?? "",
     )
   ) {

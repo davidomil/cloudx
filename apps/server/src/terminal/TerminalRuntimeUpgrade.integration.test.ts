@@ -26,7 +26,7 @@ describe.skipIf(process.platform !== "linux")("running terminal owners across an
     const pid = Number(/ORIGINAL_PID=(\d+)/u.exec(output)![1]);
     original.detach!();
 
-    await fs.writeFile(installation.helper, 'CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v2"\nraise RuntimeError("The next helper has an incompatible argument contract")\n');
+    await fs.writeFile(installation.helper, 'CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v3"\nraise RuntimeError("The next helper has an incompatible argument contract")\n');
 
     const restored = await installation.terminals.attach("existing-shell");
     let restoredOutput = "";
@@ -98,6 +98,7 @@ async function runningInstallation() {
   for (const name of ["NodePtyTerminalProcess", "TerminalSupervisor", "TerminalSupervisorRuntime"]) {
     await fs.copyFile(new URL(`./${name}.ts`, import.meta.url), path.join(modules, `${name}.ts`));
   }
+  await fs.copyFile(new URL("../statePersistence.ts", import.meta.url), path.join(directory, "src", "statePersistence.ts"));
   const helper = path.join(directory, "helpers", "terminal-supervisor.py");
   await fs.copyFile(new URL("../../helpers/terminal-supervisor.py", import.meta.url), helper);
   const factoryModule = JSON.stringify(pathToFileURL(path.join(modules, "NodePtyTerminalProcess.ts")).href);

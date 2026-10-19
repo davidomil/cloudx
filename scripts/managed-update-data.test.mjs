@@ -223,7 +223,7 @@ it("reads the selected target's terminal contracts without importing its runtime
   fs.mkdirSync(terminal);
   for (const name of ["TerminalRuntimeReceipt", "TerminalSupervisorRuntime", "NodePtyTerminalProcess", "DurableTerminalProcess"])
     fs.copyFileSync(new URL(`../apps/server/src/terminal/${name}.ts`, import.meta.url), path.join(terminal, `${name}.ts`));
-  expect(inspectTargetRuntime(f.release)).toEqual({ brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true });
+  expect(inspectTargetRuntime(f.release)).toEqual({ brokerProtocol: 2, supervisorContract: "execution-json-v2", persistentSessions: true });
   fs.unlinkSync(path.join(terminal, "TerminalRuntimeReceipt.ts"));
   expect(inspectTargetRuntime(f.release)).toMatchObject({ brokerProtocol: null, persistentSessions: true });
   fs.writeFileSync(path.join(terminal, "NodePtyTerminalProcess.ts"), "const helper = 'mutable helper path';");

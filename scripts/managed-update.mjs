@@ -19,7 +19,7 @@ import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDir
 const GENERATED = ['node_modules', 'packages/shared/dist', 'packages/plugin-api/dist', 'apps/server/dist', 'apps/web/dist', 'services/asr/.venv', 'services/documentation-indexer/.venv'];
 const PHASES = ['prepare', 'quiesce', 'snapshot', 'activate', 'start', 'verify'];
 const FORGE_WORKFLOW_FILE = `plugin-data/forge-${createHash('sha256').update('forge').digest('hex')}.json`;
-export const CURRENT_TERMINAL_CONTRACT = { brokerProtocol: 1, supervisorContract: 'execution-json-v1', persistentSessions: true };
+export const CURRENT_TERMINAL_CONTRACT = { brokerProtocol: 2, supervisorContract: 'execution-json-v2', persistentSessions: true };
 const runtimeData = relative => relative === `${FORGE_WORKFLOW_FILE}.writer-lock` || /^(terminal-runtime|terminal-broker|terminal-recovery-[^/]+|terminal-upgrade-backup-[^/]+)(\/|$)/u.test(relative);
 
 export class ManagedUpdate {

@@ -182,6 +182,7 @@ class DurableTerminalProcess implements TerminalProcess {
         this.exitListeners.clear();
         break;
       case "terminated": this.terminated = true; this.terminating?.resolve(); break;
+      case "termination-failed": this.terminating?.reject(new Error(response.message)); break;
       case "missing":
         this.disconnect(new PluginSessionMissingError("The running terminal is unavailable in the terminal broker. It was not restarted."));
         this.socket.destroy();

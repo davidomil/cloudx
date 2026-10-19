@@ -846,23 +846,64 @@ describe("durable Settings update monitoring", () => {
     state: "running",
   };
   const completedRun = { ...launchedRun, state: "succeeded" };
+  const confirmation = {
+    targetCommit: targetSha,
+    message: "The selected target requires terminal replacement.",
+  };
+  const awaitingConsent = {
+    ...launchedRun,
+    state: "failed",
+    phase: "prepare",
+    component: "terminals",
+    resumable: true,
+    cause: "Confirm the disclosed terminal interruption before continuing.",
+  };
 
-  function updateResponse(code, run) {
+  function updateResponse(code, run, status = {}) {
     return {
       status: () => code,
       ok: () => code === 200,
-      json: vi.fn(async () => ({ available: true, run })),
+      json: vi.fn(async () => ({ available: true, run, ...status })),
     };
   }
 
-  async function monitorUpdate(responses, timeoutMs = 2000) {
+  async function monitorUpdate(
+    responses,
+    timeoutMs = 2000,
+    {
+      launchResponse = updateResponse(200, launchedRun),
+      confirmationResponse = updateResponse(200, launchedRun),
+      actions = [],
+    } = {},
+  ) {
     const evidenceDir = await fs.mkdtemp(
       path.join(os.tmpdir(), "cloudx-update-monitor-"),
     );
     const profile = new LifecycleBrowserProfile({ evidenceDir });
     const frame = {};
     profile.openUpdates = async () => ({
-      getByRole: () => ({ click: async () => {} }),
+      getByRole: (role, { name, exact }) => ({
+        click: async () => {
+          expect(role).toBe("button");
+          expect(exact).toBe(true);
+          if (name === "Update CloudX and dependencies") {
+            actions.push("start update");
+            return;
+          }
+          expect(name).toBe("Confirm interruption and continue");
+          expect(actions.at(-1)).toBe("check interruption");
+          expect(profile.page.waitForResponse).toHaveBeenCalledTimes(3);
+          actions.push("confirm interruption");
+        },
+      }),
+      getByLabel: (label) => ({
+        check: async () => {
+          expect(label).toBe(
+            "I understand that affected terminal sessions and running work will be interrupted.",
+          );
+          actions.push("check interruption");
+        },
+      }),
     });
     profile.page = {
       waitForResponse: vi
@@ -870,7 +911,8 @@ describe("durable Settings update monitoring", () => {
         .mockResolvedValueOnce({
           json: async () => ({ target: { commit: targetSha } }),
         })
-        .mockResolvedValueOnce(updateResponse(200, launchedRun)),
+        .mockResolvedValueOnce(launchResponse)
+        .mockResolvedValueOnce(confirmationResponse),
       on: (_event, navigated) => navigated(frame),
       mainFrame: () => frame,
       locator: () => ["shell-pane", "codex-pane"],
@@ -907,6 +949,150 @@ describe("durable Settings update monitoring", () => {
       await fs.rm(evidenceDir, { recursive: true, force: true });
     }
   }
+
+  it.each(["initial request", "target preparation"])(
+    "confirms the disclosed interruption through Settings during %s",
+    async (disclosure) => {
+      const actions = [];
+      const lateDisclosure = disclosure === "target preparation";
+      const responses = [
+        ...(lateDisclosure
+          ? [updateResponse(200, awaitingConsent, { confirmation })]
+          : []),
+        updateResponse(200, completedRun),
+      ];
+      const { result, evidence } = await monitorUpdate(responses, 2000, {
+        actions,
+        ...(!lateDisclosure
+          ? { launchResponse: updateResponse(200, undefined, { confirmation }) }
+          : {}),
+      });
+      expect(actions).toEqual([
+        "start update",
+        "check interruption",
+        "confirm interruption",
+      ]);
+      expect(result.run).toEqual(completedRun);
+      expect(evidence).toMatchObject({
+        run: completedRun,
+        interruptionConfirmed: true,
+        reconnects: 1,
+      });
+    },
+  );
+
+  it.each([
+    ["missing disclosure", awaitingConsent, {}],
+    [
+      "unavailable installation",
+      awaitingConsent,
+      { available: false, confirmation },
+    ],
+    [
+      "nonresumable run",
+      { ...awaitingConsent, resumable: false },
+      { confirmation },
+    ],
+    [
+      "activation failure",
+      { ...awaitingConsent, phase: "activate" },
+      { confirmation },
+    ],
+    [
+      "capacity failure",
+      { ...awaitingConsent, component: "capacity" },
+      { confirmation },
+    ],
+    [
+      "different run",
+      { ...awaitingConsent, id: "another-update" },
+      { confirmation },
+    ],
+    [
+      "different target",
+      { ...awaitingConsent, targetCommit: "c".repeat(40) },
+      { confirmation },
+    ],
+    [
+      "different disclosure target",
+      awaitingConsent,
+      { confirmation: { ...confirmation, targetCommit: "c".repeat(40) } },
+    ],
+    [
+      "snapshot restoration",
+      awaitingConsent,
+      {
+        confirmation: {
+          ...confirmation,
+          restoreSnapshotRunId: "saved-snapshot",
+        },
+      },
+    ],
+  ])(
+    "does not grant interruption consent for %s",
+    async (_scenario, run, status) => {
+      const actions = [];
+      await expect(
+        monitorUpdate([updateResponse(200, run, status)], 2000, { actions }),
+      ).rejects.toThrow();
+      expect(actions).toEqual(["start update"]);
+    },
+  );
+
+  it("rejects a changed target while the accepted durable run is still running", async () => {
+    await expect(
+      monitorUpdate([
+        updateResponse(200, { ...launchedRun, targetCommit: "c".repeat(40) }),
+        updateResponse(200, completedRun),
+      ]),
+    ).rejects.toThrow();
+  });
+
+  it.each([
+    ["different run", { ...launchedRun, id: "another-update" }],
+    ["different target", { ...launchedRun, targetCommit: "c".repeat(40) }],
+    ["failed state", awaitingConsent],
+  ])("rejects a confirmation response with a %s", async (_scenario, run) => {
+    const actions = [];
+    await expect(
+      monitorUpdate(
+        [
+          updateResponse(200, awaitingConsent, { confirmation }),
+          updateResponse(200, completedRun),
+        ],
+        2000,
+        { actions, confirmationResponse: updateResponse(200, run) },
+      ),
+    ).rejects.toThrow();
+    expect(actions).toEqual([
+      "start update",
+      "check interruption",
+      "confirm interruption",
+    ]);
+  });
+
+  it("does not repeat consent when the resumed update fails again", async () => {
+    const actions = [];
+    await expect(
+      monitorUpdate(
+        [
+          updateResponse(200, awaitingConsent, { confirmation }),
+          updateResponse(
+            200,
+            { ...awaitingConsent, cause: "Still blocked after confirmation." },
+            { confirmation },
+          ),
+        ],
+        2000,
+        { actions },
+      ),
+    ).rejects.toThrow("Still blocked after confirmation.");
+    expect(actions).toEqual([
+      "start update",
+      "check interruption",
+      "confirm interruption",
+    ]);
+  });
 
   it("waits through service shutdown HTTP 503 until the accepted durable run succeeds", async () => {
     const stopping = updateResponse(503);

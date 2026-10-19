@@ -142,6 +142,94 @@ describe("TerminalSupervisor ownership receipts", () => {
     await expect(fixture.supervisor.terminate()).rejects.toThrow("without confirming its descendants stopped");
   });
 
+  for (const operation of ["write", "rename"] as const) {
+    it.each(["ENOSPC", "EDQUOT"])(`reconciles an acknowledgement ${operation} failure with %s only on explicit shutdown`, async code => {
+      const fixture = await supervisorFixture();
+      const failure = Object.assign(new Error("Acknowledgement storage is full"), { code });
+      let capacityAvailable = false;
+      let attempts = 0;
+      const originalWrite = fs.writeFile.bind(fs);
+      const originalRename = fs.rename.bind(fs);
+      vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+        if (operation === "write" && String(args[0]).endsWith("acknowledged.tmp")) {
+          attempts++;
+          if (!capacityAvailable) throw failure;
+        }
+        return originalWrite(...args);
+      });
+      vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+        if (operation === "rename" && String(args[1]).endsWith("acknowledged.json")) {
+          attempts++;
+          if (!capacityAvailable) throw failure;
+        }
+        return originalRename(...args);
+      });
+      let stopping: Promise<void> | undefined;
+      try {
+        await fixture.receipt("complete", { pid: process.pid, exitCode: 23 });
+        await vi.waitFor(() => expect(attempts).toBe(1));
+        capacityAvailable = true;
+        await fixture.receipt("unrelated", {});
+        await new Promise(resolve => setImmediate(resolve));
+        expect(attempts).toBe(1);
+        stopping = fixture.supervisor.terminate();
+        void stopping.catch(() => {});
+        await fixture.acknowledged();
+        expect(attempts).toBe(2);
+        await fs.rm(fixture.directory, { recursive: true });
+        fixture.exit();
+        await expect(stopping).resolves.toBeUndefined();
+        expect(await fixture.supervisor.completion).toEqual({ event: { exitCode: 23 } });
+      } finally {
+        fixture.exit();
+        await fixture.supervisor.completion;
+        await stopping?.catch(() => {});
+      }
+    });
+  }
+
+  it.each(["ENOSPC", "EDQUOT", "EACCES"])("preserves failed acknowledgement after %s when explicit reconciliation is unsafe", async code => {
+    const fixture = await supervisorFixture();
+    const failure = Object.assign(new Error("Acknowledgement unavailable"), { code });
+    const originalWrite = fs.writeFile.bind(fs);
+    let attempts = 0;
+    vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      if (String(args[0]).endsWith("acknowledged.tmp")) { attempts++; throw failure; }
+      return originalWrite(...args);
+    });
+    await fixture.receipt("complete", { pid: process.pid, exitCode: 23 });
+    await vi.waitFor(() => expect(attempts).toBe(1));
+    if (code !== "EACCES") fixture.native.pid = 2_147_483_647;
+    vi.useFakeTimers();
+    const stopped = expect(fixture.supervisor.terminate()).rejects.toThrow("shutdown deadline");
+    await vi.advanceTimersByTimeAsync(5_000);
+    await stopped;
+    expect(attempts).toBe(1);
+    if (code !== "EACCES") expect(fixture.native.kill).not.toHaveBeenCalled();
+    fixture.exit();
+    expect(await fixture.supervisor.completion).toMatchObject({ event: { exitCode: 125 }, error: failure });
+  });
+
+  it("rechecks completion ownership before accepting a retried acknowledgement", async () => {
+    const fixture = await supervisorFixture();
+    const originalWrite = fs.writeFile.bind(fs);
+    const failure = Object.assign(new Error("Acknowledgement storage is full"), { code: "ENOSPC" });
+    let attempts = 0;
+    vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+      if (String(args[0]).endsWith("acknowledged.tmp") && attempts++ === 0) throw failure;
+      return originalWrite(...args);
+    });
+    await fixture.receipt("complete", { pid: process.pid, exitCode: 23 });
+    await vi.waitFor(() => expect(attempts).toBe(1));
+    await fixture.receipt("complete", { pid: 2_147_483_647, exitCode: 0 });
+    const stopping = expect(fixture.supervisor.terminate()).rejects.toThrow("without confirming its descendants stopped");
+    await fixture.acknowledged();
+    await fs.rm(fixture.directory, { recursive: true });
+    fixture.exit();
+    await stopping;
+    expect(await fixture.supervisor.completion).toMatchObject({ event: { exitCode: 125 }, error: expect.any(Error) });
+  });
+
   it("refuses startup evidence from a different process", async () => {
     const fixture = await supervisorFixture();
     await fixture.receipt("ready", { pid: 2_147_483_647 });

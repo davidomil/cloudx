@@ -1597,6 +1597,24 @@ describe("SessionStore voice actions", () => {
     expect(store.listTabs()).toEqual([]);
   });
 
+  it("flushes a pending terminal output window during shutdown without waiting for its timer", async () => {
+    const { store, root, plugin } = await createStore();
+    const tab = await store.createTab({ pluginId: "fake-default", cwd: root });
+    vi.useFakeTimers();
+    try {
+      plugin.lastSession!.emitData("last output before shutdown");
+      expect(vi.getTimerCount()).toBe(1);
+      await store.dispose();
+      expect(await fs.readFile(tab.contextPath!, "utf8")).toContain("last output before shutdown");
+      expect(plugin.lastSession!.stopped).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["written", "failed"] as const)("bounds owned terminal context work and drains later output after the first batch is %s", async outcome => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-owned-session-context-"));
     const writeStarted = deferred<void>();

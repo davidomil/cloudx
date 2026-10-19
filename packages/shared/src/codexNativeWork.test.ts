@@ -35,9 +35,15 @@ describe("native work contracts", () => {
     expect(() => parseCodexNativeWork(incident)).toThrow("Invalid Codex native work");
   });
 
+  it("preserves the native turn that resolved an incident separately from failed recovery history", () => {
+    const resolved = { ...work, turnStatus: "completed", goalStatus: "active", recoveryStatus: "failed", incidentResolvedByTurnId: "later-turn" };
+    expect(parseCodexNativeWork(resolved)).toEqual(resolved);
+  });
+
   it.each([
     { version: 2 }, { tabId: "../tab" }, { executionId: "" }, { threadId: null }, { updatedAt: "unknown" },
     { turnStatus: "idle" }, { goalStatus: "failed" }, { recoveryStatus: "ready" },
+    { incidentResolvedByTurnId: "../turn" }, { incidentResolvedByTurnId: "" }, { incidentResolvedByTurnId: null },
     { lastError: { message: "x".repeat(1025), kind: "terminal" } },
     { lastError: { message: "error", kind: "terminal", httpStatusCode: 200.5 } },
     { lastError: { message: "error", kind: "terminal", code: "private content" } },

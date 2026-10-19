@@ -298,6 +298,64 @@ describe("Codex native work recovery", () => {
     expect(host.textContent).toContain("request-after-http-200");
     expect(recover).not.toHaveBeenCalled();
   });
+
+  it("automatically clears failed-recovery guidance after later native success and retains inspectable history across refresh", async () => {
+    const observed: CodexNativeWork[] = [];
+    const threadId = "00000000-0000-4000-8000-000000000002";
+    const observer = new CodexNativeWorkObservation({ tabId: tab.id, executionId: "00000000-0000-4000-8000-000000000001",
+      receiptPath: "/work/native-receipt", recovery: true, expectedThreadId: threadId },
+    (work: CodexNativeWork) => observed.push(work), { selectedThreadId: threadId });
+    const start = (id: string) => observer.fromServer({ method: "turn/started", params: { threadId, turn: { id } } });
+    const complete = (id: string, error?: object) => observer.fromServer({ method: "turn/completed", params: { threadId,
+      turn: { id, status: error ? "failed" : "completed", ...(error ? { error } : {}) } } });
+    const refresh = () => show({ ...tab, nativeWork: structuredClone(observed.at(-1)!) });
+    start("failed-recovery");
+    complete("failed-recovery", { message: "server overloaded", codexErrorInfo: "serverOverloaded", requestId: "req_failed" });
+    await refresh();
+    expect(host.textContent).toContain("Recovery failed:");
+    expect(restartButton().disabled).toBe(false);
+    start("later-turn");
+    await refresh();
+    expect(host.querySelector("h2")?.textContent).toBe("Native turn running");
+    expect(restartButton().disabled).toBe(true);
+    complete("later-turn");
+    await refresh();
+    expect(host.querySelector("h2")?.textContent).toBe("Codex native work");
+    expect(host.querySelector("h2 svg")).toBeNull();
+    expect(details().hidden).toBe(true);
+    expect(host.textContent).not.toContain("Recovery failed:");
+    expect(host.textContent).not.toContain("Restart only this client");
+    expect(restartButton()).toBeUndefined();
+    await toggleDetails();
+    expect(host.textContent).toContain("Previous recovery attempt failed");
+    const history = host.querySelector("details")!;
+    expect(history.open).toBe(false);
+    expect(history.querySelector("summary")?.textContent).toBe("Resolved provider incident diagnostics");
+    expect(history.textContent).toContain("req_failed");
+    await act(async () => root.render(createElement("div")));
+    sessionStorage.clear();
+    await refresh();
+    expect(details().hidden).toBe(true);
+    expect(restartButton()).toBeUndefined();
+    start("new-failure");
+    complete("new-failure", { message: "server overloaded", codexErrorInfo: "serverOverloaded", requestId: "req_failed" });
+    await refresh();
+    expect(details().hidden).toBe(false);
+    expect(host.textContent).toContain("Recovery failed:");
+    expect(restartButton().disabled).toBe(false);
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("keeps blocked-goal guidance after the provider incident is resolved", async () => {
+    await show(withWork({ recoveryStatus: "failed", turnStatus: "completed", incidentResolvedByTurnId: "later-turn" }));
+    expect(details().hidden).toBe(false);
+    expect(host.querySelector("h2")?.textContent).toBe("Codex native work · Goal blocked");
+    expect(host.textContent).toContain("/goal resume");
+    expect(host.textContent).not.toContain("Recovery failed:");
+    expect(restartButton().disabled).toBe(false);
+    await show(withWork({ recoveryStatus: "failed", turnStatus: "running", incidentResolvedByTurnId: "later-turn" }));
+    expect(restartButton().disabled).toBe(true);
+  });
 });
 
 function withWork(overrides: Partial<CodexNativeWork>): WorkspaceTab {

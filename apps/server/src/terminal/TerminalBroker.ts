@@ -120,7 +120,10 @@ export class TerminalBroker {
             terminal.process.resize(value.cols, value.rows);
             break;
           case "kill": case "terminate": {
-            void this.closeTerminal(sessionId!, terminal).catch((error: unknown) => this.fail(output, error));
+            void this.closeTerminal(sessionId!, terminal).catch((error: unknown) => {
+              if (value.type === "kill") return this.fail(output, error);
+              output.send({ type: "termination-failed", message: error instanceof Error ? error.message : "Terminal ownership could not be confirmed." });
+            });
             break;
           }
         }

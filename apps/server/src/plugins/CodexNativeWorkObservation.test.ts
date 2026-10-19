@@ -253,7 +253,59 @@ it("retains repeated recovery failure and native blocked protection without rest
   tab.resumeGoal();
   tab.start("another-turn");
   tab.complete("completed", undefined, "another-turn");
+  expect(tab.last()).toMatchObject({ recoveryStatus: "failed", turnStatus: "completed", goalStatus: "active",
+    incidentResolvedByTurnId: "another-turn", lastError: { kind: "terminal", requestId } });
+});
+
+it("resolves a failed recovery incident only after a later matching successful native turn", () => {
+  const tab = conversation(true);
+  tab.start("failed-recovery");
+  tab.complete("failed", providerError, "failed-recovery");
+  const failure = tab.last().lastError;
+  tab.goal("complete");
+  expect(tab.last().incidentResolvedByTurnId).toBeUndefined();
+  tab.start("later-turn");
+  expect(tab.last().incidentResolvedByTurnId).toBeUndefined();
+  tab.fromServer({ method: "turn/completed", params: { threadId: otherThreadId, turn: { id: "later-turn", status: "completed" } } });
+  tab.complete("completed", undefined, "unrelated-turn");
+  expect(tab.last()).toMatchObject({ turnStatus: "running", recoveryStatus: "failed" });
+  expect(tab.last().incidentResolvedByTurnId).toBeUndefined();
+  tab.complete("completed", undefined, "later-turn");
+  expect(tab.last()).toMatchObject({ turnStatus: "completed", recoveryStatus: "failed", incidentResolvedByTurnId: "later-turn", lastError: failure });
+  tab.goal("active");
+  expect(tab.last().incidentResolvedByTurnId).toBe("later-turn");
+  tab.start("new-failure");
+  tab.complete("failed", providerError, "new-failure");
+  expect(tab.last()).toMatchObject({ turnStatus: "failed", recoveryStatus: "failed", lastError: failure });
+  expect(tab.last().incidentResolvedByTurnId).toBeUndefined();
+});
+
+it.each(["completion-error", "terminal-notification", "interrupted"])("retains the active incident after later %s", outcome => {
+  const tab = conversation(true);
+  tab.start("failed-recovery");
+  tab.complete("failed", providerError, "failed-recovery");
+  tab.start("later-turn");
+  if (outcome === "terminal-notification") tab.fromServer({ method: "error", params: { threadId, turnId: "later-turn", willRetry: false, error: providerError } });
+  tab.complete(outcome === "interrupted" ? "interrupted" : "completed", outcome === "completion-error" ? providerError : undefined, "later-turn");
+  expect(tab.last().incidentResolvedByTurnId).toBeUndefined();
   expect(tab.last().recoveryStatus).toBe("failed");
+});
+
+it("does not resolve saved failure from an unobserved historical completion", () => {
+  const tab = conversation(true, threadId, nativeWorkError(providerError, "terminal"));
+  tab.complete("completed", undefined, "historical-turn");
+  expect(tab.last().incidentResolvedByTurnId).toBeUndefined();
+  expect(tab.last().recoveryStatus).toBe("awaiting_turn");
+});
+
+it("keeps blocked-goal guidance independent of a resolved provider incident", () => {
+  const tab = conversation(true);
+  tab.start("failed-recovery");
+  tab.complete("failed", providerError, "failed-recovery");
+  tab.goal("blocked");
+  tab.start("later-turn");
+  tab.complete("completed", undefined, "later-turn");
+  expect(tab.last()).toMatchObject({ goalStatus: "blocked", recoveryStatus: "failed", incidentResolvedByTurnId: "later-turn" });
 });
 
 it("keeps parallel and auxiliary conversations from changing selected-tab health", () => {

@@ -2,6 +2,7 @@ import { readFileSync, watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { IPty } from "node-pty";
+import { isCapacityStateWriteError } from "../statePersistence.js";
 import type { TerminalExecutionBinding } from "./TerminalProcess.js";
 
 export interface TerminalExit { exitCode: number; signal?: number; reason?: "broker-shutdown" }
@@ -15,6 +16,7 @@ export class TerminalSupervisor {
   private readonly started: string | undefined;
   private exited = false;
   private acknowledged: Promise<SupervisorExit> | undefined;
+  private acknowledgementFailure: Error | undefined;
   private termination: Promise<void> | undefined;
   private watcher: FSWatcher | undefined;
   private observationError: Error | undefined;
@@ -101,6 +103,12 @@ export class TerminalSupervisor {
 
   terminate(): Promise<void> {
     if (this.exited) return this.completion.then(({ error }) => { if (error) throw error; });
+    if (!this.termination && isCapacityStateWriteError(this.acknowledgementFailure)
+      && this.started && processStarted(this.process.pid) === this.started) {
+      this.acknowledged = undefined;
+      this.acknowledgementFailure = undefined;
+      this.acknowledgeCompletion();
+    }
     this.termination ??= this.stopAndWait().catch(error => {
       this.termination = undefined;
       throw error;
@@ -115,7 +123,7 @@ export class TerminalSupervisor {
       const result = await Promise.race([
         this.completion,
         new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error("Terminal supervisor did not confirm all descendants stopped before the shutdown deadline.")), 5_000);
+          timer = setTimeout(() => reject(new Error("Terminal supervisor did not confirm all descendants stopped before the shutdown deadline. Resolve any storage error shown in the terminal, then retry close or recovery. Ownership remains unconfirmed.")), 5_000);
         })
       ]);
       if (result.error) throw result.error;
@@ -133,7 +141,10 @@ export class TerminalSupervisor {
       await fs.writeFile(temporary, JSON.stringify({ pid: this.process.pid }), { mode: 0o600 });
       await fs.rename(temporary, path.join(this.directory, "acknowledged.json"));
       return result;
-    }).catch((error: Error) => ({ event: { exitCode: 125 }, error }));
+    }).catch((error: Error) => {
+      this.acknowledgementFailure = error;
+      return { event: { exitCode: 125 }, error };
+    });
   }
 
   private async confirmExit(): Promise<SupervisorExit> {
