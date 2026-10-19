@@ -98,6 +98,7 @@ async function runningInstallation() {
   for (const name of ["NodePtyTerminalProcess", "TerminalSupervisor", "TerminalSupervisorRuntime"]) {
     await fs.copyFile(new URL(`./${name}.ts`, import.meta.url), path.join(modules, `${name}.ts`));
   }
+  await fs.copyFile(new URL("../statePersistence.ts", import.meta.url), path.join(directory, "src", "statePersistence.ts"));
   const helper = path.join(directory, "helpers", "terminal-supervisor.py");
   await fs.copyFile(new URL("../../helpers/terminal-supervisor.py", import.meta.url), helper);
   const factoryModule = JSON.stringify(pathToFileURL(path.join(modules, "NodePtyTerminalProcess.ts")).href);

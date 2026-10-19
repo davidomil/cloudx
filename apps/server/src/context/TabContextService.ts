@@ -12,6 +12,7 @@ import { isCapacityStateWriteError } from "../statePersistence.js";
 
 const MAX_CONTEXT_BYTES = 64_000;
 const MAX_CONTEXT_ENTRY_BYTES = 12_000;
+const TERMINAL_OUTPUT_WINDOW_MS = 250;
 const TRIMMED_CONTEXT_HEADER = `# Cloudx Tab Context\n\n_Trimmed to the latest ${MAX_CONTEXT_BYTES} bytes._\n\n`;
 const MAX_PENDING_CONTEXT_BYTES = MAX_CONTEXT_BYTES - Buffer.byteLength(TRIMMED_CONTEXT_HEADER, "utf8");
 const TRIMMED_PENDING_HEADER = "_Older pending context was trimmed to the latest context bytes._\n\n";
@@ -66,6 +67,7 @@ interface OwnedTabContext {
 interface ContextBatch {
   text: string;
   written: Promise<void>;
+  flush(): void;
 }
 
 export class TabContextService {
@@ -115,19 +117,40 @@ export class TabContextService {
     const pending = this.pendingBatches.get(contextPath);
     if (pending) {
       pending.text = boundedPendingContext(pending.text + entry);
+      if (kind !== "terminal-output") pending.flush();
       return pending.written;
     }
-    const batch: ContextBatch = { text: entry, written: NO_CONTEXT_WRITE };
-    batch.written = this.enqueue(contextPath, () => {
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const batch: ContextBatch = {
+      text: entry,
+      written: NO_CONTEXT_WRITE,
+      flush: () => {
+        clearTimeout(timer);
+        timer = undefined;
+        release();
+      }
+    };
+    batch.written = this.enqueue(contextPath, async () => {
+      await ready;
       this.pendingBatches.delete(contextPath);
-      return this.append(contextPath, owned, batch.text);
+      await this.append(contextPath, owned, batch.text);
     });
     this.pendingBatches.set(contextPath, batch);
+    if (kind === "terminal-output") timer = setTimeout(batch.flush, TERMINAL_OUTPUT_WINDOW_MS);
+    else batch.flush();
     return batch.written;
+  }
+
+  async flush(): Promise<void> {
+    for (const batch of this.pendingBatches.values()) batch.flush();
+    await Promise.all(this.writeQueues.values());
   }
 
   async read(tab: WorkspaceTab): Promise<string> {
     // A read includes preceding records and may include later arrivals in their batch.
+    if (tab.contextPath) this.pendingBatches.get(path.resolve(tab.contextPath))?.flush();
     const owned = tab.contextPath ? this.ownedContexts.get(path.resolve(tab.contextPath)) : undefined;
     if (owned?.deleting) {
       await owned.deleting;
@@ -155,6 +178,7 @@ export class TabContextService {
       return;
     }
     const contextPath = path.resolve(tab.contextPath);
+    this.pendingBatches.get(contextPath)?.flush();
     const ownedContext = this.ownedContexts.get(contextPath);
     if (ownedContext) {
       if (ownedContext.deleting) return ownedContext.deleting;

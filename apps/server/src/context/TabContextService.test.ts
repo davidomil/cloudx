@@ -21,6 +21,127 @@ const fileOperations: TabContextFileOperations = {
 };
 
 describe("TabContextService", () => {
+  it("retains forty terminal redraws paced 25 ms apart in four fixed output windows", async () => {
+    const { service, tab, append, rotate } = memoryContext();
+    vi.useFakeTimers();
+    try {
+      const recordings: Promise<void>[] = [];
+      for (let index = 0; index < 40; index++) {
+        recordings.push(service.record(tab, "terminal-output", `paced-output-${index}\n`));
+        await vi.advanceTimersByTimeAsync(25);
+        if (index === 8) expect(append).not.toHaveBeenCalled();
+      }
+      await Promise.all(recordings);
+      expect(append).toHaveBeenCalledTimes(4);
+      expect(rotate).toHaveBeenCalledTimes(4);
+      const saved = await service.read(tab);
+      const events = Array.from({ length: 40 }, (_, index) => `paced-output-${index}\n`);
+      expect(events.every(event => saved.includes(event))).toBe(true);
+      expect(events.map(event => saved.indexOf(event))).toEqual([...events.map(event => saved.indexOf(event))].sort((a, b) => a - b));
+      expect(Buffer.byteLength(saved)).toBeLessThanOrEqual(64_000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("settles a window's records only after its append finishes", async () => {
+    const { service, tab, append } = memoryContext();
+    const release = deferred<void>();
+    append.mockImplementation(async () => release.promise);
+    vi.useFakeTimers();
+    try {
+      let written = false;
+      const recording = service.record(tab, "terminal-output", "first output");
+      void recording.then(() => { written = true; });
+      await vi.advanceTimersByTimeAsync(249);
+      expect(append).not.toHaveBeenCalled();
+      expect(written).toBe(false);
+      expect(service.record(tab, "terminal-output", "last output")).toBe(recording);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(append).toHaveBeenCalledOnce();
+      expect(written).toBe(false);
+      release.resolve();
+      await recording;
+      expect(written).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { release.resolve(); vi.useRealTimers(); }
+  });
+
+  it("starts each tab's output window from that tab's first record", async () => {
+    const { service, tab, append } = memoryContext();
+    const other = { ...tab, id: "other-tab", contextPath: path.join(path.dirname(tab.contextPath), "other.md") };
+    vi.useFakeTimers();
+    try {
+      const first = service.record(tab, "terminal-output", "first tab");
+      await vi.advanceTimersByTimeAsync(125);
+      const second = service.record(other, "terminal-output", "second tab");
+      await vi.advanceTimersByTimeAsync(125);
+      await first;
+      expect(append).toHaveBeenCalledExactlyOnceWith(tab.contextPath, expect.stringContaining("first tab"), "Tab context file");
+      await vi.advanceTimersByTimeAsync(124);
+      expect(append).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      await second;
+      expect(append).toHaveBeenLastCalledWith(other.contextPath, expect.stringContaining("second tab"), "Tab context file");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["action", "read", "flush"] as const)("flushes pending terminal output immediately for %s", async operation => {
+    const { service, tab, append } = memoryContext();
+    vi.useFakeTimers();
+    try {
+      const recording = service.record(tab, "terminal-output", "preceding output");
+      if (operation === "action") await service.record(tab, "plugin-action", "following action");
+      if (operation === "read") expect(await service.read(tab)).toContain("preceding output");
+      if (operation === "flush") await service.flush();
+      await recording;
+      expect(append).toHaveBeenCalledOnce();
+      expect(append).toHaveBeenCalledWith(tab.contextPath, expect.stringContaining("preceding output"), "Tab context file");
+      expect(vi.getTimerCount()).toBe(0);
+      if (operation === "action") {
+        const saved = await service.read(tab);
+        expect(saved.indexOf("preceding output")).toBeLessThan(saved.indexOf("following action"));
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("flushes deletion without allowing the timer to recreate context (owned directory: %s)", async ownedDirectory => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-context-delete-window-"));
+    const service = new TabContextService(root);
+    const tab = tabFixture(root);
+    tab.contextPath = await service.create(tab, { ownedDirectory });
+    vi.useFakeTimers();
+    try {
+      const recording = service.record(tab, "terminal-output", "last output before deletion");
+      await service.delete(tab);
+      await recording;
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(1000);
+      const late = service.record(tab, "terminal-output", "late output");
+      const result = Promise.allSettled([late]);
+      await service.flush();
+      await result;
+      await expect(fs.stat(tab.contextPath!)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { vi.useRealTimers(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("rechecks owned directory identity when a delayed window flushes", async () => {
+    await withOwnedContext(async ({ service, tab, root }) => {
+      const owned = service.directory(tab.contextPath)!;
+      vi.useFakeTimers();
+      try {
+        const recording = service.record(tab, "terminal-output", "must not reach replacement");
+        const rejected = expect(recording).rejects.toThrow("ownership changed");
+        await fs.rename(owned.path, path.join(root, "original-context"));
+        await fs.mkdir(owned.path);
+        await fs.writeFile(tab.contextPath!, "replacement must survive");
+        await vi.advanceTimersByTimeAsync(250);
+        await rejected;
+        expect(await fs.readFile(tab.contextPath!, "utf8")).toBe("replacement must survive");
+        expect(vi.getTimerCount()).toBe(0);
+      } finally { vi.useRealTimers(); }
+    });
+  });
+
   it("bounds sustained owned terminal output to an active write and one recent UTF-8 batch", async () => {
     const output = "🙂".repeat(1000);
     const chunksPerRound = 400;
@@ -559,4 +680,21 @@ async function withOwnedContext(run: (fixture: { root: string; dataDir: string; 
     tab.contextPath = await service.create(tab, { ownedDirectory: true });
     await run({ root, dataDir, service, tab });
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+}
+
+function memoryContext() {
+  const root = path.join(os.tmpdir(), "cloudx-context-window");
+  const tab = { ...tabFixture(root), contextPath: path.join(root, "context", "tab.md") };
+  let content = "x".repeat(64_000);
+  const append = vi.fn(async (_path: string, entry: string) => { content += entry; });
+  const rotate = vi.fn(async (_root: string, _path: string, text: string) => { content = text; });
+  const service = new TabContextService(root, {
+    ...fileOperations,
+    requireSafeDirectory: async () => true,
+    requireRegularFile: async () => true,
+    appendTextFileNoFollow: append,
+    readTextFileNoFollow: async () => content,
+    writeTextFileAtomic: rotate
+  });
+  return { service, tab, append, rotate };
 }

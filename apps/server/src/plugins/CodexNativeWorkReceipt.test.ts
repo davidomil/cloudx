@@ -61,4 +61,24 @@ describe("native work receipt authority", () => {
     await new Promise(resolve => setTimeout(resolve, 300));
     expect(observed).toHaveBeenCalledTimes(count);
   });
+
+  it("restores incident resolution and failed-attempt diagnostics through receipt refresh and reconnect", async () => {
+    const failed = { ...work, recoveryStatus: "failed", lastError: { message: "The provider is experiencing high demand.", kind: "terminal", code: "serverOverloaded" } };
+    await fs.writeFile(receipt.receiptPath, JSON.stringify(failed));
+    const observed = vi.fn();
+    dispose = receipt.observe(work.tabId, work.executionId, observed);
+    expect(observed).toHaveBeenLastCalledWith(failed);
+    const resolved = { ...failed, goalStatus: "active", turnStatus: "completed", turnId: "later-turn", incidentResolvedByTurnId: "later-turn" };
+    await fs.writeFile(receipt.receiptPath, JSON.stringify(resolved));
+    await vi.waitFor(() => expect(observed).toHaveBeenLastCalledWith(resolved));
+    dispose();
+    const reconnected = vi.fn();
+    dispose = receipt.observe(work.tabId, work.executionId, reconnected);
+    expect(reconnected).toHaveBeenCalledExactlyOnceWith(resolved);
+    expect(new CodexNativeWorkReceipt(home).readForExecution(work.tabId, work.executionId)).toEqual(resolved);
+    expect(() => receipt.readForExecution("other-tab", work.executionId)).toThrow("different tab or execution");
+    expect(() => receipt.readForExecution(work.tabId, "other-execution")).toThrow("different tab or execution");
+    await fs.writeFile(receipt.receiptPath, JSON.stringify({ ...failed, turnId: "new-failure" }));
+    await vi.waitFor(() => expect(reconnected).toHaveBeenLastCalledWith({ ...failed, turnId: "new-failure" }));
+  });
 });

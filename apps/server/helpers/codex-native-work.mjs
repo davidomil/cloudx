@@ -70,6 +70,7 @@ export class CodexNativeWorkObservation {
     this.goalResumed = false;
     this.goalResumeRequired = false;
     this.recoveryTurnId = undefined;
+    this.startedTurnId = undefined;
   }
 
   selected() {
@@ -86,6 +87,7 @@ export class CodexNativeWorkObservation {
       this.goalResumeRequired = this.recovering && this.binding.previousGoalStatus !== undefined &&
         !["active", "complete"].includes(this.binding.previousGoalStatus);
       this.recoveryTurnId = undefined;
+      this.startedTurnId = undefined;
       this.state = {
         version: 1, tabId: this.binding.tabId, executionId: this.binding.executionId, threadId,
         ...(this.recovering && this.binding.previousError ? { lastError: restoredNativeWorkError(this.binding.previousError) } : {}),
@@ -162,6 +164,7 @@ export class CodexNativeWorkObservation {
     if (typeof turnId !== "string" || !TURN_ID.test(turnId)) return;
     if (this.state.turnId === turnId) return;
     this.state.turnId = turnId;
+    this.startedTurnId = turnId;
     this.state.turnStatus = "running";
     if (this.recovering && !["failed", "succeeded"].includes(this.state.recoveryStatus)) {
       if (!this.goalResumeRequired || this.goalResumed || this.resumePending()) this.recoveryTurnId = turnId;
@@ -177,6 +180,9 @@ export class CodexNativeWorkObservation {
     this.state.turnStatus = error || this.state.turnStatus === "failed" && this.state.lastError?.kind === "terminal" ? "failed" : status;
     if (error) this.state.lastError = nativeWorkError(error, "terminal");
     if (this.recovering && this.state.turnStatus !== "completed") this.state.recoveryStatus = "failed";
+    if (this.state.turnStatus === "failed") delete this.state.incidentResolvedByTurnId;
+    else if (this.state.turnStatus === "completed" && this.startedTurnId === turnId &&
+        (this.state.lastError || this.state.recoveryStatus === "failed")) this.state.incidentResolvedByTurnId = turnId;
     this.observeRecoveryCompletion();
     this.persist();
   }
@@ -195,6 +201,7 @@ export class CodexNativeWorkObservation {
   }
 
   recordError(error, kind, affectsTurn = true, incidentId) {
+    delete this.state.incidentResolvedByTurnId;
     this.state.lastError = { ...nativeWorkError(error, kind), ...(incidentId ? { incidentId } : {}) };
     if (kind === "terminal") {
       if (affectsTurn) this.state.turnStatus = "failed";

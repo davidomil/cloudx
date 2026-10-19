@@ -242,6 +242,71 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
     expect(await fs.readdir(execution.directory)).toEqual(["complete.json", "ready.json"]);
   });
 
+  for (const retention of ["ephemeral", "durable"]) {
+    it.each(["ENOSPC", "EDQUOT"])(`retains the ${retention} owner when both receipts fail with %s, then reconciles on explicit close`, async (code) => {
+      const fault = await receiptStorageFault(code);
+      try {
+        const fixture = await DetachedTerminalFixture.create("exited", retention === "durable", fault.env);
+        const exited = vi.fn();
+        fixture.terminal.onExit(exited);
+        let output = "";
+        fixture.terminal.onData(data => { output += data; });
+        await waitUntil(async () => output.includes("Free disk space or quota, then retry close"));
+        expect(await fault.attempts()).toEqual(["complete.tmp", "error.tmp"]);
+        const command = await fixture.process("command");
+        const owner = (await readProcess(command.parent))!;
+        expect(await isRunning(owner)).toBe(true);
+        expect(await isRunning(command)).toBe(false);
+        expect(await isRunning(await fixture.process("daemon"))).toBe(false);
+
+        await expect(fixture.terminal.terminate()).rejects.toThrow("Resolve any storage error");
+        expect(await fault.attempts()).toEqual(["complete.tmp", "error.tmp", "complete.tmp", "error.tmp"]);
+        expect(exited).not.toHaveBeenCalled();
+        expect(await isRunning(owner)).toBe(true);
+
+        // Restored capacity alone must not start an automatic receipt retry.
+        await fault.restore();
+        await new Promise(resolve => setTimeout(resolve, 50));
+        expect(exited).not.toHaveBeenCalled();
+        await fixture.terminal.terminate();
+        expect(exited).toHaveBeenCalledExactlyOnceWith({ exitCode: 23 });
+        await fixture.terminal.terminate();
+        expect(await isRunning(owner)).toBe(false);
+        expect(fixture.unrelated.exitCode).toBeNull();
+        expect(fixture.unrelated.signalCode).toBeNull();
+        if (fixture.execution) {
+          const ready = JSON.parse(await fs.readFile(path.join(fixture.execution.directory, "ready.json"), "utf8"));
+          expect(JSON.parse(await fs.readFile(path.join(fixture.execution.directory, "complete.json"), "utf8")))
+            .toEqual({ ...ready, exitCode: 23 });
+        }
+      } finally { await fault.restore(); }
+    }, 15_000);
+  }
+
+  it.each([
+    ["ephemeral", "rename"], ["durable", "rename"], ["durable", "sync"]
+  ] as const)("reconciles %s completion after ENOSPC during receipt %s", async (retention, stage) => {
+    const fault = await receiptStorageFault("ENOSPC", stage);
+    try {
+      const fixture = await DetachedTerminalFixture.create("exited", retention === "durable", fault.env);
+      let output = "";
+      fixture.terminal.onData(data => { output += data; });
+      const exited = vi.fn();
+      fixture.terminal.onExit(exited);
+      await waitUntil(async () => output.includes("Free disk space or quota, then retry close"));
+      expect(await fault.attempts()).toEqual(["complete.tmp", "error.tmp"]);
+      const command = await fixture.process("command");
+      const owner = (await readProcess(command.parent))!;
+      expect(await isRunning(owner)).toBe(true);
+      expect(await isRunning(await fixture.process("daemon"))).toBe(false);
+      expect(exited).not.toHaveBeenCalled();
+      await fault.restore();
+      await fixture.terminal.terminate();
+      expect(exited).toHaveBeenCalledExactlyOnceWith({ exitCode: 23 });
+      expect(await isRunning(owner)).toBe(false);
+    } finally { await fault.restore(); }
+  });
+
   it.each(["bootId", "pidNamespace"] as const)("refuses a changed %s before launching and retains the error receipt", async (changed) => {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-invalid-binding-test-"));
     directories.push(directory);
@@ -419,13 +484,13 @@ class DetachedTerminalFixture {
     return directory;
   }
 
-  static async create(mode: "alive" | "exited", durable = false) {
+  static async create(mode: "alive" | "exited", durable = false, env = process.env) {
     const directory = await this.prepareCommand();
     const execution = durable ? await executionBinding(directory) : undefined;
     const unrelated = spawn(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], { stdio: "ignore" });
     try {
       const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [path.join(directory, "command.mjs"), directory, mode], {
-        cwd: directory, env: process.env, cols: 100, rows: 30, execution
+        cwd: directory, env, cols: 100, rows: 30, execution
       });
       const fixture = new DetachedTerminalFixture(directory, terminal, unrelated, execution);
       fixtures.push(fixture);
@@ -451,6 +516,52 @@ class DetachedTerminalFixture {
     await stopChild(this.unrelated);
     await fs.rm(this.directory, { recursive: true, force: true });
   }
+}
+
+async function receiptStorageFault(code: string, stage = "open") {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-storage-fault-"));
+  directories.push(directory);
+  const blocked = path.join(directory, "capacity-exhausted");
+  const attempts = path.join(directory, "receipt-attempts");
+  await fs.writeFile(blocked, "blocked");
+  await fs.writeFile(path.join(directory, "python3"), `#!/usr/bin/python3
+import errno, os, pathlib, stat, sys
+original_open = pathlib.Path.open
+original_replace = pathlib.Path.replace
+original_sync = os.fsync
+current_receipt = None
+def fail_receipt(file):
+    if file and file.name in ('complete.tmp', 'error.tmp') and pathlib.Path(${JSON.stringify(blocked)}).exists():
+        with original_open(pathlib.Path(${JSON.stringify(attempts)}), 'a') as output:
+            output.write(file.name + '\\n')
+        raise OSError(errno.${code}, 'Injected receipt capacity failure')
+def receipt_open(file, mode='r', *args, **kwargs):
+    global current_receipt
+    if mode == 'w':
+        current_receipt = file
+        if ${JSON.stringify(stage)} == 'open':
+            fail_receipt(file)
+    return original_open(file, mode, *args, **kwargs)
+def receipt_replace(file, target):
+    if ${JSON.stringify(stage)} == 'rename':
+        fail_receipt(file)
+    return original_replace(file, target)
+def receipt_sync(descriptor):
+    if ${JSON.stringify(stage)} == 'sync' and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        fail_receipt(current_receipt)
+    return original_sync(descriptor)
+pathlib.Path.open = receipt_open
+pathlib.Path.replace = receipt_replace
+os.fsync = receipt_sync
+source = sys.argv[4]
+sys.argv = ['-c', *sys.argv[5:]]
+exec(compile(source, '<terminal-supervisor>', 'exec'))
+`, { mode: 0o755 });
+  return {
+    env: { ...process.env, PATH: `${directory}:${process.env.PATH}` },
+    attempts: async () => (await fs.readFile(attempts, "utf8")).trim().split("\n"),
+    restore: () => fs.rm(blocked, { force: true })
+  };
 }
 
 async function readRecordedProcess(directory: string, name: string): Promise<ProcessIdentity> {

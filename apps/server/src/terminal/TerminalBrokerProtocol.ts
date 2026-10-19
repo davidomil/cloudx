@@ -22,7 +22,7 @@ export type TerminalResponse =
   | { type: "data"; data: string }
   | { type: "screen"; data: string; cols: number; rows: number; complete: boolean }
   | { type: "exit"; event: TerminalExit }
-  | { type: "error"; message: string };
+  | { type: "error" | "termination-failed"; message: string };
 
 export function terminalSocketPath(dataDir: string): string {
   const identity = createHash("sha256").update(path.resolve(dataDir)).digest("hex").slice(0, 16);
@@ -93,7 +93,7 @@ export function isTerminalResponse(value: unknown): value is TerminalResponse {
     case "ready": case "terminated": case "missing": return true;
     case "data": return typeof value.data === "string";
     case "screen": return typeof value.data === "string" && isDimension(value.cols) && isDimension(value.rows) && typeof value.complete === "boolean";
-    case "error": return typeof value.message === "string";
+    case "error": case "termination-failed": return typeof value.message === "string";
     case "exit": return isRecord(value.event) && Number.isInteger(value.event.exitCode)
       && Number(value.event.exitCode) >= 0 && Number(value.event.exitCode) <= 255
       && (value.event.reason === undefined || value.event.reason === "broker-shutdown")

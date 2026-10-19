@@ -155,7 +155,7 @@ export class SessionStore {
     const plugin = this.plugins.values().find(plugin => plugin.id === tab.pluginId);
     let recovery: TabRecovery | undefined;
     if (plugin?.panelKind === "terminal") {
-      recovery = { state: "unavailable", message: `${message} Check the connection before deciding whether the process ended.` };
+      recovery = { state: "unavailable", message: `${message} Reconnect to retry terminal ownership verification. Resolve any storage error shown in the terminal before retrying close or recovery.` };
       if (error instanceof PluginSessionMissingError) {
         recovery = { state: "missing", message: plugin.id === "standard-terminal"
           ? "The previous terminal process ended. Open a new shell in the saved directory to continue."
@@ -973,6 +973,7 @@ export class SessionStore {
     } else {
       errors.push(...await this.stopSessions());
     }
+    await this.contextService.flush();
     await drainPromises(this.contextWrites);
     if (errors.length > 0) {
       throw new AggregateError(errors, "One or more plugin sessions failed to stop.");
