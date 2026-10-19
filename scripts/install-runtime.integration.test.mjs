@@ -3,7 +3,7 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { DurableTerminalProcessFactory } from "../apps/server/src/terminal/DurableTerminalProcess.ts";
@@ -12,6 +12,7 @@ import { PathPolicy } from "../apps/server/src/pathPolicy.ts";
 import { SessionStateStore } from "../apps/server/src/workspace/SessionStateStore.ts";
 import { WorkspaceLayoutStore } from "../apps/server/src/workspace/WorkspaceLayoutStore.ts";
 import { inspectRuntimeUpdate, prepareRuntimeUpdate } from "./install-runtime.mjs";
+import { inspectTargetRuntime } from "./managed-update-data.mjs";
 
 const cleanups = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -81,7 +82,7 @@ it.skipIf(process.platform !== "linux").each([false, true])("keeps compatible br
   const beforeBrokerStop = vi.fn();
   const migration = migrationAdapter(installation, beforeBrokerStop);
   const result = prepareRuntimeUpdate({ ...migration, interruptionConfirmed: true,
-    targetRuntime: { brokerProtocol: 1, supervisorContract: "execution-json-v1", persistentSessions: true } });
+    targetRuntime: { brokerProtocol: 2, supervisorContract: "execution-json-v2", persistentSessions: true } });
   expect(result.plan.stopServices).toEqual(migrateWeb ? ["cloudx.service"] : []);
   expect(migration.actions).toEqual(migrateWeb ? ["cloudx.service"] : []);
   expect(beforeBrokerStop).not.toHaveBeenCalled();
@@ -131,6 +132,80 @@ it.skipIf(process.platform !== "linux").each(["empty", "partial"])("refuses migr
   await vi.waitFor(() => expect(attachedOutput).toContain(`PRESERVED_PID=${pid}`));
   await attached.terminate();
 }, 20_000);
+
+it.skipIf(process.platform !== "linux")("migrates abb7269 runtime receipts before activating retryable capacity recovery without replaying saved input", async () => {
+  const installation = await legacyInstallation({ current: true });
+  const saved = saveRecoveryState(installation);
+  for (const role of ["web", "broker"]) {
+    const file = path.join(installation.dataDir, "terminal-runtime", `${role}.json`);
+    const receipt = JSON.parse(fs.readFileSync(file, "utf8"));
+    fs.writeFileSync(file, JSON.stringify({ ...receipt, brokerProtocol: 1,
+      supervisor: { ...receipt.supervisor, contract: "execution-json-v1" } }));
+  }
+  const targetRuntime = inspectTargetRuntime(fileURLToPath(new URL("..", import.meta.url)));
+  expect(targetRuntime).toEqual({ brokerProtocol: 2, supervisorContract: "execution-json-v2", persistentSessions: true });
+  const migration = { ...migrationAdapter(installation, () => {}), targetRuntime };
+  const plan = inspectRuntimeUpdate(migration);
+  expect(plan.requiresInterruption).toBe(true);
+  expect(plan.stopServices).toEqual(["cloudx.service", "cloudx-terminal.service"]);
+  expect(() => prepareRuntimeUpdate(migration)).toThrow("Confirm terminal interruption");
+  expect(migration.actions).toEqual([]);
+  prepareRuntimeUpdate({ ...migration, interruptionConfirmed: true });
+  expect(migration.actions).toEqual(["cloudx.service", "cloudx-terminal.service"]);
+  installation.installCurrentRuntime();
+  installation.broker = await installation.startBroker();
+  installation.web = await installation.startWeb();
+  expect(inspectRuntimeUpdate({ ...migrationAdapter(installation, () => {}), targetRuntime }).requiresInterruption).toBe(false);
+  for (const [relative, bytes] of saved.originals)
+    expect(fs.readFileSync(path.join(installation.dataDir, relative))).toEqual(bytes);
+
+  const fault = receiptCapacityFault(installation.root);
+  const options = { cwd: installation.root, env: fault.env, cols: 100, rows: 30, sessionId: "saved-codex" };
+  await expect(installation.terminals.attach(options.sessionId)).rejects.toThrow("It was not restarted");
+  const recovered = await installation.terminals.spawn("/bin/sh", ["-c", "printf RECOVERED_EXPLICITLY"], options);
+  let output = "";
+  recovered.onData(data => { output += data; });
+  try {
+    await vi.waitFor(() => expect(output).toContain("Free disk space or quota, then retry close"));
+    expect(fs.readFileSync(fault.attempts, "utf8")).toBe("complete.tmp\nerror.tmp\n");
+    await expect(recovered.terminate()).rejects.toThrow("Resolve any storage error");
+    recovered.detach();
+    const reattached = await installation.terminals.attach(options.sessionId);
+    const exited = new Promise(resolve => reattached.onExit(resolve));
+    fault.restore();
+    await reattached.terminate();
+    expect(await exited).toEqual({ exitCode: 0 });
+    await reattached.terminate();
+    await expect(installation.terminals.attach(options.sessionId)).rejects.toThrow("It was not restarted");
+    expect(fs.existsSync(path.join(installation.root, "replayed-command"))).toBe(false);
+    for (const [relative, bytes] of saved.originals)
+      expect(fs.readFileSync(path.join(installation.dataDir, relative))).toEqual(bytes);
+  } finally { fault.restore(); }
+}, 20_000);
+
+function receiptCapacityFault(root) {
+  const directory = path.join(root, "fault-bin");
+  fs.mkdirSync(directory);
+  const blocked = path.join(directory, "capacity-exhausted");
+  const attempts = path.join(directory, "attempts");
+  fs.writeFileSync(blocked, "blocked");
+  fs.writeFileSync(path.join(directory, "python3"), `#!/usr/bin/python3
+import errno, pathlib, sys
+original_open = pathlib.Path.open
+def receipt_open(file, mode='r', *args, **kwargs):
+    if mode == 'w' and file.name in ('complete.tmp', 'error.tmp') and pathlib.Path(${JSON.stringify(blocked)}).exists():
+        with original_open(pathlib.Path(${JSON.stringify(attempts)}), 'a') as output:
+            output.write(file.name + '\\n')
+        raise OSError(errno.ENOSPC, 'Injected receipt capacity failure')
+    return original_open(file, mode, *args, **kwargs)
+pathlib.Path.open = receipt_open
+source = sys.argv[4]
+sys.argv = ['-c', *sys.argv[5:]]
+exec(compile(source, '<terminal-supervisor>', 'exec'))
+`, { mode: 0o755 });
+  return { env: { ...process.env, PATH: `${directory}:${process.env.PATH}` }, attempts,
+    restore: () => fs.rmSync(blocked, { force: true }) };
+}
 
 async function legacyInstallation({ current = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-legacy-upgrade-"));
@@ -188,9 +263,10 @@ if __name__ == "__main__":
     process.on('SIGTERM', () => void broker.stop());
   `);
   const broker = await startBroker();
-  const web = await startOwner(root, "web", `${factoryImport}\nnew NodePtyTerminalProcessFactory();\n${receiptSource("web")}\nsetInterval(() => {}, 1000);`);
+  const startWeb = () => startOwner(root, "web", `${factoryImport}\nnew NodePtyTerminalProcessFactory();\n${receiptSource("web")}\nsetInterval(() => {}, 1000);`);
+  const web = await startWeb();
   return {
-    root, dataDir, helper, broker, web, startBroker, current,
+    root, dataDir, helper, broker, web, startBroker, startWeb, current,
     terminals: new DurableTerminalProcessFactory(socket, new NodePtyTerminalProcessFactory()),
     installCurrentRuntime() {
       fs.writeFileSync(helper, currentHelper);

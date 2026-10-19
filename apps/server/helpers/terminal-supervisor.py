@@ -13,7 +13,7 @@ import time
 import tempfile
 
 
-CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v1"
+CLOUDX_TERMINAL_SUPERVISOR_CONTRACT = "execution-json-v2"
 PR_SET_PDEATHSIG = 1
 PR_SET_CHILD_SUBREAPER = 36
 SUPERVISOR_SIGNALS = (
@@ -97,10 +97,18 @@ class TerminalSupervisor:
                 except OSError:
                     # A detached PTY must not discard the only quiescence proof.
                     pass
-                # Only an explicit termination request republishes this evidence.
-                # Keep the subreaper alive even when neither receipt can be saved.
-                while not self.receipt_requested:
+                # The live host requests publication through explicit termination.
+                while not self.receipt_requested and os.getppid() == self.parent:
                     time.sleep(0.01)
+                if os.getppid() != self.parent:
+                    if self.execution is None:
+                        # No consumer survives. ECHILD already proved cleanup;
+                        # ephemeral receipts can be removed even while full.
+                        self.record("parent-exited-with-unpublished-completion")
+                        return
+                    # After owner loss, this process alone holds durable proof.
+                    # Check capacity until it can publish for restarted recovery.
+                    time.sleep(1)
 
     def remove_ephemeral_receipts(self):
         self.record("awaiting-receipt-acknowledgement")

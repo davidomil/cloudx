@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 
-const contract = "execution-json-v1";
+const contract = "execution-json-v2";
 
 // Import eagerly in both process owners: an in-place update must not change
 // which supervisor a running broker or web server launches next.

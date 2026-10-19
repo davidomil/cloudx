@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { ForgeExecutionRecovery } from "../forge/ForgeExecution.js";
 import { NodePtyTerminalProcessFactory } from "./NodePtyTerminalProcess.js";
 import type { TerminalExecutionBinding, TerminalProcess } from "./TerminalProcess.js";
 
@@ -243,6 +244,64 @@ describe.skipIf(process.platform !== "linux")("terminal descendant ownership", (
   });
 
   for (const retention of ["ephemeral", "durable"]) {
+    it.each(["ENOSPC", "EDQUOT"])(`reconciles ${retention} completion after parent SIGKILL while both receipts fail with %s`, async (code) => {
+      const fault = await receiptStorageFault(code);
+      const directory = await DetachedTerminalFixture.prepareCommand();
+      const execution = retention === "durable" ? await new ForgeExecutionRecovery(directory).prepare() : undefined;
+      const harnessFile = path.join(directory, "host.mjs");
+      await fs.writeFile(harnessFile, `import fs from 'node:fs';
+        import { NodePtyTerminalProcessFactory } from ${JSON.stringify(new URL("./NodePtyTerminalProcess.ts", import.meta.url).href)};
+        const terminal = await new NodePtyTerminalProcessFactory().spawn(process.execPath, [${JSON.stringify(path.join(directory, "command.mjs"))}, ${JSON.stringify(directory)}, 'exited'], {
+          cwd: ${JSON.stringify(directory)}, env: process.env, cols: 100, rows: 30,
+          execution: ${JSON.stringify(execution ?? null)}
+        });
+        fs.writeFileSync(${JSON.stringify(path.join(directory, "supervisor-directory"))}, terminal.supervisor.directory);
+        setTimeout(() => process.exit(0), 15000);
+      `);
+      const host = spawn(process.execPath, ["--import", "tsx", harnessFile], { stdio: "ignore", env: fault.env });
+      let supervisor: ProcessIdentity | undefined;
+      try {
+        const command = await readRecordedProcess(directory, "command");
+        const daemon = await readRecordedProcess(directory, "daemon");
+        supervisor = (await readProcess(command.parent))!;
+        expect(supervisor.parent).toBe(host.pid);
+        await waitUntil(async () => fault.attempts().then(attempts => attempts.length >= 2, () => false));
+        expect(await isRunning(command)).toBe(false);
+        expect(await isRunning(daemon)).toBe(false);
+        const receipts = await fs.readFile(path.join(directory, "supervisor-directory"), "utf8");
+        directories.push(receipts);
+        const ready = JSON.parse(await fs.readFile(path.join(receipts, "ready.json"), "utf8"));
+        await expect(fs.access(path.join(receipts, "complete.json"))).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(fs.access(path.join(receipts, "error.json"))).rejects.toMatchObject({ code: "ENOENT" });
+
+        await stopChild(host);
+        expect(host.signalCode).toBe("SIGKILL");
+        if (execution) {
+          const restarted = new ForgeExecutionRecovery(directory);
+          // Wait beyond the single PDEATHSIG retry while capacity remains exhausted.
+          await waitUntil(async () => (await fault.attempts()).length >= 6);
+          expect(await isRunning(supervisor)).toBe(true);
+          expect((await fs.readFile(`/proc/${supervisor.pid}/task/${supervisor.pid}/children`, "utf8")).trim()).toBe("");
+          await expect(restarted.assertEnded(execution)).rejects.toThrow("still alive");
+          await fault.restore();
+          await waitUntil(async () => !await isRunning(supervisor!));
+          expect(JSON.parse(await fs.readFile(path.join(receipts, "complete.json"), "utf8"))).toEqual({ ...ready, exitCode: 23 });
+          await expect(restarted.assertEnded(execution)).resolves.toBeUndefined();
+          await restarted.remove(execution);
+        } else {
+          // No surviving consumer needs an ephemeral receipt: the reaped owner can retire it even while full.
+          await waitUntil(async () => !await isRunning(supervisor!));
+          await fault.restore();
+        }
+        await expect(fs.access(receipts)).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await fault.restore();
+        await stopChild(host);
+        await stopRecordedProcesses(directory);
+        if (supervisor) await stopProcess(supervisor);
+      }
+    }, 15_000);
+
     it.each(["ENOSPC", "EDQUOT"])(`retains the ${retention} owner when both receipts fail with %s, then reconciles on explicit close`, async (code) => {
       const fault = await receiptStorageFault(code);
       try {
