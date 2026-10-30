@@ -23,6 +23,7 @@ import type { PluginSkillContributionFile } from "@cloudx/plugin-api";
 
 import { isSameOrChildPath } from "../pathBoundary.js";
 import { RulesSkillsGitService } from "./RulesSkillsGitService.js";
+import { SOURCE_GROUNDED_WRITING, SOURCE_GROUNDED_WRITING_FILES } from "./sourceGroundedWriting.js";
 
 export const DEFAULT_PERSONALITY_TEMPLATE_ID = "default-codex";
 export const TEMPLATE_METADATA_KEY = "selectedTemplateId";
@@ -68,7 +69,8 @@ export const CLOUDX_SYSTEM_SKILLS: CloudxSkill[] = [
     name: "Migrate Skill To CloudX",
     description: "Import an existing local Codex skill into the CloudX rules/skills catalog.",
     scope: "system"
-  }
+  },
+  SOURCE_GROUNDED_WRITING
 ];
 
 export const CLOUDX_SYSTEM_RULES: CloudxRule[] = [];
@@ -400,9 +402,13 @@ export class RulesSkillsCatalogService {
     const settings = asRecord(await readJson(this.settingsPath(), this.rootPath));
     const rules = await readRules(this.rulesPath());
     const systemRules = await readRules(this.systemRulesPath(), "system");
-    const skills = await readSkills(this.skillsPath(), "user");
     const systemSkills = await readSkills(this.systemSkillsPath(), "system");
-    const templates = await readTemplates(this.templatesPath());
+    const builtInSkillIds = new Set(CLOUDX_SYSTEM_SKILLS.map(skill => skill.id));
+    const skills = (await readSkills(this.skillsPath(), "user")).filter(skill => !builtInSkillIds.has(skill.id));
+    const templates = (await readTemplates(this.templatesPath())).map(template => ({
+      ...template,
+      skillIds: template.skillIds.filter(id => !builtInSkillIds.has(id))
+    }));
     const defaultTemplateId = typeof settings.defaultTemplateId === "string" && templates.some((template) => template.id === settings.defaultTemplateId)
       ? settings.defaultTemplateId
       : templates[0]?.id;
@@ -515,6 +521,16 @@ export async function listCloudxSystemRules(rulesSkillsRoot: string): Promise<Cl
 
 export async function ensureCloudxSystemSkills(rulesSkillsRoot: string): Promise<void> {
   for (const skill of CLOUDX_SYSTEM_SKILLS) {
+    if (skill.id === SOURCE_GROUNDED_WRITING.id) {
+      const skillDir = path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id));
+      for (const file of SOURCE_GROUNDED_WRITING_FILES) {
+        const target = path.join(skillDir, file.path);
+        await ensureCatalogDirectory(path.dirname(target), rulesSkillsRoot);
+        await writeUtf8FileIfChanged(target, file.content, rulesSkillsRoot);
+        if (file.executable) await fsp.chmod(target, 0o755);
+      }
+      continue;
+    }
     await writeSkillFile(path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)), {
       ...skill,
       instructions: SYSTEM_SKILL_INSTRUCTIONS[skill.id] ?? `# ${skill.name}\n\n${skill.description}`

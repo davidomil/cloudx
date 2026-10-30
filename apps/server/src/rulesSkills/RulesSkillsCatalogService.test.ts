@@ -25,7 +25,7 @@ describe("RulesSkillsCatalogService", () => {
     expect(store.rules.map((rule) => rule.id)).toContain("review-carefully");
     expect(store.systemRules).toEqual([]);
     expect(store.skills.find((skill) => skill.id === "reviewer")?.instructions).toContain("Reviewer skill instructions.");
-    expect(store.systemSkills.map((skill) => skill.id)).toEqual(["create-cloudx-skill", "migrate-skill-to-cloudx"]);
+    expect(store.systemSkills.map((skill) => skill.id)).toEqual(["create-cloudx-skill", "migrate-skill-to-cloudx", "source-grounded-writing"]);
     const skillFile = await fs.readFile(path.join(service.catalogRoot(), "skills", "reviewer", "SKILL.md"), "utf8");
     expect(skillFile).toContain('name: "reviewer"');
     expect(skillFile).toContain('description: "Review code."');
@@ -77,7 +77,8 @@ describe("RulesSkillsCatalogService", () => {
     expect(store.systemSkills.map((skill) => skill.id)).toEqual([
       "create-cloudx-skill",
       "documentation-search",
-      "migrate-skill-to-cloudx"
+      "migrate-skill-to-cloudx",
+      "source-grounded-writing"
     ]);
     const skillFile = await fs.readFile(path.join(service.catalogRoot(), "system-skills", "documentation-search", "SKILL.md"), "utf8");
     expect(skillFile).toContain("CLOUDX_DOCUMENTATION_URL");

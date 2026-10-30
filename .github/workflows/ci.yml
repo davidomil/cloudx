@@ -303,6 +303,21 @@ jobs:
       - env:
           LANES_RESULT: ${{ needs.isolated-lanes.result }}
         run: test "$LANES_RESULT" = success
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+      - name: Install writing validation dependencies
+        run: python -m pip install -r requirements.txt
+        working-directory: apps/server/skills/source-grounded-writing
+      - name: Verify the bundled writing compiler and validators
+        run: python -m unittest discover -s tests -v
+        working-directory: apps/server/skills/source-grounded-writing
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
   browser:
     name: Browser smoke (desktop and mobile)
     if: always()

@@ -1,0 +1,165 @@
+{
+  "schema_version": 2,
+  "title": "Reset Sequence Fixture",
+  "doc_kind": "design_doc",
+  "audience": "firmware engineer reviewing a synthetic example",
+  "style_profile": "compact_evidence_first",
+  "targets": [
+    "html",
+    "gfm",
+    "docx",
+    "pdf-quarto"
+  ],
+  "source_inventory": [
+    {
+      "id": "reset_note",
+      "title": "Synthetic reset design note",
+      "source_type": "design_record",
+      "authority": "primary",
+      "access": "local",
+      "revision": "A",
+      "locator": "reset-design-note.txt",
+      "path": "reset-design-note.txt",
+      "sha256": "cd9b24a935f7740d3d3cdc322a74c5ea3723666589324d18e760b3eff13cbd47",
+      "notes": "Synthetic fixture only; not evidence about real hardware."
+    }
+  ],
+  "claims": [
+    {
+      "id": "reset_line",
+      "kind": "technical_fact",
+      "text": "The proposed sequence drives RESET_N low using GPIO3_IO12.",
+      "support_status": "supported",
+      "evidence": [
+        {
+          "source_id": "reset_note",
+          "locator": "reset-design-note.txt, revision A, sequence and measurement limit",
+          "excerpt": "The proposed reset sequence uses GPIO3_IO12 to drive RESET_N low."
+        }
+      ]
+    },
+    {
+      "id": "reset_delay",
+      "kind": "technical_fact",
+      "text": "Firmware waits for a configured 10 ms delay before releasing RESET_N.",
+      "support_status": "supported",
+      "evidence": [
+        {
+          "source_id": "reset_note",
+          "locator": "reset-design-note.txt, revision A, sequence and measurement limit",
+          "excerpt": "Firmware waits for a configured delay of 10 ms, then releases RESET_N."
+        }
+      ]
+    },
+    {
+      "id": "enable_order",
+      "kind": "technical_fact",
+      "text": "Firmware enables the peripheral after releasing RESET_N.",
+      "support_status": "supported",
+      "evidence": [
+        {
+          "source_id": "reset_note",
+          "locator": "reset-design-note.txt, revision A, sequence and measurement limit",
+          "excerpt": "Firmware enables the peripheral after releasing RESET_N."
+        }
+      ]
+    },
+    {
+      "id": "measurement_limit",
+      "kind": "technical_fact",
+      "text": "The fixture includes no electrical timing measurement.",
+      "support_status": "supported",
+      "evidence": [
+        {
+          "source_id": "reset_note",
+          "locator": "reset-design-note.txt, revision A, sequence and measurement limit",
+          "excerpt": "No electrical timing measurement is included in this fixture."
+        }
+      ]
+    }
+  ],
+  "source_gaps": [],
+  "tables": [
+    {
+      "id": "sequence",
+      "caption": "Proposed sequence from the synthetic design note.",
+      "columns": [
+        "Order",
+        "Firmware action"
+      ],
+      "rows": [
+        [
+          "1",
+          "Drive RESET_N low using GPIO3_IO12."
+        ],
+        [
+          "2",
+          "Wait for a configured delay of 10 ms."
+        ],
+        [
+          "3",
+          "Release RESET_N, then enable the peripheral."
+        ]
+      ],
+      "claim_ids": [
+        "reset_line",
+        "reset_delay",
+        "enable_order"
+      ]
+    }
+  ],
+  "visuals": [
+    {
+      "id": "reset_flow",
+      "kind": "mermaid",
+      "purpose": "Explain the proposed sequence in the synthetic note.",
+      "alt_text": "Drive reset low, wait for the configured delay, release reset, then enable the peripheral.",
+      "caption": "Proposed control sequence; electrical timing was not measured.",
+      "claim_ids": [
+        "reset_line",
+        "reset_delay",
+        "enable_order",
+        "measurement_limit"
+      ],
+      "spec": "flowchart TB\n  LOW[Drive RESET_N low] --> WAIT[Configured delay: 10 ms]\n  WAIT --> RELEASE[Release RESET_N]\n  RELEASE --> ENABLE[Enable peripheral]"
+    }
+  ],
+  "sections": [
+    {
+      "title": "Proposed sequence",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "This synthetic design note proposes driving RESET_N low using GPIO3_IO12, waiting for a configured 10 ms delay, and releasing RESET_N before enabling the peripheral. No electrical timing was measured.",
+          "claim_ids": [
+            "reset_line",
+            "reset_delay",
+            "enable_order",
+            "measurement_limit"
+          ]
+        },
+        {
+          "kind": "table_ref",
+          "table_id": "sequence"
+        },
+        {
+          "kind": "visual_ref",
+          "visual_id": "reset_flow"
+        }
+      ]
+    },
+    {
+      "title": "Measurement limit",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "The configured delay describes firmware intent; this fixture contains no electrical timing measurement.",
+          "claim_ids": [
+            "reset_delay",
+            "measurement_limit"
+          ]
+        }
+      ]
+    }
+  ]
+}

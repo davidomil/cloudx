@@ -1,0 +1,6 @@
+Reset design note — revision A (synthetic fixture, not a hardware specification)
+
+The proposed reset sequence uses GPIO3_IO12 to drive RESET_N low.
+Firmware waits for a configured delay of 10 ms, then releases RESET_N.
+Firmware enables the peripheral after releasing RESET_N.
+No electrical timing measurement is included in this fixture.

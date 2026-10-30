@@ -255,7 +255,7 @@ async function materializeSelectedSkills(
   await fsp.rm(path.join(codexHome, "skills", "cloudx-system"), { recursive: true, force: true });
   await fsp.rm(path.join(codexHome, "skills", "cloudx-exceptions"), { recursive: true, force: true });
   const sources = [
-    ...(resolved?.skills ?? []).map((skill) => ({
+    ...(resolved?.skills ?? []).filter(skill => !systemSkills.some(system => system.id === skill.id)).map((skill) => ({
       sourceDir: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)),
       targetDir: path.join(codexHome, "skills", "cloudx", safePathSegment(skill.id))
     })),

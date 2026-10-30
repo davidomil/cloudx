@@ -1,0 +1,768 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cloudx.local/skills/source-grounded-writing/intermediate-schema.json",
+  "title": "Source Grounded Writing Intermediate Representation v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "title",
+    "doc_kind",
+    "audience",
+    "style_profile",
+    "targets",
+    "source_inventory",
+    "claims",
+    "sections"
+  ],
+  "properties": {
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "doc_kind": {
+      "type": "string",
+      "enum": [
+        "technical_doc",
+        "design_doc",
+        "decision_record",
+        "email",
+        "chat",
+        "issue",
+        "gap_report"
+      ]
+    },
+    "audience": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "style_profile": {
+      "type": "string",
+      "enum": [
+        "compact_evidence_first",
+        "email_brief",
+        "chat_update",
+        "executive_summary"
+      ]
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "qmd",
+          "html",
+          "docx",
+          "gfm",
+          "pdf-quarto",
+          "pdf-html",
+          "email",
+          "chat"
+        ]
+      }
+    },
+    "source_inventory": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "source_gaps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source_gap"
+      },
+      "default": []
+    },
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/section"
+      }
+    },
+    "schema_version": {
+      "const": 2
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/claim"
+      }
+    },
+    "tables": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/table"
+      }
+    },
+    "visuals": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/visual"
+      }
+    },
+    "runtime_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    },
+    "presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "show_title": {
+          "type": "boolean"
+        },
+        "show_section_headings": {
+          "type": "boolean"
+        },
+        "toc": {
+          "type": "boolean"
+        },
+        "number_sections": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "source_type",
+        "authority",
+        "locator",
+        "access"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.:-]+$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "source_type": {
+          "type": "string",
+          "enum": [
+            "datasheet",
+            "register_map",
+            "errata",
+            "schematic",
+            "bom",
+            "repo_code",
+            "design_record",
+            "application_note",
+            "user_guide",
+            "release_note",
+            "meeting_note",
+            "chat",
+            "email",
+            "issue",
+            "web",
+            "other"
+          ]
+        },
+        "authority": {
+          "type": "string",
+          "enum": [
+            "primary",
+            "secondary",
+            "context"
+          ]
+        },
+        "revision": {
+          "type": "string"
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "access": {
+          "enum": [
+            "local",
+            "recipient",
+            "public"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-fA-F0-9]{64}$"
+        }
+      },
+      "dependentRequired": {
+        "sha256": [
+          "path"
+        ]
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "blocks"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "blocks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/block"
+          }
+        }
+      }
+    },
+    "block": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/paragraph_block"
+        },
+        {
+          "$ref": "#/$defs/bullets_block"
+        },
+        {
+          "$ref": "#/$defs/code_block"
+        },
+        {
+          "$ref": "#/$defs/callout_block"
+        },
+        {
+          "$ref": "#/$defs/table_ref_block"
+        },
+        {
+          "$ref": "#/$defs/visual_ref_block"
+        },
+        {
+          "$ref": "#/$defs/gap_ref_block"
+        }
+      ]
+    },
+    "claim_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true
+    },
+    "paragraph_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "text",
+        "claim_ids"
+      ],
+      "properties": {
+        "kind": {
+          "const": "paragraph"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "claim_ids": {
+          "$ref": "#/$defs/claim_refs"
+        }
+      }
+    },
+    "bullets_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "items",
+        "claim_ids"
+      ],
+      "properties": {
+        "kind": {
+          "const": "bullets"
+        },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        },
+        "claim_ids": {
+          "$ref": "#/$defs/claim_refs"
+        }
+      }
+    },
+    "code_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "language",
+        "text",
+        "claim_ids"
+      ],
+      "properties": {
+        "kind": {
+          "const": "code"
+        },
+        "language": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "claim_ids": {
+          "$ref": "#/$defs/claim_refs"
+        }
+      }
+    },
+    "callout_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "style",
+        "title",
+        "text",
+        "claim_ids"
+      ],
+      "properties": {
+        "kind": {
+          "const": "callout"
+        },
+        "style": {
+          "type": "string",
+          "enum": [
+            "note",
+            "tip",
+            "important",
+            "warning",
+            "caution"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "claim_ids": {
+          "$ref": "#/$defs/claim_refs"
+        }
+      }
+    },
+    "table_ref_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "table_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "table_ref"
+        },
+        "table_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "visual_ref_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "visual_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "visual_ref"
+        },
+        "visual_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "text",
+        "support_status",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.:-]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "support_status": {
+          "type": "string",
+          "enum": [
+            "supported",
+            "source_gap",
+            "unsupported"
+          ]
+        },
+        "required_for_output": {
+          "type": "boolean",
+          "default": true
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "gap_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "kind": {
+          "enum": [
+            "technical_fact",
+            "observation",
+            "inference",
+            "proposal"
+          ]
+        },
+        "reasoning": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "inference"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reasoning"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "support_status": {
+                "const": "source_gap"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "gap_id"
+            ]
+          }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "locator",
+        "excerpt"
+      ],
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "excerpt": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    },
+    "source_gap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "missing_claim",
+        "why_missing",
+        "needed_source",
+        "blocks_output"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.:-]+$"
+        },
+        "missing_claim": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "why_missing": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "needed_source": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "blocks_output": {
+          "type": "boolean"
+        }
+      }
+    },
+    "visual": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "purpose",
+        "alt_text",
+        "caption",
+        "spec",
+        "claim_ids"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.:-]+$"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "mermaid",
+            "d2",
+            "graphviz",
+            "plantuml",
+            "vega-lite",
+            "source-image"
+          ]
+        },
+        "purpose": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "alt_text": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "caption": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "spec": {},
+        "claim_ids": {
+          "$ref": "#/$defs/claim_refs"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "mermaid",
+                  "d2",
+                  "graphviz",
+                  "plantuml"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "spec": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "vega-lite"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "spec": {
+                "type": "object",
+                "minProperties": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "source-image"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "spec": {
+                "oneOf": [
+                  {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "path"
+                    ],
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S"
+                      },
+                      "width": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "caption",
+        "columns",
+        "rows",
+        "claim_ids"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_.:-]+$"
+        },
+        "caption": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "claim_ids": {
+          "$ref": "#/$defs/claim_refs"
+        }
+      }
+    },
+    "gap_ref_block": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "gap_id"
+      ],
+      "properties": {
+        "kind": {
+          "const": "gap_ref"
+        },
+        "gap_id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        }
+      }
+    }
+  }
+}

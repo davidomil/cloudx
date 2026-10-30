@@ -1,0 +1,12 @@
+project:
+  type: default
+
+format:
+  html:
+    toc: true
+    number-sections: true
+    css: source-grounded.css
+  docx:
+    toc: true
+  gfm:
+    variant: +yaml_metadata_block

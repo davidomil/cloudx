@@ -1,0 +1,6 @@
+beautifulsoup4==4.14.3
+jsonschema==4.26.0
+lxml==6.0.2
+Pillow==12.2.0
+PyYAML==6.0.3
+weasyprint==68.1
