@@ -654,7 +654,7 @@ describe("TerminalPanel", () => {
     expect(uploadedFile).toBe(file);
     expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
     const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert image into native prompt")!;
-    act(() => insert.click());
+    act(() => { const checkbox = host!.querySelector<HTMLInputElement>(".terminal-attachments input[type=checkbox]")!; checkbox.click(); insert.click(); });
     expect(inputMessages(TestWebSocket.latest!)).toContainEqual({ type: "input", data: `\x1b[200~/tmp/${relativePath}\x1b[201~` });
     expect(host!.textContent).toContain("verify the image in the native prompt");
   });
@@ -674,6 +674,72 @@ describe("TerminalPanel", () => {
     expect(event.defaultPrevented).toBe(false);
     expect(terminalPanelMocks.uploadFileBrowserFile).not.toHaveBeenCalled();
     expect(inputMessages(TestWebSocket.latest!).some((message) => message.data.includes("@.cloudx/pasted-images"))).toBe(false);
+  });
+
+  it("requires a ready native prompt and keeps sent attachments unconfirmed until the user sees them", async () => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "ready.png", { type: "image/png" }))));
+    await flushAsyncWork();
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert image into native prompt")!;
+    expect(insert.disabled).toBe(true);
+    act(() => insert.click());
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+    act(() => { host!.querySelector<HTMLInputElement>(".terminal-attachments input")!.click(); insert.click(); });
+    expect(inputMessages(TestWebSocket.latest!)).toHaveLength(1);
+    expect(host!.textContent).toContain("path sent; verify the image");
+    expect(host!.textContent).not.toContain("confirmed in the native prompt by you");
+    act(() => Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "I can see the native image")!.click());
+    expect(host!.textContent).toContain("confirmed in the native prompt by you");
+    expect(host!.textContent).toContain("removal are owned by the native prompt");
+    act(() => Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Dismiss attachment status")!.click());
+    expect(inputMessages(TestWebSocket.latest!)).toHaveLength(1);
+  });
+
+  it("uploads an ordinary dropped file to its originating workspace and inserts one editable native reference", async () => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    const file = new File(["local file contents"], "../report with spaces.txt", { type: "text/plain" });
+    const event = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", { value: { files: [file, file] } });
+    act(() => host!.querySelector(".terminal-panel")!.dispatchEvent(event));
+    await flushAsyncWork();
+    expect(event.defaultPrevented).toBe(true);
+    expect(terminalPanelMocks.uploadFileBrowserFile).toHaveBeenCalledOnce();
+    const [tabId, relativePath, uploaded] = terminalPanelMocks.uploadFileBrowserFile.mock.calls[0]!;
+    expect(tabId).toBe(tab.id);
+    expect(relativePath).toMatch(/^\.cloudx\/pasted-files\/pasted-file-\d+-\d+-.._report_with_spaces.txt$/u);
+    expect(uploaded).toBe(file);
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert file reference into native prompt")!;
+    act(() => { host!.querySelector<HTMLInputElement>(".terminal-attachments input")!.click(); insert.click(); });
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([{ type: "input", data: `\x1b[200~ @/tmp/${relativePath} \x1b[201~` }]);
+    expect(host!.textContent).toContain("verify the file reference in the native prompt");
+  });
+
+  it("does not upload unsupported dropped binary files or insert a caption twice", async () => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    const event = pasteImageEvent(new File([new Uint8Array([1])], "unsupported.exe", { type: "application/octet-stream" }), "Keep caption");
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(event));
+    await flushAsyncWork();
+    expect(terminalPanelMocks.uploadFileBrowserFile).not.toHaveBeenCalled();
+    expect(host!.textContent).toContain("unsupported file type");
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([{ type: "input", data: "\x1b[200~Keep caption\x1b[201~" }]);
+  });
+
+  it("cannot insert an already uploaded image into a replacement connection", async () => {
+    vi.useFakeTimers();
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "connection.png", { type: "image/png" }))));
+    await flushAsyncWork();
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert image into native prompt")!;
+    act(() => TestWebSocket.latest!.close(1001));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    act(() => TestWebSocket.latest!.open());
+    act(() => { host!.querySelector<HTMLInputElement>(".terminal-attachments input")!.click(); insert.click(); });
+    expect(host!.textContent).toContain("terminal connection changed");
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
   });
   it("keeps Claude command controls hidden and makes no command polling requests", async () => {
     vi.useFakeTimers();

@@ -11,6 +11,7 @@ import { CodexUpdateService } from "./CodexUpdateService.js";
 import { CodexConfigRepairService } from "./CodexConfigRepairService.js";
 import { validateNativeCodexConfiguration } from "./CodexConfigurationProbe.js";
 import { materializeCodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
+import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
 
 vi.mock("../../../../scripts/codex-updater.mjs", () => ({ readCodexVersion: vi.fn(async () => "0.162.1") }));
 vi.mock("./CodexConfigurationProbe.js", () => ({ validateNativeCodexConfiguration: vi.fn(async () => undefined) }));
@@ -53,6 +54,12 @@ describe("native settings persistence through the hook boundary", () => {
     expect(JSON.stringify(environment)).not.toContain("private-environment-value");
     expect(JSON.stringify(environment)).not.toContain("private-proxy-value");
     expect(JSON.stringify(result)).toContain("launch executable version");
+    await new AgentLaunchRecords(f.sources.dataDir).record({ providerId: "codex", tabId: "policy-tab", executionId: "execution-1", accountId: "original-account", command: "/original/codex", version: "0.166.0", cwd: f.root,
+      args: ["--model", "gpt-6-sol", "--", "private prompt"], env: { OPENAI_API_KEY: "private-token" }, enforcedEnvironmentKeys: ["CODEX_HOME"], configurationPaths: [path.join(f.sources.viewPath("policy-tab"), "config.toml")] });
+    const recorded = await f.call("codex-settings.inspect-launch", { tabId: "policy-tab" });
+    expect(recorded).toMatchObject({ inspection: { launchRecord: { command: "/original/codex", version: "0.166.0", accountId: "original-account", executionId: "execution-1" } } });
+    expect(JSON.stringify(recorded)).not.toContain("private-token");
+    expect(JSON.stringify(recorded)).not.toContain("private prompt");
     expect(await fs.readFile(f.configPath, "utf8")).toBe(before);
     expect(validateNativeCodexConfiguration).not.toHaveBeenCalled();
     await expect(f.call("codex-settings.inspect-launch", { tabId: "../escape" })).rejects.toThrow();

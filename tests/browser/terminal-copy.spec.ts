@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { build } from "vite";
 import { NativeCodexCopySession } from "./fixtures/native-codex-copy.js";
+import { NativeClaudeTerminalSession } from "./fixtures/native-claude-terminal.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let fixtureBuild: string;
@@ -136,6 +137,277 @@ test.afterAll(async () => {
     );
   if (fixtureBuild) await fs.rm(fixtureBuild, { recursive: true, force: true });
 });
+
+for (const fullscreen of [false, true]) {
+  test(`keeps a real Claude multiline prompt editable and delivers a pasted image to the isolated provider (fullscreen: ${fullscreen})`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+    test.skip(
+      !claude || testInfo.project.name !== "desktop-chromium",
+      "Set CLOUDX_NATIVE_CLAUDE to the reviewed native CLI; native acceptance is separate from emulation.",
+    );
+    test.setTimeout(60_000);
+    const version = execFileSync(claude!, ["--version"], {
+      encoding: "utf8",
+    }).trim();
+    if (process.env.CLOUDX_NATIVE_CLAUDE_VERSION)
+      expect(version).toBe(
+        `${process.env.CLOUDX_NATIVE_CLAUDE_VERSION} (Claude Code)`,
+      );
+    const native = await NativeClaudeTerminalSession.create(
+      claude!,
+      fullscreen,
+    );
+    const writes: string[] = [];
+    try {
+      let socket: WebSocketRoute;
+      await page.routeWebSocket("**/ws/terminal/*", (connection) => {
+        socket = connection;
+        connection.onMessage((message) => {
+          const event = JSON.parse(String(message));
+          if (event.type === "input") writes.push(event.data);
+          native.input(event);
+        });
+      });
+      await page.route("**/api/tabs/*/terminal-capabilities", (route) =>
+        route.fulfill({
+          json: {
+            tabId: "copy-tab",
+            providerId: "claude",
+            commandCapture: false,
+          },
+        }),
+      );
+      await page.route("**/api/tabs/*/files/upload?*", async (route) => {
+        const relativePath = new URL(route.request().url()).searchParams.get(
+          "relativePath",
+        )!;
+        const bytes = route.request().postDataBuffer()!;
+        const filename = await native.uploadFile(relativePath, bytes);
+        await route.fulfill({
+          json: {
+            uploaded: true,
+            path: filename,
+            relativePath,
+            bytes: bytes.length,
+          },
+        });
+      });
+      await page.goto(`${baseUrl}?view=claude`);
+      await expect(page.locator(".xterm-rows")).toContainText("Cloudx tab");
+      const dimensions = await page.evaluate(() => ({
+        cols: window.testTerminal.cols,
+        rows: window.testTerminal.rows,
+      }));
+      await native.start(dimensions, (chunk) =>
+        socket.send(JSON.stringify({ type: "data", data: chunk })),
+      );
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "Do you want to use this API key?",
+        { timeout: 15_000 },
+      );
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("ArrowUp");
+      await page.keyboard.press("Enter");
+      await expect(page.locator(".xterm-rows")).toContainText("Claude Code", {
+        timeout: 15_000,
+      });
+      await page.locator(".xterm-helper-textarea").focus();
+      await expect
+        .poll(() => page.evaluate(() => window.testTerminal.buffer.active.type))
+        .toBe(fullscreen ? "alternate" : "normal");
+      await page.keyboard.type("first line");
+      await page.keyboard.press("Shift+Enter");
+      await page.keyboard.type("second line");
+      await expect(page.locator(".xterm-rows")).toContainText("second line");
+      await page.keyboard.press("Control+g");
+      await expect.poll(() => native.editorInvocations()).toBe("invoked\n");
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "second line editor edit",
+      );
+      expect(native.requests).toHaveLength(0);
+      await page.evaluate(() => {
+        const clipboardData = new DataTransfer();
+        const png = Uint8Array.from(
+          atob(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+          ),
+          (char) => char.charCodeAt(0),
+        );
+        clipboardData.items.add(
+          new File([png], "native-test.png", { type: "image/png" }),
+        );
+        clipboardData.setData("text/plain", " caption");
+        document.querySelector(".xterm-helper-textarea")!.dispatchEvent(
+          new ClipboardEvent("paste", {
+            clipboardData,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+      await page
+        .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+        .check();
+      await page
+        .getByRole("button", { name: "Insert image into native prompt" })
+        .click();
+      await expect(page.locator(".xterm-rows")).toContainText("[Image #1]");
+      expect(native.requests).toHaveLength(0);
+      await page
+        .getByRole("button", { name: "I can see the native image" })
+        .click();
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Backspace");
+      await expect(page.locator(".xterm-rows")).not.toContainText("[Image #1]");
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "second line editor edit caption",
+      );
+      await dropFile(page, "native-dropped.png", "image/png", nativePng);
+      await page
+        .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+        .check();
+      await page
+        .getByRole("button", { name: "Insert image into native prompt" })
+        .click();
+      await expect(page.locator(".xterm-rows")).toContainText("[Image #2]");
+      await dropFile(
+        page,
+        "context with spaces.txt",
+        "text/plain",
+        Buffer.from("Native dropped context café.\n").toString("base64"),
+      );
+      await page
+        .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+        .check();
+      await page
+        .getByRole("button", {
+          name: "Insert file reference into native prompt",
+        })
+        .click();
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "context_with_spaces.txt",
+      );
+      expect(native.requests).toHaveLength(0);
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Enter");
+      await expect.poll(() => native.requests.length).toBe(1);
+      const request = JSON.stringify(native.requests[0]!.messages);
+      expect(request).toContain("first line\\nsecond line editor edit caption");
+      expect(request).toContain('"type":"image"');
+      expect(request).toContain('"media_type":"image/png"');
+      expect(request).toContain("Native dropped context café.");
+      expect(request.match(/"type":"image"/gu)).toHaveLength(1);
+      await expect(page.locator(".xterm-rows")).toContainText(native.answer, {
+        timeout: 15_000,
+      });
+      expect(native.requests).toHaveLength(1);
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+      await page.evaluate(() =>
+        navigator.clipboard.writeText("native clipboard sentinel"),
+      );
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.type("/copy");
+      await page.keyboard.press("Enter");
+      const clipboard = page.getByRole("complementary", {
+        name: "Application clipboard request",
+      });
+      await expect(clipboard.getByRole("textbox")).toHaveValue(native.answer);
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+        "native clipboard sentinel",
+      );
+      await page.evaluate(() => {
+        const write = navigator.clipboard.writeText.bind(navigator.clipboard);
+        let deny = true;
+        navigator.clipboard.writeText = async (text) => {
+          if (deny) {
+            deny = false;
+            throw new DOMException(
+              "Native fixture clipboard denial",
+              "NotAllowedError",
+            );
+          }
+          return write(text);
+        };
+      });
+      await clipboard
+        .getByRole("button", { name: "Copy application text" })
+        .click();
+      await expect(clipboard).toContainText("Native fixture clipboard denial");
+      expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+        "native clipboard sentinel",
+      );
+      await clipboard
+        .getByRole("button", { name: "Copy application text" })
+        .click();
+      await expect
+        .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(native.answer);
+      await expect(clipboard).toBeHidden();
+      expect(native.requests).toHaveLength(1);
+      await page.screenshot({
+        path: testInfo.outputPath("native-claude-multiline-image.png"),
+      });
+      testInfo.annotations.push(
+        { type: "native-cli-version", description: version },
+        {
+          type: "browser-version",
+          description: page.context().browser()!.version(),
+        },
+      );
+    } finally {
+      await fs.writeFile(
+        testInfo.outputPath("native-claude-terminal.txt"),
+        native.output,
+      );
+      await fs.writeFile(
+        testInfo.outputPath("native-claude-provider-input.json"),
+        JSON.stringify(
+          {
+            version,
+            node: process.version,
+            browser: page.context().browser()!.version(),
+            fullscreen,
+            requests: native.requests,
+            paths: native.paths,
+            writes,
+          },
+          null,
+          2,
+        ),
+      );
+      await native.dispose();
+    }
+  });
+}
+
+const nativePng =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+async function dropFile(
+  page: Page,
+  name: string,
+  type: string,
+  base64: string,
+) {
+  await page.evaluate(
+    ({ name, type, base64 }) => {
+      const dataTransfer = new DataTransfer();
+      const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+      dataTransfer.items.add(new File([bytes], name, { type }));
+      document.querySelector(".terminal-panel")!.dispatchEvent(
+        new DragEvent("drop", {
+          dataTransfer,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    },
+    { name, type, base64 },
+  );
+}
 
 async function terminalStream(
   page: Page,
@@ -2124,6 +2396,9 @@ for (const provider of ["codex", "claude"]) {
       .poll(() => stream.input.join(""))
       .toBe("\x1b[200~A useful caption\x1b[201~");
     await page
+      .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+      .check();
+    await page
       .getByRole("button", { name: "Insert image into native prompt" })
       .click();
     await expect
@@ -2320,13 +2595,15 @@ for (const fullscreen of [true, false])
           "relativePath",
         )!;
         const bytes = route.request().postDataBuffer()!;
-        expect(bytes.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
-        expect(bytes.length).toBe(69);
-        const filename = await native.uploadImage(relativePath, bytes);
-        await fs.writeFile(
-          testInfo.outputPath("native-uploaded-image.png"),
-          bytes,
-        );
+        if (relativePath.endsWith(".png")) {
+          expect(bytes.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+          expect(bytes.length).toBe(69);
+          await fs.writeFile(
+            testInfo.outputPath("native-uploaded-image.png"),
+            bytes,
+          );
+        } else expect(bytes.toString()).toBe("Native dropped context café.\n");
+        const filename = await native.uploadFile(relativePath, bytes);
         await route.fulfill({
           json: {
             uploaded: true,
@@ -2360,6 +2637,11 @@ for (const fullscreen of [true, false])
       await page.keyboard.press("Shift+Enter");
       await page.keyboard.type("second line");
       await expect(page.locator(".xterm-rows")).toContainText("second line");
+      await page.keyboard.press("Control+g");
+      await expect.poll(() => native.editorInvocations()).toBe("invoked\n");
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "second line editor edit",
+      );
       expect(native.requestCount).toBe(0);
       await page.evaluate(() => {
         const clipboardData = new DataTransfer();
@@ -2382,6 +2664,9 @@ for (const fullscreen of [true, false])
         );
       });
       await page
+        .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+        .check();
+      await page
         .getByRole("button", { name: "Insert image into native prompt" })
         .click();
       await expect(page.locator(".xterm-rows")).toContainText("[Image #1]");
@@ -2394,7 +2679,7 @@ for (const fullscreen of [true, false])
       await page.keyboard.press("Backspace");
       await expect(page.locator(".xterm-rows")).not.toContainText("[Image #1]");
       await expect(page.locator(".xterm-rows")).toContainText(
-        "second line caption",
+        "second line editor edit caption",
       );
       expect(native.requestCount).toBe(0);
       await page.evaluate(() => {
@@ -2417,18 +2702,44 @@ for (const fullscreen of [true, false])
         );
       });
       await page
+        .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+        .check();
+      await page
         .getByRole("button", { name: "Insert image into native prompt" })
         .click();
       await expect(page.locator(".xterm-rows")).toContainText("[Image #1]");
 
+      await dropFile(
+        page,
+        "context with spaces.txt",
+        "text/plain",
+        Buffer.from("Native dropped context café.\n").toString("base64"),
+      );
+      await page
+        .getByRole("checkbox", { name: "Native prompt is ready for insertion" })
+        .check();
+      await page
+        .getByRole("button", {
+          name: "Insert file reference into native prompt",
+        })
+        .click();
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "context_with_spaces.txt",
+      );
+      expect(native.requestCount).toBe(0);
       await page.locator(".xterm-helper-textarea").focus();
       await page.keyboard.press("Enter");
       await expect.poll(() => native.requestCount).toBe(1);
       await expect
         .poll(() => native.prompts[0])
-        .toContain("first line\\nsecond line caption");
+        .toContain("first line\\nsecond line editor edit caption");
       expect(native.prompts[0]).toContain("input_image");
       expect(native.prompts[0]).toContain("data:image/png;base64,");
+      expect(native.prompts[0]!.match(/"type":"input_image"/gu)).toHaveLength(
+        1,
+      );
+      expect(native.prompts[0]).toContain("@/tmp/cloudx-native-browser-copy-");
+      expect(native.prompts[0]).toContain("context_with_spaces.txt");
       await expect(page.locator(".xterm-rows")).toContainText(native.answer, {
         timeout: 15_000,
       });
@@ -2449,6 +2760,7 @@ for (const fullscreen of [true, false])
             {
               version,
               node: process.version,
+              browser: page.context().browser()!.version(),
               fullscreen,
               requestCount: native.requestCount,
               prompts: native.prompts,

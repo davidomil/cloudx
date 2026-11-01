@@ -29,7 +29,7 @@ export function TerminalPreferencesPanel() {
     <label>Attachments <select value={preferences.attachments ?? ""} onChange={e => change("attachments", e.target.value || undefined)}>
       <option value="">Inherit — review before insertion</option><option value="review">Review before insertion</option><option value="disabled">Disabled</option>
     </select></label>
-    <p>Paste/drop uploads are staged outside the native prompt. Remove staged files before insertion. After insertion, use the native prompt to check and remove its attachments; upload success does not confirm native acceptance.</p>
+    <p>Paste/drop uploads are staged outside the native prompt. Images, text/code files, PDF and notebooks up to 20 MiB are supported; native inclusion limits still apply. Confirm that the native prompt is ready before insertion, then check its image or editable file reference. Native acceptance is confirmed only when you select “I can see” after checking the prompt. Remove staged files in the tray; after insertion, remove native items in the native prompt. Dismissing a status does not remove a native item.</p>
     <label>Shift+Enter encoding <select value={preferences.shiftEnter ?? ""} onChange={e => change("shiftEnter", e.target.value || undefined)}>
       <option value="">Inherit — native modified Enter</option><option value="modified-enter">Native modified Enter (CSI-u)</option><option value="ctrl-j">Ctrl+J newline action</option>
     </select></label>

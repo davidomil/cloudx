@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  CLAUDE_BOOLEAN_SETTINGS, CLAUDE_CONFIGURATION_REFERENCE,
+  CLAUDE_BOOLEAN_SETTINGS, CLAUDE_CONFIGURATION_REFERENCE, CLAUDE_SETTINGS_NATIVE_REVIEW,
   claudeConfigurationAvailability, claudeConfigurationCatalog, claudeConfigurationDisposition, claudeConfigurationRequiresNewerVersion,
   type ClaudeBooleanSetting, type ClaudeConfigurationEntry, type ClaudeConfigurationFamily, type ClaudeGlobalSettings
 } from "@cloudx/shared";
@@ -31,7 +31,8 @@ export function ClaudeConfigurationCatalog({ settings, version, nativeOptions, o
   return <details className="codex-settings-group">
     <summary>Search native Claude configuration</summary>
     <p>Checked reference inventory: {counts.settings} settings rows, {counts.environment} environment rows, {counts.cli} CLI rows (including repeated flag summaries). Original official reference snapshots: {CLAUDE_CONFIGURATION_REFERENCE.referenceSnapshotDate}; review: {CLAUDE_CONFIGURATION_REFERENCE.reviewedAt}.</p>
-    <p>No native versions are certified by this documentation inventory. {version ? `Selected executable reports ${version}.` : "No native version is established."} Version changes require a catalog review; an absent minimum version means unknown availability. Reference defaults are separate from saved values and observed effective state. CloudX does not probe a model, install a provider or restart sessions to show this catalog.</p>
+    <p>The complete reference inventory is separate from native runtime certification. {version ? `Selected executable reports ${version}.` : "No native version is established."} Version changes require a catalog review; an absent minimum version means unknown availability. Reference defaults are separate from saved values and observed effective state. CloudX does not probe a model, install a provider or restart sessions to show this catalog.</p>
+    <p>Native {CLAUDE_SETTINGS_NATIVE_REVIEW.version} review: {CLAUDE_SETTINGS_NATIVE_REVIEW.scope}. Reviewed controls: {CLAUDE_SETTINGS_NATIVE_REVIEW.settings.join(", ")}. Other entries retain their documented scope and availability limits.</p>
     <p>Typed options below save only user values through the same settings owner as the curated controls. Unset removes that key; it preserves unrelated values. Native reload depends on the option and version; project, managed, environment and launch overrides remain applicable. Secrets are classified by name and never read into this catalog.</p>
     <label>Search configuration<input aria-label="Search Claude configuration" value={query} onChange={event => { setQuery(event.target.value); setLimit(PAGE_SIZE); }} /></label>
     <label>Configuration family<select aria-label="Claude configuration family" value={family} onChange={event => { setFamily(event.target.value as ClaudeConfigurationFamily); setTopic(""); setLimit(PAGE_SIZE); }}>

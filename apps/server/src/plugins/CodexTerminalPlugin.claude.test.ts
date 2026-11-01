@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -13,28 +14,51 @@ import { CodexTerminalPlugin, DEFAULT_TERMINAL_REPLAY_BYTES } from "./CodexTermi
 import { ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
+vi.mock("../agents/claude/ClaudeNativeSettings.js", () => ({ verifyClaudeNativeAccount: vi.fn(async () => undefined) }));
+
 const SESSION = "a5570c58-978a-4694-84f9-c67756be3acd";
 
 class FakeTerminalProcess implements TerminalProcess {
   written = "";
+  terminated = false;
+  exitAtStartup = false;
+  acknowledgePrompt = true;
+  forgeBinding?: { workerId: string; attemptId: string; receiptPath: string };
   private exitListener: ((event: TerminalExit) => void) | undefined;
-  onData() { return () => undefined; }
-  onExit(listener: (event: TerminalExit) => void) { this.exitListener = listener; return () => { this.exitListener = undefined; }; }
+  onData(listener: (data: string) => void) { queueMicrotask(() => listener("Claude native composer ready\r\n")); return () => undefined; }
+  onExit(listener: (event: TerminalExit) => void) { this.exitListener = listener; if (this.exitAtStartup) queueMicrotask(() => listener({ exitCode: 1 })); return () => { this.exitListener = undefined; }; }
   write(data: string) {
     this.written += data;
     if (data === "\r" && this.written.includes("/exit")) queueMicrotask(() => this.exitListener?.({ exitCode: 0 }));
+    else if (data === "\r" && this.forgeBinding) {
+      if (this.acknowledgePrompt) writeFileSync(this.forgeBinding.receiptPath, JSON.stringify({ workerId: this.forgeBinding.workerId, attemptId: this.forgeBinding.attemptId, threadId: SESSION, turnId: "initial", status: "running" }));
+      else queueMicrotask(() => this.exitListener?.({ exitCode: 1 }));
+    }
   }
   resize() { return undefined; }
   kill() { return undefined; }
   exit(exitCode: number) { this.exitListener?.({ exitCode }); }
-  async terminate() { return undefined; }
+  async terminate() { this.terminated = true; }
 }
 
 class CapturingFactory implements TerminalProcessFactory {
+  deliverReceipt = true;
+  acknowledgePrompt = true;
+  exitWithoutReceipt = true;
   launches: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv; process: FakeTerminalProcess }> = [];
   async spawn(command: string, args: string[], options: { env: NodeJS.ProcessEnv }) {
     const process = new FakeTerminalProcess();
+    process.exitAtStartup = !this.deliverReceipt && this.exitWithoutReceipt;
+    process.acknowledgePrompt = this.acknowledgePrompt;
     this.launches.push({ command, args, env: options.env, process });
+    const configDir = options.env.CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR!;
+    try { process.forgeBinding = JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-forge-turn.json"), "utf8")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const settings = JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-settings.json"), "utf8"));
+    const hook = settings.hooks.SessionStart[0].hooks[0].command as string;
+    const executionId = [...hook.matchAll(/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}/gu)].at(-1)![0];
+    const cwd = path.join(path.dirname(path.dirname(path.dirname(configDir))), "work");
+    if (this.deliverReceipt) await fs.writeFile(path.join(configDir, ".cloudx-conversation.json"), JSON.stringify({ version: 2, authority: "selected", tabId: "tab-1", executionId, sessionId: SESSION, cwd }));
     return process;
   }
   get last() { return this.launches.at(-1)!; }
@@ -62,11 +86,55 @@ async function setup() {
     createdAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString()
   };
   const restored: Record<string, unknown>[] = [];
-  const controls = { setTabIndicator: () => undefined, closeTab: () => undefined, setRestoreInput: (input: Record<string, unknown>) => { restored.push(input); } };
+  const controls = { setTabIndicator: vi.fn(), closeTab: () => undefined, setRestoreInput: (input: Record<string, unknown>) => { restored.push(input); } };
   return { root, env, dataDir, accounts, account, factory, plugin, cwd, tab, controls, restored, claudeSettings };
 }
 
 describe("CodexTerminalPlugin on Claude", () => {
+  it("stops an unacknowledged Forge prompt without admitting the worker or replaying the prompt", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.acknowledgePrompt = false;
+    await expect(plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+      agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "attempt-1.json") },
+      initialInput: { agent: { providerId: "claude" }, prompt: "Submit this exactly once" }
+    })).rejects.toThrow("did not replay the prompt");
+    expect(factory.last.process.written.match(/Submit this exactly once/gu)).toHaveLength(1);
+    expect(factory.last.process.terminated).toBe(true);
+  });
+
+  it("surfaces unavailable interactive tracking and restores the activity indicator after a late valid receipt", async () => {
+    const { plugin, factory, tab, cwd, controls, restored } = await setup();
+    factory.deliverReceipt = false;
+    factory.exitWithoutReceipt = false;
+    vi.useFakeTimers();
+    let session;
+    try {
+      session = await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" } } });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(controls.setTabIndicator).toHaveBeenCalledWith(expect.objectContaining({ label: "Tracking unavailable", color: "yellow" }));
+      expect(restored.at(-1)?.codexIdentityError).toMatch(/Tracking and automatic recovery are unavailable/);
+      vi.useRealTimers();
+      const configDir = factory.last.env.CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR!;
+      const settings = JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-settings.json"), "utf8"));
+      const executionId = [...settings.hooks.SessionStart[0].hooks[0].command.matchAll(/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}/gu)].at(-1)![0];
+      await fs.writeFile(path.join(configDir, ".cloudx-conversation.json"), JSON.stringify({ version: 2, authority: "selected", tabId: tab.id, executionId, sessionId: SESSION, cwd }));
+      await vi.waitFor(() => expect(restored.at(-1)?.codexIdentityError).toBeUndefined());
+      expect(controls.setTabIndicator).toHaveBeenLastCalledWith(tab.indicator);
+    } finally { session?.stop?.(); vi.useRealTimers(); }
+  });
+  it("does not submit Forge work when the actual native execution cannot deliver its startup receipt", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.deliverReceipt = false;
+    await expect(plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+      agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "attempt-1.json") },
+      initialInput: { agent: { providerId: "claude" }, prompt: "Never submit this work" }
+    })).rejects.toThrow("No worker prompt was submitted");
+    expect(factory.lastCommandLine).not.toContain("Never submit this work");
+    expect(factory.last.process.written).toBe("");
+    expect(factory.last.process.terminated).toBe(true);
+  });
   it("launches Claude Code in a per-tab config dir on the selected account", async () => {
     const { plugin, factory, tab, cwd, controls, account, dataDir, restored } = await setup();
     await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, prompt: "Fix it" } });
@@ -76,7 +144,7 @@ describe("CodexTerminalPlugin on Claude", () => {
     expect(factory.lastCommandLine).toMatch(/^unset ANTHROPIC_API_KEY /u);
     expect(factory.lastCommandLine).toContain('CLAUDE_CONFIG_DIR="$CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR"');
     expect(factory.lastCommandLine).toContain('ANTHROPIC_CONFIG_DIR="$CLOUDX_ENFORCED_ANTHROPIC_CONFIG_DIR"');
-    expect(factory.lastCommandLine).toMatch(/; exec claude --settings \S+\.cloudx-settings\.json --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
+    expect(factory.lastCommandLine).toMatch(/; exec claude --settings \S+\.cloudx-settings\.json --append-system-prompt-file \S+\.cloudx-instructions\.md --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
     expect(factory.last.env).toMatchObject({ CLAUDE_CONFIG_DIR: configDir, CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR: configDir });
     expect(factory.last.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-settings.json"), "utf8"))).toMatchObject({
@@ -124,7 +192,9 @@ describe("CodexTerminalPlugin on Claude", () => {
     });
 
     const first = await launch();
-    expect(factory.lastCommandLine).toContain(`--model claude-opus-5-5 --effort xhigh --session-id ${SESSION} -- Review`);
+    expect(factory.lastCommandLine).toContain(`--model claude-opus-5-5 --effort xhigh --session-id ${SESSION}`);
+    expect(factory.lastCommandLine).not.toContain("Review");
+    expect(factory.last.process.written).toContain("Review");
     expect(JSON.parse(await fs.readFile(path.join(dataDir, "claude-launches", "tab-1", ".cloudx-forge-turn.json"), "utf8")))
       .toEqual({ ...agentTurn, expectedThreadId: SESSION });
 
@@ -137,7 +207,8 @@ describe("CodexTerminalPlugin on Claude", () => {
     await fs.mkdir(path.dirname(transcript), { recursive: true });
     await fs.writeFile(transcript, "");
     await launch();
-    expect(factory.lastCommandLine).toContain(`--resume ${SESSION} -- Review`);
+    expect(factory.lastCommandLine).toContain(`--resume ${SESSION}`);
+    expect(factory.last.process.written).toContain("Review");
   });
 
   it("keeps the native session for a same-provider switch and writes a handoff for Codex", async () => {

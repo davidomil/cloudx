@@ -26,9 +26,10 @@ if [ "$1" = "--settings" ]; then shift 2; fi
 case "$1 $2" in
   "--version "*) echo "9.9.9 (Claude Code)";;
   "auth status")
-    if [ -n "$ANTHROPIC_API_KEY" ]; then echo '{"loggedIn":true,"authMethod":"api_key"}';
-    elif [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then echo '{"loggedIn":true,"authMethod":"claude.ai"}';
-    else echo '{"loggedIn":false,"authMethod":"none"}'; fi;;
+    if [ -n "$ANTHROPIC_API_KEY" ]; then method=api_key; logged=true;
+    elif [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then method=claude.ai; logged=true;
+    else method=none; logged=false; fi
+    printf '{"loggedIn":%s,"authMethod":"%s","apiProvider":"firstParty","configDirectory":"%s","apiKeySource":"ANTHROPIC_API_KEY"}' "$logged" "$method" "$CLAUDE_CONFIG_DIR";;
   *) exit 2;;
 esac
 `, { mode: 0o755 });

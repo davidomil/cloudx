@@ -21,6 +21,12 @@ export interface ClaudeConfigurationEntry {
 }
 
 export const CLAUDE_CONFIGURATION_REFERENCE = inventory;
+export const CLAUDE_SETTINGS_NATIVE_REVIEW = {
+  version: "2.1.316",
+  reviewedAt: "2026-11-01",
+  settings: [...CLAUDE_BOOLEAN_SETTINGS, "modelSettings", "language", "autoUpdatesChannel"],
+  scope: "Saved user values, native source merging, launch precedence and unset; no model work or full runtime-default certification",
+} as const;
 const entries = inventory.entries as ClaudeConfigurationEntry[];
 const curated = new Set(["model", "modelSettings", "alwaysThinkingEnabled", "fastMode", "outputStyle", "language", "autoUpdatesChannel", ...CLAUDE_BOOLEAN_SETTINGS]);
 const launchPolicy = new Set(["permissions.defaultMode", "disableBundledSkills", "autoMemoryEnabled", "syncClaudeAiSkills", "syncClaudeAiPlugins", "skillOverrides", "enabledPlugins", "hooks", "disableAllHooks"]);
@@ -68,6 +74,9 @@ export function claudeConfigurationAvailability(entry: ClaudeConfigurationEntry,
   const version = installedVersion?.match(/\b\d+\.\d+\.\d+\b/u)?.[0];
   if (!version) return "Native version/effective behavior unverified";
   if (entry.minimumVersion && compareVersions(version, entry.minimumVersion) < 0) return `Requires native ${entry.minimumVersion}+; selected ${version} is older`;
+  if (version === CLAUDE_SETTINGS_NATIVE_REVIEW.version && entry.family === "settings"
+    && CLAUDE_SETTINGS_NATIVE_REVIEW.settings.some(name => name === entry.name))
+    return `Saved user value, source merging and unset verified with native ${version}; running-session behavior remains setting-dependent`;
   return entry.minimumVersion ? `Documented since ${entry.minimumVersion}; selected ${version} runtime unverified` : `Minimum version not established; selected ${version} runtime unverified`;
 }
 

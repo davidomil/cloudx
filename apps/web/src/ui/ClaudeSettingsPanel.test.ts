@@ -174,7 +174,8 @@ describe("ClaudeSettingsPanel", () => {
     const callHook = hooks({ ...saved, nativeOptions: { autoScrollEnabled: true } });
     const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
     expect(container.textContent).toContain("247 settings rows, 384 environment rows, 121 CLI rows");
-    expect(container.textContent).toContain("No native versions are certified");
+    expect(container.textContent).toContain("complete reference inventory is separate from native runtime certification");
+    expect(container.textContent).toContain("Native 2.1.316 review");
     await change(control(container, "Search Claude configuration"), "autoScrollEnabled");
     expect(container.textContent).toContain("Native reference default: true");
     expect(container.textContent).toContain("Saved user value: true");

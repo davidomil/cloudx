@@ -126,6 +126,10 @@ export class NativeCodexCopySession {
       );
       const port = (fixture.provider.address() as { port: number }).port;
       await fs.mkdir(fixture.home, { mode: 0o700 });
+      await fs.writeFile(
+        path.join(fixture.root, "editor.mjs"),
+        `import fs from "node:fs";\nfs.appendFileSync(process.argv[2], " editor edit");\nfs.appendFileSync(${JSON.stringify(path.join(fixture.root, "editor-invocations"))}, "invoked\\n");\n`,
+      );
       const catalogPath = path.join(fixture.home, "models.json");
       await fs.writeFile(
         catalogPath,
@@ -193,7 +197,7 @@ export class NativeCodexCopySession {
     output: (chunk: string) => void,
   ): Promise<void> {
     let command = this.codex;
-    let args: string[] = [];
+    let args: string[] = ["--no-daemon"];
     if (this.bridgeDiagnostics) {
       const wrapper = path.join(this.root, "codex-diagnostics.mjs");
       await fs.writeFile(
@@ -246,6 +250,8 @@ if (process.argv.includes('app-server')) setInterval(() => {
           TERM: "xterm-256color",
           SHELL: "/bin/sh",
           SSH_TTY: "/dev/pts/cloudx-isolated-copy",
+          VISUAL: `${process.execPath} ${JSON.stringify(path.join(this.root, "editor.mjs"))}`,
+          EDITOR: `${process.execPath} ${JSON.stringify(path.join(this.root, "editor.mjs"))}`,
         },
       },
     );
@@ -255,13 +261,25 @@ if (process.argv.includes('app-server')) setInterval(() => {
     });
   }
 
-  async uploadImage(relativePath: string, bytes: Buffer): Promise<string> {
+  async uploadFile(relativePath: string, bytes: Buffer): Promise<string> {
     const filename = path.resolve(this.root, relativePath);
     if (!filename.startsWith(`${this.root}${path.sep}`))
       throw new Error("Image must stay inside the isolated workspace.");
     await fs.mkdir(path.dirname(filename), { recursive: true });
     await fs.writeFile(filename, bytes);
     return filename;
+  }
+
+  async editorInvocations(): Promise<string> {
+    try {
+      return await fs.readFile(
+        path.join(this.root, "editor-invocations"),
+        "utf8",
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+      throw error;
+    }
   }
 
   async emitBackendDiagnostics(): Promise<string> {

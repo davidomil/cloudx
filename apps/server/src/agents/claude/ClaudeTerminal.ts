@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions } from "@cloudx/plugin-api";
-import { readAgentSelection, type AgentSelection } from "@cloudx/shared";
+import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions, type PluginTabControls } from "@cloudx/plugin-api";
+import { isForgeTurnCompletion, readAgentSelection, type AgentSelection, type TabIndicatorUpdate } from "@cloudx/shared";
 
 import {
   CODEX_CLOSE_ON_EXIT_GRACE_MS,
@@ -19,7 +20,8 @@ import type { TerminalProcessFactory } from "../../terminal/TerminalProcess.js";
 import { buildEnforcedLoginShellLaunch, buildToolEnv, resolveClaudeCommand } from "../../terminal/ShellLaunch.js";
 import type { AgentAccountStore } from "../AgentAccountStore.js";
 import type { AgentUsageRecorder } from "../usage/AgentUsageRecorder.js";
-import { claudeAccountLaunch } from "../agentCli.js";
+import { claudeAccountLaunch, readAgentProviderStatus } from "../agentCli.js";
+import { AgentLaunchRecords } from "../AgentLaunchRecords.js";
 import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
 import { codexResumeInput } from "../resumeInput.js";
 import {
@@ -32,6 +34,7 @@ import {
 } from "./ClaudeHomeOverlay.js";
 import { buildClaudeLaunchArgs, findClaudeTranscript } from "./ClaudeLaunch.js";
 import type { ClaudeLaunchPreferences, ClaudeSettingsService } from "./ClaudeSettingsService.js";
+import { verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
 
 export interface ClaudeTerminalOptions {
   factory: TerminalProcessFactory;
@@ -83,8 +86,10 @@ export class ClaudeTerminal {
     let overlay: ClaudeHomeOverlay;
     let env: NodeJS.ProcessEnv;
     let accountLaunch: ReturnType<typeof claudeAccountLaunch>;
+    let skillSelections: Array<{ name: string; source: "personal" | "synced"; selected: boolean; available: boolean }>;
     try {
       const current = await this.options.settings.read();
+      skillSelections = current.skills.map(skill => ({ name: skill.name, source: skill.origin, selected: skill.allowed, available: skill.available }));
       // Forge workers run unattended, like Codex workers with approvals off.
       settings = { permissionMode: input.agentTurn ? "bypassPermissions" : current.permissionMode, autoTrustWorkspace: current.autoTrustWorkspace };
       if (settings.permissionMode === "bypassPermissions" && current.bypassDisabled)
@@ -103,6 +108,7 @@ export class ClaudeTerminal {
       };
       overlay = await materializeClaudeHomeOverlay(overlayInput);
       applyTemplateEnv(env, template, overlay.rulesSkillsRoot, overlay.systemRules.map(rule => rule.id));
+      await verifyClaudeNativeAccount({ command: resolveClaudeCommand(env), cwd: input.cwd, env, settingsPath: overlay.settingsPath }, accountLaunch.policy);
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
@@ -112,7 +118,8 @@ export class ClaudeTerminal {
     try {
       await writeForgeTurnBinding(configDir, input.agentTurn, input.prepareAgentSession ? newSessionId ?? codexResumeInput(launchInput)?.sessionId : undefined);
       args = buildClaudeLaunchArgs(launchInput, {
-        settings, settingsPath: overlay.settingsPath, addDirs: [overlay.rulesSkillsRoot], newSessionId
+        settings, settingsPath: overlay.settingsPath, instructionsPath: overlay.instructionsPath, addDirs: [overlay.rulesSkillsRoot], newSessionId,
+        deferPrompt: Boolean(input.agentTurn)
       });
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
@@ -129,14 +136,24 @@ export class ClaudeTerminal {
     await input.controls.setRestoreInput?.(restoredInput);
     // The selected account wins over credentials the user's profile exports.
     const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, accountLaunch.enforced);
+    const provider = await readAgentProviderStatus("claude", env);
+    await new AgentLaunchRecords(dataDir).record({
+      providerId: "claude", tabId: input.tab.id, executionId, command: resolveClaudeCommand(env),
+      version: provider.version, accountId: account.id, cwd: input.cwd, args, env,
+      skillSelections,
+      enforcedEnvironmentKeys: [...accountLaunch.enforced.unset, ...Object.keys(accountLaunch.enforced.set)],
+      configurationPaths: [overlay.settingsPath, overlay.instructionsPath, path.join(this.providerHome, "settings.json"),
+        path.join(input.cwd, ".claude", "settings.json"), path.join(input.cwd, ".claude", "settings.local.json")]
+    });
     const execution = await input.prepareTerminalExecution?.(input.tab.id);
     const terminalProcess = await this.options.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd, env: launch.env, cols: 100, rows: 30,
       ...(execution ? { execution } : {}),
       ...(!input.tab.ownerPluginId ? { sessionId: input.tab.id } : {})
     });
-    return new CodexTerminalSession(input.tab, terminalProcess, input.controls, {
-      ...this.sessionOptions(input, () => restoredInput, next => { restoredInput = next; }, conversation),
+    const tracking = new ClaudeTrackingStatus(input.controls, input.tab.indicator);
+    const session = new CodexTerminalSession(input.tab, terminalProcess, tracking.controls, {
+      ...this.sessionOptions(input, () => restoredInput, next => { restoredInput = next; }, conversation, tracking),
       closeOnExit: !input.tab.ownerPluginId && !recovering,
       voiceSummary: voiceSummary(template),
       templateName: template?.template.name,
@@ -156,14 +173,31 @@ export class ClaudeTerminal {
         };
       }
     });
+    if (input.agentTurn) {
+      try {
+        const sessionId = await waitForClaudeReceipt(conversation, input.tab.id, executionId, input.cwd, () => session.hasExited(), newSessionId ?? codexResumeInput(launchInput)?.sessionId);
+        await session.handleAction("wait_until_ready", { timeoutMs: 30_000 });
+        const prompt = launchInput?.prompt;
+        if (prompt !== undefined) {
+          if (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0")) throw new Error("Claude initial prompt must be a non-empty string without null bytes.");
+          await session.handleAction("enter_text", { text: prompt, submit: true });
+          await waitForClaudePromptReceipt(input.agentTurn, sessionId, () => session.hasExited());
+        }
+      } catch (error) {
+        await session.terminate();
+        throw new PluginSessionNotStartedError(error);
+      }
+    }
+    return session;
   }
 
   async restore(input: CreatePluginSessionInput): Promise<PluginSession> {
     if (!this.options.factory.attach) throw new Error("Claude terminal reconnection is unavailable.");
     const terminal = await this.options.factory.attach(input.tab.id);
     let restoredInput = { ...input.initialInput };
-    return new CodexTerminalSession(input.tab, terminal, input.controls, {
-      ...this.sessionOptions(input, () => restoredInput, next => { restoredInput = next; }, new CodexConversationRecovery(this.configDir(input.tab.id))),
+    const tracking = new ClaudeTrackingStatus(input.controls, input.tab.indicator);
+    return new CodexTerminalSession(input.tab, terminal, tracking.controls, {
+      ...this.sessionOptions(input, () => restoredInput, next => { restoredInput = next; }, new CodexConversationRecovery(this.configDir(input.tab.id)), tracking),
       closeOnExit: input.initialInput?.codexRecovered !== true,
       voiceSummary: "Existing interactive Claude Code session."
     });
@@ -204,7 +238,8 @@ export class ClaudeTerminal {
     input: CreatePluginSessionInput,
     current: () => Record<string, unknown>,
     update: (next: Record<string, unknown>) => void,
-    conversation: CodexConversationRecovery
+    conversation: CodexConversationRecovery,
+    tracking: ClaudeTrackingStatus
   ) {
     const receipt = agentTurnReceiptPath(this.configDir(input.tab.id));
     return {
@@ -216,20 +251,96 @@ export class ClaudeTerminal {
       turnState: () => readClaudeTurnState(receipt, conversation.readForExecution(input.tab.id, current().codexExecutionId)?.transcriptPath),
       onEnded: () => this.options.usage?.ended(input.tab.id),
       restoreInput: current,
-      observeConversation: () => conversation.observe(identity => {
-        if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== current().codexExecutionId))
-          throw new Error("Conversation identity belongs to a different tab or execution.");
-        update({ ...current(), resume: { mode: "session", sessionId: identity.sessionId } });
-        this.options.usage?.conversationStarted(input.tab, "claude", readAgentSelection(current().agent)?.accountId, identity.sessionId, input.workspaceId);
-        return input.controls.setRestoreInput?.(current());
-      }, error => {
-        const next: Record<string, unknown> = { ...current(), codexIdentityError: error instanceof Error ? error.message : "Conversation identity could not be read." };
-        delete next.resume;
-        update(next);
-        void Promise.resolve().then(() => input.controls.setRestoreInput?.(current())).catch(() => undefined);
-      })
+      observeConversation: () => {
+        const unavailable = (message: string) => {
+          const next: Record<string, unknown> = { ...current(), codexIdentityError: message };
+          delete next.resume;
+          update(next);
+          tracking.unavailable(message);
+          void Promise.resolve().then(() => input.controls.setRestoreInput?.(current())).catch(() => undefined);
+        };
+        const timeout = setTimeout(() => unavailable("Claude has not delivered its required startup receipt. Tracking and automatic recovery are unavailable until native startup and CloudX hooks succeed. Check the trust prompt and native hook policy."), 30_000);
+        timeout.unref();
+        const stop = conversation.observe(identity => {
+          if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== current().codexExecutionId))
+            throw new Error("Conversation identity belongs to a different tab or execution.");
+          clearTimeout(timeout);
+          tracking.recovered();
+          const next: Record<string, unknown> = { ...current(), resume: { mode: "session", sessionId: identity.sessionId } };
+          delete next.codexIdentityError;
+          update(next);
+          this.options.usage?.conversationStarted(input.tab, "claude", readAgentSelection(current().agent)?.accountId, identity.sessionId, input.workspaceId);
+          return input.controls.setRestoreInput?.(current());
+        }, error => {
+          clearTimeout(timeout);
+          unavailable(error instanceof Error ? error.message : "Conversation identity could not be read.");
+        });
+        return () => { clearTimeout(timeout); stop(); };
+      }
     };
   }
+}
+
+class ClaudeTrackingStatus {
+  readonly controls: PluginTabControls;
+  private missing = false;
+
+  constructor(private readonly owner: PluginTabControls, private activity: TabIndicatorUpdate) {
+    this.controls = { ...owner, setTabIndicator: indicator => {
+      this.activity = indicator;
+      if (!this.missing) owner.setTabIndicator(indicator);
+    } };
+  }
+
+  unavailable(message: string): void {
+    this.missing = true;
+    this.owner.setTabIndicator({ color: "yellow", label: "Tracking unavailable", message });
+  }
+
+  recovered(): void {
+    if (!this.missing) return;
+    this.missing = false;
+    this.owner.setTabIndicator(this.activity);
+  }
+}
+
+async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tabId: string, executionId: string, cwd: string, exited: () => boolean, expectedSessionId?: string): Promise<string> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const receipt = conversation.readForExecution(tabId, executionId);
+    if (receipt?.selection?.executionId === executionId && receipt.cwd === cwd) {
+      if (expectedSessionId && receipt.sessionId !== expectedSessionId) throw new Error("Claude's startup receipt belongs to a different Forge conversation. No worker prompt was submitted.");
+      return receipt.sessionId;
+    }
+    if (exited()) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error("Claude did not deliver its required SessionStart receipt. Native hook policy or a hook failure prevents CloudX tracking. Ask the policy owner to permit CloudX SessionStart, UserPromptSubmit, Stop and StopFailure hooks before starting Forge work. No worker prompt was submitted.");
+}
+
+async function waitForClaudePromptReceipt(binding: NonNullable<PluginSessionLaunchOptions["agentTurn"]>, sessionId: string, exited: () => boolean): Promise<void> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    let file;
+    try {
+      file = await fs.open(binding.receiptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size > 64 * 1024) throw new Error("Claude's Forge prompt receipt is invalid.");
+      const buffer = Buffer.alloc(64 * 1024 + 1);
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > 64 * 1024) throw new Error("Claude's Forge prompt receipt exceeds the size limit.");
+      let value: unknown;
+      try { value = JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")); } catch { throw new Error("Claude's Forge prompt receipt is invalid."); }
+      if (!isForgeTurnCompletion(value) || value.workerId !== binding.workerId || value.attemptId !== binding.attemptId || value.threadId !== sessionId)
+        throw new Error("Claude's prompt receipt does not belong to this Forge attempt and conversation.");
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    } finally { await file?.close(); }
+    if (exited()) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  throw new Error("Claude did not acknowledge the Forge prompt through UserPromptSubmit. A native startup dialog or hook failure prevents verified receipt delivery. Review the terminal and native hook policy. CloudX stopped the session and did not replay the prompt.");
 }
 
 // Forge attempt identity for the Claude hook helper, which writes the same

@@ -5,7 +5,8 @@
 //
 // Usage: claude-hook-receipt.mjs <configDir> <tabId> <executionId> <event>
 // The hook payload arrives as JSON on stdin. The hook always exits 0 so a
-// receipt failure never blocks the user's session.
+// receipt failure never blocks an interactive user's session. Forge prompt
+// receipt failures exit 2 so native Claude blocks model work it cannot track.
 //
 // Claude runs Stop hooks in parallel, and another hook can block the stop and
 // continue the same prompt. So Stop only records a pending stop and starts
@@ -301,10 +302,23 @@ async function main() {
   if (!configDir || !path.isAbsolute(configDir) || !tabId || !CONVERSATION_ID.test(executionId ?? "") || !event) return;
   const payload = JSON.parse(await readStdin());
   if (event === "Stop") return recordStop(configDir, { tabId, executionId }, payload);
-  if (event === "UserPromptSubmit") recordPrompt(configDir, payload);
+  if (event === "UserPromptSubmit") {
+    const forge = readForgeBinding(configDir);
+    if (forge && (!CONVERSATION_ID.test(String(payload?.session_id ?? "")) || forge.expectedThreadId && forge.expectedThreadId !== payload.session_id))
+      throw new Error("Forge prompt belongs to a different conversation.");
+    recordPrompt(configDir, payload);
+  }
   applyEvent(configDir, { tabId, executionId }, event, payload);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(error => { process.stderr.write(`CloudX receipt: ${error instanceof Error ? error.message : String(error)}\n`); }).finally(() => process.exit(0));
+  main().then(() => process.exit(0), () => {
+    const [configDir, , , event] = process.argv.slice(2);
+    let forgePrompt = false;
+    if (event === "UserPromptSubmit" && configDir && path.isAbsolute(configDir)) {
+      try { forgePrompt = statSync(path.join(configDir, FORGE_TURN_BINDING)).isFile(); } catch { /* No owned Forge turn. */ }
+    }
+    process.stderr.write("CloudX receipt delivery failed. Check the configured receipt directory and native hook policy. No hook payload or configuration values were included in this diagnostic.\n");
+    process.exit(forgePrompt ? 2 : 0);
+  });
 }

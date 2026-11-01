@@ -3,6 +3,7 @@ import path from "node:path";
 import type { CodexLaunchPolicyInspection } from "@cloudx/shared";
 import { readCodexConfiguration } from "./CodexConfigurationSettings.js";
 import type { CodexStateSources } from "./CodexStateSources.js";
+import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
 
 /** Inspect owned generated state without starting a client or reading credential values. */
 export async function inspectCodexLaunchPolicy(sources: CodexStateSources, tabId: string, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CodexLaunchPolicyInspection> {
@@ -26,12 +27,16 @@ export async function inspectCodexLaunchPolicy(sources: CodexStateSources, tabId
     });
   }
   if (signal?.aborted) throw new Error("Codex launch inspection cancelled.");
+  const launchRecord = await new AgentLaunchRecords(sources.dataDir).read(tabId, "codex");
   return {
+    ...(launchRecord ? { launchRecord } : {}),
     tabId, sourcePath, observation: "generated-config-on-disk", values: configuration.values, skills,
     serverEnvironmentKeys: Object.keys(env).filter(key => /^(?:CODEX_|OPENAI_|AZURE_|AWS_|GOOGLE_|GCLOUD_|HTTP_PROXY$|HTTPS_PROXY$|ALL_PROXY$|NO_PROXY$)/.test(key) && env[key] !== undefined).sort(),
     unresolvedLayers: [
       "The generated file is observed on disk, not read back from a running client; later edits may differ from its in-memory state.",
-      "The launch executable version, process environment, explicit arguments and selected account are not recorded in this inspection; the current selected version is not substituted.",
+      launchRecord
+        ? "The launch record preserves a pre-launch executable version probe, selected account, redacted arguments and environment names. Login-shell command resolution and later native state remain unobserved."
+        : "The launch executable version, process environment, explicit arguments and selected account were not recorded for this launch; the current selected version is not substituted.",
       "Trusted project/nested project configuration, enforced administrator requirements and later skill discovery are evaluated by the native client and are not observed here.",
       "Environment names describe the current CloudX server, not the historical process environment. Values are never returned.",
     ],

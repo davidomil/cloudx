@@ -39,6 +39,8 @@ import { codexResumeInput } from "../agents/resumeInput.js";
 import { ClaudeTerminal } from "../agents/claude/ClaudeTerminal.js";
 import type { ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 import type { AgentUsageRecorder } from "../agents/usage/AgentUsageRecorder.js";
+import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
+import { readAgentProviderStatus } from "../agents/agentCli.js";
 
 // Provider services the agent terminal needs beyond the Codex state sources.
 export interface AgentTerminalProviders {
@@ -268,6 +270,21 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ], launchTemplate.env, enforced)
       : buildEnforcedLoginShellLaunch(command, launchArgs, launchTemplate.env, enforced);
     const execution = await input.prepareTerminalExecution?.(input.tab.id);
+    if (this.dataDir && selection && this.sources) {
+      const status = await readAgentProviderStatus("codex", launchTemplate.env);
+      const source = await this.sources.readBinding(input.tab.id);
+      await new AgentLaunchRecords(this.dataDir).record({
+        providerId: "codex", tabId: input.tab.id, executionId: selection.executionId,
+        command, version: status.version, accountId: codexAgent?.accountId,
+        cwd: input.cwd, args: launchArgs, env: launchTemplate.env,
+        enforcedEnvironmentKeys: Object.keys(enforced.set),
+        configurationPaths: [
+          path.join(launchTemplate.overlay!.codexHome, "config.toml"),
+          ...(source ? [path.join(source.home, "config.toml")] : []),
+          path.join(input.cwd, ".codex", "config.toml"),
+        ],
+      });
+    }
     const terminalProcess = await this.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd,
       env: launch.env,

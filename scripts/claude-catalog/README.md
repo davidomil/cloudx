@@ -20,6 +20,21 @@ checked inventory is a documentation snapshot, not proof that a particular
 native binary accepts or applies each option. No native versions are certified
 by this inventory.
 
+The separate `CLAUDE_SETTINGS_NATIVE_REVIEW` records a narrower native 2.1.316
+check. An isolated no-model control session observes all eleven typed Boolean
+settings with both values, per-model effort, language and update-channel merging, user/project/
+launch precedence, unset, and preservation of unrelated model fields. It runs
+through the production settings service. This checks the native merge contract;
+it does not certify every reference row, model-dependent defaults, visual
+effects, or managed policy on a different machine. A later version never inherits
+this exact-version observation.
+
+Run the fixture with the explicitly selected executable:
+
+```bash
+CLOUDX_NATIVE_CLAUDE=/path/to/claude node node_modules/vitest/vitest.mjs run apps/server/src/agents/claude/ClaudeConfiguration.native.test.ts --maxWorkers=1
+```
+
 `claudeConfiguration.ts` classifies every entry. Managed policy, account and
 credential settings, legacy keys, native commands, unsupported native session
 lifecycles, and native-owned settings remain separate. The catalog reads saved

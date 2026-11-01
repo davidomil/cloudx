@@ -52,8 +52,24 @@ redacts known authentication/native-managed fields, and lists recorded skill pat
 selections with source classification, local file presence and provenance. Server
 environment variable names are shown without values. The generated file is an
 on-disk observation, not proof of what an already-running process loaded.
-An effective per-session layer and skill inventory is still required to establish
-all project/environment/managed contributions for an individual client.
+
+Both provider panels can also inspect a launch-time record by tab or worker tab
+ID. New launches record the execution ID, selected account ID, native command,
+pre-launch version probe, reviewed arguments, environment variable names and
+bounded configuration-file SHA-256 fingerprints. Claude records external skill
+choices and file availability separately from actual native loading. Prompt text,
+environment values, remote connection targets, arbitrary arguments and inline
+configuration values are omitted. Records use private files; inspection does not
+start a native client. An older launch without a record stays unobserved rather
+than inheriting today's settings or account selection.
+
+The record identifies bytes present at launch; a project-file fingerprint does
+not prove that native project trust accepted it. Shell command lookup, later
+project/managed policy changes and later skill discovery remain explicitly
+unobserved. Native effective settings can be inspected in isolated no-model
+fixtures; that print-mode inspection runs SessionStart hooks, so CloudX does not
+run it as an extra production preflight or replay user hooks merely to show
+Settings.
 
 ## Native activity and resource ownership
 
@@ -101,10 +117,25 @@ personal native file. At the next launch, differences from a known tab file are
 captured into an allowlist-only CloudX preference file. Existing tabs retain
 their local values; the newest changed native configuration file wins for future
 tabs when edits compete. This does not copy credentials/trust or rewrite the
-personal file. Personal rules retain their directory structure, and personal
-instruction text keeps its existing inclusion without an extra native import hop.
-Original source identity, relative imports outside the shared rules tree, broken
-imports and trust/depth equivalence still need native acceptance under #237.
+personal file. Personal rules retain their directory structure. The overlay links
+the original personal CLAUDE.md and appends CloudX-only instructions through the
+native append-system-prompt-file flag. This retains the original source directory
+without adding an import hop. Native 2.1.316 fixtures verify relative imports,
+escaped spaces, the fourth/fifth import-depth boundary, nested/path-scoped rules,
+and approved/denied external project imports. The native loader still identifies
+the root through its overlay alias when applying `claudeMdExcludes`; a pattern
+naming only the original root can therefore differ from plain Claude. Full
+root-source identity remains unresolved under #237. CloudX does not rewrite
+exclusions or emulate the native glob matcher. The overlay inherits only the
+current project's typed trust/import decisions, preserving subsequent per-tab
+decisions without copying credentials, allowed tools or other projects.
+
+The separate native settings review verifies all eleven typed Boolean controls,
+language, channel, user/project/launch precedence and unset on 2.1.316 through
+the production settings owner. Unrelated native values survive these edits.
+This establishes the native merge contract, not full runtime behavior for every
+reference entry or another native release. The searchable catalog keeps these
+exact-version observations separate from reference defaults and unknown values.
 
 ## Selected Claude accounts and service routing
 
@@ -133,6 +164,24 @@ stop before a client is spawned. Managed fragments follow native file order;
 matching service routing is retained rather than silently overridden. Diagnostics
 name keys and policy sources and do not print credential values.
 
+Before terminal launch, CloudX also runs native `auth status --json` with the
+resolved environment and generated settings. It checks provider, configuration
+directory and authentication method/source names without starting a model turn
+or executing SessionStart hooks. Account status uses the same validator. Invalid
+contracts, conflicting helpers, abnormal exits and an unsuccessful exit paired
+with successful-looking login data fail explicitly. The native readback does not
+reveal or compare credential bytes, endpoint values or every cloud-chain identity;
+it is not full proof of account isolation under an unknown managed source.
+
+Forge defers the initial prompt until the actual native process delivers its
+execution-bound SessionStart receipt. The prompt is submitted once, and CloudX
+requires a matching UserPromptSubmit receipt. Missing, invalid or wrong-session
+receipts stop that launch. The hook helper blocks Forge prompt work if it cannot
+write the owned receipt. Interactive tabs show tracking unavailable after a
+missing startup receipt and recover their prior activity indicator if it arrives
+later. These checks establish delivered receipts; they do not continuously
+certify that a later policy change will permit Stop or StopFailure delivery.
+
 The [official environment reference](https://code.claude.com/docs/en/env-vars),
 [settings reference](https://code.claude.com/docs/en/settings-reference) and
 [WIF reference](https://platform.claude.com/docs/en/manage-claude/wif-reference)
@@ -141,9 +190,9 @@ are primary evidence, reviewed on 1 November 2026. Native behavior was probed wi
 enable CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST implicitly because it also changes
 native model-policy and feature behavior.
 
-Remote/server-managed, MDM and registry policy, policy-helper results, late policy
-updates and the complete cloud credential-chain behavior remain unestablished by
-these file-backed checks. Unsupported known file-based combinations fail clearly;
-full selected-account acceptance still requires effective native policy inspection
-and version-matched fixtures for those other sources. No paid native turn or live
-credential was used in this validation.
+Complete remote/server-managed, MDM and registry lifecycle, policy-helper results,
+late policy updates and cloud credential-chain identity remain unestablished.
+Unsupported known combinations fail clearly; full selected-account acceptance
+still requires current-session identity/endpoint evidence and version-matched
+fixtures for those other sources. No paid native turn or live credential was
+used in this validation.

@@ -34,6 +34,9 @@ describe("Claude native configuration inventory", () => {
   });
 
   it("preserves literal defaults, unset state, source provenance and version uncertainty", () => {
+    expect(claudeConfigurationAvailability(setting("autoCompactEnabled"), "2.1.316 (Claude Code)")).toContain("source merging and unset verified");
+    expect(claudeConfigurationAvailability(setting("autoCompactEnabled"), "2.1.317")).not.toContain("unset verified");
+    expect(claudeConfigurationAvailability(setting("allowManagedHooksOnly"), "2.1.316")).toContain("runtime unverified");
     expect(setting("copyOnSelect")).toMatchObject({ nativeDefault: true, defaultKind: "literal", scope: "Global config" });
     expect(setting("copyFullResponse")).toMatchObject({ nativeDefault: false, defaultKind: "literal" });
     expect(setting("modelSettings")).toMatchObject({ minimumVersion: "2.1.251", defaultKind: "unset" });

@@ -3,6 +3,7 @@ import { uploadFileBrowserFile } from "../api.js";
 import { readTerminalPreferences, TERMINAL_DEFAULTS } from "./terminalPreferences.js";
 
 const imageExtensions = new Map([["image/png", "png"], ["image/jpeg", "jpg"], ["image/jpg", "jpg"], ["image/webp", "webp"], ["image/gif", "gif"]]);
+const referenceExtensions = new Set("txt md markdown json jsonl csv tsv log yaml yml toml xml html css js mjs cjs ts tsx jsx py rs go c h cpp hpp java sh sql svg pdf ipynb".split(" "));
 const maxBytes = 20 * 1024 * 1024;
 let sequence = 0;
 
@@ -73,10 +74,12 @@ export class TerminalAttachments {
       this.panel.hidden = false;
       this.entries.add(entry);
       const extension = imageExtensions.get(file.type.toLowerCase());
-      if (!extension) { status.textContent = `${file.name}: unsupported file type. Paste a workspace file citation for non-image files.`; continue; }
-      if (file.size > maxBytes || !file.size) { status.textContent = `${file.name}: image must be 1 byte–20 MiB.`; continue; }
+      const image = extension !== undefined;
+      if (!image && !referenceExtensions.has(file.name.split(".").at(-1)?.toLowerCase() ?? "")) { status.textContent = `${file.name}: unsupported file type. Use an image, text/code file, PDF or notebook.`; continue; }
+      if (file.size > maxBytes || !file.size) { status.textContent = `${file.name}: attachment must be 1 byte–20 MiB.`; continue; }
       const id = ++sequence;
-      const relativePath = `.cloudx/pasted-images/pasted-image-${Date.now()}-${id}-1.${extension}`;
+      const filename = file.name.replace(/[^\p{L}\p{N}._-]/gu, "_").slice(-160);
+      const relativePath = image ? `.cloudx/pasted-images/pasted-image-${Date.now()}-${id}-1.${extension}` : `.cloudx/pasted-files/pasted-file-${Date.now()}-${id}-${filename}`;
       status.textContent = `${file.name}: waiting to upload`;
       const connection = this.origin.connection();
       this.queue = this.queue.then(async () => {
@@ -88,22 +91,39 @@ export class TerminalAttachments {
             if (!entry.cancelled && !this.disposed) status.textContent = `${file.name}: uploading ${progress.lengthComputable && progress.totalBytes ? `${Math.round(progress.loadedBytes / progress.totalBytes * 100)}%` : `${progress.loadedBytes} bytes`}`;
           });
           if (entry.cancelled || this.disposed) return;
-          if (upload.uploaded !== true || upload.relativePath !== relativePath || upload.bytes !== file.size || typeof upload.path !== "string" || !/^(?:\/|[A-Za-z]:[\\/])/u.test(upload.path) || /[\u0000-\u001f\u007f]/u.test(upload.path)) throw new Error("Upload response does not match the staged image.");
+          if (upload.uploaded !== true || upload.relativePath !== relativePath || upload.bytes !== file.size || typeof upload.path !== "string" || !/^(?:\/|[A-Za-z]:[\\/])/u.test(upload.path) || /[\u0000-\u001f\u007f]/u.test(upload.path)) throw new Error("Upload response does not match the staged attachment.");
           if (!this.origin.connected() || this.origin.connection() !== connection) throw new Error("Terminal disconnected after upload. Remove this staged image and paste again after reconnecting.");
           entry.path = upload.path;
           status.textContent = `${file.name}: uploaded; awaiting insertion into native prompt`;
+          const readiness = document.createElement("label");
+          const ready = document.createElement("input");
+          ready.type = "checkbox";
+          readiness.append(ready, "Native prompt is ready for insertion");
           const insert = document.createElement("button");
-          insert.textContent = "Insert image into native prompt";
+          insert.textContent = image ? "Insert image into native prompt" : "Insert file reference into native prompt";
+          insert.disabled = true;
+          ready.onchange = () => { insert.disabled = !ready.checked; };
           insert.onclick = () => {
             if (entry.cancelled || this.disposed || !entry.path) return;
-            if (!this.origin.connected()) { status.textContent = `${file.name}: reconnect before insertion`; return; }
+            if (!ready.checked) return;
+            if (!this.origin.connected() || this.origin.connection() !== connection) { status.textContent = `${file.name}: terminal connection changed; remove this staged attachment and upload again`; return; }
             // Native image detection expects one raw path per bracketed paste.
             this.terminal.focus();
-            this.terminal.paste(entry.path);
-            status.textContent = `${file.name}: path sent; verify the image in the native prompt. Remove it there before submitting if needed.`;
+            this.terminal.paste(image ? entry.path : ` @${/\s/u.test(entry.path) ? JSON.stringify(entry.path) : entry.path} `);
+            status.textContent = `${file.name}: path sent; verify the ${image ? "image" : "file reference"} in the native prompt. Remove it there before submitting if needed.`;
             insert.remove();
+            readiness.remove();
             remove.textContent = "Dismiss attachment status";
+            const confirm = document.createElement("button");
+            confirm.textContent = image ? "I can see the native image" : "I can see the native file reference";
+            confirm.onclick = () => {
+              if (!this.origin.connected() || this.origin.connection() !== connection) { status.textContent = `${file.name}: terminal connection changed; check its native prompt before submitting`; return; }
+              status.textContent = `${file.name}: confirmed in the native prompt by you. Its current contents and removal are owned by the native prompt.`;
+              confirm.remove();
+            };
+            row.insertBefore(confirm, remove);
           };
+          row.insertBefore(readiness, remove);
           row.insertBefore(insert, remove);
         } catch (error) {
           if (!entry.cancelled && !this.disposed) status.textContent = `${file.name}: ${error instanceof Error ? error.message : String(error)}`;

@@ -70,6 +70,9 @@ export interface ClaudeHomeOverlay {
   rulesSkillsRoot: string;
   // CloudX hook settings, passed with --settings.
   settingsPath: string;
+  // CloudX additions use a separate native prompt input so personal imports
+  // keep their source file and native import-depth budget.
+  instructionsPath: string;
   systemRules: CloudxRule[];
 }
 
@@ -81,17 +84,21 @@ export function claudeUserStatePath(env: NodeJS.ProcessEnv): string {
   return path.join(env.HOME?.trim() || os.homedir(), ".claude.json");
 }
 
-async function isTrustedByUser(statePath: string, cwd: string): Promise<boolean> {
+const PROJECT_TRUST_KEYS = ["hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved", "hasClaudeMdExternalIncludesWarningShown"] as const;
+type ProjectTrust = Partial<Record<typeof PROJECT_TRUST_KEYS[number], boolean>>;
+
+async function userProjectTrust(statePath: string, cwd: string): Promise<ProjectTrust> {
   try {
     const stat = await fsp.stat(statePath);
-    if (!stat.isFile() || stat.size > 16 * 1024 * 1024) return false;
+    if (!stat.isFile() || stat.size > 16 * 1024 * 1024) return {};
     const state: unknown = JSON.parse(await fsp.readFile(statePath, "utf8"));
-    if (!state || typeof state !== "object") return false;
+    if (!state || typeof state !== "object") return {};
     const projects = (state as Record<string, unknown>).projects;
     const project = projects && typeof projects === "object" ? (projects as Record<string, unknown>)[cwd] : undefined;
-    return Boolean(project && typeof project === "object" && (project as Record<string, unknown>).hasTrustDialogAccepted === true);
+    if (!project || typeof project !== "object" || Array.isArray(project)) return {};
+    return Object.fromEntries(PROJECT_TRUST_KEYS.filter(key => typeof (project as Record<string, unknown>)[key] === "boolean").map(key => [key, (project as Record<string, unknown>)[key]]));
   } catch {
-    return false;
+    return {};
   }
 }
 
@@ -112,8 +119,9 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   await replaceLink(path.join(options.accountHome, ".credentials.json"), path.join(configDir, ".credentials.json"));
   await ensureClaudeSettingsFile(options.providerHome);
   for (const name of SHARED_ENTRIES) await replaceLink(path.join(options.providerHome, name), path.join(configDir, name));
-  const trusted = options.trustProject === true || Boolean(options.cwd && options.userStatePath && await isTrustedByUser(options.userStatePath, options.cwd));
-  await new ClaudeGlobalPreferences(options.dataDir).seed(configDir, options.userStatePath, state => seedClaudeState(state, options.cwd, trusted));
+  const projectTrust = options.cwd && options.userStatePath ? await userProjectTrust(options.userStatePath, options.cwd) : {};
+  const trusted = options.trustProject === true || projectTrust.hasTrustDialogAccepted === true;
+  await new ClaudeGlobalPreferences(options.dataDir).seed(configDir, options.userStatePath, state => seedClaudeState(state, options.cwd, trusted, projectTrust));
 
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
@@ -126,11 +134,12 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
     cloudxSkillNames: generated.map(skill => skill.directory)
   });
   await materializeSkills(configDir, options.providerHome, generated, policy);
-  await writeInstructions(configDir, options.providerHome, options.resolved, systemRules);
+  await replaceLink(path.join(options.providerHome, "CLAUDE.md"), path.join(configDir, "CLAUDE.md"));
+  const instructionsPath = await writeInstructions(configDir, options.resolved, systemRules);
   const settingsPath = path.join(configDir, ".cloudx-settings.json");
   const launchSettings = { ...policy.settings, ...accountPolicy.settings, ...hookSettings(configDir, options.tabId, options.executionId) };
   await writeAtomic(settingsPath, `${JSON.stringify(launchSettings, null, 2)}\n`);
-  return { configDir, rulesSkillsRoot, settingsPath, systemRules };
+  return { configDir, rulesSkillsRoot, settingsPath, instructionsPath, systemRules };
 }
 
 // CloudX passes its hooks and skill policy with --settings. The hooks are
@@ -153,12 +162,12 @@ function hookSettings(configDir: string, tabId: string, executionId: string): Re
 // The launch environment's value for every account variable, or empty, which
 // Claude Code treats as unset. Sent with --settings, it outranks the env block
 // of every user, project and local settings file.
-function seedClaudeState(state: Record<string, unknown>, cwd: string | undefined, trustProject: boolean): void {
+function seedClaudeState(state: Record<string, unknown>, cwd: string | undefined, trustProject: boolean, projectTrust: ProjectTrust): void {
   state.hasCompletedOnboarding = true;
-  if (trustProject && cwd) {
+  if (cwd && (trustProject || Object.keys(projectTrust).length)) {
     const projects = state.projects && typeof state.projects === "object" && !Array.isArray(state.projects) ? state.projects as Record<string, unknown> : {};
     const current = projects[cwd] && typeof projects[cwd] === "object" ? projects[cwd] as Record<string, unknown> : {};
-    projects[cwd] = { ...current, hasTrustDialogAccepted: true };
+    projects[cwd] = { ...projectTrust, ...current, ...(trustProject ? { hasTrustDialogAccepted: true } : {}) };
     state.projects = projects;
   }
 }
@@ -224,25 +233,16 @@ async function writeCatalogSkillEntrypoint(source: string, target: string): Prom
 
 async function writeInstructions(
   configDir: string,
-  providerHome: string,
   resolved: ResolvedPersonalityTemplate | undefined,
   systemRules: CloudxRule[]
-): Promise<void> {
-  const target = path.join(configDir, "CLAUDE.md");
-  const basePath = path.join(providerHome, "CLAUDE.md");
-  let base: string | undefined;
-  try { base = await fsp.readFile(basePath, "utf8"); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+): Promise<string> {
+  const target = path.join(configDir, ".cloudx-instructions.md");
   const rules = resolved?.rules ?? [];
-  if (!base?.trim() && systemRules.length === 0 && rules.length === 0) {
-    await fsp.rm(target, { force: true });
-    return;
-  }
   const sections = ["# CloudX Claude Session Instructions"];
-  if (base?.trim()) sections.push("", "## Base Claude Home Instructions", "", base.trim());
   if (systemRules.length) sections.push("", "## CloudX System Rules", "", ...systemRules.map(rule => `- ${rule.text}`));
   if (resolved && rules.length) sections.push("", `## CloudX Template: ${resolved.template.name}`, "", ...rules.map(rule => `- ${rule.text}`));
   await writeAtomic(target, `${sections.join("\n").trimEnd()}\n`);
+  return target;
 }
 
 function writeAtomic(target: string, content: string): Promise<void> {

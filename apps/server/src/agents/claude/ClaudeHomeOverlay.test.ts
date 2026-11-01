@@ -18,6 +18,23 @@ async function fixture() {
 }
 
 describe("Claude personal configuration inheritance", () => {
+  it.each([false, true])("preserves only the current project's native import approval (%s) and keeps later tab decisions", async approved => {
+    const input = await fixture();
+    const cwd = path.join(input.root, "project");
+    const project = { hasTrustDialogAccepted: true, hasClaudeMdExternalIncludesApproved: approved, hasClaudeMdExternalIncludesWarningShown: true };
+    const personal = { oauthAccount: "private", projects: { [cwd]: { ...project, allowedTools: ["private"] }, "/other": { hasTrustDialogAccepted: true } } };
+    await fs.writeFile(input.userStatePath, JSON.stringify(personal));
+    const overlay = await materializeClaudeHomeOverlay({ ...input, cwd });
+    const statePath = path.join(overlay.configDir, ".claude.json");
+    const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+    expect(state.projects).toEqual({ [cwd]: project });
+    state.projects[cwd].hasClaudeMdExternalIncludesApproved = !approved;
+    await fs.writeFile(statePath, JSON.stringify(state));
+    await materializeClaudeHomeOverlay({ ...input, cwd });
+    expect(JSON.parse(await fs.readFile(statePath, "utf8")).projects[cwd].hasClaudeMdExternalIncludesApproved).toBe(!approved);
+    expect(JSON.parse(await fs.readFile(input.userStatePath, "utf8"))).toEqual(personal);
+  });
+
   it("inherits only the supported personal preferences while isolating account and tab state", async () => {
     const input = await fixture();
     const personal = { copyOnSelect: false, copyFullResponse: true, externalEditorContext: true, oauthAccount: { token: "fake-personal" }, unrelated: "private", projects: { "/trusted": { hasTrustDialogAccepted: true } } };
@@ -90,7 +107,7 @@ describe("Claude personal configuration inheritance", () => {
     await expect(materializeClaudeHomeOverlay(input)).rejects.toThrow("Invalid CloudX Claude global preferences");
   });
 
-  it("preserves personal instruction import depth and shares unflattened nested and path-scoped rules", async () => {
+  it("retains the personal source file and import depth while adding CloudX instructions separately", async () => {
     const input = await fixture();
     const base = "Personal instructions.\n@rules/preferences.md\n@missing.md\n";
     const scoped = "---\npaths:\n  - '**/*.ts'\n---\nUse TypeScript conventions.\n";
@@ -100,9 +117,13 @@ describe("Claude personal configuration inheritance", () => {
     await fs.writeFile(path.join(input.providerHome, "rules", "nested", "format.md"), scoped);
     const overlay = await materializeClaudeHomeOverlay(input);
     const instructions = await fs.readFile(path.join(overlay.configDir, "CLAUDE.md"), "utf8");
-    expect(instructions).toContain(base.trim());
+    expect(instructions).toBe(base);
+    expect(await fs.readlink(path.join(overlay.configDir, "CLAUDE.md"))).toBe(path.join(input.providerHome, "CLAUDE.md"));
     expect(instructions).not.toContain(`@${path.join(input.providerHome, "CLAUDE.md").replace(/ /gu, "\\ ")}`);
     expect(instructions).not.toContain("Use TypeScript conventions");
+    const additions = await fs.readFile(overlay.instructionsPath, "utf8");
+    expect(additions).toContain("# CloudX Claude Session Instructions");
+    expect(additions).not.toContain("Personal instructions");
     expect(await fs.readlink(path.join(overlay.configDir, "rules"))).toBe(path.join(input.providerHome, "rules"));
     expect(await fs.readFile(path.join(overlay.configDir, "rules", "nested", "format.md"), "utf8")).toBe(scoped);
     expect(await fs.readFile(path.join(input.providerHome, "CLAUDE.md"), "utf8")).toBe(base);

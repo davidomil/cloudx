@@ -30,6 +30,7 @@ export interface CodexGlobalSettings {
 }
 
 export interface CodexLaunchPolicyInspection {
+  launchRecord?: import("./agentLaunchRecord.js").AgentLaunchRecord;
   tabId: string;
   sourcePath: string;
   observation: "generated-config-on-disk";

@@ -20,6 +20,14 @@ export class ClaudeSettingsPlugin implements WorkspacePlugin {
     const nullable = (schema: Record<string, unknown>) => ({ anyOf: [schema, { type: "null" }] });
     this.hooks = [
       {
+        id: "claude-settings.inspect-launch", owner,
+        title: "Inspect recorded Claude launch",
+        description: "Read an existing tab's launch-time identity and source fingerprints without starting or changing a native client.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: { tabId: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" } }, required: ["tabId"], additionalProperties: false },
+        execute: async input => ({ launchRecord: await settings.inspectLaunch(input.tabId as string) }),
+      },
+      {
         id: CLAUDE_SETTINGS_HOOKS.read, owner,
         title: "Read Claude settings",
         description: "Read Claude Code defaults, CloudX launch preferences, bypass consent and the installed Claude Code version.",

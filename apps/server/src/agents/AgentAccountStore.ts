@@ -22,6 +22,7 @@ import { resolveCodexHome } from "../rulesSkills/CodexHomeOverlay.js";
 import type { EnforcedEnv } from "../terminal/ShellLaunch.js";
 import { agentCommand, claudeAccountLaunch, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
 import { assertClaudeAccountCompatibility } from "./claude/ClaudeAccountPreflight.js";
+import { parseClaudeNativeAccountStatus } from "./claude/ClaudeNativeSettings.js";
 
 const ACCOUNTS_FILE = "agent-accounts.json";
 const ACCOUNTS_DIRECTORY = "agent-accounts";
@@ -228,14 +229,7 @@ export class AgentAccountStore {
     if (account.providerId === "claude") {
       const launch = await this.claudeAccountCommand(account);
       const result = await runAgentCli(command, [...launch.args, "auth", "status", "--json"], { env: launch.env, cwd: home, signal });
-      try {
-        const parsed: unknown = JSON.parse(result.stdout);
-        if (isRecord(parsed)) return {
-          loggedIn: parsed.loggedIn === true,
-          ...(typeof parsed.authMethod === "string" ? { authMethod: parsed.authMethod.slice(0, 64) } : {})
-        };
-      } catch { /* reported below */ }
-      throw new AgentAccountError("Claude Code did not report a readable login status. Check the installed Claude Code version.", 502);
+      return parseClaudeNativeAccountStatus(result, launch.policy);
     }
     const result = await runAgentCli(command, ["login", "status"], { env: { ...this.env, CODEX_HOME: home }, cwd: home, signal });
     const summary = `${result.stdout}\n${result.stderr}`.split(/\r?\n/u).map(line => line.trim()).find(line => /logged in/iu.test(line));

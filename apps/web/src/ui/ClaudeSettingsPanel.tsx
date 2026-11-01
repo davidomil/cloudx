@@ -16,6 +16,7 @@ import {
 
 import { ControlButton } from "./Control.js";
 import { ClaudeConfigurationCatalog } from "./ClaudeConfigurationCatalog.js";
+import { ClaudeLaunchInspection } from "./ClaudeLaunchInspection.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
@@ -245,13 +246,14 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
         <summary>Defaults and launch policy</summary>
         <p>Fresh CloudX defaults: bypass permissions, automatic workspace trust, no personal or synced names selected. Saved choices remain unchanged. Native permission defaults depend on the surface, and native skills and memory normally have their own defaults; CloudX overrides these only for its launches.</p>
         <p>Skill sources are separate: CloudX system catalog and selected template are supplied by CloudX; personal and claude.ai synced rows show filesystem availability and saved selection. Bundled, plugin and known project sources receive launch exclusions. Managed skills and dynamically added directories are not verified here. A cached synced skill is not proof of its selected-account or selected-version provenance.</p>
-        <p>Clipboard/editor preferences start from the personal .claude.json. Native /config changes to copyOnSelect, copyFullResponse and externalEditorContext are retained separately for future CloudX tabs; existing tabs keep their own values. If several tabs change a choice, the latest native configuration file wins at the next launch. Account credentials and trust state stay isolated, and the personal file is unchanged. Personal keybindings and rules are shared from the native home. Use /keybindings and native --debug diagnostics for invalid bindings. Browser clipboard and external-editor delivery require separate host support.</p>
-        <p>CloudX receipts require compatible native hooks. Detected file-backed hook restrictions stop launch with a diagnostic; remote/MDM/registry policies and later changes are not verified by this panel. Selected-account credentials and intentional service routing override settings environment variables; managed provider policy still needs native verification. Credential values are never shown here.</p>
+        <p>Clipboard/editor preferences start from the personal .claude.json. Native /config changes to copyOnSelect, copyFullResponse and externalEditorContext are retained separately for future CloudX tabs; existing tabs keep their own values. If several tabs change a choice, the latest native configuration file wins at the next launch. Account credentials and trust state stay isolated, and the personal file is unchanged. Personal keybindings and rules are shared from the native home. Personal instruction imports retain their original relative directory and depth budget; original-root exclusion patterns still need native identity support. Use /keybindings and native --debug diagnostics for invalid bindings. Browser clipboard and external-editor delivery require separate host support.</p>
+        <p>CloudX receipts require compatible native hooks. File-backed restrictions stop launch with a diagnostic. Forge waits for its actual execution-bound startup receipt before submitting work; a missing receipt stops the worker. Interactive tabs report unavailable tracking when startup receipts are missing. The selected account and service routing are checked against native authentication status without a model turn. This checks native provider/account selection at launch; later managed policy or cloud credential refresh still belongs to the native client. Credential values are never shown here.</p>
         <p>Native agent view, background agents and native worktrees have no established CloudX ownership, status, recovery or cleanup contract. They are unsupported as managed CloudX sessions.</p>
         <p><a href="https://code.claude.com/docs/en/settings-reference" target="_blank" rel="noreferrer">Official native settings and defaults</a> · <a href="https://code.claude.com/docs/en/settings" target="_blank" rel="noreferrer">Scope, precedence and reload behavior</a>. The catalog below inventories the retained references; runtime certification and additional native editors remain explicitly unverified or unavailable.</p>
       </details>
 
       <ClaudeConfigurationCatalog settings={settings} version={cli?.version} nativeOptions={draft.nativeOptions} disabled={busy !== null} onChange={(key, value) => set("nativeOptions", { ...draft.nativeOptions, [key]: value })} />
+      <ClaudeLaunchInspection callHook={callHook} disabled={busy !== null} />
 
       <div className="codex-settings-save">
         <div className="codex-settings-actions">

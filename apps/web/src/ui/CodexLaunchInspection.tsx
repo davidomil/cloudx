@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { CodexLaunchPolicyInspection } from "@cloudx/shared";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 import { ControlButton } from "./Control.js";
+import { AgentLaunchRecordView } from "./AgentLaunchRecordView.js";
 
 export function CodexLaunchInspection({ callHook, disabled = false }: { callHook: NonNullable<UiContributionRenderContext["callHook"]>; disabled?: boolean }) {
   const [tabId, setTabId] = useState("");
@@ -27,6 +28,7 @@ export function CodexLaunchInspection({ callHook, disabled = false }: { callHook
     {error ? <p role="alert">{error}</p> : null}
     {inspection ? <>
       <p>Observed generated file: {inspection.sourcePath}. Tab: {inspection.tabId}.</p>
+      {inspection.launchRecord ? <AgentLaunchRecordView record={inspection.launchRecord} /> : <p>No launch-time record exists for this execution. Its historical version, account and arguments remain unobserved.</p>}
       <table><thead><tr><th>Skill path and source</th><th>Availability</th><th>Fresh default</th><th>Recorded launch selection</th><th>Provenance</th></tr></thead><tbody>
         {inspection.skills.map((skill, index) => <tr key={`${index}-${skill.path}`}><th>{skill.path}<small>{skill.source}</small></th><td>{skill.available ? "SKILL.md present" : "Missing"}</td><td>{skill.freshDefault}</td><td>{skill.enabled ? "Enabled" : "Disabled"}</td><td>{skill.provenance}</td></tr>)}
       </tbody></table>

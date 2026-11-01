@@ -24,6 +24,7 @@ import {
 import { JsonStateFile, writeTextFileAtomic } from "../../jsonStateFile.js";
 import { agentCommand, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } from "../agentCli.js";
 import { discoverClaudeUserSkills, type ClaudeUserSkill } from "./claudeSkillPolicy.js";
+import { AgentLaunchRecords } from "../AgentLaunchRecords.js";
 
 const MAX_SETTINGS_BYTES = 1024 * 1024;
 const UPDATE_TIMEOUT_MS = 5 * 60_000;
@@ -69,7 +70,7 @@ export class ClaudeSettingsService {
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
-    dataDir: string,
+    private readonly dataDir: string,
     private readonly providerHome: () => string,
     private readonly env: NodeJS.ProcessEnv = process.env
   ) {
@@ -78,6 +79,10 @@ export class ClaudeSettingsService {
 
   async launchPreferences(): Promise<ClaudeLaunchPreferences> {
     return parsePreferences(await this.preferences.read<unknown>());
+  }
+
+  inspectLaunch(tabId: string) {
+    return new AgentLaunchRecords(this.dataDir).read(tabId, "claude");
   }
 
   async read(): Promise<ClaudeGlobalSettings> {
