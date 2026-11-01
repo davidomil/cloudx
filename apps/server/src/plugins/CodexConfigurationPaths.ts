@@ -1,13 +1,13 @@
 import os from "node:os";
 import path from "node:path";
 import type { TomlTable } from "smol-toml";
-import { codexConfigurationValidationSchema, inventoryCodexConfiguration } from "@cloudx/shared";
+import { CODEX_CONFIGURATION_VERSIONS, codexConfigurationValidationSchema, inventoryCodexConfiguration } from "@cloudx/shared";
 
 // Native loader resolves typed path fields before merging layers, preserving the original shape:
 // https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/config/src/loader/mod.rs#L1438
-const pathPatterns = [...inventoryCodexConfiguration(codexConfigurationValidationSchema("0.162.1"))]
+const pathPatterns = Object.keys(CODEX_CONFIGURATION_VERSIONS).flatMap(version => [...inventoryCodexConfiguration(codexConfigurationValidationSchema(version))]
   .filter(([, nodes]) => nodes.some(node => node.$ref === "#/definitions/AbsolutePathBuf" || node.$ref === "#/definitions/LegacyAppPathString"))
-  .map(([key]) => key.split("."));
+  .map(([key]) => key.split(".")));
 
 /** Keep source-file path meaning when config is copied into a probe or launch home. */
 export function resolveCodexConfigurationPaths(config: TomlTable, sourceHome: string, userHome = os.homedir()): TomlTable {

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Download } from "lucide-react";
-import { isExactCodexVersion, parseCodexReleaseCatalog, parseCodexUpdateStatus, type CodexReleaseCatalog, type CodexUpdateStatus } from "@cloudx/shared";
+import { codexConfigurationVersionReviewed, CODEX_CONFIGURATION_BASELINE_VERSION, isExactCodexVersion, parseCodexReleaseCatalog, parseCodexUpdateStatus, type CodexReleaseCatalog, type CodexUpdateStatus } from "@cloudx/shared";
 
 import { HttpError } from "../api.js";
 import { ControlButton } from "./Control.js";
@@ -156,6 +156,9 @@ export function CodexUpdateControl({ callHook }: { callHook: CallHook }) {
       <ControlButton disabled={active} onClick={() => setReleaseRevision(value => value + 1)}>Reload releases</ControlButton>
     </div>
     <p>Selection preview: active <strong>{update?.activeVersion ?? "Unavailable"}</strong> → requested <strong>{selectedVersion || "Choose a version"}</strong>.</p>
+    {selectedVersion ? <p aria-label="Selected release Settings coverage">{codexConfigurationVersionReviewed(selectedVersion)
+      ? `Reviewed Settings catalog: ${selectedVersion}. Native options remain editable for this exact version.`
+      : `No reviewed Settings catalog for ${selectedVersion}. You can select this release, but native option writes will be blocked. Latest reviewed catalog: ${CODEX_CONFIGURATION_BASELINE_VERSION}; it will not be substituted for your selection.`}</p> : null}
     <div className="codex-settings-actions">
       <ControlButton disabled={blocked || !update || active || !selectedRelease || Boolean(selectionError)} onClick={() => { void startUpdate.current?.(selectedVersion); }}>
         <Download size={16} aria-hidden="true" /> Apply selected version

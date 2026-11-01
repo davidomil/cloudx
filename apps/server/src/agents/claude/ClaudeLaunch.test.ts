@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 
 import { buildClaudeLaunchArgs, findClaudeTranscript } from "./ClaudeLaunch.js";
-import { claudeLaunchEnv } from "../agentCli.js";
+import { claudeEnforcedEnv, claudeLaunchEnv } from "../agentCli.js";
+import { CLAUDE_ACCOUNT_ENV_KEYS, CLAUDE_SERVICE_ROUTING_KEYS } from "./claudeAccountPolicy.js";
 import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { CodexConversationRecovery } from "../../plugins/CodexConversationRecovery.js";
@@ -49,8 +50,19 @@ describe("claudeLaunchEnv", () => {
       PATH: "/bin", ANTHROPIC_API_KEY: "inherited", CLAUDECODE: "1", CODEX_HOME: "/codex",
       CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_SESSION_ID: "parent", CLAUDE_CODE_MESSAGING_SOCKET: "/run/sock"
     }, "/overlay", {});
-    expect(env).toEqual({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/overlay" });
+    expect(env).toEqual({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/overlay", ANTHROPIC_CONFIG_DIR: "/overlay/anthropic-auth" });
     expect(claudeLaunchEnv({}, "/overlay", { ANTHROPIC_API_KEY: "account" })).toMatchObject({ ANTHROPIC_API_KEY: "account" });
+  });
+
+  it("clears newer account credentials and reapplies intentional service routing after the login profile", () => {
+    const base = { PATH: "/bin", ANTHROPIC_AWS_API_KEY: "fake-inherited", ANTHROPIC_FOUNDRY_API_KEY: "fake-inherited", CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_BEDROCK_MANTLE_BASE_URL: "https://gateway.invalid" };
+    const selected = claudeLaunchEnv(base, "/overlay", {});
+    expect(selected.ANTHROPIC_AWS_API_KEY).toBeUndefined();
+    expect(selected.ANTHROPIC_FOUNDRY_API_KEY).toBeUndefined();
+    expect(selected.CLAUDE_CODE_USE_MANTLE).toBe("1");
+    const enforced = claudeEnforcedEnv("/overlay", {}, selected);
+    expect(enforced.set).toMatchObject({ CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_BEDROCK_MANTLE_BASE_URL: "https://gateway.invalid", CLAUDE_CONFIG_DIR: "/overlay" });
+    expect(enforced.unset).toEqual(expect.arrayContaining(["ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE", ...CLAUDE_SERVICE_ROUTING_KEYS]));
   });
 });
 
@@ -67,8 +79,11 @@ describe("Claude overlay and hook receipts", () => {
     const env = async (launchEnv: NodeJS.ProcessEnv) => JSON.parse(await fs.readFile((await materializeClaudeHomeOverlay({ ...options, launchEnv })).settingsPath, "utf8")).env;
 
     const configDir = path.join(root, "data", "claude-launches", "tab-1");
-    const cleared = { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "", CLAUDE_CODE_OAUTH_TOKEN: "", ANTHROPIC_BASE_URL: "", CLAUDE_CODE_USE_BEDROCK: "", CLAUDE_CODE_USE_VERTEX: "", CLAUDE_CODE_USE_FOUNDRY: "", CLAUDE_CONFIG_DIR: configDir };
+    const cleared = { ...Object.fromEntries(CLAUDE_ACCOUNT_ENV_KEYS.map(key => [key, ""])), CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth") };
     expect(await env({ PATH: "/bin" })).toEqual(cleared);
+    // Fake native settings cannot retain the newer provider selectors or key.
+    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_USE_ANTHROPIC_AWS: "1", CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_AWS_API_KEY: "fake-other-account" } }));
+    expect(await env({ ANTHROPIC_API_KEY: "fake-selected" })).toMatchObject({ ANTHROPIC_API_KEY: "fake-selected", CLAUDE_CODE_USE_ANTHROPIC_AWS: "", CLAUDE_CODE_USE_MANTLE: "", ANTHROPIC_AWS_API_KEY: "" });
     // A selected API key, and an endpoint the CloudX process itself runs with, are kept.
     expect(await env({ ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "https://gateway.example" })).toEqual({ ...cleared, ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "https://gateway.example" });
     expect((await fs.stat(path.join(configDir, ".cloudx-settings.json"))).mode & 0o777).toBe(0o600);

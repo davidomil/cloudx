@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_TERMINAL_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, isAgentProviderId, type AgentAccountsState, type AgentProviderId, type AgentSelection, DEFAULT_WORKSPACE_MAX_PANES, combineAgentUsage, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_TERMINAL_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, isAgentProviderId, type AgentAccountsState, type AgentProviderId, type AgentSelection, DEFAULT_WORKSPACE_MAX_PANES, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -1776,10 +1776,8 @@ export function WindowSwitcher({
   const [error, setError] = useState<string | undefined>();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const tabsById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
-  const agentTabIds = useMemo(() => tabs.filter(isAgentTab).map(tab => tab.id), [tabs]);
-  const usage = useAgentUsage(callHook, open && agentTabIds.length ? { tabIds: agentTabIds } : undefined);
+  const usage = useAgentUsage(callHook, open ? { windowIds: windows.map(window => window.id) } : undefined);
   const usageHover = useUsageHover();
-  const windowAgentTabIds = (window: WorkspaceWindow) => windowTabIds(window, tabsById).filter(tabId => isAgentTab(tabsById.get(tabId)!));
 
   useOutsidePointerDismiss(open, rootRef, () => onOpenChange(false));
 
@@ -1900,13 +1898,12 @@ export function WindowSwitcher({
           <div className="window-list">
             {visibleWindows.map((window) => {
               const tabCount = tabCountForWindow(window, tabsById);
-              const agentIds = windowAgentTabIds(window);
               return (
                 <div key={window.id} className={`window-menu-row ${window.id === activeWindow?.id ? "selected" : ""}`}>
                   <button type="button" className="window-row-main" onClick={() => void onSelect(window.id)}
-                    {...(usage ? usageHover.handlers(window.name, { tabIds: agentIds }) : {})}>
+                    {...(usage ? usageHover.handlers(window.name, { windowIds: [window.id] }) : {})}>
                     <span>{window.name}</span>
-                    <small>{tabCount} tabs{windowUsageText(agentIds, usage)} · {window.defaultCwd}</small>
+                    <small>{tabCount} tabs{windowUsageText(window.id, usage)} · {window.defaultCwd}</small>
                   </button>
                   <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => openEditDialog(window)} title={`Edit ${window.name}`} aria-label={`Edit ${window.name}`}>
                     <Wrench size={14} />
@@ -1980,10 +1977,9 @@ function tabCountForWindow(window: WorkspaceWindow, tabsById: Map<string, Worksp
   return windowTabIds(window, tabsById).length;
 }
 
-function windowUsageText(tabIds: string[], usage: AgentUsageReadResult | undefined): string {
-  const summaries = tabIds.map(tabId => usage?.tabs[tabId]).filter(summary => summary !== undefined);
-  const total = combineAgentUsage(summaries);
-  return total.totals.requests ? ` · ${usageLine(total)}` : "";
+export function windowUsageText(windowId: string, usage: AgentUsageReadResult | undefined): string {
+  const total = usage?.windows[windowId];
+  return total?.totals.requests ? ` · ${usageLine(total)}` : "";
 }
 
 function WindowDeleteWarning({ window, tabCount, onCancel, onConfirm }: { window: WorkspaceWindow; tabCount: number; onCancel: () => void; onConfirm: () => void }) {

@@ -1263,9 +1263,9 @@ const CLAUDE_SANDBOX_ARGS: Record<CodexExecInput["sandbox"], string[]> = {
 async function runClaudeAutomationExec(input: CodexExecInput, accounts: AgentAccountStore | undefined): Promise<CodexExecResult> {
   if (!accounts) throw new Error("Claude automation runs need the agent account store.");
   if (input.profile) throw new Error("Codex profiles do not apply to Claude models. Remove the profile input.");
-  const env = await accounts.defaultClaudeEnv(process.env);
+  const { env, args: accountArgs } = await accounts.defaultClaudeLaunch(process.env);
   const args = [
-    "-p",
+    ...accountArgs, "-p",
     "--output-format", input.json ? "json" : "text",
     "--model", input.model!,
     ...CLAUDE_SANDBOX_ARGS[input.sandbox],

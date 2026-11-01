@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ClaudeSettingsService, ensureClaudeSettingsFile } from "./ClaudeSettingsService.js";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
@@ -41,7 +41,7 @@ describe("ClaudeSettingsService", () => {
     });
     expect(after).toMatchObject({ model: "claude-sonnet-5-5", effortLevel: "high", alwaysThinkingEnabled: false, fastMode: null, outputStyle: "Explanatory" });
     expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual({
-      theme: "dark", hooks: { Stop: [] }, model: "claude-sonnet-5-5", effortLevel: "high", alwaysThinkingEnabled: false,
+      theme: "dark", hooks: { Stop: [] }, model: "claude-sonnet-5-5", modelSettings: { "claude-sonnet-5-5": { effortLevel: "high" } }, alwaysThinkingEnabled: false,
       outputStyle: "Explanatory", language: "english", autoUpdatesChannel: "stable"
     });
     await expect(service.update({ expectedRevision: before.revision, model: "opus" })).rejects.toThrow("changed. Reload");
@@ -101,8 +101,104 @@ describe("ClaudeSettingsService", () => {
     const expectedRevision = (await service.read()).revision;
     await expect(service.update({ expectedRevision, model: "gpt-6.1-sol" })).rejects.toThrow("Claude model id or alias");
     await expect(service.update({ expectedRevision, effortLevel: "max" as never })).rejects.toThrow("effort level");
+    await expect(service.update({ expectedRevision, autoUpdatesChannel: "rc" as never, permissionMode: "plan" })).rejects.toThrow("update channel");
     await expect(service.update({ expectedRevision, language: "x\n" })).rejects.toThrow("short name");
     await expect(service.update({ expectedRevision, unexpected: true } as never)).rejects.toThrow("Invalid Claude settings update");
+  });
+
+  it("keeps per-model effort, compaction settings and legacy values separate", async () => {
+    const { service, providerHome } = await setup({
+      model: "claude-opus-5-5", effortLevel: "low", modelSettings: {
+        "claude-opus-5-5": { effortLevel: "high", maxEffortLevel: "xhigh", autoCompactWindow: 200000 },
+        "claude-sonnet-5-5": { effortLevel: "medium" }
+      }
+    });
+    vi.spyOn(service, "cliStatus").mockResolvedValue({ installed: true, command: "fixture", version: "2.1.290 (Claude Code)" });
+    expect(await service.read()).toMatchObject({ effortLevel: "high", legacyEffortLevel: "low", modelEffortLevels: { "claude-sonnet-5-5": "medium" } });
+    await service.update({ expectedRevision: (await service.read()).revision, effortModel: "claude-opus-5-5", effortLevel: "xhigh" });
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toMatchObject({
+      effortLevel: "low", modelSettings: { "claude-opus-5-5": { effortLevel: "xhigh", maxEffortLevel: "xhigh", autoCompactWindow: 200000 }, "claude-sonnet-5-5": { effortLevel: "medium" } }
+    });
+    await service.update({ expectedRevision: (await service.read()).revision, effortLevel: null });
+    expect(await service.read()).toMatchObject({ effortLevel: null, legacyEffortLevel: "low" });
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).modelSettings["claude-opus-5-5"])
+      .toEqual({ maxEffortLevel: "xhigh", autoCompactWindow: 200000 });
+  });
+
+  it("rejects ambiguous models, old native effort and malformed model entries before writing either owner", async () => {
+    const { service, providerHome, dataDir } = await setup({ model: "opus", effortLevel: "high" });
+    const expectedRevision = (await service.read()).revision;
+    await expect(service.update({ expectedRevision, effortLevel: "xhigh", autoTrustWorkspace: false })).rejects.toThrow("full Claude model ID");
+    vi.spyOn(service, "cliStatus").mockResolvedValue({ installed: true, command: "fixture", version: "2.1.250 (Claude Code)" });
+    await expect(service.update({ expectedRevision, effortModel: "claude-opus-5-5", effortLevel: "xhigh", autoTrustWorkspace: false })).rejects.toThrow("2.1.251");
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual({ model: "opus", effortLevel: "high" });
+    await expect(fs.stat(path.join(dataDir, "claude-launch-preferences.json"))).rejects.toThrow();
+    vi.mocked(service.cliStatus).mockResolvedValue({ installed: true, command: "fixture", version: "2.1.251 (Claude Code)" });
+    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ modelSettings: { "claude-opus-5-5": [] } }));
+    await expect(service.update({ expectedRevision: (await service.read()).revision, effortModel: "claude-opus-5-5", effortLevel: "high" })).rejects.toThrow("must be an object");
+  });
+
+  it("rejects unsupported model effort rather than silently saving an ineffective or lowered choice", async () => {
+    const { service, providerHome } = await setup({ model: "claude-haiku-4-5-20251001", modelSettings: { unrelated: { autoCompactWindow: "auto" } } });
+    const expectedRevision = (await service.read()).revision;
+    await expect(service.update({ expectedRevision, effortLevel: "high" })).rejects.toThrow("not supported for this model");
+    await expect(service.update({ expectedRevision, effortModel: "claude-opus-4-6", effortLevel: "xhigh" })).rejects.toThrow("does not support saved xhigh");
+    await service.update({ expectedRevision, effortModel: "claude-opus-4-6-20260205[1m]", effortLevel: "high" });
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).modelSettings)
+      .toEqual({ unrelated: { autoCompactWindow: "auto" }, "claude-opus-4-6": { effortLevel: "high" } });
+  });
+
+  it("lets the user remove an unsupported model effort without discarding unrelated model configuration", async () => {
+    const { service, providerHome } = await setup({ model: "claude-haiku-4-5-20251001", modelSettings: { "claude-haiku-4-5-20251001": { effortLevel: "high", autoCompactWindow: "auto" } } });
+    expect((await service.read()).effortLevel).toBe("high");
+    await service.update({ expectedRevision: (await service.read()).revision, effortLevel: null });
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).modelSettings)
+      .toEqual({ "claude-haiku-4-5-20251001": { autoCompactWindow: "auto" } });
+  });
+
+  it("preserves unsupported saved channels until corrected, and refuses to invoke the updater", async () => {
+    const { service, providerHome, dataDir } = await setup({ autoUpdatesChannel: "rc", unknown: "keep" });
+    const before = await service.read();
+    expect(before.autoUpdatesChannel).toBe("rc");
+    await expect(service.update({ expectedRevision: before.revision, autoUpdatesChannel: "rc" as never, permissionMode: "plan" })).rejects.toThrow("update channel");
+    await expect(fs.stat(path.join(dataDir, "claude-launch-preferences.json"))).rejects.toThrow();
+    await expect(service.updateCli()).rejects.toThrow("unsupported");
+    await service.update({ expectedRevision: before.revision, language: "english" });
+    expect((await service.read()).autoUpdatesChannel).toBe("rc");
+    for (const channel of ["stable", "latest", null] as const) {
+      await service.update({ expectedRevision: (await service.read()).revision, autoUpdatesChannel: channel });
+      expect((await service.read()).autoUpdatesChannel).toBe(channel);
+    }
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual({ unknown: "keep", language: "english" });
+  });
+
+  it("round-trips typed native Boolean options without exposing or replacing unrelated native configuration", async () => {
+    const { service, providerHome } = await setup({ autoScrollEnabled: true, autoCompactEnabled: false, env: { ANTHROPIC_API_KEY: "fake-private" }, sandbox: { enabled: true }, unknown: { keep: 1 } });
+    const before = await service.read();
+    expect(before.nativeOptions).toMatchObject({ autoScrollEnabled: true, autoCompactEnabled: false, prefersReducedMotion: null });
+    expect(JSON.stringify(before)).not.toContain("fake-private");
+    const saved = await service.update({ expectedRevision: before.revision, nativeOptions: { autoScrollEnabled: false, autoCompactEnabled: null, prefersReducedMotion: true } });
+    expect(saved.nativeOptions).toMatchObject({ autoScrollEnabled: false, autoCompactEnabled: null, prefersReducedMotion: true });
+    const native = JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"));
+    expect(native).toEqual({ autoScrollEnabled: false, prefersReducedMotion: true, env: { ANTHROPIC_API_KEY: "fake-private" }, sandbox: { enabled: true }, unknown: { keep: 1 } });
+    for (const nativeOptions of [{ apiKeyHelper: true }, { autoScrollEnabled: "false" }, { disableAllHooks: true }])
+      await expect(service.update({ expectedRevision: saved.revision, nativeOptions } as never)).rejects.toThrow("supported Boolean");
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual(native);
+  });
+
+  it("rejects a documented newer native option before changing either settings owner", async () => {
+    const { service, providerHome, dataDir } = await setup({ bashEditDiffEnabled: true, unrelated: "keep" });
+    vi.spyOn(service, "cliStatus").mockResolvedValue({ installed: true, command: "fixture", version: "2.1.268 (Claude Code)" });
+    const before = await service.read();
+    await expect(service.update({ expectedRevision: before.revision, nativeOptions: { bashEditDiffEnabled: false }, autoTrustWorkspace: false })).rejects.toThrow("requires native 2.1.269");
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual({ bashEditDiffEnabled: true, unrelated: "keep" });
+    await expect(fs.stat(path.join(dataDir, "claude-launch-preferences.json"))).rejects.toThrow();
+    await service.update({ expectedRevision: before.revision, nativeOptions: { bashEditDiffEnabled: null } });
+    vi.mocked(service.cliStatus).mockResolvedValue({ installed: true, command: "fixture", version: "2.1.269 (Claude Code)" });
+    await service.update({ expectedRevision: (await service.read()).revision, nativeOptions: { bashEditDiffEnabled: false } });
+    expect((await service.read()).nativeOptions?.bashEditDiffEnabled).toBe(false);
+    vi.mocked(service.cliStatus).mockResolvedValue({ installed: true, command: "fixture", version: "unparseable native output" });
+    await expect(service.update({ expectedRevision: (await service.read()).revision, nativeOptions: { bashEditDiffEnabled: true } })).rejects.toThrow("Cannot establish");
   });
 });
 

@@ -40,12 +40,12 @@ async function runClaudeExec(
   baseEnv: NodeJS.ProcessEnv = process.env
 ): Promise<string> {
   if (!accounts) throw new Error("Claude requests need the agent account store.");
-  const env = await accounts.defaultClaudeEnv(baseEnv);
+  const { env, args: accountArgs } = await accounts.defaultClaudeLaunch(baseEnv);
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), options.outputPrefix ?? "cloudx-claude-exec-"));
   try {
     const imagePaths = options.imagePaths ?? [];
     const args = [
-      "-p", "--output-format", "json", "--no-session-persistence",
+      ...accountArgs, "-p", "--output-format", "json", "--no-session-persistence",
       "--model", model,
       "--setting-sources", "", "--strict-mcp-config",
       // Images are read with the Read tool; nothing else is allowed.

@@ -37,7 +37,8 @@ function TerminalCopyFixture() {
   const tab: WorkspaceTab = {
     id: tabId,
     pluginId: view === "terminal" ? "standard-terminal" : "codex-terminal",
-    title: view === "terminal" ? "Terminal" : "Codex",
+    title:
+      view === "terminal" ? "Terminal" : view === "claude" ? "Claude" : "Codex",
     cwd: "/workspace",
     status: "running",
     indicator: { color: "green", label: "Running", updatedAt: "2026-10-02" },

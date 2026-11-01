@@ -1,5 +1,5 @@
 import { descriptorFromPlugin, type HookDefinition, type PluginSession, type WorkspacePlugin } from "@cloudx/plugin-api";
-import { CLAUDE_EFFORT_LEVELS, CLAUDE_LAUNCH_PERMISSION_MODES, CLAUDE_SKILL_NAME_PATTERN, CLAUDE_SETTINGS_HOOKS, CLAUDE_SETTINGS_PLUGIN_ID, CLAUDE_UPDATE_CHANNELS, type ClaudeGlobalSettingsUpdate } from "@cloudx/shared";
+import { CLAUDE_BOOLEAN_SETTINGS, CLAUDE_EFFORT_LEVELS, CLAUDE_LAUNCH_PERMISSION_MODES, CLAUDE_SKILL_NAME_PATTERN, CLAUDE_SETTINGS_HOOKS, CLAUDE_SETTINGS_PLUGIN_ID, CLAUDE_UPDATE_CHANNELS, type ClaudeGlobalSettingsUpdate } from "@cloudx/shared";
 
 import { CLAUDE_BYPASS_WARNING, type ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 
@@ -41,6 +41,8 @@ export class ClaudeSettingsPlugin implements WorkspacePlugin {
             expectedRevision: { type: "string", pattern: "^[a-f0-9]{64}$" },
             model: nullable({ type: "string", maxLength: 128 }),
             effortLevel: nullable({ type: "string", enum: [...CLAUDE_EFFORT_LEVELS] }),
+            effortModel: { type: "string", maxLength: 128 },
+            nativeOptions: { type: "object", properties: Object.fromEntries(CLAUDE_BOOLEAN_SETTINGS.map(key => [key, nullable({ type: "boolean" })])), additionalProperties: false },
             alwaysThinkingEnabled: nullable({ type: "boolean" }),
             fastMode: nullable({ type: "boolean" }),
             outputStyle: nullable({ type: "string", maxLength: 64 }),

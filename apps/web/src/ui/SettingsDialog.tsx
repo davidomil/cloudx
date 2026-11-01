@@ -10,6 +10,7 @@ import { CodexSettingsPanel } from "./CodexSettingsPanel.js";
 import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePanel.js";
 import { ForgeConnections } from "./ForgeConnections.js";
 import { AgentAccountsPanel, type AgentLoginTab } from "./AgentAccountsPanel.js";
+import { TerminalPreferencesPanel } from "./TerminalPreferencesPanel.js";
 import { ClaudeSettingsPanel } from "./ClaudeSettingsPanel.js";
 import { AgentPricingPanel } from "./AgentPricingPanel.js";
 import { LogsPanel } from "./LogsPanel.js";
@@ -170,6 +171,12 @@ export function SettingsDialog({
     description: "Appearance, AI controls, and defaults for CloudX.",
     entries: config.globalFields.filter(isUserVisibleConfigField).map(field => fieldEntry(field))
   }];
+  categories.push({
+    id: "terminal",
+    label: "Terminal",
+    description: "Browser host input, links, attachments and terminal display.",
+    entries: [{ id: "host-preferences", searchText: "Terminal host Option Meta font scrollback links citations attachments Shift Enter newline clipboard native shortcuts", content: <TerminalPreferencesPanel />, mountWhenVisible: true }]
+  });
   if (rulesSkillsStore) categories[0].entries.push({
     id: "default-template",
     searchText: `Default template personality ${rulesSkillsStore.templates.map(template => template.name).join(" ")}`,

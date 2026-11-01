@@ -3706,6 +3706,8 @@ a:hover svg {
 .codex-native-options fieldset { min-width: 0; margin-top: 12px; border: 1px solid var(--color-border); border-radius: 6px; }
 .codex-native-options textarea { width: 100%; box-sizing: border-box; resize: vertical; padding: 10px; font-family: monospace; color: var(--color-foreground); background: var(--color-background); border: 1px solid var(--color-border); border-radius: 6px; }
 .codex-native-options p, .codex-native-options li, .codex-native-options legend { overflow-wrap: anywhere; }
+.codex-settings-form table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: var(--font-size-xs); }
+.codex-settings-form th, .codex-settings-form td { padding: 6px; border: 1px solid var(--color-border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
 .codex-settings-form .codex-settings-toggle { display: flex; flex-direction: row; align-items: flex-start; gap: 10px; min-height: 44px; cursor: pointer; }
 .codex-settings-form .codex-settings-toggle input { flex: none; width: 18px; height: 18px; padding: 0; margin: 2px 0 0; accent-color: var(--color-accent); }
 .codex-settings-toggle span { min-width: 0; overflow-wrap: anywhere; }
@@ -8354,3 +8356,17 @@ a:hover svg {
 .agent-pricing-table table { border-collapse: collapse; font-size: 0.85em; }
 .agent-pricing-table th, .agent-pricing-table td { padding: 2px 4px; text-align: left; white-space: nowrap; }
 .agent-pricing-table input { width: 6em; }
+
+.terminal-input-help { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 4px 10px; font-size: var(--font-size-xs); border-bottom: 1px solid var(--color-border); }
+.terminal-input-help details[open] { flex-basis: 100%; }
+.terminal-input-help p { margin: 6px 0; }
+.terminal-touch-selection, .terminal-attachments { position: absolute; z-index: 9; background: var(--color-background); border: 1px solid var(--color-accent); border-radius: 8px; padding: 10px; max-height: 60vh; overflow: auto; }
+.terminal-touch-selection { top: 100%; left: 0; width: min(600px, 95vw); touch-action: auto; }
+.terminal-touch-selection textarea { display: block; width: 100%; height: 200px; user-select: text; touch-action: auto; }
+.terminal-attachments { top: 8px; left: 8px; right: 8px; }
+.terminal-attachments[hidden] { display: none; }
+.terminal-attachments button { margin: 4px 6px; }
+.terminal-link-dialog { width: min(900px, 94vw); max-height: 85vh; background: var(--color-background); color: var(--color-text); border: 1px solid var(--color-accent); border-radius: 8px; padding: 16px; overflow: auto; }
+.terminal-link-dialog p { overflow-wrap: anywhere; }
+.terminal-link-dialog textarea { width: 100%; height: 50vh; white-space: pre; font-family: monospace; }
+.terminal-link-dialog a { margin-right: 12px; }

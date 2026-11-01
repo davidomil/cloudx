@@ -19,6 +19,7 @@ export * from "./directoryOwnership.js";
 export * from "./agents.js";
 import type { AGENT_ACCOUNTS_OPTION_SOURCE } from "./agents.js";
 export * from "./claudeSettings.js";
+export * from "./claudeConfiguration.js";
 export * from "./agentUsage.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-5.6-luna";
@@ -1362,3 +1363,5 @@ export * from "./forgeResources.js";
 export * from "./forgeCheckoutEvidence.js";
 export * from "./forgeGitHistory.js";
 export * from "./forgeDiagnosticSnapshots.js";
+
+export * from "./terminalCapabilities.js";

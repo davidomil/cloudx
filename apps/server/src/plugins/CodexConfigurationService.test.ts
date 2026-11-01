@@ -10,6 +10,7 @@ import { CodexSettingsPlugin } from "./CodexSettingsPlugin.js";
 import { CodexUpdateService } from "./CodexUpdateService.js";
 import { CodexConfigRepairService } from "./CodexConfigRepairService.js";
 import { validateNativeCodexConfiguration } from "./CodexConfigurationProbe.js";
+import { materializeCodexHomeOverlay } from "../rulesSkills/CodexHomeOverlay.js";
 
 vi.mock("../../../../scripts/codex-updater.mjs", () => ({ readCodexVersion: vi.fn(async () => "0.162.1") }));
 vi.mock("./CodexConfigurationProbe.js", () => ({ validateNativeCodexConfiguration: vi.fn(async () => undefined) }));
@@ -28,10 +29,40 @@ async function fixture(text = 'model_verbosity="medium" # preserve preference\n'
   const hooks = new HookRegistry();
   new CodexSettingsPlugin(service, new CodexUpdateService(root), new CodexConfigRepairService(sources)).hooks.forEach(hook => hooks.register(hook));
   const call = (id: string, input: Record<string, unknown> = {}) => hooks.call(id, input, { caller: { kind: "http" } });
-  return { root, home, configPath, service, call };
+  return { root, home, configPath, sources, service, call };
 }
 
 describe("native settings persistence through the hook boundary", () => {
+  it("inspects the actual generated launch skills and redacts credential values without changing the source", async () => {
+    const text = '# CloudX launch preferences: {"defaultSkills":{"imagegen":false,"slides":true}}\n[model_providers.private]\nexperimental_bearer_token="synthetic-secret"\n';
+    const f = await fixture(text);
+    const vendor = path.join(f.home, "skills", ".system", "slides");
+    const project = path.join(f.root, ".agents", "skills", "project");
+    for (const directory of [vendor, project]) { await fs.mkdir(directory, { recursive: true }); await fs.writeFile(path.join(directory, "SKILL.md"), "---\nname: fixture-skill\ndescription: Test fixture skill.\n---\n# Fixture skill\n"); }
+    await materializeCodexHomeOverlay({ dataDir: f.sources.dataDir, sources: f.sources, source: await f.sources.resolve(), tabId: "policy-tab", cwd: f.root, baseEnv: { HOME: f.home } });
+    const before = await fs.readFile(f.configPath, "utf8");
+    const result = await f.call("codex-settings.inspect-launch", { tabId: "policy-tab" });
+    expect(result).toMatchObject({ inspection: { tabId: "policy-tab", observation: "generated-config-on-disk", skills: expect.arrayContaining([expect.objectContaining({ source: "cloudx-system", available: true, enabled: true, freshDefault: "enabled" })]) } });
+    expect(JSON.stringify(result)).not.toContain("synthetic-secret");
+    expect(result).toMatchObject({ inspection: { skills: expect.arrayContaining([
+      expect.objectContaining({ source: "native-vendor-cache", available: true, enabled: true, freshDefault: "disabled", provenance: expect.stringContaining("unverified") }),
+      expect.objectContaining({ source: "native-config", available: true, enabled: false }),
+    ]) } });
+    const environment = await new CodexSettingsService(f.sources, { OPENAI_API_KEY: "private-environment-value", HTTPS_PROXY: "private-proxy-value" }).inspectLaunch("policy-tab");
+    expect(environment.serverEnvironmentKeys).toEqual(["HTTPS_PROXY", "OPENAI_API_KEY"]);
+    expect(JSON.stringify(environment)).not.toContain("private-environment-value");
+    expect(JSON.stringify(environment)).not.toContain("private-proxy-value");
+    expect(JSON.stringify(result)).toContain("launch executable version");
+    expect(await fs.readFile(f.configPath, "utf8")).toBe(before);
+    expect(validateNativeCodexConfiguration).not.toHaveBeenCalled();
+    await expect(f.call("codex-settings.inspect-launch", { tabId: "../escape" })).rejects.toThrow();
+    await expect(f.call("codex-settings.inspect-launch", { tabId: "missing-tab" })).rejects.toThrow(/binding is missing/);
+    const generated = path.join(f.sources.viewPath("policy-tab"), "config.toml");
+    await fs.unlink(generated);
+    await fs.symlink(f.configPath, generated);
+    await expect(f.call("codex-settings.inspect-launch", { tabId: "policy-tab" })).rejects.toThrow();
+    expect(await fs.readFile(f.configPath, "utf8")).toBe(before);
+  });
   it.each([
     ["model", "model", "gpt-6-sol", "gpt-6-astra"],
     ["serviceTier", "service_tier", "priority", "flex"],

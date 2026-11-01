@@ -6,6 +6,27 @@ import { readCodexConfiguration, validateCodexNativeOptions } from "./CodexConfi
 const snapshot = (text = "", version = "0.162.1") => readCodexConfiguration(text, version, "/bin/codex", "/user/config.toml", false);
 
 describe("native Codex settings", () => {
+  it("saves, reloads and unsets newer presets and model hooks without exposing or deleting IdP secrets on unrelated edits", () => {
+    const text = 'web_search="live"\n[mcp_enterprise_managed_auth.idp]\nissuer="https://login.example.test"\nclient_id="public-client"\nclient_secret="private-client-secret" # preserve\n';
+    const before = snapshot(text, "0.166.0");
+    expect(before.blockedReason).toBeNull();
+    expect(JSON.stringify(before)).not.toContain("private-client-secret");
+    const values = { tui: { copy_on_select_clear_selection: true, presets: { "2": { input: "Review this change", label: "Review" } } }, hooks: { PreModelRequest: [{ hooks: [{ type: "command", command: "true" }] }] } };
+    expect(() => validateCodexNativeOptions(values, before, text)).not.toThrow();
+    let saved = text;
+    for (const [family, value] of Object.entries(values)) saved = editCodexConfiguration(saved, family, before.values[family], value);
+    const reloaded = snapshot(saved, "0.166.0");
+    expect(reloaded.values).toMatchObject(values);
+    expect(reloaded.values.web_search).toBe("live");
+    expect(saved).toContain('client_secret="private-client-secret" # preserve');
+    expect(JSON.stringify(reloaded)).not.toContain("private-client-secret");
+    expect(() => validateCodexNativeOptions({ mcp_enterprise_managed_auth: { idp: { client_secret: "replacement" } } }, reloaded, saved)).toThrow(/authentication/);
+    const unset = editCodexConfiguration(saved, "tui", reloaded.values.tui, null);
+    expect(snapshot(unset, "0.166.0").values).not.toHaveProperty("tui");
+    expect(unset).toContain("private-client-secret");
+    expect(snapshot("", "0.167.0").blockedReason).toContain("no reviewed schema");
+    expect(() => validateCodexNativeOptions(values, snapshot("", "0.162.1"), "")).toThrow(/reviewed/);
+  });
   it("redacts authentication values, including nested profile credentials, while publishing environment references", () => {
     const text = '[mcp_servers.private]\ncommand="mcp"\nenv={ SECRET="hidden-value" }\nbearer_token="hidden-token"\nbearer_token_env_var="MCP_TOKEN"\n[model_providers.private]\nname="Provider"\nexperimental_bearer_token="hidden-provider-token"\nenv_key="PROVIDER_KEY"\n';
     const settings = snapshot(text);

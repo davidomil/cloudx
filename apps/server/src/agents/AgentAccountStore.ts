@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +20,8 @@ import {
 import { JsonStateFile, writeTextFileAtomic } from "../jsonStateFile.js";
 import { resolveCodexHome } from "../rulesSkills/CodexHomeOverlay.js";
 import type { EnforcedEnv } from "../terminal/ShellLaunch.js";
-import { agentCommand, claudeEnforcedEnv, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
+import { agentCommand, claudeAccountLaunch, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
+import { assertClaudeAccountCompatibility } from "./claude/ClaudeAccountPreflight.js";
 
 const ACCOUNTS_FILE = "agent-accounts.json";
 const ACCOUNTS_DIRECTORY = "agent-accounts";
@@ -122,6 +123,10 @@ export class AgentAccountStore {
     const label = validateAgentAccountLabel(input.label);
     if (input.kind !== "subscription" && input.kind !== "api-key") throw new AgentAccountError("Choose a subscription login or an API key.");
     const apiKey = input.kind === "api-key" ? validateApiKey(input.apiKey) : undefined;
+    if (apiKey && input.providerId === "claude") {
+      const launch = claudeAccountLaunch(this.env, this.providerHome("claude"), { ANTHROPIC_API_KEY: apiKey });
+      await assertClaudeAccountCompatibility(launch.policy);
+    }
     const account = await this.mutate(async stored => {
       if (stored.accounts.length >= MAX_ACCOUNTS) throw new AgentAccountError(`At most ${MAX_ACCOUNTS} agent accounts can be configured.`);
       const created: AgentAccount = {
@@ -185,9 +190,11 @@ export class AgentAccountStore {
     const home = this.home(account);
     await fs.mkdir(home, { recursive: true, mode: 0o700 });
     const command = agentCommand(account.providerId, this.env);
-    return account.providerId === "claude"
-      ? { command, args: ["auth", "login"], env: claudeLaunchEnv(this.env, home, {}), enforced: claudeEnforcedEnv(home, {}), cwd: home }
-      : { command, args: ["login"], env: { ...this.env, CODEX_HOME: home }, enforced: { set: { CODEX_HOME: home }, unset: [] }, cwd: home };
+    if (account.providerId === "claude") {
+      const launch = await this.claudeAccountCommand(account);
+      return { command, args: [...launch.args, "auth", "login"], env: launch.env, enforced: launch.enforced, cwd: home };
+    }
+    return { command, args: ["login"], env: { ...this.env, CODEX_HOME: home }, enforced: { set: { CODEX_HOME: home }, unset: [] }, cwd: home };
   }
 
   // Environment additions a launch needs beyond the provider home itself.
@@ -198,17 +205,29 @@ export class AgentAccountStore {
 
   // Environment for a one-shot Claude Code run on the default Claude account,
   // using the account home as its config dir.
-  async defaultClaudeEnv(baseEnv: NodeJS.ProcessEnv = this.env): Promise<NodeJS.ProcessEnv> {
+  async defaultClaudeLaunch(baseEnv: NodeJS.ProcessEnv = this.env) {
     const account = await this.resolve("claude");
-    return claudeLaunchEnv(baseEnv, this.home(account), await this.launchEnv(account));
+    return this.claudeAccountCommand(account, baseEnv);
+  }
+
+  private async claudeAccountCommand(account: AgentAccount, baseEnv: NodeJS.ProcessEnv = this.env) {
+    const home = this.home(account);
+    const launch = claudeAccountLaunch(baseEnv, home, await this.launchEnv(account));
+    await assertClaudeAccountCompatibility(launch.policy);
+    const text = `${JSON.stringify(launch.policy.settings, null, 2)}\n`;
+    const directory = path.join(home, ".cloudx-account-policy");
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    const settingsPath = path.join(directory, `${createHash("sha256").update(text).digest("hex")}.json`);
+    await writeTextFileAtomic(directory, settingsPath, text, "Claude account launch policy", 0o600);
+    return { ...launch, args: ["--settings", settingsPath] };
   }
 
   private async readLoginStatus(account: AgentAccount, signal?: AbortSignal): Promise<Pick<AgentAccount, "loggedIn" | "authMethod">> {
     const home = this.home(account);
     const command = agentCommand(account.providerId, this.env);
     if (account.providerId === "claude") {
-      const env = claudeLaunchEnv(this.env, home, await this.launchEnv(account));
-      const result = await runAgentCli(command, ["auth", "status", "--json"], { env, cwd: home, signal });
+      const launch = await this.claudeAccountCommand(account);
+      const result = await runAgentCli(command, [...launch.args, "auth", "status", "--json"], { env: launch.env, cwd: home, signal });
       try {
         const parsed: unknown = JSON.parse(result.stdout);
         if (isRecord(parsed)) return {

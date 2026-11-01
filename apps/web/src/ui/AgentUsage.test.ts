@@ -50,6 +50,15 @@ describe("usage formatting", () => {
 });
 
 describe("UsageHoverCard", () => {
+  it("requests durable window usage and shows details even without open agent tabs", async () => {
+    const total = summary(3, "mixed", "closed-tab-model", 10_000);
+    const callHook = vi.fn(async () => ({ usage: { tabs: {}, windows: { window: total }, forgeWorkers: {}, total } }));
+    const container = await render(createElement(UsageHoverCard, { target: { title: "Window", request: { windowIds: ["window"] }, left: 0, top: 0 }, callHook: callHook as never }));
+    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { windowIds: ["window"] });
+    expect(container.textContent).toContain("$3.00 API and API-equivalent");
+    expect(container.textContent).toContain("Model requests");
+  });
+
   it("reads usage for the hovered owner and shows details", async () => {
     const callHook = vi.fn(async () => ({ usage: { tabs: {}, forgeWorkers: {}, total: summary(0.42, "api", "claude-opus-5-5", 5_000) } }));
     const container = await render(createElement(UsageHoverCard, { target: { title: "Agent tab", request: { tabIds: ["tab-1"] }, left: 0, top: 0 }, callHook: callHook as never }));

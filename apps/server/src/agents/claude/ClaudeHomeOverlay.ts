@@ -20,13 +20,17 @@ import { writeTextFileAtomic } from "../../jsonStateFile.js";
 import { shellQuote } from "../../terminal/ShellLaunch.js";
 import { ensureClaudeSettingsFile } from "./ClaudeSettingsService.js";
 import { claudeSkillPolicy, type ClaudeSkillPolicy } from "./claudeSkillPolicy.js";
+import { resolveClaudeAccountPolicy, type ClaudeAccountPolicy } from "./claudeAccountPolicy.js";
+import { assertClaudeAccountCompatibility } from "./ClaudeAccountPreflight.js";
+import { assertClaudeHookCompatibility } from "./ClaudeHookPolicy.js";
+import { ClaudeGlobalPreferences } from "./ClaudeGlobalPreferences.js";
 
 export const CLAUDE_FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
 
 // Shared user configuration that every Claude tab sees through its overlay.
 // Credentials are linked separately from the tab's account home. Personal
 // skills and commands are linked one by one when the user allows them.
-const SHARED_ENTRIES = ["settings.json", "agents", "plugins", "output-styles"] as const;
+const SHARED_ENTRIES = ["settings.json", "agents", "plugins", "output-styles", "keybindings.json", "rules"] as const;
 const GENERATED_SKILL_GROUPS = ["cloudx", "cloudx-system"] as const;
 
 interface ClaudeSkillSource {
@@ -38,10 +42,6 @@ interface ClaudeSkillSource {
 // Variables that choose the credentials or the API endpoint. Claude Code
 // applies the env block of each settings file over the process environment,
 // so a value there would replace the selected account.
-const ACCOUNT_ENV_KEYS = [
-  "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL",
-  "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CONFIG_DIR"
-] as const;
 
 export interface ClaudeHomeOverlayOptions {
   dataDir: string;
@@ -62,6 +62,7 @@ export interface ClaudeHomeOverlayOptions {
   // The environment Claude is launched with, whose account variables win over
   // settings files.
   launchEnv?: NodeJS.ProcessEnv;
+  accountPolicy?: ClaudeAccountPolicy;
 }
 
 export interface ClaudeHomeOverlay {
@@ -99,7 +100,10 @@ export function claudeOverlayPath(dataDir: string, tabId: string): string {
 }
 
 export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOptions): Promise<ClaudeHomeOverlay> {
+  await assertClaudeHookCompatibility(options.providerHome, options.cwd);
   const configDir = claudeOverlayPath(options.dataDir, options.tabId);
+  const accountPolicy = options.accountPolicy ?? resolveClaudeAccountPolicy(options.launchEnv ?? {}, configDir, options.launchEnv?.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: options.launchEnv.ANTHROPIC_API_KEY } : {});
+  await assertClaudeAccountCompatibility(accountPolicy);
   await fsp.mkdir(path.dirname(configDir), { recursive: true, mode: 0o700 });
   await fsp.mkdir(configDir, { recursive: true, mode: 0o700 });
   const projectsDir = path.join(options.providerHome, "projects");
@@ -109,7 +113,7 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   await ensureClaudeSettingsFile(options.providerHome);
   for (const name of SHARED_ENTRIES) await replaceLink(path.join(options.providerHome, name), path.join(configDir, name));
   const trusted = options.trustProject === true || Boolean(options.cwd && options.userStatePath && await isTrustedByUser(options.userStatePath, options.cwd));
-  await seedClaudeState(path.join(configDir, ".claude.json"), options.cwd, trusted);
+  await new ClaudeGlobalPreferences(options.dataDir).seed(configDir, options.userStatePath, state => seedClaudeState(state, options.cwd, trusted));
 
   const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
@@ -124,7 +128,7 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   await materializeSkills(configDir, options.providerHome, generated, policy);
   await writeInstructions(configDir, options.providerHome, options.resolved, systemRules);
   const settingsPath = path.join(configDir, ".cloudx-settings.json");
-  const launchSettings = { ...policy.settings, env: accountEnvOverrides(options.launchEnv ?? {}, configDir), ...hookSettings(configDir, options.tabId, options.executionId) };
+  const launchSettings = { ...policy.settings, ...accountPolicy.settings, ...hookSettings(configDir, options.tabId, options.executionId) };
   await writeAtomic(settingsPath, `${JSON.stringify(launchSettings, null, 2)}\n`);
   return { configDir, rulesSkillsRoot, settingsPath, systemRules };
 }
@@ -149,19 +153,7 @@ function hookSettings(configDir: string, tabId: string, executionId: string): Re
 // The launch environment's value for every account variable, or empty, which
 // Claude Code treats as unset. Sent with --settings, it outranks the env block
 // of every user, project and local settings file.
-function accountEnvOverrides(launchEnv: NodeJS.ProcessEnv, configDir: string): Record<string, string> {
-  const selected: NodeJS.ProcessEnv = { ...launchEnv, CLAUDE_CONFIG_DIR: configDir };
-  return Object.fromEntries(ACCOUNT_ENV_KEYS.map(key => [key, selected[key] ?? ""]));
-}
-
-async function seedClaudeState(statePath: string, cwd: string | undefined, trustProject: boolean): Promise<void> {
-  let state: Record<string, unknown> = {};
-  try {
-    const parsed: unknown = JSON.parse(await fsp.readFile(statePath, "utf8"));
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) state = parsed as Record<string, unknown>;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
-  }
+function seedClaudeState(state: Record<string, unknown>, cwd: string | undefined, trustProject: boolean): void {
   state.hasCompletedOnboarding = true;
   if (trustProject && cwd) {
     const projects = state.projects && typeof state.projects === "object" && !Array.isArray(state.projects) ? state.projects as Record<string, unknown> : {};
@@ -169,7 +161,6 @@ async function seedClaudeState(statePath: string, cwd: string | undefined, trust
     projects[cwd] = { ...current, hasTrustDialogAccepted: true };
     state.projects = projects;
   }
-  await writeAtomic(statePath, `${JSON.stringify(state, null, 2)}\n`);
 }
 
 // Claude Code discovers skills one level below skills/, so CloudX skills use
@@ -238,8 +229,9 @@ async function writeInstructions(
   systemRules: CloudxRule[]
 ): Promise<void> {
   const target = path.join(configDir, "CLAUDE.md");
+  const basePath = path.join(providerHome, "CLAUDE.md");
   let base: string | undefined;
-  try { base = await fsp.readFile(path.join(providerHome, "CLAUDE.md"), "utf8"); }
+  try { base = await fsp.readFile(basePath, "utf8"); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const rules = resolved?.rules ?? [];
   if (!base?.trim() && systemRules.length === 0 && rules.length === 0) {

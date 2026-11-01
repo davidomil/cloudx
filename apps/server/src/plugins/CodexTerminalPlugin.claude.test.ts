@@ -73,9 +73,15 @@ describe("CodexTerminalPlugin on Claude", () => {
 
     const configDir = path.join(dataDir, "claude-launches", "tab-1");
     // The login profile runs first; the selection is re-applied before exec.
-    expect(factory.lastCommandLine).toMatch(/^unset ANTHROPIC_API_KEY .*; export CLAUDE_CONFIG_DIR="\$CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR"; unset CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR; exec claude --settings \S+\.cloudx-settings\.json --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
+    expect(factory.lastCommandLine).toMatch(/^unset ANTHROPIC_API_KEY /u);
+    expect(factory.lastCommandLine).toContain('CLAUDE_CONFIG_DIR="$CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR"');
+    expect(factory.lastCommandLine).toContain('ANTHROPIC_CONFIG_DIR="$CLOUDX_ENFORCED_ANTHROPIC_CONFIG_DIR"');
+    expect(factory.lastCommandLine).toMatch(/; exec claude --settings \S+\.cloudx-settings\.json --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
     expect(factory.last.env).toMatchObject({ CLAUDE_CONFIG_DIR: configDir, CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR: configDir });
     expect(factory.last.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-settings.json"), "utf8"))).toMatchObject({
+      apiKeyHelper: "", env: { ANTHROPIC_API_KEY: "", CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth") }
+    });
     expect(restored.at(-1)).toMatchObject({ agent: { providerId: "claude", accountId: account.id } });
   });
 
@@ -171,11 +177,11 @@ describe("CodexTerminalPlugin on Claude", () => {
     const { factory, tab, cwd, controls, env, dataDir, accounts, claudeSettings, restored } = await setup();
     const usage = { conversationStarted: vi.fn(), ended: vi.fn() };
     const plugin = new CodexTerminalPlugin(factory, DEFAULT_TERMINAL_REPLAY_BYTES, dataDir, undefined, env, { accounts, claudeSettings, usage: usage as never });
-    await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" } } });
+    await plugin.createSession({ tab, cwd, workspaceId: "window-1", controls, initialInput: { agent: { providerId: "claude" } } });
     await fs.writeFile(path.join(dataDir, "claude-launches", "tab-1", ".cloudx-conversation.json"), JSON.stringify({
       version: 2, authority: "selected", tabId: "tab-1", executionId: restored.at(-1)!.codexExecutionId, sessionId: SESSION, cwd
     }));
-    await vi.waitFor(() => expect(usage.conversationStarted).toHaveBeenCalledWith(expect.objectContaining({ id: "tab-1" }), "claude", expect.any(String), SESSION), { timeout: 2_000 });
+    await vi.waitFor(() => expect(usage.conversationStarted).toHaveBeenCalledWith(expect.objectContaining({ id: "tab-1" }), "claude", expect.any(String), SESSION, "window-1"), { timeout: 2_000 });
     factory.last.process.exit(0);
     expect(usage.ended).toHaveBeenCalledWith("tab-1");
   });

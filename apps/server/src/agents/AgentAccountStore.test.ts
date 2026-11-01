@@ -22,6 +22,7 @@ esac
 `, { mode: 0o755 });
   const claude = path.join(bin, "fake-claude");
   await fs.writeFile(claude, `#!/bin/sh
+if [ "$1" = "--settings" ]; then shift 2; fi
 case "$1 $2" in
   "--version "*) echo "9.9.9 (Claude Code)";;
   "auth status")
@@ -112,7 +113,9 @@ describe("AgentAccountStore", () => {
     await fs.writeFile(path.join(store.home(account), ".credentials.json"), "{}");
     expect(await store.verify(account.id)).toMatchObject({ loggedIn: true, authMethod: "claude.ai" });
     const login = await store.loginCommand(account.id);
-    expect(login).toMatchObject({ args: ["auth", "login"], env: { CLAUDE_CONFIG_DIR: store.home(account) } });
+    expect(login).toMatchObject({ args: ["--settings", expect.stringContaining(".cloudx-account-policy"), "auth", "login"], env: { CLAUDE_CONFIG_DIR: store.home(account) } });
+    expect((await fs.stat(login.args[1]!)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await fs.readFile(login.args[1]!, "utf8"))).toMatchObject({ apiKeyHelper: "", awsAuthRefresh: "", awsCredentialExport: "", gcpAuthRefresh: "", env: { CLAUDE_CONFIG_DIR: store.home(account) } });
     expect(login.env.CLAUDECODE).toBeUndefined();
   });
 
@@ -123,6 +126,24 @@ describe("AgentAccountStore", () => {
       expect.objectContaining({ providerId: "codex", installed: true, version: "codex-cli 0.0.1" }),
       expect.objectContaining({ providerId: "claude", installed: false })
     ]);
+  });
+
+  it("uses the account store's intentional routing for login and post-shell enforcement", async () => {
+    const { dataDir, env } = await setup();
+    const store = new AgentAccountStore(dataDir, { ...env, ANTHROPIC_BASE_URL: "https://gateway.invalid", CLAUDE_CODE_USE_MANTLE: "1" });
+    const account = await store.create({ providerId: "claude", label: "Service route", kind: "subscription" });
+    const launch = await store.loginCommand(account.id);
+    expect(launch.env.ANTHROPIC_BASE_URL).toBe("https://gateway.invalid");
+    expect(launch.enforced.set).toMatchObject({ ANTHROPIC_BASE_URL: "https://gateway.invalid", CLAUDE_CODE_USE_MANTLE: "1", CLAUDE_CONFIG_DIR: store.home(account) });
+    expect(launch.enforced.unset).toContain("ANTHROPIC_AWS_API_KEY");
+  });
+
+  it("rejects an API-key account incompatible with service routing before persisting credentials", async () => {
+    const { dataDir, env } = await setup();
+    const store = new AgentAccountStore(dataDir, { ...env, CLAUDE_CODE_USE_BEDROCK: "1", AWS_PROFILE: "service" });
+    await expect(store.create({ providerId: "claude", label: "API", kind: "api-key", apiKey: "fake-api-key" })).rejects.toThrow("API-key account cannot authenticate");
+    expect(await store.list()).toEqual([]);
+    expect(await fs.readdir(dataDir)).not.toContain("agent-accounts");
   });
 
   it("rejects invalid labels and keys", async () => {

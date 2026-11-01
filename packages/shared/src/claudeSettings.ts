@@ -11,8 +11,23 @@ export const CLAUDE_SETTINGS_HOOKS = {
 
 export const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 export type ClaudeEffortLevel = typeof CLAUDE_EFFORT_LEVELS[number];
-export const CLAUDE_UPDATE_CHANNELS = ["latest", "stable", "rc"] as const;
+// Current official model-config reference, reviewed 2026-11-01. Alias
+// resolution, provider deployment IDs and future models remain unestablished.
+export function claudeModelEffort(model: string): { model: string; levels: readonly ClaudeEffortLevel[]; referenceDefault: ClaudeEffortLevel } | undefined {
+  const canonical = model.replace(/\[1m\]$/u, "").replace(/-\d{8}$/u, "");
+  if (/^claude-(?:opus|sonnet)-4-6$/u.test(canonical)) return { model: canonical, levels: ["low", "medium", "high"], referenceDefault: "high" };
+  if (/^claude-(?:(?:opus|sonnet|haiku)-5-5|(?:opus|sonnet)-5|opus-4-[78]|fable-5(?:-1)?)$/u.test(canonical))
+    return { model: canonical, levels: CLAUDE_EFFORT_LEVELS, referenceDefault: canonical.endsWith("-5-5") ? "medium" : canonical === "claude-opus-4-7" ? "xhigh" : "high" };
+  return undefined;
+}
+export const CLAUDE_UPDATE_CHANNELS = ["latest", "stable"] as const;
 export type ClaudeUpdateChannel = typeof CLAUDE_UPDATE_CHANNELS[number];
+export const CLAUDE_BOOLEAN_SETTINGS = [
+  "autoCompactEnabled", "autoScrollEnabled", "syntaxHighlightingDisabled", "terminalProgressBarEnabled",
+  "showTurnDuration", "showThinkingSummaries", "respectGitignore", "includeGitInstructions",
+  "spinnerTipsEnabled", "prefersReducedMotion", "bashEditDiffEnabled"
+] as const;
+export type ClaudeBooleanSetting = typeof CLAUDE_BOOLEAN_SETTINGS[number];
 export const CLAUDE_LAUNCH_PERMISSION_MODES = ["bypassPermissions", "acceptEdits", "auto", "manual", "plan"] as const;
 export type ClaudeLaunchPermissionMode = typeof CLAUDE_LAUNCH_PERMISSION_MODES[number];
 
@@ -36,6 +51,12 @@ export interface ClaudeGlobalSettings {
   // Native settings. Null means the key is absent and Claude Code decides.
   model: string | null;
   effortLevel: string | null;
+  // Per-model user values, not a projection of managed/project/env/run values.
+  modelEffortLevels?: Record<string, string>;
+  modelEffortLimits?: Record<string, string>;
+  legacyEffortLevel?: string | null;
+  effortEnvironmentOverride?: boolean;
+  nativeOptions?: Partial<Record<ClaudeBooleanSetting, boolean | null>>;
   alwaysThinkingEnabled: boolean | null;
   fastMode: boolean | null;
   outputStyle: string | null;
@@ -54,6 +75,9 @@ export interface ClaudeGlobalSettingsUpdate {
   expectedRevision: string;
   model?: string | null;
   effortLevel?: ClaudeEffortLevel | null;
+  // An exact model ID; aliases can resolve differently across releases/accounts.
+  effortModel?: string;
+  nativeOptions?: Partial<Record<ClaudeBooleanSetting, boolean | null>>;
   alwaysThinkingEnabled?: boolean | null;
   fastMode?: boolean | null;
   outputStyle?: string | null;

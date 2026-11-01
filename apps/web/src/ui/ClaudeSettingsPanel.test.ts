@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClaudeGlobalSettings } from "@cloudx/shared";
 
 import { ClaudeSettingsPanel } from "./ClaudeSettingsPanel.js";
+import { ClaudeConfigurationCatalog } from "./ClaudeConfigurationCatalog.js";
 import { SettingsDialog } from "./SettingsDialog.js";
 
 let root: Root | undefined;
@@ -90,7 +91,7 @@ describe("ClaudeSettingsPanel", () => {
     await act(async () => button(container, "Save Claude settings").click());
 
     expect(callHook).toHaveBeenCalledWith("claude-settings.update", {
-      expectedRevision: "a".repeat(64), model: "claude-sonnet-5-5", effortLevel: "high", fastMode: null, permissionMode: "acceptEdits"
+      expectedRevision: "a".repeat(64), model: "claude-sonnet-5-5", effortModel: "claude-sonnet-5-5", effortLevel: "high", fastMode: null, permissionMode: "acceptEdits"
     });
     expect(container.textContent).toContain("Claude settings saved.");
   });
@@ -126,6 +127,78 @@ describe("ClaudeSettingsPanel", () => {
     await act(async () => (control(container, "Allow docx") as HTMLInputElement).click());
     await act(async () => button(container, "Save Claude settings").click());
     expect(callHook).toHaveBeenCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), allowedSkills: ["release-notes"] });
+  });
+
+  it("explains user values, model limits, permission rules and activation timing without promising effective runtime state", async () => {
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: hooks({ ...saved, legacyEffortLevel: "xhigh" }) as never }));
+    expect(container.textContent).toContain("not observed values for an open tab");
+    expect(container.textContent).toContain("always-thinking models");
+    expect(container.textContent).toContain("Legacy user effortLevel: xhigh");
+    expect(container.textContent).toContain("use native /model or /effort for a running session");
+    expect(container.textContent).toContain("Saving never restarts a client");
+    await change(control(container, "Permission mode for CloudX tabs"), "manual");
+    expect(container.textContent).toContain("Allows reads and pre-approved operations");
+    await change(control(container, "Permission mode for CloudX tabs"), "plan");
+    expect(container.textContent).toContain("permitted read-only shell commands");
+    expect(container.textContent).not.toContain("Off disables thinking");
+    expect(container.textContent).not.toContain("Asks before every tool use");
+  });
+
+  it("shows unsupported saved channels and blocks updates until the user corrects the value", async () => {
+    const callHook = hooks({ ...saved, autoUpdatesChannel: "rc" });
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    expect(container.textContent).toContain("Unsupported saved update channel: rc");
+    expect(button(container, "Update Claude Code").disabled).toBe(true);
+    const channels = control(container, "Update channel") as HTMLSelectElement;
+    expect([...channels.options].map(option => option.value)).toEqual(["", "latest", "stable", "rc"]);
+    await change(channels, "stable");
+    await act(async () => button(container, "Save Claude settings").click());
+    expect(callHook).toHaveBeenCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), autoUpdatesChannel: "stable" });
+    expect(button(container, "Update Claude Code").disabled).toBe(false);
+  });
+
+  it("reads effort for each exact model and prevents saving an ambiguous account alias", async () => {
+    const callHook = hooks({ ...saved, model: "claude-opus-5-5", effortLevel: "high", modelEffortLevels: { "claude-opus-5-5": "high", "claude-sonnet-5-5": "medium" } });
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    await change(control(container, "Default model"), "claude-sonnet-5-5");
+    expect(control(container, "Effort").value).toBe("medium");
+    await change(control(container, "Default model"), "opus");
+    await change(control(container, "Effort"), "xhigh");
+    expect(container.textContent).toContain("Choose a full Claude model ID before saving effort");
+    expect(button(container, "Save Claude settings").disabled).toBe(true);
+    await change(control(container, "Effort model"), "claude-opus-5-5");
+    expect(control(container, "Effort").value).toBe("high");
+  });
+
+  it("searches the complete reference by family and exposes only reviewed typed persistent editors", async () => {
+    const callHook = hooks({ ...saved, nativeOptions: { autoScrollEnabled: true } });
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    expect(container.textContent).toContain("247 settings rows, 384 environment rows, 121 CLI rows");
+    expect(container.textContent).toContain("No native versions are certified");
+    await change(control(container, "Search Claude configuration"), "autoScrollEnabled");
+    expect(container.textContent).toContain("Native reference default: true");
+    expect(container.textContent).toContain("Saved user value: true");
+    expect(container.textContent).toContain("Effective session value: unresolved");
+    await change(control(container, "Claude native autoScrollEnabled"), "");
+    await act(async () => button(container, "Save Claude settings").click());
+    expect(callHook).toHaveBeenCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), nativeOptions: { autoScrollEnabled: null } });
+    await change(control(container, "Search Claude configuration"), "allowManagedHooksOnly");
+    expect(container.textContent).toContain("Organization policy. Read-only in CloudX");
+    expect(container.querySelector('[aria-label="Claude native allowManagedHooksOnly"]')).toBeNull();
+    await change(control(container, "Claude configuration family"), "environment");
+    await change(control(container, "Search Claude configuration"), "CLAUDE_CODE_USE_MANTLE");
+    expect(container.textContent).toContain("Account, credential or provider configuration");
+    await change(control(container, "Claude configuration family"), "cli");
+    await change(control(container, "Search Claude configuration"), "--worktree");
+    expect(container.textContent).toContain("Not supported as a managed CloudX session");
+  });
+
+  it("disables newer option values for an older executable while preserving the unset correction", async () => {
+    const container = await render(createElement(ClaudeConfigurationCatalog, { settings: saved, version: "2.1.268 (Claude Code)", nativeOptions: { bashEditDiffEnabled: true }, onChange: vi.fn() }));
+    await change(control(container, "Search Claude configuration"), "bashEditDiffEnabled");
+    const options = [...(control(container, "Claude native bashEditDiffEnabled") as HTMLSelectElement).options];
+    expect(options.map(option => [option.value, option.disabled])).toEqual([["", false], ["true", true], ["false", true]]);
+    expect(container.textContent).toContain("selected 2.1.268 is older");
   });
 });
 

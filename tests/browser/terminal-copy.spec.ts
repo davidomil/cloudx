@@ -2,19 +2,54 @@ import { expect, test, type Page, type WebSocketRoute } from "@playwright/test";
 import react from "@vitejs/plugin-react";
 import { createServer as createHttpServer, type Server } from "node:http";
 import path from "node:path";
+import os from "node:os";
 import fs from "node:fs/promises";
 import { execFileSync } from "node:child_process";
-import { createServer, type ViteDevServer } from "vite";
+import { build } from "vite";
 import { NativeCodexCopySession } from "./fixtures/native-codex-copy.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
-let server: ViteDevServer;
+let fixtureBuild: string;
 let httpServer: Server;
 let baseUrl: string;
 
-test.beforeAll(async () => {
-  httpServer = createHttpServer();
-  server = await createServer({
+test.beforeAll(async ({}, testInfo) => {
+  const started = Date.now();
+  const evidencePath = path.join(
+    repoRoot,
+    "test-results",
+    "terminal-fixture",
+    `${testInfo.project.name}-${process.pid}.json`,
+  );
+  await fs.mkdir(path.dirname(evidencePath), { recursive: true });
+  await fs.writeFile(
+    evidencePath,
+    JSON.stringify(
+      {
+        state: "starting",
+        node: process.version,
+        nodeOptions: process.env.NODE_OPTIONS ?? "",
+        build: "production",
+        project: testInfo.project.name,
+      },
+      null,
+      2,
+    ),
+  );
+  await testInfo.attach("terminal-fixture-starting", {
+    body: JSON.stringify({
+      state: "starting",
+      node: process.version,
+      execArgv: process.execArgv,
+      build: "production",
+      project: testInfo.project.name,
+    }),
+    contentType: "application/json",
+  });
+  fixtureBuild = await fs.mkdtemp(
+    path.join(os.tmpdir(), "cloudx-terminal-browser-build-"),
+  );
+  await build({
     configFile: false,
     root: repoRoot,
     plugins: [react()],
@@ -23,10 +58,68 @@ test.beforeAll(async () => {
         "@cloudx/shared": path.join(repoRoot, "packages/shared/src/index.ts"),
       },
     },
-    server: { middlewareMode: { server: httpServer }, ws: false },
-    optimizeDeps: { entries: ["tests/browser/fixtures/terminal-copy.html"] },
+    build: {
+      outDir: fixtureBuild,
+      emptyOutDir: true,
+      minify: false,
+      reportCompressedSize: false,
+      rollupOptions: {
+        input: path.join(repoRoot, "tests/browser/fixtures/terminal-copy.html"),
+      },
+    },
   });
-  httpServer.on("request", server.middlewares);
+  await testInfo.attach("terminal-fixture-built", {
+    body: JSON.stringify({
+      state: "built",
+      durationMs: Date.now() - started,
+      rssBytes: process.memoryUsage().rss,
+      maxRssKb: process.resourceUsage().maxRSS,
+      node: process.version,
+    }),
+    contentType: "application/json",
+  });
+  await fs.writeFile(
+    evidencePath,
+    JSON.stringify(
+      {
+        state: "built",
+        durationMs: Date.now() - started,
+        rssBytes: process.memoryUsage().rss,
+        maxRssKb: process.resourceUsage().maxRSS,
+        node: process.version,
+        nodeOptions: process.env.NODE_OPTIONS ?? "",
+        project: testInfo.project.name,
+      },
+      null,
+      2,
+    ),
+  );
+  httpServer = createHttpServer(async (request, response) => {
+    try {
+      const url = new URL(request.url!, "http://fixture.invalid");
+      const filename = path.resolve(
+        fixtureBuild,
+        `.${decodeURIComponent(url.pathname)}`,
+      );
+      if (!filename.startsWith(`${fixtureBuild}${path.sep}`)) {
+        response.writeHead(403).end();
+        return;
+      }
+      const body = await fs.readFile(filename);
+      const type = filename.endsWith(".html")
+        ? "text/html"
+        : filename.endsWith(".js")
+          ? "text/javascript"
+          : filename.endsWith(".css")
+            ? "text/css"
+            : "application/octet-stream";
+      response
+        .writeHead(200, { "content-type": type, "cache-control": "no-store" })
+        .end(body);
+    } catch {
+      response.writeHead(404).end();
+    }
+  });
   await new Promise<void>((resolve) =>
     httpServer.listen(0, "127.0.0.1", resolve),
   );
@@ -34,13 +127,14 @@ test.beforeAll(async () => {
   if (!address || typeof address === "string")
     throw new Error("Missing browser fixture port");
   baseUrl = `http://127.0.0.1:${address.port}/tests/browser/fixtures/terminal-copy.html`;
-});
+}, 120_000);
 
 test.afterAll(async () => {
-  await server?.close();
-  await new Promise<void>((resolve, reject) =>
-    httpServer.close((error) => (error ? reject(error) : resolve())),
-  );
+  if (httpServer?.listening)
+    await new Promise<void>((resolve, reject) =>
+      httpServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  if (fixtureBuild) await fs.rm(fixtureBuild, { recursive: true, force: true });
 });
 
 async function terminalStream(
@@ -60,6 +154,17 @@ async function terminalStream(
       if (event.type === "input") input.push(event.data);
     });
   });
+  await page.route("**/api/tabs/*/terminal-capabilities", (route) =>
+    route.fulfill({
+      json: {
+        tabId: decodeURIComponent(
+          new URL(route.request().url()).pathname.split("/").at(-2)!,
+        ),
+        providerId: view === "claude" ? "claude" : "codex",
+        commandCapture: false,
+      },
+    }),
+  );
   await page.goto(`${baseUrl}?view=${view}&split=${split}`);
   if (pausedClock) {
     await expect(page.locator(".xterm")).toBeVisible();
@@ -1918,3 +2023,443 @@ test("copies the saved selection while a supported native Codex picker hands off
     },
   );
 });
+
+for (const provider of ["codex", "claude"]) {
+  test(`preserves modified Enter, composition and host preferences for ${provider}`, async ({
+    page,
+  }) => {
+    const stream = await terminalStream(page, false, provider);
+    await page.locator(".xterm-helper-textarea").focus();
+    await page.keyboard.type("first line");
+    await page.keyboard.press("Shift+Enter");
+    await page.keyboard.type("second line");
+    await page.keyboard.press("Enter");
+    await page.keyboard.press("Control+j");
+    await expect
+      .poll(() => stream.input.join(""))
+      .toBe("first line\x1b[13;2usecond line\r\n");
+    await page.evaluate(() => {
+      const input = document.querySelector(".xterm-helper-textarea")!;
+      input.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key: "Enter",
+          shiftKey: true,
+          isComposing: true,
+          keyCode: 229,
+        }),
+      );
+      window.localStorage.setItem(
+        "cloudx.terminal-preferences.v1",
+        JSON.stringify({
+          macOptionIsMeta: true,
+          scrollback: 2222,
+          fontFamily: "monospace",
+          shiftEnter: "ctrl-j",
+        }),
+      );
+      window.dispatchEvent(new Event("cloudx-terminal-preferences-changed"));
+    });
+    await expect
+      .poll(() => page.evaluate(() => window.testTerminal.options.scrollback))
+      .toBe(2222);
+    expect(
+      await page.evaluate(() => ({
+        meta: window.testTerminal.options.macOptionIsMeta,
+        font: window.testTerminal.options.fontFamily,
+      })),
+    ).toEqual({ meta: true, font: "monospace" });
+    await page.keyboard.press("Shift+Enter");
+    await expect
+      .poll(() => stream.input.join(""))
+      .toBe("first line\x1b[13;2usecond line\r\n\n");
+  });
+
+  test(`preserves captions and stages image paste/drop once for ${provider}`, async ({
+    page,
+  }) => {
+    const uploads: string[] = [];
+    await page.route("**/api/tabs/*/files/upload?*", async (route) => {
+      const relativePath = new URL(route.request().url()).searchParams.get(
+        "relativePath",
+      )!;
+      uploads.push(relativePath);
+      await route.fulfill({
+        json: {
+          uploaded: true,
+          path: `/workspace/${relativePath}`,
+          relativePath,
+          bytes: route.request().postDataBuffer()?.length ?? 0,
+        },
+      });
+    });
+    const stream = await terminalStream(page, false, provider);
+    stream.data("\x1b[?2004h");
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => window.testTerminal.write("", resolve)),
+    );
+    await page.evaluate(() => {
+      const clipboardData = new DataTransfer();
+      clipboardData.items.add(
+        new File([new Uint8Array([137, 80, 78, 71])], "screenshot.png", {
+          type: "image/png",
+        }),
+      );
+      clipboardData.setData("text/plain", "A useful caption");
+      document.querySelector(".xterm-helper-textarea")!.dispatchEvent(
+        new ClipboardEvent("paste", {
+          clipboardData,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+    await expect(
+      page.getByRole("button", { name: "Insert image into native prompt" }),
+    ).toBeVisible();
+    expect(uploads).toHaveLength(1);
+    await expect
+      .poll(() => stream.input.join(""))
+      .toBe("\x1b[200~A useful caption\x1b[201~");
+    await page
+      .getByRole("button", { name: "Insert image into native prompt" })
+      .click();
+    await expect
+      .poll(() => stream.input.join(""))
+      .toContain(`\x1b[200~/workspace/${uploads[0]}\x1b[201~`);
+    await expect(
+      page.getByRole("complementary", { name: "Terminal attachments" }),
+    ).toContainText("verify the image in the native prompt");
+    await page.evaluate(() => {
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(
+        new File([new Uint8Array([137, 80, 78, 71])], "dropped.png", {
+          type: "image/png",
+        }),
+      );
+      document.querySelector(".terminal-panel")!.dispatchEvent(
+        new DragEvent("drop", {
+          dataTransfer,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    });
+    await expect(
+      page.getByRole("button", {
+        name: "Remove staged attachment",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Remove staged attachment", exact: true })
+      .click();
+    expect(stream.input.join("").match(/pasted-images/g)).toHaveLength(1);
+  });
+}
+
+test("routes plain and OSC 8 destinations to a browser confirmation or originating workspace", async ({
+  page,
+}) => {
+  const opened: string[] = [];
+  await page.route("**/api/tabs/*/files/raw?*", (route) => {
+    opened.push(route.request().url());
+    return route.fulfill({
+      contentType: "text/plain",
+      body: "first\nsecond\nthird\n",
+    });
+  });
+  const stream = await terminalStream(page);
+  stream.screen(
+    "https://example.test/plain\r\n\x1b]8;;vscode://file/workspace/src/caf%C3%A9%20file.ts:2:2\x1b\\File citation\x1b]8;;\x1b\\",
+  );
+  await expect(page.locator(".xterm-rows")).toContainText("File citation");
+  const bounds = await cells(page);
+  await page.mouse.click(
+    bounds.x + bounds.cell * 8,
+    bounds.y + bounds.height / 2,
+  );
+  const destination = page.getByRole("dialog", {
+    name: "Terminal link destination",
+  });
+  await expect(
+    destination.getByRole("link", { name: "Open in browser" }),
+  ).toHaveAttribute("href", "https://example.test/plain");
+  await destination.getByRole("button", { name: "Close", exact: true }).click();
+  await page.mouse.click(
+    bounds.x + bounds.cell * 5,
+    bounds.y + bounds.height * 1.5,
+  );
+  await expect(
+    destination.getByRole("textbox", { name: "Workspace file citation" }),
+  ).toHaveValue("first\nsecond\nthird\n");
+  expect(opened[0]).toContain(
+    "/api/tabs/copy-tab/files/raw?relativePath=src%2Fcaf%C3%A9+file.ts",
+  );
+  await expect(destination).toContainText("Line 2, column 2");
+});
+
+test("provides a stable touch-friendly text selection mode while output streams", async ({
+  page,
+  context,
+}) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const stream = await terminalStream(page);
+  stream.screen("First selected line\r\nCafé 界 selected line");
+  await expect(page.locator(".xterm-rows")).toContainText(
+    "Café 界 selected line",
+  );
+  await page
+    .getByRole("button", { name: "Select visible terminal text" })
+    .click();
+  const preview = page.getByRole("textbox", {
+    name: "Visible terminal text",
+    exact: true,
+  });
+  await expect(preview).toContainText("First selected line");
+  stream.screen("New streamed frame");
+  await expect(preview).toContainText("First selected line");
+  await page
+    .getByRole("button", { name: "Copy selected visible text" })
+    .click();
+  await expect
+    .poll(() => page.evaluate(() => navigator.clipboard.readText()))
+    .toContain("Café 界 selected line");
+  await page.getByRole("button", { name: "Close text selection" }).click();
+  await expect(preview).toBeHidden();
+});
+
+test("does not poll unsupported command capture and refreshes capability after a tab switch", async ({
+  page,
+}) => {
+  let requests = 0;
+  await page.route("**/api/tabs/*/command-details", (route) => {
+    requests++;
+    return route.fulfill({
+      json: {
+        version: 1,
+        tabId: "other-tab",
+        executionId: "codex-execution",
+        status: "available",
+        commands: [],
+      },
+    });
+  });
+  const stream = await terminalStream(page, false, "claude");
+  await expect(
+    page.getByText("Claude shortcuts", { exact: true }),
+  ).toBeVisible();
+  await page.waitForTimeout(1100);
+  expect(requests).toBe(0);
+  await expect(
+    page.getByRole("region", { name: "Codex command details" }),
+  ).toHaveCount(0);
+  await page.route("**/api/tabs/*/terminal-capabilities", (route) =>
+    route.fulfill({
+      json: {
+        tabId: "other-tab",
+        providerId: "codex",
+        executionId: "codex-execution",
+        commandCapture: true,
+      },
+    }),
+  );
+  await page.getByRole("button", { name: "Switch tab", exact: true }).click();
+  await expect.poll(() => stream.connections()).toBe(2);
+  await expect(page.getByLabel("Codex command details")).toBeVisible();
+  await expect.poll(() => requests).toBeGreaterThan(0);
+});
+
+for (const fullscreen of [true, false])
+  test(`keeps a real Codex multiline prompt editable and delivers a pasted image to the isolated provider (fullscreen: ${fullscreen})`, async ({
+    page,
+    context,
+  }, testInfo) => {
+    const codex = process.env.CLOUDX_NATIVE_CODEX;
+    test.skip(
+      !codex || testInfo.project.name !== "desktop-chromium",
+      "Set CLOUDX_NATIVE_CODEX to the reviewed native CLI; native acceptance is separate from emulation.",
+    );
+    test.setTimeout(60_000);
+    const version = execFileSync(codex!, ["--version"], {
+      encoding: "utf8",
+    }).trim();
+    if (process.env.CLOUDX_NATIVE_CODEX_VERSION)
+      expect(version).toBe(
+        `codex-cli ${process.env.CLOUDX_NATIVE_CODEX_VERSION}`,
+      );
+    const native = await NativeCodexCopySession.create(
+      codex!,
+      false,
+      fullscreen,
+    );
+    const writes: string[] = [];
+    try {
+      let socket: WebSocketRoute;
+      await page.routeWebSocket("**/ws/terminal/*", (connection) => {
+        socket = connection;
+        connection.onMessage((message) => {
+          const input = JSON.parse(String(message));
+          if (input.type === "input") writes.push(input.data);
+          native.input(input);
+        });
+      });
+      await page.route("**/api/tabs/*/terminal-capabilities", (route) =>
+        route.fulfill({
+          json: {
+            tabId: "copy-tab",
+            providerId: "codex",
+            commandCapture: false,
+          },
+        }),
+      );
+      await page.route("**/api/tabs/*/files/upload?*", async (route) => {
+        const relativePath = new URL(route.request().url()).searchParams.get(
+          "relativePath",
+        )!;
+        const bytes = route.request().postDataBuffer()!;
+        expect(bytes.subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
+        expect(bytes.length).toBe(69);
+        const filename = await native.uploadImage(relativePath, bytes);
+        await fs.writeFile(
+          testInfo.outputPath("native-uploaded-image.png"),
+          bytes,
+        );
+        await route.fulfill({
+          json: {
+            uploaded: true,
+            path: filename,
+            relativePath,
+            bytes: bytes.length,
+          },
+        });
+      });
+      await page.goto(baseUrl);
+      await expect(page.locator(".xterm-rows")).toContainText("Cloudx tab");
+      const dimensions = await page.evaluate(() => ({
+        cols: window.testTerminal.cols,
+        rows: window.testTerminal.rows,
+      }));
+      await native.start(dimensions, (chunk) =>
+        socket.send(JSON.stringify({ type: "data", data: chunk })),
+      );
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "Ask Codex to do anything",
+        { timeout: 15_000 },
+      );
+      await page.locator(".xterm-helper-textarea").focus();
+      await expect(page.locator(".xterm-rows")).toContainText("GPT-6.1 Sol", {
+        timeout: 15000,
+      });
+      expect(
+        await page.evaluate(() => window.testTerminal.modes.bracketedPasteMode),
+      ).toBe(true);
+      await page.keyboard.type("first line");
+      await page.keyboard.press("Shift+Enter");
+      await page.keyboard.type("second line");
+      await expect(page.locator(".xterm-rows")).toContainText("second line");
+      expect(native.requestCount).toBe(0);
+      await page.evaluate(() => {
+        const clipboardData = new DataTransfer();
+        const png = Uint8Array.from(
+          atob(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+          ),
+          (char) => char.charCodeAt(0),
+        );
+        clipboardData.items.add(
+          new File([png], "native-test.png", { type: "image/png" }),
+        );
+        clipboardData.setData("text/plain", " caption");
+        document.querySelector(".xterm-helper-textarea")!.dispatchEvent(
+          new ClipboardEvent("paste", {
+            clipboardData,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+      await page
+        .getByRole("button", { name: "Insert image into native prompt" })
+        .click();
+      await expect(page.locator(".xterm-rows")).toContainText("[Image #1]");
+      expect(native.requestCount).toBe(0);
+      await page.screenshot({
+        path: testInfo.outputPath("native-codex-multiline-image.png"),
+      });
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Backspace");
+      await page.keyboard.press("Backspace");
+      await expect(page.locator(".xterm-rows")).not.toContainText("[Image #1]");
+      await expect(page.locator(".xterm-rows")).toContainText(
+        "second line caption",
+      );
+      expect(native.requestCount).toBe(0);
+      await page.evaluate(() => {
+        const dataTransfer = new DataTransfer();
+        const png = Uint8Array.from(
+          atob(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+          ),
+          (char) => char.charCodeAt(0),
+        );
+        dataTransfer.items.add(
+          new File([png], "native-dropped.png", { type: "image/png" }),
+        );
+        document.querySelector(".terminal-panel")!.dispatchEvent(
+          new DragEvent("drop", {
+            dataTransfer,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      });
+      await page
+        .getByRole("button", { name: "Insert image into native prompt" })
+        .click();
+      await expect(page.locator(".xterm-rows")).toContainText("[Image #1]");
+
+      await page.locator(".xterm-helper-textarea").focus();
+      await page.keyboard.press("Enter");
+      await expect.poll(() => native.requestCount).toBe(1);
+      await expect
+        .poll(() => native.prompts[0])
+        .toContain("first line\\nsecond line caption");
+      expect(native.prompts[0]).toContain("input_image");
+      expect(native.prompts[0]).toContain("data:image/png;base64,");
+      await expect(page.locator(".xterm-rows")).toContainText(native.answer, {
+        timeout: 15_000,
+      });
+      expect(native.requestCount).toBe(1);
+      testInfo.annotations.push(
+        { type: "native-cli-version", description: version },
+        { type: "browser-version", description: context.browser()!.version() },
+      );
+    } finally {
+      try {
+        await fs.writeFile(
+          testInfo.outputPath("native-codex-multiline-terminal.txt"),
+          native.output,
+        );
+        await fs.writeFile(
+          testInfo.outputPath("native-codex-provider-input.json"),
+          JSON.stringify(
+            {
+              version,
+              node: process.version,
+              fullscreen,
+              requestCount: native.requestCount,
+              prompts: native.prompts,
+              writes,
+            },
+            null,
+            2,
+          ),
+        );
+      } finally {
+        await native.dispose();
+      }
+    }
+  });

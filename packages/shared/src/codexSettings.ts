@@ -29,6 +29,23 @@ export interface CodexGlobalSettings {
   configuration?: CodexConfigurationSnapshot;
 }
 
+export interface CodexLaunchPolicyInspection {
+  tabId: string;
+  sourcePath: string;
+  observation: "generated-config-on-disk";
+  values: Record<string, CodexConfigurationValue>;
+  skills: {
+    path: string;
+    source: "cloudx-system" | "selected-template" | "native-vendor-cache" | "native-config";
+    available: boolean;
+    enabled: boolean;
+    freshDefault: "enabled" | "disabled" | "template-dependent" | "native-config";
+    provenance: string;
+  }[];
+  serverEnvironmentKeys: string[];
+  unresolvedLayers: string[];
+}
+
 export interface CodexGlobalSettingsUpdate {
   expectedRevision: string;
   model?: string | null;

@@ -282,6 +282,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
+      providerId: "codex",
       voiceSummary: launchTemplate.voiceSummary,
       templateName: launchTemplate.templateName,
       turnState: launchTemplate.overlay ? () => readAgentTurnState(agentTurnReceiptPath(launchTemplate.overlay!.codexHome)) : undefined,
@@ -300,7 +301,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
           throw new Error("Codex conversation identity belongs to a different tab or execution.");
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
-        this.providers?.usage?.conversationStarted(input.tab, "codex", readAgentSelection(restoredInput.agent)?.accountId, identity.sessionId);
+        this.providers?.usage?.conversationStarted(input.tab, "codex", readAgentSelection(restoredInput.agent)?.accountId, identity.sessionId, input.workspaceId);
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
@@ -370,6 +371,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       replayBytes: this.replayBytes,
       submitDelayMs: CODEX_SUBMIT_DELAY_MS,
       voiceKind: "codex-terminal",
+      providerId: "codex",
       voiceSummary: "Existing interactive Codex CLI session.",
       turnState: this.sources ? () => readAgentTurnState(agentTurnReceiptPath(this.sources!.viewPath(input.tab.id))) : undefined,
       restoreInput: () => restoredInput,
@@ -382,7 +384,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== restoredInput.codexExecutionId))
           throw new Error("Codex conversation identity belongs to a different tab or execution.");
         restoredInput = { ...restoredInput, resume: { mode: "session", sessionId: identity.sessionId } };
-        this.providers?.usage?.conversationStarted(input.tab, "codex", readAgentSelection(restoredInput.agent)?.accountId, identity.sessionId);
+        this.providers?.usage?.conversationStarted(input.tab, "codex", readAgentSelection(restoredInput.agent)?.accountId, identity.sessionId, input.workspaceId);
         return input.controls.setRestoreInput?.(restoredInput);
       }, error => {
         restoredInput = { ...restoredInput, codexIdentityError: error instanceof Error ? error.message : "Codex conversation identity could not be read." };
@@ -905,6 +907,7 @@ function codexReadinessAction(): PluginActionDefinition {
 }
 
 interface TerminalSessionOptions {
+  providerId?: "codex" | "claude";
   closeOnExit: boolean;
   closeOnExitAfterMs?: number;
   replayBytes?: number;
@@ -1280,7 +1283,10 @@ export class CodexTerminalSession implements PluginSession {
       status: this.status,
       statusMessage: this.statusMessage,
       recentOutput: this.recentOutput,
-      state: { readiness: this.readinessSnapshot(), turn: this.options.turnState?.() },
+      state: { readiness: this.readinessSnapshot(), turn: this.options.turnState?.(), terminalCapabilities: {
+        tabId: this.tab.id, providerId: this.options.providerId,
+        executionId: this.options.restoreInput?.().codexExecutionId, commandCapture: Boolean(this.options.commandDetails)
+      } },
       nativeWork: this.nativeWorkState
     };
   }

@@ -1,6 +1,6 @@
 import { Ajv } from "ajv";
 import {
-  CODEX_CONFIGURATION_BASELINE_VERSION, codexConfigurationCatalog, codexConfigurationValidationSchema,
+  CODEX_CONFIGURATION_BASELINE_VERSION, codexConfigurationCatalog, codexConfigurationValidationSchema, codexConfigurationVersionReviewed,
   isCodexProtectedPath, isCodexReadOnlyPath, isCodexKnownPath, type CodexConfigurationSnapshot, type CodexConfigurationValue,
 } from "@cloudx/shared";
 import { parseCodexConfiguration } from "./CodexConfigurationDocument.js";
@@ -21,7 +21,7 @@ function publicValue(value: unknown, parts: string[], version: string): CodexCon
 export function readCodexConfiguration(text: string, version: string, command: string, sourcePath: string, yolo: boolean): CodexConfigurationSnapshot {
   const config = parseCodexConfiguration(text);
   const baseline = codexConfigurationCatalog(CODEX_CONFIGURATION_BASELINE_VERSION);
-  const reviewedVersion = ["0.160.0", "0.162.1"].includes(version) ? version : CODEX_CONFIGURATION_BASELINE_VERSION;
+  const reviewedVersion = codexConfigurationVersionReviewed(version) ? version : CODEX_CONFIGURATION_BASELINE_VERSION;
   const families = new Set(baseline.map(entry => entry.family));
   const values: Record<string, CodexConfigurationValue> = {};
   for (const [key, value] of Object.entries(config)) {
