@@ -38,7 +38,7 @@ def slug(value: str) -> str:
 
 
 def cell(value: object) -> str:
-    return str(value).replace("\n", " ").replace("|", "\\|")
+    return " ".join(str(value).splitlines()).replace("|", "\\|")
 
 
 def markdown_label(text: str) -> str:

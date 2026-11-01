@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -21,6 +22,13 @@ from validate_evidence import file_sha256, find_host_paths, validate_ir
 FILLER_PATTERNS = [r"\bit should be noted that\b", r"\bin order to\b", r"\bdue to the fact that\b", r"\bat this point in time\b", r"\bclearly\b", r"\bobviously\b"]
 DIAGRAM_LANGUAGES = {"mermaid", "mermaid-js", "d2", "dot", "graphviz", "plantuml", "vega-lite"}
 STATIC_LIMITS = "Static checks compare content and local image bytes; they do not establish semantic support, visual correctness or layout visibility."
+
+
+@dataclass(frozen=True)
+class ExpectedText:
+    label: str
+    text: str
+    literal: bool = False
 
 
 def prose_blocks(section: dict[str, Any]) -> list[tuple[str, str]]:
@@ -73,7 +81,7 @@ def local_marker_errors(text: str, ir: dict[str, Any], label: str) -> list[str]:
     return errors
 
 
-def expected_content(ir: dict[str, Any]) -> list[tuple[str, str]]:
+def expected_content(ir: dict[str, Any]) -> list[ExpectedText]:
     tables = {item["id"]: item for item in ir.get("tables", [])}
     visuals = {item["id"]: item for item in ir.get("visuals", [])}
     gaps = {item["id"]: item for item in ir.get("source_gaps", [])}
@@ -84,21 +92,21 @@ def expected_content(ir: dict[str, Any]) -> list[tuple[str, str]]:
             kind = block["kind"]
             if kind in {"paragraph", "code", "callout"}:
                 if kind == "callout":
-                    result.append((label + " title", block["title"]))
-                result.append((label, block["text"]))
+                    result.append(ExpectedText(label + " title", block["title"]))
+                result.append(ExpectedText(label, block["text"], literal=kind == "code"))
             elif kind == "bullets":
-                result.extend((f"{label} item[{index}]", item) for index, item in enumerate(block["items"]))
+                result.extend(ExpectedText(f"{label} item[{index}]", item) for index, item in enumerate(block["items"]))
             elif kind == "table_ref":
                 table = tables[block["table_id"]]
                 values = [table["caption"], *table["columns"], *(cell for row in table["rows"] for cell in row)]
-                result.extend((f"table {table['id']} content[{index}]", value) for index, value in enumerate(values) if value.strip())
+                result.extend(ExpectedText(f"table {table['id']} content[{index}]", value) for index, value in enumerate(values) if value.strip())
             elif kind == "visual_ref":
                 visual = visuals[block["visual_id"]]
-                result.append((f"visual {visual['id']} caption", visual["caption"]))
+                result.append(ExpectedText(f"visual {visual['id']} caption", visual["caption"]))
             elif kind == "gap_ref":
                 gap = gaps[block["gap_id"]]
-                result.append((f"gap {gap['id']} visible label", "Source gap"))
-                result.extend((f"gap {gap['id']} {key}", gap[key]) for key in ("missing_claim", "why_missing", "needed_source"))
+                result.append(ExpectedText(f"gap {gap['id']} visible label", "Source gap"))
+                result.extend(ExpectedText(f"gap {gap['id']} {key}", gap[key]) for key in ("missing_claim", "why_missing", "needed_source"))
     return result
 
 
@@ -138,8 +146,8 @@ def validate_ir_presentation(ir: dict[str, Any], *, allow_gaps: bool = False, so
     errors = validate_ir(ir, allow_gaps=allow_gaps, source_root=source_root)
     if errors:
         return errors
-    for label, text in expected_content(ir):
-        errors.extend(local_marker_errors(text, ir, label))
+    for expected in expected_content(ir):
+        errors.extend(local_marker_errors(expected.text, ir, expected.label))
     for visual in ir.get("visuals", []):
         errors.extend(local_marker_errors(visual["alt_text"], ir, f"visual {visual['id']} alt text"))
     return errors
@@ -160,6 +168,43 @@ def normalized_text(text: str, *, markdown: bool = True) -> str:
             parts[index] = re.sub(r"\\([\\`*_{}\[\]()#+.!|>-])", r"\1", part)
         text = "".join(parts)
     return " ".join(re.findall(r"\w+|[^\w\s]", text))
+
+
+def literal_text(text: str, *, pdf: bool = False) -> str:
+    return " ".join(text.split()) if pdf else text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def markdown_code_blocks(text: str) -> list[str]:
+    """Read the top-level fenced or indented code emitted by the GFM writer."""
+    blocks, lines = [], []
+    fence, indented, comment = "", False, False
+    for line in literal_text(text).split("\n"):
+        if fence:
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", line):
+                blocks.append("\n".join(lines))
+                fence, lines = "", []
+            else:
+                lines.append(line)
+            continue
+        if line.startswith(("    ", "\t")) and not comment:
+            lines.append(line[4:] if line.startswith("    ") else line[1:])
+            indented = True
+            continue
+        if indented:
+            if not line.strip():
+                lines.append("")
+                continue
+            blocks.append("\n".join(lines))
+            lines, indented = [], False
+        if comment or "<!--" in line:
+            comment = "-->" not in line
+            continue
+        opening = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
+        if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+            fence = opening[1]
+    if fence or indented:
+        blocks.append("\n".join(lines))
+    return blocks
 
 
 def image_errors(data: bytes, label: str) -> list[str]:
@@ -269,7 +314,14 @@ def docx_content(path: Path) -> tuple[str, list[str], int, list[list[list[str]]]
         root = ElementTree.fromstring(document.read("word/document.xml"))
         ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         def paragraph_text(paragraph):
-            return "".join(element.text or "" if element.tag.endswith("}t") else " " for element in paragraph.iter() if element.tag.rsplit("}", 1)[-1] in {"t", "tab", "br"})
+            parts = []
+            for element in paragraph.iter():
+                kind = element.tag.rsplit("}", 1)[-1]
+                if kind == "t":
+                    parts.append(element.text or "")
+                elif kind in {"tab", "br"}:
+                    parts.append("\t" if kind == "tab" else "\n")
+            return "".join(parts)
         text = "\n".join(paragraph_text(paragraph) for paragraph in root.findall(".//w:p", ns))
         images = [name for name in document.namelist() if name.startswith("word/media/") and not name.endswith("/")]
         for name in images:
@@ -286,7 +338,7 @@ def docx_content(path: Path) -> tuple[str, list[str], int, list[list[list[str]]]
 
 
 def normalize_pdf_line_breaks(text: str, ir: dict[str, Any]) -> str:
-    words = set(re.findall(r"\b\w+(?:-\w+)*\b", "\n".join(value for _, value in expected_content(ir))))
+    words = set(re.findall(r"\b\w+(?:-\w+)*\b", "\n".join(expected.text for expected in expected_content(ir) if not expected.literal)))
     def join_word(match):
         left, right = match.groups()
         joined, hyphenated = left + right, left + "-" + right
@@ -312,7 +364,7 @@ def validate_artifact(path: Path, ir: dict[str, Any]) -> list[str]:
             result = subprocess.run([tool, "-layout", str(path), "-"], capture_output=True, text=True)
             if result.returncode:
                 return [f"PDF text extraction failed: {result.stderr.strip()}"]
-            text, errors, images, tables = normalize_pdf_line_breaks(result.stdout, ir), [], None, None
+            text, errors, images, tables = result.stdout, [], None, None
         else:
             return [f"unsupported artifact type {suffix}; use Markdown, HTML, DOCX or PDF"]
     except (OSError, ValueError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
@@ -320,10 +372,18 @@ def validate_artifact(path: Path, ir: dict[str, Any]) -> list[str]:
     if not text.strip():
         errors.append("artifact has no visible/extractable content")
     markdown = suffix in {".md", ".markdown", ".gfm"}
-    actual = normalized_text(text, markdown=markdown)
-    for label, expected in expected_content(ir):
-        if normalized_text(expected) not in actual:
-            errors.append(f"artifact is missing expected {label}: {expected[:100]}")
+    prose = normalize_pdf_line_breaks(text, ir) if suffix == ".pdf" else text
+    actual = normalized_text(prose, markdown=markdown)
+    literal_content = markdown_code_blocks(path.read_text(encoding="utf-8")) if markdown else [text]
+    literal_content = [literal_text(code, pdf=suffix == ".pdf") for code in literal_content]
+    for expected in expected_content(ir):
+        if expected.literal:
+            code = literal_text(expected.text, pdf=suffix == ".pdf")
+            present = any(code in candidate for candidate in literal_content)
+        else:
+            present = normalized_text(expected.text) in actual
+        if not present:
+            errors.append(f"artifact is missing expected {expected.label}: {expected.text[:100]}")
     errors.extend(local_marker_errors(text, ir, "artifact text"))
     for host_path in find_host_paths(text):
         if host_path not in ir.get("runtime_paths", []):
@@ -389,7 +449,7 @@ def main() -> int:
         print(f"Artifact sha256: {file_sha256(path)}")
         print(STATIC_LIMITS)
         if path.suffix.lower() == ".pdf":
-            print("PDF checks cover extracted text only; embedded image bytes, table structure and link destinations were not checked.")
+            print("PDF checks cover extracted text only; code whitespace, embedded image bytes, table structure and link destinations were not checked.")
     return 0
 
 

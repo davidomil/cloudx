@@ -244,17 +244,26 @@ class PortableTableExamples(unittest.TestCase):
         self.ir["sections"][0]["blocks"].append({"kind": "table_ref", "table_id": "readings"})
 
     def test_table_values_keep_word_boundaries_in_portable_markdown(self):
-        result = compile_doc.compile_qmd(self.ir, compile_doc.RenderOptions())
-        self.assertIn("| Firmware configured |", result)
+        for newline in ["\n", "\r\n", "\r"]:
+            with self.subTest(newline=repr(newline)):
+                self.ir["tables"][0].update(columns=[f"Recorded{newline}result"], rows=[[f"Firmware{newline}configured | ready"]])
+                result = compile_doc.compile_qmd(self.ir, compile_doc.RenderOptions())
+                self.assertIn("| Recorded result |", result)
+                self.assertIn("| Firmware configured \\| ready |", result)
+                self.assertNotIn("\r", result)
 
-    @unittest.skipUnless(sgw_common.which("quarto"), "Quarto is required for the real DOCX conversion")
-    def test_multiline_table_value_survives_docx_conversion(self):
+    @unittest.skipUnless(sgw_common.which("quarto"), "Quarto is required for real document conversion")
+    def test_multiline_table_headers_and_values_survive_conversion(self):
         with tempfile.TemporaryDirectory(prefix="sgw-docx-table-tests-") as directory:
             root = Path(directory)
             qmd = root / "table.qmd"
-            qmd.write_text(compile_doc.compile_qmd(self.ir, compile_doc.RenderOptions(targets=("docx",))))
-            artifact = render_doc.render_quarto(qmd, "docx", root / "rendered")
-            self.assertEqual(validate_artifact(artifact, self.ir), [])
+            for target in ["docx", "gfm"]:
+                for newline in ["\n", "\r\n", "\r"]:
+                    with self.subTest(target=target, newline=repr(newline)):
+                        self.ir["tables"][0].update(columns=[f"Recorded{newline}result"], rows=[[f"Firmware{newline}configured"]])
+                        qmd.write_text(compile_doc.compile_qmd(self.ir, compile_doc.RenderOptions(targets=(target,))))
+                        artifact = render_doc.render_quarto(qmd, target, root / "rendered")
+                        self.assertEqual(validate_artifact(artifact, self.ir), [])
 
 
 class DependencyExamples(unittest.TestCase):

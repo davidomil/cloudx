@@ -14,6 +14,7 @@ import {
   rulesSkillsRootPath,
   type ResolvedPersonalityTemplate
 } from "../../rulesSkills/RulesSkillsCatalogService.js";
+import { SOURCE_GROUNDED_WRITING } from "../../rulesSkills/sourceGroundedWriting.js";
 import { replaceLink } from "../replaceLink.js";
 import { writeTextFileAtomic } from "../../jsonStateFile.js";
 import { shellQuote } from "../../terminal/ShellLaunch.js";
@@ -27,6 +28,13 @@ export const CLAUDE_FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
 // skills and commands are linked one by one when the user allows them.
 const SHARED_ENTRIES = ["settings.json", "agents", "plugins", "output-styles"] as const;
 const GENERATED_SKILL_GROUPS = ["cloudx", "cloudx-system"] as const;
+
+interface ClaudeSkillSource {
+  directory: string;
+  source: string;
+  catalogResources?: boolean;
+}
+
 // Variables that choose the credentials or the API endpoint. Claude Code
 // applies the env block of each settings file over the process environment,
 // so a value there would replace the selected account.
@@ -170,17 +178,21 @@ function generatedSkills(
   rulesSkillsRoot: string,
   resolved: ResolvedPersonalityTemplate | undefined,
   systemSkills: CloudxSkill[]
-): { directory: string; source: string }[] {
+): ClaudeSkillSource[] {
   return [
     ...(resolved?.skills ?? []).map(skill => ({ directory: `${GENERATED_SKILL_GROUPS[0]}-${safeSegment(skill.id)}`, source: path.dirname(cloudxSkillFilePath(rulesSkillsRoot, skill.id)) })),
-    ...systemSkills.map(skill => ({ directory: `${GENERATED_SKILL_GROUPS[1]}-${safeSegment(skill.id)}`, source: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)) }))
+    ...systemSkills.map(skill => ({
+      directory: `${GENERATED_SKILL_GROUPS[1]}-${safeSegment(skill.id)}`,
+      source: path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)),
+      catalogResources: skill.id === SOURCE_GROUNDED_WRITING.id
+    }))
   ];
 }
 
 async function materializeSkills(
   configDir: string,
   providerHome: string,
-  generated: { directory: string; source: string }[],
+  generated: ClaudeSkillSource[],
   policy: ClaudeSkillPolicy
 ): Promise<void> {
   const skillsDir = path.join(configDir, "skills");
@@ -193,7 +205,9 @@ async function materializeSkills(
   if ((await optionalLstat(commandsDir))?.isSymbolicLink()) await fsp.unlink(commandsDir);
   else await fsp.rm(commandsDir, { recursive: true, force: true });
   for (const skill of generated) {
-    await fsp.cp(skill.source, path.join(skillsDir, skill.directory), { recursive: true, dereference: false, verbatimSymlinks: true });
+    const target = path.join(skillsDir, skill.directory);
+    if (skill.catalogResources) await writeCatalogSkillEntrypoint(skill.source, target);
+    else await fsp.cp(skill.source, target, { recursive: true, dereference: false, verbatimSymlinks: true });
   }
   for (const source of [...policy.personalLinks, ...(policy.linkSynced ? ["skills/synced"] : [])]) {
     const target = path.join(configDir, ...source.split("/"));
@@ -201,6 +215,20 @@ async function materializeSkills(
     await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
     await fsp.symlink(path.join(providerHome, ...source.split("/")), target);
   }
+}
+
+async function writeCatalogSkillEntrypoint(source: string, target: string): Promise<void> {
+  const original = await fsp.realpath(path.join(source, "SKILL.md"));
+  const instructions = await fsp.readFile(original, "utf8");
+  const frontmatter = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/u.exec(instructions)?.[0];
+  if (!frontmatter) throw new Error(`CloudX skill ${original} must contain YAML frontmatter.`);
+  await fsp.mkdir(target, { recursive: true });
+  await writeAtomic(path.join(target, "SKILL.md"), [
+    frontmatter.trimEnd(), "", "# Skill source", "",
+    `Read the original instructions at ${JSON.stringify(original)} before using this skill.`,
+    `Resolve relative paths to skill-owned scripts, assets, references, and dependencies against ${JSON.stringify(path.dirname(original))}.`,
+    "Resolve task input and output paths from the task working directory, following any explicit working-directory instructions in the original skill. The original instructions and resources are authoritative.", ""
+  ].join("\n"));
 }
 
 async function writeInstructions(

@@ -12,12 +12,16 @@ Artifact tools require Python 3.10 or newer. Verify `python3 --version` before
 creating the environment; CloudX's older host-Python bootstrap requirement does
 not apply to these tools. CloudX installations also have managed Python 3.12.
 
-From the skill directory, create the Python environment if absent and install its pinned requirements:
+Install tools in the durable system skill catalog. Claude and Codex session
+entries point to this directory; session refreshes preserve its dependencies
+and generated outputs. Set `SGW` and enter that directory before creating the
+Python environment or installing pinned requirements:
 
 ```bash
+export SGW="${CLOUDX_RULES_SKILLS_DIR:?CloudX catalog path is required}/system-skills/source-grounded-writing"
+cd "$SGW"
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
-export SGW="$CLOUDX_RULES_SKILLS_DIR/system-skills/source-grounded-writing"
 export PATH="$SGW/.tools/bin:$SGW/node_modules/.bin:$SGW/.venv/bin:$PATH"
 ```
 
@@ -73,7 +77,7 @@ Compile separately for another target, or repeat `--target` for explicitly reque
 
 Other render targets are `docx`, `pdf-quarto`, and `pdf-html`. Select the HTML PDF engine explicitly with `--engine weasyprint` or `--engine pagedjs`. Keep the chosen target and engine after a failure. GFM output omits YAML metadata. Short-channel profiles omit title/TOC/section scaffolding by default; optional IR `presentation` booleans control title, section headings, TOC, and numbering.
 
-Embedded line breaks in table cells become spaces so text stays readable in
+Embedded line breaks (LF, CRLF, or CR) in table cells become spaces so text stays readable in
 HTML, Markdown, Word, and PDF exports.
 
 Every visual kind (Mermaid, D2, Graphviz, PlantUML, Vega-Lite, source-image) produces a static asset or fails with the renderer's error output. Source-image paths resolve against the IR directory, or `--source-root`. Raster files are decoded before use. Diagram specs are not delivered as a substitute for images.
@@ -88,6 +92,10 @@ Every visual kind (Mermaid, D2, Graphviz, PlantUML, Vega-Lite, source-image) pro
 Both validators accept `--allow-gaps` only with `doc_kind: gap_report`; compilation accepts the same flag. Gap reports use explicit `gap_ref` blocks. Ordinary blocks may never emit unsupported claims, even if `required_for_output` is false.
 
 Evidence validation checks schema, references, declared support states, source authority rules, portable paths, and supplied local file paths/hashes. It does not read remote sources or prove entailment. Presentation validation treats prose style as advisory, rejects explicit internal markers, and checks the final artifact's expected text, tables/captions, and local image assets. HTML and Markdown receive static content/asset checks; PDF and DOCX checks extract text and do not establish layout. Artifact checks report the exact file hash and their limits.
+
+Code-block checks preserve literal punctuation, quotes, entity spellings, and
+internal spacing in HTML, GFM, and DOCX. PDF code checks fold extracted whitespace
+and cannot verify spacing.
 
 Review the final artifact in a browser or inspect PDF pages when layout matters. Check readable figures/tables, clipping, pagination, and content after the last edit. A passing validator is not a semantic or visual approval.
 

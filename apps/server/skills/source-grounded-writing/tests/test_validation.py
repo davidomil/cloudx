@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import html
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 
@@ -290,6 +292,96 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(self.artifact('```sh\ngrep -I "$HOME/file"\n```'), [])
         for altered in ['grep -i "$HOME/file"', 'grep -I "$home/file"']:
             self.assertError(self.artifact('```sh\n' + altered + '\n```'), 'missing expected')
+
+    def code_artifact(self, code, suffix):
+        if suffix == '.docx':
+            path = self.root / 'code.docx'
+            with zipfile.ZipFile(path, 'w') as document:
+                document.writestr('word/document.xml', '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>' + html.escape(code) + '</w:t></w:r></w:p></w:body></w:document>')
+            return validate_artifact(path, self.ir)
+        if suffix == '.html':
+            return self.artifact('<pre><code>' + html.escape(code) + '</code></pre>', suffix)
+        return self.artifact('````sh\n' + code + '\n````\n', suffix)
+
+    def test_literal_code_accepts_markdown_syntax_and_entity_spellings(self):
+        for code in ['printf "**%s**" "$value"', 'printf "[result](guide.txt)"', 'printf "__result__"',
+                     r'printf "\[value\]"', 'printf "&amp;"', 'printf "<br>"', 'printf "<!-- literal -->"',
+                     'printf "%s" "“value”"']:
+            self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]
+            for suffix in ['.md', '.html', '.docx']:
+                with self.subTest(code=code, suffix=suffix):
+                    self.assertEqual(self.code_artifact(code, suffix), [])
+
+    def test_literal_code_rejects_changed_markdown_syntax_and_entities(self):
+        for expected, altered in [('printf "**%s**" "$value"', 'printf "%s" "$value"'),
+                                  ('printf "[result](guide.txt)"', 'printf "result"'),
+                                  ('printf "__result__"', 'printf "result"'),
+                                  (r'printf "\[value\]"', 'printf "[value]"'),
+                                  ('printf "&amp;"', 'printf "&"'), ('printf "<br>"', 'printf " "'),
+                                  ('printf "<!-- literal -->"', 'printf ""'),
+                                  ('printf "%s" "“value”"', 'printf "%s" "value"')]:
+            self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': expected, 'claim_ids': ['voltage']}]
+            for suffix in ['.md', '.html', '.docx']:
+                with self.subTest(expected=expected, suffix=suffix):
+                    self.assertError(self.code_artifact(altered, suffix), 'missing expected')
+
+    def test_markdown_code_fences_and_indented_code_preserve_literals(self):
+        code = 'printf "**%s**" "$value"\nprintf "`literal` <!-- comment -->"'
+        self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]
+        for content in ['``` sh\n' + code + '\n```', '~~~~sh\n' + code + '\n~~~~~',
+                        '\n'.join('    ' + line for line in code.splitlines())]:
+            with self.subTest(content=content):
+                self.assertEqual(self.artifact(content), [])
+
+    def test_hidden_markdown_comment_does_not_supply_expected_code(self):
+        code = 'printf "**%s**" "$value"'
+        self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]
+        for hidden in ['<!-- ' + code + ' -->', '<!--\n```sh\n' + code + '\n```\n-->']:
+            with self.subTest(hidden=hidden):
+                content = hidden + '\n\n```sh\nprintf "%s" "$value"\n```'
+                self.assertError(self.artifact(content), 'missing expected')
+
+    def test_literal_code_keeps_spaces_inside_command_arguments(self):
+        code = 'printf "%s" "a  b"'
+        self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]
+        for suffix in ['.md', '.html', '.docx']:
+            with self.subTest(suffix=suffix):
+                self.assertEqual(self.code_artifact(code, suffix), [])
+                self.assertError(self.code_artifact(code.replace('a  b', 'a b'), suffix), 'missing expected')
+
+    def test_docx_code_retains_tabs_and_line_breaks(self):
+        code = 'printf\t"**%s**"\nprintf "&amp;"'
+        self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]
+        path = self.root / 'code.docx'
+        content = '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>printf</w:t><w:tab/><w:t>"**%s**"</w:t><w:br/><w:t>printf "&amp;amp;"</w:t></w:r></w:p></w:body></w:document>'
+        with zipfile.ZipFile(path, 'w') as document:
+            document.writestr('word/document.xml', content)
+        self.assertEqual(validate_artifact(path, self.ir), [])
+        with zipfile.ZipFile(path, 'w') as document:
+            document.writestr('word/document.xml', content.replace('<w:tab/>', '<w:t> </w:t>'))
+        self.assertError(validate_artifact(path, self.ir), 'missing expected')
+
+    def test_pdf_hyphen_repair_does_not_rewrite_literal_code(self):
+        self.ir['sections'][0]['blocks'] = [
+            {'kind': 'paragraph', 'text': 'measurement', 'claim_ids': ['voltage']},
+            {'kind': 'code', 'language': 'sh', 'text': 'printf measurement', 'claim_ids': ['voltage']},
+        ]
+        path = self.root / 'code.pdf'
+        path.write_bytes(b'PDF extraction is supplied by the test.')
+        for extracted, valid in [('measurement\nprintf measurement\n', True),
+                                 ('measurement\nprintf measure-\nment\n', False)]:
+            with self.subTest(extracted=extracted), patch('validate_presentation.which', return_value='pdftotext'), \
+                    patch('validate_presentation.subprocess.run', return_value=subprocess.CompletedProcess([], 0, extracted, '')):
+                errors = validate_artifact(path, self.ir)
+                if valid:
+                    self.assertEqual(errors, [])
+                else:
+                    self.assertError(errors, 'missing expected')
+
+    def test_inline_code_in_markdown_prose_keeps_literal_punctuation(self):
+        self.ir['sections'][0]['blocks'][0]['text'] = 'Use **the command** `printf "**%s**" "$value"`.'
+        self.assertEqual(self.artifact(self.ir['sections'][0]['blocks'][0]['text']), [])
+        self.assertEqual(self.artifact('<p>Use <strong>the command</strong> <code>printf "**%s**" "$value"</code>.</p>', '.html'), [])
 
     def test_pdf_line_break_hyphenation_preserves_real_hyphens(self):
         self.ir['sections'][0]['blocks'][0]['text'] = 'The measurement is a source-grounded observation.'

@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { PluginSkillContributionFile } from "@cloudx/plugin-api";
 import type { CloudxSkill } from "@cloudx/shared";
@@ -10,7 +12,7 @@ export const SOURCE_GROUNDED_WRITING: CloudxSkill = {
   scope: "system"
 };
 
-const bundle = new URL("../../skills/source-grounded-writing/", import.meta.url);
+const bundle = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../skills/source-grounded-writing");
 
 export const SOURCE_GROUNDED_WRITING_FILES: PluginSkillContributionFile[] = [
   ".gitignore",
@@ -37,10 +39,11 @@ export const SOURCE_GROUNDED_WRITING_FILES: PluginSkillContributionFile[] = [
   "scripts/sgw_common.py",
   "scripts/validate_evidence.py",
   "scripts/validate_presentation.py",
+  "tests/test_literal_rendering.py",
   "tests/test_rendering.py",
   "tests/test_validation.py"
 ].map(file => ({
   path: file,
-  content: fs.readFileSync(new URL(file, bundle), "utf8"),
+  content: fs.readFileSync(path.join(bundle, file), "utf8"),
   executable: file.startsWith("scripts/")
 }));
