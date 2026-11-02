@@ -527,7 +527,7 @@ export async function ensureCloudxSystemSkills(rulesSkillsRoot: string): Promise
         const target = path.join(skillDir, file.path);
         await ensureCatalogDirectory(path.dirname(target), rulesSkillsRoot);
         await writeUtf8FileIfChanged(target, file.content, rulesSkillsRoot);
-        if (file.executable) await fsp.chmod(target, 0o755);
+        if (file.executable && ((await fsp.stat(target)).mode & 0o7777) !== 0o755) await fsp.chmod(target, 0o755);
       }
       continue;
     }
