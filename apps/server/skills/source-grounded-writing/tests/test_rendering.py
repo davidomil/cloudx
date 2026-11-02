@@ -117,6 +117,19 @@ class RenderingExamples(unittest.TestCase):
         self.assertIn("## Internal planning section", result)
         self.assertIn('"toc": true', result)
 
+    def test_code_line_endings_stay_separate_from_the_closing_fence(self):
+        ir = message_ir()
+        for newline in ['\n', '\r\n', '\r']:
+            with self.subTest(newline=repr(newline)):
+                ir['sections'][0]['blocks'] = [{
+                    'kind': 'code', 'language': 'sh',
+                    'text': 'printf "**%s**" "$value"' + newline * 2,
+                    'claim_ids': ['result'],
+                }]
+                result = compile_doc.compile_qmd(ir, self.options)
+                self.assertIn('```sh\nprintf "**%s**" "$value"\n\n\n```', result)
+                self.assertNotIn('\r', result)
+
     def test_url_does_not_grant_citation_visibility_and_tables_follow_claim_evidence(self):
         ir = message_ir()
         ir["tables"] = [{"id": "readings", "caption": "Measurements", "columns": ["Value"], "rows": [["recorded"]], "claim_ids": ["result"]}]

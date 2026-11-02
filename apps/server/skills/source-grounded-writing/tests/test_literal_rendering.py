@@ -66,6 +66,14 @@ class LiteralRenderingTests(unittest.TestCase):
         artifact = self.render(self.ir, "gfm", "unlabeled-gfm")
         self.assertEqual(validate_artifact(artifact, self.ir), [])
 
+    def test_newline_terminated_code_survives_gfm_conversion(self):
+        for newline in ['\n', '\r\n', '\r']:
+            for count in [0, 1, 2, 3]:
+                with self.subTest(newline=repr(newline), count=count):
+                    self.ir['sections'][0]['blocks'][1]['text'] = self.code + newline * count
+                    artifact = self.render(self.ir, 'gfm', 'newline-gfm')
+                    self.assertEqual(validate_artifact(artifact, self.ir), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -97,6 +97,10 @@ Code-block checks preserve literal punctuation, quotes, entity spellings, and
 internal spacing in HTML, GFM, and DOCX. PDF code checks fold extracted whitespace
 and cannot verify spacing.
 
+Set a code block's `language` when terminal blank lines must survive GFM export.
+Pandoc writes unlabeled code as an indented block and drops terminal blank lines;
+validation reports that loss. Fenced code retains its final content newline.
+
 Review the final artifact in a browser or inspect PDF pages when layout matters. Check readable figures/tables, clipping, pagination, and content after the last edit. A passing validator is not a semantic or visual approval.
 
 ## Optional audit output

@@ -333,6 +333,21 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertEqual(self.artifact(content), [])
 
+    def test_fenced_code_preserves_terminal_content_newlines(self):
+        command = 'printf "**%s**" "$value"'
+        for newline in ['\n', '\r\n', '\r']:
+            for count in [1, 2, 3]:
+                code = command + newline * count
+                self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]
+                for fence in ['```', '~~~~']:
+                    with self.subTest(newline=repr(newline), count=count, fence=fence):
+                        content = fence + 'sh' + newline + code + fence + newline
+                        self.assertEqual(self.artifact(content), [])
+                        self.assertError(self.artifact(content.replace('**%s**', '%s')), 'missing expected')
+                        if count > 1:
+                            shortened = fence + 'sh' + newline + command + newline * (count - 1) + fence + newline
+                            self.assertError(self.artifact(shortened), 'missing expected')
+
     def test_hidden_markdown_comment_does_not_supply_expected_code(self):
         code = 'printf "**%s**" "$value"'
         self.ir['sections'][0]['blocks'] = [{'kind': 'code', 'language': 'sh', 'text': code, 'claim_ids': ['voltage']}]

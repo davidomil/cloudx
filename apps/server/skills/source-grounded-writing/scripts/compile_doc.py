@@ -173,8 +173,9 @@ def emit_block(block: dict, claims: dict, tables: dict, visuals: dict, gaps: dic
     elif kind == "bullets":
         lines = [f"- {item}{citation if index == len(block['items']) - 1 else ''}" for index, item in enumerate(block["items"])]
     elif kind == "code":
-        fence = "`" * max(3, 1 + max((len(match.group()) for match in re.finditer(r"`+", block["text"])), default=0))
-        lines = [fence + block.get("language", ""), block["text"], fence]
+        text = block["text"].replace("\r\n", "\n").replace("\r", "\n")
+        fence = "`" * max(3, 1 + max((len(match.group()) for match in re.finditer(r"`+", text)), default=0))
+        lines = [fence + block.get("language", ""), text, fence]
         if citation:
             lines.extend(["", citation.strip()])
     elif kind == "callout":

@@ -11,7 +11,10 @@ two documents with the same figure ID into one directory overwrites the first
 document's image. Table-cell line breaks (LF, CRLF, and CR) become spaces so
 exports preserve word boundaries instead of dropping raw HTML break tags or
 splitting table rows. Artifact validation preserves code-block literals rather
-than interpreting their contents as prose Markdown. Regressions cover compiled
+than interpreting their contents as prose Markdown. Fenced GFM extraction keeps
+the content newline before the closing fence, including terminal blank lines.
+Code line endings normalize before compilation so a terminal CR cannot combine
+with the fence separator. Regressions cover compiled
 and delivered images, portable table text, and literal code validation, including
 real conversions when Quarto is installed. The remaining instructions, schema,
 fixtures, and dependency versions match that revision.

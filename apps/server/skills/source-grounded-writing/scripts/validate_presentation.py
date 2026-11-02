@@ -181,7 +181,7 @@ def markdown_code_blocks(text: str) -> list[str]:
     for line in literal_text(text).split("\n"):
         if fence:
             if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", line):
-                blocks.append("\n".join(lines))
+                blocks.append("".join(line + "\n" for line in lines))
                 fence, lines = "", []
             else:
                 lines.append(line)
