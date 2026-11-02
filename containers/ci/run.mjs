@@ -88,7 +88,7 @@ export function verificationCommands(lane = "full") {
         { PYTHONPATH: "services/documentation-indexer/src" },
       ),
       command(
-        commandTimeoutMs,
+        30 * 60 * 1_000,
         "npm",
         "run",
         "test:browser",
