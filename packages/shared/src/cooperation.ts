@@ -1,5 +1,5 @@
 import boardSchema from "./cooperationBoardSchema.json" with { type: "json" };
-import { Ajv2020 } from "ajv/dist/2020.js";
+import { Ajv2020, type ValidateFunction } from "ajv/dist/2020.js";
 export const COOPERATION_BOARD_SCHEMA = boardSchema;
 export const COOPERATION_PLUGIN_ID = "cooperation";
 export const COOPERATION_SCHEMA_VERSION = 1 as const;
@@ -153,15 +153,19 @@ export function isCooperationId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
-const validateBoard = new Ajv2020({ allErrors: true, strict: false }).compile(boardSchema);
+let cachedBoardValidator: ValidateFunction | undefined;
+function boardValidator(): ValidateFunction {
+  return cachedBoardValidator ??= new Ajv2020({ allErrors: true, strict: false }).compile(boardSchema);
+}
 
 export function parseCooperationBoard(value: unknown): CooperationBoard {
+  const validateBoard = boardValidator();
   if (!validateBoard(value)) throw new Error(`Invalid cooperation board: ${validateBoard.errors?.map(error => `${error.instancePath || "/"} ${error.message}`).join("; ")}`);
   return value as unknown as CooperationBoard;
 }
 
 export function isCooperationBoard(value: unknown): value is CooperationBoard {
-  return validateBoard(value) === true;
+  return boardValidator()(value) === true;
 }
 
 export function cooperationActor(caller: CooperationCaller): CooperationActor {
