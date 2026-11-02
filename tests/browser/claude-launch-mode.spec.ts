@@ -102,6 +102,43 @@ test("discloses the managed source tradeoff, saves future choice and preserves e
   ).toBe(true);
 });
 
+test("offers only new and exact-ID Claude sessions and submits the selected UUID", async ({
+  page,
+}) => {
+  await page.goto(baseUrl);
+  await page
+    .getByRole("button", { name: "Open new Claude tab", exact: true })
+    .click();
+  const dialog = page.locator(".dialog");
+  const session = dialog.getByLabel("Session", { exact: true });
+  await expect(session.locator("option")).toHaveText([
+    "New session",
+    "Resume ID",
+  ]);
+  await expect(
+    dialog.getByText("Resume picker and Resume last cannot verify", {
+      exact: false,
+    }),
+  ).toBeVisible();
+  await session.selectOption("session");
+  await expect(
+    dialog.getByRole("button", { name: "Create", exact: true }),
+  ).toBeDisabled();
+  await dialog
+    .getByLabel("Session ID", { exact: true })
+    .fill("b16b3294-9703-4c3c-a35c-de2c86d7e717");
+  await dialog.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(page.getByLabel("Submitted launch")).toHaveText(
+    JSON.stringify({
+      resume: {
+        mode: "session",
+        sessionId: "b16b3294-9703-4c3c-a35c-de2c86d7e717",
+      },
+      agent: { providerId: "claude", accountId: "selected" },
+    }),
+  );
+});
+
 test("keeps the longer mode disclosure and launch controls reachable in a short desktop window", async ({
   page,
 }) => {

@@ -36,6 +36,7 @@ it.skipIf(!fs.existsSync(path.join(sourceRoot, "apps/server/dist/config.js"))).e
   fs.writeFileSync(path.join(dataDir, "sessions.json"), JSON.stringify(saved));
   fs.cpSync(path.join(sourceRoot, "apps/server/dist"), path.join(releaseRoot, "apps/server/dist"), { recursive: true });
   fs.cpSync(path.join(sourceRoot, "apps/server/skills"), path.join(releaseRoot, "apps/server/skills"), { recursive: true });
+  fs.cpSync(path.join(sourceRoot, "apps/server/helpers"), path.join(releaseRoot, "apps/server/helpers"), { recursive: true });
   fs.mkdirSync(path.join(releaseRoot, "scripts"));
   for (const file of ["codex-selection.mjs", "codex-updater.mjs", "codex-state-errors.mjs"]) {
     fs.copyFileSync(path.join(sourceRoot, "scripts", file), path.join(releaseRoot, "scripts", file));
@@ -63,12 +64,15 @@ it.skipIf(!fs.existsSync(path.join(sourceRoot, "apps/server/dist/config.js"))).e
     import { SessionStateStore } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/workspace/SessionStateStore.js")).href)};
     import { resolveAssistantCommand } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/terminal/ShellLaunch.js")).href)};
     import { RulesSkillsCatalogService } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/rulesSkills/RulesSkillsCatalogService.js")).href)};
+    import { ClaudeConversationPolicies } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/agents/claude/ClaudeConversationPolicies.js")).href)};
     const env = JSON.parse(process.argv[1]);
     const config = loadConfig(env);
     await new RulesSkillsCatalogService(config.dataDir).list();
-    console.log(JSON.stringify({ assistantBin: resolveAssistantCommand(env), dataDir: config.dataDir, https: config.https, socket: terminalSocketPath(config.dataDir), sessions: await new SessionStateStore(config.dataDir).read() }));
+    const conversation = await new ClaudeConversationPolicies(config.dataDir).resolve({ sessionId: "12345678-1234-1234-1234-123456789012", accountId: "default", cwd: ${JSON.stringify(repoRoot)} });
+    console.log(JSON.stringify({ conversation, assistantBin: resolveAssistantCommand(env), dataDir: config.dataDir, https: config.https, socket: terminalSocketPath(config.dataDir), sessions: await new SessionStateStore(config.dataDir).read() }));
   `, JSON.stringify(activatedEnv)], { encoding: "utf8" }));
   expect(inspected.dataDir).toBe(dataDir);
+  expect(inspected.conversation).toEqual({ mode: "native-project", source: "default", historical: true });
   expect(activatedEnv.CLOUDX_ASSISTANT_BIN).toBe(envConfig.CLOUDX_ASSISTANT_BIN);
   expect(inspected.assistantBin).toBe(assistantBin);
   expect(fs.readFileSync(path.join(prefix, ".cloudx-codex-selection.json"), "utf8")).toBe(selection);

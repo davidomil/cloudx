@@ -2813,6 +2813,7 @@ export function CreateTabDialog({
   const isLocalWeb = selectedPlugin?.panelKind === "web-viewer";
   const isCodex = selectedPlugin?.id === AGENT_TERMINAL_PLUGIN_ID;
   const isClaude = isCodex && agentChoice?.providerId === "claude";
+  const resumeMode = isClaude && (codexResumeMode === "picker" || codexResumeMode === "last") ? "new" : codexResumeMode;
   const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
   const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
 
@@ -2865,7 +2866,7 @@ export function CreateTabDialog({
         ? { url: localWebUrl.trim() }
         : isCodex
           ? agentTabInitialInput(
-            codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll && !isClaude, codexResumeIncludeNonInteractive && !isClaude),
+            codexTabInitialInput(resumeMode, codexResumeSessionId, codexResumeAll && !isClaude, codexResumeIncludeNonInteractive && !isClaude),
             agentSelection(agentChoice, agentAccountId),
             isClaude ? claudeLaunchMode || undefined : undefined
           )
@@ -2953,12 +2954,12 @@ export function CreateTabDialog({
             ? "Inherit saved mode (resolved by server at launch)"
             : savedClaudeLaunchMode === null ? "Inherit · Native project (fresh CloudX default)" : `Inherit saved · ${claudeLaunchModeLabel(savedClaudeLaunchMode)}`} onChange={setClaudeLaunchMode} />
           {claudeModeReadFailed ? <small role="status">The saved mode could not be read here. Inherit still resolves on the server before launch; no mode has been changed.</small> : null}
-          {codexResumeMode !== "new" ? <small>Resume preserves the original recorded launch policy. An incompatible mode or an unverified historical managed session is rejected before work.</small> : null}
+          {resumeMode !== "new" ? <small>Resume preserves the original recorded launch policy. An incompatible mode or an unverified historical managed session is rejected before work.</small> : null}
         </> : null}
         {isCodex ? (
           <label>
             Session
-            <select aria-label="Session" value={codexResumeMode} onChange={(event) => {
+            <select aria-label="Session" value={resumeMode} onChange={(event) => {
               const mode = event.target.value as CodexSessionResumeMode;
               setCodexResumeMode(mode);
               if (mode === "new") {
@@ -2968,19 +2969,22 @@ export function CreateTabDialog({
               }
             }}>
               <option value="new">New session</option>
-              <option value="picker">Resume picker</option>
-              <option value="last">Resume last</option>
+              {!isClaude ? <>
+                <option value="picker">Resume picker</option>
+                <option value="last">Resume last</option>
+              </> : null}
               <option value="session">Resume ID</option>
             </select>
           </label>
         ) : null}
-        {isCodex && codexResumeMode === "session" ? (
+        {isClaude ? <small>Resume picker and Resume last cannot verify the conversation policy before launch. Use Resume ID with the exact conversation UUID, or start a new session.</small> : null}
+        {isCodex && resumeMode === "session" ? (
           <label>
             Session ID
-            <input value={codexResumeSessionId} onChange={(event) => setCodexResumeSessionId(event.target.value)} placeholder="UUID or thread name" {...noSystemTextAssistProps} />
+            <input value={codexResumeSessionId} onChange={(event) => setCodexResumeSessionId(event.target.value)} placeholder={isClaude ? "UUID" : "UUID or thread name"} {...noSystemTextAssistProps} />
           </label>
         ) : null}
-        {isCodex && !isClaude && codexResumeMode !== "new" && codexResumeMode !== "session" ? (
+        {isCodex && !isClaude && resumeMode !== "new" && resumeMode !== "session" ? (
           <>
             <label className="checkbox-row">
               <input type="checkbox" checked={codexResumeAll} onChange={(event) => setCodexResumeAll(event.target.checked)} />
@@ -3004,7 +3008,7 @@ export function CreateTabDialog({
         ) : null}
         <div className="dialog-actions">
           <ControlButton onClick={onCancel}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && resumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
             Create
           </ControlButton>
         </div>

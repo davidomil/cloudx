@@ -346,6 +346,21 @@ async function openFixtureTerminal(page: Page) {
     cwd: path.join(root, "workspace"),
   });
   expect(created.status(), await created.text()).toBe(201);
+  await expect(
+    page.getByLabel("Codex command details", { exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.locator(".terminal-panel").evaluate((panel) => {
+        const screen = panel.querySelector(".xterm-screen")!;
+        const viewport = panel.querySelector(".xterm-viewport")!;
+        return (
+          screen.getBoundingClientRect().height <=
+          viewport.getBoundingClientRect().height + 0.5
+        );
+      }),
+    )
+    .toBe(true);
   await expect(page.locator(".xterm-rows")).toContainText("READY");
   await page.locator(".xterm-helper-textarea").focus();
 }

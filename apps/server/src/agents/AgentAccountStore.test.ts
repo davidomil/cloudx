@@ -5,6 +5,8 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { AgentAccountStore } from "./AgentAccountStore.js";
+import { runAgentCli } from "./agentCli.js";
+import { buildEnforcedLoginShellLaunch } from "../terminal/ShellLaunch.js";
 
 // Fake provider CLIs record their arguments and report login state from the
 // files in the home they were pointed at.
@@ -25,6 +27,7 @@ esac
 if [ "$1" = "--settings" ]; then shift 2; fi
 case "$1 $2" in
   "--version "*) echo "2.1.316 (Claude Code)";;
+  "auth login") echo verified-login;;
   "auth status")
     if [ -n "$ANTHROPIC_API_KEY" ]; then method=api_key; logged=true;
     elif [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then method=claude.ai; logged=true;
@@ -175,4 +178,28 @@ exit 1
     await expect(store.create({ providerId: "claude", label: "Key", kind: "api-key", apiKey: "has space" })).rejects.toThrow("format is invalid");
     expect(await store.list()).toEqual([]);
   });
+});
+
+
+it("runs account login with the canonical executable verified before a hostile login profile changes PATH", async () => {
+  const { root, env, store } = await setup();
+  const native = env.CLOUDX_CLAUDE_BIN!;
+  const other = path.join(root, "profile-bin");
+  await fs.mkdir(other);
+  const substituted = path.join(root, "substituted");
+  await fs.writeFile(path.join(other, "claude"), `#!/bin/sh\ntouch ${substituted}\necho unreviewed-login\n`, { mode: 0o755 });
+  await fs.symlink(native, path.join(root, "bin", "claude"));
+  env.CLOUDX_CLAUDE_BIN = "claude";
+  env.PATH = `${path.join(root, "bin")}:${env.PATH}`;
+  const profile = path.join(root, "profile.sh");
+  await fs.writeFile(profile, `export PATH=${other}:$PATH\n`);
+  Object.assign(env, { SHELL: "/bin/bash", BASH_ENV: profile });
+  const account = await store.create({ providerId: "claude", label: "Pinned login", kind: "subscription" });
+  const selected = await store.loginCommand(account.id);
+  const launch = buildEnforcedLoginShellLaunch(selected.command, selected.args, selected.env, selected.enforced);
+  const result = await runAgentCli(launch.command, launch.args, { cwd: selected.cwd, env: launch.env });
+  expect(result.code).toBe(0);
+  expect(result.stdout.trim()).toBe("verified-login");
+  expect(selected.command).toBe(await fs.realpath(native));
+  await expect(fs.stat(substituted)).rejects.toMatchObject({ code: "ENOENT" });
 });

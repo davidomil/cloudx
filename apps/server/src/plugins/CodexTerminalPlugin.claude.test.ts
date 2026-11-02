@@ -73,6 +73,9 @@ async function setup() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-plugin-"));
   const env = { PATH: process.env.PATH, HOME: path.join(root, "home"), SHELL: "/bin/bash", CLOUDX_CLAUDE_BIN: "claude", ANTHROPIC_API_KEY: "inherited" };
   await fs.mkdir(env.HOME, { recursive: true });
+  const binary = path.join(env.HOME, "claude-fixture");
+  await fs.writeFile(binary, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.316 (Claude Code)"; fi\n', { mode: 0o755 });
+  env.CLOUDX_CLAUDE_BIN = binary;
   const dataDir = path.join(root, "data");
   await fs.mkdir(dataDir);
   const accounts = new AgentAccountStore(dataDir, env);
@@ -147,7 +150,7 @@ describe("CodexTerminalPlugin on Claude", () => {
     expect(factory.lastCommandLine).toMatch(/^unset ANTHROPIC_API_KEY /u);
     expect(factory.lastCommandLine).toContain('CLAUDE_CONFIG_DIR="$CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR"');
     expect(factory.lastCommandLine).toContain('ANTHROPIC_CONFIG_DIR="$CLOUDX_ENFORCED_ANTHROPIC_CONFIG_DIR"');
-    expect(factory.lastCommandLine).toMatch(/; exec claude --settings \S+\.cloudx-settings\.json --append-system-prompt-file \S+\.cloudx-instructions\.md --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
+    expect(factory.lastCommandLine).toMatch(/; exec \S+claude-fixture --settings \S+\.cloudx-settings\.json --append-system-prompt-file \S+\.cloudx-instructions\.md --add-dir \S+ --dangerously-skip-permissions -- 'Fix it'$/u);
     expect(factory.last.env).toMatchObject({ CLAUDE_CONFIG_DIR: configDir, CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR: configDir });
     expect(factory.last.env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-settings.json"), "utf8"))).toMatchObject({
@@ -305,17 +308,18 @@ it("rejects mode/account changes for a bound conversation before spawning or cha
   expect(original.agent).toEqual({ providerId: "claude", accountId: account.id }); first.stop?.();
 });
 
-it("keeps the verified managed executable when a login profile changes PATH", async () => {
+it.each(["native-project", "cloudx-managed"] as const)("keeps the verified %s executable when a login profile changes PATH", async mode => {
   const { plugin, factory, tab, cwd, controls, env, dataDir } = await setup();
   const reviewed = path.join(env.HOME, "reviewed-bin"); const other = path.join(env.HOME, "profile-bin");
   await fs.mkdir(reviewed); await fs.mkdir(other);
   const binary = path.join(reviewed, "claude");
   await fs.writeFile(binary, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.316 (Claude Code)"; else echo verified-executable; fi\n', { mode: 0o755 });
   await fs.writeFile(path.join(other, "claude"), '#!/bin/sh\necho unreviewed-executable\n', { mode: 0o755 });
+  env.CLOUDX_CLAUDE_BIN = "claude";
   env.PATH = `${reviewed}:${env.PATH}`;
   const profile = path.join(env.HOME, "profile.sh"); await fs.writeFile(profile, `export PATH=${other}:$PATH\n`);
   Object.assign(env, { BASH_ENV: profile });
-  const session = await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, claudeLaunchMode: "cloudx-managed" } });
+  const session = await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, claudeLaunchMode: mode } });
   try {
     const result = await runAgentCli(factory.last.command, factory.last.args, { cwd, env: factory.last.env });
     expect(result.code).toBe(0); expect(result.stdout.trim()).toBe("verified-executable");
@@ -335,4 +339,18 @@ it("keeps historical resume unverified and rejects strict mode, ambiguous resume
   expect(factory.launches).toHaveLength(0);
   const native = await plugin.createSession({ tab, cwd, controls, initialInput: { ...initialInput, claudeLaunchMode: "native-project" } });
   expect(await new AgentLaunchRecords(dataDir).read(tab.id, "claude")).toMatchObject({ historicalClaudeConversation: true, claudeLaunchPolicy: { exclusiveSkills: false } }); native.stop?.();
+});
+
+
+it("rejects a managed terminal before spawning or submitting when excluded project settings would clear disabled personal hooks", async () => {
+  const { plugin, factory, tab, cwd, controls, env } = await setup();
+  const personal = path.join(env.HOME, ".claude", "settings.json");
+  const project = path.join(cwd, ".claude", "settings.json");
+  await Promise.all([personal, project].map(file => fs.mkdir(path.dirname(file), { recursive: true })));
+  await fs.writeFile(personal, '{"disableAllHooks":true}');
+  await fs.writeFile(project, '{"disableAllHooks":false}');
+  await expect(plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, claudeLaunchMode: "cloudx-managed", prompt: "Never submit work" } })).rejects.toThrow("disableAllHooks");
+  expect(factory.launches).toHaveLength(0);
+  expect(await fs.readFile(personal, "utf8")).toBe('{"disableAllHooks":true}');
+  expect(await fs.readFile(project, "utf8")).toBe('{"disableAllHooks":false}');
 });

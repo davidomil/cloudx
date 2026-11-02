@@ -68,7 +68,7 @@ it.skipIf(!nativeBinary)("new tabs and Forge workers use the selected installati
       await fs.writeFile(path.join(packageDir, "package.json"), JSON.stringify({ name: "@openai/codex", version, bin: { codex: "bin/codex.js" } }));
       await fs.writeFile(path.join(packageDir, "bin/codex.js"), [
         "#!/bin/sh",
-        `printf '%s\\t%s\\n' ${shellQuote(label)} "$CODEX_HOME" >> ${shellQuote(commandLog)}`,
+        `printf '%s\\t%s\\t%s\\n' ${shellQuote(label)} "$CODEX_HOME" "$*" >> ${shellQuote(commandLog)}`,
         `exec ${shellQuote(nativeBinary!)} "$@"`, ""
       ].join("\n"), { mode: 0o700 });
       await fs.symlink(path.join(packageDir, "bin/codex.js"), assistantBin);
@@ -122,9 +122,12 @@ it.skipIf(!nativeBinary)("new tabs and Forge workers use the selected installati
     const launches = (await fs.readFile(commandLog, "utf8")).trim().split("\n");
     for (const session of [originalTab, originalWorker, selectedTab, selectedWorker]) {
       const expected = session.id.startsWith("original") ? "original" : "selected";
-      expect(launches.filter(line => line.endsWith(`/${session.id}`))).toEqual([
-        `${expected}\t${sources.viewPath(session.id)}`, `${expected}\t${sources.viewPath(session.id)}`
-      ]);
+      const calls = launches.map(line => line.split("\t")).filter(([, home]) => home === sources.viewPath(session.id));
+      expect(calls.map(([installation]) => installation)).toEqual([expected, expected, expected]);
+      const args = calls.map(([, , args]) => args!);
+      expect(args.filter(args => args === "--version")).toHaveLength(1);
+      expect(args.filter(args => args.includes("app-server"))).toHaveLength(1);
+      expect(args.filter(args => args !== "--version" && !args.includes("app-server"))).toHaveLength(1);
       expect(session.recovery.read()!.sessionId).toBe(session.threadId);
     }
     expect(originalTab.session.snapshot().status).toBe("running");

@@ -21,6 +21,7 @@ import { JsonStateFile, writeTextFileAtomic } from "../jsonStateFile.js";
 import { resolveCodexHome } from "../rulesSkills/CodexHomeOverlay.js";
 import type { EnforcedEnv } from "../terminal/ShellLaunch.js";
 import { agentCommand, claudeAccountLaunch, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
+import { pinClaudeExecutable } from "./claude/ClaudeManagedExecutable.js";
 import { assertClaudeAccountCompatibility } from "./claude/ClaudeAccountPreflight.js";
 import { parseClaudeNativeAccountStatus, verifyClaudeAccountPolicyVersion } from "./claude/ClaudeNativeSettings.js";
 
@@ -193,7 +194,7 @@ export class AgentAccountStore {
     const command = agentCommand(account.providerId, this.env);
     if (account.providerId === "claude") {
       const launch = await this.claudeAccountCommand(account);
-      return { command, args: [...launch.args, "auth", "login"], env: launch.env, enforced: launch.enforced, cwd: home };
+      return { command: agentCommand("claude", launch.env), args: [...launch.args, "auth", "login"], env: launch.env, enforced: launch.enforced, cwd: home };
     }
     return { command, args: ["login"], env: { ...this.env, CODEX_HOME: home }, enforced: { set: { CODEX_HOME: home }, unset: [] }, cwd: home };
   }
@@ -214,7 +215,8 @@ export class AgentAccountStore {
   private async claudeAccountCommand(account: AgentAccount, baseEnv: NodeJS.ProcessEnv = this.env) {
     const home = this.home(account);
     const launch = claudeAccountLaunch(baseEnv, home, await this.launchEnv(account));
-    await verifyClaudeAccountPolicyVersion(agentCommand("claude", baseEnv), launch.env);
+    await pinClaudeExecutable(launch.env, home);
+    await verifyClaudeAccountPolicyVersion(agentCommand("claude", launch.env), launch.env);
     await assertClaudeAccountCompatibility(launch.policy);
     const text = `${JSON.stringify(launch.policy.settings, null, 2)}\n`;
     const directory = path.join(home, ".cloudx-account-policy");
@@ -229,7 +231,7 @@ export class AgentAccountStore {
     const command = agentCommand(account.providerId, this.env);
     if (account.providerId === "claude") {
       const launch = await this.claudeAccountCommand(account);
-      const result = await runAgentCli(command, [...launch.args, "auth", "status", "--json"], { env: launch.env, cwd: home, signal });
+      const result = await runAgentCli(agentCommand("claude", launch.env), [...launch.args, "auth", "status", "--json"], { env: launch.env, cwd: home, signal });
       return parseClaudeNativeAccountStatus(result, launch.policy);
     }
     const result = await runAgentCli(command, ["login", "status"], { env: { ...this.env, CODEX_HOME: home }, cwd: home, signal });

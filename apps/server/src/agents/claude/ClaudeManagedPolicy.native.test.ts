@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { expect, it } from "vitest";
 import { materializeClaudeHomeOverlay, type ClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
+import { inspectClaudeNativeSettings } from "./ClaudeNativeSettings.js";
 import { CLAUDE_MANAGED_SOURCE_ENV_KEYS } from "./ClaudeManagedPolicy.js";
 import { buildEnforcedLoginShellLaunch } from "../../terminal/ShellLaunch.js";
 
@@ -234,3 +235,65 @@ native("managed source scope excludes project MCP configuration while Native pro
     expect(await fs.readFile(observations, "utf8")).toContain("prompts/list");
   } finally { await active?.close(); await fs.rm(root, { recursive: true, force: true }); }
 }, 35_000);
+
+
+native("managed preflight rejects disabled personal hooks despite an enabling excluded project setting, before any native prompt", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-hook-sources-"));
+  const providerHome = path.join(root, "personal"), accountHome = path.join(root, "account"), cwd = path.join(root, "project");
+  let requests = 0;
+  const server = http.createServer((_request, response) => { requests++; response.writeHead(400); response.end("{}"); });
+  try {
+    await Promise.all([providerHome, accountHome, cwd].map(directory => fs.mkdir(directory)));
+    await write(path.join(providerHome, "settings.json"), '{"disableAllHooks":true}');
+    await write(path.join(cwd, ".claude", "settings.json"), '{"disableAllHooks":false}');
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const env = { PATH: process.env.PATH, HOME: root, ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as {port:number}).port}`, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
+    const options = { dataDir: path.join(root, "data"), tabId: "rejected", providerHome, accountHome, cwd, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: "2.1.316", launchEnv: env };
+    await expect(materializeClaudeHomeOverlay({ ...options, launchMode: "cloudx-managed" })).rejects.toThrow("disableAllHooks");
+    await expect(fs.stat(path.join(options.dataDir, "claude-launches"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(requests).toBe(0);
+    // Read the real native source merge without sending a prompt/model request.
+    const settingsPath = path.join(root, "probe.json"); await write(settingsPath, "{}");
+    const probe = { command: claude!, settingsPath, cwd, env: { ...env, CLAUDE_CONFIG_DIR: providerHome } };
+    const managed = await inspectClaudeNativeSettings({ ...probe, configurationArgs: ["--setting-sources", "user"] });
+    const nativeProject = await inspectClaudeNativeSettings(probe);
+    expect(managed.version).toBe("2.1.316");
+    expect(managed.hooks.policy).toMatchObject({ allDisabled: true });
+    expect(nativeProject.hooks.policy).toMatchObject({ allDisabled: false });
+    expect(requests).toBe(0);
+    expect(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).toBe('{"disableAllHooks":true}');
+    expect(await fs.readFile(path.join(cwd, ".claude", "settings.json"), "utf8")).toBe('{"disableAllHooks":false}');
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); await fs.rm(root, { recursive: true, force: true }); }
+}, 30_000);
+
+native.each(["settings.json", "settings.local.json"])("Native project rejects required skill suppression in loaded %s before launch while the native control advertises it", async file => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-skill-sources-"));
+  const providerHome = path.join(root, "personal"), accountHome = path.join(root, "account"), cwd = path.join(root, "project");
+  let active: ReturnType<typeof client> | undefined;
+  try {
+    await Promise.all([providerHome, accountHome, cwd].map(directory => fs.mkdir(directory)));
+    const dataDir = path.join(root, "data");
+    await write(path.join(dataDir, "rules-skills", "skills", "template-owned", "SKILL.md"), "---\ndescription: Selected template fixture.\n---\nTemplate body.");
+    const resolved = { source: "tab" as const, template: { id: "template", name: "Template", color: "green" as const, ruleIds: [], skillIds: ["template-owned"] }, rules: [], skills: [{ id: "template-owned", name: "Template owned", description: "Selected fixture" }] };
+    const env = { PATH: process.env.PATH, HOME: root, ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: "http://127.0.0.1:1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
+    const options = { dataDir, tabId: "control", providerHome, accountHome, cwd, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: "2.1.316", launchMode: "native-project" as const, launchEnv: env, resolved };
+    const overlay = await materializeClaudeHomeOverlay(options);
+    active = client(overlay, cwd, env); await active.request("initialize");
+    const before = (await active.request("get_skills_dialog")).skills as Skill[];
+    await active.close(); active = undefined;
+    const source = path.join(cwd, ".claude", file);
+    for (const name of ["cloudx-system-create-cloudx-skill", "cloudx-template-owned"]) {
+      expect(before.find(skill => skill.name === name)).toMatchObject({ state: "on", advertised: true });
+      const original = JSON.stringify({ skillOverrides: { [name]: "off" } });
+      await write(source, original);
+      await expect(materializeClaudeHomeOverlay({ ...options, tabId: "rejected" })).rejects.toThrow(`disables required CloudX skill ${name}`);
+      await expect(fs.stat(path.join(options.dataDir, "claude-launches", "rejected"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(source, "utf8")).toBe(original);
+      // The existing fixture demonstrates actual native suppression without model work.
+      active = client(overlay, cwd, env); await active.request("initialize");
+      const after = (await active.request("get_skills_dialog")).skills as Skill[];
+      expect(after.find(skill => skill.name === name)).toMatchObject({ state: "off", advertised: false });
+      await active.close(); active = undefined;
+    }
+  } finally { await active?.close(); await fs.rm(root, { recursive: true, force: true }); }
+}, 30_000);

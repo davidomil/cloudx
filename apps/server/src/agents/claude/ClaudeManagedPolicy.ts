@@ -1,9 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { isRecord } from "@cloudx/shared";
+import { isRecord, type ClaudeLaunchMode } from "@cloudx/shared";
 import { defaultManagedFiles, managedSettingsFiles, readPolicy } from "./ClaudeHookPolicy.js";
-import { worktreeLocalSettings } from "./ClaudeInstructionPolicy.js";
+import { claudeLoadedSettingsFiles, worktreeLocalSettings } from "./ClaudeSettingsSources.js";
 
 export const CLAUDE_MANAGED_VERSION = "2.1.316";
 export const CLAUDE_MANAGED_SETTING_SOURCES = ["user"];
@@ -16,13 +16,12 @@ export const CLAUDE_MANAGED_SOURCE_ENV_KEYS = [
 ] as const;
 const INJECTED_SOURCES = /^(?:CLAUDE_CODE_(?:PLUGIN(?:_|$)|HOST_SKILL_CATALOG$|DESKTOP_SKILLS_PLUGIN_DIR$|MCP_SERVE_ENABLED_PLUGINS$|USE_COWORK_PLUGINS$|RESTRICT_PERSONAL_CONFIG$|PROJECT_DIR_NAME$)|CLAUDE_AI_PLUGINS_SCOPE$)/u;
 
-export async function assertClaudeCatalogOwnership(providerHome: string, names: string[], managedFiles = defaultManagedFiles()): Promise<void> {
-  const userFile = path.join(providerHome, "settings.json");
+export async function assertClaudeCatalogOwnership(providerHome: string, names: string[], managedFiles = defaultManagedFiles(), launch: { cwd?: string; mode: ClaudeLaunchMode } = { mode: "native-project" }): Promise<void> {
   const assertAvailable = (settings: Record<string, unknown>, file: string) => {
     if (isRecord(settings.skillOverrides)) for (const name of names) if (settings.skillOverrides[name] === "off")
       throw new Error(`Claude skillOverrides in ${file} disables required CloudX skill ${name}. Ask the policy owner to permit the CloudX catalog before launching; CloudX has not changed policy.`);
   };
-  assertAvailable(await readPolicy(userFile), userFile);
+  for (const file of await claudeLoadedSettingsFiles(providerHome, launch.cwd, launch.mode)) assertAvailable(await readPolicy(file), file);
   for (const file of await managedSettingsFiles(managedFiles)) {
     const policy = await readPolicy(file);
     assertAvailable(policy, file);

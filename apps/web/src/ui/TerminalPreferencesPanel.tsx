@@ -5,11 +5,19 @@ export function TerminalPreferencesPanel() {
   const [initial] = useState(terminalPreferenceState);
   const [preferences, setPreferences] = useState(initial.preferences);
   const [error, setError] = useState<string | undefined>(initial.error);
-  useEffect(() => onTerminalPreferencesChanged(() => { const next = terminalPreferenceState(); setPreferences(next.preferences); setError(next.error); }), []);
+  const [fontFamily, setFontFamily] = useState(initial.preferences.fontFamily ?? "");
+  const [scrollback, setScrollback] = useState(String(initial.preferences.scrollback ?? ""));
+  useEffect(() => onTerminalPreferencesChanged(() => {
+    const next = terminalPreferenceState();
+    setPreferences(next.preferences);
+    setFontFamily(next.preferences.fontFamily ?? "");
+    setScrollback(String(next.preferences.scrollback ?? ""));
+    setError(next.error);
+  }), []);
   function change(key: keyof TerminalPreferences, value: unknown) {
-    const next = { ...preferences, [key]: value };
+    const next = { ...terminalPreferenceState().preferences, [key]: value };
     if (value === undefined) delete next[key];
-    try { saveTerminalPreferences(next); setPreferences(next); setError(undefined); }
+    try { saveTerminalPreferences(next); }
     catch (error) { setError(error instanceof Error ? error.message : String(error)); }
   }
   return <section aria-label="CloudX terminal preferences">
@@ -18,9 +26,9 @@ export function TerminalPreferencesPanel() {
       <option value="">Inherit — off</option><option value="true">On</option><option value="false">Off</option>
     </select></label>
     <p>Option-drag still selects text. Option-key shortcuts require Meta; physical keyboard behavior depends on the browser and OS.</p>
-    <label>Terminal font family <input defaultValue={preferences.fontFamily ?? ""} placeholder={TERMINAL_DEFAULTS.fontFamily} onBlur={e => change("fontFamily", e.target.value || undefined)} /></label>
+    <label>Terminal font family <input value={fontFamily} onChange={e => setFontFamily(e.target.value)} placeholder={TERMINAL_DEFAULTS.fontFamily} onBlur={() => { if (fontFamily !== (preferences.fontFamily ?? "")) change("fontFamily", fontFamily || undefined); }} /></label>
     <p>Effective font: {preferences.fontFamily ?? TERMINAL_DEFAULTS.fontFamily}. Font size follows CloudX UI scale.</p>
-    <label>Scrollback lines <input type="number" min={0} max={100000} defaultValue={preferences.scrollback ?? ""} placeholder="1000" onBlur={e => change("scrollback", e.target.value === "" ? undefined : Number(e.target.value))} /></label>
+    <label>Scrollback lines <input type="number" min={0} max={100000} value={scrollback} onChange={e => setScrollback(e.target.value)} placeholder="1000" onBlur={() => { if (scrollback !== String(preferences.scrollback ?? "")) change("scrollback", scrollback === "" ? undefined : Number(scrollback)); }} /></label>
     <p>Effective scrollback: {preferences.scrollback ?? TERMINAL_DEFAULTS.scrollback} lines. Reducing it discards older output from the browser view.</p>
     <label>Link activation <select value={preferences.links ?? ""} onChange={e => change("links", e.target.value || undefined)}>
       <option value="">Inherit — confirm destination</option><option value="confirm">Confirm destination</option><option value="disabled">Disabled</option>

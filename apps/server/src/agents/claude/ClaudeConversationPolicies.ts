@@ -2,7 +2,7 @@ import path from "node:path";
 import { parseClaudeResolvedLaunchPolicy, resolveClaudeLaunchMode, type ClaudeLaunchMode, type ClaudeResolvedLaunchPolicy } from "@cloudx/shared";
 import { JsonStateFile } from "../../jsonStateFile.js";
 import { defaultManagedFiles, managedSettingsFiles, readPolicy } from "./ClaudeHookPolicy.js";
-import { worktreeLocalSettings } from "./ClaudeInstructionPolicy.js";
+import { worktreeLocalSettings } from "./ClaudeSettingsSources.js";
 const files = await import(new URL("../../../helpers/claude-conversation-policy.mjs", import.meta.url).href);
 
 interface ConversationPolicy {

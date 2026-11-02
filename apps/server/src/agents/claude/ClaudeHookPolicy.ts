@@ -1,23 +1,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { isRecord } from "@cloudx/shared";
+import { claudeLoadedSettingsFiles } from "./ClaudeSettingsSources.js";
+import { isRecord, type ClaudeLaunchMode } from "@cloudx/shared";
 
 const MAX_SETTINGS_BYTES = 1024 * 1024;
 
 // File-backed policy preflight. Remote/MDM/registry policy and changes after
 // launch still require native capability verification; this never rewrites policy.
-export async function assertClaudeHookCompatibility(providerHome: string, cwd?: string, managedFiles = defaultManagedFiles()): Promise<void> {
-  const directories: string[] = [];
-  if (cwd) {
-    for (let current = path.resolve(cwd); ; current = path.dirname(current)) {
-      directories.unshift(current);
-      if (path.dirname(current) === current) break;
-    }
-  }
+export async function assertClaudeHookCompatibility(providerHome: string, cwd?: string, managedFiles = defaultManagedFiles(), mode: ClaudeLaunchMode = "native-project"): Promise<void> {
   const files = [
-    { file: path.join(providerHome, "settings.json"), managed: false },
-    ...directories.flatMap(directory => ["settings.json", "settings.local.json"].map(name => ({ file: path.join(directory, ".claude", name), managed: false }))),
+    ...(await claudeLoadedSettingsFiles(providerHome, cwd, mode)).map(file => ({ file, managed: false })),
     ...(await managedSettingsFiles(managedFiles)).map(file => ({ file, managed: true }))
   ];
   let disabledBy: string | undefined;

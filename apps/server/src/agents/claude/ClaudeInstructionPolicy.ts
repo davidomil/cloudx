@@ -1,12 +1,9 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 
 import { defaultManagedFiles, managedSettingsFiles, readPolicy } from "./ClaudeHookPolicy.js";
 
-const run = promisify(execFile);
+import { worktreeLocalSettings } from "./ClaudeSettingsSources.js";
 
 // Native 2.1.316 checks root exclusions before resolving a CLAUDE.md symlink.
 // Imports and rules keep their native loader; CloudX does not emulate its globs.
@@ -38,27 +35,5 @@ export async function assertClaudeInstructionSourceCompatibility(providerHome: s
     catch { throw new Error(`Cannot verify Claude claudeMdExcludes in ${file}. Fix the unreadable or invalid settings file before launching; CloudX has not changed it.`); }
     if (excludes === undefined || Array.isArray(excludes) && excludes.every(value => value === "")) continue;
     throw new Error(`Claude claudeMdExcludes in ${file} cannot be safely combined with CloudX's linked personal CLAUDE.md: native root exclusions are checked before resolving the original source. Launch Claude directly with the original personal configuration, or ask the policy owner to remove this unsupported combination before a CloudX launch. CloudX has not changed instructions, exclusions or trust.`);
-  }
-}
-
-export async function worktreeLocalSettings(directory: string): Promise<string | undefined> {
-  const gitEntry = path.join(directory, ".git");
-  try {
-    if (!(await fs.stat(gitEntry)).isFile()) return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-    throw new Error(`Cannot verify Claude claudeMdExcludes sources through ${gitEntry}. Make the project metadata readable before launching.`);
-  }
-  try {
-    const { stdout } = await run("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], {
-      timeout: 5_000, maxBuffer: 64 * 1024, encoding: "utf8", windowsHide: true,
-      env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull, GIT_OPTIONAL_LOCKS: "0" }
-    });
-    const [gitDir, commonDir] = stdout.trimEnd().split("\n");
-    if (!gitDir || !commonDir || path.dirname(gitDir) !== path.join(commonDir, "worktrees")) return;
-    const main = path.basename(commonDir) === ".git" ? path.dirname(commonDir) : commonDir;
-    return path.join(main, ".claude", "settings.local.json");
-  } catch {
-    throw new Error(`Cannot verify Claude claudeMdExcludes sources through ${gitEntry}. Repair the linked project metadata before launching; CloudX has not changed it.`);
   }
 }

@@ -159,6 +159,21 @@ describe("Claude personal configuration inheritance", () => {
 });
 
 describe("Claude required receipt hook policy", () => {
+  it("rejects a managed launch when an excluded project value would clear disabled personal hooks", async () => {
+    const input = await fixture();
+    const cwd = path.join(input.root, "project");
+    await fs.mkdir(path.join(cwd, ".claude"), { recursive: true });
+    const user = path.join(input.providerHome, "settings.json");
+    const project = path.join(cwd, ".claude", "settings.json");
+    await fs.writeFile(user, '{"disableAllHooks":true}');
+    await fs.writeFile(project, '{"disableAllHooks":false}');
+    await expect(materializeClaudeHomeOverlay({ ...input, cwd, launchMode: "cloudx-managed", nativeVersion: "2.1.316" })).rejects.toThrow("disableAllHooks");
+    await expect(fs.stat(path.join(input.dataDir, "claude-launches"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(user, "utf8")).toBe('{"disableAllHooks":true}');
+    expect(await fs.readFile(project, "utf8")).toBe('{"disableAllHooks":false}');
+    await expect(materializeClaudeHomeOverlay({ ...input, cwd, launchMode: "native-project" })).resolves.toMatchObject({ launchPolicy: { mode: "native-project" } });
+  });
+
   it("rejects a disabling user setting before materializing a tracked launch without rewriting it", async () => {
     const input = await fixture();
     const settingsPath = path.join(input.providerHome, "settings.json");
@@ -241,6 +256,11 @@ it("keeps the writer's installed tools and outputs in the catalog across Claude 
     expect(instructions).toContain(`against ${JSON.stringify(skillDir)}`);
     expect(instructions).toContain("Resolve task input and output paths from the task working directory");
   }
+  const managed = await materializeClaudeHomeOverlay({ ...options, tabId: "managed", executionId: "execution-4", launchMode: "cloudx-managed", nativeVersion: "2.1.316" });
+  const managedEntry = path.join(managed.configDir, "skills", "cloudx-system-source-grounded-writing");
+  expect(await fs.readFile(path.join(managedEntry, "SKILL.md"), "utf8")).toBe(await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8"));
+  for (const file of files) expect(await fs.readFile(path.join(managedEntry, file), "utf8")).toBe(file);
+  expect((await fs.lstat(managedEntry)).isSymbolicLink()).toBe(false);
   for (const [index, file] of files.entries()) {
     expect(await fs.readFile(path.join(skillDir, file), "utf8")).toBe(file);
     expect((await fs.stat(path.join(skillDir, file))).ino).toBe(originalFiles[index]!.ino);

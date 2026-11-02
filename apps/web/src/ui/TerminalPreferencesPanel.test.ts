@@ -33,6 +33,28 @@ describe("terminal preference ownership and recovery", () => {
     expect(readTerminalPreferences()).toEqual({});
     expect(panel.textContent).toContain("Unset inherits the CloudX default");
   });
+  it.each([
+    { field: "fontFamily", first: "First Mono", newer: "Shared Mono", selector: 'input:not([type])' },
+    { field: "scrollback", first: 1200, newer: 2400, selector: 'input[type="number"]' }
+  ])("keeps a newer shared $field preference after an unedited blur", ({ field, first, newer, selector }) => {
+    const panel = mount();
+    const input = panel.querySelector<HTMLInputElement>(selector)!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, String(first));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    act(() => input.dispatchEvent(new FocusEvent("focusout", { bubbles: true })));
+    expect(readTerminalPreferences()).toEqual({ [field]: first });
+
+    act(() => {
+      values.set(TERMINAL_PREFERENCES_KEY, JSON.stringify({ [field]: newer }));
+      window.dispatchEvent(new StorageEvent("storage", { key: TERMINAL_PREFERENCES_KEY }));
+    });
+    expect(input.value).toBe(String(newer));
+    act(() => input.dispatchEvent(new FocusEvent("focusout", { bubbles: true })));
+    expect(readTerminalPreferences()).toEqual({ [field]: newer });
+  });
   it("saves browser Option/Meta preferences immediately without native configuration writes", () => {
     const panel = mount();
     const option = panel.querySelector<HTMLSelectElement>("select")!;

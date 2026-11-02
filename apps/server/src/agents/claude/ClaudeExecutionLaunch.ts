@@ -10,7 +10,7 @@ import { buildToolEnv } from "../../terminal/ShellLaunch.js";
 import { claudeOverlayPath, claudeUserStatePath, materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { ClaudeSettingsService } from "./ClaudeSettingsService.js";
 import { verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
-import { pinClaudeManagedExecutable } from "./ClaudeManagedExecutable.js";
+import { pinClaudeExecutable } from "./ClaudeManagedExecutable.js";
 
 // One-shot/automation launches share the same settings, source policy, account
 // preflight and execution observations as interactive Claude tabs.
@@ -27,7 +27,7 @@ export async function prepareClaudeExecutionLaunch(accounts: AgentAccountStore, 
   const account = await accounts.resolve("claude");
   const configDir = claudeOverlayPath(accounts.dataDir, tabId);
   const launch = claudeAccountLaunch(buildToolEnv(baseEnv), configDir, await accounts.launchEnv(account));
-  if (selection.mode === "cloudx-managed") await pinClaudeManagedExecutable(launch.env, input.cwd);
+  await pinClaudeExecutable(launch.env, input.cwd);
   const provider = await readAgentProviderStatus("claude", launch.env);
   const command = agentCommand("claude", launch.env);
   await fs.mkdir(path.dirname(configDir), { recursive: true, mode: 0o700 });

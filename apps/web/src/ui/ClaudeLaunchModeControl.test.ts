@@ -21,10 +21,10 @@ const plugin: PluginDescriptor = {
   creatable: true, requiresDirectory: true, actions: [], configFields: []
 };
 
-async function fixture(savedMode: ClaudeLaunchMode | null, failRead = false, providerId: "claude" | "codex" = "claude") {
+async function fixture(savedMode: ClaudeLaunchMode | null, failRead = false, providerId: "claude" | "codex" | "both" = "claude") {
   const state: AgentAccountsState = {
-    providers: [{ providerId, installed: true, label: providerId }],
-    accounts: [{ id: "selected", providerId, label: "Selected", kind: "subscription", isDefault: true, createdAt: "2026-11-02" }]
+    providers: (providerId === "both" ? ["codex", "claude"] as const : [providerId]).map(providerId => ({ providerId, installed: true, label: providerId })),
+    accounts: (providerId === "both" ? ["codex", "claude"] as const : [providerId]).map(providerId => ({ id: "selected", providerId, label: "Selected", kind: "subscription", isDefault: true, createdAt: "2026-11-02" }))
   };
   const onCreate = vi.fn(async () => undefined);
   const callHook = vi.fn(async (id: string) => {
@@ -73,13 +73,38 @@ describe("Claude interactive launch mode", () => {
     const { container, onCreate } = await fixture(null);
     expect(container.textContent).toContain("Inherit · Native project (fresh CloudX default)");
     await select(container, "Claude launch mode", "cloudx-managed");
-    await select(container, "Session", "last");
+    const sessions = container.querySelector<HTMLSelectElement>('[aria-label="Session"]')!;
+    expect([...sessions.options].map(option => option.value)).toEqual(["new", "session"]);
+    expect(container.textContent).toContain("Resume picker and Resume last cannot verify the conversation policy before launch");
+    await select(container, "Session", "session");
+    const sessionId = container.querySelector<HTMLInputElement>('input[placeholder="UUID"]')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(sessionId, "b16b3294-9703-4c3c-a35c-de2c86d7e717");
+      sessionId.dispatchEvent(new Event("input", { bubbles: true }));
+    });
     expect(container.textContent).toContain("Resume preserves the original recorded launch policy");
     await create(container);
     expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ initialInput: {
       agent: { providerId: "claude", accountId: "selected" }, claudeLaunchMode: "cloudx-managed",
-      resume: { mode: "last", all: false, includeNonInteractive: false }
+      resume: { mode: "session", sessionId: "b16b3294-9703-4c3c-a35c-de2c86d7e717" }
     } }));
+  });
+
+  it("drops an ambiguous Codex resume choice when switching the dialog to Claude", async () => {
+    const { container, onCreate } = await fixture(null, false, "both");
+    const plugin = container.querySelector<HTMLSelectElement>("select")!;
+    await act(async () => {
+      plugin.value = "codex-terminal#codex";
+      plugin.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await select(container, "Session", "last");
+    await act(async () => {
+      plugin.value = "codex-terminal#claude";
+      plugin.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(container.querySelector<HTMLSelectElement>('[aria-label="Session"]')!.value).toBe("new");
+    await create(container);
+    expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({ initialInput: { agent: { providerId: "claude", accountId: "selected" } } }));
   });
 
   it("leaves inheritance to the server after a read failure and supports an explicit native choice", async () => {

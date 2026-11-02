@@ -751,6 +751,20 @@ describe("TerminalPanel", () => {
     expect(host!.querySelector(".codex-command-details")).toBeNull();
   });
 
+  it("keeps verified command controls mounted while reconnecting the same execution", async () => {
+    vi.useFakeTimers();
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    const toolbar = host!.querySelector(".codex-command-details");
+    expect(toolbar).not.toBeNull();
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => TestWebSocket.latest!.open());
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+    await act(async () => finish({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true }));
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+  });
+
   it("aborts capability and command requests when a tab becomes inactive", async () => {
     let finish!: (value: unknown) => void;
     terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });

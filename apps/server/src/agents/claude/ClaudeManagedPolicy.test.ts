@@ -142,3 +142,15 @@ it("bounds the combined selected snapshots before materializing the overlay", as
   await expect(materializeClaudeHomeOverlay({ ...options, allowedSkills: ["first", "second"] })).rejects.toThrow("bounded snapshot size");
   await expect(fs.stat(path.join(options.dataDir, "claude-launches"))).rejects.toMatchObject({ code: "ENOENT" });
 });
+
+
+it.each(["settings.json", "settings.local.json"])("rejects suppression of required CloudX system and template skills in loaded Native project %s", async file => {
+  const { options } = await fixture();
+  const source = path.join(options.cwd, ".claude", file);
+  for (const name of ["cloudx-system-create-cloudx-skill", "cloudx-template-owned"]) {
+    const original = JSON.stringify({ skillOverrides: { [name]: "off" } });
+    await write(source, original);
+    await expect(assertClaudeCatalogOwnership(options.providerHome, [name], [], { cwd: options.cwd, mode: "native-project" })).rejects.toThrow(`disables required CloudX skill ${name}`);
+    expect(await fs.readFile(source, "utf8")).toBe(original);
+  }
+});

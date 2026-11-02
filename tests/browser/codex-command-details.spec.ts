@@ -72,6 +72,17 @@ async function openFixture(page: Page) {
   };
   const input: string[] = [];
   const reads: string[] = [];
+  await page.route("**/api/tabs/*/terminal-capabilities", async (route) => {
+    const tabId = route.request().url().split("/").at(-2)!;
+    await route.fulfill({
+      json: {
+        tabId,
+        providerId: "codex",
+        executionId: snapshots[tabId].executionId,
+        commandCapture: true,
+      },
+    });
+  });
   await page.route("**/api/tabs/*/command-details", async (route) => {
     reads.push(route.request().method());
     const tabId = route.request().url().split("/").at(-2)!;

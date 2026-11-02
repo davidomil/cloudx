@@ -8,11 +8,12 @@ import { type ClaudeLaunchMode } from "@cloudx/shared";
 import { expect, it, vi } from "vitest";
 
 import { CodexConversationRecovery } from "../../plugins/CodexConversationRecovery.js";
-import { buildEnforcedLoginShellLaunch, shellQuote } from "../../terminal/ShellLaunch.js";
+import { buildEnforcedLoginShellLaunch, resolveClaudeCommand, shellQuote } from "../../terminal/ShellLaunch.js";
 import { claudeAccountLaunch, runAgentCli } from "../agentCli.js";
 import { agentTurnReceiptPath } from "../agentTurn.js";
 import { CLAUDE_FORGE_TURN_BINDING, claudeOverlayPath, materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { CLAUDE_MANAGED_SOURCE_ENV_KEYS } from "./ClaudeManagedPolicy.js";
+import { pinClaudeExecutable } from "./ClaudeManagedExecutable.js";
 import { verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
@@ -47,6 +48,7 @@ native.each((["native-project", "cloudx-managed"] as const).flatMap(mode => [
     }, { timeout: 10_000 });
     if (scenario !== "failure") expect(await fixture.final()).toMatchObject({ text: "Local receipt fixture complete.", status: "completed" });
     expect(await fs.readFile(fixture.userSettings, "utf8")).toBe(fixture.originalSettings);
+    await fixture.assertReviewedExecutable();
     expect(fixture.conversation()).toMatchObject({ sessionId: SESSION, cwd: fixture.cwd, selection: { executionId: EXECUTION, tabId: TAB } });
   } finally { await fixture.close(); }
 }, 60_000);
@@ -62,6 +64,11 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
   const receiptPath = path.join(root, "forge.json");
   const userSettings = path.join(providerHome, "settings.json");
   const profileMarker = path.join(root, "profile-ran");
+  const substituted = path.join(root, "wrong-installation-ran");
+  const reviewedBin = path.join(root, "reviewed-bin"), profileBin = path.join(root, "profile-bin");
+  await Promise.all([reviewedBin, profileBin].map(directory => fs.mkdir(directory)));
+  await fs.symlink(claude!, path.join(reviewedBin, "claude"));
+  await fs.writeFile(path.join(profileBin, "claude"), `#!/bin/sh\ntouch ${shellQuote(substituted)}\necho "2.1.317 (Claude Code)"\n`, { mode: 0o755 });
   const requestObservations: Array<Record<string, boolean>> = [];
   await Promise.all([providerHome, accountHome, cwd, path.join(root, "home"), path.join(cwd, ".claude")].map(directory => fs.mkdir(directory, { recursive: true })));
   const userHooks: Settings = {};
@@ -82,7 +89,7 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
   await fs.writeFile(path.join(cwd, ".claude", "settings.json"), JSON.stringify({ env: conflictingEnv }));
   if (mode === "native-project") await fs.writeFile(path.join(cwd, ".claude", "settings.local.json"), JSON.stringify({ env: conflictingEnv }));
   const profile = path.join(root, "profile.sh");
-  await fs.writeFile(profile, [...Object.entries(conflictingEnv).map(([key, value]) => `export ${key}=${shellQuote(value)}`), `touch ${shellQuote(profileMarker)}`].join("\n"));
+  await fs.writeFile(profile, [`export PATH=${shellQuote(profileBin)}:$PATH`, ...Object.entries(conflictingEnv).map(([key, value]) => `export ${key}=${shellQuote(value)}`), `touch ${shellQuote(profileMarker)}`].join("\n"));
   const json = async (file: string) => JSON.parse(await fs.readFile(file, "utf8"));
   const conversation = () => new CodexConversationRecovery(configDir).readForExecution(TAB, EXECUTION);
   const server = http.createServer(async (request, response) => {
@@ -125,18 +132,22 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Local fixture needs a TCP endpoint.");
   const baseEnv = {
-    PATH: process.env.PATH, HOME: path.join(root, "home"), SHELL: "/bin/bash", BASH_ENV: profile,
+    PATH: `${reviewedBin}:${process.env.PATH}`, CLOUDX_CLAUDE_BIN: "claude", HOME: path.join(root, "home"), SHELL: "/bin/bash", BASH_ENV: profile,
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${address.port}/selected`, ANTHROPIC_CUSTOM_HEADERS: "X-CloudX-Fixture: intentional-service-header",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1"
   };
   return {
     cwd, originalSettings, userSettings, requestObservations, conversation,
+    assertReviewedExecutable: () => expect(fs.stat(substituted)).rejects.toMatchObject({ code: "ENOENT" }),
     receipt: () => json(receiptPath), turn: () => json(agentTurnReceiptPath(configDir)), final: () => json(`${receiptPath}.final.json`),
     execute: async () => {
       const account = claudeAccountLaunch(baseEnv, configDir, { ANTHROPIC_API_KEY: "fake-selected-local-key" });
+      await pinClaudeExecutable(account.env, cwd);
+      const command = resolveClaudeCommand(account.env);
+      expect(command).toBe(await fs.realpath(claude!));
       const overlay = await materializeClaudeHomeOverlay({ dataDir, tabId: TAB, accountHome, providerHome, executionId: EXECUTION,
         cwd, trustProject: true, launchEnv: account.env, accountPolicy: account.policy, launchMode: mode, nativeVersion: "2.1.316" });
-      await verifyClaudeNativeAccount({ command: claude!, settingsPath: overlay.settingsPath, cwd, env: account.env, configurationArgs: overlay.configurationArgs }, account.policy);
+      await verifyClaudeNativeAccount({ command, settingsPath: overlay.settingsPath, cwd, env: account.env, configurationArgs: overlay.configurationArgs }, account.policy);
       expect(requestObservations).toEqual([]);
       expect(conversation()).toBeUndefined();
       await fs.writeFile(path.join(configDir, CLAUDE_FORGE_TURN_BINDING), JSON.stringify({
@@ -149,7 +160,7 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
       if (scenario === "failure") {
         args[args.indexOf("json")] = "stream-json";
         args.push("--input-format", "stream-json", "--verbose");
-        const launch = buildEnforcedLoginShellLaunch(claude!, args, account.env, enforced);
+        const launch = buildEnforcedLoginShellLaunch(command, args, account.env, enforced);
         const child = spawn(launch.command, launch.args, { cwd, env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
         let startupError: Error | undefined;
         const closed = new Promise<void>(resolve => {
@@ -177,7 +188,7 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
         return;
       }
       args.push("--", "Run only the local receipt fixture.");
-      const launch = buildEnforcedLoginShellLaunch(claude!, args, account.env, enforced);
+      const launch = buildEnforcedLoginShellLaunch(command, args, account.env, enforced);
       const result = await runAgentCli(launch.command, launch.args, { cwd, env: launch.env, timeoutMs: 40_000 });
       expect(result.code).toBe(0);
     },

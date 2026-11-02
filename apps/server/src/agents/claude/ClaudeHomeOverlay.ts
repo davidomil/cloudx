@@ -119,8 +119,9 @@ export function claudeOverlayPath(dataDir: string, tabId: string): string {
 }
 
 export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOptions): Promise<ClaudeHomeOverlay> {
+  const mode = options.launchMode ?? "native-project";
   await assertClaudeInstructionSourceCompatibility(options.providerHome, options.cwd);
-  await assertClaudeHookCompatibility(options.providerHome, options.cwd);
+  await assertClaudeHookCompatibility(options.providerHome, options.cwd, undefined, mode);
   const configDir = claudeOverlayPath(options.dataDir, options.tabId);
   const accountPolicy = options.accountPolicy ?? resolveClaudeAccountPolicy(options.launchEnv ?? {}, configDir, options.launchEnv?.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: options.launchEnv.ANTHROPIC_API_KEY } : {});
   await assertClaudeAccountCompatibility(accountPolicy);
@@ -128,8 +129,7 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
   const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
   const generated = generatedSkills(rulesSkillsRoot, options.resolved, systemSkills);
-  await assertClaudeCatalogOwnership(options.providerHome, generated.map(skill => skill.directory));
-  const mode = options.launchMode ?? "native-project";
+  await assertClaudeCatalogOwnership(options.providerHome, generated.map(skill => skill.directory), undefined, { cwd: options.cwd, mode });
   if (options.conversationPolicy) await assertClaudeConversationNavigationCompatibility({ providerHome: options.providerHome, cwd: options.cwd, env: options.launchEnv, mode });
   const policy = await claudeSkillPolicy({
     providerHome: options.providerHome,

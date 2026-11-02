@@ -8,11 +8,16 @@ import { execFileSync } from "node:child_process";
 import { build } from "vite";
 import { NativeCodexCopySession } from "./fixtures/native-codex-copy.js";
 import { NativeClaudeTerminalSession } from "./fixtures/native-claude-terminal.js";
+import { buildServer, buildServices } from "../../apps/server/src/server.js";
+import { loadConfig } from "../../apps/server/src/config.js";
+import type { WorkspaceTab } from "@cloudx/shared";
 
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 let fixtureBuild: string;
 let httpServer: Server;
 let baseUrl: string;
+let citationWorkspace: string;
+let citationApi: Awaited<ReturnType<typeof buildServer>>;
 
 test.beforeAll(async ({}, testInfo) => {
   const started = Date.now();
@@ -50,6 +55,35 @@ test.beforeAll(async ({}, testInfo) => {
   fixtureBuild = await fs.mkdtemp(
     path.join(os.tmpdir(), "cloudx-terminal-browser-build-"),
   );
+  citationWorkspace = await fs.mkdtemp(
+    path.join(os.tmpdir(), "cloudx-citation-browser-"),
+  );
+  await fs.mkdir(path.join(citationWorkspace, "src"));
+  await fs.writeFile(
+    path.join(citationWorkspace, "src", "café file.ts"),
+    "first\nsecond\nthird\n",
+  );
+  const citationConfig = {
+    ...loadConfig({
+      CLOUDX_DATA_DIR: path.join(citationWorkspace, ".cloudx"),
+      CLOUDX_ALLOWED_ROOTS: citationWorkspace,
+      CLOUDX_WEB_DIST_DIR: path.join(citationWorkspace, "missing-web-dist"),
+      CLOUDX_APP_SERVER_ENABLED: "false",
+      CLOUDX_AUTOMATION_START_DISABLED: "true",
+      CLOUDX_LOG_LEVEL: "silent",
+    }),
+    trustedOrigins: ["http://localhost"],
+  };
+  const citationServices = buildServices(citationConfig);
+  citationServices.sessions.getTab = (tabId) => {
+    if (tabId !== "copy-tab") throw new Error("Unknown citation fixture tab.");
+    return {
+      id: tabId,
+      pluginId: "codex-terminal",
+      cwd: citationWorkspace,
+    } as WorkspaceTab;
+  };
+  citationApi = await buildServer(citationConfig, citationServices);
   await build({
     configFile: false,
     root: repoRoot,
@@ -98,6 +132,16 @@ test.beforeAll(async ({}, testInfo) => {
   httpServer = createHttpServer(async (request, response) => {
     try {
       const url = new URL(request.url!, "http://fixture.invalid");
+      if (url.pathname === "/api/tabs/copy-tab/files/text") {
+        const result = await citationApi.inject({
+          method: "GET",
+          url: `${url.pathname}${url.search}`,
+        });
+        response
+          .writeHead(result.statusCode, result.headers)
+          .end(result.rawPayload);
+        return;
+      }
       const filename = path.resolve(
         fixtureBuild,
         `.${decodeURIComponent(url.pathname)}`,
@@ -136,6 +180,9 @@ test.afterAll(async () => {
       httpServer.close((error) => (error ? reject(error) : resolve())),
     );
   if (fixtureBuild) await fs.rm(fixtureBuild, { recursive: true, force: true });
+  await citationApi?.close();
+  if (citationWorkspace)
+    await fs.rm(citationWorkspace, { recursive: true, force: true });
 });
 
 for (const fullscreen of [false, true]) {
@@ -2439,12 +2486,9 @@ test("routes plain and OSC 8 destinations to a browser confirmation or originati
   page,
 }) => {
   const opened: string[] = [];
-  await page.route("**/api/tabs/*/files/raw?*", (route) => {
-    opened.push(route.request().url());
-    return route.fulfill({
-      contentType: "text/plain",
-      body: "first\nsecond\nthird\n",
-    });
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname.endsWith("/files/text"))
+      opened.push(request.url());
   });
   const stream = await terminalStream(page);
   stream.screen(
@@ -2471,7 +2515,7 @@ test("routes plain and OSC 8 destinations to a browser confirmation or originati
     destination.getByRole("textbox", { name: "Workspace file citation" }),
   ).toHaveValue("first\nsecond\nthird\n");
   expect(opened[0]).toContain(
-    "/api/tabs/copy-tab/files/raw?relativePath=src%2Fcaf%C3%A9+file.ts",
+    "/api/tabs/copy-tab/files/text?relativePath=src%2Fcaf%C3%A9+file.ts",
   );
   await expect(destination).toContainText("Line 2, column 2");
 });

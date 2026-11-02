@@ -234,6 +234,60 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 
+  test("keeps shared font and scrollback edits after an unedited blur in another tab", async ({
+    page,
+    context,
+    isMobile,
+  }) => {
+    const other = await context.newPage();
+    async function openTerminalPreferences(target: Page) {
+      await target.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      if (isMobile) {
+        await target.getByRole("button", { name: "Workspace actions" }).click();
+        await target.getByRole("menuitem", { name: "Settings" }).click();
+      } else {
+        await target
+          .getByRole("button", { name: "Settings", exact: true })
+          .click();
+      }
+      await target
+        .locator(".settings-dialog")
+        .getByRole("tab", { name: "Terminal", exact: true })
+        .click();
+    }
+    try {
+      await openTerminalPreferences(page);
+      await openTerminalPreferences(other);
+      for (const [label, first, shared] of [
+        ["Terminal font family", "First Mono", "Shared Mono"],
+        ["Scrollback lines", "1200", "2400"],
+      ]) {
+        const input = page.getByLabel(label, { exact: true });
+        await input.fill(first);
+        await input.blur();
+        await expect(other.getByLabel(label, { exact: true })).toHaveValue(
+          first,
+        );
+        await other.getByLabel(label, { exact: true }).fill(shared);
+        await other.getByLabel(label, { exact: true }).blur();
+        await expect(input).toHaveValue(shared);
+        await input.focus();
+        await input.blur();
+        await expect(other.getByLabel(label, { exact: true })).toHaveValue(
+          shared,
+        );
+        const saved = await page.evaluate(() =>
+          JSON.parse(localStorage.getItem("cloudx.terminal-preferences.v1")!),
+        );
+        expect(
+          saved[label === "Terminal font family" ? "fontFamily" : "scrollback"],
+        ).toBe(label === "Terminal font family" ? shared : Number(shared));
+      }
+    } finally {
+      await other.close();
+    }
+  });
+
   test("restores the same running Codex terminal across two full page reloads", async ({
     page,
   }, testInfo) => {
@@ -1564,6 +1618,7 @@ async function writeTerminalFixture(root: string): Promise<string> {
       "#!" + process.execPath,
       'const fs = require("node:fs");',
       'const { once } = require("node:events");',
+      'if (process.argv.length === 3 && process.argv[2] === "--version") { console.log("codex-cli 0.166.0"); process.exit(0); }',
       "const startLog = " +
         JSON.stringify(path.join(root, "fixture-starts.jsonl")) +
         ";",

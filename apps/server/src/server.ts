@@ -692,6 +692,15 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     return reply.send(file.stream);
   });
 
+  app.get<{ Params: { tabId: string }; Querystring: { relativePath?: string } }>("/api/tabs/:tabId/files/text", async (request, reply) => {
+    const tab = services.sessions.getTab(request.params.tabId);
+    const file = await services.fileTransfer!.createTextPreview(tab, request.query.relativePath);
+    reply.header("content-type", file.contentType);
+    reply.header("cache-control", "no-store");
+    reply.header("x-content-type-options", "nosniff");
+    return reply.send(file.stream);
+  });
+
   app.post<{ Params: { tabId: string }; Querystring: { relativePath?: string }; Body: NodeJS.ReadableStream }>("/api/tabs/:tabId/files/upload", async (request) => {
     const contentLength = parseContentLength(request.headers["content-length"]);
     if (contentLength !== undefined && contentLength > FILE_UPLOAD_MAX_BYTES) {

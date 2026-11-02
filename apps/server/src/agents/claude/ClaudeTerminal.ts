@@ -36,7 +36,7 @@ import type { ClaudeLaunchPreferences, ClaudeSettingsService } from "./ClaudeSet
 import { verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
 import { CLAUDE_MANAGED_SOURCE_ENV_KEYS } from "./ClaudeManagedPolicy.js";
 import { ClaudeConversationPolicies } from "./ClaudeConversationPolicies.js";
-import { pinClaudeManagedExecutable } from "./ClaudeManagedExecutable.js";
+import { pinClaudeExecutable } from "./ClaudeManagedExecutable.js";
 
 export interface ClaudeTerminalOptions {
   factory: TerminalProcessFactory;
@@ -121,7 +121,7 @@ export class ClaudeTerminal {
           mode = { mode: previous.claudeLaunchPolicy.mode, source: "conversation", historical: false };
         }
       }
-      if (mode.mode === "cloudx-managed") await pinClaudeManagedExecutable(env, input.cwd);
+      await pinClaudeExecutable(env, input.cwd);
       const provider = await readAgentProviderStatus("claude", env);
       overlayInput = {
         dataDir, tabId: input.tab.id, accountHome: accounts.home(account), providerHome: this.providerHome, executionId,

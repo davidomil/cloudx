@@ -142,6 +142,11 @@ export function fileBrowserRawFileUrl(tabId: string, relativePath: string): stri
   return `/api/tabs/${encodeURIComponent(tabId)}/files/raw?${params.toString()}`;
 }
 
+export function terminalFileTextUrl(tabId: string, relativePath: string): string {
+  const params = new URLSearchParams({ relativePath });
+  return `/api/tabs/${encodeURIComponent(tabId)}/files/text?${params.toString()}`;
+}
+
 export async function uploadFileBrowserFile(tabId: string, relativePath: string, file: Blob, onProgress?: (progress: FileUploadProgress) => void): Promise<FileUploadResponse> {
   const params = new URLSearchParams({ relativePath });
   return new Promise<FileUploadResponse>((resolve, reject) => {

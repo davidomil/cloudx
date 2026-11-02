@@ -1,5 +1,5 @@
 import type { ILink, ILinkHandler, Terminal } from "@xterm/xterm";
-import { fileBrowserRawFileUrl } from "../api.js";
+import { terminalFileTextUrl } from "../api.js";
 import { readTerminalPreferences, TERMINAL_DEFAULTS } from "./terminalPreferences.js";
 
 export type TerminalLinkDestination = { kind: "web"; url: string } | { kind: "file"; relativePath: string; line: number; column: number };
@@ -119,7 +119,7 @@ export class TerminalLinks {
       }
       status.textContent = `Workspace: ${this.origin.cwd} · Line ${target.line}, column ${target.column} · Reading file…`;
       const request = this.request = new AbortController();
-      const response = await fetch(fileBrowserRawFileUrl(this.origin.tabId, target.relativePath), { signal: request.signal, cache: "no-store" });
+      const response = await fetch(terminalFileTextUrl(this.origin.tabId, target.relativePath), { signal: request.signal, cache: "no-store" });
       if (!response.ok) throw new Error(`File could not be opened (${response.status}).`);
       if (!/^(?:text\/|application\/(?:json|javascript|xml))/u.test(response.headers.get("content-type") ?? "")) throw new Error("This file type is not supported by the text citation preview.");
       const reader = response.body?.getReader();
