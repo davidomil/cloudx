@@ -666,6 +666,74 @@ test.describe("CloudX shipped shell", () => {
     }
   });
 
+  test("keeps a plugin chosen as its startup options become available", async ({
+    page,
+  }) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/api/plugins", async (route) => {
+      const response = await route.fetch();
+      await held;
+      await route.fulfill({ response });
+    });
+    let tabId: string | undefined;
+
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await page
+        .locator(".workspace-pane.active")
+        .getByTitle("Add tab to this pane")
+        .click();
+      await expect(page.getByLabel("Plugin")).toBeDisabled();
+      await page.evaluate(() => {
+        const select =
+          document.querySelector<HTMLSelectElement>(".dialog select")!;
+        const observer = new MutationObserver(() => {
+          if (
+            select.disabled ||
+            !select.querySelector('option[value="local-web"]')
+          )
+            return;
+          observer.disconnect();
+          select.value = "local-web";
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+          select.dataset.earlySelection = "local-web";
+        });
+        observer.observe(select, {
+          attributes: true,
+          childList: true,
+          subtree: true,
+        });
+      });
+      release();
+      await expect(page.getByLabel("Plugin")).toHaveAttribute(
+        "data-early-selection",
+        "local-web",
+      );
+      await expect(page.getByLabel("URL", { exact: true })).toBeVisible();
+      await page
+        .getByLabel("Title", { exact: true })
+        .fill("Early plugin choice");
+      const creating = page.waitForResponse(
+        (response) =>
+          response.request().method() === "POST" &&
+          new URL(response.url()).pathname === "/api/tabs",
+      );
+      await page.getByRole("button", { name: "Create", exact: true }).click();
+      const response = await creating;
+      expect(response.status()).toBe(201);
+      const created = (await response.json()) as CreateTabResponse;
+      tabId = created.tab.id;
+      expect(created.tab.pluginId).toBe("local-web");
+    } finally {
+      release();
+      await page.unrouteAll({ behavior: "wait" });
+      if (tabId) await page.request.delete(`${baseUrl}/api/tabs/${tabId}`);
+    }
+  });
+
   test("keeps queued uploads and their progress with the original tab while switching tabs", async ({
     page,
     isMobile,

@@ -2816,10 +2816,10 @@ function CreateTabDialog({
   const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
 
   useEffect(() => {
-    if (!selectedPlugin) {
-      setPluginId(selectCreateTabPluginId(creatablePlugins));
-    }
-  }, [creatablePlugins, selectedPlugin]);
+    setPluginId((current) => creatablePlugins.some((plugin) => plugin.id === current)
+      ? current
+      : selectCreateTabPluginId(creatablePlugins));
+  }, [creatablePlugins]);
 
   useEffect(() => {
     if (!callHook) return;
