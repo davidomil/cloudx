@@ -20,6 +20,7 @@ export class BlackboardRepository {
   async load(): Promise<BlackboardState> {
     try {
       await requireSafeDirectory(this.rootDir, this.rootDir, { create: true, label: "Cooperation data directory" });
+      await this.syncRootHierarchy();
       try { return JSON.parse(await this.readText("state.json", COOPERATION_LIMITS.stateBytes)) as BlackboardState; }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyBlackboardState(); throw error; }
     } catch (error) {
@@ -40,8 +41,14 @@ export class BlackboardRepository {
 
   async writeBytes(relativePath: string, bytes: Buffer): Promise<void> {
     await this.withDirectory(path.dirname(relativePath), true, async directory => {
-      const file = await fs.open(this.child(directory, path.basename(relativePath)), constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
-      try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
+      const target = this.child(directory, path.basename(relativePath));
+      const file = await fs.open(target, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+      try { await file.writeFile(bytes); await file.sync(); await directory.sync(); }
+      catch (error) {
+        try { await fs.unlink(target); }
+        catch (cleanupError) { throw new AggregateError([error, cleanupError], "The original write and its cleanup failed."); }
+        throw error;
+      } finally { await file.close(); }
     });
   }
 
@@ -104,11 +111,29 @@ export class BlackboardRepository {
     try {
       for (const segment of segments) {
         const child = this.child(directory, segment);
-        if (create) await fs.mkdir(child, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+        if (create) {
+          await fs.mkdir(child, { mode: 0o700 }).catch(error => { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; });
+          await directory.sync();
+        }
         const next = await fs.open(child, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
         await directory.close(); directory = next;
       }
       return await action(directory);
+    } finally { await directory.close(); }
+  }
+
+  private async syncRootHierarchy(): Promise<void> {
+    requireCooperation(process.platform === "linux", "INTEGRITY_ERROR", "Cooperation managed storage requires Linux descriptor-relative file access.");
+    const canonical = await fs.realpath(this.rootDir);
+    const filesystemRoot = path.parse(canonical).root;
+    let directory = await fs.open(filesystemRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      for (const segment of path.relative(filesystemRoot, canonical).split(path.sep).filter(Boolean)) {
+        await directory.sync();
+        const next = await fs.open(this.child(directory, segment), constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        await directory.close(); directory = next;
+      }
+      await directory.sync();
     } finally { await directory.close(); }
   }
 

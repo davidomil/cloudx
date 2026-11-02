@@ -403,6 +403,32 @@ describe("original images and publication", () => {
     await service.discardStagedAsset(board.boardId, staged.stagedToken);
   });
 
+  it("keeps the staged original and authority unchanged when the committed image directory cannot be flushed", async () => {
+    const bytes = await image();
+    const staged = await service.stageAsset(board.boardId, { mime: "image/png", bytes });
+    const authority = await readFile(path.join(root, "state.json"), "utf8");
+    const fs = (await import("node:fs/promises")).default;
+    const open = fs.open;
+    const failure = new Error("Original directory flush failed");
+    const failedDirectory = path.join(root, "boards", board.boardId, "assets");
+    const opens = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const file = await open(...args);
+      if (await fs.realpath(`/proc/self/fd/${file.fd}`) === failedDirectory) vi.spyOn(file, "sync").mockRejectedValueOnce(failure);
+      return file;
+    });
+    const request = transaction([{ kind: "attachAsset", stagedToken: staged.stagedToken, item: { id: "image", kind: "image", geometry: note().geometry,
+      content: { title: "Reference", alt: "reference", assetId: staged.asset.id } } }]);
+    await expect(service.apply(request, user)).rejects.toBe(failure);
+    expect(await readFile(path.join(root, "state.json"), "utf8")).toBe(authority);
+    expect(service.getBoard(board.boardId).assets).toEqual([]);
+    expect(service.getBoard(board.boardId).items).toEqual([]);
+    await expect(fs.stat(path.join(failedDirectory, path.basename(staged.asset.relativePath)))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path.join(root, "staging", staged.stagedToken))).toEqual(bytes);
+    opens.mockRestore();
+    await service.apply(request, user);
+    expect((await service.resolveAsset(board.boardId, staged.asset.id)).bytes).toEqual(bytes);
+  });
+
   it("keeps committed originals when authority replacement succeeds but durability acknowledgment fails", async () => {
     const bytes = await image();
     const staged = await service.stageAsset(board.boardId, { mime: "image/png", bytes });
