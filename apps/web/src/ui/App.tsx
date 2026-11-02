@@ -82,6 +82,8 @@ import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
 import { agentSelection, agentTabChoices } from "./agentTabChoice.js";
+import { ClaudeLaunchModeControl, claudeLaunchModeLabel } from "./ClaudeLaunchModeControl.js";
+import { CLAUDE_SETTINGS_HOOKS, type ClaudeGlobalSettings, type ClaudeLaunchMode } from "@cloudx/shared";
 import { UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
 import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
@@ -2772,7 +2774,7 @@ function workspaceSocketReconnectDelayMs(attempt: number): number {
   return Math.min(WORKSPACE_SOCKET_RECONNECT_BASE_MS * 2 ** attempt, WORKSPACE_SOCKET_RECONNECT_MAX_MS);
 }
 
-function CreateTabDialog({
+export function CreateTabDialog({
   plugins,
   callHook,
   templates,
@@ -2802,6 +2804,9 @@ function CreateTabDialog({
   const [agentAccounts, setAgentAccounts] = useState<AgentAccountsState>();
   const [agentProviderId, setAgentProviderId] = useState<AgentProviderId>();
   const [agentAccountId, setAgentAccountId] = useState<string>();
+  const [claudeLaunchMode, setClaudeLaunchMode] = useState<ClaudeLaunchMode | "">("");
+  const [savedClaudeLaunchMode, setSavedClaudeLaunchMode] = useState<ClaudeLaunchMode | null>();
+  const [claudeModeReadFailed, setClaudeModeReadFailed] = useState(false);
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
   const agentChoices = useMemo(() => agentTabChoices(agentAccounts), [agentAccounts]);
   const agentChoice = agentChoices.find((choice) => choice.providerId === agentProviderId) ?? agentChoices[0];
@@ -2833,6 +2838,17 @@ function CreateTabDialog({
   }, [requiresDirectory]);
 
   useEffect(() => {
+    if (!isClaude || !callHook) return;
+    let disposed = false;
+    setClaudeModeReadFailed(false);
+    setSavedClaudeLaunchMode(undefined);
+    callHook<{ settings: ClaudeGlobalSettings }>(CLAUDE_SETTINGS_HOOKS.read, {})
+      .then(result => { if (!disposed) setSavedClaudeLaunchMode(result.settings.launchMode); })
+      .catch(() => { if (!disposed) setClaudeModeReadFailed(true); });
+    return () => { disposed = true; };
+  }, [isClaude, callHook]);
+
+  useEffect(() => {
     if (!isCodex) {
       setTemplateId("");
       setCodexResumeMode("new");
@@ -2850,7 +2866,8 @@ function CreateTabDialog({
         : isCodex
           ? agentTabInitialInput(
             codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll && !isClaude, codexResumeIncludeNonInteractive && !isClaude),
-            agentSelection(agentChoice, agentAccountId)
+            agentSelection(agentChoice, agentAccountId),
+            isClaude ? claudeLaunchMode || undefined : undefined
           )
           : undefined;
       await onCreate({
@@ -2868,7 +2885,7 @@ function CreateTabDialog({
 
   return (
     <div className="dialog-backdrop">
-      <div className="dialog">
+      <div className={`dialog${isClaude ? " claude-launch-dialog" : ""}`}>
         <h2>New tab</h2>
         <label>
           Plugin
@@ -2931,6 +2948,13 @@ function CreateTabDialog({
         {isCodex && templates.length > 0 ? (
           <TemplateSelect value={templateId} templates={templates} onChange={setTemplateId} label="Template" includeInherited />
         ) : null}
+        {isClaude ? <>
+          <ClaudeLaunchModeControl value={claudeLaunchMode} inheritedLabel={savedClaudeLaunchMode === undefined
+            ? "Inherit saved mode (resolved by server at launch)"
+            : savedClaudeLaunchMode === null ? "Inherit · Native project (fresh CloudX default)" : `Inherit saved · ${claudeLaunchModeLabel(savedClaudeLaunchMode)}`} onChange={setClaudeLaunchMode} />
+          {claudeModeReadFailed ? <small role="status">The saved mode could not be read here. Inherit still resolves on the server before launch; no mode has been changed.</small> : null}
+          {codexResumeMode !== "new" ? <small>Resume preserves the original recorded launch policy. An incompatible mode or an unverified historical managed session is rejected before work.</small> : null}
+        </> : null}
         {isCodex ? (
           <label>
             Session
@@ -3001,9 +3025,11 @@ function agentPluginOptionValue(providerId: AgentProviderId): string {
 
 export function agentTabInitialInput(
   initialInput: CreateTabRequest["initialInput"],
-  agent: AgentSelection | undefined
+  agent: AgentSelection | undefined,
+  claudeLaunchMode?: ClaudeLaunchMode
 ): CreateTabRequest["initialInput"] {
-  return agent ? { ...initialInput, agent } : initialInput;
+  const mode = agent?.providerId === "claude" && claudeLaunchMode ? { claudeLaunchMode } : {};
+  return agent ? { ...initialInput, agent, ...mode } : initialInput;
 }
 
 export function codexTabInitialInput(

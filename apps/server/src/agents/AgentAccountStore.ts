@@ -64,7 +64,7 @@ export class AgentAccountStore {
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(
-    dataDir: string,
+    readonly dataDir: string,
     private readonly env: NodeJS.ProcessEnv = process.env
   ) {
     this.file = new JsonStateFile(dataDir, ACCOUNTS_FILE, "Agent accounts", 0o600);

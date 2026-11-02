@@ -13,6 +13,9 @@ export interface AgentLaunchRecord {
   arguments: string[];
   environmentKeys: string[];
   enforcedEnvironmentKeys: string[];
+  claudeLaunchPolicy?: import("./claudeLaunchPolicy.js").ClaudeResolvedLaunchPolicy;
+  claudeLaunchModeSource?: "launch" | "saved" | "default" | "conversation";
+  historicalClaudeConversation?: true;
   skillSelections: { name: string; source: "personal" | "synced"; selected: boolean; available: boolean }[];
   configurationSources: {
     path: string;

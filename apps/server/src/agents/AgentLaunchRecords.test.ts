@@ -90,3 +90,18 @@ it("omits inline settings, secret-bearing unknown arguments and remote connectio
   expect(observed.arguments).toEqual(["--settings", "[omitted]", "--remote", "[omitted]", "[omitted]", "--model", "[omitted]"]);
   expect(JSON.stringify(await f.records.read("tab-1", "claude"))).not.toContain("secret");
 });
+
+
+it("preserves the execution's resolved mode and source snapshots while leaving older policy unobserved", async () => {
+  const f = await fixture();
+  expect((await f.records.record(f.input)).claudeLaunchPolicy).toBeUndefined();
+  const policy = { mode: "cloudx-managed" as const, contractVersion: 1 as const, nativeVersion: "2.1.316", exclusiveSkills: true, activation: "next-launch" as const,
+    settingSources: ["user"], includedSources: ["personal instructions"], excludedSources: ["project", "local", "plugins"],
+    skills: [{ name: "notes", origin: "personal" as const, nativeSource: "user" as const, sourcePath: "/personal/skills/notes", sha256: "b".repeat(64) }] };
+  const saved = await f.records.record({ ...f.input, args: ["--setting-sources", "user"], claudeLaunchPolicy: policy, claudeLaunchModeSource: "saved" });
+  expect(await new AgentLaunchRecords(f.root).read("tab-1", "claude")).toMatchObject({ claudeLaunchPolicy: policy, claudeLaunchModeSource: "saved", arguments: ["--setting-sources", "user"] });
+  const file = path.join(f.root, "agent-launch-records/claude-tab-1.json");
+  await fs.writeFile(file, JSON.stringify({ ...saved, claudeLaunchPolicy: { ...policy, settingSources: ["user", "project"] } }));
+  await expect(f.records.read("tab-1", "claude")).rejects.toThrow("Invalid recorded Claude launch policy");
+  await expect(f.records.record({ ...f.input, providerId: "codex", claudeLaunchPolicy: policy, claudeLaunchModeSource: "saved" })).rejects.toThrow("Invalid agent launch record");
+});

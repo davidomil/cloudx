@@ -59,7 +59,7 @@ export async function inspectClaudeNativeSettings(input: ClaudeNativeInspectionI
 /** Native auth status reads merged authentication policy without executing session hooks or a model turn. */
 export async function verifyClaudeNativeAccount(input: ClaudeNativeInspectionInput, policy: ClaudeAccountPolicy, run: Runner = runAgentCli): Promise<void> {
   await verifyClaudeAccountPolicyVersion(input.command, input.env, run, input.signal);
-  const result = await run(input.command, ["--settings", input.settingsPath, "auth", "status", "--json"], {
+  const result = await run(input.command, ["--settings", input.settingsPath, ...(input.configurationArgs ?? []), "auth", "status", "--json"], {
     env: input.env, cwd: input.cwd, signal: input.signal, timeoutMs: 15_000
   });
   parseClaudeNativeAccountStatus(result, policy);

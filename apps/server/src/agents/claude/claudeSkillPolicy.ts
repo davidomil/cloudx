@@ -4,7 +4,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { CLAUDE_SKILL_NAME_PATTERN, isRecord, type ClaudeSkillOrigin } from "@cloudx/shared";
+import { CLAUDE_SKILL_NAME_PATTERN, isRecord, type ClaudeSkillOrigin, type ClaudeLaunchMode } from "@cloudx/shared";
 
 const run = promisify(execFile);
 const MAX_SETTINGS_BYTES = 1024 * 1024;
@@ -23,15 +23,14 @@ const BUILT_IN_PLUGIN_SKILLS = ["plugin-authoring"];
 export interface ClaudeUserSkill {
   name: string;
   origin: ClaudeSkillOrigin;
-  // Path below the Claude home, linked into a tab when the skill is allowed.
+  // Original path below the Claude home, read into a selected launch snapshot.
   source: string;
 }
 
 export interface ClaudeSkillPolicy {
   // Merged into the launch settings passed with --settings.
   settings: Record<string, unknown>;
-  // Personal skills and commands to link into the tab, as paths below the home.
-  personalLinks: string[];
+  selected: ClaudeUserSkill[];
 }
 
 export interface ClaudeSkillPolicyInput {
@@ -40,20 +39,19 @@ export interface ClaudeSkillPolicyInput {
   allowedSkills: readonly string[];
   // Directory names of the skills CloudX itself provides. They stay on.
   cloudxSkillNames: readonly string[];
+  launchMode?: ClaudeLaunchMode;
 }
 
-// CloudX skills and selected personal skills are materialized separately.
-// Synced background loading cannot preserve that source boundary and is
-// rejected. Exact-name overrides cover discovered project names, not later
-// project discovery; they are not a session-wide default-deny policy.
+// The selected additions are snapshots. Native-project discovery stays native;
+// the managed launch source boundary is enforced separately before startup.
 export async function claudeSkillPolicy(input: ClaudeSkillPolicyInput): Promise<ClaudeSkillPolicy> {
   const allowed = new Set(input.allowedSkills);
   const user = await discoverClaudeUserSkills(input.providerHome);
-  const project = input.cwd ? await discoverProjectSkills(input.cwd) : { names: [], settingsDirectories: [] };
+  const project = input.cwd && input.launchMode !== "cloudx-managed" ? await discoverProjectSkills(input.cwd) : { names: [], settingsDirectories: [] };
   assertSelectedSkillSources(input, user, project.names);
-  const personal = user.filter(skill => skill.origin === "personal" && allowed.has(skill.name));
-  const kept = new Set([...input.cloudxSkillNames, ...personal.map(skill => skill.name)]);
-  const hidden = [...new Set([...user.map(skill => skill.name), ...project.names, ...BUILT_IN_PLUGIN_SKILLS].filter(name => !kept.has(name)))].sort();
+  const selected = user.filter(skill => allowed.has(skill.name));
+  const hidden = [...BUILT_IN_PLUGIN_SKILLS, ...(input.launchMode === "cloudx-managed" ? ["design"] : [])]
+    .filter(name => !input.cloudxSkillNames.includes(name) && !selected.some(skill => skill.name === name));
   const plugins = await enabledPlugins([
     path.join(input.providerHome, "settings.json"),
     ...project.settingsDirectories.flatMap(directory => ["settings.json", "settings.local.json"].map(name => path.join(directory, ".claude", name)))
@@ -67,7 +65,7 @@ export async function claudeSkillPolicy(input: ClaudeSkillPolicyInput): Promise<
       ...(hidden.length ? { skillOverrides: Object.fromEntries(hidden.map(name => [name, "off"])) } : {}),
       ...(plugins.length ? { enabledPlugins: Object.fromEntries(plugins.map(plugin => [plugin, false])) } : {})
     },
-    personalLinks: personal.map(skill => skill.source)
+    selected
   };
 }
 
@@ -80,9 +78,6 @@ function assertSelectedSkillSources(input: ClaudeSkillPolicyInput, user: ClaudeU
     if (origins.length > 1)
       throw new Error(`Claude skill "${name}" has conflicting sources (${origins.join(", ")}). Native name-only overrides cannot authorize one source without authorizing the others. Remove the collision before launching. Saved skill selections are unchanged.`);
   }
-  const synced = user.filter(skill => skill.origin === "synced" && selected.has(skill.name));
-  if (synced.length)
-    throw new Error(`Selected synced Claude skills (${synced.map(skill => skill.name).join(", ")}) require a native background-sync mode that cannot enforce the CloudX skill allowlist. This launch is blocked before linking the synced directory or starting Claude. Review the selection in Settings → Claude; saved selections and account choices are unchanged.`);
 }
 
 // Personal skills in <home>/skills/<dir>/, personal commands in

@@ -23,10 +23,10 @@ export class ClaudeGlobalPreferences {
     this.file = new JsonStateFile(dataDir, "claude-global-preferences.json", "Claude global preferences", 0o600);
   }
 
-  seed(configDir: string, personalPath: string | undefined, initialize: (state: Record<string, unknown>) => void): Promise<void> {
+  seed(configDir: string, personalPath: string | undefined, initialize: (state: Record<string, unknown>) => void, track = true): Promise<void> {
     const key = this.file.filePath;
     const pending = ClaudeGlobalPreferences.queues.get(key) ?? Promise.resolve();
-    const run = pending.then(() => this.seedAfterPending(configDir, personalPath, initialize));
+    const run = pending.then(() => this.seedAfterPending(configDir, personalPath, initialize, track));
     ClaudeGlobalPreferences.queues.set(key, run);
     void run.finally(() => {
       if (ClaudeGlobalPreferences.queues.get(key) === run) ClaudeGlobalPreferences.queues.delete(key);
@@ -34,7 +34,7 @@ export class ClaudeGlobalPreferences {
     return run;
   }
 
-  private async seedAfterPending(configDir: string, personalPath: string | undefined, initialize: (state: Record<string, unknown>) => void): Promise<void> {
+  private async seedAfterPending(configDir: string, personalPath: string | undefined, initialize: (state: Record<string, unknown>) => void, track: boolean): Promise<void> {
     const saved = await this.file.read<unknown>();
     if (saved !== undefined && (!isRecord(saved) || saved.version !== 1 || !isPreferences(saved.values) || !isRecord(saved.overlays) ||
       Object.keys(saved).some(key => !["version", "values", "personal", "overlays"].includes(key)) ||
@@ -71,7 +71,7 @@ export class ClaudeGlobalPreferences {
     const state = { ...shared.values, ...current.value };
     initialize(state);
     await new JsonStateFile(configDir, ".claude.json", "Claude tab state", 0o600).write(state);
-    shared.overlays[path.basename(configDir)] = preferences(state);
+    if (track) shared.overlays[path.basename(configDir)] = preferences(state);
     await this.file.write(shared);
   }
 }

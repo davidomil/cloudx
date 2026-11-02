@@ -6,6 +6,7 @@ import {
   CLAUDE_EFFORT_LEVELS,
   CLAUDE_BOOLEAN_SETTINGS,
   CLAUDE_LAUNCH_PERMISSION_MODES,
+  CLAUDE_LAUNCH_MODES,
   CLAUDE_MODEL_ID_PATTERN,
   CLAUDE_SKILL_NAME_PATTERN,
   CLAUDE_TEXT_SETTING_PATTERN,
@@ -18,6 +19,7 @@ import {
   type ClaudeGlobalSettings,
   type ClaudeGlobalSettingsUpdate,
   type ClaudeLaunchPermissionMode,
+  type ClaudeLaunchMode,
   type ClaudeSkillChoice
 } from "@cloudx/shared";
 
@@ -38,9 +40,10 @@ export const CLAUDE_BYPASS_WARNING =
   "By accepting, you accept responsibility for actions taken in this mode, the same as accepting the warning inside Claude Code.";
 
 export interface ClaudeLaunchPreferences {
+  launchMode?: ClaudeLaunchMode;
   permissionMode: ClaudeLaunchPermissionMode;
   autoTrustWorkspace: boolean;
-  // Personal or synced skills CloudX tabs may use. All others are hidden.
+  // Supplied additions in Native project; an exclusive set in managed mode.
   allowedSkills: string[];
 }
 
@@ -139,7 +142,9 @@ export class ClaudeSettingsService {
     if (input.expectedRevision !== settingsFrom(target, original, preferences, installed).revision) throw new Error("Claude settings changed. Reload before saving again.");
 
     // Every check runs before either file is written.
+    const launchMode = input.launchMode === undefined ? preferences.launchMode : input.launchMode;
     const next: ClaudeLaunchPreferences = {
+      ...(launchMode ? { launchMode } : {}),
       permissionMode: input.permissionMode ?? preferences.permissionMode,
       autoTrustWorkspace: input.autoTrustWorkspace ?? preferences.autoTrustWorkspace,
       allowedSkills: input.allowedSkills ? [...new Set(input.allowedSkills)].sort() : preferences.allowedSkills
@@ -233,6 +238,7 @@ function settingsFrom(settingsPath: string, text: string | undefined, preference
     outputStyle: string("outputStyle"),
     language: string("language"),
     autoUpdatesChannel: string("autoUpdatesChannel"),
+    launchMode: preferences.launchMode ?? null,
     permissionMode: preferences.permissionMode,
     autoTrustWorkspace: preferences.autoTrustWorkspace,
     skills,
@@ -264,9 +270,10 @@ function parseSettings(settingsPath: string, text: string | undefined): Record<s
 function parsePreferences(value: unknown): ClaudeLaunchPreferences {
   if (value === undefined) return { ...DEFAULT_CLAUDE_LAUNCH_PREFERENCES };
   const allowedSkills = isRecord(value) && value.allowedSkills === undefined ? [] : isRecord(value) ? value.allowedSkills : undefined;
-  if (!isRecord(value) || !CLAUDE_LAUNCH_PERMISSION_MODES.some(mode => mode === value.permissionMode) || typeof value.autoTrustWorkspace !== "boolean" || !validSkillNames(allowedSkills))
+  if (!isRecord(value) || !CLAUDE_LAUNCH_PERMISSION_MODES.some(mode => mode === value.permissionMode) || typeof value.autoTrustWorkspace !== "boolean" || !validSkillNames(allowedSkills) ||
+      (value.launchMode !== undefined && !CLAUDE_LAUNCH_MODES.some(mode => mode === value.launchMode)))
     throw new Error("Claude launch preferences are invalid. Fix or remove claude-launch-preferences.json in the CloudX data directory.");
-  return { permissionMode: value.permissionMode as ClaudeLaunchPermissionMode, autoTrustWorkspace: value.autoTrustWorkspace, allowedSkills };
+  return { ...(value.launchMode ? { launchMode: value.launchMode as ClaudeLaunchMode } : {}), permissionMode: value.permissionMode as ClaudeLaunchPermissionMode, autoTrustWorkspace: value.autoTrustWorkspace, allowedSkills };
 }
 
 function validSkillNames(value: unknown): value is string[] {
@@ -274,7 +281,7 @@ function validSkillNames(value: unknown): value is string[] {
 }
 
 function validateUpdate(input: ClaudeGlobalSettingsUpdate): void {
-  const allowed = ["expectedRevision", ...NATIVE_KEYS, "effortLevel", "effortModel", "nativeOptions", "permissionMode", "autoTrustWorkspace", "allowedSkills"];
+  const allowed = ["expectedRevision", ...NATIVE_KEYS, "effortLevel", "effortModel", "nativeOptions", "launchMode", "permissionMode", "autoTrustWorkspace", "allowedSkills"];
   if (!isRecord(input) || Object.keys(input).some(key => !allowed.includes(key)) ||
       typeof input.expectedRevision !== "string" || !/^[a-f0-9]{64}$/u.test(input.expectedRevision))
     throw new Error("Invalid Claude settings update.");
@@ -287,6 +294,7 @@ function validateUpdate(input: ClaudeGlobalSettingsUpdate): void {
     throw new Error("Claude effortModel must be a full Claude model ID.");
   if (input.effortModel !== undefined && input.effortLevel === undefined) throw new Error("Claude effortModel requires an effort change.");
   nullable(input.autoUpdatesChannel, value => CLAUDE_UPDATE_CHANNELS.includes(value), "Invalid Claude update channel.");
+  nullable(input.launchMode, value => CLAUDE_LAUNCH_MODES.includes(value), "Invalid Claude launch mode.");
   for (const key of ["alwaysThinkingEnabled", "fastMode"] as const) nullable(input[key], value => typeof value === "boolean", `Claude ${key} must be true or false.`);
   for (const key of ["outputStyle", "language"] as const)
     nullable(input[key], value => typeof value === "string" && CLAUDE_TEXT_SETTING_PATTERN.test(value), `Claude ${key} must be a short name of letters, numbers and spaces.`);

@@ -2,21 +2,24 @@
 
 Settings distinguishes saved user choices from native defaults and generated launch
 policy. The Settings snapshot is not a measurement of an open client's effective
-configuration. CloudX launch preferences apply to future launches. Native user
-settings follow the selected client's documented reload or next-turn behavior;
-model and effort defaults for future sessions do not replace native /model or
+configuration. CloudX launch preferences apply to future launches. Native-project
+Claude tabs share the original user settings file and follow the selected client's
+documented reload or next-turn behavior. CloudX-managed Claude copies user settings
+at launch; edits to the original file reach managed sessions only at the next launch.
+Other providers retain their documented native reload behavior.
+Model and effort defaults for future sessions do not replace native /model or
 /effort commands for an existing session. Reload rereads shared state and
 discards drafts; it does not restart a client or replay work.
 
-| Fresh CloudX choice | Codex | Claude |
-| --- | --- | --- |
-| Permission bypass | YOLO enabled | bypassPermissions |
-| Workspace auto-trust | Disabled | Enabled |
-| Vendor/native skill selection | imagegen selected from shared cache | No personal/synced names selected |
-| CloudX system skills | Included | Included |
-| Selected template skills | Included for the launch | Included for the launch |
-| Native bundled skills | Disabled by generated overlay | Disabled by generated settings |
-| Native memory | Inherit selected Codex/native configuration | autoMemoryEnabled=false in generated settings |
+| Fresh CloudX choice           | Codex                                       | Claude                                        |
+| ----------------------------- | ------------------------------------------- | --------------------------------------------- |
+| Permission bypass             | YOLO enabled                                | bypassPermissions                             |
+| Workspace auto-trust          | Disabled                                    | Enabled                                       |
+| Vendor/native skill selection | imagegen selected from shared cache         | No personal/synced names selected             |
+| CloudX system skills          | Included                                    | Included                                      |
+| Selected template skills      | Included for the launch                     | Included for the launch                       |
+| Native bundled skills         | Disabled by generated overlay               | Disabled by generated settings                |
+| Native memory                 | Inherit selected Codex/native configuration | autoMemoryEnabled=false in generated settings |
 
 These differences preserve the existing product policy. Existing saved permission,
 trust, model, memory, account and skill choices are not reset by the visibility UI.
@@ -30,32 +33,72 @@ an enforced administrator requirement. The saved user/profile projection does no
 include every trusted project, environment, administrator or explicit launch layer.
 Credential values remain hidden; managed settings remain read-only.
 
+Native-project Claude tabs record native bypass-warning acceptance in the shared
+user settings. A CloudX-managed tab records native acceptance only in its own
+settings snapshot. Acknowledging the warning in Settings → Claude updates the
+original user settings for future launches, including Forge; it does not update
+an open managed snapshot. CloudX never accepts the warning automatically.
+
 ## Skills and provenance
 
-| Source | Codex launch contract | Claude launch contract |
-| --- | --- | --- |
-| CloudX system catalog | Materialize system skills | Materialize system skills |
-| Selected template | Materialize selected catalog skills | Materialize selected catalog skills |
-| Native vendor cache/bundle | Shared skills/.system files are availability evidence only; selected-version provenance is unverified. Materialize selected available entries. Missing enabled entries block launch. Disable native bundled discovery. | Disable bundled discovery |
-| Personal | Materialize selected catalog sources. Disable discovered .agents/skills paths unless an explicit native skills.config entry owns the path. | Link individually selected allowed skill names; reject discovered source/name collisions before launch |
-| Project/nested project | Disable discovered .agents/skills and .codex/skills files at launch unless explicitly configured; a later-discovered set is not measured by global Settings. | Launch-time discovered names are disabled; later-discovery containment requires independent native validation |
-| Synced | Global vendor-cache view does not enumerate or verify synced loading | Reject selected synced sources before materialization: background sync cannot enforce the selected source/account boundary. Preserve saved selections; never link the mutable synced root |
-| Plugin | Native configuration remains a separate layer; loaded plugin skills are not observed in global Settings | Generated launch disables known enabled plugins and native plugin sync |
-| Managed | Enforced administrator requirements win; discovered /etc/codex/skills paths are disabled unless explicitly configured | Managed policy remains authoritative and is not editable here |
+| Source                     | Codex launch contract                                                                                                                                                                                                  | Claude launch contract                                                                                                             |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| CloudX system catalog      | Materialize system skills                                                                                                                                                                                              | Materialize system skills                                                                                                          |
+| Selected template          | Materialize selected catalog skills                                                                                                                                                                                    | Materialize selected catalog skills                                                                                                |
+| Native vendor cache/bundle | Shared skills/.system files are availability evidence only; selected-version provenance is unverified. Materialize selected available entries. Missing enabled entries block launch. Disable native bundled discovery. | Disable bundled discovery                                                                                                          |
+| Personal                   | Materialize selected catalog sources. Disable discovered .agents/skills paths unless an explicit native skills.config entry owns the path.                                                                             | Copy selected skill snapshots; reject conflicting source/name ownership before launch                                              |
+| Project/nested project     | Disable discovered .agents/skills and .codex/skills files at launch unless explicitly configured; a later-discovered set is not measured by global Settings.                                                           | Native discovery in Native project; excluded by the CloudX-managed source boundary                                                 |
+| Synced                     | Global vendor-cache view does not enumerate or verify synced loading                                                                                                                                                   | Copy only selected skill snapshots with native names and original account provenance; no background sync or whole synced root link |
+| Plugin                     | Native configuration remains a separate layer; loaded plugin skills are not observed in global Settings                                                                                                                | Generated launch disables known enabled plugins and native plugin sync                                                             |
+| Managed                    | Enforced administrator requirements win; discovered /etc/codex/skills paths are disabled unless explicitly configured                                                                                                  | Managed policy remains authoritative and is not editable here                                                                      |
 
-Native Claude 2.1.316 still has no proven session-wide source allowlist for
-project discovery (#240). Exact-name overrides block only names already known;
-a newly created project skill is advertised after reload even with no selected
-external skills. Filtered personal links do preserve selected-file updates, omit
-unselected personal arrivals and retain CloudX skills; account changes and
-revocation apply to future tabs. They do not contain later project discovery.
-A native probe of `--setting-sources user,local` suppresses project skills but also
-removes project `CLAUDE.md` and rules, so CloudX does not use it as a containment
-fix. Disabling all slash commands or using managed plugin-only policy also drops
-allowed/CloudX categories. Completion requires upstream source-aware native
-allowlisting, or an explicit owner decision for an opt-in restricted scope that
-forgoes shared project settings/instructions/rules. Name enumeration, watchers
-and hook timing are not default-deny enforcement.
+Claude launch mode is an explicit future-launch choice. An unset preference
+keeps **Native project** as the fresh default; **CloudX-managed** is opt-in.
+Settings, new Claude tabs, Forge coding/review roles and automation accept an
+explicit choice or inherit the saved preference. Reading Settings never starts
+a native client. Permission, trust, account and template choices are separate.
+
+| Source contract                                  | Native project                                                   | CloudX-managed                                                                    |
+| ------------------------------------------------ | ---------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Native setting sources                           | user, project, local                                             | user only, verified on Linux with Claude 2.1.316                                  |
+| Shared project settings, project CLAUDE.md/rules | Native behavior retained                                         | Omitted; not flattened or reimported                                              |
+| Local settings and CLAUDE.local.md               | Native behavior retained                                         | Not supported in this configuration; existing local inputs reject before launch   |
+| Personal instructions and rules                  | Native loader, original imports/trust                            | Native loader, original imports/trust                                             |
+| Selected external and CloudX skills              | Supplied additions; native project discovery remains available   | Supplied skill snapshots form the controlled available set                        |
+| Synced source                                    | Selected skill copied with original account/path/hash provenance | Selected skill copied with original account/path/hash provenance                  |
+| Later project/nested/add-dir/directory discovery | Native behavior; selection is not an exclusive allowlist         | Excluded by the verified native source contract                                   |
+| Plugin discovery                                 | Existing CloudX plugin policy and native project scope           | No plugin source directory; incompatible injection/settings/managed policy reject |
+
+The tested `user,local` setting-source restriction also removes shared project
+memory/rules, but leaves local settings able to introduce plugins later. It is
+not the managed contract. The supported managed configuration uses `user` only,
+a user-settings snapshot, selected skill snapshots and a tab-owned plugin-path
+precondition. Original provider settings/skill/plugin arrivals cannot change
+that supplied set. Native reload and directory-transition fixtures verify this
+boundary; name enumeration, filesystem watchers and hook timing do not enforce it.
+Existing local inputs or incompatible managed/native sources fail with their
+source/key and a Native project alternative before prompt/model work. CloudX does
+not bypass organization policy or pass the unrelated native restricted/safe-mode
+flags. This release does not claim a managed contract for another version or OS.
+
+Selections, revocation, template changes and source updates apply at the next
+launch. Skill snapshots keep the native skill name and supporting files; original
+personal/synced/account origins and content hashes are recorded separately from
+the native loader's `user` category. No whole mutable synced directory is linked.
+A running execution is not rematerialized when templates change.
+
+Each execution records its resolved mode, source scope and supplied snapshots.
+A bound conversation keeps its mode, account and workspace on CloudX resume or
+recovery, even when the saved default changes. Native navigation is checked again
+by the required prompt hook before model work. A new or cleared conversation can
+bind the current policy; resumed history must match its recorded mode, account and
+workspace. Use a new conversation to change those choices. Automatic interrupted-turn
+continuation is unsupported: its environment flag is rejected in configuration
+preflight and after login-profile setup rather than silently removed. Managed
+launches pin the verified executable through login-profile PATH changes. Historical conversations without a recorded policy remain unverified
+and can resume only under an explicit/non-managed Native project choice; current
+Settings never supplies a historical managed claim. Select an exact conversation;
+ambiguous picker/last startup cannot verify its policy before work.
 
 Availability, a fresh default selection, a saved launch selection and observed
 native loading are different facts. The global source matrix deliberately marks

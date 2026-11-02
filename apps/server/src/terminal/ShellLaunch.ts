@@ -57,6 +57,7 @@ export function buildLoginShellCommandLaunch(command: string, args: string[], en
 export interface EnforcedEnv {
   set: Record<string, string>;
   unset: readonly string[];
+  rejectNonempty?: readonly string[];
 }
 
 const ENFORCED_ENV_PREFIX = "CLOUDX_ENFORCED_";
@@ -73,15 +74,20 @@ export function buildEnforcedLoginShellLaunch(
   enforced: EnforcedEnv
 ): ProcessLaunch & { env: NodeJS.ProcessEnv } {
   const names = Object.keys(enforced.set);
-  if ([...names, ...enforced.unset].some(name => !ENV_NAME_PATTERN.test(name))) throw new Error("Enforced environment variable names must be shell identifiers.");
+  const rejected = enforced.rejectNonempty ?? [];
+  if ([...names, ...enforced.unset, ...rejected].some(name => !ENV_NAME_PATTERN.test(name))) throw new Error("Enforced environment variable names must be shell identifiers.");
   const direct = { ...env };
   for (const name of enforced.unset) delete direct[name];
   Object.assign(direct, enforced.set);
-  if (!supportsLoginShell(resolveUserShell(env))) return { command, args, env: direct };
+  if (!supportsLoginShell(resolveUserShell(env))) {
+    for (const name of rejected) if (direct[name]) throw new Error(`CloudX cannot verify automatic continuation with ${name}. Remove it before launching; no provider work has started.`);
+    return { command, args, env: direct };
+  }
   const unset = enforced.unset.filter(name => !names.includes(name));
   const steps = [
     ...(unset.length ? [`unset ${unset.join(" ")}`] : []),
-    ...names.map(name => `export ${name}="$${ENFORCED_ENV_PREFIX}${name}"; unset ${ENFORCED_ENV_PREFIX}${name}`)
+    ...names.map(name => `export ${name}="$${ENFORCED_ENV_PREFIX}${name}"; unset ${ENFORCED_ENV_PREFIX}${name}`),
+    ...rejected.map(name => `[ -z "\${${name}:-}" ] || { printf '%s\\n' ${shellQuote(`CloudX cannot verify automatic continuation with ${name}. Remove it from the launch environment/profile before launching; no provider work has started.`)} >&2; exit 78; }`)
   ];
   return {
     command: resolveUserShell(env),

@@ -3,6 +3,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, forgeWorkerIssueNumbers, validateForgeDiagnosticSnapshotInput } from "@cloudx/shared";
 import type {
+  ClaudeLaunchMode,
   CodexReasoningEffort,
   DirectoryOwnershipAvailability,
   DirectoryOwnershipPreview,
@@ -53,6 +54,8 @@ export interface ForgeSettings {
   reviewReasoningEffort: CodexReasoningEffort;
   workerAccountId?: string;
   reviewAccountId?: string;
+  workerClaudeLaunchMode?: ClaudeLaunchMode;
+  reviewClaudeLaunchMode?: ClaudeLaunchMode;
   maxRunMinutes: number;
 }
 interface Runtime {
@@ -123,6 +126,7 @@ interface Runtime {
       model: string;
       reasoningEffort: CodexReasoningEffort;
       accountId?: string;
+      claudeLaunchMode?: ClaudeLaunchMode;
       prompt: string;
       preserveConversation?: true;
       windowId: string;
@@ -2918,6 +2922,7 @@ export class ForgeWorkflowService {
         model: worker.kind === "issue" ? settings.workerModel : settings.reviewModel,
         reasoningEffort: worker.kind === "issue" ? settings.workerReasoningEffort : settings.reviewReasoningEffort,
         accountId: worker.kind === "issue" ? settings.workerAccountId : settings.reviewAccountId,
+        claudeLaunchMode: worker.kind === "issue" ? settings.workerClaudeLaunchMode : settings.reviewClaudeLaunchMode,
         prompt,
         ...(worker.batch ? { preserveConversation: true as const } : {}),
         ...placement,

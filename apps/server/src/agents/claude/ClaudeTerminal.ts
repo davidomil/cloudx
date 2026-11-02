@@ -4,13 +4,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions, type PluginTabControls } from "@cloudx/plugin-api";
-import { isForgeTurnCompletion, readAgentSelection, type AgentSelection, type TabIndicatorUpdate } from "@cloudx/shared";
+import { isForgeTurnCompletion, readAgentSelection, type ClaudeLaunchMode, type AgentSelection, type TabIndicatorUpdate } from "@cloudx/shared";
 
 import {
   CODEX_CLOSE_ON_EXIT_GRACE_MS,
   CODEX_SUBMIT_DELAY_MS,
   CodexTerminalSession,
-  buildCodexRuntimeUpdatePrompt,
   templateFromRuntimeContext
 } from "../../plugins/CodexTerminalPlugin.js";
 import { CodexConversationRecovery } from "../../plugins/CodexConversationRecovery.js";
@@ -35,6 +34,9 @@ import {
 import { buildClaudeLaunchArgs, findClaudeTranscript } from "./ClaudeLaunch.js";
 import type { ClaudeLaunchPreferences, ClaudeSettingsService } from "./ClaudeSettingsService.js";
 import { verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
+import { CLAUDE_MANAGED_SOURCE_ENV_KEYS } from "./ClaudeManagedPolicy.js";
+import { ClaudeConversationPolicies } from "./ClaudeConversationPolicies.js";
+import { pinClaudeManagedExecutable } from "./ClaudeManagedExecutable.js";
 
 export interface ClaudeTerminalOptions {
   factory: TerminalProcessFactory;
@@ -58,9 +60,11 @@ export interface ClaudeRecoveryDescription {
 // differs from Codex: the per-tab config overlay, launch flags and receipts.
 export class ClaudeTerminal {
   private readonly env: NodeJS.ProcessEnv;
+  private readonly conversationPolicies: ClaudeConversationPolicies;
 
   constructor(private readonly options: ClaudeTerminalOptions) {
     this.env = options.env ?? process.env;
+    this.conversationPolicies = new ClaudeConversationPolicies(options.dataDir);
   }
 
   private get providerHome(): string {
@@ -86,6 +90,9 @@ export class ClaudeTerminal {
     let overlay: ClaudeHomeOverlay;
     let env: NodeJS.ProcessEnv;
     let accountLaunch: ReturnType<typeof claudeAccountLaunch>;
+    let launchInput = input.initialInput;
+    let newSessionId: string | undefined;
+    let mode: { mode: ClaudeLaunchMode; source: "launch" | "saved" | "default" | "conversation"; historical: boolean };
     let skillSelections: Array<{ name: string; source: "personal" | "synced"; selected: boolean; available: boolean }>;
     try {
       const current = await this.options.settings.read();
@@ -99,26 +106,43 @@ export class ClaudeTerminal {
       account = await accounts.resolve("claude", agent.accountId);
       accountLaunch = claudeAccountLaunch(buildToolEnv(this.env), configDir, await accounts.launchEnv(account));
       env = accountLaunch.env;
+      ({ launchInput, newSessionId } = await this.selectConversation(input, env));
+      const resume = codexResumeInput(launchInput);
+      if (resume && resume.mode !== "session") throw new Error("Select an exact saved Claude conversation to preserve its launch policy. Picker/last launches cannot verify the policy before work.");
+      const policySessionId = resume?.sessionId ?? (newSessionId && await this.conversationPolicies.read(newSessionId) ? newSessionId : undefined);
+      mode = await this.conversationPolicies.resolve({ sessionId: policySessionId, requestedMode: input.initialInput?.claudeLaunchMode,
+        savedMode: current.launchMode, accountId: account.id, cwd: input.cwd });
+      if (recovering && !resume) {
+        const previous = await new AgentLaunchRecords(dataDir).read(input.tab.id, "claude");
+        if (previous && previous.executionId === input.initialInput?.codexExecutionId && previous.claudeLaunchPolicy) {
+          if (previous.accountId !== account.id) throw new Error("Recover this Claude execution with its recorded account, or start a new conversation.");
+          if (input.initialInput?.claudeLaunchMode !== undefined && input.initialInput.claudeLaunchMode !== previous.claudeLaunchPolicy.mode)
+            throw new Error("Recover this Claude execution with its recorded launch mode, or start a new conversation.");
+          mode = { mode: previous.claudeLaunchPolicy.mode, source: "conversation", historical: false };
+        }
+      }
+      if (mode.mode === "cloudx-managed") await pinClaudeManagedExecutable(env, input.cwd);
+      const provider = await readAgentProviderStatus("claude", env);
       overlayInput = {
         dataDir, tabId: input.tab.id, accountHome: accounts.home(account), providerHome: this.providerHome, executionId,
         resolved: template, cwd: input.cwd, userStatePath: claudeUserStatePath(this.env),
         trustProject: Boolean(await input.authorizeProjectTrust?.()) || settings.autoTrustWorkspace,
         allowedSkills: current.skills.filter(skill => skill.allowed).map(skill => skill.name),
-        launchEnv: env, accountPolicy: accountLaunch.policy
+        launchEnv: env, accountPolicy: accountLaunch.policy, launchMode: mode.mode, nativeVersion: provider.version,
+        conversationPolicy: { accountId: account.id, sessionId: newSessionId ?? resume?.sessionId, historical: mode.historical }
       };
       overlay = await materializeClaudeHomeOverlay(overlayInput);
       applyTemplateEnv(env, template, overlay.rulesSkillsRoot, overlay.systemRules.map(rule => rule.id));
-      await verifyClaudeNativeAccount({ command: resolveClaudeCommand(env), cwd: input.cwd, env, settingsPath: overlay.settingsPath }, accountLaunch.policy);
+      await verifyClaudeNativeAccount({ command: resolveClaudeCommand(env), cwd: input.cwd, env, settingsPath: overlay.settingsPath, configurationArgs: overlay.configurationArgs }, accountLaunch.policy);
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
     }
 
-    const { launchInput, newSessionId } = await this.selectConversation(input, env);
     let args: string[];
     try {
       await writeForgeTurnBinding(configDir, input.agentTurn, input.prepareAgentSession ? newSessionId ?? codexResumeInput(launchInput)?.sessionId : undefined);
       args = buildClaudeLaunchArgs(launchInput, {
-        settings, settingsPath: overlay.settingsPath, instructionsPath: overlay.instructionsPath, addDirs: [overlay.rulesSkillsRoot], newSessionId,
+        settings, settingsPath: overlay.settingsPath, instructionsPath: overlay.instructionsPath, configurationArgs: overlay.configurationArgs, addDirs: [overlay.rulesSkillsRoot], newSessionId,
         deferPrompt: Boolean(input.agentTurn)
       });
     } catch (error) {
@@ -126,7 +150,8 @@ export class ClaudeTerminal {
     }
 
     let restoredInput: Record<string, unknown> = {
-      ...launchInput, agent: { providerId: "claude", accountId: account.id },
+      ...launchInput, claudeLaunchMode: mode.mode, claudeLaunchModeSource: mode.source, claudeLaunchPolicy: overlay.launchPolicy,
+      ...(mode.historical ? { historicalClaudeConversation: true } : {}), agent: { providerId: "claude", accountId: account.id },
       ...(newSessionId ? { resume: { mode: "session", sessionId: newSessionId } } : {}),
       codexRuntimeContext: input.runtimeContext, codexRecovered: recovering, codexExecutionId: executionId
     };
@@ -135,13 +160,17 @@ export class ClaudeTerminal {
     await fs.rm(agentTurnReceiptPath(configDir), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
     // The selected account wins over credentials the user's profile exports.
-    const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, accountLaunch.enforced);
+    const enforced = { set: accountLaunch.enforced.set,
+      unset: [...accountLaunch.enforced.unset, ...(mode.mode === "cloudx-managed" ? CLAUDE_MANAGED_SOURCE_ENV_KEYS : [])],
+      rejectNonempty: ["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] };
+    const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, enforced);
     const provider = await readAgentProviderStatus("claude", env);
     await new AgentLaunchRecords(dataDir).record({
       providerId: "claude", tabId: input.tab.id, executionId, command: resolveClaudeCommand(env),
       version: provider.version, accountId: account.id, cwd: input.cwd, args, env,
-      skillSelections,
-      enforcedEnvironmentKeys: [...accountLaunch.enforced.unset, ...Object.keys(accountLaunch.enforced.set)],
+      skillSelections, claudeLaunchPolicy: overlay.launchPolicy, claudeLaunchModeSource: mode.source,
+      ...(mode.historical ? { historicalClaudeConversation: true } : {}),
+      enforcedEnvironmentKeys: [...enforced.unset, ...enforced.rejectNonempty, ...Object.keys(enforced.set)],
       configurationPaths: [overlay.settingsPath, overlay.instructionsPath, path.join(this.providerHome, "settings.json"),
         path.join(input.cwd, ".claude", "settings.json"), path.join(input.cwd, ".claude", "settings.local.json")]
     });
@@ -160,22 +189,14 @@ export class ClaudeTerminal {
       nativeTurn: input.agentTurn,
       exitCommand: "/exit",
       agentLabel: "Claude",
-      applyRuntimeContext: async (runtimeContext) => {
-        const nextTemplate = templateFromRuntimeContext(runtimeContext);
-        await materializeClaudeHomeOverlay({ ...overlayInput, resolved: nextTemplate });
-        restoredInput = { ...restoredInput, codexRuntimeContext: runtimeContext };
-        await input.controls.setRestoreInput?.(restoredInput);
-        return {
-          prompt: buildCodexRuntimeUpdatePrompt(nextTemplate, undefined),
-          voiceSummary: voiceSummary(nextTemplate),
-          templateName: nextTemplate?.template.name,
-          templateId: nextTemplate?.template.id
-        };
+      applyRuntimeContext: async () => {
+        throw new Error("Claude template and source changes apply to the next launch. Start a new conversation to change this execution's recorded policy; the running session was not changed.");
       }
     });
     if (input.agentTurn) {
       try {
         const sessionId = await waitForClaudeReceipt(conversation, input.tab.id, executionId, input.cwd, () => session.hasExited(), newSessionId ?? codexResumeInput(launchInput)?.sessionId);
+        await this.conversationPolicies.bind(sessionId, { accountId: account.id, cwd: input.cwd, policy: overlay.launchPolicy, historical: mode.historical });
         await session.handleAction("wait_until_ready", { timeoutMs: 30_000 });
         const prompt = launchInput?.prompt;
         if (prompt !== undefined) {
@@ -261,12 +282,18 @@ export class ClaudeTerminal {
         };
         const timeout = setTimeout(() => unavailable("Claude has not delivered its required startup receipt. Tracking and automatic recovery are unavailable until native startup and CloudX hooks succeed. Check the trust prompt and native hook policy."), 30_000);
         timeout.unref();
-        const stop = conversation.observe(identity => {
+        const stop = conversation.observe(async identity => {
           if (identity.selection && (identity.selection.tabId !== input.tab.id || identity.selection.executionId !== current().codexExecutionId))
             throw new Error("Conversation identity belongs to a different tab or execution.");
+          const launchPolicy = await new AgentLaunchRecords(this.options.dataDir).read(input.tab.id, "claude");
+          if (launchPolicy && launchPolicy.executionId === current().codexExecutionId && launchPolicy.claudeLaunchPolicy && launchPolicy.accountId)
+            await this.conversationPolicies.bind(identity.sessionId, { accountId: launchPolicy.accountId, cwd: input.cwd,
+              policy: launchPolicy.claudeLaunchPolicy, historical: identity.historicalClaudeConversation ?? launchPolicy.historicalClaudeConversation });
           clearTimeout(timeout);
           tracking.recovered();
           const next: Record<string, unknown> = { ...current(), resume: { mode: "session", sessionId: identity.sessionId } };
+          if (identity.historicalClaudeConversation === true) next.historicalClaudeConversation = true;
+          else if (identity.historicalClaudeConversation === false) delete next.historicalClaudeConversation;
           delete next.codexIdentityError;
           update(next);
           this.options.usage?.conversationStarted(input.tab, "claude", readAgentSelection(current().agent)?.accountId, identity.sessionId, input.workspaceId);

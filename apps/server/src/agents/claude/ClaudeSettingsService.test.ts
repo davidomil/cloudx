@@ -20,6 +20,37 @@ async function setup(settings?: unknown) {
 }
 
 describe("ClaudeSettingsService", () => {
+  it("leaves an absent launch mode unset until the user saves a choice", async () => {
+    const { service, providerHome, dataDir } = await setup({ theme: "dark" });
+    expect((await service.read()).launchMode).toBeNull();
+    expect(await service.launchPreferences()).not.toHaveProperty("launchMode");
+    await expect(fs.stat(path.join(dataDir, "claude-launch-preferences.json"))).rejects.toThrow();
+    await service.update({ expectedRevision: (await service.read()).revision, autoTrustWorkspace: false });
+    expect(JSON.parse(await fs.readFile(path.join(dataDir, "claude-launch-preferences.json"), "utf8"))).not.toHaveProperty("launchMode");
+    const nativeBefore = await fs.readFile(path.join(providerHome, "settings.json"), "utf8");
+    await service.update({ expectedRevision: (await service.read()).revision, launchMode: "cloudx-managed" });
+    expect((await service.read()).launchMode).toBe("cloudx-managed");
+    expect(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).toBe(nativeBefore);
+    await service.update({ expectedRevision: (await service.read()).revision, launchMode: null });
+    expect((await service.read()).launchMode).toBeNull();
+    expect(await service.launchPreferences()).toEqual({ permissionMode: "bypassPermissions", autoTrustWorkspace: false, allowedSkills: [] });
+  });
+
+  it("preserves existing choices and rejects invalid saved or requested modes before writes", async () => {
+    const { service, providerHome, dataDir } = await setup({ theme: "dark" });
+    const target = path.join(dataDir, "claude-launch-preferences.json");
+    const original = JSON.stringify({ permissionMode: "plan", autoTrustWorkspace: false, allowedSkills: ["missing"], launchMode: "native-project" });
+    await fs.writeFile(target, original);
+    const revision = (await service.read()).revision;
+    await expect(service.update({ expectedRevision: revision, launchMode: "restricted" as never, model: "sonnet" })).rejects.toThrow("launch mode");
+    expect(await fs.readFile(target, "utf8")).toBe(original);
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8"))).toEqual({ theme: "dark" });
+    await service.update({ expectedRevision: revision, launchMode: "cloudx-managed" });
+    expect(await service.launchPreferences()).toEqual({ permissionMode: "plan", autoTrustWorkspace: false, allowedSkills: ["missing"], launchMode: "cloudx-managed" });
+    await fs.writeFile(target, original.replace("native-project", "restricted"));
+    await expect(service.read()).rejects.toThrow("launch preferences are invalid");
+  });
+
   it("reads absent settings as Claude Code defaults with CloudX launch defaults", async () => {
     const { service, providerHome } = await setup();
     expect(await service.read()).toMatchObject({

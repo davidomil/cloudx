@@ -2,16 +2,18 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { isRecord } from "@cloudx/shared";
+import { isRecord, type ClaudeLaunchMode } from "@cloudx/shared";
 
 import type { AgentAccountStore } from "./AgentAccountStore.js";
 import { agentCommand, runAgentCli } from "./agentCli.js";
 import { isClaudeModel } from "./claude/ClaudeLaunch.js";
+import { prepareClaudeExecutionLaunch } from "./claude/ClaudeExecutionLaunch.js";
 
 const CLAUDE_EXEC_TIMEOUT_MS = 120_000;
 const CLAUDE_EXEC_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 export interface AgentExecOptions {
+  claudeLaunchMode?: ClaudeLaunchMode;
   schemaPath?: string;
   timeoutMs?: number;
   imagePaths?: string[];
@@ -40,14 +42,16 @@ async function runClaudeExec(
   baseEnv: NodeJS.ProcessEnv = process.env
 ): Promise<string> {
   if (!accounts) throw new Error("Claude requests need the agent account store.");
-  const { env, args: accountArgs } = await accounts.defaultClaudeLaunch(baseEnv);
   const workDir = await fs.mkdtemp(path.join(os.tmpdir(), options.outputPrefix ?? "cloudx-claude-exec-"));
+  let launch: Awaited<ReturnType<typeof prepareClaudeExecutionLaunch>> | undefined;
   try {
+    launch = await prepareClaudeExecutionLaunch(accounts, { cwd: workDir, claudeLaunchMode: options.claudeLaunchMode, baseEnv, signal: options.signal });
+    const { env, args: policyArgs } = launch;
     const imagePaths = options.imagePaths ?? [];
     const args = [
-      ...accountArgs, "-p", "--output-format", "json", "--no-session-persistence",
+      ...policyArgs, "-p", "--output-format", "json", "--no-session-persistence",
       "--model", model,
-      "--setting-sources", "", "--strict-mcp-config",
+      "--strict-mcp-config",
       // Images are read with the Read tool; nothing else is allowed.
       "--tools", imagePaths.length ? "Read" : "",
       "--permission-mode", "dontAsk",
@@ -64,7 +68,8 @@ async function runClaudeExec(
     });
     return readClaudeExecResult(result.stdout, result.code, options.taskLabel ?? "Claude request");
   } finally {
-    await fs.rm(workDir, { recursive: true, force: true });
+    try { await launch?.dispose(); }
+    finally { await fs.rm(workDir, { recursive: true, force: true }); }
   }
 }
 

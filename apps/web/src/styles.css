@@ -6425,6 +6425,11 @@ a:hover svg {
   text-transform: uppercase;
 }
 
+.claude-launch-dialog {
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+}
+
 .dialog label,
 .dialog .field-group {
   display: grid;

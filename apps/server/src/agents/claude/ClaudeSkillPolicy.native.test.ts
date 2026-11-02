@@ -61,7 +61,7 @@ function nativeControls(child: ChildProcessWithoutNullStreams) {
   };
 }
 
-native("keeps personal skill links current while late unselected personal names, account changes and next-launch revocation stay isolated", async () => {
+native("keeps selected skill snapshots stable while late unselected personal names, account changes and next-launch revocation stay isolated", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-personal-skills-"));
   const providerHome = path.join(root, "home", ".claude");
   const cwd = path.join(root, "project");
@@ -89,7 +89,7 @@ native("keeps personal skill links current while late unselected personal names,
     const overlay = await materializeClaudeHomeOverlay(options);
     const settings = JSON.parse(await fs.readFile(overlay.settingsPath, "utf8"));
     expect(settings.syncClaudeAiSkills).toBe(false);
-    expect(await fs.readlink(path.join(overlay.configDir, "skills", "notes"))).toBe(path.join(providerHome, "skills", "notes"));
+    expect((await fs.lstat(path.join(overlay.configDir, "skills", "notes"))).isSymbolicLink()).toBe(false);
     child = spawn(claude!, ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
       "--no-session-persistence", "--settings", overlay.settingsPath], { cwd, env: { ...launchEnv, CLAUDE_CONFIG_DIR: overlay.configDir } });
     let stderr = "";
@@ -110,7 +110,7 @@ native("keeps personal skill links current while late unselected personal names,
     await controls.request("reload_skills");
     const after = await skills();
     expect(after.some(entry => entry.name === "late-personal")).toBe(false);
-    expect(after).toEqual(expect.arrayContaining([expect.objectContaining({ name: "notes", description: "Selected personal revision two.", state: "on" })]));
+    expect(after).toEqual(expect.arrayContaining([expect.objectContaining({ name: "notes", description: "Selected personal revision one.", state: "on" })]));
 
     const accountB = path.join(root, "account-b");
     await fs.mkdir(accountB);
@@ -122,7 +122,8 @@ native("keeps personal skill links current while late unselected personal names,
     expect(await fs.readlink(path.join(overlay.configDir, ".credentials.json"))).toBe(path.join(accountHome, ".credentials.json"));
 
     await skill(path.join(providerHome, "skills", "synced", "account-a", "docx"), "Account A fixture.");
-    await expect(materializeClaudeHomeOverlay({ ...options, tabId: "sync-a", allowedSkills: ["docx"] })).rejects.toThrow("background-sync mode");
+    const synced = await materializeClaudeHomeOverlay({ ...options, tabId: "sync-a", allowedSkills: ["docx"] });
+    expect(await fs.readFile(path.join(synced.configDir, "skills", "docx", "SKILL.md"), "utf8")).toContain("Account A fixture.");
     await skill(path.join(providerHome, "skills", "synced", "account-b", "docx"), "Account B collision.");
     await expect(materializeClaudeHomeOverlay({ ...options, accountHome: accountB, tabId: "sync-b", allowedSkills: ["docx"] })).rejects.toThrow("conflicting sources");
     expect((await skills()).some(entry => entry.name === "notes" && entry.state === "on")).toBe(true);
@@ -131,7 +132,7 @@ native("keeps personal skill links current while late unselected personal names,
       await fs.mkdir(process.env.CLOUDX_NATIVE_EVIDENCE_DIR, { recursive: true });
       await fs.writeFile(path.join(process.env.CLOUDX_NATIVE_EVIDENCE_DIR, "personal-skill-lifecycle.json"), JSON.stringify({ nativeVersion: initialize.claude_code_version,
         nativeSha256: createHash("sha256").update(await fs.readFile(claude!)).digest("hex"), modelRequests,
-        scope: "Filtered personal links and preflight only. Does not establish containment of project, nested, add-dir or cd discovery.",
+        scope: "Immutable selected snapshots and preflight only. Does not establish containment of project, nested, add-dir or cd discovery.",
         before, after, responses: controls.responses, stderr }, null, 2));
     }
   } finally {

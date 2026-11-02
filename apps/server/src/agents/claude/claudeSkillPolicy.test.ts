@@ -63,55 +63,40 @@ describe("Claude skill policy", () => {
     expect(await discoverClaudeUserSkills(path.join(providerHome, "missing"))).toEqual([]);
   });
 
-  it("hides discovered unselected skills for this launch without changing the user's settings", async () => {
+  it("preserves native project discovery while supplied selections remain separate additions", async () => {
     const { providerHome, cwd } = await fixture();
     const policy = await claudeSkillPolicy({ providerHome, cwd, allowedSkills: [], cloudxSkillNames: ["cloudx-system-create-cloudx-skill"] });
-    expect(policy).toEqual({
-      settings: {
-        disableBundledSkills: true,
-        autoMemoryEnabled: false,
-        syncClaudeAiPlugins: false,
-        syncClaudeAiSkills: false,
-        // Names discovered now; later project discovery is not contained by this list.
-        skillOverrides: {
-          ...BUILT_IN, deploy: "off", docx: "off", "frontend:component": "off", legacy: "off", linked: "off", "local-tool": "off",
-          "nested-deploy": "off", notes: "off", pdf: "off", private: "off", shared: "off", vendored: "off"
-        },
-        enabledPlugins: { "format@market": false, "review@market": false }
-      },
-      personalLinks: []
-    });
+    expect(policy).toEqual({ settings: { disableBundledSkills: true, autoMemoryEnabled: false, syncClaudeAiPlugins: false,
+      syncClaudeAiSkills: false, skillOverrides: BUILT_IN, enabledPlugins: { "format@market": false, "review@market": false } }, selected: [] });
   });
 
-  it("preserves allowed personal names and links without enabling synced loading", async () => {
+  it("preserves allowed personal names and source identities without enabling synced loading", async () => {
     const { providerHome, cwd } = await fixture();
     const policy = await claudeSkillPolicy({ providerHome, cwd, allowedSkills: ["notes", "legacy"], cloudxSkillNames: [] });
-    expect(policy.personalLinks).toEqual(["skills/notes", "commands/legacy.md"]);
+    expect(policy.selected.map(skill => skill.source)).toEqual(["skills/notes", "commands/legacy.md"]);
     expect(policy.settings.syncClaudeAiSkills).toBe(false);
-    expect(policy.settings.skillOverrides).toEqual({
-      ...BUILT_IN, docx: "off", deploy: "off", "frontend:component": "off", linked: "off", "local-tool": "off",
-      "nested-deploy": "off", pdf: "off", private: "off", shared: "off", vendored: "off"
-    });
+    expect(policy.settings.skillOverrides).toEqual(BUILT_IN);
   });
 
-  it("rejects selected synced background mode without resetting the selection or personal files", async () => {
+  it("selects account-scoped synced sources for an immutable next-launch snapshot, without enabling native sync", async () => {
     const { providerHome, cwd } = await fixture();
     const allowedSkills = ["notes", "docx"];
     const original = await fs.readFile(path.join(providerHome, "settings.json"), "utf8");
-    await expect(claudeSkillPolicy({ providerHome, cwd, allowedSkills, cloudxSkillNames: [] }))
-      .rejects.toThrow(/synced Claude skills \(docx\).*background-sync mode/u);
+    const policy = await claudeSkillPolicy({ providerHome, cwd, allowedSkills, cloudxSkillNames: [] });
+    expect(policy.selected).toEqual(expect.arrayContaining([{ name: "docx", origin: "synced", source: "skills/synced/account-1/docx" }]));
+    expect(policy.settings.syncClaudeAiSkills).toBe(false);
     expect(allowedSkills).toEqual(["notes", "docx"]);
     expect(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).toBe(original);
   });
 
-  it("does not let an unavailable saved personal selection authorize a project skill of that name", async () => {
+  it("does not supply an unavailable saved selection as a CloudX addition, while native project discovery stays native", async () => {
     const { providerHome, cwd } = await fixture();
     await fs.rm(path.join(providerHome, "skills", "notes"), { recursive: true });
     await skill(path.join(cwd, ".claude", "skills", "notes"));
     const allowedSkills = ["notes"];
     const policy = await claudeSkillPolicy({ providerHome, cwd, allowedSkills, cloudxSkillNames: [] });
-    expect(policy.personalLinks).toEqual([]);
-    expect(policy.settings.skillOverrides).toMatchObject({ notes: "off" });
+    expect(policy.selected).toEqual([]);
+    expect(policy.settings.skillOverrides).not.toHaveProperty("notes");
     expect(allowedSkills).toEqual(["notes"]);
   });
 
@@ -132,18 +117,18 @@ describe("Claude skill policy", () => {
       .rejects.toThrow(/cloudx-system-create-cloudx-skill.*CloudX, project/u);
   });
 
-  it("hides the main checkout's skills in a linked worktree that has none of its own", async () => {
+  it("preserves native main-checkout discovery in a linked worktree that has none of its own", async () => {
     const { root, providerHome, repo } = await fixture();
     execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "base"], { cwd: repo });
     const worktree = path.join(root, "worktree");
     execFileSync("git", ["worktree", "add", "-q", "--detach", worktree], { cwd: repo });
     const policy = await claudeSkillPolicy({ providerHome, cwd: worktree, allowedSkills: [], cloudxSkillNames: [] });
     // Untracked in the main checkout, so only the inherited root skills apply.
-    expect(Object.keys(policy.settings.skillOverrides as object)).toEqual(expect.arrayContaining(["deploy"]));
+    expect(Object.keys(policy.settings.skillOverrides as object)).not.toContain("deploy");
     expect(Object.keys(policy.settings.skillOverrides as object)).not.toContain("nested-deploy");
   });
 
-  it("links only allowed skills into the tab and passes the policy with the CloudX hooks", async () => {
+  it("copies only allowed skill additions into the tab and passes the policy with the CloudX hooks", async () => {
     const { root, providerHome, cwd } = await fixture();
     const dataDir = path.join(root, "data");
     const accountHome = path.join(root, "account");
@@ -152,7 +137,7 @@ describe("Claude skill policy", () => {
     const options = { dataDir, tabId: "tab-1", accountHome, providerHome, executionId: "11111111-1111-4111-8111-111111111111", cwd };
 
     const overlay = await materializeClaudeHomeOverlay({ ...options, allowedSkills: ["notes", "legacy"] });
-    expect(await fs.readlink(path.join(overlay.configDir, "commands", "legacy.md"))).toBe(path.join(providerHome, "commands", "legacy.md"));
+    expect(await fs.readFile(path.join(overlay.configDir, "commands", "legacy.md"), "utf8")).toBe("Old command.\n");
     const entries = await fs.readdir(path.join(overlay.configDir, "skills"));
     expect(entries).toContain("notes");
     expect(entries).not.toContain("synced");
@@ -163,8 +148,8 @@ describe("Claude skill policy", () => {
     expect(settings.skillOverrides["cloudx-system-create-cloudx-skill"]).toBeUndefined();
     expect(Object.keys(settings.hooks)).toEqual(["SessionStart", "UserPromptSubmit", "Stop", "StopFailure"]);
 
-    await expect(materializeClaudeHomeOverlay({ ...options, allowedSkills: ["docx"] })).rejects.toThrow("background-sync mode");
-    expect(await fs.readdir(path.join(overlay.configDir, "skills"))).toEqual(entries);
+    await materializeClaudeHomeOverlay({ ...options, allowedSkills: ["docx"] });
+    expect(await fs.readFile(path.join(overlay.configDir, "skills", "docx", "SKILL.md"), "utf8")).toContain("Fixture");
     await materializeClaudeHomeOverlay({ ...options, allowedSkills: [] });
     const relaunched = await fs.readdir(path.join(overlay.configDir, "skills"));
     expect(relaunched).not.toContain("synced");
@@ -172,11 +157,12 @@ describe("Claude skill policy", () => {
     await expect(fs.readdir(path.join(overlay.configDir, "commands"))).rejects.toThrow();
   });
 
-  it("rejects unsupported selected sync before creating or replacing an overlay", async () => {
+  it("rejects selected cross-account ambiguity before creating or replacing an overlay", async () => {
     const { root, providerHome, cwd } = await fixture();
     const dataDir = path.join(root, "data");
+    await skill(path.join(providerHome, "skills", "synced", "account-2", "docx"));
     await expect(materializeClaudeHomeOverlay({ dataDir, tabId: "blocked", accountHome: path.join(root, "account"), providerHome, cwd,
-      executionId: "11111111-1111-4111-8111-111111111111", allowedSkills: ["docx"] })).rejects.toThrow("background-sync mode");
+      executionId: "11111111-1111-4111-8111-111111111111", allowedSkills: ["docx"] })).rejects.toThrow("conflicting sources");
     await expect(fs.stat(path.join(dataDir, "claude-launches", "blocked"))).rejects.toThrow();
   });
 });

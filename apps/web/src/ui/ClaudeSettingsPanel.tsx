@@ -11,12 +11,14 @@ import {
   type ClaudeCliStatus,
   type ClaudeGlobalSettings,
   type ClaudeGlobalSettingsUpdate,
+  type ClaudeLaunchMode,
   type ClaudeLaunchPermissionMode
 } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
 import { ClaudeConfigurationCatalog } from "./ClaudeConfigurationCatalog.js";
 import { ClaudeLaunchInspection } from "./ClaudeLaunchInspection.js";
+import { ClaudeLaunchModeControl, claudeLaunchModeLabel } from "./ClaudeLaunchModeControl.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
@@ -40,6 +42,7 @@ interface Draft {
   outputStyle: string;
   language: string;
   autoUpdatesChannel: string;
+  launchMode: ClaudeLaunchMode | "";
   permissionMode: ClaudeLaunchPermissionMode;
   autoTrustWorkspace: boolean;
   allowedSkills: string[];
@@ -52,6 +55,7 @@ function draftFrom(settings: ClaudeGlobalSettings): Draft {
     model: settings.model ?? "", effortLevel: settings.effortLevel ?? "", effortModel: settings.model?.startsWith("claude-") ? settings.model : "", alwaysThinkingEnabled: flag(settings.alwaysThinkingEnabled),
     fastMode: flag(settings.fastMode), outputStyle: settings.outputStyle ?? "", language: settings.language ?? "",
     autoUpdatesChannel: settings.autoUpdatesChannel ?? "", permissionMode: settings.permissionMode, autoTrustWorkspace: settings.autoTrustWorkspace,
+    launchMode: settings.launchMode ?? "",
     allowedSkills: settings.skills.filter(skill => skill.allowed).map(skill => skill.name).sort(),
     nativeOptions: settings.nativeOptions ?? {}
   };
@@ -71,6 +75,7 @@ function changes(settings: ClaudeGlobalSettings, draft: Draft): Omit<ClaudeGloba
   for (const key of ["alwaysThinkingEnabled", "fastMode"] as const)
     if (draft[key] !== saved[key]) update[key] = draft[key] === "" ? null : draft[key] === "true";
   if (draft.permissionMode !== saved.permissionMode) update.permissionMode = draft.permissionMode;
+  if (draft.launchMode !== saved.launchMode) update.launchMode = draft.launchMode || null;
   if (draft.autoTrustWorkspace !== saved.autoTrustWorkspace) update.autoTrustWorkspace = draft.autoTrustWorkspace;
   if (draft.allowedSkills.join("\n") !== saved.allowedSkills.join("\n")) update.allowedSkills = draft.allowedSkills;
   const nativeOptions = Object.fromEntries(CLAUDE_BOOLEAN_SETTINGS.filter(key => (draft.nativeOptions[key] ?? null) !== (saved.nativeOptions[key] ?? null)).map(key => [key, draft.nativeOptions[key] ?? null]));
@@ -131,7 +136,7 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
       <h2><Settings2 size={18} aria-hidden="true" /> Claude settings</h2>
       <p>Model and behavior defaults are saved in {settings ? <code>{settings.settingsPath}</code> : "your Claude settings file"} and also apply to <code>claude</code> outside CloudX. Session permissions apply to CloudX tabs only.</p>
       <p>These are saved user values, not observed values for an open tab. Unset removes the user override. Project, managed policy, environment, per-model values and launch flags can change the result; effective session values remain unresolved here.</p>
-      <p>Model and saved effort apply at the next launch; use native /model or /effort for a running session. Other native settings can reload when supported by the installed version. CloudX permissions, trust and skill choices apply at the next launch. Saving never restarts a client or replays work.</p>
+      <p>Model and saved effort apply at the next launch; use native /model or /effort for a running session. Native project shares the user settings file and follows native reload where supported. CloudX-managed copies user settings at launch; changes to that original file reach a managed session only at the next launch. CloudX permissions, trust and skill choices apply at the next launch. Saving never restarts a client or replays work.</p>
     </header>
 
     <section className="codex-update-control" aria-label="Claude Code CLI">
@@ -187,20 +192,20 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
         {!validEffort ? <p role="alert">Choose a full Claude model ID before saving effort.</p> : null}
         {settings.legacyEffortLevel ? <p>Legacy user effortLevel: <code>{settings.legacyEffortLevel}</code>. This separate value is preserved; Opus 5.5 and later models ignore it in user settings.</p> : null}
         <FlagSelect label="Extended thinking" value={draft.alwaysThinkingEnabled} onChange={value => set("alwaysThinkingEnabled", value)}>
-          Unset enables thinking where supported. Off has no effect on always-thinking models (including Opus/Sonnet/Haiku 5.5 and Fable); third-party adaptive models may still think. MAX_THINKING_TOKENS can override this saved value. Native reload applies where supported.
+          Unset enables thinking where supported. Off has no effect on always-thinking models (including Opus/Sonnet/Haiku 5.5 and Fable); third-party adaptive models may still think. MAX_THINKING_TOKENS can override this saved value. Native project reloads where supported; CloudX-managed receives the saved change at its next launch.
         </FlagSelect>
         <FlagSelect label="Fast mode" value={draft.fastMode} onChange={value => set("fastMode", value)}>
-          Saved user fast-mode preference; native reload and availability depend on model, account and version. This panel does not establish an effective speed or cost.
+          Saved user fast-mode preference. Native project reload and availability depend on model, account and version; CloudX-managed receives the saved change at its next launch. This panel does not establish an effective speed or cost.
         </FlagSelect>
         <label>
           Output style
           <input aria-label="Output style" value={draft.outputStyle} placeholder="Claude Code default" maxLength={64} aria-invalid={!validText(draft.outputStyle)} onChange={event => set("outputStyle", event.target.value)} />
-          <small>Saved user output style, such as Explanatory or Learning. Native settings reload where supported; higher-priority sources can override it.</small>
+          <small>Saved user output style, such as Explanatory or Learning. Native project reloads where supported; CloudX-managed receives the saved change at its next launch. Higher-priority sources can override it.</small>
         </label>
         <label>
           Response language
           <input aria-label="Response language" value={draft.language} placeholder="Claude Code default" maxLength={64} aria-invalid={!validText(draft.language)} onChange={event => set("language", event.target.value)} />
-          <small>Saved user response language, such as english or japanese. Native settings reload where supported; higher-priority sources can override it.</small>
+          <small>Saved user response language, such as english or japanese. Native project reloads where supported; CloudX-managed receives the saved change at its next launch. Higher-priority sources can override it.</small>
         </label>
         <ChoiceSelect label="Update channel" value={draft.autoUpdatesChannel} saved={settings.autoUpdatesChannel} options={CLAUDE_UPDATE_CHANNELS} onChange={value => set("autoUpdatesChannel", value)}>
           Unset follows the native latest channel. Saved latest or stable controls subsequent native updates; it does not update or restart the current binary. Homebrew follows its cask instead.
@@ -226,7 +231,9 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
 
       <fieldset className="codex-settings-group" disabled={busy !== null}>
         <legend>Claude skills outside CloudX</legend>
-        <small>CloudX adds system and selected-template skills. Personal choices apply at the next launch; revoking a choice does not restart open tabs. Selected synced skills and conflicting source names block a new launch because native controls cannot enforce that selection. Saved choices remain unchanged. Bundled skills, known enabled plugins, known project names and auto-memory receive launch exclusions. New project skills discovered later remain an unresolved native policy gap.</small>
+        <ClaudeLaunchModeControl value={draft.launchMode} inheritedLabel="Unset · Native project (fresh CloudX default)" onChange={value => set("launchMode", value)} />
+        <p>Saved choice: {settings.launchMode ? claudeLaunchModeLabel(settings.launchMode) : "Unset · Native project (fresh CloudX default)"}. Selected for future launches: {claudeLaunchModeLabel(draft.launchMode || "native-project")}{draft.launchMode ? " (explicit)" : " (fresh default)"}.</p>
+        <small>Saved choices remain unchanged until you save. Personal and synced rows show installed sources and saved additions. Same-name collisions or incompatible managed policy produce a launch diagnostic. Selection does not prove an effective value in an existing session.</small>
         {settings.skills.map(skill => <label className="codex-settings-toggle" key={skill.name}>
           <input
             type="checkbox"
@@ -237,16 +244,16 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
               ? [...draft.allowedSkills, skill.name].sort()
               : draft.allowedSkills.filter(name => name !== skill.name))}
           />
-          <span>{skill.name}<small>{skill.available ? skill.origin === "synced" ? "Synced from claude.ai. Selecting this skill blocks new Claude launches: native background sync cannot enforce this selection." : "Personal skill." : "Not installed."}</small></span>
+          <span>{skill.name}<small>{skill.available ? skill.origin === "synced" ? "Synced from claude.ai. The selected account and source are checked at launch." : "Personal skill." : "Not installed."}</small></span>
         </label>)}
         {!settings.skills.length ? <p>No personal or synced Claude skills are installed.</p> : null}
       </fieldset>
 
       <details className="codex-settings-group">
         <summary>Defaults and launch policy</summary>
-        <p>Fresh CloudX defaults: bypass permissions, automatic workspace trust, no personal or synced names selected. Saved choices remain unchanged. Native permission defaults depend on the surface, and native skills and memory normally have their own defaults; CloudX overrides these only for its launches.</p>
-        <p>Skill sources are separate: CloudX system catalog and selected template are supplied by CloudX; personal and claude.ai synced rows show filesystem availability and saved selection. Bundled, plugin and known project sources receive launch exclusions. Managed skills and dynamically added directories are not verified here. A cached synced skill is not proof of its selected-account or selected-version provenance.</p>
-        <p>Clipboard/editor preferences start from the personal .claude.json. Native /config changes to copyOnSelect, copyFullResponse and externalEditorContext are retained separately for future CloudX tabs; existing tabs keep their own values. If several tabs change a choice, the latest native configuration file wins at the next launch. Account credentials and trust state stay isolated, and the personal file is unchanged. Personal keybindings and rules are shared from the native home. Personal instruction imports retain their original relative directory and depth budget; original-root exclusion patterns still need native identity support. Use /keybindings and native --debug diagnostics for invalid bindings. Browser clipboard and external-editor delivery require separate host support.</p>
+        <p>Fresh CloudX defaults: Native project, bypass permissions, automatic workspace trust, no personal or synced names selected. Saved choices remain unchanged. An interactive launch, Forge or automation can explicitly select a supported mode or inherit the saved mode; an unset preference resolves to Native project. Mode and supplied source observations are recorded for each new execution. Historical launches without a record remain unverified.</p>
+        <p>Skill sources are separate: CloudX system catalog and selected template are supplied by CloudX; personal and claude.ai synced rows show filesystem availability and saved selection. Native project discovery remains native and is not an exclusive CloudX allowlist. CloudX-managed records its controlled supplied set and omitted sources. A cached synced skill is not proof of its selected-account or selected-version provenance. Updates and revocation apply to future launches.</p>
+        <p>Clipboard/editor preferences start from the personal .claude.json. Native /config changes to copyOnSelect, copyFullResponse and externalEditorContext are retained separately for future CloudX tabs; existing tabs keep their own values. If several tabs change a choice, the latest native configuration file wins at the next launch. Account credentials and trust state stay isolated, and the personal file is unchanged. Personal keybindings and rules are retained where permitted by the selected mode. Personal instruction imports retain their original relative directory and depth budget; unsupported root-exclusion combinations stop launch with a diagnostic. Use /keybindings and native --debug diagnostics for invalid bindings. Browser clipboard and external-editor delivery require separate host support.</p>
         <p>CloudX receipts require compatible native hooks. File-backed restrictions stop launch with a diagnostic. Forge waits for its actual execution-bound startup receipt before submitting work; a missing receipt stops the worker. Interactive tabs report unavailable tracking when startup receipts are missing. The selected account and service routing are checked against native authentication status without a model turn. This checks native provider/account selection at launch; later managed policy or cloud credential refresh still belongs to the native client. Credential values are never shown here.</p>
         <p>Native agent view, background agents and native worktrees have no established CloudX ownership, status, recovery or cleanup contract. They are unsupported as managed CloudX sessions.</p>
         <p><a href="https://code.claude.com/docs/en/settings-reference" target="_blank" rel="noreferrer">Official native settings and defaults</a> · <a href="https://code.claude.com/docs/en/settings" target="_blank" rel="noreferrer">Scope, precedence and reload behavior</a>. The catalog below inventories the retained references; runtime certification and additional native editors remain explicitly unverified or unavailable.</p>
@@ -267,9 +274,9 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
     {settings ? <section className="codex-update-control agent-bypass" aria-label="Claude bypass permissions">
       <h3>Bypass permissions warning</h3>
       {settings.bypassAccepted
-        ? <p>Accepted. Claude tabs in bypass mode start without the warning, and Forge workers can run on Claude.</p>
+        ? <p>Accepted for future launches. New Claude tabs in bypass mode start without the warning, and Forge workers can run on Claude. This acknowledgement does not change an open managed tab's snapshot.</p>
         : <>
-          <p>Not accepted. A Claude tab in bypass mode shows Claude Code's warning on its first start, and accepting it there is remembered. Forge workers on Claude need it accepted first.</p>
+          <p>Not accepted globally. Native project records native warning acceptance in the shared user settings. CloudX-managed records it only in that tab's settings snapshot. Accepting here updates the original user settings for future launches; it does not change open managed snapshots. Forge workers on Claude need the global acknowledgement first.</p>
           {reviewingBypass ? <>
             <p className="agent-warning">{warning}</p>
             <div className="codex-settings-actions">

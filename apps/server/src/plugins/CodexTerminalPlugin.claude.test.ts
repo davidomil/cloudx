@@ -12,6 +12,9 @@ import type { TerminalProcess, TerminalProcessFactory } from "../terminal/Termin
 import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import { CodexTerminalPlugin, DEFAULT_TERMINAL_REPLAY_BYTES } from "./CodexTerminalPlugin.js";
 import { ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
+import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
+import { ClaudeConversationPolicies } from "../agents/claude/ClaudeConversationPolicies.js";
+import { runAgentCli } from "../agents/agentCli.js";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
 vi.mock("../agents/claude/ClaudeNativeSettings.js", () => ({ verifyClaudeNativeAccount: vi.fn(async () => undefined) }));
@@ -256,4 +259,80 @@ describe("CodexTerminalPlugin on Claude", () => {
     factory.last.process.exit(0);
     expect(usage.ended).toHaveBeenCalledWith("tab-1");
   });
+});
+
+
+it("records an explicit managed execution and preserves its mode through recovery despite changed defaults", async () => {
+  const { plugin, factory, tab, cwd, controls, env, dataDir, restored, claudeSettings, account } = await setup();
+  const binary = path.join(env.HOME, "reviewed-claude");
+  await fs.writeFile(binary, '#!/bin/sh\necho "2.1.316 (Claude Code)"\n', { mode: 0o755 }); env.CLOUDX_CLAUDE_BIN = binary;
+  const first = await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, claudeLaunchMode: "cloudx-managed" } });
+  await vi.waitFor(async () => expect(await new ClaudeConversationPolicies(dataDir).read(SESSION)).toMatchObject({ accountId: account.id, policy: { mode: "cloudx-managed" } }));
+  const original = first.restoreInput!()!;
+  expect(factory.lastCommandLine).toContain("--setting-sources user");
+  expect(factory.lastCommandLine).toContain("CLAUDE_CODE_HOST_SKILL_CATALOG");
+  expect(factory.lastCommandLine).toContain("CLAUDE_CODE_PLUGIN_DIRS");
+  expect(original).toMatchObject({ claudeLaunchMode: "cloudx-managed", claudeLaunchPolicy: { mode: "cloudx-managed", exclusiveSkills: true } });
+  const snapshot = await fs.readFile(path.join(dataDir, "claude-launches", tab.id, ".cloudx-launch-policy.json"), "utf8");
+  await expect(first.applyRuntimeContext?.({})).rejects.toThrow("next launch");
+  expect(await fs.readFile(path.join(dataDir, "claude-launches", tab.id, ".cloudx-launch-policy.json"), "utf8")).toBe(snapshot);
+  await claudeSettings.update({ expectedRevision: (await claudeSettings.read()).revision, launchMode: "native-project" });
+  const transcript = path.join(env.HOME, ".claude", "projects", "-work", `${SESSION}.jsonl`);
+  await fs.mkdir(path.dirname(transcript), { recursive: true }); await fs.writeFile(transcript, "");
+  first.stop?.();
+  const recovered = await plugin.recoverSession({ tab, cwd, controls, initialInput: original });
+  expect(factory.lastCommandLine).toContain("--setting-sources user");
+  expect(await new AgentLaunchRecords(dataDir).read(tab.id, "claude")).toMatchObject({ claudeLaunchModeSource: "conversation", claudeLaunchPolicy: { mode: "cloudx-managed" } });
+  expect(restored.at(-1)).toMatchObject({ claudeLaunchMode: "cloudx-managed" });
+  recovered.stop?.();
+});
+
+it("rejects mode/account changes for a bound conversation before spawning or changing its overlay", async () => {
+  const { plugin, factory, tab, cwd, controls, env, dataDir, accounts, account } = await setup();
+  const binary = path.join(env.HOME, "reviewed-claude");
+  await fs.writeFile(binary, '#!/bin/sh\necho "2.1.316 (Claude Code)"\n', { mode: 0o755 }); env.CLOUDX_CLAUDE_BIN = binary;
+  const first = await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, claudeLaunchMode: "cloudx-managed" } });
+  await vi.waitFor(async () => expect(await new ClaudeConversationPolicies(dataDir).read(SESSION)).toBeDefined());
+  const original = first.restoreInput!()!; const launches = factory.launches.length;
+  const settingsPath = path.join(dataDir, "claude-launches", tab.id, ".cloudx-settings.json"); const before = await fs.readFile(settingsPath, "utf8");
+  await expect(plugin.createSession({ tab, cwd, controls, initialInput: { ...original, claudeLaunchMode: "native-project" } })).rejects.toThrow("different launch mode");
+  const other = await accounts.create({ providerId: "claude", label: "Other", kind: "subscription" });
+  const transcript = path.join(env.HOME, ".claude", "projects", "-work", `${SESSION}.jsonl`);
+  await fs.mkdir(path.dirname(transcript), { recursive: true }); await fs.writeFile(transcript, "");
+  await expect(plugin.prepareAgentSwitch({ tab, cwd, controls, initialInput: original }, { providerId: "claude", accountId: other.id })).rejects.toThrow("recorded account");
+  await expect(plugin.createSession({ tab, cwd, controls, initialInput: { ...original, agent: { providerId: "claude", accountId: other.id } } })).rejects.toThrow("different account");
+  expect(factory.launches).toHaveLength(launches); expect(await fs.readFile(settingsPath, "utf8")).toBe(before);
+  expect(original.agent).toEqual({ providerId: "claude", accountId: account.id }); first.stop?.();
+});
+
+it("keeps the verified managed executable when a login profile changes PATH", async () => {
+  const { plugin, factory, tab, cwd, controls, env, dataDir } = await setup();
+  const reviewed = path.join(env.HOME, "reviewed-bin"); const other = path.join(env.HOME, "profile-bin");
+  await fs.mkdir(reviewed); await fs.mkdir(other);
+  const binary = path.join(reviewed, "claude");
+  await fs.writeFile(binary, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "2.1.316 (Claude Code)"; else echo verified-executable; fi\n', { mode: 0o755 });
+  await fs.writeFile(path.join(other, "claude"), '#!/bin/sh\necho unreviewed-executable\n', { mode: 0o755 });
+  env.PATH = `${reviewed}:${env.PATH}`;
+  const profile = path.join(env.HOME, "profile.sh"); await fs.writeFile(profile, `export PATH=${other}:$PATH\n`);
+  Object.assign(env, { BASH_ENV: profile });
+  const session = await plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, claudeLaunchMode: "cloudx-managed" } });
+  try {
+    const result = await runAgentCli(factory.last.command, factory.last.args, { cwd, env: factory.last.env });
+    expect(result.code).toBe(0); expect(result.stdout.trim()).toBe("verified-executable");
+    expect(await new AgentLaunchRecords(dataDir).read(tab.id, "claude")).toMatchObject({ command: await fs.realpath(binary), claudeLaunchPolicy: { nativeVersion: "2.1.316" } });
+  } finally { session.stop?.(); }
+});
+
+it("keeps historical resume unverified and rejects strict mode, ambiguous resume and malformed launch input before spawn", async () => {
+  const { plugin, factory, tab, cwd, controls, env, claudeSettings, dataDir } = await setup();
+  const transcript = path.join(env.HOME, ".claude", "projects", "-work", `${SESSION}.jsonl`);
+  await fs.mkdir(path.dirname(transcript), { recursive: true }); await fs.writeFile(transcript, "");
+  await claudeSettings.update({ expectedRevision: (await claudeSettings.read()).revision, launchMode: "cloudx-managed" });
+  const initialInput = { agent: { providerId: "claude" }, resume: { mode: "session", sessionId: SESSION } };
+  await expect(plugin.createSession({ tab, cwd, controls, initialInput })).rejects.toThrow("historical");
+  await expect(plugin.createSession({ tab, cwd, controls, initialInput: { ...initialInput, claudeLaunchMode: "invalid" } })).rejects.toThrow("launch mode must");
+  await expect(plugin.createSession({ tab, cwd, controls, initialInput: { agent: { providerId: "claude" }, resume: { mode: "last" } } })).rejects.toThrow("exact saved Claude");
+  expect(factory.launches).toHaveLength(0);
+  const native = await plugin.createSession({ tab, cwd, controls, initialInput: { ...initialInput, claudeLaunchMode: "native-project" } });
+  expect(await new AgentLaunchRecords(dataDir).read(tab.id, "claude")).toMatchObject({ historicalClaudeConversation: true, claudeLaunchPolicy: { exclusiveSkills: false } }); native.stop?.();
 });

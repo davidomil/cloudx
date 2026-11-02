@@ -30,7 +30,7 @@ it("shows historical account/version/arguments and source evidence without claim
   await view.fill("../escape"); expect(view.button.disabled).toBe(true);
   await view.fill("worker-1"); await act(async () => view.button.click());
   expect(view.call).toHaveBeenCalledExactlyOnceWith("claude-settings.inspect-launch", { tabId: "worker-1" });
-  for (const text of ["2.1.316", "account-1", "execution-1", "ANTHROPIC_API_KEY", "SHA-256", "missing", "Prompt text", "later skill discovery", "docx", "synced", "Missing", "Fresh CloudX default", "Launch selection", "Not selected", "Allowed"]) expect(view.container.textContent).toContain(text);
+  for (const text of ["2.1.316", "account-1", "execution-1", "ANTHROPIC_API_KEY", "SHA-256", "missing", "Prompt text", "later skill discovery", "docx", "synced", "Missing", "Fresh CloudX default", "Launch selection", "Not selected", "Allowed", "Historical Claude launch policy is unverified"]) expect(view.container.textContent).toContain(text);
 });
 
 it("does not substitute current settings for a missing record", async () => {
@@ -56,4 +56,16 @@ it("reports an inaccessible owned record without displaying the error contents",
   await view.fill("worker-1"); await act(async () => view.button.click());
   expect(view.container.textContent).toContain("Launch record unavailable");
   expect(view.container.textContent).not.toContain("private diagnostics");
+});
+
+
+it("shows the recorded mode and original synced snapshot provenance separately from native loading", async () => {
+  const view = await mount(async () => ({ ...record, claudeLaunchModeSource: "conversation", historicalClaudeConversation: true, claudeLaunchPolicy: {
+    mode: "cloudx-managed", contractVersion: 1, nativeVersion: "2.1.316", exclusiveSkills: true, activation: "next-launch", settingSources: ["user"],
+    includedSources: ["personal instructions"], excludedSources: ["project CLAUDE.md and rules", "local settings and CLAUDE.local.md"],
+    skills: [{ name: "docx", origin: "synced", nativeSource: "user", account: "synced-account-a", sourcePath: "/personal/skills/synced/synced-account-a/docx", sha256: "b".repeat(64) }]
+  } }));
+  await view.fill("worker-1"); await act(async () => view.button.click());
+  for (const text of ["CloudX-managed", "Choice source: conversation", "Native setting sources: user", "project CLAUDE.md and rules", "CLAUDE.local.md", "synced-account-a", "Snapshot SHA-256", "historical and unverified"])
+    expect(view.container.textContent).toContain(text);
 });

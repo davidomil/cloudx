@@ -799,6 +799,24 @@ describe("AutomationExecutor", () => {
     expect(run.trace.map((entry) => entry.message)).toEqual(expect.arrayContaining(["Starting bash process.", "Bash process completed."]));
   });
 
+  it.each(["exclusive", null])("rejects unsupported Claude launch mode %s before launching", async claudeLaunchMode => {
+    const group = codexExecGroup();
+    const node = group.graph.nodes.find(node => node.typeId === "primitive:codex.exec")!;
+    node.config = { ...node.config, model: "claude-opus-5-5", profile: "", claudeLaunchMode };
+    const run = await new AutomationExecutor().execute(group, event(), await primitiveCatalog(), new HookRegistry());
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("claudeLaunchMode");
+  });
+
+  it("rejects a Claude launch mode on a Codex node instead of silently discarding it", async () => {
+    const group = codexExecGroup();
+    const node = group.graph.nodes.find(node => node.typeId === "primitive:codex.exec")!;
+    node.config = { ...node.config, claudeLaunchMode: "cloudx-managed" };
+    const run = await new AutomationExecutor().execute(group, event(), await primitiveCatalog(), new HookRegistry());
+    expect(run.status).toBe("failed");
+    expect(run.error).toContain("Claude launch mode requires a Claude model");
+  });
+
   it("runs Codex exec primitives with bounded subprocess output and parsed JSONL", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-exec-"));
     const fakeCodex = await fakeCodexExecutable(dataDir, `

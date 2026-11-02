@@ -26,6 +26,7 @@ const saved: ClaudeGlobalSettings = {
   revision: "a".repeat(64), settingsPath: "/home/user/.claude/settings.json",
   model: "opus", effortLevel: null, alwaysThinkingEnabled: null, fastMode: true, outputStyle: null, language: null, autoUpdatesChannel: null,
   permissionMode: "bypassPermissions", autoTrustWorkspace: true, bypassAccepted: false, bypassDisabled: false,
+  launchMode: null,
   skills: [
     { name: "release-notes", origin: "personal", allowed: false, available: true },
     { name: "docx", origin: "synced", allowed: true, available: true },
@@ -99,14 +100,15 @@ describe("ClaudeSettingsPanel", () => {
   it("records bypass acceptance only after the warning is reviewed and confirmed", async () => {
     const callHook = hooks();
     const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
-    expect(container.textContent).toContain("Not accepted.");
+    expect(container.textContent).toContain("Not accepted globally.");
     expect(container.textContent).not.toContain("will not ask for approval");
     await act(async () => button(container, "Review warning…").click());
     expect(container.textContent).toContain("Claude Code will not ask for approval.");
     expect(callHook).not.toHaveBeenCalledWith("claude-settings.accept-bypass", expect.anything());
     await act(async () => button(container, "I accept").click());
     expect(callHook).toHaveBeenCalledWith("claude-settings.accept-bypass", { accepted: true });
-    expect(container.textContent).toContain("Accepted. Claude tabs in bypass mode start without the warning");
+    expect(container.textContent).toContain("Accepted for future launches");
+    expect(container.textContent).toContain("does not change an open managed tab's snapshot");
   });
 
   it("warns when policy disables bypass mode and runs the Claude updater", async () => {
@@ -129,14 +131,34 @@ describe("ClaudeSettingsPanel", () => {
     expect(callHook).toHaveBeenCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), allowedSkills: ["release-notes"] });
   });
 
-  it("distinguishes installed synced skills from launch support without resetting saved selections", async () => {
+  it("discloses both modes before selection without resetting saved skill choices", async () => {
     const callHook = hooks();
     const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
     expect((control(container, "Allow docx") as HTMLInputElement).checked).toBe(true);
-    expect(container.textContent).toContain("Selecting this skill blocks new Claude launches");
+    expect(control(container, "Claude launch mode").value).toBe("");
+    expect(container.textContent).toContain("Saved choice: Unset");
+    expect(container.textContent).toContain("Shared project settings, project CLAUDE.md and project rules are omitted");
+    expect(container.textContent).toContain("CLAUDE.local.md");
+    expect(container.textContent).toContain("additions, not an exclusive native allowlist");
     expect(container.textContent).toContain("Saved choices remain unchanged");
-    expect(container.textContent).toContain("New project skills discovered later remain an unresolved native policy gap");
+    const mode = control(container, "Claude launch mode");
+    const disclosure = container.querySelector(`#${mode.getAttribute("aria-describedby")}`)!;
+    expect(disclosure.compareDocumentPosition(mode) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(callHook.mock.calls.some(([hookId]) => hookId === "claude-settings.update")).toBe(false);
+  });
+
+  it("saves an explicit managed choice for future launches and can return to the unset fresh default", async () => {
+    const callHook = hooks();
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    await change(control(container, "Claude launch mode"), "cloudx-managed");
+    expect(container.textContent).toContain("Selected for future launches: CloudX-managed");
+    await act(async () => button(container, "Save Claude settings").click());
+    expect(callHook).toHaveBeenLastCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), launchMode: "cloudx-managed" });
+    expect(container.textContent).toContain("Saved choice: CloudX-managed");
+    expect((control(container, "Allow docx") as HTMLInputElement).checked).toBe(true);
+    await change(control(container, "Claude launch mode"), "");
+    await act(async () => button(container, "Save Claude settings").click());
+    expect(callHook).toHaveBeenLastCalledWith("claude-settings.update", { expectedRevision: "b".repeat(64), launchMode: null });
   });
 
   it("explains user values, model limits, permission rules and activation timing without promising effective runtime state", async () => {
@@ -146,12 +168,23 @@ describe("ClaudeSettingsPanel", () => {
     expect(container.textContent).toContain("Legacy user effortLevel: xhigh");
     expect(container.textContent).toContain("use native /model or /effort for a running session");
     expect(container.textContent).toContain("Saving never restarts a client");
+    expect(container.textContent).toContain("Native project shares the user settings file and follows native reload where supported");
+    expect(container.textContent).toContain("CloudX-managed copies user settings at launch; changes to that original file reach a managed session only at the next launch");
     await change(control(container, "Permission mode for CloudX tabs"), "manual");
     expect(container.textContent).toContain("Allows reads and pre-approved operations");
     await change(control(container, "Permission mode for CloudX tabs"), "plan");
     expect(container.textContent).toContain("permitted read-only shell commands");
     expect(container.textContent).not.toContain("Off disables thinking");
     expect(container.textContent).not.toContain("Asks before every tool use");
+  });
+
+  it("distinguishes native-project shared consent, managed-tab consent and global future-launch acknowledgement", async () => {
+    const callHook = hooks({ ...saved, launchMode: "cloudx-managed" });
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    expect(container.textContent).toContain("Native project records native warning acceptance in the shared user settings");
+    expect(container.textContent).toContain("CloudX-managed records it only in that tab's settings snapshot");
+    expect(container.textContent).toContain("Accepting here updates the original user settings for future launches");
+    expect(callHook.mock.calls.some(([id]) => id === "claude-settings.accept-bypass")).toBe(false);
   });
 
   it("shows unsupported saved channels and blocks updates until the user corrects the value", async () => {

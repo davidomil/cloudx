@@ -28,6 +28,7 @@ export interface ClaudeLaunchArgsOptions {
   settings: Pick<ClaudeLaunchPreferences, "permissionMode" | "autoTrustWorkspace">;
   settingsPath: string;
   instructionsPath?: string;
+  configurationArgs?: string[];
   addDirs: string[];
   deferPrompt?: boolean;
   // Starts a new conversation under this id.
@@ -41,6 +42,7 @@ export function buildClaudeLaunchArgs(initialInput: Record<string, unknown> | un
   if (resume?.mode === "session" && !SESSION_ID_PATTERN.test(resume.sessionId ?? "")) throw new Error("Claude resume requires an exact session id.");
   const args = ["--settings", options.settingsPath];
   if (options.instructionsPath) args.push("--append-system-prompt-file", options.instructionsPath);
+  args.push(...options.configurationArgs ?? []);
   for (const directory of options.addDirs) args.push("--add-dir", directory);
   if (options.settings.permissionMode === "bypassPermissions") args.push("--dangerously-skip-permissions");
   else args.push("--permission-mode", options.settings.permissionMode);

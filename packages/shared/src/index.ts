@@ -19,6 +19,7 @@ export * from "./directoryOwnership.js";
 export * from "./agents.js";
 import type { AGENT_ACCOUNTS_OPTION_SOURCE } from "./agents.js";
 export * from "./claudeSettings.js";
+export * from "./claudeLaunchPolicy.js";
 export * from "./claudeConfiguration.js";
 export * from "./agentUsage.js";
 export * from "./agentLaunchRecord.js";

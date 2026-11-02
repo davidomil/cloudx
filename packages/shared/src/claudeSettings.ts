@@ -1,6 +1,8 @@
 // Claude Code settings shown in Settings → Claude. Native settings live in the
 // user's ~/.claude/settings.json and also apply to plain `claude`; launch
 // preferences apply only to CloudX tabs.
+import type { ClaudeLaunchMode } from "./claudeLaunchPolicy.js";
+
 export const CLAUDE_SETTINGS_PLUGIN_ID = "claude-settings";
 export const CLAUDE_SETTINGS_HOOKS = {
   read: "claude-settings.read",
@@ -32,7 +34,7 @@ export const CLAUDE_LAUNCH_PERMISSION_MODES = ["bypassPermissions", "acceptEdits
 export type ClaudeLaunchPermissionMode = typeof CLAUDE_LAUNCH_PERMISSION_MODES[number];
 
 // Skills Claude Code finds outside CloudX: personal skills in the user's Claude
-// home and skills synced from claude.ai. CloudX tabs hide them unless allowed.
+// home and skills synced from claude.ai. Their launch policy depends on mode.
 export const CLAUDE_SKILL_ORIGINS = ["personal", "synced"] as const;
 export type ClaudeSkillOrigin = typeof CLAUDE_SKILL_ORIGINS[number];
 export const CLAUDE_SKILL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -63,6 +65,8 @@ export interface ClaudeGlobalSettings {
   language: string | null;
   autoUpdatesChannel: string | null;
   // CloudX launch preferences.
+  // Null leaves the fresh CloudX default (Native project) unset.
+  launchMode: ClaudeLaunchMode | null;
   permissionMode: ClaudeLaunchPermissionMode;
   autoTrustWorkspace: boolean;
   skills: ClaudeSkillChoice[];
@@ -83,6 +87,7 @@ export interface ClaudeGlobalSettingsUpdate {
   outputStyle?: string | null;
   language?: string | null;
   autoUpdatesChannel?: ClaudeUpdateChannel | null;
+  launchMode?: ClaudeLaunchMode | null;
   permissionMode?: ClaudeLaunchPermissionMode;
   autoTrustWorkspace?: boolean;
   // Names of personal or synced skills CloudX tabs may use.

@@ -4,9 +4,9 @@
 // bridge so recovery and switching read one format.
 //
 // Usage: claude-hook-receipt.mjs <configDir> <tabId> <executionId> <event>
-// The hook payload arrives as JSON on stdin. The hook always exits 0 so a
-// receipt failure never blocks an interactive user's session. Forge prompt
-// receipt failures exit 2 so native Claude blocks model work it cannot track.
+// The hook payload arrives as JSON on stdin. SessionStart remains observational.
+// Owned execution-policy and Forge prompt failures exit 2, blocking native model
+// work whose conversation policy or required receipt cannot be verified.
 //
 // Claude runs Stop hooks in parallel, and another hook can block the stop and
 // continue the same prompt. So Stop only records a pending stop and starts
@@ -14,11 +14,12 @@
 // turn once the transcript shows that Stop's hooks ended it.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fsyncSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { EXECUTION_POLICY, guardConversationEvent } from "./claude-conversation-policy.mjs";
 
 const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 // File names match AGENT_TURN_RECEIPT and CLAUDE_FORGE_TURN_BINDING in the
@@ -58,6 +59,7 @@ export function receiptsForEvent(event, payload, binding) {
         value: {
           version: 2, authority: "selected", tabId: binding.tabId, executionId: binding.executionId,
           sessionId, cwd: payload.cwd,
+          ...(typeof binding.historical === "boolean" ? { historicalClaudeConversation: binding.historical } : {}),
           ...(typeof payload.transcript_path === "string" && path.isAbsolute(payload.transcript_path) ? { transcriptPath: payload.transcript_path } : {})
         }
       });
@@ -301,6 +303,7 @@ async function main() {
   const [configDir, tabId, executionId, event] = args;
   if (!configDir || !path.isAbsolute(configDir) || !tabId || !CONVERSATION_ID.test(executionId ?? "") || !event) return;
   const payload = JSON.parse(await readStdin());
+  const navigation = guardConversationEvent(configDir, executionId, event, payload);
   if (event === "Stop") return recordStop(configDir, { tabId, executionId }, payload);
   if (event === "UserPromptSubmit") {
     const forge = readForgeBinding(configDir);
@@ -308,17 +311,20 @@ async function main() {
       throw new Error("Forge prompt belongs to a different conversation.");
     recordPrompt(configDir, payload);
   }
-  applyEvent(configDir, { tabId, executionId }, event, payload);
+  applyEvent(configDir, { tabId, executionId, ...(navigation ? { historical: navigation.historical } : {}) }, event, payload);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then(() => process.exit(0), () => {
     const [configDir, , , event] = process.argv.slice(2);
     let forgePrompt = false;
+    let policyPrompt = false;
     if (event === "UserPromptSubmit" && configDir && path.isAbsolute(configDir)) {
       try { forgePrompt = statSync(path.join(configDir, FORGE_TURN_BINDING)).isFile(); } catch { /* No owned Forge turn. */ }
+      try { lstatSync(path.join(configDir, EXECUTION_POLICY)); policyPrompt = true; } catch { /* No execution policy. */ }
     }
     process.stderr.write("CloudX receipt delivery failed. Check the configured receipt directory and native hook policy. No hook payload or configuration values were included in this diagnostic.\n");
-    process.exit(forgePrompt ? 2 : 0);
+    if (policyPrompt) process.stderr.write("CloudX blocked this prompt because its conversation policy could not be verified. Resume with the recorded mode, account and workspace, or start a new conversation.\n");
+    process.exit(forgePrompt || policyPrompt ? 2 : 0);
   });
 }

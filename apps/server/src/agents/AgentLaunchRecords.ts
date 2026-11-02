@@ -2,14 +2,14 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { AgentLaunchRecord, AgentProviderId } from "@cloudx/shared";
+import { parseClaudeResolvedLaunchPolicy, type AgentLaunchRecord, type AgentProviderId } from "@cloudx/shared";
 import { JsonStateFile } from "../jsonStateFile.js";
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u;
 const ENVIRONMENT_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const MAX_SOURCE_BYTES = 524_288;
 const OMITTED = "[omitted]";
-const VALUE_FLAGS = new Set(["--model", "-m", "--profile", "-p", "--effort", "--permission-mode", "--settings", "--add-dir", "--cd", "--session-id", "--resume", "--remote", "--append-system-prompt-file"]);
+const VALUE_FLAGS = new Set(["--model", "-m", "--profile", "-p", "--effort", "--permission-mode", "--settings", "--add-dir", "--cd", "--session-id", "--resume", "--remote", "--append-system-prompt-file", "--setting-sources"]);
 const SWITCH_FLAGS = new Set(["--yolo", "--dangerously-skip-permissions", "--continue", "--no-alt-screen"]);
 
 export class AgentLaunchRecords {
@@ -20,6 +20,9 @@ export class AgentLaunchRecords {
     version?: string; accountId?: string; cwd: string; args: string[];
     env: NodeJS.ProcessEnv; enforcedEnvironmentKeys: string[]; configurationPaths: string[];
     skillSelections?: AgentLaunchRecord["skillSelections"];
+    claudeLaunchPolicy?: AgentLaunchRecord["claudeLaunchPolicy"];
+    claudeLaunchModeSource?: AgentLaunchRecord["claudeLaunchModeSource"];
+    historicalClaudeConversation?: true;
   }): Promise<AgentLaunchRecord> {
     const version = input.version?.match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/u)?.[0] ?? null;
     const record = parseRecord({
@@ -29,8 +32,11 @@ export class AgentLaunchRecords {
       environmentKeys: Object.keys(input.env).filter(key => input.env[key] !== undefined).sort(),
       enforcedEnvironmentKeys: [...new Set(input.enforcedEnvironmentKeys)].sort(),
       skillSelections: input.skillSelections ?? [],
+      ...(input.claudeLaunchPolicy ? { claudeLaunchPolicy: input.claudeLaunchPolicy, claudeLaunchModeSource: input.claudeLaunchModeSource } : {}),
+      ...(input.historicalClaudeConversation ? { historicalClaudeConversation: true } : {}),
       configurationSources: await Promise.all([...new Set(input.configurationPaths)].map(sourceFingerprint)),
     });
+    if (Buffer.byteLength(JSON.stringify(record)) > 2 * 1024 * 1024) throw new Error("Agent launch record exceeds the inspection limit.");
     await this.file(input.tabId, input.providerId).write(record);
     return record;
   }
@@ -38,7 +44,7 @@ export class AgentLaunchRecords {
   async read(tabId: string, providerId: AgentProviderId): Promise<AgentLaunchRecord | undefined> {
     const file = this.file(tabId, providerId);
     try {
-      if ((await fs.lstat(file.filePath)).size > 262_144) throw new Error("Agent launch record exceeds the inspection limit.");
+      if ((await fs.lstat(file.filePath)).size > 2 * 1024 * 1024) throw new Error("Agent launch record exceeds the inspection limit.");
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const value = await file.read<unknown>();
     if (value === undefined) return undefined;
@@ -66,6 +72,7 @@ function publicArguments(args: string[]): string[] {
           : ["--model", "-m"].includes(arg) ? /^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$/u.test(value)
           : ["--profile", "-p", "--session-id", "--resume"].includes(arg) ? ID.test(value)
           : arg === "--permission-mode" ? ["manual", "acceptEdits", "auto", "plan", "bypassPermissions"].includes(value)
+          : arg === "--setting-sources" ? /^(?:user|project|local)(?:,(?:user|project|local))*$/u.test(value)
           : arg === "--effort" ? ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"].includes(value) : false);
       result.push(arg, safe ? value! : OMITTED);
       index++;
@@ -116,7 +123,13 @@ function parseRecord(value: unknown): AgentLaunchRecord {
       || !["file", "missing", "unobserved"].includes(source.state)
       || source.state === "file" && (typeof source.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.sha256))
       || source.state !== "file" && source.sha256 !== undefined)) return invalid();
+  const policy = record.claudeLaunchPolicy === undefined ? undefined : parseClaudeResolvedLaunchPolicy(record.claudeLaunchPolicy);
+  if ((policy || record.claudeLaunchModeSource !== undefined || record.historicalClaudeConversation !== undefined) && record.providerId !== "claude") return invalid();
+  if (policy && !["launch", "saved", "default", "conversation"].includes(record.claudeLaunchModeSource ?? "") || !policy && record.claudeLaunchModeSource !== undefined
+    || record.historicalClaudeConversation !== undefined && record.historicalClaudeConversation !== true) return invalid();
   return {
+    ...(policy ? { claudeLaunchPolicy: policy, claudeLaunchModeSource: record.claudeLaunchModeSource } : {}),
+    ...(record.historicalClaudeConversation ? { historicalClaudeConversation: true as const } : {}),
     providerId: record.providerId, tabId: record.tabId, executionId: record.executionId, recordedAt: record.recordedAt,
     command: record.command, version: record.version, accountId: record.accountId, cwd: record.cwd,
     arguments: publicArguments(record.arguments), environmentKeys: record.environmentKeys, enforcedEnvironmentKeys: record.enforcedEnvironmentKeys,

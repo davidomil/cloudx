@@ -32,6 +32,8 @@ describe("Claude settings API contract", () => {
     const schema = plugin.hooks.find(hook => hook.id === "claude-settings.update")!.inputSchema;
     const validate = new Ajv().compile(schema);
     const base = { expectedRevision: "a".repeat(64) };
+    for (const launchMode of ["native-project", "cloudx-managed", null]) expect(validate({ ...base, launchMode })).toBe(true);
+    for (const launchMode of ["", "restricted", false]) expect(validate({ ...base, launchMode })).toBe(false);
     for (const autoUpdatesChannel of ["latest", "stable", null]) expect(validate({ ...base, autoUpdatesChannel })).toBe(true);
     expect(validate({ ...base, autoUpdatesChannel: "rc", permissionMode: "plan" })).toBe(false);
     expect(validate({ ...base, effortModel: "claude-opus-5-5", effortLevel: "xhigh" })).toBe(true);

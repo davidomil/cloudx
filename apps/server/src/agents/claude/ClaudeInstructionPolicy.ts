@@ -41,7 +41,7 @@ export async function assertClaudeInstructionSourceCompatibility(providerHome: s
   }
 }
 
-async function worktreeLocalSettings(directory: string): Promise<string | undefined> {
+export async function worktreeLocalSettings(directory: string): Promise<string | undefined> {
   const gitEntry = path.join(directory, ".git");
   try {
     if (!(await fs.stat(gitEntry)).isFile()) return;
