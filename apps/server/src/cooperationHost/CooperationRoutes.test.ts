@@ -192,7 +192,7 @@ describe("cooperation HTTP and live boundary", () => {
     const original = await app.inject({ url: `${base}/assets/${asset.id}` });
     expect(original.headers["content-type"]).toBe("image/png");
     expect(original.headers["x-content-type-options"]).toBe("nosniff");
-    expect(original.rawPayload).toEqual(bytes);
+    expect(original.rawPayload.equals(bytes)).toBe(true);
     const resolved = await agent("asset", { assetId: asset.id });
     expect(resolved.statusCode).toBe(200);
     expect(resolved.json()).toMatchObject({ id: asset.id, sha256: asset.sha256, localPath: expect.stringContaining(root) });
@@ -200,7 +200,7 @@ describe("cooperation HTTP and live boundary", () => {
     const other = await boards.createBoard({ title: "Other board" });
     const wrongBoard = await app.inject({ url: `/api/cooperation/boards/${other.boardId}/assets/${asset.id}` });
     expect(wrongBoard.statusCode).toBe(400);
-    expect(wrongBoard.rawPayload).not.toEqual(bytes);
+    expect(wrongBoard.rawPayload.equals(bytes)).toBe(false);
   });
 
   it("rejects oversized, unknown-field, cross-board and malformed requests without changing state", async () => {

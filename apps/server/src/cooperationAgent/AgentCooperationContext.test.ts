@@ -121,7 +121,7 @@ it("exposes only byte-identical originals in this tab's image directory and clea
   const asset: CooperationAsset = { id: "asset-1", mime: "image/png", sha256: createHash("sha256").update(bytes).digest("hex"), byteLength: bytes.length, width: 1200, height: 800, relativePath: "assets/reference.png" };
   const original = await f.contexts.materializeAsset("tab-1", 3, { asset, localPath: originalPath });
   expect(path.dirname(original.localPath)).toBe(f.locator.assetRoot);
-  expect(await fs.readFile(original.localPath)).toEqual(bytes);
+  expect((await fs.readFile(original.localPath)).equals(bytes)).toBe(true);
   expect((await fs.stat(original.localPath)).mode & 0o777).toBe(0o400);
   await expect(f.contexts.materializeAsset("tab-1", 3, { asset: { ...asset, sha256: "0".repeat(64) }, localPath: originalPath })).rejects.toThrow("hash changed");
   await fs.chmod(original.localPath, 0o600);
