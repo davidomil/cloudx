@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Check, CircleHelp, Lightbulb, MessageSquare, Pencil, Send, ShieldAlert, Trash2 } from "lucide-react";
-import type { CooperationBoard, CooperationInboxEvent, CooperationOperation, CooperationReaction, CooperationTarget, CooperationThread } from "@cloudx/shared";
+import type { CooperationBoard, CooperationInboxEvent, CooperationOperation, CooperationPrecondition, CooperationReaction, CooperationTarget, CooperationThread } from "@cloudx/shared";
 import { FeedbackDelivery } from "./FeedbackDelivery.js";
 import { ControlButton } from "../Control.js";
 import { boardId, targetAuthor, targetTitle } from "./boardModel.js";
@@ -9,11 +9,11 @@ const emotes = [{ kind: "question", glyph: "?", title: "Question", Icon: CircleH
 export type FeedbackKind = CooperationReaction["kind"];
 interface ComposeDraft { kind: FeedbackKind; description: string; glyph: string; recipientTabId: string }
 interface ReplyDraft { text: string; sources: string; requestResponse: boolean; recipientTabId: string }
-interface ReactionDraft { editing: boolean; description: string; glyph: string }
+interface ReactionDraft { editing: boolean; description: string; glyph: string; baseRevision: number }
 export interface BoardFeedbackDrafts { compositions: Map<string, ComposeDraft>; replies: Map<string, ReplyDraft>; reactions: Map<string, ReactionDraft> }
 export function feedbackDraftKey(target: CooperationTarget) { return `${target.kind}:${target.id}:${target.anchor ? `${target.anchor.blockId}:${target.anchor.blockRevision}:${target.anchor.start}:${target.anchor.end}` : "whole"}`; }
 export function hasFeedbackDrafts(drafts: BoardFeedbackDrafts) { return [...drafts.compositions.values()].some(draft => draft.description.length > 0) || [...drafts.replies.values()].some(draft => draft.text.length > 0 || draft.sources.length > 0) || [...drafts.reactions.values()].some(draft => draft.editing); }
-interface FeedbackProps { board: CooperationBoard; target: CooperationTarget; initialKind?: FeedbackKind; threadId?: string; inbox: CooperationInboxEvent[]; readOnly: boolean; busy: boolean; drafts: BoardFeedbackDrafts; onDraftChanged: () => void; onOperations: (operations: CooperationOperation[]) => Promise<boolean>; onThread: (target: CooperationTarget, threadId?: string) => void; onDeliveryChanged: () => void; refreshKey: number }
+interface FeedbackProps { board: CooperationBoard; target: CooperationTarget; initialKind?: FeedbackKind; threadId?: string; inbox: CooperationInboxEvent[]; readOnly: boolean; busy: boolean; drafts: BoardFeedbackDrafts; onDraftChanged: () => void; onOperations: (operations: CooperationOperation[], options?: { observedPreconditions?: CooperationPrecondition[] }) => Promise<boolean>; onThread: (target: CooperationTarget, threadId?: string) => void; onDeliveryChanged: () => void; refreshKey: number }
 
 export function BoardFeedback({ board, target, initialKind, threadId, inbox, readOnly, busy, drafts, onDraftChanged, onOperations, onThread, onDeliveryChanged, refreshKey }: FeedbackProps) {
   const owner = targetAuthor(board, target);
@@ -53,11 +53,20 @@ export function BoardFeedback({ board, target, initialKind, threadId, inbox, rea
 }
 
 function ReactionRow({ reaction, board, readOnly, busy, drafts, onDraftChanged, onOperations, onThread }: { reaction: CooperationReaction; board: CooperationBoard; readOnly: boolean; busy: boolean; drafts: BoardFeedbackDrafts; onDraftChanged: () => void; onOperations: FeedbackProps["onOperations"]; onThread: FeedbackProps["onThread"] }) {
-  const [{ editing, description, glyph }, updateDraft] = useRetainedDraft(drafts.reactions, reaction.id, saved => saved ?? { editing: false, description: reaction.description, glyph: reaction.glyph }, onDraftChanged);
-  const setEditing = (editing: boolean) => updateDraft({ editing });
+  const [{ editing, description, glyph, baseRevision }, updateDraft] = useRetainedDraft(drafts.reactions, reaction.id, saved => saved ?? { editing: false, description: reaction.description, glyph: reaction.glyph, baseRevision: reaction.revision }, onDraftChanged);
+  const stale = baseRevision !== reaction.revision;
+  const loadCurrent = (editing: boolean) => updateDraft({ editing, description: reaction.description, glyph: reaction.glyph, baseRevision: reaction.revision });
   const setDescription = (description: string) => updateDraft({ description });
   const setGlyph = (glyph: string) => updateDraft({ glyph });
-  return <div className="cooperation-reaction-row"><span className={`cooperation-reaction reaction-${reaction.kind}`}>{reaction.glyph}</span>{editing ? <form onSubmit={event => { event.preventDefault(); void onOperations([{ kind: "updateReaction", reactionId: reaction.id, patch: { description, glyph } }]).then(saved => { if (saved) setEditing(false); }); }}><label>Reaction glyph<input required maxLength={16} value={glyph} onChange={event => setGlyph(event.target.value)} /></label><label>Edit reaction<textarea aria-label="Edit reaction" required value={description} onChange={event => setDescription(event.target.value)} maxLength={4000} /></label><ControlButton type="submit" size="compact" disabled={busy}>Save reaction</ControlButton><ControlButton size="compact" onClick={() => updateDraft({ editing: false, description: reaction.description, glyph: reaction.glyph })}>Cancel</ControlButton></form> : <div><p>{reaction.description}</p><small>{actorLabel(board, reaction.author)} · {reaction.kind}{reaction.target.anchor?.status === "stale" ? " · stale selection" : ""}</small>{reaction.threadId ? <button type="button" className="cooperation-text-action" onClick={() => onThread(reaction.target, reaction.threadId)}>Open discussion</button> : null}</div>}{!readOnly && !editing ? <div className="cooperation-reaction-controls"><ControlButton size="compact" iconOnly aria-label={`Edit reaction: ${reaction.description}`} onClick={() => setEditing(true)}><Pencil size={12} /></ControlButton><ControlButton size="compact" iconOnly aria-label={`Remove reaction: ${reaction.description}`} disabled={busy} onClick={() => void onOperations([{ kind: "removeReaction", reactionId: reaction.id }])}><Trash2 size={12} /></ControlButton></div> : null}</div>;
+  async function save() {
+    if (readOnly || busy || stale) return;
+    if (await onOperations([{ kind: "updateReaction", reactionId: reaction.id, patch: { description, glyph } }], { observedPreconditions: [{ targetKind: "reaction", targetId: reaction.id, expectedRevision: baseRevision }] })) updateDraft({ editing: false });
+  }
+  return <div className="cooperation-reaction-row"><span className={`cooperation-reaction reaction-${reaction.kind}`}>{reaction.glyph}</span>{editing ? <form onSubmit={event => { event.preventDefault(); void save(); }}>
+    {stale ? <div className="cooperation-error" role="alert">This reaction changed while you were editing. Your draft is retained.<ControlButton size="compact" disabled={busy} onClick={() => loadCurrent(true)}>Discard draft and load current reaction</ControlButton></div> : null}
+    <fieldset disabled={readOnly || busy}><label>Reaction glyph<input required maxLength={16} value={glyph} onChange={event => setGlyph(event.target.value)} /></label><label>Edit reaction<textarea aria-label="Edit reaction" required value={description} onChange={event => setDescription(event.target.value)} maxLength={4000} /></label></fieldset>
+    <ControlButton type="submit" size="compact" disabled={readOnly || busy || stale}>Save reaction</ControlButton><ControlButton size="compact" disabled={busy} onClick={() => loadCurrent(false)}>Cancel</ControlButton>
+  </form> : <div><p>{reaction.description}</p><small>{actorLabel(board, reaction.author)} · {reaction.kind}{reaction.target.anchor?.status === "stale" ? " · stale selection" : ""}</small>{reaction.threadId ? <button type="button" className="cooperation-text-action" onClick={() => onThread(reaction.target, reaction.threadId)}>Open discussion</button> : null}</div>}{!readOnly && !editing ? <div className="cooperation-reaction-controls"><ControlButton size="compact" iconOnly aria-label={`Edit reaction: ${reaction.description}`} disabled={busy} onClick={() => loadCurrent(true)}><Pencil size={12} /></ControlButton><ControlButton size="compact" iconOnly aria-label={`Remove reaction: ${reaction.description}`} disabled={busy} onClick={() => void onOperations([{ kind: "removeReaction", reactionId: reaction.id }])}><Trash2 size={12} /></ControlButton></div> : null}</div>;
 }
 
 function ThreadView({ board, thread, inbox, readOnly, busy, drafts, onDraftChanged, onOperations, onThread, onDeliveryChanged, refreshKey }: { board: CooperationBoard; thread: CooperationThread; inbox: CooperationInboxEvent[]; readOnly: boolean; busy: boolean; drafts: BoardFeedbackDrafts; onDraftChanged: () => void; onOperations: FeedbackProps["onOperations"]; onThread: FeedbackProps["onThread"]; onDeliveryChanged: () => void; refreshKey: number }) {
@@ -83,7 +92,9 @@ function actorLabel(board: CooperationBoard, actor: string) {
 }
 
 function useRetainedDraft<T>(store: Map<string, T>, key: string, initial: (saved: T | undefined) => T, onChanged: () => void) {
-  const [draft, setDraft] = useState(() => initial(store.get(key)));
-  useEffect(() => { store.set(key, draft); onChanged(); }, [store, key, draft, onChanged]);
-  return [draft, (patch: Partial<T>) => { const next = { ...(store.get(key) ?? draft), ...patch }; store.set(key, next); setDraft(next); onChanged(); }] as const;
+  const [, redraw] = useState(() => { store.set(key, initial(store.get(key))); return 0; });
+  if (!store.has(key)) store.set(key, initial(undefined));
+  const draft = store.get(key)!;
+  useEffect(onChanged, [draft, onChanged]);
+  return [draft, (patch: Partial<T>) => { store.set(key, { ...store.get(key)!, ...patch }); redraw(version => version + 1); onChanged(); }] as const;
 }

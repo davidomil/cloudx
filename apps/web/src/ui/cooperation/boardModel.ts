@@ -67,7 +67,7 @@ export function protectedItemIds(board: CooperationBoard): Set<string> {
   return new Set(board.items.filter(item => board.regions.some(region => region.mode === "wip" && (region.protectedItemIds.includes(item.id) || boundsIntersect(itemBounds(item), region.geometry)))).map(item => item.id));
 }
 
-export function preconditionsForOperations(board: CooperationBoard, operations: CooperationOperation[], undoChangedIds: ReadonlyMap<string, string[]> = new Map()): CooperationPrecondition[] {
+export function preconditionsForOperations(board: CooperationBoard, operations: CooperationOperation[], { undoChangedIds = new Map(), observedPreconditions = [] }: { undoChangedIds?: ReadonlyMap<string, string[]>; observedPreconditions?: CooperationPrecondition[] } = {}): CooperationPrecondition[] {
   const found = new Map<string, CooperationPrecondition>();
   const collections = { item: board.items, connection: board.connections, region: board.regions, reaction: board.reactions, thread: board.threads };
   function observe(kind: CooperationPrecondition["targetKind"], id: string) {
@@ -120,6 +120,7 @@ export function preconditionsForOperations(board: CooperationBoard, operations: 
       for (const id of ids) { annotations("item", id); annotations("connection", id); annotations("region", id); annotations("threadMessage", id); }
     }
   }
+  for (const observation of observedPreconditions) found.set(`${observation.targetKind}:${observation.targetId}`, observation);
   return [...found.values()];
 }
 

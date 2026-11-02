@@ -1873,3 +1873,221 @@ test("Undo skips addressed questions and keeps their discussion and native deliv
     recipientTabId: "fixture-codex",
   });
 });
+
+test("reaction edits refresh saved feedback and retain concurrent drafts until explicit review", async ({
+  page,
+}) => {
+  const id = await create(page, "Concurrent feedback", "decision-review");
+  const target = { kind: "item" as const, id: "unicode-note" };
+  await apply(id, [
+    {
+      kind: "addReaction",
+      reaction: {
+        id: "concurrent-idea",
+        kind: "idea",
+        glyph: "+",
+        description: "Initial feedback",
+        target,
+      },
+    },
+  ]);
+  await page
+    .getByRole("button", { name: "idea: Initial feedback", exact: true })
+    .click();
+  await apply(id, [
+    {
+      kind: "updateReaction",
+      reactionId: "concurrent-idea",
+      patch: { description: "Coworker saved feedback" },
+    },
+  ]);
+  await page
+    .getByRole("button", {
+      name: "Edit reaction: Coworker saved feedback",
+      exact: true,
+    })
+    .click();
+  await expect(page.getByLabel("Edit reaction", { exact: true })).toHaveValue(
+    "Coworker saved feedback",
+  );
+  await page.getByLabel("Reaction glyph", { exact: true }).fill("★");
+  await page
+    .getByRole("button", { name: "Save reaction", exact: true })
+    .click();
+  await expect
+    .poll(() =>
+      boards
+        .getBoard(id)
+        .reactions.find((reaction) => reaction.id === "concurrent-idea"),
+    )
+    .toMatchObject({
+      description: "Coworker saved feedback",
+      glyph: "★",
+      revision: 3,
+    });
+
+  await page
+    .getByRole("button", {
+      name: "Edit reaction: Coworker saved feedback",
+      exact: true,
+    })
+    .click();
+  await page
+    .getByLabel("Edit reaction", { exact: true })
+    .fill("My unfinished feedback");
+  await apply(id, [
+    {
+      kind: "updateReaction",
+      reactionId: "concurrent-idea",
+      patch: { description: "Newer coworker feedback" },
+    },
+  ]);
+  await expect(page.getByRole("alert")).toContainText("This reaction changed");
+  await expect(
+    page.getByRole("button", { name: "Save reaction", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "Close drawer", exact: true }).click();
+  await page
+    .getByRole("button", { name: "idea: Newer coworker feedback", exact: true })
+    .click();
+  await expect(page.getByLabel("Edit reaction", { exact: true })).toHaveValue(
+    "My unfinished feedback",
+  );
+  await expect(
+    page.getByRole("button", { name: "Save reaction", exact: true }),
+  ).toBeDisabled();
+  expect(
+    boards
+      .getBoard(id)
+      .reactions.find((reaction) => reaction.id === "concurrent-idea")
+      ?.description,
+  ).toBe("Newer coworker feedback");
+
+  await page
+    .getByRole("button", {
+      name: "Discard draft and load current reaction",
+      exact: true,
+    })
+    .click();
+  await expect(page.getByLabel("Edit reaction", { exact: true })).toHaveValue(
+    "Newer coworker feedback",
+  );
+  await page
+    .getByLabel("Edit reaction", { exact: true })
+    .fill("Reviewed feedback");
+  await apply(id, [
+    {
+      kind: "createItem",
+      item: {
+        id: "unrelated-note",
+        kind: "note",
+        geometry: { x: 1500, y: 100, width: 300, height: 180, rotation: 0 },
+        content: {
+          title: "Unrelated change",
+          blocks: [
+            {
+              id: "unrelated-body",
+              revision: 1,
+              text: "This change does not invalidate the reaction edit.",
+            },
+          ],
+        },
+      },
+    },
+  ]);
+  await expect(page.locator('[data-item-id="unrelated-note"]')).toBeAttached();
+  const saveRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().endsWith(`/boards/${id}/transactions`),
+  );
+  await page
+    .getByRole("button", { name: "Save reaction", exact: true })
+    .click();
+  expect((await saveRequest).postDataJSON().preconditions).toContainEqual({
+    targetKind: "reaction",
+    targetId: "concurrent-idea",
+    expectedRevision: 4,
+  });
+  await expect
+    .poll(() =>
+      boards
+        .getBoard(id)
+        .reactions.find((reaction) => reaction.id === "concurrent-idea"),
+    )
+    .toMatchObject({ description: "Reviewed feedback", revision: 5 });
+});
+
+test("reopening feedback while its save finishes clears the committed question", async ({
+  page,
+}) => {
+  const id = await create(page, "Feedback save lifecycle", "decision-review");
+  await page
+    .locator('[data-item-id="unicode-note"]')
+    .click({ button: "right" });
+  await page
+    .getByRole("menuitem", { name: "Ask a question", exact: true })
+    .click();
+  await page
+    .getByRole("textbox", { name: "Question", exact: true })
+    .fill("Question saving during drawer changes");
+  let accepted!: () => void;
+  let release!: () => void;
+  const committed = new Promise<void>((resolve) => {
+    accepted = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let writes = 0;
+  await page.route(
+    `**/api/cooperation/boards/${id}/transactions`,
+    async (route) => {
+      writes++;
+      const response = await route.fetch({
+        url: route.request().url().replace(browserUrl, baseUrl),
+      });
+      accepted();
+      await released;
+      await route.fulfill({ response });
+    },
+  );
+  try {
+    await page
+      .getByRole("button", { name: "Ask question", exact: true })
+      .click();
+    await committed;
+    await page
+      .getByRole("button", { name: "Close drawer", exact: true })
+      .click();
+    await page
+      .getByRole("button", {
+        name: "question: Question saving during drawer changes",
+        exact: true,
+      })
+      .click();
+    await expect(
+      page.getByRole("textbox", { name: "Question", exact: true }),
+    ).toHaveValue("Question saving during drawer changes");
+    release();
+    await expect(
+      page.getByRole("textbox", { name: "Question", exact: true }),
+    ).toHaveValue("");
+    await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+      "Saved",
+    );
+    expect(
+      boards
+        .getBoard(id)
+        .threads.filter(
+          (thread) =>
+            thread.messages[0]?.text ===
+            "Question saving during drawer changes",
+        ),
+    ).toHaveLength(1);
+    expect(writes).toBe(1);
+  } finally {
+    release();
+    await page.unroute(`**/api/cooperation/boards/${id}/transactions`);
+  }
+});

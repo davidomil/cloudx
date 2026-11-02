@@ -2,7 +2,7 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CooperationBoard, CooperationTarget } from "@cloudx/shared";
+import type { CooperationBoard, CooperationOperation, CooperationPrecondition, CooperationTarget } from "@cloudx/shared";
 import { BoardFeedback, hasFeedbackDrafts, type BoardFeedbackDrafts } from "./BoardFeedback.js";
 
 let root: Root;
@@ -18,9 +18,9 @@ async function fill(input: HTMLInputElement | HTMLTextAreaElement | HTMLSelectEl
 async function setup(scene = board()) {
   const container = document.createElement("div"); document.body.append(container); root = createRoot(container);
   const store = drafts();
-  const onOperations = vi.fn(async () => true);
+  const onOperations = vi.fn(async (_operations: CooperationOperation[], _options?: { observedPreconditions?: CooperationPrecondition[] }) => true);
   const props = { board: scene, target, inbox: [], readOnly: false, busy: false, drafts: store, onDraftChanged: vi.fn(), onOperations, onThread: vi.fn(), onDeliveryChanged: vi.fn(), refreshKey: 0 };
-  const render = async (nextTarget = target, threadId?: string) => act(async () => root.render(createElement(BoardFeedback, { ...props, target: nextTarget, threadId, key: `${nextTarget.id}:${threadId ?? "new"}` })));
+  const render = async (nextTarget = target, threadId?: string, nextBoard = scene) => act(async () => root.render(createElement(BoardFeedback, { ...props, board: nextBoard, target: nextTarget, threadId, key: `${nextTarget.id}:${threadId ?? "new"}` })));
   await render();
   return { container, store, onOperations, render };
 }
@@ -87,6 +87,43 @@ describe("retained feedback drafts", () => {
     await act(async () => button(container, "Edit reaction: Original").click());
     expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!.value).toBe("Original");
   });
+  it("starts a reaction edit from its latest saved text after a remote update", async () => {
+    const scene = board(); scene.reactions = [{ id: "reaction", revision: 1, kind: "idea", glyph: "+", description: "Original", target, author: "user:local" }];
+    const { container, render, onOperations } = await setup(scene);
+    const newer = structuredClone(scene); newer.revision = 2; Object.assign(newer.reactions[0]!, { revision: 2, description: "Coworker feedback", glyph: "!" });
+    await render(target, undefined, newer);
+    await act(async () => button(container, "Edit reaction: Coworker feedback").click());
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!.value).toBe("Coworker feedback");
+    await fill(container.querySelector<HTMLInputElement>('input[maxlength="16"]')!, "★");
+    await act(async () => button(container, "Save reaction").click());
+    expect(onOperations).toHaveBeenCalledWith([{ kind: "updateReaction", reactionId: "reaction", patch: { description: "Coworker feedback", glyph: "★" } }], { observedPreconditions: [{ targetKind: "reaction", targetId: "reaction", expectedRevision: 2 }] });
+  });
+  it("retains a stale reaction edit through closing the drawer and requires explicit current-record review", async () => {
+    const scene = board(); scene.reactions = [{ id: "reaction", revision: 1, kind: "idea", glyph: "+", description: "Original", target, author: "user:local" }];
+    const { container, render, onOperations, store } = await setup(scene);
+    await act(async () => button(container, "Edit reaction: Original").click());
+    await fill(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!, "My unfinished review");
+    const newer = structuredClone(scene); newer.revision = 2; Object.assign(newer.reactions[0]!, { revision: 2, description: "Coworker feedback" });
+    await render(target, undefined, newer);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("This reaction changed");
+    expect(button(container, "Save reaction").disabled).toBe(true);
+    await act(async () => root.render(null));
+    await render(target, undefined, newer);
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!.value).toBe("My unfinished review");
+    expect(button(container, "Save reaction").disabled).toBe(true);
+    await act(async () => container.querySelector<HTMLFormElement>(".cooperation-reaction-row form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(onOperations).not.toHaveBeenCalled();
+    expect(hasFeedbackDrafts(store)).toBe(true);
+    await act(async () => button(container, "Discard draft and load current reaction").click());
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!.value).toBe("Coworker feedback");
+    expect(button(container, "Save reaction").disabled).toBe(false);
+    await fill(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!, "Reviewed feedback");
+    onOperations.mockResolvedValueOnce(false);
+    await act(async () => button(container, "Save reaction").click());
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit reaction"]')!.value).toBe("Reviewed feedback");
+    expect(hasFeedbackDrafts(store)).toBe(true);
+    expect(onOperations).toHaveBeenLastCalledWith([{ kind: "updateReaction", reactionId: "reaction", patch: { description: "Reviewed feedback", glyph: "+" } }], { observedPreconditions: [{ targetKind: "reaction", targetId: "reaction", expectedRevision: 2 }] });
+  });
   it("clears a committed compose draft even if the drawer closes before the save response", async () => {
     const { container, store, onOperations } = await setup();
     let complete!: (saved: boolean) => void;
@@ -97,6 +134,21 @@ describe("retained feedback drafts", () => {
     expect(hasFeedbackDrafts(store)).toBe(true);
     await act(async () => complete(true));
     expect(hasFeedbackDrafts(store)).toBe(false);
+  });
+  it("clears a committed question in a drawer reopened before its original save response", async () => {
+    const { container, store, onOperations, render } = await setup();
+    let complete!: (saved: boolean) => void;
+    onOperations.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    await fill(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Question"]')!, "Question saving now");
+    await act(async () => container.querySelector<HTMLFormElement>("form.cooperation-feedback-compose")!.requestSubmit());
+    await act(async () => root.render(null));
+    await render();
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Question"]')!.value).toBe("Question saving now");
+    await act(async () => complete(true));
+    await render();
+    expect(hasFeedbackDrafts(store)).toBe(false);
+    expect(container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Question"]')!.value).toBe("");
+    expect(onOperations).toHaveBeenCalledOnce();
   });
   it("retains stale-selection text for review and disables new feedback until the target is reattached", async () => {
     const { container, render, onOperations } = await setup();

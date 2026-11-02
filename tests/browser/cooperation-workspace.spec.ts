@@ -277,6 +277,17 @@ test("full workspace assigns both providers, keeps the panel, updates remote bad
   await expect(
     panel.getByText("Remote design", { exact: true }).last(),
   ).toBeVisible();
+  const boardTab = services.sessions
+    .listTabs()
+    .find((tab) => tab.pluginMetadata?.cooperation?.boardId === boardId)!;
+  await expect
+    .poll(() => {
+      const window = services.workspace!.getActiveWindow();
+      return listTabLayoutPanes(window.layout.root).find(
+        (pane) => pane.id === window.layout.activePaneId,
+      )?.activeTabId;
+    })
+    .toBe(boardTab.id);
   await page.reload();
   await expect(panel).toBeVisible();
   expect(

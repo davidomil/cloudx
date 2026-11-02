@@ -89,4 +89,10 @@ describe("semantic board editing", () => {
     expect(new Set(observed.map(record => `${record.targetKind}/${record.targetId}`)).size).toBe(observed.length);
     expect(preconditionsForOperations(snapshot, [{ kind: "reattachTarget", targetKind: "thread", targetId: "discussion", target: { kind: "item", id: "worker" } }])).toEqual(expect.arrayContaining([{ targetKind: "reaction", targetId: "question", expectedRevision: 8 }, { targetKind: "thread", targetId: "discussion", expectedRevision: 9 }]));
   });
+  it("keeps an editor's observed reaction revision when the live snapshot advances", () => {
+    const snapshot = board();
+    snapshot.reactions = [{ id: "review", revision: 3, kind: "idea", glyph: "+", description: "Coworker feedback", author: "user:local", target: { kind: "item", id: "goal" } }];
+    const observed = preconditionsForOperations(snapshot, [{ kind: "updateReaction", reactionId: "review", patch: { description: "My draft" } }], { observedPreconditions: [{ targetKind: "reaction", targetId: "review", expectedRevision: 2 }] });
+    expect(observed).toEqual([{ targetKind: "reaction", targetId: "review", expectedRevision: 2 }]);
+  });
 });
