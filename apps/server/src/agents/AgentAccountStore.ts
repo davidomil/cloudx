@@ -19,7 +19,7 @@ import {
 
 import { JsonStateFile, writeTextFileAtomic } from "../jsonStateFile.js";
 import { resolveCodexHome } from "../rulesSkills/CodexHomeOverlay.js";
-import type { EnforcedEnv } from "../terminal/ShellLaunch.js";
+import { buildToolEnv, type EnforcedEnv } from "../terminal/ShellLaunch.js";
 import { agentCommand, claudeAccountLaunch, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
 import { pinClaudeExecutable } from "./claude/ClaudeManagedExecutable.js";
 import { assertClaudeAccountCompatibility } from "./claude/ClaudeAccountPreflight.js";
@@ -214,7 +214,7 @@ export class AgentAccountStore {
 
   private async claudeAccountCommand(account: AgentAccount, baseEnv: NodeJS.ProcessEnv = this.env) {
     const home = this.home(account);
-    const launch = claudeAccountLaunch(baseEnv, home, await this.launchEnv(account));
+    const launch = claudeAccountLaunch(buildToolEnv(baseEnv), home, await this.launchEnv(account));
     await pinClaudeExecutable(launch.env, home);
     await verifyClaudeAccountPolicyVersion(agentCommand("claude", launch.env), launch.env);
     await assertClaudeAccountCompatibility(launch.policy);

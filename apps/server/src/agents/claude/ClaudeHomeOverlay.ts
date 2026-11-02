@@ -15,7 +15,7 @@ import {
   rulesSkillsRootPath,
   type ResolvedPersonalityTemplate
 } from "../../rulesSkills/RulesSkillsCatalogService.js";
-import { SOURCE_GROUNDED_WRITING } from "../../rulesSkills/sourceGroundedWriting.js";
+import { SOURCE_GROUNDED_WRITING, SOURCE_GROUNDED_WRITING_FILES } from "../../rulesSkills/sourceGroundedWriting.js";
 import { replaceLink } from "../replaceLink.js";
 import { writeTextFileAtomic } from "../../jsonStateFile.js";
 import { shellQuote } from "../../terminal/ShellLaunch.js";
@@ -258,7 +258,7 @@ interface SkillSnapshot { catalogResources?: boolean; target: string; content: C
 
 async function selectedSkillSnapshots(providerHome: string, generated: ClaudeSkillSource[], policy: ClaudeSkillPolicy, mode: ClaudeLaunchMode): Promise<SkillSnapshot[]> {
   const entries = [
-    ...generated.map(skill => ({ catalogResources: mode === "native-project" && skill.catalogResources, name: skill.directory, source: skill.source, target: `skills/${skill.directory}`,
+    ...generated.map(skill => ({ catalogResources: skill.catalogResources, name: skill.directory, source: skill.source, target: `skills/${skill.directory}`,
       origin: skill.directory.startsWith("cloudx-system-") ? "cloudx-system" as const : "selected-template" as const })),
     ...policy.selected.map(skill => ({ name: skill.name, source: path.join(providerHome, skill.source), target: skill.source.startsWith("commands/") ? skill.source : `skills/${skill.name}`,
       origin: skill.origin, ...(skill.origin === "synced" ? { account: skill.source.split("/")[2] } : {}) }))
@@ -266,8 +266,10 @@ async function selectedSkillSnapshots(providerHome: string, generated: ClaudeSki
   const snapshots: SkillSnapshot[] = [];
   const remaining = { bytes: 128 * 1024 * 1024, entries: 5_000 };
   for (const entry of entries) {
-    const catalogResources = "catalogResources" in entry && entry.catalogResources === true;
-    const content = await readClaudeSkillSnapshot(catalogResources ? path.join(entry.source, "SKILL.md") : entry.source, remaining);
+    const bundledWriter = "catalogResources" in entry && entry.catalogResources === true;
+    const catalogResources = mode === "native-project" && bundledWriter;
+    const content = await readClaudeSkillSnapshot(catalogResources ? path.join(entry.source, "SKILL.md") : entry.source, remaining,
+      bundledWriter && !catalogResources ? SOURCE_GROUNDED_WRITING_FILES.map(file => file.path) : undefined);
     remaining.bytes -= content.files.reduce((total, file) => total + file.content.length, 0);
     remaining.entries -= content.entries;
     if (content.files.some(file => file.relative.split(path.sep).includes(".claude-plugin")))

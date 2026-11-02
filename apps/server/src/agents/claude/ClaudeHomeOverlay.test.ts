@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { assertClaudeHookCompatibility } from "./ClaudeHookPolicy.js";
+import { SOURCE_GROUNDED_WRITING_FILES } from "../../rulesSkills/sourceGroundedWriting.js";
 
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-preferences-"));
@@ -226,7 +228,7 @@ describe("Claude required receipt hook policy", () => {
   });
 });
 
-it("keeps the writer's installed tools and outputs in the catalog across Claude tabs and refreshes", async ({ onTestFinished }) => {
+it("keeps real writer runtime resources in the catalog and only bundled source in managed launches", async ({ onTestFinished }) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-writing-"));
   onTestFinished(() => fs.rm(root, { recursive: true, force: true }));
   const options = {
@@ -236,12 +238,18 @@ it("keeps the writer's installed tools and outputs in the catalog across Claude 
   await Promise.all([options.providerHome, options.accountHome, options.cwd].map(directory => fs.mkdir(directory, { recursive: true })));
   const first = await materializeClaudeHomeOverlay(options);
   const skillDir = path.join(first.rulesSkillsRoot, "system-skills", "source-grounded-writing");
-  const files = [".venv/local-install", ".tools/local-tool", "node_modules/local-package/index.js", "build/report.md"];
-  for (const file of files) {
+  const beforeSetup = await materializeClaudeHomeOverlay({ ...options, tabId: "managed-before", launchMode: "cloudx-managed", nativeVersion: "2.1.316" });
+  execFileSync("python3", ["-m", "venv", ".venv"], { cwd: skillDir, timeout: 20_000 });
+  const python = path.join(skillDir, ".venv", "bin", "python");
+  expect((await fs.lstat(python)).isSymbolicLink()).toBe(true);
+  expect(await fs.realpath(python)).not.toContain(skillDir);
+  const files = [".venv/pyvenv.cfg", ".tools/local-tool", "node_modules/local-package/index.js", "build/report.md"];
+  for (const file of files.slice(1)) {
     await fs.mkdir(path.dirname(path.join(skillDir, file)), { recursive: true });
     await fs.writeFile(path.join(skillDir, file), file);
   }
-  const originalFiles = await Promise.all(files.map(file => fs.stat(path.join(skillDir, file))));
+  const originalFiles = await Promise.all([...files, ".venv/bin/python"].map(file => fs.lstat(path.join(skillDir, file))));
+  const originalContents = await Promise.all(files.map(file => fs.readFile(path.join(skillDir, file), "utf8")));
 
   await materializeClaudeHomeOverlay({ ...options, executionId: "execution-2" });
   const second = await materializeClaudeHomeOverlay({ ...options, tabId: "tab-2", executionId: "execution-3" });
@@ -259,10 +267,46 @@ it("keeps the writer's installed tools and outputs in the catalog across Claude 
   const managed = await materializeClaudeHomeOverlay({ ...options, tabId: "managed", executionId: "execution-4", launchMode: "cloudx-managed", nativeVersion: "2.1.316" });
   const managedEntry = path.join(managed.configDir, "skills", "cloudx-system-source-grounded-writing");
   expect(await fs.readFile(path.join(managedEntry, "SKILL.md"), "utf8")).toBe(await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8"));
-  for (const file of files) expect(await fs.readFile(path.join(managedEntry, file), "utf8")).toBe(file);
+  for (const file of SOURCE_GROUNDED_WRITING_FILES) {
+    expect(await fs.readFile(path.join(managedEntry, file.path), "utf8")).toBe(file.content);
+    expect((await fs.lstat(path.join(managedEntry, file.path))).isFile()).toBe(true);
+  }
+  for (const directory of [".venv", ".tools", "node_modules", "build"]) {
+    await expect(fs.stat(path.join(managedEntry, directory))).rejects.toMatchObject({ code: "ENOENT" });
+  }
+  const writerSource = (overlay: typeof managed) => overlay.launchPolicy.skills.find(skill => skill.name === "cloudx-system-source-grounded-writing")!;
+  expect(writerSource(managed)).toEqual(writerSource(beforeSetup));
   expect((await fs.lstat(managedEntry)).isSymbolicLink()).toBe(false);
   for (const [index, file] of files.entries()) {
-    expect(await fs.readFile(path.join(skillDir, file), "utf8")).toBe(file);
+    expect(await fs.readFile(path.join(skillDir, file), "utf8")).toBe(originalContents[index]);
     expect((await fs.stat(path.join(skillDir, file))).ino).toBe(originalFiles[index]!.ino);
+  }
+  expect((await fs.lstat(python)).ino).toBe(originalFiles.at(-1)!.ino);
+}, 30_000);
+
+it("applies bundled writer source updates only to the next managed launch", async ({ onTestFinished }) => {
+  const input = await fixture();
+  onTestFinished(() => fs.rm(input.root, { recursive: true, force: true }));
+  const options = { ...input, launchMode: "cloudx-managed" as const, nativeVersion: "2.1.316" };
+  const first = await materializeClaudeHomeOverlay(options);
+  const writer = "cloudx-system-source-grounded-writing";
+  const source = path.join(first.rulesSkillsRoot, "system-skills", "source-grounded-writing");
+  const readme = SOURCE_GROUNDED_WRITING_FILES.find(file => file.path === "README.md")!;
+  const original = readme.content;
+  const previous = first.launchPolicy.skills.find(skill => skill.name === writer)!;
+  try {
+    readme.content += "\nBundled writer source update fixture.\n";
+    const second = await materializeClaudeHomeOverlay({ ...options, tabId: "next" });
+    const current = second.launchPolicy.skills.find(skill => skill.name === writer)!;
+    expect(current.sourcePath).toBe(source);
+    expect(previous.sourcePath).toBe(source);
+    expect(current.sha256).not.toBe(previous.sha256);
+    expect(await fs.readFile(path.join(first.configDir, "skills", writer, "README.md"), "utf8")).toBe(original);
+    expect(await fs.readFile(path.join(second.configDir, "skills", writer, "README.md"), "utf8")).toBe(readme.content);
+    expect(original).toContain('export SGW="$PWD"');
+    expect(original).not.toContain("${CLOUDX_RULES_SKILLS_DIR");
+    expect(await fs.readFile(path.join(first.configDir, "skills", writer, "SKILL.md"), "utf8")).not.toContain(source);
+  } finally {
+    readme.content = original;
   }
 });

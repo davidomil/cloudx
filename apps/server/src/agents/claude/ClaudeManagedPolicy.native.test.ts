@@ -10,6 +10,7 @@ import { materializeClaudeHomeOverlay, type ClaudeHomeOverlay } from "./ClaudeHo
 import { inspectClaudeNativeSettings } from "./ClaudeNativeSettings.js";
 import { CLAUDE_MANAGED_SOURCE_ENV_KEYS } from "./ClaudeManagedPolicy.js";
 import { buildEnforcedLoginShellLaunch } from "../../terminal/ShellLaunch.js";
+import { RulesSkillsCatalogService } from "../../rulesSkills/RulesSkillsCatalogService.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
 const native = it.skipIf(!claude);
@@ -65,7 +66,13 @@ native("native 2.1.316 contains late synced, project, nested, add-dir and plugin
     const port = (server.address() as { port: number }).port;
     const env = { PATH: process.env.PATH, HOME: path.dirname(providerHome), ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1" };
     const options = { dataDir: path.join(root, "data"), tabId: "first", executionId: "11111111-1111-4111-8111-111111111111", accountHome, providerHome, cwd, launchEnv: env, nativeVersion: "2.1.316", launchMode: "cloudx-managed" as const, allowedSkills: ["notes", "docx"] };
+    const catalog = new RulesSkillsCatalogService(options.dataDir);
+    await catalog.list();
+    const writer = path.join(catalog.catalogRoot(), "system-skills", "source-grounded-writing");
+    await run("python3", ["-m", "venv", ".venv"], { cwd: writer, timeout: 20_000, maxBuffer: 64 * 1024 });
+    expect((await fs.lstat(path.join(writer, ".venv", "bin", "python"))).isSymbolicLink()).toBe(true);
     const overlay = await materializeClaudeHomeOverlay(options);
+    await expect(fs.lstat(path.join(overlay.configDir, "skills", "cloudx-system-source-grounded-writing", ".venv"))).rejects.toMatchObject({ code: "ENOENT" });
     const profile = path.join(root, "hostile-bash-env");
     await write(profile, `export CLAUDE_CODE_PLUGIN_DIRS=${JSON.stringify(path.join(root, "late-plugin"))}
 export CLAUDE_CODE_HOST_SKILL_CATALOG='{"skills":["late-personal"]}'
@@ -76,6 +83,7 @@ export CLAUDE_CODE_PLUGIN_CACHE_DIR=${JSON.stringify(path.join(providerHome, "pl
     expect((initialize.commands as { name: string }[]).some(command => command.name === "doctor")).toBe(false);
     const skills = async () => (await active!.request("get_skills_dialog")).skills as Skill[];
     const before = await skills();
+    expect(before).toContainEqual(expect.objectContaining({ name: "cloudx-system-source-grounded-writing", state: "on", advertised: true }));
     expect(before.filter(entry => entry.state !== "off").map(entry => entry.name).sort()).toEqual(overlay.launchPolicy.skills.map(entry => entry.name).sort());
     await skill(path.join(providerHome, "skills", "synced", "account-one"), "late-synced");
     await skill(path.join(providerHome, "skills"), "late-personal");

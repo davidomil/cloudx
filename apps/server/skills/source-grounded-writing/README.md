@@ -12,14 +12,18 @@ Artifact tools require Python 3.10 or newer. Verify `python3 --version` before
 creating the environment; CloudX's older host-Python bootstrap requirement does
 not apply to these tools. CloudX installations also have managed Python 3.12.
 
-Install tools in the durable system skill catalog. Claude and Codex session
-entries point to this directory; session refreshes preserve its dependencies
-and generated outputs. Set `SGW` and enter that directory before creating the
-Python environment or installing pinned requirements:
+Enter the active skill's source directory before installing tools. Use the
+source path supplied by its entrypoint or base-directory notice. Native project
+Claude and Codex entries point to the durable system skill catalog; session
+refreshes preserve its dependencies and outputs. CloudX-managed Claude uses a
+per-launch source snapshot instead. Keep that launch's commands in its snapshot
+so later catalog updates cannot change its source.
+
+After entering the active source directory, set `SGW` and create the Python
+environment before installing pinned requirements:
 
 ```bash
-export SGW="${CLOUDX_RULES_SKILLS_DIR:?CloudX catalog path is required}/system-skills/source-grounded-writing"
-cd "$SGW"
+export SGW="$PWD"
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 export PATH="$SGW/.tools/bin:$SGW/node_modules/.bin:$SGW/.venv/bin:$PATH"

@@ -10,9 +10,13 @@ export interface ClaudeSkillSnapshot {
   entries: number;
 }
 
-export async function readClaudeSkillSnapshot(source: string, limits = { bytes: 128 * 1024 * 1024, entries: 5_000 }): Promise<ClaudeSkillSnapshot> {
+export async function readClaudeSkillSnapshot(source: string, limits = { bytes: 128 * 1024 * 1024, entries: 5_000 }, manifest?: readonly string[]): Promise<ClaudeSkillSnapshot> {
+  if (manifest && (!manifest.length || new Set(manifest).size !== manifest.length || manifest.some(file =>
+    file.includes("\\") || /^[A-Za-z]:/u.test(file) || file.split("/").some(part => !part || part === "." || part === ".."))))
+    throw new Error(`Claude skill source manifest must contain unique, relative file paths: ${source}.`);
   const root = await fs.realpath(source);
   const directory = (await fs.stat(root)).isDirectory();
+  if (manifest && !directory) throw new Error(`Claude skill source manifest requires a directory: ${source}.`);
   const files: ClaudeSkillSnapshot["files"] = [];
   let bytes = 0;
   let entries = 0;
@@ -23,8 +27,13 @@ export async function readClaudeSkillSnapshot(source: string, limits = { bytes: 
     if (real !== root && !real.startsWith(root + path.sep)) throw new Error(`Claude skill snapshot is not self-contained: ${current}. Keep supporting files inside the selected source before launching.`);
     const stat = await fs.stat(real);
     if (stat.isDirectory()) {
+      if (manifest && relative) throw new Error(`Claude skill source manifest must identify regular files: ${current}.`);
       if (visited.has(real)) throw new Error(`Claude skill source contains a cyclic directory link: ${current}.`);
       visited.add(real);
+      if (manifest) {
+        for (const file of [...manifest].sort()) await read(path.join(root, file), file);
+        return;
+      }
       const names: string[] = [];
       for await (const entry of await fs.opendir(real)) {
         if (entries + names.length >= limits.entries) throw new Error(`Claude skill source exceeds the bounded snapshot entry count: ${source}.`);

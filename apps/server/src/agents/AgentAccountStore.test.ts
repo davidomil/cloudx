@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 
 import { AgentAccountStore } from "./AgentAccountStore.js";
 import { runAgentCli } from "./agentCli.js";
@@ -49,6 +49,49 @@ async function setup() {
 }
 
 describe("AgentAccountStore", () => {
+  describe.each([
+    { source: "CLOUDX_TOOL_PATH alone", competingPath: false },
+    { source: "CLOUDX_TOOL_PATH before another PATH installation", competingPath: true }
+  ])("Claude account commands use $source", ({ competingPath }) => {
+    it.each(["login", "verification", "default launch"])("pins the reviewed executable for %s", async operation => {
+      const { root, env, dataDir } = await setup();
+      onTestFinished(() => fs.rm(root, { recursive: true, force: true }));
+      const reviewed = await fs.realpath(env.CLOUDX_CLAUDE_BIN!);
+      const toolPath = path.join(root, "tools");
+      const otherPath = path.join(root, "other-bin");
+      const unexpected = path.join(root, "unexpected-executable");
+      await fs.mkdir(toolPath);
+      await fs.mkdir(otherPath);
+      await fs.symlink(reviewed, path.join(toolPath, "claude"));
+      if (competingPath) await fs.writeFile(path.join(otherPath, "claude"), `#!/bin/sh
+printf invoked > '${unexpected}'
+echo "2.1.317 (Claude Code)"
+`, { mode: 0o755 });
+      const store = new AgentAccountStore(dataDir, {
+        ...env, CLOUDX_CLAUDE_BIN: undefined, CLOUDX_TOOL_PATH: toolPath, PATH: otherPath, SHELL: "/bin/sh"
+      });
+      const account = await store.create({ providerId: "claude", label: "Configured tool path", kind: "subscription" });
+      await fs.writeFile(path.join(store.home(account), ".credentials.json"), "{}");
+      expect((await store.state()).providers).toContainEqual(expect.objectContaining({ providerId: "claude", installed: true, version: "2.1.316 (Claude Code)" }));
+
+      if (operation === "verification") {
+        expect(await store.verify(account.id)).toMatchObject({ loggedIn: true, authMethod: "claude.ai" });
+      } else if (operation === "login") {
+        const login = await store.loginCommand(account.id);
+        expect(login.command).toBe(reviewed);
+        const launch = buildEnforcedLoginShellLaunch(login.command, login.args, login.env, login.enforced);
+        expect(await runAgentCli(launch.command, launch.args, { env: launch.env, cwd: login.cwd })).toMatchObject({ code: 0, stdout: "verified-login\n" });
+      } else {
+        const launch = await store.defaultClaudeLaunch();
+        expect(launch.env.CLOUDX_CLAUDE_BIN).toBe(reviewed);
+        const result = await runAgentCli(launch.env.CLOUDX_CLAUDE_BIN!, [...launch.args, "auth", "status", "--json"], { env: launch.env, cwd: store.home(account) });
+        expect(result.code).toBe(0);
+        expect(JSON.parse(result.stdout)).toMatchObject({ loggedIn: true, authMethod: "claude.ai", configDirectory: store.home(account) });
+      }
+      await expect(fs.stat(unexpected)).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
   it("keeps the selected account and native credentials when an unreviewed version blocks login, status and model launch", async () => {
     const { root, env, store } = await setup();
     const account = await store.create({ providerId: "claude", label: "Saved choice", kind: "subscription" });
