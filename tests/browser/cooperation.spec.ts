@@ -23,6 +23,15 @@ let web: ViteDevServer;
 let boards: BlackboardService;
 let root: string;
 let baseUrl: string;
+let browserUrl: string;
+test.use({
+  launchOptions: {
+    args: [
+      "--host-resolver-rules=MAP cooperation.test 127.0.0.1",
+      "--no-proxy-server",
+    ],
+  },
+});
 const fixtureTabs = [
   { id: "fixture-codex", title: "Codex Architect" },
   { id: "fixture-claude", title: "Claude Reviewer", ownerPluginId: "forge" },
@@ -79,6 +88,7 @@ test.beforeAll(async () => {
     optimizeDeps: { entries: ["tests/browser/fixtures/cooperation.html"] },
     server: {
       host: "127.0.0.1",
+      allowedHosts: ["cooperation.test"],
       port: 0,
       strictPort: false,
       proxy: {
@@ -92,6 +102,7 @@ test.beforeAll(async () => {
   if (!webAddress || typeof webAddress === "string")
     throw new Error("Missing cooperation UI port");
   baseUrl = `http://127.0.0.1:${webAddress.port}`;
+  browserUrl = `http://cooperation.test:${webAddress.port}`;
 });
 test.afterAll(async () => {
   await web?.close();
@@ -99,7 +110,7 @@ test.afterAll(async () => {
   if (root) await fs.rm(root, { recursive: true, force: true });
 });
 test.beforeEach(async ({ page }) => {
-  await page.goto(`${baseUrl}/tests/browser/fixtures/cooperation.html`);
+  await page.goto(`${browserUrl}/tests/browser/fixtures/cooperation.html`);
 });
 
 async function create(
@@ -172,6 +183,373 @@ async function apply(id: string, operations: CooperationOperation[]) {
     respondsToEventIds: [],
   };
   await boards.apply(transaction, { kind: "user", userId: "local" });
+}
+
+test("no active tool pans empty canvas and moves items; Hand pans without editing and connections follow dragging", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  const writes: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/transactions"))
+      writes.push(request.url());
+  });
+  page.on("console", (message) => {
+    if (message.type() === "warning" && message.text().includes("[React Flow]"))
+      errors.push(message.text());
+  });
+  expect(
+    await page.evaluate(() => ({
+      secure: isSecureContext,
+      uuid: typeof crypto.randomUUID,
+    })),
+  ).toEqual({ secure: false, uuid: "undefined" });
+  const id = await create(page, "Natural canvas gestures");
+  await apply(id, [
+    {
+      kind: "createItem",
+      item: {
+        id: "gesture-from",
+        kind: "shape",
+        geometry: { x: 0, y: 0, width: 180, height: 100, rotation: 0 },
+        content: { title: "Source", shape: "rectangle", label: "Source" },
+      },
+    },
+    {
+      kind: "createItem",
+      item: {
+        id: "gesture-to",
+        kind: "shape",
+        geometry: { x: 360, y: 160, width: 180, height: 100, rotation: 0 },
+        content: {
+          title: "Destination",
+          shape: "rectangle",
+          label: "Destination",
+        },
+      },
+    },
+  ]);
+  await page
+    .getByRole("button", { name: "Fit board to view", exact: true })
+    .click();
+  const tools = page.getByRole("navigation", {
+    name: "Blackboard tools",
+    exact: true,
+  });
+  await expect(tools.locator('[aria-pressed="true"]')).toHaveCount(0);
+  const viewport = page.locator(
+    ".cooperation-board:visible .react-flow__viewport",
+  );
+  const pane = page.locator(".cooperation-board:visible .react-flow__pane");
+  const canvas = (await pane.boundingBox())!;
+  async function drag(x: number, y: number, dx: number, dy: number) {
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + dx, y + dy, { steps: 10 });
+    await page.mouse.up();
+  }
+  const beforePan = await viewport.getAttribute("style");
+  const beforeGeometry = structuredClone(
+    boards.getBoard(id).items.map((item) => item.geometry),
+  );
+  await drag(
+    canvas.x + canvas.width * 0.5,
+    canvas.y + canvas.height * 0.85,
+    35,
+    -25,
+  );
+  await expect.poll(() => viewport.getAttribute("style")).not.toBe(beforePan);
+  expect(boards.getBoard(id).items.map((item) => item.geometry)).toEqual(
+    beforeGeometry,
+  );
+  const source = page.locator(
+    '[data-item-id="gesture-from"] .cooperation-shape',
+  );
+  let bounds = (await source.boundingBox())!;
+  await drag(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, 45, 30);
+  await expect
+    .poll(
+      () =>
+        boards.getBoard(id).items.find((item) => item.id === "gesture-from")!
+          .geometry.x,
+    )
+    .not.toBe(0);
+  await page.getByRole("button", { name: "Pan (H)", exact: true }).click();
+  const stored = structuredClone(
+    boards.getBoard(id).items.map((item) => item.geometry),
+  );
+  const handViewport = await viewport.getAttribute("style");
+  bounds = (await source.boundingBox())!;
+  await drag(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2,
+    40,
+    -25,
+  );
+  await expect
+    .poll(() => viewport.getAttribute("style"))
+    .not.toBe(handViewport);
+  expect(boards.getBoard(id).items.map((item) => item.geometry)).toEqual(
+    stored,
+  );
+  await page.getByRole("button", { name: "Pan (H)", exact: true }).click();
+  await expect(tools.locator('[aria-pressed="true"]')).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Connect items (L)", exact: true })
+    .click();
+  await source.click({ position: { x: 20, y: 20 } });
+  const beforeInspect = writes.length;
+  await page
+    .getByRole("button", { name: "Inspect Destination", exact: true })
+    .click();
+  await expect(page.getByLabel("Inspector", { exact: true })).toBeVisible();
+  await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+    "Saved",
+  );
+  expect(writes).toHaveLength(beforeInspect);
+  expect(boards.getBoard(id).connections).toHaveLength(0);
+  await page.getByRole("button", { name: "Close drawer", exact: true }).click();
+  await page
+    .locator('[data-item-id="gesture-to"] .cooperation-shape')
+    .click({ position: { x: 20, y: 20 } });
+  await expect.poll(() => boards.getBoard(id).connections.length).toBe(1);
+  const fromPort = page.locator(
+    '[data-nodeid="gesture-from"][data-handleid="east"]',
+  );
+  const toPort = page.locator(
+    '[data-nodeid="gesture-to"][data-handleid="west"]',
+  );
+  await expect(fromPort).toHaveClass(/connectablestart/);
+  const fromBounds = (await fromPort.boundingBox())!;
+  const toBounds = (await toPort.boundingBox())!;
+  await page.mouse.move(
+    fromBounds.x + fromBounds.width / 2,
+    fromBounds.y + fromBounds.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    toBounds.x + toBounds.width / 2,
+    toBounds.y + toBounds.height / 2,
+    { steps: 12 },
+  );
+  await page.mouse.up();
+  await expect.poll(() => boards.getBoard(id).connections.length).toBe(2);
+  expect(boards.getBoard(id).connections.at(-1)).toMatchObject({
+    from: { itemId: "gesture-from", port: "east" },
+    to: { itemId: "gesture-to", port: "west" },
+  });
+  const edge = page
+    .locator(".cooperation-board:visible .react-flow__edge-path")
+    .first();
+  const edgePath = await edge.getAttribute("d");
+  await page
+    .getByRole("button", { name: "Connect items (L)", exact: true })
+    .click();
+  bounds = (await source.boundingBox())!;
+  await page.mouse.move(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    bounds.x + bounds.width / 2 + 35,
+    bounds.y + bounds.height / 2 + 30,
+    { steps: 8 },
+  );
+  await expect.poll(() => edge.getAttribute("d")).not.toBe(edgePath);
+  await page.mouse.up();
+  await expect(
+    page.locator(".cooperation-save-state:visible"),
+  ).not.toContainText("Saving");
+  await source.dblclick();
+  await expect(page.getByLabel("Inspector", { exact: true })).toBeVisible();
+  await page.getByLabel("Title", { exact: true }).fill("Moved source");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect
+    .poll(
+      () =>
+        boards.getBoard(id).items.find((item) => item.id === "gesture-from")!
+          .content.title,
+    )
+    .toBe("Moved source");
+  expect(errors).toEqual([]);
+});
+
+test("Select boxes and moves a group; Pan crosses the selection and note text without editing", async ({
+  page,
+}) => {
+  const id = await create(page, "Selection and hand gestures");
+  await apply(id, [
+    {
+      kind: "createItem",
+      item: {
+        id: "group-note",
+        kind: "note",
+        geometry: { x: 0, y: 0, width: 220, height: 120, rotation: 0 },
+        content: {
+          title: "Group note",
+          blocks: [
+            {
+              id: "group-body",
+              revision: 1,
+              text: "Select this text outside Pan mode.",
+            },
+          ],
+        },
+      },
+    },
+    {
+      kind: "createItem",
+      item: {
+        id: "group-shape",
+        kind: "shape",
+        geometry: { x: 340, y: 140, width: 180, height: 100, rotation: 0 },
+        content: {
+          title: "Group shape",
+          shape: "rectangle",
+          label: "Group shape",
+        },
+      },
+    },
+  ]);
+  await page
+    .getByRole("button", { name: "Fit board to view", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Select (V)", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Collapse tools", exact: true })
+    .click();
+  const note = page.locator('[data-item-id="group-note"]');
+  const shape = page.locator('[data-item-id="group-shape"]');
+  const noteBounds = (await note.boundingBox())!;
+  const shapeBounds = (await shape.boundingBox())!;
+  const viewport = page.locator(
+    ".cooperation-board:visible .react-flow__viewport",
+  );
+  const beforeSelect = await viewport.getAttribute("style");
+  await page.mouse.move(noteBounds.x - 10, noteBounds.y - 10);
+  await page.mouse.down();
+  await page.mouse.move(
+    shapeBounds.x + shapeBounds.width + 10,
+    shapeBounds.y + shapeBounds.height + 10,
+    { steps: 10 },
+  );
+  await page.mouse.up();
+  await expect(
+    page.locator(".cooperation-board:visible .react-flow__node.selected"),
+  ).toHaveCount(2);
+  expect(await viewport.getAttribute("style")).toBe(beforeSelect);
+  const group = page.locator(
+    ".cooperation-board:visible .react-flow__nodesselection-rect",
+  );
+  let bounds = (await group.boundingBox())!;
+  async function drag(x: number, y: number, dx: number, dy: number) {
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + dx, y + dy, { steps: 10 });
+    await page.mouse.up();
+  }
+  await drag(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, 60, 40);
+  await expect.poll(() => boards.getBoard(id).items[0]!.geometry.x).not.toBe(0);
+  const moved = boards.getBoard(id).items.map((item) => item.geometry);
+  expect(moved[1]!.x - moved[0]!.x).toBe(340);
+  expect(moved[1]!.y - moved[0]!.y).toBe(140);
+  await page.keyboard.press("h");
+  bounds = (await group.boundingBox())!;
+  const beforePan = await viewport.getAttribute("style");
+  await drag(
+    bounds.x + bounds.width / 2,
+    bounds.y + bounds.height / 2,
+    25,
+    -20,
+  );
+  await expect.poll(() => viewport.getAttribute("style")).not.toBe(beforePan);
+  expect(boards.getBoard(id).items.map((item) => item.geometry)).toEqual(moved);
+  bounds = (await note.locator(".cooperation-item-text").boundingBox())!;
+  const beforeTextPan = await viewport.getAttribute("style");
+  await drag(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, 20, 15);
+  await expect
+    .poll(() => viewport.getAttribute("style"))
+    .not.toBe(beforeTextPan);
+  expect(boards.getBoard(id).items.map((item) => item.geometry)).toEqual(moved);
+  await page.keyboard.press("l");
+  await note
+    .locator(".cooperation-item-heading")
+    .click({ position: { x: 30, y: 12 } });
+  await shape
+    .locator(".cooperation-shape")
+    .click({ position: { x: 20, y: 20 } });
+  await expect.poll(() => boards.getBoard(id).connections.length).toBe(1);
+});
+
+for (const [label, kind, shape] of [
+  ["Add note (N)", "note", undefined],
+  ["Add code (C)", "code", undefined],
+  ["Flowchart shapes (R)", "shape", "rectangle"],
+  ["Decision diamond", "shape", "diamond"],
+  ["Ellipse", "shape", "ellipse"],
+  ["Database cylinder", "shape", "cylinder"],
+  ["Work in progress region (W)", "region", undefined],
+] as const) {
+  test(`HTTP LAN canvas places and edits ${shape ?? kind}`, async ({
+    page,
+  }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    const id = await create(page, `Canvas ${shape ?? kind}`);
+    if (shape)
+      await page
+        .getByRole("button", { name: "Flowchart shapes (R)", exact: true })
+        .click();
+    if (label !== "Flowchart shapes (R)")
+      await page.getByRole("button", { name: label, exact: true }).click();
+    const pane = page.locator(".cooperation-board:visible .react-flow__pane");
+    const bounds = (await pane.boundingBox())!;
+    await pane.click({
+      position: { x: bounds.width * 0.6, y: bounds.height * 0.5 },
+    });
+    await expect
+      .poll(() =>
+        kind === "region"
+          ? boards.getBoard(id).regions.length
+          : boards.getBoard(id).items.length,
+      )
+      .toBe(1);
+    await expect(page.getByLabel("Inspector", { exact: true })).toBeVisible();
+    await page
+      .getByLabel(kind === "region" ? "Region name" : "Title", { exact: true })
+      .fill(`Created ${shape ?? kind}`);
+    if (kind === "note" || kind === "code")
+      await page
+        .getByLabel("Text block 1", { exact: true })
+        .fill("Saved over the LAN HTTP origin.");
+    await page
+      .getByRole("button", { name: "Save changes", exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        kind === "region"
+          ? boards.getBoard(id).regions[0]?.title
+          : boards.getBoard(id).items[0]?.content.title,
+      )
+      .toBe(`Created ${shape ?? kind}`);
+    if (shape)
+      expect(boards.getBoard(id).items[0]).toMatchObject({
+        kind: "shape",
+        content: { shape },
+      });
+    await page
+      .getByRole("button", { name: "Close drawer", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Board options", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "New board view", exact: true }),
+    ).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
 }
 
 test("manager and owned agent menu create, rename, assign, detach, reopen, export and delete real boards", async ({
@@ -499,9 +877,7 @@ test("WIP, freehand ink, original images, collapse controls, drafts and remote c
     );
   await expect(page.getByLabel("Image drafts", { exact: true })).toHaveCount(0);
   await expect.poll(() => boards.getBoard(id).assets.length).toBeGreaterThan(1);
-  await page
-    .getByRole("button", { name: "Select and pan (V)", exact: true })
-    .click();
+  await page.getByRole("button", { name: "Select (V)", exact: true }).click();
   await page
     .getByRole("button", { name: "Fit board to view", exact: true })
     .click();
@@ -953,7 +1329,9 @@ test("paste, drop, upload failures, disconnect drafts and uncertain save receipt
     `**/api/cooperation/boards/${id}/transactions`,
     async (route) => {
       mutations++;
-      await route.fetch();
+      await route.fetch({
+        url: route.request().url().replace(browserUrl, baseUrl),
+      });
       await route.abort("failed");
     },
   );
@@ -1351,7 +1729,9 @@ test("real view retirement releases uncommitted image stages and preserves origi
   await page.route(
     `**/api/cooperation/boards/${savedId}/transactions`,
     async (route) => {
-      await route.fetch();
+      await route.fetch({
+        url: route.request().url().replace(browserUrl, baseUrl),
+      });
       await route.abort("failed");
     },
   );
@@ -1387,7 +1767,9 @@ test("real view retirement releases uncommitted image stages and preserves origi
   await page.route(
     `**/api/cooperation/boards/${lateId}/assets`,
     async (route) => {
-      const response = await route.fetch();
+      const response = await route.fetch({
+        url: route.request().url().replace(browserUrl, baseUrl),
+      });
       arrived();
       await released;
       await route.fulfill({ response });

@@ -830,11 +830,19 @@ export function App() {
   }
 
   async function openBlackboard(boardId: string, title: string, newView = false) {
-    const existing = !newView && tabsRef.current.find(tab => tab.pluginId === "cooperation" && tab.pluginMetadata?.cooperation?.boardId === boardId);
-    if (existing) {
-      const pane = findPaneContainingTab(layoutRef.current.root, existing.id);
-      await activateTab(existing.id, pane?.id);
-    } else await handleCreate({ pluginId: "cooperation", title, initialInput: { boardId } });
+    if (!newView) {
+      const candidates = [...windowsRef.current].sort((a, b) => Number(b.id === activeWindowIdRef.current) - Number(a.id === activeWindowIdRef.current));
+      for (const window of candidates) {
+        for (const pane of listPanes(window.layout.root)) {
+          const tab = tabsRef.current.find(tab => tab.pluginId === "cooperation" && tab.pluginMetadata?.cooperation?.boardId === boardId && pane.tabIds.includes(tab.id));
+          if (!tab) continue;
+          if (window.id !== activeWindowIdRef.current) await handleSelectWindow(window.id);
+          await activateTab(tab.id, pane.id);
+          return;
+        }
+      }
+    }
+    await handleCreate({ pluginId: "cooperation", title, initialInput: { boardId } });
   }
 
   function closeCreateDialog() {

@@ -25,8 +25,18 @@ let root: string;
 let app: FastifyInstance;
 let services: AppServices;
 let baseURL: string;
+let apiURL: string;
 let first: WorkspaceTab;
 let second: WorkspaceTab;
+
+test.use({
+  launchOptions: {
+    args: [
+      "--host-resolver-rules=MAP cooperation.test 127.0.0.1",
+      "--no-proxy-server",
+    ],
+  },
+});
 
 // Only model processes are simulated. App, session lifecycle, storage, routes,
 // origin admission, WebSockets and the native panel all run their production code.
@@ -74,12 +84,15 @@ test.beforeAll(async () => {
   if (!address || typeof address === "string")
     throw new Error("A loopback listener is required.");
   const port = address.port;
+  baseURL = `http://cooperation.test:${port}`;
+  apiURL = `http://127.0.0.1:${port}`;
   await new Promise<void>((resolve, reject) =>
     reservation.close((error) => (error ? reject(error) : resolve())),
   );
   const config = loadConfig({
     CLOUDX_HOST: "127.0.0.1",
     CLOUDX_PORT: String(port),
+    CLOUDX_TRUSTED_ORIGINS: baseURL,
     CLOUDX_ALLOWED_ROOTS: root,
     CLOUDX_DATA_DIR: path.join(root, "data"),
     CLOUDX_LOG_LEVEL: "silent",
@@ -120,7 +133,6 @@ test.beforeAll(async () => {
     })
   ).tab;
   await app.listen({ port, host: "127.0.0.1" });
-  baseURL = `http://127.0.0.1:${port}`;
 });
 test.afterAll(async () => {
   await app?.close();
@@ -135,6 +147,8 @@ test("full workspace assigns both providers, keeps the panel, updates remote bad
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto(baseURL);
+  expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
+  expect(await page.evaluate(() => typeof crypto.randomUUID)).toBe("undefined");
   const firstTab = page
     .locator(".tab-button")
     .filter({ has: page.locator(".tab-title", { hasText: first.title }) });
@@ -272,7 +286,7 @@ test("full workspace assigns both providers, keeps the panel, updates remote bad
       ?.cooperation?.boardId,
   ).toBe(boardId);
 
-  const forbidden = await request.post(`${baseURL}/api/cooperation/boards`, {
+  const forbidden = await request.post(`${apiURL}/api/cooperation/boards`, {
     headers: { origin: "https://untrusted.example" },
     data: { title: "Forbidden" },
   });
@@ -301,5 +315,82 @@ test("full workspace assigns both providers, keeps the panel, updates remote bad
     body: await page.screenshot(),
     contentType: "image/png",
   });
+  expect(errors).toEqual([]);
+});
+
+test("opening an existing board switches to its workspace window and pane", async ({
+  page,
+  request,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const created = await request.post(`${apiURL}/api/cooperation/boards`, {
+    data: { title: "Board in another window" },
+  });
+  expect(created.ok()).toBe(true);
+  const board = await created.json();
+  const boardWindow = await services.workspace!.createWindow({
+    name: "Board workspace",
+    projectPath: root,
+  });
+  const boardPane = listTabLayoutPanes(boardWindow.layout.root)[0]!;
+  const view = (
+    await services.workspaceCommands!.createTab({
+      windowId: boardWindow.id,
+      paneId: boardPane.id,
+      pluginId: "cooperation",
+      title: board.title,
+      initialInput: { boardId: board.boardId },
+    })
+  ).tab;
+  const agentWindow = await services.workspace!.createWindow({
+    name: "Agent workspace",
+    projectPath: root,
+  });
+  const agent = (
+    await services.workspaceCommands!.createTab({
+      windowId: agentWindow.id,
+      paneId: listTabLayoutPanes(agentWindow.layout.root)[0]!.id,
+      pluginId: "codex-terminal",
+      cwd: root,
+      title: "Across-window colleague",
+      initialInput: { agent: { providerId: "codex" } },
+    })
+  ).tab;
+  const assigned = await request.put(
+    `${apiURL}/api/cooperation/assignments/${agent.id}`,
+    { data: { boardId: board.boardId } },
+  );
+  expect(assigned.ok()).toBe(true);
+
+  await page.goto(baseURL);
+  expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
+  const badge = page.getByRole("button", {
+    name: `Open blackboard ${board.title}`,
+    exact: true,
+  });
+  await expect(badge).toBeVisible();
+  const panel = page.getByRole("region", {
+    name: `Blackboard ${board.title}`,
+    exact: true,
+  });
+  await expect(panel).toBeHidden();
+  await badge.click();
+  await expect(panel).toBeVisible();
+  await expect(page.locator(".window-switcher-button")).toHaveText(
+    boardWindow.name,
+  );
+  expect(services.workspace!.getActiveWindow().id).toBe(boardWindow.id);
+  expect(services.workspace!.getActiveWindow().layout.activePaneId).toBe(
+    boardPane.id,
+  );
+  expect(services.sessions.getActiveTabId()).toBe(view.id);
+  expect(
+    services.sessions
+      .listTabs()
+      .filter(
+        (tab) => tab.pluginMetadata?.cooperation?.boardId === board.boardId,
+      ),
+  ).toHaveLength(1);
   expect(errors).toEqual([]);
 });

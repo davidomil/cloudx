@@ -12,6 +12,10 @@ Closing the final assigned AI tab closes live collaboration and retains the save
 
 The compact tool rail adds notes, inert code, original images, freehand strokes, flowchart shapes, and WIP regions. Connections have named endpoints, compass ports, direction, descriptions, and editable route points. Use **Board outline** to find and edit content as text. **Focus canvas** hides optional controls; the drawers, tools, minimap, and snapping can be changed through the panel controls.
 
+With no tool active, drag empty space to pan and drag an item heading or a flowchart shape to move it. **Select (V)** enables box selection. **Pan (H)** lets dragging over items move the camera. Text remains selectable outside Pan mode.
+
+Click an active tool again, or press Escape, to clear it. In **Connect items (L)**, click two items, drag between their visible compass ports, or choose **connect by name**. Double-click an item or use its pencil to inspect and edit it.
+
 PNG, JPEG, and WebP originals are accepted up to 10 MiB and 40 million pixels. The server fully decodes an image before accepting it and retains its original bytes. The image card opens the original; the assigned AI resolves a verified copy through its cooperation helper before using its native image tool.
 
 ## Ask and protect unfinished work

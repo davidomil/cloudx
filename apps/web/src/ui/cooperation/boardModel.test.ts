@@ -1,13 +1,30 @@
 // @vitest-environment jsdom
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { isCooperationId } from "@cloudx/shared";
 import type { CooperationBoard, CooperationItem, CooperationReceipt, CooperationInboxEvent } from "@cloudx/shared";
-import { createBoardDrawing, createBoardItem, preconditionsForOperations, protectedItemIds, regionAroundItems, resizedDrawing, selectedTextAnchor, targetAuthor, targetFromSelection, undoableOwnOperations } from "./boardModel.js";
+import { boardId, createBoardDrawing, createBoardItem, preconditionsForOperations, protectedItemIds, regionAroundItems, resizedDrawing, selectedTextAnchor, targetAuthor, targetFromSelection, undoableOwnOperations } from "./boardModel.js";
 
 const geometry = { x: 20, y: 30, width: 180, height: 100, rotation: 0 };
 const note = (id: string, text = "A durable queue separates work."): CooperationItem => ({ id, kind: "note", geometry, revision: 2, createdBy: "user:local", updatedBy: "user:local", content: { title: id, blocks: [{ id: `${id}-body`, revision: 3, text }] } });
 const board = (): CooperationBoard => ({ schemaVersion: 1, boardId: "board", title: "Shared design", revision: 4, status: "draft", eventCursor: 4, members: [], items: [note("goal"), { ...note("worker"), geometry: { ...geometry, x: 420 } }], connections: [{ id: "relation", revision: 3, createdBy: "user:local", updatedBy: "user:local", from: { itemId: "goal", port: "east" }, to: { itemId: "worker", port: "west" }, description: "records receipt", direction: "forward", waypoints: [[310, 50]] }], regions: [], reactions: [], threads: [], assets: [] });
 
 describe("semantic board editing", () => {
+  it("creates distinct valid item and edit identities on HTTP LAN browsers without randomUUID", () => {
+    const getRandomValues = crypto.getRandomValues.bind(crypto);
+    vi.stubGlobal("crypto", { getRandomValues });
+    try {
+      const note = createBoardItem("note", [0, 0]);
+      const code = createBoardItem("code", [0, 0]);
+      const shape = createBoardItem("shape", [0, 0]);
+      const drawing = createBoardDrawing([{ points: [[0, 0, 0.5]], color: "#ffffff", width: 2 }]);
+      const region = regionAroundItems([], [0, 0]);
+      const ids = [boardId("operation"), boardId("connection"), note.id, code.id, shape.id, drawing.id, drawing.content.strokes[0]!.id, region.id];
+      if (note.kind === "note") ids.push(note.content.blocks[0]!.id);
+      if (code.kind === "code") ids.push(code.content.blocks[0]!.id);
+      expect(ids.every(isCooperationId)).toBe(true);
+      expect(new Set(ids).size).toBe(ids.length);
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("prefers immutable item and connection authors and exact message authors over the most recent editor", () => {
     const scene = board();
     scene.items[0]!.createdBy = "agent:original"; scene.items[0]!.updatedBy = "agent:editor";

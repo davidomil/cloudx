@@ -6,9 +6,12 @@ import {
 } from "@cloudx/shared";
 
 export type BoardSelection = { kind: "item" | "connection" | "region"; id: string };
-export type BoardTool = "select" | "note" | "code" | "image" | "pen" | "rectangle" | "diamond" | "ellipse" | "cylinder" | "connection" | "region";
+export type BoardTool = "none" | "select" | "pan" | "note" | "code" | "image" | "pen" | "rectangle" | "diamond" | "ellipse" | "cylinder" | "connection" | "region";
 export type BoardDrawer = "inspector" | "outline" | "members" | "history" | "feedback" | undefined;
-export const boardId = (prefix: string) => `${prefix}-${crypto.randomUUID()}`;
+export function boardId(prefix: string): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `${prefix}-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`;
+}
 export const PORTS = ["north", "east", "south", "west", "center"] as const;
 
 export function undoableOwnOperations(receipts: CooperationReceipt[], inbox: CooperationInboxEvent[]) {

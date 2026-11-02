@@ -18,14 +18,14 @@ import {
 } from "@cloudx/shared";
 import { cooperationAssetUrl } from "../../cooperationApi.js";
 import { ControlButton } from "../Control.js";
-import { PORTS, createBoardDrawing, pointPath, targetFromSelection, type BoardSelection, type BoardTool, type InkDraft } from "./boardModel.js";
+import { PORTS, boardId, createBoardDrawing, pointPath, targetFromSelection, type BoardSelection, type BoardTool, type InkDraft } from "./boardModel.js";
 
 hljs.registerLanguage("javascript", javascript);
 hljs.registerLanguage("typescript", typescript);
 hljs.registerLanguage("json", json);
 hljs.registerLanguage("python", python);
 
-type ItemData = { item: CooperationItem; boardId: string; reactions: CooperationReaction[]; showChanges: boolean; readOnly: boolean; onInspect: (target: BoardSelection) => void; onThread: (target: CooperationTarget, threadId?: string) => void; onOriginal: (item: Extract<CooperationItem, { kind: "image" }>) => void };
+type ItemData = { item: CooperationItem; boardId: string; reactions: CooperationReaction[]; showChanges: boolean; readOnly: boolean; panning: boolean; connectable: boolean; onInspect: (target: BoardSelection) => void; onThread: (target: CooperationTarget, threadId?: string) => void; onOriginal: (item: Extract<CooperationItem, { kind: "image" }>) => void };
 type RelationData = { connection: CooperationConnection; points: CooperationPoint[]; label: CooperationPoint; reactions: CooperationReaction[]; onThread: (target: CooperationTarget, threadId?: string) => void };
 type CanvasNode = FlowNode<ItemData, "item">;
 type CanvasEdge = Edge<RelationData, "universal">;
@@ -51,6 +51,11 @@ export function BoardCanvas(props: BoardCanvasProps) {
   const pen = useRef<number | undefined>(undefined);
   const dragRevision = useRef<number | undefined>(undefined);
   const [nodes, setNodes] = useState<CanvasNode[]>([]);
+  const [connectionStart, setConnectionStart] = useState<string>();
+  const moving = tool === "none" || tool === "select";
+  const panning = tool === "none" || tool === "pan";
+  const connecting = tool === "connection" && !readOnly && !busy;
+  useEffect(() => setConnectionStart(undefined), [tool]);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const onSelection = props.onSelection;
@@ -67,28 +72,53 @@ export function BoardCanvas(props: BoardCanvasProps) {
   const edgeChanges = useCallback((changes: EdgeChange<CanvasEdge>[]) => updateSelection(changes.filter(change => change.type === "select"), "connection"), [updateSelection]);
   const selectionIds = selected.filter(target => target.kind === "item").map(target => target.id).join(":");
   useEffect(() => {
-    setNodes(board.items.map(item => ({
-      id: item.id, type: "item", position: { x: item.geometry.x, y: item.geometry.y }, width: item.geometry.width, height: item.geometry.height,
-      style: { width: item.geometry.width, height: item.geometry.height }, selected: selected.some(target => target.kind === "item" && target.id === item.id),
-      draggable: !readOnly && !busy && tool === "select", connectable: !readOnly && !busy, dragHandle: ".cooperation-item-drag",
-      data: { item, boardId: board.boardId, reactions: board.reactions.filter(reaction => reaction.target.kind === "item" && reaction.target.id === item.id), showChanges: props.showChanges, readOnly, onInspect: props.onInspect, onThread: props.onThread, onOriginal: props.onOriginal }
-    })));
+    setNodes(current => {
+      const measured = new Map(current.map(node => [node.id, node.measured]));
+      return board.items.map(item => ({
+        id: item.id, type: "item", position: { x: item.geometry.x, y: item.geometry.y }, width: item.geometry.width, height: item.geometry.height,
+        measured: measured.get(item.id),
+        style: { width: item.geometry.width, height: item.geometry.height }, selected: selected.some(target => target.kind === "item" && target.id === item.id),
+        draggable: !readOnly && !busy && moving, connectable: connecting, dragHandle: ".cooperation-item-drag", className: tool === "connection" ? "nopan" : undefined,
+        data: { item, boardId: board.boardId, reactions: board.reactions.filter(reaction => reaction.target.kind === "item" && reaction.target.id === item.id), showChanges: props.showChanges, readOnly, panning: tool === "pan", connectable: connecting, onInspect: props.onInspect, onThread: props.onThread, onOriginal: props.onOriginal }
+      }));
+    });
   }, [board, selectionIds, readOnly, busy, tool, props.showChanges, props.onInspect, props.onThread, props.onOriginal]);
+  const displayedItems = useMemo(() => {
+    const positions = new Map(nodes.map(node => [node.id, node.position]));
+    return board.items.map(item => {
+      const position = positions.get(item.id);
+      return position ? { ...item, geometry: { ...item.geometry, ...position } } : item;
+    });
+  }, [board.items, nodes]);
   const edges = useMemo<CanvasEdge[]>(() => board.connections.map(connection => ({
     id: connection.id, type: "universal", source: connection.from.itemId, sourceHandle: connection.from.port, target: connection.to.itemId, targetHandle: connection.to.port,
     selected: selected.some(target => target.kind === "connection" && target.id === connection.id), interactionWidth: 18,
-    data: { connection, points: connectionPolyline(connection, board.items), label: connectionLabelCenter(connection, board.items), reactions: board.reactions.filter(reaction => reaction.target.kind === "connection" && reaction.target.id === connection.id), onThread: props.onThread }
-  })), [board.connections, board.items, board.reactions, selected, props.onThread]);
+    data: { connection, points: connectionPolyline(connection, displayedItems), label: connectionLabelCenter(connection, displayedItems), reactions: board.reactions.filter(reaction => reaction.target.kind === "connection" && reaction.target.id === connection.id), onThread: props.onThread }
+  })), [board.connections, displayedItems, board.reactions, selected, props.onThread]);
   function worldPoint(event: { clientX: number; clientY: number }): CooperationPoint {
     const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }, { snapToGrid: tool !== "pen" && props.snap });
     return [point.x, point.y];
   }
   function connect(connection: Connection) {
-    if (readOnly || !connection.source || !connection.target) return;
+    if (readOnly || busy || !connection.source || !connection.target) return;
     const fromPort = PORTS.find(port => port === connection.sourceHandle);
     const toPort = PORTS.find(port => port === connection.targetHandle);
     if (!fromPort || !toPort) { props.onError("Choose a named connection port on each item."); return; }
-    props.onOperations([{ kind: "createConnection", connection: { id: `connection-${crypto.randomUUID()}`, from: { itemId: connection.source, port: fromPort }, to: { itemId: connection.target, port: toPort }, description: "Related to", direction: "forward", waypoints: [] } }]);
+    props.onOperations([{ kind: "createConnection", connection: { id: boardId("connection"), from: { itemId: connection.source, port: fromPort }, to: { itemId: connection.target, port: toPort }, description: "Related to", direction: "forward", waypoints: [] } }]);
+    setConnectionStart(undefined);
+  }
+  function connectItem(node: CanvasNode) {
+    if (!connecting) return;
+    const from = board.items.find(item => item.id === connectionStart);
+    if (!from) { setConnectionStart(node.id); props.onSelection([{ kind: "item", id: node.id }]); return; }
+    setConnectionStart(undefined);
+    if (from.id === node.id) return;
+    const dx = node.position.x + node.data.item.geometry.width / 2 - from.geometry.x - from.geometry.width / 2;
+    const dy = node.position.y + node.data.item.geometry.height / 2 - from.geometry.y - from.geometry.height / 2;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const sourceHandle = horizontal ? (dx >= 0 ? "east" : "west") : (dy >= 0 ? "south" : "north");
+    const targetHandle = { east: "west", west: "east", south: "north", north: "south" }[sourceHandle];
+    connect({ source: from.id, target: node.id, sourceHandle, targetHandle });
   }
   function penDown(event: PointerEvent<HTMLDivElement>) {
     if (tool !== "pen" || readOnly || event.button !== 0) return;
@@ -117,7 +147,10 @@ export function BoardCanvas(props: BoardCanvasProps) {
         props.onOperations(operations, dragRevision.current);
         dragRevision.current = undefined;
       }}
-      onNodeClick={event => { if (tool !== "select" && tool !== "connection") event.preventDefault(); }}
+      onNodeClick={(event, node) => {
+        if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) return;
+        if (tool === "connection") connectItem(node); else if (!moving) event.preventDefault();
+      }}
       onNodeDoubleClick={(_event, node) => props.onInspect({ kind: "item", id: node.id })}
       onNodeContextMenu={(event, node) => { event.preventDefault(); props.onContext(targetFromSelection(board, node.id, window.getSelection()), event.clientX, event.clientY); }}
       onEdgeDoubleClick={(event, edge) => {
@@ -126,10 +159,10 @@ export function BoardCanvas(props: BoardCanvasProps) {
         props.onOperations([{ kind: "updateConnection", connectionId: edge.id, patch: { waypoints: [...(edge.data?.connection.waypoints ?? []), point] } }]);
       }}
       onEdgeContextMenu={(event, edge) => { event.preventDefault(); props.onContext({ kind: "connection", id: edge.id }, event.clientX, event.clientY); }}
-      onPaneClick={event => { if (tool === "select") props.onSelection([]); if (!readOnly && tool !== "select" && tool !== "connection" && tool !== "pen") props.onCreate(tool, worldPoint(event)); }}
+      onPaneClick={event => { if (moving || tool === "pan") props.onSelection([]); if (!readOnly && !busy && !moving && tool !== "pan" && tool !== "connection" && tool !== "pen") props.onCreate(tool, worldPoint(event)); }}
       onConnect={connect} onEdgesDelete={deleted => { if (!readOnly) props.onOperations(deleted.map(edge => ({ kind: "deleteConnection", connectionId: edge.id }))); }}
-      nodesDraggable={!readOnly && !busy && tool === "select"} nodesConnectable={!readOnly && !busy} elementsSelectable={tool === "select" || tool === "connection"}
-      panOnDrag={tool === "select"} panOnScroll selectionOnDrag={false} selectionKeyCode="Shift" multiSelectionKeyCode={["Meta", "Control", "Shift"]}
+      nodesDraggable={!readOnly && !busy && moving} nodesConnectable={connecting} elementsSelectable={moving || tool === "connection"}
+      panOnDrag={panning} panOnScroll selectionOnDrag={tool === "select"} selectionKeyCode="Shift" multiSelectionKeyCode={["Meta", "Control", "Shift"]} zoomOnDoubleClick={false}
       deleteKeyCode={null} onlyRenderVisibleElements={false} noDragClassName="nodrag" noPanClassName="nopan"
       aria-label="Editable blackboard" proOptions={{ hideAttribution: false }}>
       <Background color="var(--color-border)" gap={20} size={1} variant={BackgroundVariant.Dots} />
@@ -161,12 +194,12 @@ const ItemNode = memo(function ItemNode({ data, selected }: NodeProps<CanvasNode
     <article className={`cooperation-item item-${item.kind}${item.kind === "shape" ? ` shape-${item.content.shape}` : ""}`} style={{ width: geometry.width, height: geometry.height, transform: `rotate(${geometry.rotation}deg)` }}>
       {item.kind === "shape" ? <ShapeContent item={item} /> : <>
         <header className="cooperation-item-heading cooperation-item-drag"><Icon size={16} /><strong>{item.content.title}</strong>{item.kind === "code" ? <span className="cooperation-code-language">{item.content.language || "text"}</span> : null}</header>
-        {item.kind === "note" || item.kind === "code" ? <div className="cooperation-item-text nodrag nopan nowheel">{item.content.blocks.map(block => <div key={block.id} data-cooperation-block={block.id} data-cooperation-item={item.id} className={item.kind === "code" ? "cooperation-code-block" : "cooperation-note-block"}>{item.kind === "code" && hljs.getLanguage(item.content.language) ? <code dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(hljs.highlight(block.text, { language: item.content.language, ignoreIllegals: true }).value) }} /> : block.text || <span className="cooperation-empty-block">Double-click to write</span>}</div>)}</div> : null}
+        {item.kind === "note" || item.kind === "code" ? <div className={`cooperation-item-text${data.panning ? "" : " nodrag nopan nowheel"}`}>{item.content.blocks.map(block => <div key={block.id} data-cooperation-block={block.id} data-cooperation-item={item.id} className={item.kind === "code" ? "cooperation-code-block" : "cooperation-note-block"}>{item.kind === "code" && hljs.getLanguage(item.content.language) ? <code dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(hljs.highlight(block.text, { language: item.content.language, ignoreIllegals: true }).value) }} /> : block.text || <span className="cooperation-empty-block">Double-click to write</span>}</div>)}</div> : null}
         {item.kind === "image" ? <div className="cooperation-image-content"><img src={cooperationAssetUrl(data.boardId, item.content.assetId)} alt={item.content.alt} draggable={false} onError={event => { event.currentTarget.hidden = true; const message = event.currentTarget.nextElementSibling as HTMLElement | null; if (message) message.hidden = false; }} /><p hidden>Original image unavailable. Inspect the asset record or open the original.</p><button type="button" className="cooperation-open-original nodrag nopan" onClick={() => data.onOriginal(item)}><ExternalLink size={12} />Open original</button></div> : null}
         {item.kind === "drawing" ? <svg className="cooperation-drawing" viewBox={`0 0 ${geometry.width} ${geometry.height}`} aria-label={item.content.description} preserveAspectRatio="none">{item.content.strokes.map(stroke => <path key={stroke.id} d={pointPath(stroke.points.map(([x, y]) => [x, y]))} fill="none" stroke={stroke.color} strokeWidth={stroke.width} strokeLinecap="round" strokeLinejoin="round" />)}</svg> : null}
       </>}
     </article>
-    {PORTS.map(port => { const point = itemPortWorld(item, port); return <Handle key={port} id={port} type="source" position={portPositions[port]} isConnectable={!data.readOnly} title={`${port} connection port`} aria-label={`${item.content.title} ${port} connection port`} style={{ left: point[0] - geometry.x, top: point[1] - geometry.y, right: "auto", bottom: "auto", transform: "translate(-50%, -50%)" }} />; })}
+    {PORTS.map(port => { const point = itemPortWorld(item, port); return <Handle key={port} id={port} type="source" position={portPositions[port]} isConnectable={data.connectable} title={`${port} connection port`} aria-label={`${item.content.title} ${port} connection port`} style={{ left: point[0] - geometry.x, top: point[1] - geometry.y, right: "auto", bottom: "auto", transform: "translate(-50%, -50%)" }} />; })}
     <ReactionBadges reactions={data.reactions} onThread={data.onThread} />
     {changed ? <span className="cooperation-change-label"><Sparkles size={11} />AI changed here</span> : null}
     <button className="cooperation-item-edit nodrag nopan" type="button" aria-label={`Inspect ${item.content.title}`} onClick={() => data.onInspect({ kind: "item", id: item.id })}><Pencil size={12} /></button>

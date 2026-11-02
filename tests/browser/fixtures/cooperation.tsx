@@ -2,6 +2,7 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { WorkspaceTab } from "@cloudx/shared";
 import { CooperationPanel } from "../../../apps/web/src/ui/cooperation/CooperationPanel.js";
+import { boardId as viewId } from "../../../apps/web/src/ui/cooperation/boardModel.js";
 import {
   AgentSwitchMenu,
   useAgentSwitchMenu,
@@ -44,7 +45,7 @@ function Fixture() {
     }
     const tab = {
       ...manager,
-      id: crypto.randomUUID(),
+      id: viewId("view"),
       title,
       pluginMetadata: { cooperation: { boardId } },
     };
