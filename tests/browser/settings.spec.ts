@@ -1006,9 +1006,17 @@ test("Codex version selection searches releases, previews a downgrade, and expli
 }) => {
   let update = installedCodex;
   const starts: unknown[] = [];
-  await page.route("**/api/hooks/codex-update.read", (route) =>
-    route.fulfill({ json: { result: { update } } }),
-  );
+  let holdIdlePoll = false;
+  let releaseIdlePoll: (() => Promise<void>) | undefined;
+  await page.route("**/api/hooks/codex-update.read", (route) => {
+    const polledUpdate = update;
+    if (holdIdlePoll && polledUpdate.phase === "idle") {
+      releaseIdlePoll = () =>
+        route.fulfill({ json: { result: { update: polledUpdate } } });
+      return;
+    }
+    return route.fulfill({ json: { result: { update: polledUpdate } } });
+  });
   await page.route("**/api/hooks/codex-update.start", async (route) => {
     starts.push(route.request().postDataJSON());
     update = {
@@ -1063,11 +1071,26 @@ test("Codex version selection searches releases, previews a downgrade, and expli
   await expect(exact).toHaveValue("0.9.0");
   await expect(control).toContainText("active 1.0.0 → requested 0.9.0");
   expect(starts).toEqual([]);
-  await apply.click();
-  const polledUpdate = await page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === "/api/hooks/codex-update.read",
-  );
+  holdIdlePoll = true;
+  await expect.poll(() => Boolean(releaseIdlePoll)).toBe(true);
+  const [polledUpdate] = await Promise.all([
+    page.waitForResponse(async (response) => {
+      if (new URL(response.url()).pathname !== "/api/hooks/codex-update.read")
+        return false;
+      return (await response.json()).result.update.jobId === "downgrade";
+    }),
+    (async () => {
+      try {
+        await apply.click();
+        await expect(control).toContainText(
+          "Verifying selected Codex 0.9.0 before activation.",
+        );
+      } finally {
+        holdIdlePoll = false;
+        await releaseIdlePoll!();
+      }
+    })(),
+  ]);
   expect(await polledUpdate.json()).toMatchObject({
     result: {
       update: {

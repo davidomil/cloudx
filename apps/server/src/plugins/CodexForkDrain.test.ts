@@ -6,12 +6,13 @@ import { expect, it, vi } from "vitest";
 import { listTabLayoutPanes } from "@cloudx/shared";
 
 import { TabContextService } from "../context/TabContextService.js";
+import { JsonStateFile } from "../jsonStateFile.js";
 import { PathPolicy } from "../pathPolicy.js";
 import { PluginRegistry } from "../pluginRegistry.js";
 import { SessionStore } from "../sessionStore.js";
 import type { TerminalProcess, TerminalProcessFactory, TerminalSpawnOptions } from "../terminal/TerminalProcess.js";
 import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
-import { SessionStateStore } from "../workspace/SessionStateStore.js";
+import { SessionStateStore, type SavedSessions } from "../workspace/SessionStateStore.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { CodexConversationForks } from "./CodexConversationForks.js";
@@ -37,6 +38,9 @@ it.each([false, true])("opens later confirmed forks exactly once before source c
   const sessions = new SessionStore(registry, policy, new TabContextService(data), undefined, workspace, undefined, undefined, saved);
   const commands = new WorkspaceCommandService(sessions, workspace);
   let restoreClock: (() => void) | undefined;
+  let restoreWrites: (() => void) | undefined;
+  let releaseSavedClose!: () => void;
+  const savedClose = new Promise<void>(resolve => { releaseSavedClose = resolve; });
   try {
     const imagegen = path.join(home, "skills", ".system", "imagegen");
     await fs.mkdir(imagegen, { recursive: true });
@@ -58,6 +62,13 @@ it.each([false, true])("opens later confirmed forks exactly once before source c
         .filter(tab => tab.id !== source.id).map(tab => sessions.getSession(tab.id).restoreInput?.()?.resume);
       return closeTab(tabId, options);
     });
+    const write = JsonStateFile.prototype.write;
+    const delayedWrite = vi.spyOn(JsonStateFile.prototype, "write").mockImplementation(async function (this: JsonStateFile, value) {
+      if (this.filePath === path.join(data, "sessions.json") &&
+        !(value as SavedSessions).sessions.some(entry => entry.tab.id === source.id)) await savedClose;
+      await write.call(this, value);
+    });
+    restoreWrites = () => delayedWrite.mockRestore();
     await new Promise(resolve => setImmediate(resolve));
     const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + CODEX_CLOSE_ON_EXIT_GRACE_MS + 1);
     restoreClock = () => clock.mockRestore();
@@ -69,6 +80,9 @@ it.each([false, true])("opens later confirmed forks exactly once before source c
     }));
     factory.terminals.get(source.id)!.exit(0);
     await vi.waitFor(() => expect(sessions.listTabs().some(tab => tab.id === source.id)).toBe(false));
+    expect((await saved.read())!.sessions.map(entry => entry.tab.id)).toContain(source.id);
+    releaseSavedClose();
+    await sessions.flush();
 
     const expectedConversations = (missingFirstDirectory ? [secondId] : [firstId, secondId])
       .map(sessionId => ({ mode: "session", sessionId }));
@@ -85,6 +99,8 @@ it.each([false, true])("opens later confirmed forks exactly once before source c
     expect(factory.terminals.size).toBe(expectedConversations.length + 1);
     expect(close.mock.calls.filter(([tabId]) => tabId === source.id)).toHaveLength(1);
   } finally {
+    releaseSavedClose();
+    restoreWrites?.();
     restoreClock?.();
     await sessions.dispose();
     await sources.dispose();

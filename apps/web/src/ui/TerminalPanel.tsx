@@ -75,17 +75,21 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   const [connectionRevision, setConnectionRevision] = useState(0);
   const [runtimeRevision, setRuntimeRevision] = useState(0);
   const [capabilityResult, setCapabilityResult] = useState<{ scope: string; capabilities: TerminalCapabilities }>();
-  const capabilityScope = `${tab.id}:${tab.updatedAt}:${active}`;
-  const capabilities = capabilityResult?.scope === capabilityScope ? capabilityResult.capabilities : undefined;
+  const starting = tab.status === "starting";
+  const capabilityScope = `${tab.id}:${tab.pluginId}:${tab.nativeWork?.executionId ?? ""}:${active}`;
+  const capabilities = !starting && capabilityResult?.scope === capabilityScope ? capabilityResult.capabilities : undefined;
   useEffect(() => {
-    if (!active || !isAgentTab(tab)) return;
+    if (!active || !isAgentTab(tab) || starting) {
+      setCapabilityResult(undefined);
+      return;
+    }
     const request = new AbortController();
     let disposed = false;
     void readTerminalCapabilities(tab.id, request.signal).then(next => {
       if (!disposed) setCapabilityResult({ scope: capabilityScope, capabilities: next });
     }).catch(() => { if (!disposed) setCapabilityResult(undefined); });
     return () => { disposed = true; request.abort(); };
-  }, [capabilityScope, connectionRevision, tab.id, tab.pluginId, active]);
+  }, [capabilityScope, connectionRevision, tab.id, tab.pluginId, tab.updatedAt, active, starting]);
   useEffect(() => {
     const view = viewRef.current;
     if (!view || !capabilities) return;

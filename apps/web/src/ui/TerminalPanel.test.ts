@@ -765,6 +765,76 @@ describe("TerminalPanel", () => {
     expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
   });
 
+  it("keeps verified command controls mounted while tab metadata is revalidated", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    const toolbar = host!.querySelector(".codex-command-details");
+    expect(toolbar).not.toBeNull();
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "restored-tab-status" }, active: true, uiScale: 1 })));
+
+    expect(terminalPanelMocks.readTerminalCapabilities).toHaveBeenCalledTimes(2);
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+    await act(async () => finish({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true }));
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+  });
+
+  it("retires verified capabilities when a replacement execution is reported", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    terminalPanelMocks.readCodexCommandDetails.mockImplementation(() => new Promise(() => {}));
+    const agent = { ...tab, pluginId: "codex-terminal", nativeWork: { version: 1 as const, tabId: tab.id, executionId: "codex-run", threadId: "thread", updatedAt: tab.updatedAt } };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    const commandSignal = terminalPanelMocks.readCodexCommandDetails.mock.calls[0]![1] as AbortSignal;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(() => {}));
+
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, nativeWork: { ...agent.nativeWork, executionId: "replacement-run" } }, active: true, uiScale: 1 })));
+
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+    expect(commandSignal.aborted).toBe(true);
+  });
+
+  it("retires verified capabilities before starting an unidentified replacement", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).not.toBeNull();
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, status: "starting" }, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(() => {}));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "replacement-running" }, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+  });
+
+  it("retires previous command requests when revalidation reports another provider", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    terminalPanelMocks.readCodexCommandDetails.mockImplementation(() => new Promise(() => {}));
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    const commandSignal = terminalPanelMocks.readCodexCommandDetails.mock.calls[0]![1] as AbortSignal;
+    const previousTerminal = terminalPanelMocks.terminals[0]!;
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "claude", executionId: "claude-run", commandCapture: false });
+
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "provider-changed" }, active: true, uiScale: 1 })));
+
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+    expect(host!.textContent).toContain("Claude shortcuts");
+    expect(commandSignal.aborted).toBe(true);
+    expect(previousTerminal.disposed).toBe(true);
+  });
+
+  it("hides verified controls when capability revalidation fails", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).not.toBeNull();
+    terminalPanelMocks.readTerminalCapabilities.mockRejectedValue(new Error("Connection failed"));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "unverified-status" }, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+  });
+
   it("aborts capability and command requests when a tab becomes inactive", async () => {
     let finish!: (value: unknown) => void;
     terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
