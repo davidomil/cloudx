@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type Dispatch,
 import {
   Background, BackgroundVariant, BaseEdge, ConnectionMode, EdgeLabelRenderer, Handle, MiniMap,
   Position, ReactFlow, ViewportPortal, applyNodeChanges, useReactFlow, useStoreApi, useUpdateNodeInternals,
-  type Connection, type Edge, type EdgeChange, type EdgeProps, type Node as FlowNode, type NodeChange, type NodeProps, type ReactFlowInstance, type Viewport
+  type Connection, type Edge, type EdgeChange, type EdgeProps, type Node as FlowNode, type NodeChange, type NodePositionChange, type NodeProps, type ReactFlowInstance, type Viewport
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Code2, ExternalLink, FileText, Image as ImageIcon, LockKeyhole, MessageCircle, Pencil, Sparkles } from "lucide-react";
@@ -72,7 +72,20 @@ export function BoardCanvas(props: BoardCanvasProps) {
   const nodeChanges = useCallback((changes: NodeChange<CanvasNode>[]) => {
     setNodes(current => applyNodeChanges(changes, current));
     updateSelection(changes.filter(change => change.type === "select"), "item");
-  }, [updateSelection]);
+    if (changes.some(change => change.type === "position" && change.dragging === true)) dragRevision.current ??= board.revision;
+    const completed = changes.filter((change): change is NodePositionChange => change.type === "position" && change.dragging === false);
+    const observedRevision = dragRevision.current ?? board.revision;
+    if (completed.length) dragRevision.current = undefined;
+    if (readOnly || busy || !moving) return;
+    const operations: CooperationOperation[] = completed.flatMap(change => {
+      const item = board.items.find(item => item.id === change.id);
+      const position = change.position;
+      return item && position && (item.geometry.x !== position.x || item.geometry.y !== position.y)
+        ? [{ kind: "updateItem", itemId: item.id, patch: { geometry: { ...item.geometry, ...position } } }]
+        : [];
+    });
+    if (operations.length) props.onOperations(operations, observedRevision);
+  }, [updateSelection, board, readOnly, busy, moving, props.onOperations]);
   const edgeChanges = useCallback((changes: EdgeChange<CanvasEdge>[]) => updateSelection(changes.filter(change => change.type === "select"), "connection"), [updateSelection]);
   const selectionIds = selected.filter(target => target.kind === "item").map(target => target.id).join(":");
   useEffect(() => {
@@ -144,13 +157,6 @@ export function BoardCanvas(props: BoardCanvasProps) {
       onInit={instance => { props.onReady(instance); if (!props.viewport && board.items.length) void instance.fitView({ padding: 0.08, maxZoom: 1 }).then(() => props.onViewport(instance.getViewport())); }}
       onMoveEnd={(_event, viewport) => props.onViewport(viewport)}
       onNodesChange={nodeChanges} onEdgesChange={edgeChanges}
-      onNodeDragStart={() => { dragRevision.current = board.revision; }}
-      onNodeDragStop={(_event, _node, changed) => {
-        if (readOnly || busy) return;
-        const operations: CooperationOperation[] = changed.map(node => ({ kind: "updateItem", itemId: node.id, patch: { geometry: { ...node.data.item.geometry, x: node.position.x, y: node.position.y } } }));
-        props.onOperations(operations, dragRevision.current);
-        dragRevision.current = undefined;
-      }}
       onNodeClick={(event, node) => {
         if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select, .react-flow__handle")) return;
         if (tool === "connection") connectItem(node); else if (!moving) event.preventDefault();
