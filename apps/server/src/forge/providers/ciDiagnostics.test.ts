@@ -5,6 +5,7 @@ import type { ForgeChangeRequest, ForgeRepository } from "@cloudx/shared";
 import { createForgeProvider, ForgeCredentials } from "./index.js";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 import { maxCiLogBytes } from "./ciEvidence.js";
+import { playwrightAssertions, playwrightFailureReport } from "./playwrightFailure.fixture.js";
 
 const source = "a".repeat(40);
 const target = "b".repeat(40);
@@ -134,6 +135,32 @@ function gitlabFixture(options: {
 }
 
 describe("GitHub required CI diagnostics", () => {
+  it.each(playwrightAssertions)("offers repair for a real Playwright $name report while retaining verified job identity", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    const log = report.split("\n").map(line => `2026-11-02T06:50:53.6174080Z \x1b[1A\x1b[2K${line}`).join("\n");
+    const fixture = githubFixture({ log, logChunkSize: 7 });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ repository: github, changeNumber: change.number,
+      sourceHeadSha: source, targetHeadSha: target, testedSha: tested, state: "actionable",
+      jobs: [{ runId: "100", runAttempt: 2, jobId: "501", conclusion: "failure", testedSha: tested, classification: "code" }] });
+    expect(diagnostic.jobs[0].log).toContain(`expect(received)${assertion.name}(expected)`);
+    expect(diagnostic.jobs[0].log).toContain("Documentation service unavailable");
+  });
+
+  it.each(playwrightAssertions)("keeps independent operational blockers authoritative beside a real Playwright $name report", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    for (const [classification, blocker] of [
+      ["infrastructure", "Runner lost communication with the server"], ["infrastructure", "no space left on device"],
+      ["credentials", "fatal: authentication failed"], ["policy", "Workflow is disabled; approval required"],
+    ]) {
+      for (const log of [blocker + "\n" + report, report.replace(/(\n    attachment #[^\n]+\n)/, `$1${blocker}\n`), report + blocker]) {
+        const { provider } = githubFixture({ log, logChunkSize: 7 });
+        expect(await provider.getCiFailure(change)).toMatchObject({ state: "blocked", sourceHeadSha: source, targetHeadSha: target,
+          jobs: [{ runId: "100", runAttempt: 2, jobId: "501", classification }] });
+      }
+    }
+  });
+
   it("binds a required failed job to this repository, request, source, base and run attempt before offering repair", async () => {
     const fixture = githubFixture();
     const diagnostic = await fixture.provider.getCiFailure(change);

@@ -5831,6 +5831,8 @@ describe("Forge issue auto review", () => {
   it("repairs a Playwright attachment failure in the owned conversation and checkout with its PR and review state intact", async () => {
     const f = await approvedIssue(1, "github");
     const owned = structuredClone(f.currentIssue());
+    expect(owned.batch).toBeUndefined();
+    expect(f.runtime.launch.mock.calls[0]?.[0]).toMatchObject({ id: owned.id, preserveConversation: true });
     const reviewer = structuredClone(f.currentReview());
     const noise = "successful browser output\n".repeat(5_000);
     const evidence = realCiDiagnostics(f, "github", noise + playwrightAttachmentFailure + noise, "Isolated verifier (browser-1)", true);
@@ -5846,7 +5848,7 @@ describe("Forge issue auto review", () => {
     expect(diagnostic.jobs[0].log).toContain("terminal-mode-recovery.spec.ts:262:3");
     expect(diagnostic.jobs[0].log).toContain("expect(locator).toHaveText(expected)");
     expect(f.reports.prepare).toHaveBeenLastCalledWith(current.attemptId, expect.objectContaining({ ciRepair: expect.objectContaining({ diagnostic }) }));
-    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: owned.id, worktreePath: owned.worktreePath });
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: owned.id, worktreePath: owned.worktreePath, preserveConversation: true });
     expect(f.currentReview()).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, headSha: reviewer.headSha,
       draft: reviewer.draft, issueWorkerId: reviewer.issueWorkerId, status: reviewer.status });
     expect(f.currentReview().reviewHistory).toEqual(reviewer.reviewHistory);

@@ -3,6 +3,7 @@ import type { ForgeCiDiagnostic, ForgeRepository } from "@cloudx/shared";
 import { ForgeCredentials } from "./ForgeCredentials.js";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 import { classifyCiLog, classifyDiagnostic, maxCiLogBytes, maxCiLogScanBytes, readCiLog } from "./ciEvidence.js";
+import { playwrightAssertions, playwrightFailureReport } from "./playwrightFailure.fixture.js";
 
 const source = "a".repeat(40);
 const moved = "b".repeat(40);
@@ -144,6 +145,34 @@ describe("complete CI log evidence with bounded excerpts", () => {
 });
 
 describe("Playwright failure classification", () => {
+  it.each(playwrightAssertions)("scopes real Playwright $name failure attachments in direct and streaming evidence", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    expect(report).toContain(`expect(received)${assertion.name}(expected)`);
+    expect(report).toMatch(/Documentation service unavailable[^\n]+\.\.\./);
+    for (const chunkSize of [1, 7, 1024]) {
+      const log = report.split("\n").map(line => `2026-11-02T06:50:53.6174080Z \x1b[1A\x1b[2K${line}`).join("\n");
+      const { evidence, diagnostic } = await diagnoseStream(checkout() + log, chunkSize);
+      expect({ direct: classifyCiLog(report), streaming: evidence.classification, diagnostic: diagnostic.state })
+        .toEqual({ direct: "code", streaming: "code", diagnostic: "actionable" });
+      expect(evidence.log).toContain(`expect(received)${assertion.name}(expected)`);
+      expect(evidence.checkout).toEqual({ shas: [source], invalid: false });
+    }
+  });
+
+  it.each(playwrightAssertions)("preserves independent operational blockers around a real Playwright $name failure", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    for (const [classification, blocker] of [
+      ["infrastructure", "Runner lost communication with the server"], ["infrastructure", "no space left on device"],
+      ["credentials", "fatal: authentication failed"], ["policy", "Workflow is disabled; approval required"],
+    ]) {
+      for (const log of [blocker + "\n" + report, report.replace(/(\n    attachment #[^\n]+\n)/, `$1${blocker}\n`), report + blocker]) {
+        const { evidence, diagnostic } = await diagnoseStream(checkout() + log);
+        expect(evidence.classification).toBe(classification);
+        expect(diagnostic.state).toBe("blocked");
+      }
+    }
+  });
+
   it.each([
     browserFailure,
     "Error: expect(locator).toBeVisible() failed\nLocator: getByRole('button')\nExpected: visible\nReceived: hidden\n",

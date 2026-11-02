@@ -8,7 +8,7 @@ export const maxCiFailureJobs = 8;
 export const maxCiLogBytes = 128_000;
 export const maxCiLogScanBytes = 16_000_000;
 const maxCiLogCharacters = 31_900;
-const renderedCiAssertion = /^(?:##\[(?:error|warning)\]\s*)?(?:AssertionError\b|(?:Error|TimeoutError):\s*expect\([^\r\n]*\)\.(?:not\.)?\w+\()/i;
+const renderedCiAssertion = /^(?:##\[(?:error|warning)\]\s*)?(?:AssertionError\b|(?:Error|TimeoutError):\s*expect\([^\r\n]*\)\.(?:(?:resolves|rejects)\.)?(?:not\.)?\w+\()/i;
 const operationalCiBlockers = {
   credentials: /bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i,
   policy: /billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i,
