@@ -22,10 +22,9 @@ export class ClaudeCooperationBroker {
     if (!this.env.CLAUDE_CODE_MESSAGING_SOCKET) throw new Error("The original Claude session did not expose its native inbox socket.");
     this.control = await new CooperationNativeControl({ ...this.binding, providerId: "claude" }, envelope => this.deliver(envelope)).start();
     this.watchers.push(watch(this.binding.configDir, (_event, name) => {
-      if (name?.toString() === ".cloudx-conversation.json") void this.followConversation().catch(reportError);
-      if (name?.toString() === ".cloudx-turn.json") void this.readTurn().catch(reportError);
+      if ([".cloudx-conversation.json", ".cloudx-turn.json"].includes(name?.toString())) void this.readTurn().catch(reportError);
     }));
-    await this.followConversation();
+    await this.readTurn();
     return this;
   }
 
@@ -50,14 +49,16 @@ export class ClaudeCooperationBroker {
     try { size = (await fs.stat(this.transcriptPath)).size; } catch { /* Native creates its transcript after SessionStart. */ }
     this.transcript = new TranscriptReader(this.transcriptPath, size);
     this.transcriptWatcher = watch(path.dirname(this.transcriptPath), (_event, filename) => {
-      if (filename?.toString() === path.basename(this.transcriptPath)) void this.readTranscript().catch(reportError);
+      if (filename?.toString() === path.basename(this.transcriptPath)) void this.readTurn().catch(reportError);
     });
     this.transcriptWatcher.on("error", () => this.transcriptWatcher.close());
     await this.control.boundary();
   }
 
-  readTranscript() {
+  readTurn() {
     this.reading = this.reading.catch(() => undefined).then(async () => {
+      await this.followConversation();
+      const previousTurn = this.control.currentTurn;
       const accepted = [];
       const prompts = [];
       this.transcript?.read(line => {
@@ -76,26 +77,22 @@ export class ClaudeCooperationBroker {
         }
       });
       for (const providerTurnId of prompts) await this.control.turn({ providerTurnId, status: "running" });
+      const receipt = await readPrivateJson(path.join(this.binding.configDir, ".cloudx-turn.json")).catch(() => undefined);
+      if (receipt && receipt.sessionId === this.sessionId && (!this.promptId || !receipt.turnId || receipt.turnId === this.promptId)) {
+        const providerTurnId = receipt.turnId ?? this.control.currentTurn?.providerTurnId;
+        if (providerTurnId && (providerTurnId !== this.control.currentTurn?.providerTurnId || receipt.status !== this.control.currentTurn?.status))
+          await this.control.turn({ providerTurnId, status: receipt.status });
+      }
       for (const entry of accepted) await this.control.mark(entry.eventIds, "nativeAccepted", { reason: "The original Claude session persisted the message in its native input queue." });
       for (const entry of accepted) entry.accept?.();
+      if (previousTurn?.providerTurnId !== this.control.currentTurn?.providerTurnId || previousTurn?.status !== this.control.currentTurn?.status)
+        await this.control.boundary();
     });
     return this.reading;
   }
 
-  async readTurn() {
-    await this.followConversation();
-    await this.readTranscript();
-    let value;
-    try { value = await readPrivateJson(path.join(this.binding.configDir, ".cloudx-turn.json")); } catch { return; }
-    if (value.sessionId !== this.sessionId) return;
-    if (this.promptId && value.turnId && value.turnId !== this.promptId) return;
-    const providerTurnId = value.turnId ?? this.control.currentTurn?.providerTurnId;
-    if (providerTurnId) await this.control.turn({ providerTurnId, status: value.status });
-    await this.control.boundary();
-  }
-
   async deliver(envelope) {
-    await this.followConversation();
+    await this.readTurn();
     if (!this.sessionId || !this.transcript) return { state: "queued", reason: "The original Claude conversation is still connecting." };
     if (this.binding.owned) {
       let turn;
@@ -112,7 +109,7 @@ export class ClaudeCooperationBroker {
       message: { role: "user", content: `${marker}\n$cooperation-board $cooperation-feedback\n${envelope.text}` }
     };
     await postNativeMessage(this.env.CLAUDE_CODE_MESSAGING_SOCKET, this.env.CLAUDE_CODE_MESSAGING_TOKEN, frame);
-    await this.readTranscript();
+    await this.readTurn();
     let timer;
     if (this.pending.has(marker)) {
       try { await Promise.race([accepted, new Promise(resolve => { timer = setTimeout(resolve, 2000); })]); }

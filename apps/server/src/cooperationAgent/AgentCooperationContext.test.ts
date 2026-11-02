@@ -233,3 +233,31 @@ it.each(["running", "completed"])("keeps the original Claude transcript's curren
   await broker.readTurn();
   expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "submitted-draft", status: "completed" });
 });
+
+it("reconciles a persisted Claude completion when its native prompt arrives after the receipt observation", async () => {
+  const f = await fixture();
+  f.change({ ...f.locator, providerId: "claude", executionId: "execution-1" });
+  await f.contexts.prepare("tab-1");
+  const transcript = path.join(f.root, "conversation.jsonl");
+  await fs.writeFile(transcript, "");
+  await fs.writeFile(path.join(f.root, ".cloudx-conversation.json"), JSON.stringify({ tabId: "tab-1", executionId: "execution-1", sessionId: "session-1", transcriptPath: transcript }));
+  const { ClaudeCooperationBroker } = await import(fileURLToPath(new URL("../../helpers/cooperation-claude-broker.mjs", import.meta.url)));
+  const broker = await new ClaudeCooperationBroker({ configDir: f.root, contextPath: f.contexts.contextPath("tab-1"), tabId: "tab-1", executionId: "execution-1" }, { CLAUDE_CODE_MESSAGING_SOCKET: "/unused" }).start();
+  cleanups.push(() => broker.close());
+  // Deliver the receipt notification explicitly; leave the real original
+  // transcript watcher active for the later native prompt notification.
+  for (const watcher of broker.watchers) watcher.close();
+  const prompt = (promptId: string) => `${JSON.stringify({ type: "user", promptId, message: { role: "user", content: promptId } })}\n`;
+  await fs.appendFile(transcript, prompt("feedback-turn"));
+  await broker.readTurn();
+  expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "feedback-turn", status: "running" });
+  await fs.writeFile(path.join(f.root, ".cloudx-turn.json"), JSON.stringify({ sessionId: "session-1", turnId: "submitted-draft", status: "completed" }));
+  await broker.readTurn();
+  await fs.appendFile(transcript, prompt("submitted-draft"));
+  await vi.waitFor(() => expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "submitted-draft", status: "completed" }), { timeout: 3_000 });
+
+  await fs.appendFile(transcript, prompt("newer-user-prompt"));
+  await vi.waitFor(() => expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "newer-user-prompt", status: "running" }));
+  await broker.readTurn();
+  expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "newer-user-prompt", status: "running" });
+});

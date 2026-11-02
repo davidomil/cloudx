@@ -253,8 +253,18 @@ jobs:
           claude_version="$(node --input-type=module -e 'import { CLAUDE_CODE_VERSION } from "./scripts/install-cloudx.mjs"; console.log(CLAUDE_CODE_VERSION)')"
           npm install --global --prefix "$RUNNER_TEMP/claude" --no-audit --no-fund "@anthropic-ai/claude-code@$claude_version"
       - name: Require the CLI flags, login status and hook receipts CloudX relies on
+        env:
+          CLOUDX_COOPERATION_NATIVE_DIAGNOSTICS_DIR: ${{ runner.temp }}/claude-native-diagnostics
         run: |
           CLOUDX_NATIVE_CLAUDE="$RUNNER_TEMP/claude/bin/claude" npx vitest run apps/server/src/agents apps/server/src/cooperationAgent/CooperationNative.native.test.ts
+      - name: Retain Claude native failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: claude-native-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/claude-native-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
   terminal-stress:
     name: Terminal stress (Node 22, 2 CPUs, 7 GiB)
     runs-on: ubuntu-24.04
