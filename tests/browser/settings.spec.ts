@@ -96,6 +96,12 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/api/system/update/preview", (route) =>
     route.fulfill({ json: mainUpdatePreview }),
   );
+  await page.route("**/api/system/update/backups", (route) =>
+    route.fulfill({ json: { backups: [] } }),
+  );
+  await page.route("**/api/system/update/backups/cleanup", (route) =>
+    route.fulfill({ json: null }),
+  );
   serverLogs = "";
   testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-settings-"));
   const codex = path.join(testRoot, "codex");
