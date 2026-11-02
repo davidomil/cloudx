@@ -121,12 +121,12 @@ describe("buildServer", () => {
     const writeStarted = deferred<void>();
     const releaseWrite = deferred<void>();
     const setupFailure = new Error("Plugin setup write failed.");
-    const saveSkill = services.rulesSkills!.saveSystemSkill.bind(services.rulesSkills);
-    const save = vi.spyOn(services.rulesSkills!, "saveSystemSkill").mockImplementationOnce(async (...args) => {
+    const saveContributions = services.rulesSkills!.saveSystemContributions.bind(services.rulesSkills);
+    const save = vi.spyOn(services.rulesSkills!, "saveSystemContributions").mockImplementationOnce(async (...args) => {
       writeStarted.resolve(undefined);
       await releaseWrite.promise;
       if (fails) throw setupFailure;
-      return saveSkill(...args);
+      return saveContributions(...args);
     });
     const disposeAutomation = vi.spyOn(services.automation!, "dispose");
     const app = await buildServer(config, services);
@@ -179,12 +179,12 @@ describe("buildServer", () => {
     const refreshStarted = deferred<void>();
     const releaseRefresh = deferred<void>();
     const refreshFailure = new Error("Catalog refresh failed.");
-    const saveSkill = catalog.saveSystemSkill.bind(catalog);
-    const save = vi.spyOn(catalog, "saveSystemSkill").mockImplementation(async (skill) => {
-      if (skill.id !== finalSkill.id) return saveSkill(skill);
+    const saveContributions = catalog.saveSystemContributions.bind(catalog);
+    const save = vi.spyOn(catalog, "saveSystemContributions").mockImplementation(async (input) => {
+      if (!input.skills.some(skill => skill.id === finalSkill.id)) return saveContributions(input);
       finalSaveStarted.resolve(undefined);
       await releaseFinalSave.promise;
-      const store = await saveSkill(skill);
+      const store = await saveContributions(input);
       await releaseSetup.promise;
       return store;
     });

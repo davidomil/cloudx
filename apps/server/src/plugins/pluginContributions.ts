@@ -31,11 +31,8 @@ export async function syncPluginContributions(
   await assertNoUserContributionConflicts(contributions, rulesSkills, initialStore, logger);
   const pruned = await pruneObsoleteSystemContributions(contributions, rulesSkills, initialStore, logger);
   let store: RulesSkillsStore | undefined = pruned ? undefined : initialStore;
-  for (const rule of contributions.rules) {
-    store = await rulesSkills.saveSystemRule(rule);
-  }
-  for (const skill of contributions.skills) {
-    store = await rulesSkills.saveSystemSkill(skill);
+  if (contributions.rules.length > 0 || contributions.skills.length > 0) {
+    store = await rulesSkills.saveSystemContributions(contributions);
   }
   const syncedStore = store ?? await rulesSkills.list();
   logger?.debug?.(

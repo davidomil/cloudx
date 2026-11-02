@@ -6,7 +6,7 @@ import type { RulesSkillsStore } from "@cloudx/shared";
 import type { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogService.js";
 import { syncPluginContributions } from "./pluginContributions.js";
 
-type FakeCatalog = Pick<RulesSkillsCatalogService, "deleteRule" | "deleteSkill" | "deleteSystemRule" | "deleteSystemSkill" | "saveSystemRule" | "saveSystemSkill" | "list">;
+type FakeCatalog = Pick<RulesSkillsCatalogService, "deleteRule" | "deleteSkill" | "deleteSystemRule" | "deleteSystemSkill" | "saveSystemContributions" | "list">;
 
 describe("syncPluginContributions", () => {
   it("stores plugin rules and skills as system catalog entries", async () => {
@@ -17,21 +17,16 @@ describe("syncPluginContributions", () => {
       plugin("beta", { rules: [rule("beta-keep-citations")], skills: [skill("beta-ingest")] })
     ], catalog as RulesSkillsCatalogService);
 
-    expect(catalog.saveSystemRule).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      id: "alpha-ingest-evidence",
-      scope: "system"
-    }));
-    expect(catalog.saveSystemRule).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      id: "beta-keep-citations",
-      scope: "system"
-    }));
-    expect(catalog.saveSystemSkill).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      id: "alpha-search",
-      scope: "system"
-    }));
-    expect(catalog.saveSystemSkill).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      id: "beta-ingest",
-      scope: "system"
+    expect(catalog.saveSystemContributions).toHaveBeenCalledOnce();
+    expect(catalog.saveSystemContributions).toHaveBeenCalledWith(expect.objectContaining({
+      rules: [
+        expect.objectContaining({ id: "alpha-ingest-evidence", scope: "system" }),
+        expect.objectContaining({ id: "beta-keep-citations", scope: "system" })
+      ],
+      skills: [
+        expect.objectContaining({ id: "alpha-search", scope: "system" }),
+        expect.objectContaining({ id: "beta-ingest", scope: "system" })
+      ]
     }));
     expect(catalog.list).toHaveBeenCalledOnce();
   });
@@ -41,8 +36,7 @@ describe("syncPluginContributions", () => {
 
     await syncPluginContributions([plugin("alpha", {})], catalog as RulesSkillsCatalogService);
 
-    expect(catalog.saveSystemRule).not.toHaveBeenCalled();
-    expect(catalog.saveSystemSkill).not.toHaveBeenCalled();
+    expect(catalog.saveSystemContributions).not.toHaveBeenCalled();
     expect(catalog.list).toHaveBeenCalledOnce();
   });
 
@@ -64,8 +58,7 @@ describe("syncPluginContributions", () => {
     await expect(syncPluginContributions([plugin("alpha", { skills: [skill("alpha-search"), skill("alpha-search")] })], catalog as RulesSkillsCatalogService)).rejects.toThrow(
       "CloudX system skill contribution alpha-search is already claimed by alpha"
     );
-    expect(catalog.saveSystemRule).not.toHaveBeenCalled();
-    expect(catalog.saveSystemSkill).not.toHaveBeenCalled();
+    expect(catalog.saveSystemContributions).not.toHaveBeenCalled();
   });
 
   it("rejects user-owned id conflicts before writing to the catalog", async () => {
@@ -82,8 +75,7 @@ describe("syncPluginContributions", () => {
     ], catalog as RulesSkillsCatalogService)).rejects.toThrow(
       "Plugin contribution ids conflict with user-defined catalog entries: rule alpha-existing-rule, skill alpha-existing-skill"
     );
-    expect(catalog.saveSystemRule).not.toHaveBeenCalled();
-    expect(catalog.saveSystemSkill).not.toHaveBeenCalled();
+    expect(catalog.saveSystemContributions).not.toHaveBeenCalled();
     expect(catalog.list).toHaveBeenCalledOnce();
   });
 
@@ -104,8 +96,10 @@ describe("syncPluginContributions", () => {
 
     expect(catalog.deleteRule).toHaveBeenCalledWith("alpha-existing-rule");
     expect(catalog.deleteSkill).toHaveBeenCalledWith("alpha-existing-skill");
-    expect(catalog.saveSystemRule).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-existing-rule", scope: "system" }));
-    expect(catalog.saveSystemSkill).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-existing-skill", scope: "system" }));
+    expect(catalog.saveSystemContributions).toHaveBeenCalledWith(expect.objectContaining({
+      rules: [expect.objectContaining({ id: "alpha-existing-rule", scope: "system" })],
+      skills: [expect.objectContaining({ id: "alpha-existing-skill", scope: "system" })]
+    }));
   });
 
   it("prunes obsolete plugin-owned system contributions before writing current entries", async () => {
@@ -137,8 +131,10 @@ describe("syncPluginContributions", () => {
     expect(catalog.deleteSystemSkill).not.toHaveBeenCalledWith("alpha-current-skill");
     expect(catalog.deleteSystemRule).not.toHaveBeenCalledWith("gamma-old-rule");
     expect(catalog.deleteSystemSkill).not.toHaveBeenCalledWith("gamma-old-skill");
-    expect(catalog.saveSystemRule).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-current-rule", scope: "system" }));
-    expect(catalog.saveSystemSkill).toHaveBeenCalledWith(expect.objectContaining({ id: "alpha-current-skill", scope: "system" }));
+    expect(catalog.saveSystemContributions).toHaveBeenCalledWith(expect.objectContaining({
+      rules: [expect.objectContaining({ id: "alpha-current-rule", scope: "system" })],
+      skills: [expect.objectContaining({ id: "alpha-current-skill", scope: "system" })]
+    }));
   });
 
   it("emits debug logs for contribution sync, adoption, and pruning", async () => {
@@ -182,14 +178,7 @@ function fakeCatalog(overrides: Partial<RulesSkillsStore> = {}): FakeCatalog {
     ...overrides
   };
   return {
-    saveSystemRule: vi.fn(async (rule: PluginRuleContribution) => ({
-      ...emptyStore,
-      systemRules: [{ ...rule, scope: "system" as const }]
-    })),
-    saveSystemSkill: vi.fn(async (skill: PluginSkillContribution) => ({
-      ...emptyStore,
-      systemSkills: [{ ...skill, scope: "system" as const }]
-    })),
+    saveSystemContributions: vi.fn(async () => emptyStore),
     deleteRule: vi.fn(async () => emptyStore),
     deleteSkill: vi.fn(async () => emptyStore),
     deleteSystemRule: vi.fn(async () => emptyStore),

@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { RULES_SKILLS_PLUGIN_ID, type WorkspaceTab, type WorkspaceWindow } from "@cloudx/shared";
 
@@ -140,6 +140,113 @@ describe("RulesSkillsCatalogService", () => {
     const ruleFile = await fs.readFile(path.join(service.catalogRoot(), "system-rules", "documentation-ingest-evidence.md"), "utf8");
     expect(ruleFile).toContain("Download task evidence");
     await expect(service.saveRule({ id: "documentation-ingest-evidence", description: "Shadow.", text: "Shadow rule." })).rejects.toThrow("system rule already exists");
+  });
+
+  it("saves a complete contribution batch and refreshes bundled files without replacing local tools", async ({ onTestFinished }) => {
+    const service = await createService();
+    onTestFinished(() => fs.rm(path.dirname(service.catalogRoot()), { recursive: true, force: true }));
+    await service.list();
+    const writing = path.join(service.catalogRoot(), "system-skills", "source-grounded-writing");
+    const readme = path.join(writing, "README.md");
+    const compiler = path.join(writing, "scripts", "compile_doc.py");
+    const originalCompiler = await fs.readFile(compiler, "utf8");
+    const oldTime = new Date("2001-01-01T00:00:00Z");
+    await fs.utimes(readme, oldTime, oldTime);
+    await fs.mkdir(path.join(writing, ".tools"));
+    await fs.writeFile(path.join(writing, ".tools", "installed"), "keep");
+    await fs.writeFile(compiler, "stale");
+    await fs.chmod(compiler, 0o644);
+    const changed = vi.fn();
+    service.onChange(changed);
+
+    const store = await service.saveSystemContributions({
+      rules: [{ id: "batch-evidence", text: "Keep evidence." }],
+      skills: [
+        { id: "batch-search", name: "Search", description: "Search evidence.", files: [{ path: "scripts/search.mjs", content: "search();", executable: true }] },
+        { id: "batch-write", name: "Write", description: "Write from evidence." }
+      ]
+    });
+
+    expect(store.systemRules).toContainEqual(expect.objectContaining({ id: "batch-evidence", scope: "system" }));
+    expect(store.systemSkills.map(skill => skill.id)).toEqual(expect.arrayContaining(["batch-search", "batch-write", "source-grounded-writing"]));
+    expect(changed).toHaveBeenCalledOnce();
+    expect(await fs.readFile(path.join(service.catalogRoot(), "system-skills", "batch-search", "scripts", "search.mjs"), "utf8")).toBe("search();");
+    expect((await fs.stat(path.join(service.catalogRoot(), "system-skills", "batch-search", "scripts", "search.mjs"))).mode & 0o111).not.toBe(0);
+    expect(await fs.readFile(compiler, "utf8")).toBe(originalCompiler);
+    expect((await fs.stat(compiler)).mode & 0o7777).toBe(0o755);
+    expect((await fs.stat(readme)).mtimeMs).toBe(oldTime.getTime());
+    expect(await fs.readFile(path.join(writing, ".tools", "installed"), "utf8")).toBe("keep");
+
+    await fs.writeFile(compiler, "changed after the first batch");
+    await service.saveSystemContributions({ rules: [], skills: [{ id: "batch-write", name: "Write", description: "Updated." }] });
+    expect(await fs.readFile(compiler, "utf8")).toBe(originalCompiler);
+    expect(changed).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["invalid helper", "user rule conflict", "user skill conflict"])("rejects a whole batch before contribution writes for %s", async (failure) => {
+    const service = await createService();
+    onTestFinished(() => fs.rm(path.dirname(service.catalogRoot()), { recursive: true, force: true }));
+    await service.saveSystemRule({ id: "batch-rule", text: "Original rule." });
+    await service.saveRule({ id: "user-rule", text: "User rule." });
+    await service.saveSkill({ id: "user-skill", name: "User", description: "User skill." });
+    const before = await service.list();
+    const changed = vi.fn();
+    service.onChange(changed);
+    const input = {
+      rules: [
+        { id: "batch-rule", text: "Replacement rule." },
+        { id: failure === "user rule conflict" ? "user-rule" : "another-rule", text: "New rule." }
+      ],
+      skills: [{
+        id: failure === "user skill conflict" ? "user-skill" : "batch-skill",
+        name: "Batch", description: "Batch skill.",
+        files: [{ path: failure === "invalid helper" ? "../escape" : "scripts/helper.mjs", content: "helper();" }]
+      }]
+    };
+
+    await expect(service.saveSystemContributions(input)).rejects.toThrow(failure === "invalid helper" ? "safe relative path" : "user");
+
+    expect(await service.list()).toEqual(before);
+    expect(changed).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("notifies completed writes after a batch failure and releases queued readers (rule saved: %s)", async (ruleSaved) => {
+    const service = await createService();
+    onTestFinished(() => fs.rm(path.dirname(service.catalogRoot()), { recursive: true, force: true }));
+    await service.list();
+    const changed = vi.fn();
+    service.onChange(changed);
+    const writeStarted = deferred<void>();
+    const releaseWrite = deferred<void>();
+    const failure = new Error("Cannot publish the skill.");
+    const rename = fs.rename.bind(fs);
+    const publish = vi.spyOn(fs, "rename").mockImplementation(async (...args) => {
+      if (String(args[1]) === path.join(service.catalogRoot(), "system-skills", "batch-skill")) {
+        writeStarted.resolve();
+        await releaseWrite.promise;
+        throw failure;
+      }
+      return rename(...args);
+    });
+    onTestFinished(() => { releaseWrite.resolve(); publish.mockRestore(); });
+    const saving = service.saveSystemContributions({
+      rules: ruleSaved ? [{ id: "batch-rule", text: "The completed rule." }] : [],
+      skills: [{ id: "batch-skill", name: "Batch", description: "The failing skill." }]
+    });
+    const rejected = expect(saving).rejects.toBe(failure);
+    await writeStarted.promise;
+    let readFinished = false;
+    const reading = service.list().then(store => { readFinished = true; return store; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(readFinished).toBe(false);
+
+    releaseWrite.resolve();
+    await rejected;
+    const store = await reading;
+
+    expect(store.systemRules.some(rule => rule.id === "batch-rule")).toBe(ruleSaved);
+    expect(store.systemSkills.map(skill => skill.id)).not.toContain("batch-skill");
+    expect(changed).toHaveBeenCalledTimes(ruleSaved ? 1 : 0);
   });
 
   it("seeds catalog directories idempotently when concurrent reads create the same path", async () => {
