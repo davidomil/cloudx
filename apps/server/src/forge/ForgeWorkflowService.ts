@@ -2940,7 +2940,7 @@ export class ForgeWorkflowService {
         accountId: worker.kind === "issue" ? settings.workerAccountId : settings.reviewAccountId,
         claudeLaunchMode: worker.kind === "issue" ? settings.workerClaudeLaunchMode : settings.reviewClaudeLaunchMode,
         prompt,
-        ...(worker.batch ? { preserveConversation: true as const } : {}),
+        ...(worker.kind === "issue" ? { preserveConversation: true as const } : {}),
         ...(this.cooperationContinuations.has(worker.id) ? { cooperationContinuationOf: this.cooperationContinuations.get(worker.id)! } : {}),
         ...placement,
       },

@@ -193,9 +193,10 @@ interface OwnedWorkspace extends ForgeWorkspace {
   reviewBaseSha?: string;
   reviewRefresh?: OwnedReviewRefresh;
   reviewConversation?: ReviewConversationBinding;
+  // Durable coding conversation for both ordinary issues and named batches.
   batchConversation?: ReviewConversationBinding;
   batchConversationRequired?: true;
-  // Preserved review or batch conversation when the worker runs on Claude.
+  // Preserved review or coding conversation when the worker runs on Claude.
   claudeConversation?: ClaudeConversationBinding;
   publicationAttemptId?: string;
   publicationHandoffs?: Record<string, OwnedPublicationHandoff>;
@@ -674,9 +675,9 @@ export class ForgeRuntime {
     signal?.throwIfAborted();
     const owned = await this.readOwned(input.id);
     if (input.preserveConversation && owned.role !== "worker")
-      throw new Error("Only a coding worker can preserve a batch conversation.");
+      throw new Error("Only a coding worker can preserve a coding conversation.");
     if ((owned.batchConversation || owned.claudeConversation?.key === "batchConversation") && !input.preserveConversation)
-      throw new Error("Resume this batch with its preserved conversation.");
+      throw new Error("Resume this issue with its preserved conversation.");
     const conversationKey = owned.role === "reviewer" ? "reviewConversation" : input.preserveConversation ? "batchConversation" : undefined;
     const providerId = isClaudeModel(input.model) ? "claude" : "codex";
     if (conversationKey && providerId === "claude" && owned[conversationKey])

@@ -1397,7 +1397,7 @@ describe("Manual worker continuation", () => {
     f.runtime.beginCooperationContinuation.mockResolvedValue(true);
     const continued = await f.service.continueWorker(f.worker.id, "Answer the addressed board question.", placement);
     expect(f.runtime.beginCooperationContinuation).toHaveBeenCalledExactlyOnceWith(f.worker.tabId);
-    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.worker.id, cooperationContinuationOf: f.worker.tabId }), expect.any(AbortSignal));
+    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.worker.id, preserveConversation: true, cooperationContinuationOf: f.worker.tabId }), expect.any(AbortSignal));
     expect(f.runtime.beginCooperationContinuation.mock.invocationCallOrder[0]).toBeLessThan(f.runtime.close.mock.invocationCallOrder[0]);
     expect(f.runtime.abortCooperationContinuation).toHaveBeenCalledExactlyOnceWith(f.worker.tabId);
     expect(continued.status).toBe("running");
@@ -5773,7 +5773,7 @@ describe("Forge issue auto review", () => {
     expect(f.stored()).toEqual([]);
   });
 
-  function realCiDiagnostics(f: Awaited<ReturnType<typeof approvedIssue>>, providerKind: "github" | "gitlab", log: string, jobName = "affected tests", aggregate = false) {
+  function realCiDiagnostics(f: Pick<ReturnType<typeof fixture>, "deps" | "change" | "provider" | "reports">, providerKind: "github" | "gitlab", log: string, jobName = "affected tests", aggregate = false) {
     const repository = f.deps.settings().repository;
     const sourceHead = f.change.headSha;
     const targetHead = f.change.targetHeadSha;
@@ -5858,6 +5858,94 @@ describe("Forge issue auto review", () => {
         log: expect.stringContaining("locator.selectOption"), requiredGate: { jobId: "10", name: "CI aggregate" } }] } } });
     expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/11/logs"))).toBe(false);
     expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  const playwrightAttachmentFailure = [
+    "Running 2 tests using 1 worker, shard 1 of 2",
+    "\x1b[1A\x1b[2K  1) [desktop-chromium] › tests/browser/terminal-mode-recovery.spec.ts:262:3 › preserves scroll margins after web-server restoration",
+    "    Error: expect(locator).toHaveText(expected) failed",
+    '    Expected: "NEXT"', '    Received: "three"',
+    "    attachment #2: terminal-recovery-server.log (text/plain) ─────────────────────",
+    '    {"level":50,"err":{"type":"DocumentationServiceUnavailableError","message":"Documentation service unavailable at http://127.0.0.1:9/enrichment/pending: fet...',
+    "    ─────────────────────", "  1 failed", "  1 passed (11.1m)", "",
+  ].map(line => `2026-11-02T06:50:53.6174080Z ${line}`).join("\n");
+
+  it("repairs a Playwright attachment failure in the owned conversation and checkout with its PR and review state intact", async () => {
+    const f = await approvedIssue(1, "github");
+    const owned = structuredClone(f.currentIssue());
+    expect(owned.batch).toBeUndefined();
+    expect(f.runtime.launch.mock.calls[0]?.[0]).toMatchObject({ id: owned.id, preserveConversation: true });
+    const reviewer = structuredClone(f.currentReview());
+    const noise = "successful browser output\n".repeat(5_000);
+    const evidence = realCiDiagnostics(f, "github", noise + playwrightAttachmentFailure + noise, "Isolated verifier (browser-1)", true);
+    await f.poll(); await f.poll();
+    const current = f.currentIssue();
+    expect(current).toMatchObject({ id: owned.id, branch: owned.branch, worktreePath: owned.worktreePath,
+      changeNumber: owned.changeNumber, changeUrl: owned.changeUrl, headSha: owned.headSha,
+      status: "running", ciRepair: { phase: "repairing", attempts: 1, attemptedHeads: [evidence.sourceHead],
+        diagnostic: { repository: evidence.repository, changeNumber: 7, sourceHeadSha: evidence.sourceHead, targetHeadSha: evidence.targetHead,
+          testedSha: evidence.testedMerge, state: "actionable", jobs: [{ runId: "42", runAttempt: 1, jobId: "9",
+            classification: "code", conclusion: "failure", testedSha: evidence.testedMerge, requiredGate: { jobId: "10" } }] } } });
+    const diagnostic = current.ciRepair!.diagnostic!;
+    expect(diagnostic.jobs[0].log).toContain("terminal-mode-recovery.spec.ts:262:3");
+    expect(diagnostic.jobs[0].log).toContain("expect(locator).toHaveText(expected)");
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(current.attemptId, expect.objectContaining({ ciRepair: expect.objectContaining({ diagnostic }) }));
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: owned.id, worktreePath: owned.worktreePath, preserveConversation: true });
+    expect(f.currentReview()).toMatchObject({ id: reviewer.id, worktreePath: reviewer.worktreePath, headSha: reviewer.headSha,
+      draft: reviewer.draft, issueWorkerId: reviewer.issueWorkerId, status: reviewer.status });
+    expect(f.currentReview().reviewHistory).toEqual(reviewer.reviewHistory);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.prepareWorkspace).toHaveBeenCalledTimes(2);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    expect(evidence.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/11/logs"))).toBe(false);
+  });
+
+  it("keeps every batch member in the same conversation when Playwright attachments allow CI repair", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    onTestFinished(() => { vi.useRealTimers(); });
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Browser repair", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement, true);
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    f.change.mergeable = false;
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    vi.setSystemTime(Date.now() + 5_000);
+    await f.service.poll();
+    f.runtime.updateIssueBranch.mockClear();
+    const owned = structuredClone(f.stored().find(saved => saved.id === worker.id)!);
+    realCiDiagnostics(f, "github", playwrightAttachmentFailure);
+    vi.setSystemTime(Date.now() + 5_000);
+    await f.service.poll();
+    const current = f.stored().find(saved => saved.id === worker.id)!;
+    expect(current).toMatchObject({ id: owned.id, worktreePath: owned.worktreePath, branch: owned.branch, batch: owned.batch,
+      changeNumber: owned.changeNumber, autoReview: { reviewWorkerId: owned.autoReview?.reviewWorkerId },
+      status: "running", ciRepair: { phase: "repairing", attempts: 1 } });
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: owned.id, worktreePath: owned.worktreePath, preserveConversation: true });
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ batch: { name: "Browser repair" }, issues: [f.issues[0], f.issues[1]], ciRepair: { attempts: 1 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["credentials", "fatal: authentication failed"], ["policy", "approval required"],
+    ["infrastructure", "Runner lost communication with the server"], ["infrastructure", "no space left on device"],
+  ])("keeps real %s failures beside Playwright attachments blocked without a repair attempt", async (classification, blocker) => {
+    const f = await approvedIssue(1, "github");
+    realCiDiagnostics(f, "github", playwrightAttachmentFailure.replace("    ─────────────────────", `${blocker}\n    ─────────────────────`));
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "blocked", attempts: 0, attemptedHeads: [],
+      diagnostic: { state: "blocked", jobs: [{ classification, conclusion: "failure" }] } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
