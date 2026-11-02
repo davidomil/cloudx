@@ -9,7 +9,7 @@ Draft skill for the proposed helper in [protocol.md](../protocol.md). Follow [co
 
 1. Read current context and `inbox list`. Claim only an event addressed to this tab and assignment generation with `inbox claim --event ID`. Do not answer every event on a shared board or claim another tab’s work.
 2. Read the target, original quote, block/revision anchor, thread, connected items, and WIP state. If its anchor is stale or deleted, preserve the quote. Explain against that quote or ask for reattachment; do not guess a new target.
-3. Answer the actual question in its existing thread. Start with the explanation the user needs, then give a concrete example or opened source if useful. Label a proposed design as a proposal. If you need more evidence, say precisely what is unknown.
+3. Answer the actual question in its existing thread with a few short bullet points. Put the answer first. Give one fact, action, or question per bullet. Follow the ASD-STE100 principles in cooperation-board. Keep conditions, uncertainty, and source links.
 4. Submit one transaction that appends your message and names its `respondsToEventIds`. Confirm its receipt. This records an answer; only the user resolves the question. Do not delete the question, treat a checkmark as approval, or rewrite the user’s note to hide the concern.
 5. Point briefly to the board thread in the terminal. Leave the viewport, current selection, and other open tools alone.
 
