@@ -23,6 +23,7 @@ import type { TriggerRegistry } from "./triggers/TriggerRegistry.js";
 export interface SessionRuntimeContextResolver {
   runtimeContextFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<WorkspaceRuntimeContext> | WorkspaceRuntimeContext;
   tabIndicatorFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<TabIndicatorUpdate | undefined> | TabIndicatorUpdate | undefined;
+  prepareExecution?(tab: WorkspaceTab): Promise<void> | void;
 }
 
 export interface StartTabRequest {
@@ -622,14 +623,14 @@ export class SessionStore {
 
   agentProvider(tabId: string): AgentProviderId | undefined {
     if (!isAgentTab(this.getTab(tabId))) return undefined;
-    const input = this.sessions.get(tabId)?.restoreInput?.() ?? this.initialInputs.get(tabId);
+    const input = this.initialInputs.get(tabId);
     return readAgentSelection(input?.agent)?.providerId ?? "codex";
   }
 
   agentLineage(tabId: string): { logicalRunId?: string; attemptId?: string; executionId?: string } {
     this.getTab(tabId);
     const turn = this.launchOptions.get(tabId)?.agentTurn;
-    const input = this.sessions.get(tabId)?.restoreInput?.() ?? this.initialInputs.get(tabId);
+    const input = this.initialInputs.get(tabId);
     return { ...(turn ? { logicalRunId: turn.workerId, attemptId: turn.attemptId } : {}),
       ...(typeof input?.codexExecutionId === "string" ? { executionId: input.codexExecutionId } : {}) };
   }
@@ -1191,6 +1192,8 @@ export class SessionStore {
   }
 
   private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {
+    const agentInput = isAgentTab(session.tab) ? session.restoreInput?.() : undefined;
+    if (agentInput) this.initialInputs.set(tabId, structuredClone(agentInput));
     this.sessions.set(tabId, session);
     const offersRecovery = !session.tab.ownerPluginId && this.plugins.get(session.tab.pluginId).panelKind === "terminal";
     const disposers: Array<() => void> = [];
@@ -1270,11 +1273,15 @@ export class SessionStore {
   private createControls(tabId: string): PluginTabControls {
     return {
       setTabIndicator: (indicator) => this.updateTabIndicator(tabId, indicator),
-      setRestoreInput: (input) => {
-        if (!this.tabs.has(tabId)) return;
+      setRestoreInput: async (input) => {
+        const tab = this.tabs.get(tabId);
+        if (!tab) return;
+        const previous = this.initialInputs.get(tabId);
         this.initialInputs.set(tabId, structuredClone(input));
         this.persistSessions();
-        return this.savedSessions?.flush();
+        await this.savedSessions?.flush();
+        if (isAgentTab(tab) && input.codexExecutionId !== previous?.codexExecutionId)
+          await this.runtimeContextResolver?.prepareExecution?.(tab);
       },
       openSiblingTab: input => this.openSiblingTab(tabId, input),
       closeTab: (reason) => {
@@ -1348,7 +1355,7 @@ export class SessionStore {
     const state = {
       version: 1 as const,
       activeTabId: tabs.some(tab => tab.id === this.activeTabId) ? this.activeTabId : undefined,
-      sessions: tabs.map(tab => ({ tab, initialInput: this.sessions.get(tab.id)?.restoreInput?.() ?? this.initialInputs.get(tab.id) }))
+      sessions: tabs.map(tab => ({ tab, initialInput: isAgentTab(tab) ? this.initialInputs.get(tab.id) : this.sessions.get(tab.id)?.restoreInput?.() ?? this.initialInputs.get(tab.id) }))
     };
     void this.savedSessions.save(state).catch(error => this.reportBackgroundError(error, "persist open tabs", "workspace"));
   }

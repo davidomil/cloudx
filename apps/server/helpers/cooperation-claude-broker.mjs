@@ -35,7 +35,11 @@ export class ClaudeCooperationBroker {
     if (identity.tabId !== this.binding.tabId || identity.executionId !== this.binding.executionId ||
       typeof identity.sessionId !== "string" || typeof identity.transcriptPath !== "string" || !path.isAbsolute(identity.transcriptPath)) return;
     if (this.sessionId && this.sessionId !== identity.sessionId) {
-      for (const entry of this.pending.values()) await this.control.mark(entry.eventIds, "unknown", { reason: "The native Claude conversation changed before feedback acknowledgment." });
+      for (const entry of this.pending.values()) {
+        entry.result = { state: "unknown", reason: "The native Claude conversation changed before feedback acknowledgment." };
+        await this.control.mark(entry.eventIds, "unknown", entry.result);
+        entry.settle();
+      }
       this.pending.clear();
       this.promptId = undefined;
     }
@@ -83,8 +87,11 @@ export class ClaudeCooperationBroker {
         if (providerTurnId && (providerTurnId !== this.control.currentTurn?.providerTurnId || receipt.status !== this.control.currentTurn?.status))
           await this.control.turn({ providerTurnId, status: receipt.status });
       }
-      for (const entry of accepted) await this.control.mark(entry.eventIds, "nativeAccepted", { reason: "The original Claude session persisted the message in its native input queue." });
-      for (const entry of accepted) entry.accept?.();
+      for (const entry of accepted) {
+        entry.result = { state: "nativeAccepted", reason: "The original Claude session persisted the message in its native input queue." };
+        await this.control.mark(entry.eventIds, "nativeAccepted", entry.result);
+        entry.settle();
+      }
       if (previousTurn?.providerTurnId !== this.control.currentTurn?.providerTurnId || previousTurn?.status !== this.control.currentTurn?.status)
         await this.control.boundary();
     });
@@ -101,9 +108,10 @@ export class ClaudeCooperationBroker {
       if (!envelope.immediate) return { state: "queued", reason: "The owner attempt is running; feedback waits for its tracked continuation boundary." };
     }
     const marker = `CLOUDX_COOPERATION_EVENTS:${envelope.eventIds.join(",")}`;
-    let accept;
-    const accepted = new Promise(resolve => { accept = resolve; });
-    this.pending.set(marker, { eventIds: envelope.eventIds, accept });
+    let settle;
+    const settled = new Promise(resolve => { settle = resolve; });
+    const entry = { eventIds: envelope.eventIds, settle, result: { state: "unknown", reason: "Submitted to the original Claude inbox; waiting for its native queue receipt. Its inbound policy remains in force." } };
+    this.pending.set(marker, entry);
     const frame = {
       type: "user", session_id: this.sessionId, msg_id: envelope.eventIds[0], priority: "next",
       message: { role: "user", content: `${marker}\n$cooperation-board $cooperation-feedback\n${envelope.text}` }
@@ -112,11 +120,10 @@ export class ClaudeCooperationBroker {
     await this.readTurn();
     let timer;
     if (this.pending.has(marker)) {
-      try { await Promise.race([accepted, new Promise(resolve => { timer = setTimeout(resolve, 2000); })]); }
+      try { await Promise.race([settled, new Promise(resolve => { timer = setTimeout(resolve, 2000); })]); }
       finally { clearTimeout(timer); }
     }
-    if (!this.pending.has(marker)) return { state: "nativeAccepted", reason: "The original Claude session persisted the message in its native input queue." };
-    return { state: "unknown", reason: "Submitted to the original Claude inbox; waiting for its native queue receipt. Its inbound policy remains in force." };
+    return entry.result;
   }
 
   async close() {

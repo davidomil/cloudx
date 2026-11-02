@@ -1575,7 +1575,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   jira = new JiraIntegrationService(configService, new JiraDashboardFilterStore(pluginData));
   sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, {
     runtimeContextFor: async (tab, window) => cooperationContexts.augmentRuntimeContext(tab, await rulesSkills.runtimeContextFor(tab, window)),
-    tabIndicatorFor: (tab, window) => rulesSkills.tabIndicatorFor(tab, window)
+    tabIndicatorFor: (tab, window) => rulesSkills.tabIndicatorFor(tab, window),
+    prepareExecution: async tab => { await cooperationContexts.prepare(tab.id); }
   }, (error, details) => {
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   }, new SessionStateStore(config.dataDir));

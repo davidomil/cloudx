@@ -19,6 +19,7 @@ export class CooperationNativeControl {
   }
 
   async start() {
+    if (!await this.ownsCurrentContext()) throw new Error("The original native execution has been replaced.");
     // AF_UNIX paths are bounded independently of filesystem paths. The fixed
     // private Linux runtime directory keeps long CloudX data roots out of it.
     const directory = path.join("/tmp", `cloudx-cooperation-${process.getuid?.() ?? "user"}`);
@@ -29,10 +30,15 @@ export class CooperationNativeControl {
     this.socketPath = path.join(directory, `${randomBytes(16).toString("hex")}.sock`);
     this.server = net.createServer(socket => this.accept(socket));
     this.server.maxConnections = 16;
-    await new Promise((resolve, reject) => { this.server.once("error", reject); this.server.listen(this.socketPath, resolve); });
-    await fs.chmod(this.socketPath, 0o600);
-    await this.publish(true);
-    return this;
+    try {
+      await new Promise((resolve, reject) => { this.server.once("error", reject); this.server.listen(this.socketPath, resolve); });
+      await fs.chmod(this.socketPath, 0o600);
+      await this.publish(true);
+      return this;
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
   }
 
   async close() {
@@ -80,6 +86,10 @@ export class CooperationNativeControl {
 
   publish(replace = false) {
     this.publication = this.publication.catch(() => undefined).then(async () => {
+      if (!await this.ownsCurrentContext()) {
+        if (replace) throw new Error("The original native execution has been replaced.");
+        return;
+      }
       if (!replace) {
         const current = await readPrivateJson(`${this.binding.contextPath}.native.json`).catch(error => {
           if (error.code === "ENOENT") return undefined;
@@ -157,6 +167,13 @@ export class CooperationNativeControl {
   ownsContext(context) {
     return context.tabId === this.binding.tabId && (!context.providerId || context.providerId === this.binding.providerId) &&
       (!context.executionId || context.executionId === this.binding.executionId);
+  }
+
+  async ownsCurrentContext() {
+    const context = await readPrivateJson(this.binding.contextPath, 16384).catch(error => {
+      if (error.code !== "ENOENT") throw error;
+    });
+    return Boolean(context && this.ownsContext(context));
   }
 }
 

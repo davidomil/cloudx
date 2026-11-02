@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import fs from "node:fs/promises";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -105,9 +106,9 @@ it("gives both provider launches their own locator while preserving the existing
 
 it("ships complete board-first skills and one helper/protocol contract for both providers", () => {
   expect(COOPERATION_SKILLS.map(skill => skill.id)).toEqual(["cooperation-board", "cooperation-feedback", "cooperation-diagram"]);
-  expect(COOPERATION_RULES[0].text).toContain("At the start of every turn");
+  expect(COOPERATION_RULES[0].text).toContain("At the start of each turn");
   for (const skill of COOPERATION_SKILLS) {
-    expect(skill.instructions).toContain("coworker");
+    expect(skill.instructions).toContain("protocol.md");
     expect(skill.files?.map(file => file.path)).toEqual(["protocol.md", "scripts/cooperation-helper.mjs"]);
     expect(skill.files?.[0].content).toContain("no automatic retries");
   }
@@ -202,8 +203,12 @@ it("keeps final native observations monotonic and a retired broker cannot replac
   expect(JSON.parse(await fs.readFile(`${binding.contextPath}.native.json`, "utf8")).currentTurn.status).toBe("completed");
   f.change({ ...f.locator, executionId: "execution-2" });
   await f.contexts.prepare("tab-1");
+  const retiredReceipt = await fs.readFile(`${binding.contextPath}.native.json`, "utf8");
   await old.turn({ providerTurnId: "retired-turn", status: "running" });
+  await old.boundary();
+  await old.mark(["retired-event"], "unknown");
   expect(old.currentTurn.providerTurnId).toBe("old-turn");
+  expect(await fs.readFile(`${binding.contextPath}.native.json`, "utf8")).toBe(retiredReceipt);
   const next = await new CooperationNativeControl({ ...binding, executionId: "execution-2" }, async () => ({ state: "nativeAccepted", providerTurnId: "new-turn" })).start();
   cleanups.push(() => next.close());
   await old.close();
@@ -211,6 +216,83 @@ it("keeps final native observations monotonic and a retired broker cannot replac
   expect(JSON.parse(await fs.readFile(`${binding.contextPath}.native.json`, "utf8"))).toMatchObject({ executionId: "execution-2", status: "ready" });
   expect(await native.deliver({ recipientTabId: "tab-1", assignmentGeneration: 3, boardId: "board-1", boardRevision: 1, eventIds: ["new-event"], text: "New addressed question", executionId: "execution-2" }))
     .toMatchObject({ state: "nativeAccepted", providerTurnId: "new-turn" });
+});
+
+it("rejects a delayed retired broker before it can displace the replacement native owner", async () => {
+  const f = await fixture();
+  f.change({ ...f.locator, executionId: "execution-current" });
+  await f.contexts.prepare("tab-1");
+  const { CooperationNativeControl } = await import(fileURLToPath(new URL("../../helpers/cooperation-native-control.mjs", import.meta.url)));
+  const binding = { contextPath: f.contexts.contextPath("tab-1"), providerId: "codex", tabId: "tab-1", executionId: "execution-current" };
+  const current = await new CooperationNativeControl(binding, async () => ({ state: "nativeAccepted", providerTurnId: "current-turn" })).start();
+  cleanups.push(() => current.close());
+  const currentReceipt = await fs.readFile(`${binding.contextPath}.native.json`, "utf8");
+  const retired = new CooperationNativeControl({ ...binding, executionId: "execution-retired" }, async () => ({ state: "nativeAccepted" }));
+  cleanups.push(() => retired.close());
+  await expect(retired.start()).rejects.toThrow("replaced");
+  expect(retired.server?.listening ?? false).toBe(false);
+  expect(await fs.readFile(`${binding.contextPath}.native.json`, "utf8")).toBe(currentReceipt);
+  const native = new NativeAgentFeedbackPort({ contexts: f.contexts });
+  cleanups.push(async () => native.close());
+  expect(await native.deliver({ recipientTabId: "tab-1", assignmentGeneration: 3, boardId: "board-1", boardRevision: 1, eventIds: ["current-event"], text: "Current addressed question", executionId: binding.executionId }))
+    .toMatchObject({ state: "nativeAccepted", providerTurnId: "current-turn" });
+});
+
+it("releases a native listener when its execution is replaced during startup", async () => {
+  const f = await fixture();
+  f.change({ ...f.locator, executionId: "execution-1" });
+  await f.contexts.prepare("tab-1");
+  const { CooperationNativeControl } = await import(fileURLToPath(new URL("../../helpers/cooperation-native-control.mjs", import.meta.url)));
+  const control = new CooperationNativeControl({ contextPath: f.contexts.contextPath("tab-1"), providerId: "codex", tabId: "tab-1", executionId: "execution-1" }, async () => ({ state: "nativeAccepted" }));
+  cleanups.push(() => control.close());
+  const publish = control.publish.bind(control);
+  control.publish = async (replace: boolean) => {
+    if (replace) {
+      f.change({ ...f.locator, executionId: "execution-2" });
+      await f.contexts.prepare("tab-1");
+    }
+    return publish(replace);
+  };
+  await expect(control.start()).rejects.toThrow("replaced");
+  expect(control.server.listening).toBe(false);
+  await expect(fs.lstat(control.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(fs.lstat(`${f.contexts.contextPath("tab-1")}.native.json`)).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("keeps Claude delivery unknown when its conversation changes before a native queue acknowledgment", async () => {
+  const f = await fixture();
+  f.change({ ...f.locator, providerId: "claude", executionId: "execution-1" });
+  const locator = await f.contexts.prepare("tab-1");
+  const transcript = path.join(f.root, "original.jsonl");
+  const replacement = path.join(f.root, "replacement.jsonl");
+  const identityPath = path.join(f.root, ".cloudx-conversation.json");
+  const identity = { tabId: "tab-1", executionId: "execution-1", sessionId: "session-1", transcriptPath: transcript };
+  await Promise.all([fs.writeFile(transcript, ""), fs.writeFile(replacement, ""), fs.writeFile(identityPath, JSON.stringify(identity))]);
+  const frames: string[] = [];
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("data", chunk => frames.push(chunk.toString()));
+  });
+  const socketPath = path.join(f.root, "inbox.sock");
+  await new Promise<void>(resolve => server.listen(socketPath, resolve));
+  cleanups.push(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  });
+  const { ClaudeCooperationBroker } = await import(fileURLToPath(new URL("../../helpers/cooperation-claude-broker.mjs", import.meta.url)));
+  const broker = await new ClaudeCooperationBroker({ configDir: f.root, contextPath: f.contexts.contextPath("tab-1"), tabId: "tab-1", executionId: "execution-1" }, { CLAUDE_CODE_MESSAGING_SOCKET: socketPath }).start();
+  cleanups.push(() => broker.close());
+  const delivered = broker.control.request({ recipientTabId: "tab-1", assignmentGeneration: 3, boardId: "board-1", eventIds: ["event-switch"], text: "Read this addressed question.", capability: locator.capability });
+  await vi.waitFor(() => expect(frames).toHaveLength(1));
+  await fs.writeFile(identityPath, JSON.stringify({ ...identity, sessionId: "session-2", transcriptPath: replacement }));
+  await broker.readTurn();
+  expect(await delivered).toMatchObject({ state: "unknown", reason: expect.stringContaining("conversation changed") });
+  expect(broker.control.deliveries.get("event-switch").state).toBe("unknown");
+  expect(await fs.readFile(transcript, "utf8")).toBe("");
+  expect(await fs.readFile(replacement, "utf8")).toBe("");
+  expect(frames).toHaveLength(1);
 });
 
 it.each(["running", "completed"])("keeps the original Claude transcript's current prompt when a preceding %s hook receipt arrives late", async status => {
