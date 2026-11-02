@@ -128,8 +128,23 @@ import { registerLogRoutes } from "./logs/logRoutes.js";
 import { WorkspaceCleanupService } from "./workspace/WorkspaceCleanupService.js";
 import { registerWorkspaceCleanupRoutes } from "./workspace/WorkspaceCleanupRoutes.js";
 import { redactUrlSearchAndHash } from "./urlRedaction.js";
+import { CooperationPlugin } from "./plugins/CooperationPlugin.js";
+import { BlackboardService } from "./cooperation/BlackboardService.js";
+import { AgentCooperationContext } from "./cooperationAgent/AgentCooperationContext.js";
+import { CooperationHost } from "./cooperationHost/CooperationHost.js";
+import { registerCooperationRoutes } from "./cooperationHost/CooperationRoutes.js";
+import { NativeAgentFeedbackPort } from "./cooperationAgent/NativeAgentFeedbackPort.js";
+import { CooperationFeedbackDelivery } from "./cooperationAgent/CooperationFeedbackDelivery.js";
+import { ForgeCooperationFeedback } from "./cooperationHost/ForgeCooperationFeedback.js";
 
 export interface AppServices {
+  cooperation?: BlackboardService;
+  cooperationContexts?: AgentCooperationContext;
+  cooperationReady?: Promise<void>;
+  cooperationHost?: CooperationHost;
+  cooperationFeedback?: CooperationFeedbackDelivery;
+  cooperationNative?: NativeAgentFeedbackPort;
+  cooperationForge?: ForgeCooperationFeedback;
   logs?: CloudxLogService;
   agentAccounts?: AgentAccountStore;
   workspaceCleanup?: WorkspaceCleanupService;
@@ -247,30 +262,16 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   services.automation ??= createAutomationService(new AutomationRepository(config.dataDir), services, config, app.log);
   services.sessions.setHookRegistry?.(services.hooks);
   services.sessions.setTriggerRegistry?.(services.triggers);
-  await services.sessions.restore?.(services.pluginContributionsReady);
-  services.jiraPolling?.start?.();
-  services.forge?.start?.();
   const disposePersistenceNotifications = bindPersistenceNotifications(services);
   const localWebProxy = new LocalWebProxy(services.sessions);
-  await app.register(websocket, {
-    options: {
-      maxPayload: Math.max(config.voiceAudioUploadMaxBytes, VOICE_WS_CONTROL_MESSAGE_MAX_BYTES),
-      perMessageDeflate: false
-    }
-  });
-  const trustedOrigins = new Set(config.trustedOrigins);
-  const trustedAuthorities = new Set(config.trustedOrigins.flatMap((origin) => trustedOriginAuthorities(origin)));
-  app.addHook("onRequest", async (request, reply) => {
-    if (!isTrustedRequest(request.raw.rawHeaders, trustedOrigins, trustedAuthorities)) {
-      return reply.code(403).send({ error: "Forbidden" });
-    }
-  });
 
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = (): Promise<void> => {
     if (shutdownPromise) {
       return shutdownPromise;
     }
+    services.cooperationHost?.beginShutdown();
+    services.cooperationForge?.dispose();
     let voiceAdmissionFailure: unknown;
     try {
       services.voice.beginShutdown?.();
@@ -278,6 +279,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       voiceAdmissionFailure = error;
     }
     const requestOwnerShutdown = settleDisposers([
+      () => services.cooperationFeedback?.dispose(),
       () => services.documentationIngestQueue?.dispose(),
       () => services.codexUpdates?.dispose(),
       () => backgroundEnrichment?.dispose(),
@@ -314,6 +316,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       failures.push(...automationFailures);
       failures.push(...await setupShutdown);
       failures.push(...await rulesSkillsUpdatesShutdown);
+      failures.push(...await settleDisposers([() => services.cooperationHost?.dispose()]));
+      services.cooperationNative?.close();
       failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
       failures.push(...await sourceShutdown);
       if (failures.length > 0) {
@@ -325,6 +329,48 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
 
   app.addHook("preClose", shutdown);
   app.addHook("onClose", shutdown);
+
+  try {
+    await services.cooperationReady;
+    await services.pluginContributionsReady;
+    await services.sessions.restore?.(services.pluginContributionsReady);
+    if (services.cooperation && services.cooperationContexts) {
+      // Forge restores its embedded sessions while loading the dashboard. Its
+      // polling timer is not a restoration barrier.
+      await services.forge?.dashboard();
+      services.cooperationHost ??= new CooperationHost(services.cooperation, services.cooperationContexts, services.sessions,
+        error => app.log.error({ err: error }, "Cooperation host synchronization failed."), services.cooperationNative);
+      await services.cooperationHost.start();
+      await services.cooperationForge?.start();
+      app.addHook("onListen", async () => { await services.cooperationFeedback?.start(); });
+    }
+    services.jiraPolling?.start?.();
+    services.forge?.start?.();
+  } catch (error) {
+    const failures = new Set<unknown>([error]);
+    try { await app.close(); } catch (cleanup) {
+      for (const failure of cleanup instanceof AggregateError ? cleanup.errors : [cleanup]) failures.add(failure);
+    }
+    if (failures.size === 1) throw error;
+    throw new AggregateError([...failures], "CloudX startup failed and cleanup reported additional errors.");
+  }
+  await app.register(websocket, {
+    options: {
+      maxPayload: Math.max(config.voiceAudioUploadMaxBytes, VOICE_WS_CONTROL_MESSAGE_MAX_BYTES),
+      perMessageDeflate: false
+    }
+  });
+  const trustedOrigins = new Set(config.trustedOrigins);
+  const trustedAuthorities = new Set(config.trustedOrigins.flatMap((origin) => trustedOriginAuthorities(origin)));
+  app.addHook("onRequest", async (request, reply) => {
+    if (!isTrustedRequest(request.raw.rawHeaders, trustedOrigins, trustedAuthorities)) {
+      return reply.code(403).send({ error: "Forbidden" });
+    }
+  });
+
+  if (services.cooperation && services.cooperationContexts) {
+    await registerCooperationRoutes(app, { boards: services.cooperation, contexts: services.cooperationContexts, sessions: services.sessions, feedback: services.cooperationFeedback });
+  }
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer", bodyLimit: config.voiceAudioUploadMaxBytes }, (_request, body, done) => {
     done(null, body);
@@ -1399,6 +1445,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const pluginData = new PluginDataStore(config.dataDir);
   const installedPlugins = new InstalledPluginService(config.dataDir, { logger });
   const rulesSkills = new RulesSkillsCatalogService(config.dataDir);
+  const cooperation = new BlackboardService({ rootDir: path.join(config.dataDir, "cooperation") });
+  const cooperationReady = cooperation.init();
   const documentationUrl = config.documentationUrl ?? DEFAULT_DOCUMENTATION_URL;
   const documentation = new DocumentationClient(documentationUrl, {
     timeoutMs: config.documentationTimeoutMs,
@@ -1408,6 +1456,21 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_DOCUMENTATION_URL ??= documentationUrl;
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
+  const cooperationContexts = new AgentCooperationContext({
+    dataDir: config.dataDir,
+    caPath: config.https?.certPath,
+    endpoint: () => `${config.https ? "https" : "http"}://127.0.0.1:${config.port}/api/cooperation/agent`,
+    binding: async tabId => {
+      await cooperationReady;
+      if (!sessions) return undefined;
+      let tab;
+      try { tab = sessions.getTab(tabId); } catch { return undefined; }
+      if (!isAgentTab(tab)) return undefined;
+      return { ...cooperation.metadataForTab(tabId), providerId: sessions.agentProvider(tabId),
+        ...(tab.ownerPluginId ? { ownerPluginId: tab.ownerPluginId } : {}), ...sessions.agentLineage(tabId) };
+    }
+  });
+  const cooperationNative = new NativeAgentFeedbackPort({ contexts: cooperationContexts });
   let documentationEnrichment: DocumentationEnrichmentService | undefined;
   const agentAccounts = new AgentAccountStore(config.dataDir);
   const agentExec = createAgentExec(agentAccounts, runCodexExec);
@@ -1430,6 +1493,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
+  plugins.register(new CooperationPlugin());
   plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
   plugins.register(new WorktreeManagerPlugin(new WorktreeService(pathPolicy)));
   plugins.register(new WorkspaceControlPlugin());
@@ -1470,9 +1534,14 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }
   const configService = new ConfigService(config.dataDir, () => plugins.list(), { voiceModel: config.voiceModel });
   jira = new JiraIntegrationService(configService, new JiraDashboardFilterStore(pluginData));
-  sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, rulesSkills, (error, details) => {
+  sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, {
+    runtimeContextFor: async (tab, window) => cooperationContexts.augmentRuntimeContext(tab, await rulesSkills.runtimeContextFor(tab, window)),
+    tabIndicatorFor: (tab, window) => rulesSkills.tabIndicatorFor(tab, window)
+  }, (error, details) => {
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   }, new SessionStateStore(config.dataDir));
+  const cooperationHost = new CooperationHost(cooperation, cooperationContexts, sessions,
+    error => logger?.error({ err: error }, "Cooperation host synchronization failed."), cooperationNative);
   const workspaceCommands = new WorkspaceCommandService(sessions, workspace);
   const forgeConnections: ForgeConnectionService = new ForgeConnectionService({
     repository: () => settingsForForge.repository(),
@@ -1490,7 +1559,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger,
     provider: (repository, role, signal, context) => settingsForForge.provider(repository, role, signal,
       context ? diagnostic => forgeLog(logger, "warn", "provider_request_failed", { ...context, forgeRequest: diagnostic }) : undefined),
-    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, logger, dataDir: config.dataDir, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
+    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, logger, dataDir: config.dataDir, cooperation: { begin: tabId => cooperationHost.beginContinuation(tabId), transfer: (oldId, newId) => cooperationHost.transferContinuation(oldId, newId), abort: tabId => cooperationHost.abortContinuation(tabId) }, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     cleanupDisposableResources: worker => forgeResources.retire(worker),
@@ -1498,6 +1567,21 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     notify: (title, body) => { notifications.send({ title, body }); }
   });
   const pendingRulesSkillsUpdates = new Set<Promise<void>>();
+  const cooperationForge = new ForgeCooperationFeedback({
+    forge,
+    onReady: tabId => cooperationFeedback.boundary(tabId),
+    onError: error => logger?.error({ err: error }, "Managed cooperation continuation failed.")
+  });
+  const cooperationFeedback = new CooperationFeedbackDelivery({
+    boards: cooperation, contexts: cooperationContexts, native: cooperationNative,
+    lineage: tabId => {
+      const tab = sessions!.listTabs().find(candidate => candidate.id === tabId);
+      return tab && isAgentTab(tab) ? { ...cooperation.metadataForTab(tabId), providerId: sessions!.agentProvider(tabId),
+        ...(tab.ownerPluginId ? { ownerPluginId: tab.ownerPluginId } : {}), ...sessions!.agentLineage(tabId) } : undefined;
+    },
+    continueOwned: (envelope, binding) => cooperationForge.deliver(envelope, binding),
+    onError: error => logger?.error({ err: error }, "Cooperation feedback delivery failed.")
+  });
   const unsubscribeRulesSkills = rulesSkills.onChange(() => {
     const refresh = sessions!.refreshRuntimeIndicators().catch((error) => {
       logger?.error({ err: error }, "Failed to refresh rules/skills indicators.");
@@ -1509,7 +1593,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     unsubscribeRulesSkills();
     await Promise.all(pendingRulesSkillsUpdates);
   };
-  const pluginContributionsReady = syncPluginContributions(plugins.values(), rulesSkills, logger).then(async (store) => {
+  const pluginContributionsReady = Promise.all([cooperationReady, syncPluginContributions(plugins.values(), rulesSkills, logger)]).then(async ([, store]) => {
     await sessions?.applyRuntimeContexts(isAgentTab, "Injecting plugin-contributed system rules and skills.");
     return store;
   });
@@ -1548,7 +1632,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
+  return { cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

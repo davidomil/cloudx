@@ -254,7 +254,7 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/claude" --no-audit --no-fund "@anthropic-ai/claude-code@$claude_version"
       - name: Require the CLI flags, login status and hook receipts CloudX relies on
         run: |
-          CLOUDX_NATIVE_CLAUDE="$RUNNER_TEMP/claude/bin/claude" npx vitest run apps/server/src/agents
+          CLOUDX_NATIVE_CLAUDE="$RUNNER_TEMP/claude/bin/claude" npx vitest run apps/server/src/agents apps/server/src/cooperationAgent/CooperationNative.native.test.ts
   terminal-stress:
     name: Terminal stress (Node 22, 2 CPUs, 7 GiB)
     runs-on: ubuntu-24.04

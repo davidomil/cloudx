@@ -1,0 +1,1190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CloudX cooperation board snapshot, proposed schema version 1",
+  "description": "Design-only derived board snapshot. Ownership, membership authority, byte budgets, unique IDs, references, source correctness, and WIP authorization require semantic validation outside JSON Schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "boardId": {
+      "$ref": "#/$defs/id"
+    },
+    "title": {
+      "$ref": "#/$defs/title"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "closed"
+      ]
+    },
+    "eventCursor": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/member"
+      },
+      "minItems": 0,
+      "maxItems": 64
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/item"
+      },
+      "minItems": 0,
+      "maxItems": 2000
+    },
+    "connections": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/connection"
+      },
+      "minItems": 0,
+      "maxItems": 4000
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/region"
+      },
+      "minItems": 0,
+      "maxItems": 200
+    },
+    "reactions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reaction"
+      },
+      "minItems": 0,
+      "maxItems": 8000
+    },
+    "threads": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/thread"
+      },
+      "minItems": 0,
+      "maxItems": 4000
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/asset"
+      },
+      "minItems": 0,
+      "maxItems": 512
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "boardId",
+    "title",
+    "revision",
+    "status",
+    "eventCursor",
+    "members",
+    "items",
+    "connections",
+    "regions",
+    "reactions",
+    "threads",
+    "assets"
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "actor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 134,
+      "pattern": "^(user|agent):[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+      "description": "Stable actor identity: user:<userId> or agent:<stableTabId>. Provider and account labels are presentation, not author identity; historical tab IDs remain in retained records."
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "coordinate": {
+      "type": "number",
+      "minimum": -1000000,
+      "maximum": 1000000
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "$ref": "#/$defs/coordinate"
+        },
+        "y": {
+          "$ref": "#/$defs/coordinate"
+        },
+        "width": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "height": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "rotation": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height",
+        "rotation"
+      ],
+      "description": "Item rectangle before rotation; positive rotation is clockwise about its center. Its rendered rotated AABB must remain within the world coordinate envelope."
+    },
+    "member": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tabId": {
+          "$ref": "#/$defs/id"
+        },
+        "providerId": {
+          "type": "string",
+          "enum": [
+            "codex",
+            "claude"
+          ]
+        },
+        "label": {
+          "$ref": "#/$defs/title"
+        },
+        "assignmentGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "responder",
+            "observer"
+          ]
+        }
+      },
+      "required": [
+        "tabId",
+        "providerId",
+        "label",
+        "assignmentGeneration",
+        "role"
+      ]
+    },
+    "block": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 64000
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "text"
+      ]
+    },
+    "noteContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/title"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          },
+          "minItems": 1,
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "title",
+        "blocks"
+      ]
+    },
+    "codeContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/title"
+        },
+        "language": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          },
+          "minItems": 1,
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "title",
+        "language",
+        "blocks"
+      ]
+    },
+    "imageContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/title"
+        },
+        "assetId": {
+          "$ref": "#/$defs/id"
+        },
+        "alt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      },
+      "required": [
+        "title",
+        "assetId",
+        "alt"
+      ]
+    },
+    "shapeContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/title"
+        },
+        "shape": {
+          "type": "string",
+          "enum": [
+            "rectangle",
+            "diamond",
+            "ellipse",
+            "cylinder"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      },
+      "required": [
+        "title",
+        "shape",
+        "label"
+      ]
+    },
+    "point": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/coordinate"
+        },
+        {
+          "$ref": "#/$defs/coordinate"
+        },
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "stroke": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/point"
+          },
+          "minItems": 1,
+          "maxItems": 20000,
+          "description": "Drawing-local coordinates [x,y,pressure], before the item's geometry transform. Each point plus half the stroke width must stay within [0,item width] x [0,item height]; cross-field validation is required."
+        },
+        "color": {
+          "type": "string",
+          "minLength": 7,
+          "maxLength": 9,
+          "pattern": "^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$"
+        },
+        "width": {
+          "type": "number",
+          "minimum": 0.25,
+          "maximum": 64
+        }
+      },
+      "required": [
+        "id",
+        "points",
+        "color",
+        "width"
+      ]
+    },
+    "drawingContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "$ref": "#/$defs/title"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000
+        },
+        "strokes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/stroke"
+          },
+          "minItems": 0,
+          "maxItems": 2000
+        }
+      },
+      "required": [
+        "title",
+        "description",
+        "strokes"
+      ]
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "itemId": {
+          "$ref": "#/$defs/id"
+        },
+        "port": {
+          "type": "string",
+          "enum": [
+            "north",
+            "east",
+            "south",
+            "west",
+            "center"
+          ]
+        }
+      },
+      "required": [
+        "itemId",
+        "port"
+      ]
+    },
+    "waypoint": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/coordinate"
+        },
+        {
+          "$ref": "#/$defs/coordinate"
+        }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "connection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "from": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "to": {
+          "$ref": "#/$defs/endpoint"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "none",
+            "forward",
+            "both"
+          ]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "waypoints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/waypoint"
+          },
+          "minItems": 0,
+          "maxItems": 128
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "updatedBy": {
+          "$ref": "#/$defs/actor"
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "from",
+        "to",
+        "direction",
+        "description",
+        "waypoints",
+        "createdBy",
+        "updatedBy"
+      ],
+      "description": "Canonical world polyline from the fixed compass source port after item rotation, through persisted waypoints, to the rotated target port. Empty waypoints mean a straight line; there is no unpersisted Bezier routing. Stroke width is 2 world units. The label occupies a fixed 200 x 48 world-unit rectangle centered at half the path's arc length (or the endpoint for zero total length); label text wraps and clips."
+    },
+    "region": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "title": {
+          "$ref": "#/$defs/title"
+        },
+        "geometry": {
+          "$ref": "#/$defs/regionGeometry"
+        },
+        "ownerActor": {
+          "$ref": "#/$defs/actor"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "wip",
+            "ready"
+          ]
+        },
+        "protectedItemIds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          },
+          "minItems": 0,
+          "maxItems": 2000,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "title",
+        "geometry",
+        "ownerActor",
+        "mode",
+        "protectedItemIds"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "wip"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ownerActor": {
+                "pattern": "^user:"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "blockId": {
+          "$ref": "#/$defs/id"
+        },
+        "blockRevision": {
+          "$ref": "#/$defs/revision"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000
+        },
+        "exact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64000
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "suffix": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 256
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "attached",
+            "stale"
+          ]
+        }
+      },
+      "required": [
+        "blockId",
+        "blockRevision",
+        "start",
+        "end",
+        "exact",
+        "prefix",
+        "suffix",
+        "status"
+      ],
+      "description": "Offsets are zero-based Unicode code-point positions in the block text, using the half-open interval [start,end). Attached anchors require matching block revision and exact text. Stale anchors require user review."
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "item",
+            "connection",
+            "region",
+            "threadMessage"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "anchor": {
+          "$ref": "#/$defs/anchor"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/targetSnapshot"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "item"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "snapshot": {
+                "properties": {
+                  "record": {
+                    "$ref": "#/$defs/item"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "connection"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "snapshot": {
+                "properties": {
+                  "record": {
+                    "$ref": "#/$defs/connection"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "region"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "snapshot": {
+                "properties": {
+                  "record": {
+                    "$ref": "#/$defs/region"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "threadMessage"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "snapshot": {
+                "properties": {
+                  "record": {
+                    "$ref": "#/$defs/threadMessage"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "description": "Anchors apply only to text blocks of note or code item targets. A target missing from the live board requires snapshot of its last live record. Snapshot kind/id must match the target; original anchor quotes remain and image asset references pin bytes. References, ID equality, and anchor text require semantic validation."
+    },
+    "reaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "question",
+            "agree",
+            "concern",
+            "idea",
+            "custom"
+          ]
+        },
+        "glyph": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "author": {
+          "$ref": "#/$defs/actor"
+        },
+        "threadId": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "kind",
+        "glyph",
+        "description",
+        "target",
+        "author"
+      ]
+    },
+    "threadMessage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "author": {
+          "$ref": "#/$defs/actor"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32000
+        },
+        "sourceRefs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "minItems": 0,
+          "maxItems": 32,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "author",
+        "text",
+        "sourceRefs"
+      ]
+    },
+    "thread": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "questionReactionId": {
+          "$ref": "#/$defs/id"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "open",
+            "answered",
+            "resolved"
+          ]
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/threadMessage"
+          },
+          "minItems": 1,
+          "maxItems": 200
+        }
+      },
+      "required": [
+        "id",
+        "revision",
+        "target",
+        "status",
+        "messages"
+      ]
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "mime": {
+          "type": "string",
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/webp"
+          ]
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "byteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10485760
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 40000000
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 40000000
+        },
+        "relativePath": {
+          "type": "string",
+          "minLength": 12,
+          "maxLength": 144,
+          "pattern": "^assets/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\\.(png|jpg|jpeg|webp)$"
+        }
+      },
+      "required": [
+        "id",
+        "mime",
+        "sha256",
+        "byteLength",
+        "width",
+        "height",
+        "relativePath"
+      ]
+    },
+    "regionGeometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "$ref": "#/$defs/coordinate"
+        },
+        "y": {
+          "$ref": "#/$defs/coordinate"
+        },
+        "width": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "height": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "rotation": {
+          "const": 0
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "width",
+        "height",
+        "rotation"
+      ],
+      "description": "Regions are axis aligned; their rotation is always zero."
+    },
+    "noteItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "note"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "geometry": {
+          "$ref": "#/$defs/geometry"
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "updatedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "content": {
+          "$ref": "#/$defs/noteContent"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "revision",
+        "geometry",
+        "createdBy",
+        "updatedBy",
+        "content"
+      ]
+    },
+    "codeItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "code"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "geometry": {
+          "$ref": "#/$defs/geometry"
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "updatedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "content": {
+          "$ref": "#/$defs/codeContent"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "revision",
+        "geometry",
+        "createdBy",
+        "updatedBy",
+        "content"
+      ]
+    },
+    "imageItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "image"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "geometry": {
+          "$ref": "#/$defs/geometry"
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "updatedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "content": {
+          "$ref": "#/$defs/imageContent"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "revision",
+        "geometry",
+        "createdBy",
+        "updatedBy",
+        "content"
+      ]
+    },
+    "shapeItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "shape"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "geometry": {
+          "$ref": "#/$defs/geometry"
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "updatedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "content": {
+          "$ref": "#/$defs/shapeContent"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "revision",
+        "geometry",
+        "createdBy",
+        "updatedBy",
+        "content"
+      ]
+    },
+    "drawingItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "drawing"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
+        "geometry": {
+          "$ref": "#/$defs/geometry"
+        },
+        "createdBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "updatedBy": {
+          "$ref": "#/$defs/actor"
+        },
+        "content": {
+          "$ref": "#/$defs/drawingContent"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "revision",
+        "geometry",
+        "createdBy",
+        "updatedBy",
+        "content"
+      ]
+    },
+    "item": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/noteItem"
+        },
+        {
+          "$ref": "#/$defs/codeItem"
+        },
+        {
+          "$ref": "#/$defs/imageItem"
+        },
+        {
+          "$ref": "#/$defs/shapeItem"
+        },
+        {
+          "$ref": "#/$defs/drawingItem"
+        }
+      ]
+    },
+    "targetSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "removedAtBoardRevision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "record": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/item"
+            },
+            {
+              "$ref": "#/$defs/connection"
+            },
+            {
+              "$ref": "#/$defs/region"
+            },
+            {
+              "$ref": "#/$defs/threadMessage"
+            }
+          ]
+        }
+      },
+      "required": [
+        "removedAtBoardRevision",
+        "record"
+      ]
+    }
+  },
+  "$comment": "Proposed v1 release budgets: UTF-8 snapshot <=8 MiB; aggregate authoritative state <=64 MiB; assets <=256 MiB per board; each image <=10 MiB and <=40 megapixels; drawing points <=200000 per board. JSON Schema enforces only field-local bounds. Semantic validation must enforce byte totals, pixel products, reference integrity, attached-anchor offsets, asset identity, rotated item world bounds, and drawing points plus half brush width within the local item rectangle."
+}

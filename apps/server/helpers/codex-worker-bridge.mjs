@@ -14,6 +14,8 @@ import { CodexCommandDetailsCapture, saveCommandDetails } from "./codex-command-
 import { CodexNativeWorkObservation } from "./codex-native-work.mjs";
 import { CodexBackendDiagnostics } from "./codex-backend-diagnostics.mjs";
 import { CodexResumeTimings } from "./codex-resume-timings.mjs";
+import { CooperationNativeControl } from "./cooperation-native-control.mjs";
+import { CodexCooperationFeedback } from "./cooperation-codex-feedback.mjs";
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_AUXILIARY_THREADS = 32;
@@ -202,6 +204,28 @@ export async function runWorkerBridge(launch) {
     try { saveTurnReceipt(launch.workHealth.receiptPath, value); }
     catch (error) { recordDiagnostic(`CloudX native work health: ${error.message}\n`); }
   }, selection) : undefined;
+  let controlForward;
+  let cooperationControl;
+  const cooperation = launch.cooperation ? new CodexCooperationFeedback({
+    owned: Boolean(launch.binding),
+    threadId: () => selection?.selectedThreadId ?? turn?.turn?.threadId ?? launch.binding?.expectedThreadId,
+    connected: () => Boolean(controlForward) && phase === "conversation",
+    skills: launch.cooperation.skills,
+    boundary: () => { void cooperationControl?.boundary().catch(error => recordDiagnostic(`CloudX cooperation boundary: ${error.message}\n`)); },
+    turn: value => { void cooperationControl?.turn(value).catch(error => recordDiagnostic(`CloudX cooperation turn: ${error.message}\n`)); },
+    send: message => {
+      if (!controlForward) throw new Error("The original Codex broker is disconnected.");
+      workspace?.fromClient(message);
+      workHealth?.fromClient(message);
+      turn?.fromClient(message);
+      activity?.fromClient(message);
+      commands?.fromClient(message);
+      controlForward(`${JSON.stringify(message)}\n`);
+    }
+  }) : undefined;
+  if (cooperation) cooperationControl = await new CooperationNativeControl({
+    ...launch.cooperation, providerId: "codex"
+  }, envelope => cooperation.deliver(envelope)).start();
   if (!turn && !selection) throw new Error("A native bridge execution binding is required.");
   let finishing = false;
   let failure;
@@ -247,6 +271,10 @@ export async function runWorkerBridge(launch) {
       if (native.stdin.writableLength + Buffer.byteLength(line) > MAX_INPUT_BYTES) throw new Error("Native worker input exceeds the size limit.");
       native.stdin.write(line);
     };
+    controlForward = line => {
+      if (!native || retiring || finishing) throw new Error("The original Codex broker is not at an input boundary.");
+      forward(line);
+    };
     socket.on("error", error => {
       if (["EPIPE", "ECONNRESET"].includes(error.code) && socket.readyState === WebSocket.CLOSING) return;
       fail(error);
@@ -255,6 +283,7 @@ export async function runWorkerBridge(launch) {
       if (finishing || retiring) return;
       try {
         const message = JSON.parse(data.toString());
+        cooperation?.fromClient(message);
         const fork = forks?.fromClient(message);
         if (fork?.error) { socket.send(JSON.stringify({ id: message.id, error: fork.error })); return; }
         workspace?.fromClient(message);
@@ -275,6 +304,8 @@ export async function runWorkerBridge(launch) {
       } catch (error) { fail(error); }
     });
     socket.on("close", () => {
+      controlForward = undefined;
+      cooperation?.close();
       timings.disconnected();
       workspace?.listings.clear();
       if (retiring) return;
@@ -370,6 +401,7 @@ export async function runWorkerBridge(launch) {
         turn?.fromServer(message);
         activity?.fromServer(message);
         commands?.fromServer(message);
+        return cooperation?.fromServer(message);
       }).catch(fail);
       for (const line of queued) forward(line);
       queued.length = 0;
@@ -389,6 +421,8 @@ export async function runWorkerBridge(launch) {
       // Exiting the bridge returns ownership to the terminal supervisor, which
       // reaps the app server and remaining tools before announcing terminal exit.
       await commands?.close();
+      cooperation?.close();
+      await cooperationControl?.close();
       process.exit(signal ? 1 : code ?? 1);
     });
   };

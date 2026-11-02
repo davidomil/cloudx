@@ -20,6 +20,8 @@ export * from "./agents.js";
 import type { AGENT_ACCOUNTS_OPTION_SOURCE } from "./agents.js";
 export * from "./claudeSettings.js";
 export * from "./agentUsage.js";
+export * from "./cooperation.js";
+export * from "./cooperationGeometry.js";
 
 export const DEFAULT_VOICE_MODEL = "gpt-5.6-luna";
 

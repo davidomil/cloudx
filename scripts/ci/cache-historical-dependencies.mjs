@@ -16,6 +16,7 @@ export const historicalDependencyPackages = [
   "fast-uri@4.1.4",
   "fastify@5.10.0",
   "process-warning@5.0.0",
+  "semver@7.8.0",
   "smol-toml@1.7.0",
   "smol-toml@1.7.1",
   "source-map-js@1.2.1",

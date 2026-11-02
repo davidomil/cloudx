@@ -1,19 +1,24 @@
 import { lazy, Suspense, useEffect, useId, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { Monitor, X } from "lucide-react";
 import { isAgentTab, type ForgeWorker, type ForgeWorkerHistory, type WorkspaceTab } from "@cloudx/shared";
 
+import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { useCooperationBoards } from "./cooperation/cooperationBoards.js";
 import { ControlButton } from "./Control.js";
 
 const TerminalPanel = lazy(() => import("./TerminalPanel.js").then(module => ({ default: module.TerminalPanel })));
 const ForgeWorkerHistoryPanel = lazy(() => import("./ForgeWorkerHistoryPanel.js").then(module => ({ default: module.ForgeWorkerHistoryPanel })));
 
-export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, uiScale, onClose }: {
+export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, uiScale, onClose, onOpenBlackboard }: {
   worker: ForgeWorker;
   workerTabs: WorkspaceTab[];
   loadHistory: (id: string) => Promise<ForgeWorkerHistory | undefined>;
   uiScale: number;
   onClose: () => void;
+  onOpenBlackboard?: (boardId: string, title: string) => void;
 }) {
+  const blackboardMenu = useAgentSwitchMenu(Boolean(onOpenBlackboard));
+  const blackboards = useCooperationBoards(Boolean(onOpenBlackboard));
   const dialogRef = useRef<HTMLDialogElement>(null);
   const terminalRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
@@ -44,8 +49,9 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
   return <dialog ref={dialogRef} className="forge-worker-overlay" aria-labelledby={titleId} onCancel={event => {
     if (terminal && terminalRef.current?.contains(document.activeElement)) event.preventDefault();
   }} onClose={event => { if (!event.currentTarget.open) onClose(); }}>
-    <header className="forge-worker-overlay-header">
-      <div><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
+    <header className="forge-worker-overlay-header" {...(terminal ? blackboardMenu.tabHandlers(terminal) : {})}>
+      <div tabIndex={terminal && onOpenBlackboard ? 0 : undefined}><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
+      {terminal && onOpenBlackboard ? (() => { const board = blackboards.boards.find(board => board.members.some(member => member.tabId === terminal.id)); return board ? <ControlButton size="compact" aria-label={`Open blackboard ${board.title}`} onClick={() => { dialogRef.current?.close(); onOpenBlackboard(board.boardId, board.title); }}><Monitor size={14} />{board.title}</ControlButton> : null; })() : null}
       <ControlButton size="compact" iconOnly aria-label="Close worker terminal" title="Close worker terminal" onClick={() => dialogRef.current!.close()}><X size={18} /></ControlButton>
     </header>
     {worker.error ? <p className="forge-notice" role="alert">{worker.error}</p> : null}
@@ -60,5 +66,6 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
           <ForgeWorkerHistoryPanel history={history} uiScale={uiScale} />
         </Suspense> : <p role="status" className="forge-empty">{worker.tabId ? "The worker terminal is unavailable." : "No saved worker terminal history is available."}</p>}
     </div>
+    {blackboardMenu.position && terminal && onOpenBlackboard ? <AgentSwitchMenu tab={terminal} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={(boardId, title) => { dialogRef.current?.close(); onOpenBlackboard(boardId, title); }} onClose={blackboardMenu.close} /> : null}
   </dialog>;
 }

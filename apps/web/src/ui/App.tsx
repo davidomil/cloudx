@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
-import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
+import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, Monitor, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
 import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_TERMINAL_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, isAgentProviderId, type AgentAccountsState, type AgentProviderId, type AgentSelection, DEFAULT_WORKSPACE_MAX_PANES, combineAgentUsage, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
@@ -81,6 +81,7 @@ import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { useCooperationBoards } from "./cooperation/cooperationBoards.js";
 import { agentSelection, agentTabChoices } from "./agentTabChoice.js";
 import { UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
 import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
@@ -115,6 +116,7 @@ function forgeRepositorySettingsKey(values: Record<string, ConfigValue> | undefi
   return JSON.stringify([values?.provider, values?.apiUrl, values?.projectPath]);
 }
 
+const CooperationPanel = lazy(() => import("./cooperation/CooperationPanel.js").then(module => ({ default: module.CooperationPanel })));
 const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) => ({ default: module.AutomationPanel })));
 const DocumentationPanel = lazy(() => import("./DocumentationPanel.js").then((module) => ({ default: module.DocumentationPanel })));
 const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
@@ -403,7 +405,9 @@ export function App() {
 
   const tabById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
   const pluginById = useMemo(() => new Map(plugins.map((plugin) => [plugin.id, plugin])), [plugins]);
-  const agentSwitch = useAgentSwitchMenu(pluginById.has(AGENT_ACCOUNTS_PLUGIN_ID));
+  const cooperationEnabled = pluginById.has("cooperation");
+  const cooperation = useCooperationBoards(cooperationEnabled, tabs.map(tab => `${tab.id}:${tab.title}`).join(":"));
+  const agentSwitch = useAgentSwitchMenu(pluginById.has(AGENT_ACCOUNTS_PLUGIN_ID) || cooperationEnabled);
   const usageHover = useUsageHover();
   const usageAvailable = pluginById.has(AGENT_USAGE_PLUGIN_ID);
   const panes = useMemo(() => listPanes(layout.root), [layout.root]);
@@ -823,6 +827,14 @@ export function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  async function openBlackboard(boardId: string, title: string, newView = false) {
+    const existing = !newView && tabsRef.current.find(tab => tab.pluginId === "cooperation" && tab.pluginMetadata?.cooperation?.boardId === boardId);
+    if (existing) {
+      const pane = findPaneContainingTab(layoutRef.current.root, existing.id);
+      await activateTab(existing.id, pane?.id);
+    } else await handleCreate({ pluginId: "cooperation", title, initialInput: { boardId } });
   }
 
   function closeCreateDialog() {
@@ -1284,6 +1296,7 @@ export function App() {
       );
     },
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
+    "cooperation.panel": (_contribution, context) => context.tab ? <Suspense fallback={<div className="empty-pane">Loading blackboard…</div>}><CooperationPanel tab={context.tab} tabs={tabs} active={context.active === true} onOpenBoard={openBlackboard} /></Suspense> : null,
     "jira.panel": (_contribution, context) => context.callHook ? (
       <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
         <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />
@@ -1293,7 +1306,7 @@ export function App() {
       const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
       if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
       return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
-        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} showUsage={usageAvailable} />
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} showUsage={usageAvailable} onOpenBlackboard={cooperationEnabled ? (boardId, title) => { void openBlackboard(boardId, title); } : undefined} />
       </Suspense>;
     },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
@@ -1480,6 +1493,7 @@ export function App() {
                 onApply={handleApplyTemplate}
               />
             ) : null}
+            {cooperationEnabled && cooperation.error ? <ControlButton size="compact" iconOnly aria-label="Reconnect blackboard list" title={cooperation.error} onClick={() => void cooperation.reload()}><Monitor size={15} /></ControlButton> : null}
             {renderUiContributions("app.topbar.actions")}
           </div>
         </div>
@@ -1540,6 +1554,9 @@ export function App() {
           callHook={callUiHook}
           onSwitched={tab => setTabs(current => current.map(currentTab => currentTab.id === tab.id ? tab : currentTab))}
           onOpenAccounts={() => { setSettingsCategory("agents"); setSettingsOpen(true); }}
+          accountsEnabled={pluginById.has(AGENT_ACCOUNTS_PLUGIN_ID)}
+          cooperationEnabled={cooperationEnabled}
+          onOpenBoard={(boardId, title) => { void openBlackboard(boardId, title); }}
           onClose={agentSwitch.close}
         />
       ) : null}
@@ -1631,6 +1648,10 @@ export function App() {
                   {renderTabIndicator(tab, shouldBlink)}
                 </button>
                 <div className="tab-actions">
+                  {cooperationEnabled && isAgentTab(tab) ? (() => {
+                    const board = cooperation.boards.find(board => board.members.some(member => member.tabId === tab.id));
+                    return board ? <button type="button" className="cooperation-tab-badge" aria-label={`Open blackboard ${board.title}${board.openQuestions ? `, ${board.openQuestions} open questions` : ""}`} title={`${board.title}${board.openQuestions ? ` · ${board.openQuestions} open questions` : ""}`} onClick={event => { event.stopPropagation(); void openBlackboard(board.boardId, board.title); }}><Monitor size={13} />{board.openQuestions ? <span>{board.openQuestions}</span> : null}</button> : null;
+                  })() : null}
                   {renderUiContributions("tab.actions.trailing", { tab })}
                   <button
                     type="button"
@@ -1700,7 +1721,7 @@ export function App() {
             const plugin = pluginById.get(tab.pluginId);
             const selected = tabId === activePaneTabId;
             return (
-              <TabPanel key={tabId} active={selected} keepMounted={plugin?.panelKind === "web-viewer"}>
+              <TabPanel key={tabId} active={selected} keepMounted={plugin?.panelKind === "web-viewer" || tab.pluginId === "cooperation"}>
                 <PluginPanel
                   tab={tab}
                   plugin={plugin}

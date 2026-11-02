@@ -1,0 +1,389 @@
+{
+  "schemaVersion": 1,
+  "boardId": "board-system-design",
+  "title": "Draft template: System design",
+  "revision": 12,
+  "status": "active",
+  "eventCursor": 24,
+  "members": [
+    {
+      "tabId": "tab-codex",
+      "providerId": "codex",
+      "label": "Codex Architect",
+      "assignmentGeneration": 1,
+      "role": "responder"
+    },
+    {
+      "tabId": "tab-claude",
+      "providerId": "claude",
+      "label": "Claude Reviewer",
+      "assignmentGeneration": 1,
+      "role": "observer"
+    }
+  ],
+  "items": [
+    {
+      "id": "goal-note",
+      "kind": "note",
+      "revision": 1,
+      "geometry": {
+        "x": 80,
+        "y": 60,
+        "width": 410,
+        "height": 190,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "Goal and assumptions",
+        "blocks": [
+          {
+            "id": "goal-block",
+            "revision": 1,
+            "text": "Proposal: keep checkout responsive while each accepted payment reaches the ledger."
+          },
+          {
+            "id": "assumption-block",
+            "revision": 1,
+            "text": "Unverified assumption: the payment provider returns a durable receipt before ledger work starts."
+          }
+        ]
+      }
+    },
+    {
+      "id": "queue-decision",
+      "kind": "note",
+      "revision": 1,
+      "geometry": {
+        "x": 80,
+        "y": 390,
+        "width": 430,
+        "height": 180,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Proposal: queue before ledger",
+        "blocks": [
+          {
+            "id": "queue-reason",
+            "revision": 1,
+            "text": "A durable queue separates checkout from ledger work."
+          },
+          {
+            "id": "queue-open",
+            "revision": 1,
+            "text": "Open question: choose the replay boundary and demonstrate duplicate handling before adopting this design."
+          }
+        ]
+      }
+    },
+    {
+      "id": "checkout-api",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 560,
+        "y": 100,
+        "width": 220,
+        "height": 100,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Checkout API",
+        "shape": "rectangle",
+        "label": "Checkout API"
+      }
+    },
+    {
+      "id": "event-queue",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 900,
+        "y": 100,
+        "width": 190,
+        "height": 100,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Event queue",
+        "shape": "cylinder",
+        "label": "Event queue"
+      }
+    },
+    {
+      "id": "ledger-worker",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 1220,
+        "y": 100,
+        "width": 220,
+        "height": 100,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Ledger worker",
+        "shape": "rectangle",
+        "label": "Ledger worker"
+      }
+    },
+    {
+      "id": "contract-code",
+      "kind": "code",
+      "revision": 1,
+      "geometry": {
+        "x": 590,
+        "y": 390,
+        "width": 410,
+        "height": 220,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Proposed receipt event",
+        "language": "json",
+        "blocks": [
+          {
+            "id": "contract-block",
+            "revision": 1,
+            "text": "{\n  \"receiptId\": \"receipt-example\",\n  \"paymentId\": \"payment-example\",\n  \"kind\": \"payment.accepted\"\n}"
+          }
+        ]
+      }
+    },
+    {
+      "id": "reference-image",
+      "kind": "image",
+      "revision": 1,
+      "geometry": {
+        "x": 1110,
+        "y": 380,
+        "width": 400,
+        "height": 250,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "Generated visual reference (concept)",
+        "assetId": "reference",
+        "alt": "Concept image of a CloudX board with proposal notes and a payment-system flowchart. This is not evidence of a working payment service."
+      }
+    }
+  ],
+  "connections": [
+    {
+      "id": "api-to-queue",
+      "revision": 1,
+      "from": {
+        "itemId": "checkout-api",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "event-queue",
+        "port": "west"
+      },
+      "direction": "forward",
+      "description": "Proposed: publish an accepted-payment receipt",
+      "waypoints": [],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    },
+    {
+      "id": "queue-to-ledger",
+      "revision": 1,
+      "from": {
+        "itemId": "event-queue",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "ledger-worker",
+        "port": "west"
+      },
+      "direction": "forward",
+      "description": "Proposed: deliver a receipt for ledger work",
+      "waypoints": [],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    },
+    {
+      "id": "goal-to-api",
+      "revision": 1,
+      "from": {
+        "itemId": "goal-note",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "checkout-api",
+        "port": "west"
+      },
+      "direction": "none",
+      "description": "Design constraint: checkout response time",
+      "waypoints": [],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    },
+    {
+      "id": "reason-to-queue",
+      "revision": 1,
+      "from": {
+        "itemId": "queue-decision",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "event-queue",
+        "port": "west"
+      },
+      "direction": "none",
+      "description": "Explains the proposed queue boundary",
+      "waypoints": [
+        [
+          730,
+          320
+        ],
+        [
+          995,
+          320
+        ]
+      ],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    }
+  ],
+  "regions": [
+    {
+      "id": "architecture-region",
+      "revision": 1,
+      "title": "Initial architecture proposal",
+      "geometry": {
+        "x": 40,
+        "y": 20,
+        "width": 1510,
+        "height": 650,
+        "rotation": 0
+      },
+      "ownerActor": "user:david",
+      "mode": "ready",
+      "protectedItemIds": []
+    }
+  ],
+  "reactions": [
+    {
+      "id": "question-queue",
+      "revision": 1,
+      "kind": "question",
+      "glyph": "?",
+      "description": "What proves this queue is durable?",
+      "target": {
+        "kind": "item",
+        "id": "queue-decision",
+        "anchor": {
+          "blockId": "queue-reason",
+          "blockRevision": 1,
+          "start": 2,
+          "end": 15,
+          "exact": "durable queue",
+          "prefix": "A ",
+          "suffix": " separates checkout from ledger ",
+          "status": "attached"
+        }
+      },
+      "author": "user:david",
+      "threadId": "thread-queue"
+    },
+    {
+      "id": "agree-goal",
+      "revision": 1,
+      "kind": "agree",
+      "glyph": "✓",
+      "description": "This states the intended outcome.",
+      "target": {
+        "kind": "item",
+        "id": "goal-note"
+      },
+      "author": "user:david"
+    },
+    {
+      "id": "concern-replay",
+      "revision": 1,
+      "kind": "concern",
+      "glyph": "!",
+      "description": "Specify duplicate handling before claiming replay is safe.",
+      "target": {
+        "kind": "connection",
+        "id": "queue-to-ledger"
+      },
+      "author": "agent:tab-claude"
+    },
+    {
+      "id": "idea-reference",
+      "revision": 1,
+      "kind": "idea",
+      "glyph": "+",
+      "description": "Use this only as a layout reference.",
+      "target": {
+        "kind": "item",
+        "id": "reference-image"
+      },
+      "author": "user:david"
+    }
+  ],
+  "threads": [
+    {
+      "id": "thread-queue",
+      "revision": 2,
+      "target": {
+        "kind": "item",
+        "id": "queue-decision",
+        "anchor": {
+          "blockId": "queue-reason",
+          "blockRevision": 1,
+          "start": 2,
+          "end": 15,
+          "exact": "durable queue",
+          "prefix": "A ",
+          "suffix": " separates checkout from ledger ",
+          "status": "attached"
+        }
+      },
+      "questionReactionId": "question-queue",
+      "status": "open",
+      "messages": [
+        {
+          "id": "msg-queue-question",
+          "author": "user:david",
+          "text": "What proves this queue is durable?",
+          "sourceRefs": []
+        },
+        {
+          "id": "msg-queue-answer",
+          "author": "agent:tab-codex",
+          "text": "Durability is a requirement in this proposal. No queue product or configuration has been selected or verified. We need that evidence before this becomes a decision.",
+          "sourceRefs": []
+        }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "id": "reference",
+      "mime": "image/png",
+      "sha256": "2d06be8acfe419c5a8878300d2aa653323a838b3c28da2f55ebf0d6893baacbf",
+      "byteLength": 1510788,
+      "width": 1586,
+      "height": 992,
+      "relativePath": "assets/reference.png"
+    }
+  ]
+}

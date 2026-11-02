@@ -260,6 +260,27 @@ function recordStop(configDir, binding, payload) {
   spawn(process.execPath, [fileURLToPath(import.meta.url), "--settle", configDir, stopId], { detached: true, stdio: "ignore" }).unref();
 }
 
+function tabTurnCanComplete(current, pending) {
+  if (!current) return true;
+  if (current.sessionId !== pending.payload.session_id) return false;
+  if (current.turnId === pending.payload.prompt_id) return true;
+  // Enter during another turn can submit a queued prompt with that turn's
+  // hook ID. The dequeued native prompt and its Stop get a new ID. Only the
+  // original transcript can prove this receipt precedes the settled prompt.
+  if (!current.turnId || !pending.payload.prompt_id) return false;
+  let currentSeen = false;
+  let latestPromptId;
+  new TranscriptReader(pending.transcriptPath, 0).read(line => {
+    let record;
+    try { record = JSON.parse(line); } catch { return; }
+    if (record.type !== "user" || record.isSidechain === true || typeof record.promptId !== "string" ||
+      record.sessionId && record.sessionId !== pending.payload.session_id) return;
+    if (record.promptId === current.turnId) currentSeen = true;
+    latestPromptId = record.promptId;
+  });
+  return currentSeen && latestPromptId === pending.payload.prompt_id;
+}
+
 // Completes the turn once its Stop settled. A continued Stop leaves the turn
 // to the next Stop; if Claude writes no response after it before the
 // timeout, Claude ended the turn after all, and this Stop completes it.
@@ -283,7 +304,7 @@ async function settle(configDir, stopId) {
       // When a newer prompt already replaced the tab's turn, only the Forge
       // attempt, which tracks its own first turn, still completes.
       const current = readJson(path.join(configDir, TURN_RECEIPT));
-      const tab = !current || (current.sessionId === pending.payload.session_id && current.turnId === pending.payload.prompt_id);
+      const tab = tabTurnCanComplete(current, pending);
       return applyEvent(configDir, pending.binding, "Stop", pending.payload, { tab });
     }
     await sleep(SETTLE_POLL_MS);

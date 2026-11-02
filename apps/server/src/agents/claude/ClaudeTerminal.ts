@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions } from "@cloudx/plugin-api";
 import { readAgentSelection, type AgentSelection } from "@cloudx/shared";
@@ -19,6 +20,7 @@ import type { TerminalProcessFactory } from "../../terminal/TerminalProcess.js";
 import { buildEnforcedLoginShellLaunch, buildToolEnv, resolveClaudeCommand } from "../../terminal/ShellLaunch.js";
 import type { AgentAccountStore } from "../AgentAccountStore.js";
 import type { AgentUsageRecorder } from "../usage/AgentUsageRecorder.js";
+import { cooperationLaunchEnv } from "../../cooperationAgent/AgentCooperationContext.js";
 import { claudeEnforcedEnv, claudeLaunchEnv } from "../agentCli.js";
 import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
 import { codexResumeInput } from "../resumeInput.js";
@@ -93,7 +95,7 @@ export class ClaudeTerminal {
         throw new Error("Forge workers on Claude run without permission prompts. Accept Claude Code's bypass-permissions warning in Settings → Claude, then resume the worker.");
       account = await accounts.resolve("claude", agent.accountId);
       accountEnv = await accounts.launchEnv(account);
-      env = claudeLaunchEnv(buildToolEnv(this.env), configDir, accountEnv);
+      env = { ...claudeLaunchEnv(buildToolEnv(this.env), configDir, accountEnv), ...cooperationLaunchEnv(input.runtimeContext) };
       overlayInput = {
         dataDir, tabId: input.tab.id, accountHome: accounts.home(account), providerHome: this.providerHome, executionId,
         resolved: template, cwd: input.cwd, userStatePath: claudeUserStatePath(this.env),
@@ -111,8 +113,18 @@ export class ClaudeTerminal {
     let args: string[];
     try {
       await writeForgeTurnBinding(configDir, input.agentTurn, input.prepareAgentSession ? newSessionId ?? codexResumeInput(launchInput)?.sessionId : undefined);
+      const cooperationMcpConfig = env.CLOUDX_COOPERATION_CONTEXT ? path.join(configDir, ".cloudx-cooperation-mcp.json") : undefined;
+      if (cooperationMcpConfig) await writeTextFileAtomic(configDir, cooperationMcpConfig, `${JSON.stringify({ mcpServers: {
+        "cloudx-cooperation": {
+          command: process.execPath,
+          args: [fileURLToPath(new URL("../../../helpers/cooperation-claude-broker.mjs", import.meta.url)), configDir, input.tab.id, executionId],
+          env: { CLOUDX_COOPERATION_CONTEXT: env.CLOUDX_COOPERATION_CONTEXT, ...(input.agentTurn ? { CLOUDX_COOPERATION_OWNED: "1" } : {}) }
+        }
+      } })}\n`, "Claude cooperation MCP config", 0o600);
       args = buildClaudeLaunchArgs(launchInput, {
-        settings, settingsPath: overlay.settingsPath, addDirs: [overlay.rulesSkillsRoot], newSessionId
+        settings, settingsPath: overlay.settingsPath,
+        addDirs: [overlay.rulesSkillsRoot, ...(env.CLOUDX_COOPERATION_ASSETS ? [env.CLOUDX_COOPERATION_ASSETS] : [])],
+        newSessionId, cooperationMcpConfig
       });
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
@@ -128,7 +140,10 @@ export class ClaudeTerminal {
     await fs.rm(agentTurnReceiptPath(configDir), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
     // The selected account wins over credentials the user's profile exports.
-    const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, claudeEnforcedEnv(configDir, accountEnv));
+    const enforced = claudeEnforcedEnv(configDir, accountEnv);
+    const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, {
+      ...enforced, set: { ...enforced.set, ...cooperationLaunchEnv(input.runtimeContext) }
+    });
     const execution = await input.prepareTerminalExecution?.(input.tab.id);
     const terminalProcess = await this.options.factory.spawn(launch.command, launch.args, {
       cwd: input.cwd, env: launch.env, cols: 100, rows: 30,

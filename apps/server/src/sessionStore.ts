@@ -5,7 +5,7 @@ import path from "node:path";
 
 import { PluginSessionMissingError, PluginSessionOwnershipError, pluginActionHookId } from "@cloudx/plugin-api";
 import type { CloudxAppContext, CreatePluginSessionInput, HookCaller, PluginActionDefinition, PluginSession, PluginSessionLaunchOptions, PluginTabControls, WorkspacePlugin } from "@cloudx/plugin-api";
-import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, isRecord, listTabLayoutPanes, type AgentSwitchRequest } from "@cloudx/shared";
+import { AGENT_TERMINAL_PLUGIN_ID, isAgentTab, isRecord, listTabLayoutPanes, readAgentSelection, type AgentProviderId, type AgentSwitchRequest } from "@cloudx/shared";
 import type { CodexNativeWork, ConfigValue, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, RecoverTabRequest, TabRecovery } from "@cloudx/shared";
 import type { HookId, PluginId, PluginMetadata, PluginMetadataMap, TabIndicator, TabIndicatorUpdate, VoiceAction, WorkspaceRuntimeContext, WorkspaceSnapshot, WorkspaceTab, WorkspaceTabsUpdate, WorkspaceWindow } from "@cloudx/shared";
 
@@ -56,6 +56,7 @@ export class SessionStore {
   private readonly preparedTabFailures = new Map<string, Error>();
   private readonly sessionDisposers = new Map<string, Array<() => void>>();
   private readonly tabsListeners = new Set<(update: WorkspaceTabsUpdate) => void>();
+  private readonly tabRemovalListeners = new Set<(tab: WorkspaceTab) => void | Promise<void>>();
   private activeTabId: string | undefined;
   private hooks: HookRegistry | undefined;
   private triggers: TriggerRegistry | undefined;
@@ -489,17 +490,17 @@ export class SessionStore {
     const releaseDirectory = this.reserveSessionDirectory(await fs.realpath(cwd));
     try {
       await this.pathPolicy.ensureDirectory(cwd, false);
-      const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
-      const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
-      if (templateIndicator) {
-        tab.indicator = createTabIndicator(templateIndicator, now);
-      }
       tab.contextPath = await this.contextService.create(tab, { ownedDirectory: Boolean(ownerPluginId) });
       this.tabs.set(id, tab);
       this.initialInputs.set(id, request.initialInput);
       if (ownerPluginId) this.workspace?.registerEmbeddedTab(id);
       if (launchOptions) this.launchOptions.set(id, { authorizeProjectTrust: launchOptions.authorizeProjectTrust, prepareAgentSession: launchOptions.prepareAgentSession, prepareTerminalExecution: launchOptions.prepareTerminalExecution, agentTurn: launchOptions.agentTurn });
       this.unpublishedTabIds.add(id);
+      const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(tab, window);
+      const templateIndicator = await this.runtimeContextResolver?.tabIndicatorFor(tab, window);
+      if (templateIndicator) {
+        tab.indicator = createTabIndicator(templateIndicator, now);
+      }
       const session = await plugin.createSession({
         tab,
         cwd,
@@ -612,6 +613,25 @@ export class SessionStore {
   onTabsChange(listener: (update: WorkspaceTabsUpdate) => void): () => void {
     this.tabsListeners.add(listener);
     return () => this.tabsListeners.delete(listener);
+  }
+
+  onTabRemoved(listener: (tab: WorkspaceTab) => void | Promise<void>): () => void {
+    this.tabRemovalListeners.add(listener);
+    return () => this.tabRemovalListeners.delete(listener);
+  }
+
+  agentProvider(tabId: string): AgentProviderId | undefined {
+    if (!isAgentTab(this.getTab(tabId))) return undefined;
+    const input = this.sessions.get(tabId)?.restoreInput?.() ?? this.initialInputs.get(tabId);
+    return readAgentSelection(input?.agent)?.providerId ?? "codex";
+  }
+
+  agentLineage(tabId: string): { logicalRunId?: string; attemptId?: string; executionId?: string } {
+    this.getTab(tabId);
+    const turn = this.launchOptions.get(tabId)?.agentTurn;
+    const input = this.sessions.get(tabId)?.restoreInput?.() ?? this.initialInputs.get(tabId);
+    return { ...(turn ? { logicalRunId: turn.workerId, attemptId: turn.attemptId } : {}),
+      ...(typeof input?.codexExecutionId === "string" ? { executionId: input.codexExecutionId } : {}) };
   }
 
   getTab(tabId: string): WorkspaceTab {
@@ -881,6 +901,7 @@ export class SessionStore {
   }
 
   private async closeTabNow(tabId: string, stopSession: boolean): Promise<void> {
+    const closingTab = this.tabs.get(tabId);
     if (this.tabRecoveries.has(tabId)) await this.tabRecoveries.get(tabId)!.catch(() => {});
     if (this.tabOwnershipActions.has(tabId)) await this.tabOwnershipActions.get(tabId)!.catch(() => {});
     let session = this.sessions.get(tabId);
@@ -913,10 +934,18 @@ export class SessionStore {
     if (this.activeTabId === tabId) {
       this.activeTabId = this.listTabs().find((tab) => !tab.ownerPluginId)?.id;
     }
+    const failures: unknown[] = [];
     if (wasPublished) {
       this.emitTabsChange();
-      await this.savedSessions?.flush();
+      try { await this.savedSessions?.flush(); } catch (error) { failures.push(error); }
     }
+    if (closingTab) {
+      for (const listener of this.tabRemovalListeners) {
+        try { await listener(closingTab); } catch (error) { failures.push(error); }
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "The tab was removed, but its persistence or removal cleanup failed.");
   }
 
   dispose(): Promise<void> {

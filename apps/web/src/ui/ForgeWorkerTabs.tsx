@@ -1,11 +1,13 @@
-import { useId, type KeyboardEvent, type ReactNode } from "react";
+import { useId, type HTMLAttributes, type KeyboardEvent, type ReactNode } from "react";
 import type { ForgeWorker } from "@cloudx/shared";
 
-export function ForgeWorkerTabs({ workers, selectedWorkerId, onSelectWorker, children }: {
+export function ForgeWorkerTabs({ workers, selectedWorkerId, onSelectWorker, tabHandlers, workerActions, children }: {
   workers: ForgeWorker[];
   selectedWorkerId?: string;
   onSelectWorker: (workerId: string) => void;
   children: (worker: ForgeWorker) => ReactNode;
+  tabHandlers?: (worker: ForgeWorker) => HTMLAttributes<HTMLDivElement>;
+  workerActions?: (worker: ForgeWorker) => ReactNode;
 }) {
   const id = useId();
   const selected = workers.find(worker => worker.id === selectedWorkerId) ?? workers[0];
@@ -13,11 +15,11 @@ export function ForgeWorkerTabs({ workers, selectedWorkerId, onSelectWorker, chi
 
   return <div className="forge-workers" aria-label="Workers">
     <div className="forge-worker-tabs" role="tablist" aria-label="Worker tabs" onKeyDown={moveWorkerTabFocus}>
-      {workers.map(worker => <button key={worker.id} type="button" role="tab" id={`${id}-tab-${worker.id}`} aria-controls={`${id}-panel-${worker.id}`} aria-selected={selected.id === worker.id} tabIndex={selected.id === worker.id ? 0 : -1} className="forge-worker-tab" title={worker.title} onClick={() => onSelectWorker(worker.id)}>
+      {workers.map(worker => <div key={worker.id} className="forge-worker-tab-wrap" {...tabHandlers?.(worker)}><button type="button" role="tab" id={`${id}-tab-${worker.id}`} aria-controls={`${id}-panel-${worker.id}`} aria-selected={selected.id === worker.id} tabIndex={selected.id === worker.id ? 0 : -1} className="forge-worker-tab" title={worker.title} onClick={() => onSelectWorker(worker.id)}>
         <strong>{worker.batch ? `Batch · ${worker.batch.issues.map(issue => `#${issue.number}`).join(", ")}` : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`}</strong>
         <span>{worker.title}</span>
         <small>{worker.status.replaceAll("_", " ")}</small>
-      </button>)}
+      </button>{workerActions?.(worker)}</div>)}
     </div>
     {workers.map(worker => <div key={worker.id} id={`${id}-panel-${worker.id}`} role="tabpanel" aria-labelledby={`${id}-tab-${worker.id}`} tabIndex={0} hidden={selected.id !== worker.id} className="forge-worker-view">
       <div className="forge-worker-controls">{children(worker)}</div>

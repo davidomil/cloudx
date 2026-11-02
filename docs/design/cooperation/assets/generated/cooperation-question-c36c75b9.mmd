@@ -1,0 +1,16 @@
+sequenceDiagram
+    participant U as User
+    participant B as BlackboardService
+    participant P as Provider control adapter
+    participant A as Addressed AI tab
+    U->>B: Add question with quote and target
+    B->>B: Commit reaction + thread + inbox event
+    B-->>U: Saved and recipient queued
+    B->>P: Deliver event at supported boundary
+    P-->>B: Native accepted or unavailable/unknown
+    P->>A: Read assigned board and event
+    A->>B: Claim event with generation
+    A->>B: Read target, WIP and source context
+    A->>B: Commit thread answer + event receipt
+    B-->>U: Answer at the original target
+    U->>B: Resolve question when satisfied

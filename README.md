@@ -82,6 +82,7 @@ tools required by the output format; see the
 | Implement and verify         | [Codex Terminal](docs/plugins/codex-terminal.md), [Terminal](docs/plugins/standard-terminal.md), [Files](docs/plugins/file-browser.md)          |
 | Manage project context       | [Worktrees](docs/plugins/worktree-manager.md), [Local Web](docs/plugins/local-web.md), [Rules & Skills](docs/plugins/rules-skills.md)           |
 | Research and coordinate work | [Documentation](docs/plugins/documentation.md), [Jira](docs/plugins/jira.md), [Forge Workers](docs/plugins/forge.md)                            |
+| Design with your agents      | [Cooperation blackboards](docs/design/cooperation/runtime.md)                                                                                   |
 | Repeat a workflow            | [Automation](docs/plugins/automation.md), [Notifications](docs/plugins/notifications.md)                                                        |
 | Configure and navigate       | [Codex Settings](docs/plugins/codex-settings.md), [Workspace Controls](docs/plugins/workspace-control.md), [Audio AI](docs/plugins/audio-ai.md) |
 

@@ -152,6 +152,34 @@ describe("Claude Forge turn receipts", () => {
   const summary = (context: string[] = []) => ({ type: "system", subtype: "stop_hook_summary", hookCount: 2, hookAdditionalContext: context });
   const response = (text: string) => ({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
 
+  it("completes a dequeued prompt when its submission hook still identified the preceding prompt", async () => {
+    const { root, transcript, base, record, receipt } = await forgeAttempt();
+    await fs.writeFile(transcript, record({ type: "user", promptId: "p1", message: { role: "user", content: "Original prompt" } }));
+    // Enter queues the draft while p1 is stopping. Its submission hook still
+    // carries p1; Claude gives the dequeued draft its own p2 prompt identity.
+    await hook(root, "UserPromptSubmit", base);
+    await fs.appendFile(transcript, record({ type: "user", promptId: "p2", message: { role: "user", content: "Queued draft" } }) + record(response("Draft answer")));
+    await hook(root, "Stop", { ...base, prompt_id: "p2", last_assistant_message: "Draft answer" });
+    await fs.appendFile(transcript, record(summary()));
+
+    await vi.waitFor(async () => expect(JSON.parse(await fs.readFile(agentTurnReceiptPath(root), "utf8")))
+      .toMatchObject({ turnId: "p2", status: "completed" }), { timeout: 3_000 });
+    expect(await receipt()).toMatchObject({ turnId: "p1", status: "running" });
+  });
+
+  it.each([false, true])("a late Stop cannot complete a newer prompt whose transcript is flushed: %s", async flushed => {
+    const { root, transcript, base, record } = await forgeAttempt();
+    await fs.writeFile(transcript, record({ type: "user", promptId: "p1", message: { role: "user", content: "Old prompt" } }));
+    await hook(root, "UserPromptSubmit", base);
+    await hook(root, "UserPromptSubmit", { ...base, prompt_id: "p2" });
+    if (flushed) await fs.appendFile(transcript, record({ type: "user", promptId: "p2", message: { role: "user", content: "New prompt" } }));
+    await hook(root, "Stop", base);
+    await fs.appendFile(transcript, record(summary()));
+    await vi.waitFor(() => expect(fs.access(path.join(root, ".cloudx-turn-stop.json"))).rejects.toMatchObject({ code: "ENOENT" }), { timeout: 3_000 });
+
+    expect(JSON.parse(await fs.readFile(agentTurnReceiptPath(root), "utf8"))).toMatchObject({ turnId: "p2", status: "running" });
+  });
+
   it("records the first turn of an attempt and its final response", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
     const receiptPath = path.join(root, "attempt-1.json");

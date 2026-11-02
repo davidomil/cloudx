@@ -77,6 +77,11 @@ export interface ForgePublicationLease {
 }
 
 export interface ForgeRuntimeDependencies {
+  cooperation?: {
+    begin(tabId: string): Promise<boolean>;
+    transfer(oldTabId: string, newTabId: string): Promise<void>;
+    abort(tabId: string): Promise<void>;
+  };
   logger?: ForgeLogger;
   sessions: Pick<
     SessionStore,
@@ -271,6 +276,16 @@ export class ForgeRuntime {
     return Boolean(
       tab && !["failed", "completed", "stopped"].includes(tab.status),
     );
+  }
+
+  async beginCooperationContinuation(tabId: string): Promise<boolean> {
+    if (!this.dependencies.cooperation || !this.dependencies.sessions.listTabs().some(tab => tab.id === tabId)) return false;
+    await this.requireWorkerTab(tabId);
+    return this.dependencies.cooperation.begin(tabId);
+  }
+
+  async abortCooperationContinuation(tabId: string): Promise<void> {
+    await this.dependencies.cooperation?.abort(tabId);
   }
 
   async prepareWorkspace(
@@ -646,6 +661,7 @@ export class ForgeRuntime {
       reasoningEffort: CodexReasoningEffort;
       accountId?: string;
       preserveConversation?: true;
+      cooperationContinuationOf?: string;
       prompt: string;
       windowId: string;
       paneId: string;
@@ -776,6 +792,12 @@ export class ForgeRuntime {
         ownership.execution = await this.executions.prepare();
         this.ownedTabs.set(tabId, ownership);
         await this.captureTab(tab, ownership);
+        if (input.cooperationContinuationOf) {
+          const source = await this.tabManifest(input.cooperationContinuationOf).read<OwnedTab>();
+          if (!source || source.workerId !== owned.id || !source.quiescent || !this.dependencies.cooperation)
+            throw new PluginSessionNotStartedError(new Error("The cooperation continuation does not match this worker's confirmed prior execution."));
+          await this.dependencies.cooperation.transfer(input.cooperationContinuationOf, tabId);
+        }
         return ownership.execution;
       },
       ...(prepareAgentSession ? { prepareAgentSession } : {}),

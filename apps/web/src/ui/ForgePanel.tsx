@@ -1,8 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Terminal, Trash2 } from "lucide-react";
+import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Monitor, Terminal, Trash2 } from "lucide-react";
 import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import type { AgentUsageSummary, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
+import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { useCooperationBoards } from "./cooperation/cooperationBoards.js";
 import { ControlButton } from "./Control.js";
 import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
 import { ForgeWorkerTabs } from "./ForgeWorkerTabs.js";
@@ -26,7 +28,7 @@ const WorkerContinuations = createContext<{
   setMessage: (workerId: string, message?: string) => void;
 } | null>(null);
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, showUsage = false }: {
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, showUsage = false, onOpenBlackboard }: {
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
@@ -35,11 +37,14 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   workerTabs: WorkspaceTab[];
   // Reads token usage and cost per worker; requires the agent usage plugin.
   showUsage?: boolean;
+  onOpenBlackboard?: (boardId: string, title: string) => void;
   active: boolean;
   uiScale: number;
   repositorySettingsKey: string;
   repositoryChangePending: boolean;
 }) {
+  const blackboardMenu = useAgentSwitchMenu(Boolean(onOpenBlackboard));
+  const blackboards = useCooperationBoards(Boolean(onOpenBlackboard), workerTabs.map(tab => tab.id).join(":"));
   const bridge = useRef(callHook);
   useEffect(() => { bridge.current = callHook; }, [callHook]);
   const request: Request = useCallback(async <T,>(hook: string, input?: Record<string, unknown>) => {
@@ -170,11 +175,12 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </nav>
       {view === "workers" ? <MergeQueues workers={workers} onSelect={setSelectedWorkerId} /> : null}
       {view === "evidence" ? <ForgeResourcesPanel revision={revision} /> : null}
-      {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId}>
+      {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId} tabHandlers={worker => { const tab = workerTabs.find(tab => tab.id === worker.tabId); return tab ? blackboardMenu.tabHandlers(tab) : {}; }} workerActions={worker => { const board = blackboards.boards.find(board => board.members.some(member => member.tabId === worker.tabId)); return board && onOpenBlackboard ? <ControlButton size="compact" iconOnly aria-label={`Open blackboard ${board.title}`} title={board.title} onClick={() => onOpenBlackboard(board.boardId, board.title)}><Monitor size={14} /></ControlButton> : null; }}>
         {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : (view === "issues" || view === "changes") && dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
-      {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onClose={() => setTerminalWorkerId(undefined)} /> : null}
+      {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onOpenBlackboard={onOpenBlackboard} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
+    {blackboardMenu.position && onOpenBlackboard ? (() => { const tab = workerTabs.find(tab => tab.id === blackboardMenu.position?.tabId); return tab ? <AgentSwitchMenu tab={tab} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={onOpenBlackboard} onClose={blackboardMenu.close} /> : null; })() : null}
   </section></WorkerContinuations.Provider></WorkerActions.Provider></WorkerUsage.Provider>;
 }
 

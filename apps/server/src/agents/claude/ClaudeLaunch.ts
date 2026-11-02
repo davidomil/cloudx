@@ -30,6 +30,7 @@ export interface ClaudeLaunchArgsOptions {
   addDirs: string[];
   // Starts a new conversation under this id.
   newSessionId?: string;
+  cooperationMcpConfig?: string;
 }
 
 export function buildClaudeLaunchArgs(initialInput: Record<string, unknown> | undefined, options: ClaudeLaunchArgsOptions): string[] {
@@ -38,6 +39,7 @@ export function buildClaudeLaunchArgs(initialInput: Record<string, unknown> | un
   if (prompt !== undefined && (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0"))) throw new Error("Claude initial prompt must be a non-empty string without null bytes.");
   if (resume?.mode === "session" && !SESSION_ID_PATTERN.test(resume.sessionId ?? "")) throw new Error("Claude resume requires an exact session id.");
   const args = ["--settings", options.settingsPath];
+  if (options.cooperationMcpConfig) args.push("--mcp-config", options.cooperationMcpConfig);
   for (const directory of options.addDirs) args.push("--add-dir", directory);
   if (options.settings.permissionMode === "bypassPermissions") args.push("--dangerously-skip-permissions");
   else args.push("--permission-mode", options.settings.permissionMode);
@@ -78,4 +80,3 @@ export async function findClaudeTranscript(projectsDir: string, sessionId: strin
   }
   throw new MissingTranscriptError(`The transcript for Claude conversation ${sessionId} is unavailable. Select a saved session.`);
 }
-
