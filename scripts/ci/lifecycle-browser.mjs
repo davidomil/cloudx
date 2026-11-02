@@ -859,15 +859,42 @@ export class LifecycleBrowserProfile {
     const preserved = await this.verifyPreservedProfile({
       requiresInterruption,
     });
-    const [previewResponse, panel] = await Promise.all([
-      this.page.waitForResponse(
-        (response) =>
-          new URL(response.url()).pathname === "/api/system/update/preview" &&
-          response.request().method() === "GET",
-      ),
-      this.openUpdates(),
+    const [previewResponse, backupResponse, cleanupResponse, panel] =
+      await Promise.all([
+        this.page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/api/system/update/preview" &&
+            response.request().method() === "GET",
+        ),
+        this.page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname === "/api/system/update/backups" &&
+            response.request().method() === "GET",
+          { timeout: 120_000 },
+        ),
+        this.page.waitForResponse(
+          (response) =>
+            new URL(response.url()).pathname ===
+              "/api/system/update/backups/cleanup" &&
+            response.request().method() === "GET",
+        ),
+        this.openUpdates(),
+      ]);
+    assert.equal(
+      backupResponse.status(),
+      200,
+      "The retained update backup inventory must load before update readiness is checked.",
+    );
+    assert.equal(
+      cleanupResponse.status(),
+      200,
+      "The retained update backup cleanup status must load before update readiness is checked.",
+    );
+    const [preview] = await Promise.all([
+      previewResponse.json(),
+      backupResponse.json(),
+      cleanupResponse.json(),
     ]);
-    const preview = await previewResponse.json();
     assert.equal(preview.currentCommit, targetSha);
     assert.equal(preview.target?.commit, targetSha);
     assert.equal(preview.runtime?.commit, targetSha);
