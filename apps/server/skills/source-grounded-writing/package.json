@@ -1,0 +1,21 @@
+{
+  "name": "source-grounded-writing-skill",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": ".venv/bin/python scripts/check_deps.py --profile full",
+    "fixture": ".venv/bin/python scripts/validate_evidence.py assets/fixtures/minimal-ir.json && .venv/bin/python scripts/compile_doc.py assets/fixtures/minimal-ir.json --target html --out build/minimal.qmd && .venv/bin/python scripts/render_doc.py build/minimal.qmd --to html --out-dir build/rendered/html && .venv/bin/python scripts/validate_presentation.py assets/fixtures/minimal-ir.json --artifact build/rendered/html/minimal.html"
+  },
+  "dependencies": {
+    "@hpcc-js/wasm": "2.33.8",
+    "@mermaid-js/mermaid-cli": "11.15.0",
+    "pagedjs-cli": "0.4.0",
+    "playwright": "1.60.0",
+    "vega-cli": "6.2.0",
+    "vega-lite": "6.4.3"
+  },
+  "overrides": {
+    "tar-fs": "3.1.2",
+    "ws": "8.21.0"
+  }
+}

@@ -23,6 +23,7 @@ import type { PluginSkillContributionFile } from "@cloudx/plugin-api";
 
 import { isSameOrChildPath } from "../pathBoundary.js";
 import { RulesSkillsGitService } from "./RulesSkillsGitService.js";
+import { SOURCE_GROUNDED_WRITING, SOURCE_GROUNDED_WRITING_FILES } from "./sourceGroundedWriting.js";
 
 export const DEFAULT_PERSONALITY_TEMPLATE_ID = "default-codex";
 export const TEMPLATE_METADATA_KEY = "selectedTemplateId";
@@ -68,7 +69,8 @@ export const CLOUDX_SYSTEM_SKILLS: CloudxSkill[] = [
     name: "Migrate Skill To CloudX",
     description: "Import an existing local Codex skill into the CloudX rules/skills catalog.",
     scope: "system"
-  }
+  },
+  SOURCE_GROUNDED_WRITING
 ];
 
 export const CLOUDX_SYSTEM_RULES: CloudxRule[] = [];
@@ -209,16 +211,7 @@ export class RulesSkillsCatalogService {
   }
 
   async saveSystemRule(input: Record<string, unknown>): Promise<RulesSkillsStore> {
-    return this.withCatalogMutation(async () => {
-      const rule = { ...normalizeRule({ ...input, scope: "system" }), scope: "system" as const };
-      await this.ensureSeeded();
-      if (await pathExists(this.rulePath(rule.id))) {
-        throw new Error(`CloudX user rule already exists with the same id: ${rule.id}`);
-      }
-      await writeUtf8FileAtomic(this.systemRulePath(rule.id), formatRule(rule), this.rootPath);
-      this.emitChange();
-      return this.readStore();
-    });
+    return this.saveSystemContributions({ rules: [input], skills: [] });
   }
 
   async deleteRule(ruleId: string): Promise<RulesSkillsStore> {
@@ -290,15 +283,40 @@ export class RulesSkillsCatalogService {
   }
 
   async saveSystemSkill(input: Record<string, unknown>): Promise<RulesSkillsStore> {
+    return this.saveSystemContributions({ rules: [], skills: [input] });
+  }
+
+  async saveSystemContributions(input: { rules: Record<string, unknown>[]; skills: Record<string, unknown>[] }): Promise<RulesSkillsStore> {
     return this.withCatalogMutation(async () => {
-      const skill = { ...normalizeSkill({ ...input, scope: "system" }), scope: "system" as const };
-      const files = normalizeSkillContributionFiles(input.files);
+      const rules = input.rules.map(rule => ({ ...normalizeRule({ ...rule, scope: "system" }), scope: "system" as const }));
+      const skills = input.skills.map(skill => ({
+        skill: { ...normalizeSkill({ ...skill, scope: "system" }), scope: "system" as const },
+        files: normalizeSkillContributionFiles(skill.files)
+      }));
       await this.ensureSeeded();
-      if (await pathExists(this.skillPath(skill.id))) {
-        throw new Error(`CloudX user skill already exists with the same id: ${skill.id}`);
+      for (const rule of rules) {
+        if (await pathExists(this.rulePath(rule.id))) {
+          throw new Error(`CloudX user rule already exists with the same id: ${rule.id}`);
+        }
       }
-      await writeSystemSkillDirectoryAtomic(this.systemSkillPath(skill.id), skill, files, this.rootPath);
-      this.emitChange();
+      for (const { skill } of skills) {
+        if (await pathExists(this.skillPath(skill.id))) {
+          throw new Error(`CloudX user skill already exists with the same id: ${skill.id}`);
+        }
+      }
+      let changed = false;
+      try {
+        for (const rule of rules) {
+          await writeUtf8FileAtomic(this.systemRulePath(rule.id), formatRule(rule), this.rootPath);
+          changed = true;
+        }
+        for (const { skill, files } of skills) {
+          await writeSystemSkillDirectoryAtomic(this.systemSkillPath(skill.id), skill, files, this.rootPath);
+          changed = true;
+        }
+      } finally {
+        if (changed) this.emitChange();
+      }
       return this.readStore();
     });
   }
@@ -400,9 +418,13 @@ export class RulesSkillsCatalogService {
     const settings = asRecord(await readJson(this.settingsPath(), this.rootPath));
     const rules = await readRules(this.rulesPath());
     const systemRules = await readRules(this.systemRulesPath(), "system");
-    const skills = await readSkills(this.skillsPath(), "user");
     const systemSkills = await readSkills(this.systemSkillsPath(), "system");
-    const templates = await readTemplates(this.templatesPath());
+    const builtInSkillIds = new Set(CLOUDX_SYSTEM_SKILLS.map(skill => skill.id));
+    const skills = (await readSkills(this.skillsPath(), "user")).filter(skill => !builtInSkillIds.has(skill.id));
+    const templates = (await readTemplates(this.templatesPath())).map(template => ({
+      ...template,
+      skillIds: template.skillIds.filter(id => !builtInSkillIds.has(id))
+    }));
     const defaultTemplateId = typeof settings.defaultTemplateId === "string" && templates.some((template) => template.id === settings.defaultTemplateId)
       ? settings.defaultTemplateId
       : templates[0]?.id;
@@ -515,6 +537,16 @@ export async function listCloudxSystemRules(rulesSkillsRoot: string): Promise<Cl
 
 export async function ensureCloudxSystemSkills(rulesSkillsRoot: string): Promise<void> {
   for (const skill of CLOUDX_SYSTEM_SKILLS) {
+    if (skill.id === SOURCE_GROUNDED_WRITING.id) {
+      const skillDir = path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id));
+      for (const file of SOURCE_GROUNDED_WRITING_FILES) {
+        const target = path.join(skillDir, file.path);
+        await ensureCatalogDirectory(path.dirname(target), rulesSkillsRoot);
+        await writeUtf8FileIfChanged(target, file.content, rulesSkillsRoot);
+        if (file.executable && ((await fsp.stat(target)).mode & 0o7777) !== 0o755) await fsp.chmod(target, 0o755);
+      }
+      continue;
+    }
     await writeSkillFile(path.dirname(cloudxSystemSkillFilePath(rulesSkillsRoot, skill.id)), {
       ...skill,
       instructions: SYSTEM_SKILL_INSTRUCTIONS[skill.id] ?? `# ${skill.name}\n\n${skill.description}`

@@ -19,6 +19,8 @@ export const historicalDependencyPackages = [
   "smol-toml@1.7.0",
   "smol-toml@1.7.1",
   "source-map-js@1.2.1",
+  "undici@7.29.1",
+  "vite@8.1.4",
   "vitest@4.1.6",
 ];
 

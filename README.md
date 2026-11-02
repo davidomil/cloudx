@@ -70,6 +70,11 @@ Skills](docs/plugins/rules-skills.md) supplies reusable instructions;
 [Documentation](docs/plugins/documentation.md) keeps source material
 searchable.
 
+Source Grounded Writing is available in every Codex tab. Short technical
+replies need no additional setup. For rendered documents, install only the
+tools required by the output format; see the
+[skill setup guide](apps/server/skills/source-grounded-writing/README.md).
+
 ## Choose the tools for the task
 
 | Task                         | Plugins                                                                                                                                         |

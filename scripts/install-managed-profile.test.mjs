@@ -35,6 +35,7 @@ it.skipIf(!fs.existsSync(path.join(sourceRoot, "apps/server/dist/config.js"))).e
     cwd: repoRoot, createdAt: "then", updatedAt: "now", status: "running", indicator: { color: "green", label: "Running", updatedAt: "now" } } }] };
   fs.writeFileSync(path.join(dataDir, "sessions.json"), JSON.stringify(saved));
   fs.cpSync(path.join(sourceRoot, "apps/server/dist"), path.join(releaseRoot, "apps/server/dist"), { recursive: true });
+  fs.cpSync(path.join(sourceRoot, "apps/server/skills"), path.join(releaseRoot, "apps/server/skills"), { recursive: true });
   fs.mkdirSync(path.join(releaseRoot, "scripts"));
   for (const file of ["codex-selection.mjs", "codex-updater.mjs", "codex-state-errors.mjs"]) {
     fs.copyFileSync(path.join(sourceRoot, "scripts", file), path.join(releaseRoot, "scripts", file));
@@ -61,8 +62,10 @@ it.skipIf(!fs.existsSync(path.join(sourceRoot, "apps/server/dist/config.js"))).e
     import { terminalSocketPath } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/terminal/DurableTerminalProcess.js")).href)};
     import { SessionStateStore } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/workspace/SessionStateStore.js")).href)};
     import { resolveAssistantCommand } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/terminal/ShellLaunch.js")).href)};
+    import { RulesSkillsCatalogService } from ${JSON.stringify(pathToFileURL(path.join(repoRoot, "apps/server/dist/rulesSkills/RulesSkillsCatalogService.js")).href)};
     const env = JSON.parse(process.argv[1]);
     const config = loadConfig(env);
+    await new RulesSkillsCatalogService(config.dataDir).list();
     console.log(JSON.stringify({ assistantBin: resolveAssistantCommand(env), dataDir: config.dataDir, https: config.https, socket: terminalSocketPath(config.dataDir), sessions: await new SessionStateStore(config.dataDir).read() }));
   `, JSON.stringify(activatedEnv)], { encoding: "utf8" }));
   expect(inspected.dataDir).toBe(dataDir);
@@ -73,5 +76,9 @@ it.skipIf(!fs.existsSync(path.join(sourceRoot, "apps/server/dist/config.js"))).e
   expect(inspected.https).toEqual({ keyPath: path.join(dataDir, "certs/cloudx-local.key"), certPath: path.join(dataDir, "certs/cloudx-local.crt") });
   expect(inspected.sessions).toEqual(saved);
   expect(inspected.socket).toBe(terminalSocketPath(dataDir));
+  const writing = path.join(dataDir, "rules-skills/system-skills/source-grounded-writing");
+  expect(fs.readFileSync(path.join(writing, "SKILL.md"), "utf8")).toContain('name: "source-grounded-writing"');
+  expect(JSON.parse(fs.readFileSync(path.join(writing, "references/intermediate-schema.json"), "utf8")).properties.schema_version).toEqual({ const: 2 });
+  expect(fs.readFileSync(path.join(writing, "scripts/compile_doc.py"), "utf8")).toContain("from sgw_common import");
   expect(fs.existsSync(path.join(releaseRoot, ".cloudx"))).toBe(false);
 }, 15_000);

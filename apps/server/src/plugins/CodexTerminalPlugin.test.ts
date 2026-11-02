@@ -100,6 +100,73 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it("provides source-grounded writing and its resources without a personality template", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      vi.stubEnv("CLOUDX_PERSONALITY_TEMPLATE_ID", undefined);
+      await plugin.createSession({
+        tab, cwd: root,
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+      });
+
+      expect(factory.env?.CLOUDX_PERSONALITY_TEMPLATE_ID).toBeUndefined();
+      const surfaceDir = path.join(factory.env!.CODEX_HOME!, "skills", "cloudx-system", "source-grounded-writing");
+      const skillDir = path.join(factory.env!.CLOUDX_RULES_SKILLS_DIR!, "system-skills", "source-grounded-writing");
+      const config = parse(await fs.readFile(path.join(factory.env!.CODEX_HOME!, "config.toml"), "utf8"));
+      expect(config.skills).toMatchObject({
+        config: expect.arrayContaining([{ path: path.join(surfaceDir, "SKILL.md"), enabled: true }])
+      });
+      const surface = await fs.readFile(path.join(surfaceDir, "SKILL.md"), "utf8");
+      expect(surface).toContain(`Read the original instructions at ${JSON.stringify(path.join(skillDir, "SKILL.md"))}`);
+      expect(surface).toContain(`against ${JSON.stringify(skillDir)}`);
+      const instructions = await fs.readFile(path.join(skillDir, "SKILL.md"), "utf8");
+      expect(instructions).toContain('name: "source-grounded-writing"');
+      expect(instructions).toContain("references/evidence-policy.md");
+      expect(instructions).toContain("scripts/compile_doc.py");
+      const schema = JSON.parse(await fs.readFile(path.join(skillDir, "references", "intermediate-schema.json"), "utf8"));
+      expect(schema.properties.schema_version).toEqual({ const: 2 });
+      for (const resource of [
+        "README.md", "requirements.txt", "package.json", "package-lock.json",
+        "scripts/compile_doc.py", "scripts/sgw_common.py", "scripts/render_visual.mjs",
+        "references/evidence-policy.md", "assets/quarto/source-grounded.css", "assets/fixtures/minimal-ir.json"
+      ]) {
+        expect((await fs.stat(path.join(skillDir, resource))).isFile()).toBe(true);
+      }
+      await expect(fs.stat(path.join(skillDir, ".venv"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(path.join(skillDir, "node_modules"))).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
+
+  it("enables the built-in once when a saved template still selects an existing user copy", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const dataDir = path.join(root, "data");
+      await seedSkill(dataDir, "source-grounded-writing", "User Writer", "Local writing skill.", "Preserve this local workflow.");
+      const userSkill = path.join(dataDir, "rules-skills", "skills", "source-grounded-writing", "SKILL.md");
+      const original = await fs.readFile(userSkill, "utf8");
+      await plugin.createSession({
+        tab, cwd: root,
+        controls: { setTabIndicator: () => undefined, closeTab: () => undefined },
+        runtimeContext: { pluginRuntime: { "rules-skills": { personalityTemplate: {
+          source: "tab",
+          template: { id: "writer", name: "Writer", color: "green", ruleIds: [], skillIds: ["source-grounded-writing"] },
+          rules: [],
+          skills: [{ id: "source-grounded-writing", name: "User Writer", description: "Local writing skill.", instructions: "Preserve this local workflow." }]
+        } } } }
+      });
+
+      const codexHome = factory.env!.CODEX_HOME!;
+      const config = parse(await fs.readFile(path.join(codexHome, "config.toml"), "utf8"));
+      const skills = (config.skills as { config: Array<{ path: string; enabled: boolean }> }).config;
+      expect(skills.filter(skill => skill.enabled && skill.path.endsWith("/source-grounded-writing/SKILL.md"))).toEqual([
+        { path: path.join(codexHome, "skills", "cloudx-system", "source-grounded-writing", "SKILL.md"), enabled: true }
+      ]);
+      const skillFile = path.join(factory.env!.CLOUDX_RULES_SKILLS_DIR!, "system-skills", "source-grounded-writing", "SKILL.md");
+      const surface = await fs.readFile(path.join(codexHome, "skills", "cloudx-system", "source-grounded-writing", "SKILL.md"), "utf8");
+      expect(surface).toContain(`Read the original instructions at ${JSON.stringify(skillFile)}`);
+      await expect(fs.stat(path.join(codexHome, "skills", "cloudx", "source-grounded-writing"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await fs.readFile(userSkill, "utf8")).toBe(original);
+    });
+  });
+
   it.each([false, true])("checks ownership availability without changing an attached terminal when ended=%s", async ended => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ownership-availability-"));
     const sources = new CodexStateSources(root);

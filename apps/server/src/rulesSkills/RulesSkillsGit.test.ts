@@ -20,6 +20,25 @@ afterEach(async () => {
 });
 
 describe("Rules & Skills Git checkout", () => {
+  it("preserves helper metadata and the Git index when refreshing an unchanged catalog", async () => {
+    const { catalog, checkout } = await repositoryFixture();
+    const helper = path.join(checkout, "system-skills/source-grounded-writing/scripts/compile_doc.py");
+    for (const mode of [0o644, 0o4755, 0o2755, 0o1755]) {
+      await fs.chmod(helper, mode);
+      await catalog.list();
+      expect((await fs.stat(helper)).mode & 0o7777).toBe(0o755);
+    }
+    await catalog.gitStatus();
+    const before = await fs.stat(helper, { bigint: true });
+    const index = await fs.readFile(path.join(checkout, ".git", "index"));
+
+    await catalog.list();
+
+    expect((await fs.stat(helper, { bigint: true })).ctimeNs).toBe(before.ctimeNs);
+    await expect(catalog.gitStatus()).resolves.toMatchObject({ hasChanges: false });
+    expect(await fs.readFile(path.join(checkout, ".git", "index"))).toEqual(index);
+  });
+
   it("reports a catalog outside Git and never initializes it when setting origin", async () => {
     const { catalog, call } = await catalogFixture();
 

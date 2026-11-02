@@ -2931,7 +2931,10 @@ async function captureSample(page: Page, testInfo: TestInfo, name: string) {
     expect(content).not.toContain(privateText);
   }
   await testInfo.attach(name, {
-    body: await page.screenshot({ path: testInfo.outputPath(`${name}.png`) }),
+    body: await page.screenshot({
+      path: testInfo.outputPath(`${name}.png`),
+      scale: "css",
+    }),
     contentType: "image/png",
   });
 }

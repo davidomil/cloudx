@@ -724,6 +724,18 @@ also receive `CLOUDX_SERVER_URL`; the bundled documentation helper needs that
 server URL to resolve relative `ingest-path` arguments from the active
 workspace. With only `CLOUDX_DOCUMENTATION_URL`, pass an absolute local path.
 
+CloudX also bundles Source Grounded Writing for every Codex tab, independently
+of the selected personality template. Direct writing needs no renderer setup.
+For substantial or rendered documents, follow the README in
+`$CLOUDX_RULES_SKILLS_DIR/system-skills/source-grounded-writing` and install only
+the tools required for the requested format. Catalog refresh preserves installed
+environments, renderers, and generated outputs.
+
+An existing user skill with the same ID stays on disk; CloudX uses the built-in
+copy and omits the redundant template selection from the effective catalog.
+The bundled compiler requires IR version 2. Older IR files need the explicit
+migration described in the skill README before recompilation.
+
 Render the memory plugin guide PDF from its Quarto source locally when a PDF
 artifact is needed:
 
