@@ -21,6 +21,14 @@ describe("local CI runner", () => {
     expect(() => stepRuns("github.event_name == 'push'", context, false)).toThrow("Unsupported step condition");
   });
 
+  it("keeps hosted runner SDK cleanup off local and self-hosted machines", () => {
+    const condition = "runner.environment == 'github-hosted'";
+    expect(stepRuns(condition, context, false)).toBe(false);
+    expect(stepRuns(condition, { ...context, runnerEnvironment: "self-hosted" }, false)).toBe(false);
+    expect(stepRuns(condition, { ...context, runnerEnvironment: "github-hosted" }, false)).toBe(true);
+    expect(stepRuns(condition, { ...context, runnerEnvironment: "github-hosted" }, true)).toBe(false);
+  });
+
   it("covers every step of the reproduced CI jobs", async () => {
     const { jobs } = await readWorkflow();
     for (const name of LOCAL_JOBS) {
