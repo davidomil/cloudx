@@ -19,18 +19,22 @@ export class AgentUsagePlugin implements WorkspacePlugin {
   readonly actions = [];
   readonly hooks: HookDefinition[];
 
-  constructor(usage: AgentUsageService, ledger: AgentUsageLedger, pricing: AgentPricing, liveTabIds: () => string[]) {
+  constructor(usage: AgentUsageService, ledger: AgentUsageLedger, pricing: AgentPricing, owners: () => {
+    tabIds: string[]; windowIds: string[]; tabWindows: ReadonlyMap<string, string>;
+  }) {
     const owner = { kind: "plugin" as const, pluginId: this.id };
     this.hooks = [
       {
         id: AGENT_USAGE_HOOKS.read, owner,
         title: "Read agent usage",
-        description: "Tokens and cost for the given agent tabs and Forge workers, with their combined total.",
+        description: "Tokens and cost for agent tabs, retained window history and Forge workers, with their combined total.",
         exposures: ["app", "plugin", "ui", "http"],
-        inputSchema: { type: "object", properties: { tabIds: OWNER_IDS_SCHEMA, forgeWorkerIds: OWNER_IDS_SCHEMA }, additionalProperties: false },
+        inputSchema: { type: "object", properties: { tabIds: OWNER_IDS_SCHEMA, windowIds: OWNER_IDS_SCHEMA, forgeWorkerIds: OWNER_IDS_SCHEMA }, additionalProperties: false },
         execute: async (input) => {
-          await ledger.prune(new Set(liveTabIds()));
-          return { usage: await usage.read({ tabIds: input.tabIds as string[] | undefined, forgeWorkerIds: input.forgeWorkerIds as string[] | undefined }) };
+          const live = owners();
+          await ledger.synchronizeWindows(live.tabWindows);
+          await ledger.prune(new Set(live.tabIds), undefined, new Set(live.windowIds));
+          return { usage: await usage.read({ tabIds: input.tabIds as string[] | undefined, windowIds: input.windowIds as string[] | undefined, forgeWorkerIds: input.forgeWorkerIds as string[] | undefined }) };
         }
       },
       {

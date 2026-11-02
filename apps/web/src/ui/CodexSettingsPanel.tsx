@@ -6,6 +6,8 @@ import { ControlButton } from "./Control.js";
 import { CodexUpdateControl } from "./CodexUpdateControl.js";
 import { CodexConfigRepairControl } from "./CodexConfigRepairControl.js";
 import { CodexNativeOptions } from "./CodexNativeOptions.js";
+import { CodexDefaultsPolicy } from "./CodexDefaultsPolicy.js";
+import { CodexLaunchInspection } from "./CodexLaunchInspection.js";
 import { CodexSettingsEditor, personalities, reasoningEfforts, serviceTiers, webSearchModes } from "./CodexSettingsEditor.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -25,6 +27,8 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
     {error ? <p className="codex-settings-notice" role="alert">{error}</p> : null}
     {busy === "loading" ? <p role="status">Loading global Codex settings…</p> : null}
     {settings ? <form className="codex-settings-form" onSubmit={event => { event.preventDefault(); void editor.save(); }}>
+      <CodexDefaultsPolicy settings={settings} />
+      <CodexLaunchInspection callHook={callHook} disabled={busy !== null} />
       <fieldset className="codex-settings-group" disabled={busy !== null}>
         <legend>Model and behavior</legend>
         <label>
@@ -69,13 +73,13 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
         </label>
       </fieldset>
       <fieldset className="codex-settings-group" disabled={busy !== null || Boolean(editor.getSnapshot().targetProfile)}>
-        <legend>Default Codex skills</legend>
-        <small>Skills provided by the installed Codex version. Only imagegen is enabled by default; choose which skills new CloudX sessions can use.</small>
+        <legend>Native vendor shared-cache skills</legend>
+        <small>Shared native skills/.system cache artifacts. Selected CLI version provenance is unverified. Only imagegen is selected by default; choose which cached skills new CloudX sessions can use.</small>
         {defaultSkills.map(skill => <label className="codex-settings-toggle" key={skill.id}>
           <input type="checkbox" aria-label={`Enable ${skill.id}`} checked={skill.enabled} disabled={busy !== null || (!skill.available && !skill.enabled)} onChange={event => editor.setDefaultSkill(skill.id, event.target.checked)} />
-          <span>{skill.id}{!skill.available ? <small>Not installed.{skill.enabled ? " Disable this skill to allow new sessions to start." : ""}</small> : null}</span>
+          <span>{skill.id}<small>Source: native shared cache. Availability: {skill.available ? "SKILL.md present" : "missing"}. Fresh default: {skill.id === "imagegen" ? "selected" : "not selected"}. Saved launch selection: {skill.enabled ? "enabled" : "disabled"}. Version provenance: unverified.</small>{!skill.available ? <small>Not installed.{skill.enabled ? " Disable this skill to allow new sessions to start." : ""}</small> : null}</span>
         </label>)}
-        {!defaultSkills.length ? <p>No default skills are provided by this Codex installation.</p> : null}
+        {!defaultSkills.length ? <p>No native vendor skills are present in the shared cache.</p> : null}
       </fieldset>
       <CodexNativeOptions editor={editor} />
       <div className="codex-settings-save">

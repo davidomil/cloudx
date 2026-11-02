@@ -13,6 +13,7 @@ import {
   isForgeTurnCompletion,
   isRecord,
   validateForgeDiagnosticSnapshotInput,
+  type ClaudeLaunchMode,
   type ForgeDiagnosticSnapshotInput,
   type ForgeDiagnosticSnapshotResult,
   type ForgeDiagnosticSnapshotStatus,
@@ -660,6 +661,7 @@ export class ForgeRuntime {
       model: string;
       reasoningEffort: CodexReasoningEffort;
       accountId?: string;
+      claudeLaunchMode?: ClaudeLaunchMode;
       preserveConversation?: true;
       cooperationContinuationOf?: string;
       prompt: string;
@@ -773,6 +775,7 @@ export class ForgeRuntime {
         model: input.model,
         reasoningEffort: input.reasoningEffort,
         agent: { providerId, ...(input.accountId ? { accountId: input.accountId } : {}) },
+        ...(providerId === "claude" && input.claudeLaunchMode ? { claudeLaunchMode: input.claudeLaunchMode } : {}),
       },
       pluginMetadata: {
         [RULES_SKILLS_PLUGIN_ID]: { selectedTemplateId: input.templateId },

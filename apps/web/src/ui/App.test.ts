@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RULES_SKILLS_PLUGIN_ID, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
+import { RULES_SKILLS_PLUGIN_ID, emptyAgentUsageTotals, type PluginDescriptor, type WorkspaceStateResponse } from "@cloudx/shared";
 
-import { codexTabInitialInput, commitPaneForTabCreation, degradedPersistenceStatuses, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, persistenceWarningLabel, persistenceWarningTitle, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
+import { windowUsageText, codexTabInitialInput, commitPaneForTabCreation, degradedPersistenceStatuses, loadAudioInputId, notificationToastIdsAfterDismiss, persistAudioInputId, persistenceWarningLabel, persistenceWarningTitle, requestAudioInputEnumerationAccess, selectCreateTabPluginId, subscribeWorkspaceUpdates, voiceControlSettings, workspaceStateWithPreservedLayout } from "./App.js";
 import { defaultLayout, splitPane } from "./layout.js";
 import { pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import { collectUiContributions, selectTabIndicatorContribution } from "./uiContributions.js";
@@ -653,3 +653,14 @@ class TestWorkspaceWebSocket extends EventTarget {
     this.dispatchEvent(new MessageEvent("message", { data }));
   }
 }
+
+
+describe("window usage summary", () => {
+  it("uses durable window history independently from open tab summaries", () => {
+    const total = { totals: { ...emptyAgentUsageTotals(), input: 100, requests: 2 }, byModel: [], costUsd: 3, costBasis: "mixed" as const, unpricedModels: [] };
+    const result = { tabs: {}, windows: { retained: total }, forgeWorkers: {}, total };
+    expect(windowUsageText("retained", result)).toBe(" · $3.00 API and API-equivalent · 100 tokens");
+    expect(windowUsageText("other", result)).toBe("");
+    expect(windowUsageText("retained", undefined)).toBe("");
+  });
+});

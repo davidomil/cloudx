@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { codexConfigurationCatalog, CODEX_CONFIGURATION_BASELINE_VERSION, codexConfigurationCliCatalog } from "@cloudx/shared";
+import { codexConfigurationCatalog, CODEX_CONFIGURATION_BASELINE_VERSION, codexConfigurationCliCatalog, codexKeymapSelection } from "@cloudx/shared";
 import { ControlButton } from "./Control.js";
 import type { CodexSettingsEditor } from "./CodexSettingsEditor.js";
 
@@ -10,9 +10,7 @@ export function CodexNativeOptions({ editor }: { editor: CodexSettingsEditor }) 
   const configuration = settings?.configuration;
   if (!configuration) return null;
   const supported = configuration.blockedReason ? [] : codexConfigurationCatalog(configuration.selectedVersion);
-  const inventory = new Map(codexConfigurationCatalog(CODEX_CONFIGURATION_BASELINE_VERSION).map(entry => [entry.path, entry]));
-  for (const entry of supported) inventory.set(entry.path, entry);
-  const catalog = [...inventory.values()].sort((a, b) => a.path.localeCompare(b.path));
+  const catalog = configuration.blockedReason ? codexConfigurationCatalog(CODEX_CONFIGURATION_BASELINE_VERSION) : supported;
   const query = search.toLowerCase().trim();
   const matches = catalog.filter(entry => !query || `${entry.path} ${entry.group} ${entry.description} ${entry.reason ?? ""}`.toLowerCase().includes(query));
   const groups = [...new Set(matches.map(entry => entry.group))];
@@ -21,6 +19,7 @@ export function CodexNativeOptions({ editor }: { editor: CodexSettingsEditor }) 
     <h3>Native Codex options</h3>
     <p>Selected executable: {configuration.selectedCommand} · {configuration.selectedVersion}. Coverage baseline: {configuration.baselineVersion}.</p>
     <p>Editing user configuration: {configuration.sourcePath}. Leave an option unset to inherit its native default. Structured values use JSON; nested paths and enum choices are listed with each family. Authentication values are hidden and preserved when editing an entry. Unset removes the whole selected family, including its stored credentials.</p>
+    <p>Saved values and the user/profile projection below are not observed effective values for an open session. Project, environment, administrator policy and launch arguments are evaluated separately. Unset removes the saved override; it does not change CloudX launch policy.</p>
     <label>Configuration target<select aria-label="Configuration target" value={editor.getSnapshot().targetProfile ?? ""} disabled={busy !== null} onChange={event => void editor.selectTargetProfile(event.target.value || undefined)}>
       <option value="">Base user config.toml</option>
       {[...new Set([...(configuration.profileFiles ?? []), ...(editor.getSnapshot().targetProfile ? [editor.getSnapshot().targetProfile!] : [])])].map(name => <option key={name} value={name}>{name}.config.toml</option>)}
@@ -30,7 +29,7 @@ export function CodexNativeOptions({ editor }: { editor: CodexSettingsEditor }) 
       <small>Changing targets discards unsaved edits. Saving an option creates the separate native profile file.</small>
     </div>
     {!editor.getSnapshot().targetProfile ? <label>Launch configuration profile<select aria-label="Launch configuration profile" disabled={busy !== null} value={editor.getSnapshot().configProfile} onChange={event => editor.selectLaunchProfile(event.target.value)}><option value="">Base user defaults</option>{(configuration.profileFiles ?? []).map(name => <option key={name} value={name}>{name}</option>)}</select><small>CloudX layers this file into the generated backend configuration and passes --profile to the terminal for new tabs and workers. It does not write the rejected legacy profile key.</small></label> : null}
-    {configuration.blockedReason ? <p role="alert">{configuration.blockedReason}</p> : null}
+    {configuration.blockedReason ? <p role="alert">{configuration.blockedReason} The read-only inventory below describes baseline {configuration.baselineVersion}, not the selected executable.</p> : null}
     <details><summary>Configuration layers and overrides</summary>
       <ol>{configuration.layers.map(layer => <li key={layer}>{layer}</li>)}</ol>
       <ul>{configuration.overrides.map(override => <li key={override}>{override}</li>)}</ul>
@@ -50,19 +49,28 @@ export function CodexNativeOptions({ editor }: { editor: CodexSettingsEditor }) 
         return <fieldset key={family} disabled={busy !== null || !editable}>
           <legend>{family} · {entry.status} · {entry.platform}</legend>
           <p>{entry.description || "Native structured configuration."}</p>
-          <small>Type: {entry.type}. Scope: {entry.scope}. Native default: {entry.defaultDescription}{entry.enum ? ` Choices: ${entry.enum.map(value => JSON.stringify(value)).join(", ")}.` : ""}</small>
+          <small>Type: {entry.type}. Scope: {entry.scope}. Native default: {entry.defaultDescription}{entry.enum ? ` Choices: ${entry.enum.map(value => JSON.stringify(value)).join(", ")}.` : ""} {entry.defaultProvenance ? <a href={entry.defaultProvenance} target="_blank" rel="noreferrer">Pinned native source</a> : null}</small>
           {!editable ? <p>{selected?.reason ?? (selected ? entry.reason : `Unavailable in selected Codex ${configuration.selectedVersion}.`)}</p> : <>
             <label>{family}<textarea aria-label={`Native ${family}`} value={draft} rows={typeof value === "object" ? 6 : 2} spellCheck={false} onChange={event => editor.setNativeOption(family, event.target.value)} /></label>
             <ControlButton onClick={() => editor.setNativeOption(family, "")}>Unset {family}</ControlButton>
             <small>Blank means unset/inherit. Strings need JSON quotes; tables use objects and lists use arrays.</small>
-            {JSON.stringify(configuration.effectiveValues[family]) !== JSON.stringify(value) ? <p>Effective user/profile value: {JSON.stringify(configuration.effectiveValues[family])}</p> : null}
+            {JSON.stringify(configuration.effectiveValues[family]) !== JSON.stringify(value) ? <p>User/profile projection: {JSON.stringify(configuration.effectiveValues[family])}</p> : null}
           </>}
           {catalog.some(child => child.family === family && child.path !== family) ? <details><summary>Nested options for {family}</summary><ul>
-            {catalog.filter(child => child.family === family && child.path !== family).map(child => <li key={child.path}><code>{child.path}</code>: {child.description} Type: {child.type}. {child.enum ? `Choices: ${child.enum.map(value => JSON.stringify(value)).join(", ")}. ` : ""}{child.defaultDescription} · {child.status} · {child.platform}{child.reason ? ` · ${child.reason}` : ""}</li>)}
+            {catalog.filter(child => child.family === family && child.path !== family).map(child => <li key={child.path}><code>{child.path}</code>: {child.description} Type: {child.type}. {child.enum ? `Choices: ${child.enum.map(value => JSON.stringify(value)).join(", ")}. ` : ""}{child.defaultDescription} · {child.status} · {child.platform}{child.reason ? ` · ${child.reason}` : ""} {child.defaultProvenance ? <a href={child.defaultProvenance} target="_blank" rel="noreferrer">Pinned native source</a> : null}</li>)}
           </ul></details> : null}
         </fieldset>;
       })}
     </details>)}
+    {!configuration.blockedReason ? <details><summary>Native inherited key bindings</summary>
+      <p>Context overrides take precedence over reusable global bindings, then built-in defaults. An empty list explicitly unbinds an action. Native conflict checks, chord prefixes and active surfaces can shadow defaults. The composer handles plain Enter before the editor newline action. Browser shortcuts and host key delivery are separate.</p>
+      <table><thead><tr><th>Context and action</th><th>Native default</th><th>Saved selection</th></tr></thead><tbody>
+        {supported.filter(entry => /^tui\.keymap\.[^.]+\.[^.]+$/.test(entry.path) && entry.defaultSource === "native-source").map(entry => {
+          const selection = codexKeymapSelection(configuration.selectedVersion, entry.path, configuration.effectiveValues);
+          return <tr key={entry.path}><th>{entry.path.slice("tui.keymap.".length)}</th><td>{JSON.stringify(entry.default)}</td><td>{selection.source}: {JSON.stringify(selection.value)}</td></tr>;
+        })}
+      </tbody></table>
+    </details> : null}
     <details><summary>CLI launch options</summary><p>These affect a launch rather than persistent defaults.</p><ul>{codexConfigurationCliCatalog(configuration.blockedReason ? configuration.baselineVersion : configuration.selectedVersion).map(option => <li key={option.path}><code>{option.path}</code>: {option.reason}</li>)}</ul></details>
   </section>;
 }

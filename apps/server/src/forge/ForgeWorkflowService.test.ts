@@ -2577,6 +2577,18 @@ describe("Forge issue and review workflows", () => {
     }, expect.any(AbortSignal));
   });
 
+  it.each(["issue", "review"] as const)("passes the %s Claude mode choice to launch and leaves inheritance explicit", async kind => {
+    const f = fixture();
+    const previous = f.deps.settings();
+    f.deps.settings = () => ({ ...previous, workerModel: "claude-opus-5-5", reviewModel: "claude-opus-5-5", workerClaudeLaunchMode: "cloudx-managed", reviewClaudeLaunchMode: "native-project" });
+    const worker = kind === "issue" ? await f.service.startIssue(f.deps.settings().repository, 1, placement) : await f.service.startReview(f.deps.settings().repository, 7, false, placement);
+    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ claudeLaunchMode: kind === "issue" ? "cloudx-managed" : "native-project" }), expect.any(AbortSignal));
+    await f.service.pause(worker.id);
+    f.deps.settings = () => ({ ...previous, workerModel: "claude-opus-5-5", reviewModel: "claude-opus-5-5" });
+    await f.service.resume(worker.id, placement);
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0].claudeLaunchMode).toBeUndefined();
+  });
+
   it.each(["issue", "review"] as const)("uses the %s model defaults and current settings on resume", async kind => {
     const f = fixture();
     const worker = kind === "issue" ? await f.service.startIssue(f.deps.settings().repository, 1, placement) : await f.service.startReview(f.deps.settings().repository, 7, false, placement);

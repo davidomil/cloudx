@@ -1,5 +1,5 @@
 import { descriptorFromPlugin, type HookDefinition, type PluginSession, type WorkspacePlugin } from "@cloudx/plugin-api";
-import { CLAUDE_EFFORT_LEVELS, CLAUDE_LAUNCH_PERMISSION_MODES, CLAUDE_SKILL_NAME_PATTERN, CLAUDE_SETTINGS_HOOKS, CLAUDE_SETTINGS_PLUGIN_ID, CLAUDE_UPDATE_CHANNELS, type ClaudeGlobalSettingsUpdate } from "@cloudx/shared";
+import { CLAUDE_BOOLEAN_SETTINGS, CLAUDE_EFFORT_LEVELS, CLAUDE_LAUNCH_MODES, CLAUDE_LAUNCH_PERMISSION_MODES, CLAUDE_SKILL_NAME_PATTERN, CLAUDE_SETTINGS_HOOKS, CLAUDE_SETTINGS_PLUGIN_ID, CLAUDE_UPDATE_CHANNELS, type ClaudeGlobalSettingsUpdate } from "@cloudx/shared";
 
 import { CLAUDE_BYPASS_WARNING, type ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 
@@ -19,6 +19,14 @@ export class ClaudeSettingsPlugin implements WorkspacePlugin {
     const owner = { kind: "plugin" as const, pluginId: this.id };
     const nullable = (schema: Record<string, unknown>) => ({ anyOf: [schema, { type: "null" }] });
     this.hooks = [
+      {
+        id: "claude-settings.inspect-launch", owner,
+        title: "Inspect recorded Claude launch",
+        description: "Read an existing tab's launch-time identity and source fingerprints without starting or changing a native client.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: { tabId: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" } }, required: ["tabId"], additionalProperties: false },
+        execute: async input => ({ launchRecord: await settings.inspectLaunch(input.tabId as string) }),
+      },
       {
         id: CLAUDE_SETTINGS_HOOKS.read, owner,
         title: "Read Claude settings",
@@ -41,11 +49,14 @@ export class ClaudeSettingsPlugin implements WorkspacePlugin {
             expectedRevision: { type: "string", pattern: "^[a-f0-9]{64}$" },
             model: nullable({ type: "string", maxLength: 128 }),
             effortLevel: nullable({ type: "string", enum: [...CLAUDE_EFFORT_LEVELS] }),
+            effortModel: { type: "string", maxLength: 128 },
+            nativeOptions: { type: "object", properties: Object.fromEntries(CLAUDE_BOOLEAN_SETTINGS.map(key => [key, nullable({ type: "boolean" })])), additionalProperties: false },
             alwaysThinkingEnabled: nullable({ type: "boolean" }),
             fastMode: nullable({ type: "boolean" }),
             outputStyle: nullable({ type: "string", maxLength: 64 }),
             language: nullable({ type: "string", maxLength: 64 }),
             autoUpdatesChannel: nullable({ type: "string", enum: [...CLAUDE_UPDATE_CHANNELS] }),
+            launchMode: nullable({ type: "string", enum: [...CLAUDE_LAUNCH_MODES] }),
             permissionMode: { type: "string", enum: [...CLAUDE_LAUNCH_PERMISSION_MODES] },
             autoTrustWorkspace: { type: "boolean" },
             allowedSkills: { type: "array", maxItems: 1000, items: { type: "string", pattern: CLAUDE_SKILL_NAME_PATTERN.source } }

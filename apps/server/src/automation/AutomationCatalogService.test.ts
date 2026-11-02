@@ -6,6 +6,17 @@ import { AutomationCatalogService } from "./AutomationCatalogService.js";
 import { AutomationTypeService } from "./AutomationTypeService.js";
 
 describe("AutomationCatalogService", () => {
+  it("offers Claude launch policy inheritance and both source contracts on exec nodes", async () => {
+    const service = new AutomationCatalogService(new AutomationTypeService(), () => [], () => []);
+    const exec = (await service.catalog()).nodes.find(entry => entry.typeId === "primitive:codex.exec")!;
+    const mode = exec.inputs.find(port => port.id === "claudeLaunchMode")!;
+    expect(mode.defaultValue).toBe("");
+    expect(mode.options?.values?.map(option => option.value)).toEqual(["", "native-project", "cloudx-managed"]);
+    expect(mode.description).toContain("project CLAUDE.md");
+    expect(mode.description).toContain("CLAUDE.local.md");
+    expect(mode.description).toContain("not an exclusive allowlist");
+  });
+
   it("turns structured schemas into reusable leaf ports and config-only objects", async () => {
     const service = new AutomationCatalogService(
       new AutomationTypeService(),

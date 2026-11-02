@@ -72,6 +72,27 @@ async function select(input: HTMLInputElement | HTMLSelectElement, value: string
 }
 
 describe("Forge setup in ordinary Settings", () => {
+  it("discloses Claude source changes before saving independent coding and review modes", async () => {
+    const response = config();
+    for (const [key, label] of [["workerClaudeLaunchMode", "Coding Claude launch mode"], ["reviewClaudeLaunchMode", "Review Claude launch mode"]]) {
+      response.plugins[0].fields.push({ key, label, type: "select", defaultValue: "", options: [
+        { value: "", label: "Inherit Claude Settings" }, { value: "native-project", label: "Native project" }, { value: "cloudx-managed", label: "CloudX-managed (exclusive skills)" },
+      ], description: "CloudX-managed omits shared project settings, project CLAUDE.md, project rules, local settings and CLAUDE.local.md. Native project additions are not an exclusive allowlist." });
+    }
+    const { container, save } = await mount(templates, response);
+    const coding = field(container, "Coding Claude launch mode");
+    const review = field(container, "Review Claude launch mode");
+    expect(coding.value).toBe("");
+    expect(review.value).toBe("");
+    expect(container.textContent).toContain("project CLAUDE.md");
+    expect(container.textContent).toContain("CLAUDE.local.md");
+    expect(container.textContent).toContain("not an exclusive allowlist");
+    await select(coding, "cloudx-managed");
+    await select(review, "native-project");
+    await act(async () => [...container.querySelectorAll("button")].find(item => item.textContent === "Save")!.click());
+    expect(save.mock.calls[0][0].plugins.forge).toMatchObject({ workerClaudeLaunchMode: "cloudx-managed", reviewClaudeLaunchMode: "native-project" });
+  });
+
   it("saves the configured repository without a manual trust approval", async () => {
     const { container, save } = await mount();
     expect(container.querySelector('[aria-label="Trust this repository for Forge workers"]')).toBeNull();

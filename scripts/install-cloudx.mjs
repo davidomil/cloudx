@@ -33,7 +33,7 @@ import {
 
 export const ASR_MODEL_ID = "Systran/faster-whisper-large-v3";
 export const CODEX_CLI_VERSION = "0.157.1";
-export const CLAUDE_CODE_VERSION = "2.1.289";
+export const CLAUDE_CODE_VERSION = "2.1.316";
 export const UV_VERSION = "0.11.28";
 export { SERVICE_NAMES };
 export const LEGACY_SERVICE_NAMES = ["cloudx-asr.service", "cloudx.service"];

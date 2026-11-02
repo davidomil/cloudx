@@ -1,4 +1,4 @@
-import { AGENT_ACCOUNTS_OPTION_SOURCE, DEFAULT_CODEX_MODEL, CODEX_REASONING_EFFORTS, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
+import { AGENT_ACCOUNTS_OPTION_SOURCE, DEFAULT_CODEX_MODEL, CODEX_REASONING_EFFORTS, resolveClaudeLaunchMode, type ClaudeLaunchMode, type CodexReasoningEffort, type ConfigFieldDescriptor, type ForgeCredentialRole, type ForgeRepository } from "@cloudx/shared";
 import type { ConfigService } from "../configService.js";
 import { AGENT_EXEC_MODEL_OPTIONS } from "../aiModelOptions.js";
 import type { ForgeConnectionService } from "./connections/ForgeConnectionService.js";
@@ -39,6 +39,8 @@ export class ForgeSettingsService {
       reviewReasoningEffort: this.required("reviewReasoningEffort") as CodexReasoningEffort,
       workerAccountId: this.optional("workerAccountId"),
       reviewAccountId: this.optional("reviewAccountId"),
+      workerClaudeLaunchMode: this.claudeLaunchMode("workerClaudeLaunchMode"),
+      reviewClaudeLaunchMode: this.claudeLaunchMode("reviewClaudeLaunchMode"),
       maxRunMinutes: Number(this.config.getPluginConfig("forge").maxRunMinutes),
     };
   }
@@ -82,6 +84,11 @@ export class ForgeSettingsService {
     return typeof value === "string" && value.trim() ? value.trim() : undefined;
   }
 
+  private claudeLaunchMode(key: string): ClaudeLaunchMode | undefined {
+    const value = this.config.getPluginConfig("forge")[key];
+    return value === undefined || value === "" ? undefined : resolveClaudeLaunchMode(value).mode;
+  }
+
   private required(key: string): string {
     const value = this.config.getPluginConfig("forge")[key];
     if (typeof value !== "string" || !value.trim()) throw new Error(`Configure ${key} in Forge settings.`);
@@ -90,6 +97,15 @@ export class ForgeSettingsService {
 }
 export function forgeConfigFields(): ConfigFieldDescriptor[] {
   const reasoningOptions = CODEX_REASONING_EFFORTS.map(value => ({ value, label: value === "xhigh" ? "X-high" : value[0].toUpperCase() + value.slice(1) }));
+  const claudeMode = (key: string, label: string): ConfigFieldDescriptor => ({
+    key, label, type: "select", defaultValue: "",
+    options: [
+      { value: "", label: "Inherit Claude Settings" },
+      { value: "native-project", label: "Native project" },
+      { value: "cloudx-managed", label: "CloudX-managed (exclusive skills)" },
+    ],
+    description: "Claude only, future launches. Native project retains native discovery; selected CloudX skill additions are not an exclusive allowlist. CloudX-managed requires a verified exclusive skill contract and omits shared project settings, project CLAUDE.md, project rules, local settings and CLAUDE.local.md. Supported personal inputs remain; existing local inputs require Native project. Account and receipt policy applies in both modes. Preserved conversations keep their recorded policy or reject an incompatible change before work.",
+  });
   const fields: ConfigFieldDescriptor[] = [
     {
       key: "provider",
@@ -163,6 +179,7 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       options: reasoningOptions,
       description: "Choose a reasoning level supported by the coding model.",
     },
+    claudeMode("workerClaudeLaunchMode", "Coding Claude launch mode"),
     {
       key: "reviewTemplateId",
       label: "Review template",
@@ -197,6 +214,7 @@ export function forgeConfigFields(): ConfigFieldDescriptor[] {
       options: reasoningOptions,
       description: "Choose a reasoning level supported by the review model.",
     },
+    claudeMode("reviewClaudeLaunchMode", "Review Claude launch mode"),
     {
       key: "maxRunMinutes",
       label: "Worker time limit (minutes)",

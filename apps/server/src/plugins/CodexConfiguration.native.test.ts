@@ -19,6 +19,29 @@ const answer = "The saved native configuration completed this isolated turn.";
 const tui = { resume_cwd: "current", notifications: false, animations: false };
 const instructions = "Use the instructions file from the original isolated Codex home.";
 
+it.skipIf(!codex)("new-release presets and structured features survive native save, launch, reload and unset", async context => {
+  const fixture = await NativeConfigurationSession.create();
+  try {
+    const original = await fixture.settings.read();
+    if (original.configuration?.selectedVersion !== "0.166.0") { context.skip(); return; }
+    const nativeTui = { ...tui, copy_on_select_clear_selection: true, presets: { "3": { input: "Review the change", label: "Review" } } };
+    const features = { async_compaction: { enabled: false, model_async_compact_threshold_percent: 65 } };
+    await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { tui: nativeTui, features } });
+    const reloaded = await fixture.settings.read();
+    expect(reloaded.configuration?.values).toMatchObject({ tui: nativeTui, features });
+    await fixture.launch();
+    await fixture.completeTurn();
+    expect(parse(await fs.readFile(fixture.overlayConfigPath, "utf8"))).toMatchObject({ tui: nativeTui, features });
+    await fixture.settings.update({ expectedRevision: reloaded.revision, nativeOptions: { tui: null, features: null } });
+    const unset = await fixture.settings.read();
+    expect(unset.configuration?.values).not.toHaveProperty("tui");
+    expect(unset.configuration?.values).not.toHaveProperty("features");
+    expect(unset.model).toBe(original.model);
+    expect(unset.defaultSkills).toEqual(original.defaultSkills);
+    expect(parse(await fs.readFile(fixture.overlayConfigPath, "utf8"))).toMatchObject({ tui: nativeTui });
+  } finally { await fixture.dispose(); }
+}, 30_000);
+
 it.skipIf(!codex).each(["tab", "Forge worker"])("saved configuration reaches a new native %s while an existing session keeps its launch defaults", async role => {
   const fixture = await NativeConfigurationSession.create();
   try {
@@ -26,7 +49,7 @@ it.skipIf(!codex).each(["tab", "Forge worker"])("saved configuration reaches a n
     const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: {
       model_verbosity: "low", model_reasoning_summary: "concise", tui
     } });
-    expect(selected.configuration?.selectedVersion).toMatch(/^0\.(160\.0|162\.1)$/u);
+    expect(selected.configuration?.selectedVersion).toMatch(/^0\.(160\.0|162\.1|166\.0)$/u);
     await fixture.launch();
     await fixture.completeTurn();
     expect(fixture.requests[0]).toMatchObject({ text: { verbosity: "low" }, reasoning: { summary: "concise" } });

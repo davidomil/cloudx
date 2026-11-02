@@ -15,6 +15,49 @@ import { PathPolicy } from "./pathPolicy.js";
 const gunzipAsync = promisify(gunzip);
 
 describe("FileTransferService", () => {
+  it("reads bounded source citations from the originating agent workspace without opening raw downloads", async ({ onTestFinished }) => {
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-citation-"));
+    onTestFinished(() => fsp.rm(root, { recursive: true, force: true }));
+    await fsp.writeFile(path.join(root, "source.ts"), "export const café = true;\n");
+    const service = new FileTransferService(new PathPolicy([root]));
+    const tab = { ...workspaceTab(root), pluginId: "codex-terminal" };
+    const file = await service.createTextPreview(tab, "source.ts");
+    expect(file.contentType).toBe("text/plain; charset=utf-8");
+    expect((await streamToBuffer(file.stream)).toString("utf8")).toBe("export const café = true;\n");
+    await expect(service.createRawFile(tab, "source.ts")).rejects.toThrow("file-browser");
+    await expect(service.createTextPreview(tab, "../outside.ts")).rejects.toThrow("outside");
+    await fsp.writeFile(path.join(root, "large.md"), "x".repeat(512_001));
+    await expect(service.createTextPreview(tab, "large.md")).rejects.toThrow("512 KB");
+    await fsp.writeFile(path.join(root, "binary.ts"), Buffer.from([0, 1, 0xff]));
+    await expect(service.createTextPreview(tab, "binary.ts")).rejects.toThrow("UTF-8 text");
+    await fsp.symlink(path.join(root, "source.ts"), path.join(root, "link.ts"));
+    await expect(service.createTextPreview(tab, "link.ts")).rejects.toThrow("Symbolic links");
+    await expect(service.createTextPreview({ ...tab, pluginId: "web-browser" }, "source.ts")).rejects.toThrow("citation");
+    await fsp.writeFile(path.join(root, "exact.md"), "x".repeat(512_000));
+    expect((await streamToBuffer((await service.createTextPreview(tab, "exact.md")).stream)).length).toBe(512_000);
+    await fsp.writeFile(path.join(root, "empty.md"), "");
+    expect((await streamToBuffer((await service.createTextPreview(tab, "empty.md")).stream)).length).toBe(0);
+    await expect(service.createTextPreview(tab, ".")).rejects.toThrow("must be a file");
+  });
+
+  it("rejects citations whose final file or parent is replaced after path validation", async ({ onTestFinished }) => {
+    if (process.platform === "win32") return;
+    const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-citation-race-"));
+    const outside = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-citation-outside-"));
+    onTestFinished(async () => { await fsp.rm(root, { recursive: true, force: true }); await fsp.rm(outside, { recursive: true, force: true }); });
+    await fsp.mkdir(path.join(root, "src"));
+    const target = path.join(root, "src", "source.ts");
+    const secret = path.join(outside, "source.ts");
+    await fsp.writeFile(target, "safe");
+    await fsp.writeFile(secret, "outside");
+    const service = new FileTransferService(new PathPolicy([root, outside]));
+    const tab = { ...workspaceTab(root), pluginId: "codex-terminal" };
+    await expect(replaceWithSymlinkAfterRealpath(target, secret, () => service.createTextPreview(tab, "src/source.ts"), 1)).rejects.toThrow("Symbolic links");
+    await fsp.unlink(target);
+    await fsp.writeFile(target, "safe");
+    await expect(replaceDirectoryWithSymlinkBeforeOpen(target, path.dirname(target), outside, () => service.createTextPreview(tab, "src/source.ts"))).rejects.toThrow("Transfer target changed");
+  });
+
   it("downloads one file as its raw bytes", async () => {
     const root = await fsp.mkdtemp(path.join(os.tmpdir(), "cloudx-transfer-file-"));
     await fsp.writeFile(path.join(root, "README.md"), "hello transfer\n");
@@ -343,7 +386,7 @@ function workspaceTab(cwd: string): WorkspaceTab {
   };
 }
 
-async function replaceWithSymlinkAfterRealpath<T>(target: string, symlinkTarget: string, operation: () => Promise<T>): Promise<T> {
+async function replaceWithSymlinkAfterRealpath<T>(target: string, symlinkTarget: string, operation: () => Promise<T>, validationReads = 2): Promise<T> {
   const originalRealpath = fsp.realpath.bind(fsp);
   let replaced = false;
   let targetRealpathCalls = 0;
@@ -352,7 +395,7 @@ async function replaceWithSymlinkAfterRealpath<T>(target: string, symlinkTarget:
     if (String(args[0]) === target) {
       targetRealpathCalls += 1;
     }
-    if (!replaced && targetRealpathCalls === 2) {
+    if (!replaced && targetRealpathCalls === validationReads) {
       replaced = true;
       await fsp.rm(target);
       await fsp.symlink(symlinkTarget, target);

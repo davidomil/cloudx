@@ -8,7 +8,8 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 
 import { buildClaudeLaunchArgs, findClaudeTranscript } from "./ClaudeLaunch.js";
-import { claudeLaunchEnv } from "../agentCli.js";
+import { claudeEnforcedEnv, claudeLaunchEnv } from "../agentCli.js";
+import { CLAUDE_ACCOUNT_ENV_KEYS, CLAUDE_SERVICE_ROUTING_KEYS } from "./claudeAccountPolicy.js";
 import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { CodexConversationRecovery } from "../../plugins/CodexConversationRecovery.js";
@@ -24,6 +25,17 @@ describe("buildClaudeLaunchArgs", () => {
 
   it("starts a new session with CloudX hooks and bypassed permissions", () => {
     expect(buildClaudeLaunchArgs(undefined, options)).toEqual(["--settings", "/overlay/settings.json", "--add-dir", "/rules", "--dangerously-skip-permissions"]);
+  });
+
+  it("validates a deferred Forge prompt before native startup and keeps the work out of argv", () => {
+    expect(buildClaudeLaunchArgs({ prompt: "Review this work" }, { ...options, deferPrompt: true })).not.toContain("Review this work");
+    for (const prompt of [" ", "invalid\0prompt", 17])
+      expect(() => buildClaudeLaunchArgs({ prompt }, { ...options, deferPrompt: true })).toThrow("non-empty string without null bytes");
+  });
+
+  it("adds CloudX instructions once without wrapping the personal memory file in another import", () => {
+    const args = buildClaudeLaunchArgs(undefined, { ...options, instructionsPath: "/overlay/.cloudx-instructions.md" });
+    expect(args).toEqual(["--settings", "/overlay/settings.json", "--append-system-prompt-file", "/overlay/.cloudx-instructions.md", "--add-dir", "/rules", "--dangerously-skip-permissions"]);
   });
 
   it("resumes an exact session with a prompt and maps Codex effort names", () => {
@@ -49,8 +61,19 @@ describe("claudeLaunchEnv", () => {
       PATH: "/bin", ANTHROPIC_API_KEY: "inherited", CLAUDECODE: "1", CODEX_HOME: "/codex",
       CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_SESSION_ID: "parent", CLAUDE_CODE_MESSAGING_SOCKET: "/run/sock"
     }, "/overlay", {});
-    expect(env).toEqual({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/overlay" });
+    expect(env).toEqual({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/overlay", ANTHROPIC_CONFIG_DIR: "/overlay/anthropic-auth" });
     expect(claudeLaunchEnv({}, "/overlay", { ANTHROPIC_API_KEY: "account" })).toMatchObject({ ANTHROPIC_API_KEY: "account" });
+  });
+
+  it("clears newer account credentials and reapplies intentional service routing after the login profile", () => {
+    const base = { PATH: "/bin", ANTHROPIC_AWS_API_KEY: "fake-inherited", ANTHROPIC_FOUNDRY_API_KEY: "fake-inherited", CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_BEDROCK_MANTLE_BASE_URL: "https://gateway.invalid" };
+    const selected = claudeLaunchEnv(base, "/overlay", {});
+    expect(selected.ANTHROPIC_AWS_API_KEY).toBeUndefined();
+    expect(selected.ANTHROPIC_FOUNDRY_API_KEY).toBeUndefined();
+    expect(selected.CLAUDE_CODE_USE_MANTLE).toBe("1");
+    const enforced = claudeEnforcedEnv("/overlay", {}, selected);
+    expect(enforced.set).toMatchObject({ CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_BEDROCK_MANTLE_BASE_URL: "https://gateway.invalid", CLAUDE_CONFIG_DIR: "/overlay" });
+    expect(enforced.unset).toEqual(expect.arrayContaining(["ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE", ...CLAUDE_SERVICE_ROUTING_KEYS]));
   });
 });
 
@@ -67,8 +90,11 @@ describe("Claude overlay and hook receipts", () => {
     const env = async (launchEnv: NodeJS.ProcessEnv) => JSON.parse(await fs.readFile((await materializeClaudeHomeOverlay({ ...options, launchEnv })).settingsPath, "utf8")).env;
 
     const configDir = path.join(root, "data", "claude-launches", "tab-1");
-    const cleared = { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "", CLAUDE_CODE_OAUTH_TOKEN: "", ANTHROPIC_BASE_URL: "", CLAUDE_CODE_USE_BEDROCK: "", CLAUDE_CODE_USE_VERTEX: "", CLAUDE_CODE_USE_FOUNDRY: "", CLAUDE_CONFIG_DIR: configDir };
+    const cleared = { ...Object.fromEntries(CLAUDE_ACCOUNT_ENV_KEYS.map(key => [key, ""])), CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth") };
     expect(await env({ PATH: "/bin" })).toEqual(cleared);
+    // Fake native settings cannot retain the newer provider selectors or key.
+    await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_USE_ANTHROPIC_AWS: "1", CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_AWS_API_KEY: "fake-other-account" } }));
+    expect(await env({ ANTHROPIC_API_KEY: "fake-selected" })).toMatchObject({ ANTHROPIC_API_KEY: "fake-selected", CLAUDE_CODE_USE_ANTHROPIC_AWS: "", CLAUDE_CODE_USE_MANTLE: "", ANTHROPIC_AWS_API_KEY: "" });
     // A selected API key, and an endpoint the CloudX process itself runs with, are kept.
     expect(await env({ ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "https://gateway.example" })).toEqual({ ...cleared, ANTHROPIC_API_KEY: "selected", ANTHROPIC_BASE_URL: "https://gateway.example" });
     expect((await fs.stat(path.join(configDir, ".cloudx-settings.json"))).mode & 0o777).toBe(0o600);
@@ -131,6 +157,21 @@ describe("Claude overlay and hook receipts", () => {
 });
 
 describe("Claude Forge turn receipts", () => {
+  it("blocks native model work when an owned Forge prompt cannot persist its receipt without exposing payloads", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-hook-failure-"));
+    await fs.writeFile(path.join(root, ".cloudx-forge-turn.json"), JSON.stringify({ workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(root, "missing", "receipt.json"), expectedThreadId: SESSION }));
+    const payload = JSON.stringify({ session_id: SESSION, cwd: root, prompt_id: "p1", prompt: "private-prompt-never-print" });
+    try {
+      await run("sh", ["-c", `printf '%s' '${payload}' | ${process.execPath} ${HELPER} ${root} tab-1 ${EXECUTION} UserPromptSubmit`]);
+      throw new Error("Expected blocked native hook");
+    } catch (error) {
+      expect(error).toMatchObject({ code: 2 });
+      expect((error as { stderr: string }).stderr).toContain("CloudX receipt delivery failed");
+      expect((error as { stderr: string }).stderr).not.toContain("private-prompt");
+    }
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
   async function hook(configDir: string, event: string, payload: Record<string, unknown>, env: NodeJS.ProcessEnv = {}) {
     const input = JSON.stringify(payload).replaceAll("'", "'\\''");
     await run("sh", ["-c", `printf '%s' '${input}' | ${process.execPath} ${HELPER} ${configDir} tab-1 ${EXECUTION} ${event}`], { env: { ...process.env, ...env } });
@@ -305,11 +346,11 @@ describe("Claude Forge turn receipts", () => {
     expect(await final()).toMatchObject({ text: "Done." });
   });
 
-  it("ignores another conversation and records API failures", async () => {
+  it("blocks another Forge conversation before model work and records API failures in the owned conversation", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-forge-"));
     const receiptPath = path.join(root, "attempt-1.json");
     await fs.writeFile(path.join(root, ".cloudx-forge-turn.json"), JSON.stringify({ workerId: "issue-1", attemptId: "attempt-1", receiptPath, expectedThreadId: SESSION }));
-    await hook(root, "UserPromptSubmit", { session_id: "b5570c58-978a-4694-84f9-c67756be3acd", cwd: root, prompt_id: "p1" });
+    await expect(hook(root, "UserPromptSubmit", { session_id: "b5570c58-978a-4694-84f9-c67756be3acd", cwd: root, prompt_id: "p1" })).rejects.toMatchObject({ code: 2 });
     await expect(fs.stat(receiptPath)).rejects.toMatchObject({ code: "ENOENT" });
 
     await hook(root, "UserPromptSubmit", { session_id: SESSION, cwd: root, prompt_id: "p1" });

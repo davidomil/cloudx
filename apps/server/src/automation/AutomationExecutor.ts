@@ -6,12 +6,13 @@ import safeRegex from "safe-regex2";
 
 import type { HookRegistry } from "../hooks/HookRegistry.js";
 import { isSameOrChildPath } from "../pathBoundary.js";
-import type { AutomationCatalogResponse, AutomationEdge, AutomationGroup, AutomationNode, AutomationNodeCatalogEntry, AutomationRunSummary, AutomationRunTraceEntry, TriggerEvent } from "@cloudx/shared";
+import type { AutomationCatalogResponse, AutomationEdge, AutomationGroup, AutomationNode, AutomationNodeCatalogEntry, AutomationRunSummary, AutomationRunTraceEntry, ClaudeLaunchMode, TriggerEvent } from "@cloudx/shared";
 import { AUTOMATION_FSTRING_TYPE_ID, automationEntryWithDynamicPorts, automationFStringInputNames, automationSafetyAllowed, isRecord } from "@cloudx/shared";
 import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 import type { AgentAccountStore } from "../agents/AgentAccountStore.js";
 import { agentCommand, runAgentCli } from "../agents/agentCli.js";
 import { isClaudeModel } from "../agents/claude/ClaudeLaunch.js";
+import { prepareClaudeExecutionLaunch } from "../agents/claude/ClaudeExecutionLaunch.js";
 
 export interface AutomationExecutorOptions {
   runId?: string;
@@ -381,15 +382,25 @@ class AutomationRuntime {
       const cwd = await resolveAutomationProcessCwd(await this.optionalInputValue(node, "cwd"), this.options.allowedRoots, "Codex");
       const profile = optionalString(await this.optionalInputValue(node, "profile"));
       const model = optionalString(await this.optionalInputValue(node, "model"));
+      const modeInput = await this.optionalInputValue(node, "claudeLaunchMode");
+      const claudeLaunchMode = modeInput === undefined || modeInput === "" ? undefined
+        : enumInputValue(modeInput, ["native-project", "cloudx-managed"], node, "claudeLaunchMode");
+      if (claudeLaunchMode && !isClaudeModel(model)) throw new Error(`Node ${node.id} Claude launch mode requires a Claude model.`);
       const sandbox = enumInputValue(await this.optionalInputValue(node, "sandbox") ?? "read-only", ["read-only", "workspace-write", "danger-full-access"], node, "sandbox");
       const approvalPolicy = enumInputValue(await this.optionalInputValue(node, "approvalPolicy") ?? "never", ["untrusted", "on-request", "never"], node, "approvalPolicy");
       const ephemeral = booleanValue(await this.optionalInputValue(node, "ephemeral") ?? true, node, "ephemeral");
       const json = booleanValue(await this.optionalInputValue(node, "json") ?? false, node, "json");
       const skipGitRepoCheck = booleanValue(await this.optionalInputValue(node, "skipGitRepoCheck") ?? false, node, "skipGitRepoCheck");
       this.trace("info", "Starting Codex exec process.", node.id, { cwd, timeoutMs, sandbox, approvalPolicy, json });
-      const execInput = { prompt, stdin, cwd, timeoutMs, profile, model, sandbox, approvalPolicy, ephemeral, json, skipGitRepoCheck, signal: this.options.signal };
+      const execInput = { prompt, stdin, cwd, timeoutMs, profile, model, sandbox, approvalPolicy, ephemeral, json, skipGitRepoCheck, claudeLaunchMode, signal: this.options.signal };
       const claude = isClaudeModel(model);
-      const result = claude ? await runClaudeAutomationExec(execInput, this.options.agentAccounts) : await runCodexExec(execInput);
+      const result = claude ? await runClaudeAutomationExec(execInput, this.options.agentAccounts, launch => {
+        this.trace("info", "Claude execution launch policy recorded.", node.id, {
+          executionId: launch.executionId, mode: launch.launchPolicy.mode,
+          exclusiveSkills: launch.launchPolicy.exclusiveSkills, settingSources: launch.launchPolicy.settingSources,
+          activation: launch.launchPolicy.activation,
+        });
+      }) : await runCodexExec(execInput);
       this.assertNotCancelled();
       const jsonEvents = json ? (claude ? parseClaudeJsonResult(result.stdout, node) : parseCodexJsonLines(result.stdout, node)) : undefined;
       const finalMessage = jsonEvents ? (claude ? claudeFinalMessage(jsonEvents) : finalMessageFromCodexEvents(jsonEvents)) : result.stdout.trimEnd();
@@ -1238,6 +1249,7 @@ interface CodexExecInput {
   timeoutMs: number;
   profile?: string;
   model?: string;
+  claudeLaunchMode?: ClaudeLaunchMode;
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   approvalPolicy: "untrusted" | "on-request" | "never";
   ephemeral: boolean;
@@ -1260,22 +1272,26 @@ const CLAUDE_SANDBOX_ARGS: Record<CodexExecInput["sandbox"], string[]> = {
   "danger-full-access": ["--dangerously-skip-permissions"]
 };
 
-async function runClaudeAutomationExec(input: CodexExecInput, accounts: AgentAccountStore | undefined): Promise<CodexExecResult> {
+async function runClaudeAutomationExec(input: CodexExecInput, accounts: AgentAccountStore | undefined, onLaunch: (launch: Awaited<ReturnType<typeof prepareClaudeExecutionLaunch>>) => void): Promise<CodexExecResult> {
   if (!accounts) throw new Error("Claude automation runs need the agent account store.");
   if (input.profile) throw new Error("Codex profiles do not apply to Claude models. Remove the profile input.");
-  const env = await accounts.defaultClaudeEnv(process.env);
-  const args = [
-    "-p",
-    "--output-format", input.json ? "json" : "text",
-    "--model", input.model!,
-    ...CLAUDE_SANDBOX_ARGS[input.sandbox],
-    ...(input.ephemeral ? ["--no-session-persistence"] : []),
-    "--", input.prompt
-  ];
-  const result = await runAgentCli(agentCommand("claude", env), args, {
-    env, cwd: input.cwd, stdin: input.stdin, timeoutMs: input.timeoutMs, signal: input.signal, maxOutputBytes: AUTOMATION_CLAUDE_MAX_OUTPUT_BYTES
-  });
-  return { stdout: result.stdout, stderr: result.stderr, exitCode: result.code ?? 1 };
+  const launch = await prepareClaudeExecutionLaunch(accounts, { cwd: input.cwd, claudeLaunchMode: input.claudeLaunchMode, signal: input.signal });
+  try {
+    onLaunch(launch);
+    const { env, args: accountArgs } = launch;
+    const args = [
+      ...accountArgs, "-p",
+      "--output-format", input.json ? "json" : "text",
+      "--model", input.model!,
+      ...CLAUDE_SANDBOX_ARGS[input.sandbox],
+      ...(input.ephemeral ? ["--no-session-persistence"] : []),
+      "--", input.prompt
+    ];
+    const result = await runAgentCli(agentCommand("claude", env), args, {
+      env, cwd: input.cwd, stdin: input.stdin, timeoutMs: input.timeoutMs, signal: input.signal, maxOutputBytes: AUTOMATION_CLAUDE_MAX_OUTPUT_BYTES
+    });
+    return { stdout: result.stdout, stderr: result.stderr, exitCode: result.code ?? 1 };
+  } finally { await launch.dispose(); }
 }
 
 function parseClaudeJsonResult(stdout: string, node: AutomationNode): Record<string, unknown>[] {

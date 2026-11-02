@@ -10,6 +10,7 @@ import { SettingsDialog } from "./SettingsDialog.js";
 let root: Root | undefined;
 
 beforeEach(() => {
+  vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => undefined });
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   Element.prototype.scrollIntoView = vi.fn();
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
@@ -174,7 +175,7 @@ describe("Settings navigation and search", () => {
     const dialog = container.querySelector('[role="dialog"]')!;
     expect(dialog).not.toBeNull();
     expect(dialog.getAttribute("aria-label") ?? document.getElementById(dialog.getAttribute("aria-labelledby")!)?.textContent).toBe("Settings");
-    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Logs", "Browser"]);
+    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Terminal", "Archive Search", "Logs", "Browser"]);
     expect(tab(container, "General").getAttribute("aria-selected")).toBe("true");
     expect(visibleFields(container)).toEqual(["Workspace title", "Default template"]);
 
@@ -189,7 +190,7 @@ describe("Settings navigation and search", () => {
 
   it("omits Browser without permission state and excludes internal settings from navigation", async () => {
     const { container } = await mount({ browserNotificationState: undefined });
-    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Archive Search", "Logs"]);
+    expect([...container.querySelectorAll('[role="tab"]')].map(item => item.getAttribute("aria-label"))).toEqual(["General", "Terminal", "Archive Search", "Logs"]);
     expect(container.textContent).not.toMatch(/Diagnostic pipeline|Internal plugin field|Internal Only|Hidden field/);
   });
 
@@ -203,7 +204,7 @@ describe("Settings navigation and search", () => {
     tab(container, "General").focus();
     await pressKey(tab(container, "General"), scrollingKey);
     expect(tab(container, "General").getAttribute("aria-selected")).toBe("true");
-    for (const [key, name] of [[next, "Archive Search"], ["End", "Browser"], [next, "General"], [previous, "Browser"], ["Home", "General"]]) {
+    for (const [key, name] of [[next, "Terminal"], ["End", "Browser"], [next, "General"], [previous, "Browser"], ["Home", "General"]]) {
       await pressKey(document.activeElement as HTMLElement, key);
       const selected = tab(container, name);
       expect(selected.getAttribute("aria-selected")).toBe("true");

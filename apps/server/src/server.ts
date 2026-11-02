@@ -9,7 +9,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import type { RawData, WebSocket } from "ws";
 
-import { AGENT_ACCOUNT_ID_PATTERN, isAgentProviderId, isAgentTab, isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState, parseCodexCommandDetailsSnapshot } from "@cloudx/shared";
+import { AGENT_ACCOUNT_ID_PATTERN, isAgentProviderId, isAgentTab, isDirectoryOwnershipReconciliation, isAutomationGraphDocument, isUsableTabLayoutState, parseTerminalCapabilities, parseCodexCommandDetailsSnapshot } from "@cloudx/shared";
 import type { HookCallContext } from "@cloudx/plugin-api";
 import type {
   ApplyWorkspaceLayoutTemplateRequest,
@@ -175,6 +175,7 @@ export interface AppServices {
   updates?: CloudxUpdateApi;
   pluginContributionsReady?: Promise<RulesSkillsStore>;
   disposeRulesSkillsUpdates?: () => Promise<void>;
+  disposeAgentUsage?: () => Promise<void>;
   codexStateSources?: CodexStateSources;
   codexUpdates?: CodexUpdateService;
 }
@@ -294,6 +295,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       async () => {
         const failures = await settleDisposers([() => services.forge?.dispose()]);
         failures.push(...await settleDisposers([() => services.sessions.dispose?.()]));
+        failures.push(...await settleDisposers([() => services.disposeAgentUsage?.()]));
         if (failures.length === 1) throw failures[0];
         if (failures.length > 1) throw new AggregateError(failures, "Forge workers or sessions failed to stop.");
       }
@@ -652,6 +654,14 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     return { result };
   });
 
+  app.get<{ Params: { tabId: string } }>("/api/tabs/:tabId/terminal-capabilities", async (request, reply) => {
+    const session = services.sessions.getSession(request.params.tabId);
+    reply.header("cache-control", "no-store");
+    const capabilities = parseTerminalCapabilities(session.snapshot().state?.terminalCapabilities ?? { tabId: session.tab.id, commandCapture: false });
+    if (capabilities.tabId !== request.params.tabId) throw new Error("Terminal capabilities belong to a different tab.");
+    return capabilities;
+  });
+
   app.get<{ Params: { tabId: string } }>("/api/tabs/:tabId/command-details", async (request, reply) => {
     const session = services.sessions.getSession(request.params.tabId);
     if (!isAgentTab(session.tab)) throwBadRequest("Command details require a Codex tab.");
@@ -722,6 +732,15 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   app.get<{ Params: { tabId: string }; Querystring: { relativePath?: string } }>("/api/tabs/:tabId/files/raw", async (request, reply) => {
     const tab = services.sessions.getTab(request.params.tabId);
     const file = await services.fileTransfer!.createRawFile(tab, request.query.relativePath);
+    reply.header("content-type", file.contentType);
+    reply.header("cache-control", "no-store");
+    reply.header("x-content-type-options", "nosniff");
+    return reply.send(file.stream);
+  });
+
+  app.get<{ Params: { tabId: string }; Querystring: { relativePath?: string } }>("/api/tabs/:tabId/files/text", async (request, reply) => {
+    const tab = services.sessions.getTab(request.params.tabId);
+    const file = await services.fileTransfer!.createTextPreview(tab, request.query.relativePath);
     reply.header("content-type", file.contentType);
     reply.header("cache-control", "no-store");
     reply.header("x-content-type-options", "nosniff");
@@ -1481,12 +1500,32 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     codex: new CodexUsageReader(() => agentAccounts.providerHome("codex")),
     claude: new ClaudeUsageReader(() => agentAccounts.providerHome("claude"))
   });
+  // Native identity can arrive before a prepared tab is placed. The launch
+  // request owns that initial window; published tabs follow the live layout.
+  const usageRecorder = new AgentUsageRecorder(usageLedger, agentAccounts, error => logger?.warn({ err: error }, "Agent usage could not be recorded."),
+    (tabId, launchWindow) => workspace.findWindowForTab(tabId)?.id ?? launchWindow);
   plugins.register(new CodexTerminalPlugin(terminalFactory, config.terminalReplayBytes, config.dataDir, codexStateSources, process.env, {
     accounts: agentAccounts,
     claudeSettings,
-    usage: new AgentUsageRecorder(usageLedger, agentAccounts, error => logger?.warn({ err: error }, "Agent usage could not be recorded."))
+    usage: usageRecorder
   }));
-  plugins.register(new AgentUsagePlugin(agentUsage, usageLedger, usagePricing, () => sessions?.listTabs().map(tab => tab.id) ?? []));
+  const usageOwners = () => {
+    const windows = workspace.snapshot().windows;
+    return {
+      tabIds: sessions?.listTabs().map(tab => tab.id) ?? [],
+      windowIds: windows.map(window => window.id),
+      tabWindows: new Map(windows.flatMap(window => workspace.tabIdsForWindow(window.id).map(tabId => [tabId, window.id] as const)))
+    };
+  };
+  plugins.register(new AgentUsagePlugin(agentUsage, usageLedger, usagePricing, usageOwners));
+  const releaseUsageWindows = workspace.onChange(() => {
+    void usageLedger.synchronizeWindows(usageOwners().tabWindows).catch(error => logger?.warn({ err: error }, "Agent usage window ownership could not be recorded."));
+  });
+  const disposeAgentUsage = async () => {
+    releaseUsageWindows();
+    await usageRecorder.flush();
+    await usageLedger.flush();
+  };
   plugins.register(new AgentAccountsPlugin(agentAccounts, terminalFactory, config.terminalReplayBytes));
   plugins.register(new ClaudeSettingsPlugin(claudeSettings));
   plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates, new CodexConfigRepairService(codexStateSources)));
@@ -1632,7 +1671,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, codexStateSources, codexUpdates };
+  return { cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

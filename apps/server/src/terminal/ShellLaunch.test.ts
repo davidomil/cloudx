@@ -48,6 +48,22 @@ describe("ShellLaunch", () => {
       .toEqual({ command: "claude", args: [], env: { SHELL: "/usr/bin/nu", CLAUDE_CONFIG_DIR: "/tab" } });
   });
 
+  it("rejects unverified automatic continuation introduced by a login profile without running the provider", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-continuation-env-"));
+    onTestFinished(() => fs.rmSync(home, { recursive: true, force: true }));
+    const profile = path.join(home, "profile.sh");
+    fs.writeFileSync(profile, "export CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1\n");
+    const marker = path.join(home, "provider-started");
+    const launch = buildEnforcedLoginShellLaunch("/usr/bin/touch", [marker], { SHELL: "/bin/bash", PATH: process.env.PATH, BASH_ENV: profile }, { set: {}, unset: [], rejectNonempty: ["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] });
+    try { execFileSync(launch.command, launch.args, { env: launch.env, stdio: "pipe" }); throw new Error("Provider was allowed to start"); }
+    catch (error) {
+      expect(error).toMatchObject({ status: 78 });
+      expect(String((error as { stderr: Buffer }).stderr)).toContain("CLAUDE_CODE_RESUME_INTERRUPTED_TURN");
+    }
+    expect(fs.existsSync(marker)).toBe(false);
+    expect(() => buildEnforcedLoginShellLaunch("claude", [], { SHELL: "/usr/bin/nu", CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1" }, { set: {}, unset: [], rejectNonempty: ["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] })).toThrow("no provider work has started");
+  });
+
   it("falls back to direct command launch for unsupported shells", () => {
     expect(buildLoginShellCommandLaunch("codex", [], { SHELL: "/usr/bin/nu" })).toEqual({
       command: "codex",

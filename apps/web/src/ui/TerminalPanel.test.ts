@@ -11,7 +11,8 @@ const terminalPanelMocks = vi.hoisted(() => ({
   releaseMobileScroller: vi.fn(),
   terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; options: Record<string, unknown>; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
   uploadFileBrowserFile: vi.fn(),
-  readCodexCommandDetails: vi.fn()
+  readCodexCommandDetails: vi.fn(),
+  readTerminalCapabilities: vi.fn()
 }));
 
 vi.mock("@xterm/addon-fit", () => ({
@@ -37,6 +38,11 @@ vi.mock("@xterm/xterm", () => ({
     readonly writeCalls: string[] = [];
     readonly inputHandlers: Array<(data: string) => void> = [];
     readonly _core = { _inputHandler: { parse: (_data: string) => undefined } };
+    readonly buffer = { active: { length: 0, viewportY: 0, getLine: () => undefined } };
+    keyHandler?: (event: KeyboardEvent) => boolean;
+    registerLinkProvider() { return { dispose() {} }; }
+    attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) { this.keyHandler = handler; }
+    paste(data: string) { this.inputHandlers.forEach(handler => handler(`\x1b[200~${data}\x1b[201~`)); }
     readonly parser = { registerOscHandler: () => ({ dispose: () => undefined }) };
 
     constructor(options: Record<string, unknown>) {
@@ -110,7 +116,8 @@ vi.mock("./terminalMobileScroll.js", async (importOriginal) => {
 
 vi.mock("../api.js", () => ({
   uploadFileBrowserFile: terminalPanelMocks.uploadFileBrowserFile,
-  readCodexCommandDetails: terminalPanelMocks.readCodexCommandDetails
+  readCodexCommandDetails: terminalPanelMocks.readCodexCommandDetails,
+  readTerminalCapabilities: terminalPanelMocks.readTerminalCapabilities
 }));
 
 import { TerminalPanel } from "./TerminalPanel.js";
@@ -140,6 +147,10 @@ describe("TerminalPanel", () => {
     terminalPanelMocks.installMobileScroller.mockReturnValue(terminalPanelMocks.releaseMobileScroller);
     terminalPanelMocks.uploadFileBrowserFile.mockReset();
     terminalPanelMocks.readCodexCommandDetails.mockReset();
+    terminalPanelMocks.readTerminalCapabilities.mockReset();
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(async (tabId: string) => ({ tabId, providerId: "codex", commandCapture: false }));
+    const preferences = new Map<string, string>();
+    vi.stubGlobal("localStorage", { getItem: (key: string) => preferences.get(key) ?? null, setItem: (key: string, value: string) => preferences.set(key, value), removeItem: (key: string) => preferences.delete(key) });
     terminalPanelMocks.readCodexCommandDetails.mockImplementation(async (tabId: string) => ({ version: 1, tabId, executionId: "", status: "unavailable", commands: [] }));
     terminalPanelMocks.uploadFileBrowserFile.mockImplementation(async (_tabId: string, relativePath: string, file: Blob) => ({
       path: `/tmp/${relativePath}`,
@@ -641,7 +652,11 @@ describe("TerminalPanel", () => {
     expect(tabId).toBe(tab.id);
     expect(relativePath).toMatch(/^\.cloudx\/pasted-images\/pasted-image-\d+-\d+-1\.png$/u);
     expect(uploadedFile).toBe(file);
-    expect(inputMessages(TestWebSocket.latest!)).toContainEqual({ type: "input", data: ` @${relativePath}` });
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert image into native prompt")!;
+    act(() => { const checkbox = host!.querySelector<HTMLInputElement>(".terminal-attachments input[type=checkbox]")!; checkbox.click(); insert.click(); });
+    expect(inputMessages(TestWebSocket.latest!)).toContainEqual({ type: "input", data: `\x1b[200~/tmp/${relativePath}\x1b[201~` });
+    expect(host!.textContent).toContain("verify the image in the native prompt");
   });
 
   it("leaves image paste events alone in standard terminal tabs", async () => {
@@ -660,6 +675,252 @@ describe("TerminalPanel", () => {
     expect(terminalPanelMocks.uploadFileBrowserFile).not.toHaveBeenCalled();
     expect(inputMessages(TestWebSocket.latest!).some((message) => message.data.includes("@.cloudx/pasted-images"))).toBe(false);
   });
+
+  it("requires a ready native prompt and keeps sent attachments unconfirmed until the user sees them", async () => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "ready.png", { type: "image/png" }))));
+    await flushAsyncWork();
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert image into native prompt")!;
+    expect(insert.disabled).toBe(true);
+    act(() => insert.click());
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+    act(() => { host!.querySelector<HTMLInputElement>(".terminal-attachments input")!.click(); insert.click(); });
+    expect(inputMessages(TestWebSocket.latest!)).toHaveLength(1);
+    expect(host!.textContent).toContain("path sent; verify the image");
+    expect(host!.textContent).not.toContain("confirmed in the native prompt by you");
+    act(() => Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "I can see the native image")!.click());
+    expect(host!.textContent).toContain("confirmed in the native prompt by you");
+    expect(host!.textContent).toContain("removal are owned by the native prompt");
+    act(() => Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Dismiss attachment status")!.click());
+    expect(inputMessages(TestWebSocket.latest!)).toHaveLength(1);
+  });
+
+  it("uploads an ordinary dropped file to its originating workspace and inserts one editable native reference", async () => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    const file = new File(["local file contents"], "../report with spaces.txt", { type: "text/plain" });
+    const event = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", { value: { files: [file, file] } });
+    act(() => host!.querySelector(".terminal-panel")!.dispatchEvent(event));
+    await flushAsyncWork();
+    expect(event.defaultPrevented).toBe(true);
+    expect(terminalPanelMocks.uploadFileBrowserFile).toHaveBeenCalledOnce();
+    const [tabId, relativePath, uploaded] = terminalPanelMocks.uploadFileBrowserFile.mock.calls[0]!;
+    expect(tabId).toBe(tab.id);
+    expect(relativePath).toMatch(/^\.cloudx\/pasted-files\/pasted-file-\d+-\d+-.._report_with_spaces.txt$/u);
+    expect(uploaded).toBe(file);
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert file reference into native prompt")!;
+    act(() => { host!.querySelector<HTMLInputElement>(".terminal-attachments input")!.click(); insert.click(); });
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([{ type: "input", data: `\x1b[200~ @/tmp/${relativePath} \x1b[201~` }]);
+    expect(host!.textContent).toContain("verify the file reference in the native prompt");
+  });
+
+  it("does not upload unsupported dropped binary files or insert a caption twice", async () => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    const event = pasteImageEvent(new File([new Uint8Array([1])], "unsupported.exe", { type: "application/octet-stream" }), "Keep caption");
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(event));
+    await flushAsyncWork();
+    expect(terminalPanelMocks.uploadFileBrowserFile).not.toHaveBeenCalled();
+    expect(host!.textContent).toContain("unsupported file type");
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([{ type: "input", data: "\x1b[200~Keep caption\x1b[201~" }]);
+  });
+
+  it("cannot insert an already uploaded image into a replacement connection", async () => {
+    vi.useFakeTimers();
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "connection.png", { type: "image/png" }))));
+    await flushAsyncWork();
+    const insert = Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Insert image into native prompt")!;
+    act(() => TestWebSocket.latest!.close(1001));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    act(() => TestWebSocket.latest!.open());
+    act(() => { host!.querySelector<HTMLInputElement>(".terminal-attachments input")!.click(); insert.click(); });
+    expect(host!.textContent).toContain("terminal connection changed");
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+  });
+  it("keeps Claude command controls hidden and makes no command polling requests", async () => {
+    vi.useFakeTimers();
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "claude", executionId: "claude-run", commandCapture: false });
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    await act(async () => vi.advanceTimersByTimeAsync(3000));
+    expect(terminalPanelMocks.readCodexCommandDetails).not.toHaveBeenCalled();
+    expect(host!.textContent).toContain("Claude shortcuts");
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+  });
+
+  it("keeps verified command controls mounted while reconnecting the same execution", async () => {
+    vi.useFakeTimers();
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    const toolbar = host!.querySelector(".codex-command-details");
+    expect(toolbar).not.toBeNull();
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => TestWebSocket.latest!.open());
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+    await act(async () => finish({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true }));
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+  });
+
+  it("keeps verified command controls mounted while tab metadata is revalidated", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    const toolbar = host!.querySelector(".codex-command-details");
+    expect(toolbar).not.toBeNull();
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "restored-tab-status" }, active: true, uiScale: 1 })));
+
+    expect(terminalPanelMocks.readTerminalCapabilities).toHaveBeenCalledTimes(2);
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+    await act(async () => finish({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true }));
+    expect(host!.querySelector(".codex-command-details")).toBe(toolbar);
+  });
+
+  it("retires verified capabilities when a replacement execution is reported", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    terminalPanelMocks.readCodexCommandDetails.mockImplementation(() => new Promise(() => {}));
+    const agent = { ...tab, pluginId: "codex-terminal", nativeWork: { version: 1 as const, tabId: tab.id, executionId: "codex-run", threadId: "thread", updatedAt: tab.updatedAt } };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    const commandSignal = terminalPanelMocks.readCodexCommandDetails.mock.calls[0]![1] as AbortSignal;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(() => {}));
+
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, nativeWork: { ...agent.nativeWork, executionId: "replacement-run" } }, active: true, uiScale: 1 })));
+
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+    expect(commandSignal.aborted).toBe(true);
+  });
+
+  it("retires verified capabilities before starting an unidentified replacement", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).not.toBeNull();
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, status: "starting" }, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+    terminalPanelMocks.readTerminalCapabilities.mockImplementation(() => new Promise(() => {}));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "replacement-running" }, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+  });
+
+  it("retires previous command requests when revalidation reports another provider", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    terminalPanelMocks.readCodexCommandDetails.mockImplementation(() => new Promise(() => {}));
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    const commandSignal = terminalPanelMocks.readCodexCommandDetails.mock.calls[0]![1] as AbortSignal;
+    const previousTerminal = terminalPanelMocks.terminals[0]!;
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "claude", executionId: "claude-run", commandCapture: false });
+
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "provider-changed" }, active: true, uiScale: 1 })));
+
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+    expect(host!.textContent).toContain("Claude shortcuts");
+    expect(commandSignal.aborted).toBe(true);
+    expect(previousTerminal.disposed).toBe(true);
+  });
+
+  it("hides verified controls when capability revalidation fails", async () => {
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).not.toBeNull();
+    terminalPanelMocks.readTerminalCapabilities.mockRejectedValue(new Error("Connection failed"));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "unverified-status" }, active: true, uiScale: 1 })));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+  });
+
+  it("aborts capability and command requests when a tab becomes inactive", async () => {
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "codex", executionId: "codex-run", commandCapture: true });
+    terminalPanelMocks.readCodexCommandDetails.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    expect(terminalPanelMocks.readCodexCommandDetails).toHaveBeenCalledOnce();
+    const commandSignal = terminalPanelMocks.readCodexCommandDetails.mock.calls[0]![1] as AbortSignal;
+    const capabilitySignal = terminalPanelMocks.readTerminalCapabilities.mock.calls[0]![1] as AbortSignal;
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: false, uiScale: 1 })));
+    expect(commandSignal.aborted).toBe(true);
+    expect(capabilitySignal.aborted).toBe(true);
+    await act(async () => finish({ version: 1, tabId: tab.id, executionId: "codex-run", status: "available", commands: [] }));
+    expect(host!.querySelector(".codex-command-details")).toBeNull();
+  });
+
+  it("ignores a stale capable provider response after the execution revision changes", async () => {
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.readTerminalCapabilities.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const agent = { ...tab, pluginId: "codex-terminal" };
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: agent, active: true, uiScale: 1 })));
+    terminalPanelMocks.readTerminalCapabilities.mockResolvedValue({ tabId: tab.id, providerId: "claude", executionId: "claude-run", commandCapture: false });
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...agent, updatedAt: "new-revision" }, active: true, uiScale: 1 })));
+    await act(async () => finish({ tabId: tab.id, providerId: "codex", executionId: "old-run", commandCapture: true }));
+    expect(host!.textContent).toContain("Claude shortcuts");
+    expect(terminalPanelMocks.readCodexCommandDetails).not.toHaveBeenCalled();
+  });
+
+  it("preserves a mixed-paste caption and reports upload failure outside terminal output", async () => {
+    terminalPanelMocks.uploadFileBrowserFile.mockRejectedValue(new Error("Upload denied by path policy"));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    const terminal = terminalPanelMocks.terminals[0]!;
+    const event = pasteImageEvent(new File([new Uint8Array([1])], "caption.png", { type: "image/png" }), "Keep this caption");
+    act(() => terminal.element!.dispatchEvent(event));
+    await flushAsyncWork();
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([{ type: "input", data: "\x1b[200~Keep this caption\x1b[201~" }]);
+    expect(host!.textContent).toContain("Upload denied by path policy");
+    expect(terminal.writelnCalls.join(" ")).not.toContain("Upload denied");
+  });
+
+  it("prevents a removed staged image from returning after a late upload", async () => {
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.uploadFileBrowserFile.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "late.png", { type: "image/png" }))));
+    await flushAsyncWork();
+    act(() => Array.from(host!.querySelectorAll("button")).find(button => button.textContent === "Remove staged attachment")!.click());
+    await act(async () => finish({ uploaded: true, path: "/tmp/late.png", relativePath: "late.png", bytes: 1 }));
+    expect(host!.textContent).not.toContain("Insert image into native prompt");
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+  });
+
+  it("keeps a disconnected mixed-paste caption visible after reconnect without replaying it", async () => {
+    vi.useFakeTimers();
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => TestWebSocket.latest!.close(1001));
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "offline.png", { type: "image/png" }), "Offline caption")));
+    expect(host!.textContent).toContain("Offline caption");
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    act(() => TestWebSocket.latest!.open());
+    await flushAsyncWork();
+    expect(host!.textContent).toContain("Offline caption");
+    expect(terminalPanelMocks.uploadFileBrowserFile).not.toHaveBeenCalled();
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+  });
+
+  it("marks an upload from the disconnected socket as failed rather than attaching it after reconnect", async () => {
+    vi.useFakeTimers();
+    let finish!: (value: unknown) => void;
+    terminalPanelMocks.uploadFileBrowserFile.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId: "codex-terminal" }, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    act(() => terminalPanelMocks.terminals[0]!.element!.dispatchEvent(pasteImageEvent(new File([new Uint8Array([1])], "connection.png", { type: "image/png" }))));
+    await flushAsyncWork();
+    act(() => TestWebSocket.latest!.close(1001));
+    await act(async () => vi.advanceTimersByTimeAsync(500));
+    act(() => TestWebSocket.latest!.open());
+    await act(async () => finish({ uploaded: true, path: `/tmp/${terminalPanelMocks.uploadFileBrowserFile.mock.calls[0]![1]}`, relativePath: terminalPanelMocks.uploadFileBrowserFile.mock.calls[0]![1], bytes: 1 }));
+    expect(host!.textContent).toContain("Terminal disconnected after upload");
+    expect(host!.textContent).not.toContain("Insert image into native prompt");
+    expect(inputMessages(TestWebSocket.latest!)).toEqual([]);
+  });
+
 });
 
 function failedNativeTab(): WorkspaceTab {
@@ -669,12 +930,13 @@ function failedNativeTab(): WorkspaceTab {
   } };
 }
 
-function pasteImageEvent(file: File): ClipboardEvent {
+function pasteImageEvent(file: File, caption = ""): ClipboardEvent {
   const event = new Event("paste", { bubbles: true, cancelable: true }) as ClipboardEvent;
   Object.defineProperty(event, "clipboardData", {
     value: {
       items: [{ kind: "file", type: file.type, getAsFile: () => file }],
-      files: []
+      files: [],
+      getData: () => caption
     }
   });
   return event;

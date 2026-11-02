@@ -270,6 +270,29 @@ describe("Forge settings field contracts", () => {
 });
 
 describe("Forge connected application settings", () => {
+  it("keeps coding and review Claude launch modes optional, independent and persisted", async () => {
+    const { root, plugin, config, connections, credentials, settings } = await fixture();
+    credentials.set("worker", { kind: "token", token: "worker-private" });
+    credentials.set("reviewer", { kind: "token", token: "reviewer-private" });
+    expect(settings.settings().workerClaudeLaunchMode).toBeUndefined();
+    expect(settings.settings().reviewClaudeLaunchMode).toBeUndefined();
+    await config.update({ plugins: { forge: { workerClaudeLaunchMode: "cloudx-managed", reviewClaudeLaunchMode: "native-project" } } });
+    const reloaded = new ForgeSettingsService(new ConfigService(root, () => [plugin.descriptor()]), connections);
+    expect(reloaded.settings()).toMatchObject({ workerClaudeLaunchMode: "cloudx-managed", reviewClaudeLaunchMode: "native-project" });
+    for (const key of ["workerClaudeLaunchMode", "reviewClaudeLaunchMode"]) {
+      await expect(config.update({ plugins: { forge: { [key]: "exclusive" } } })).rejects.toThrow("configured options");
+      const field = forgeConfigFields().find(field => field.key === key)!;
+      expect(field.defaultValue).toBe("");
+      expect(field.description).toContain("project CLAUDE.md");
+      expect(field.description).toContain("CLAUDE.local.md");
+      expect(field.description).toContain("not an exclusive allowlist");
+    }
+    await config.update({ plugins: { forge: { workerClaudeLaunchMode: "" } } });
+    expect(settings.settings().workerClaudeLaunchMode).toBeUndefined();
+    expect(settings.settings().reviewClaudeLaunchMode).toBe("native-project");
+  });
+
+
   it("reloads explicit GPT-6.1 Sol and existing model choices without rewriting either", async () => {
     const { root, plugin, config, connections, credentials } = await fixture();
     credentials.set("worker", { kind: "token", token: "worker-private" });

@@ -3970,7 +3970,7 @@ describe("ForgeRuntime Codex tabs", () => {
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare(`claude-${purpose}`, purpose === "review");
     const fixture = installReviewTabs(deps, workspace);
-    const request = { ...fixture.request, model: "claude-opus-5-5", accountId: "claude-work", ...(purpose === "batch" ? { preserveConversation: true as const } : {}) };
+    const request = { ...fixture.request, model: "claude-opus-5-5", accountId: "claude-work", claudeLaunchMode: "cloudx-managed" as const, ...(purpose === "batch" ? { preserveConversation: true as const } : {}) };
 
     await runtime.close(await runtime.launch(request));
     runtime = new ForgeRuntime(deps);
@@ -3981,7 +3981,8 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(fixture.resumedIds[0]).toMatch(/^[a-f0-9-]{36}$/u);
     expect(fixture.resumedIds[1]).toBe(fixture.resumedIds[0]);
     const calls = vi.mocked(deps.workspaceCommands.createTab).mock.calls;
-    expect(calls[0]![0].initialInput).toMatchObject({ agent: { providerId: "claude", accountId: "claude-work" }, model: "claude-opus-5-5" });
+    expect(calls[0]![0].initialInput).toMatchObject({ agent: { providerId: "claude", accountId: "claude-work" }, model: "claude-opus-5-5", claudeLaunchMode: "cloudx-managed" });
+    expect(calls[1]![0].initialInput!.claudeLaunchMode).toBe("cloudx-managed");
     expect(calls[0]![0].initialInput!.prompt).toMatch(new RegExp(`^This conversation belongs to one Forge ${purpose === "batch" ? "issue batch" : "review worker"}`, "u"));
     expect(calls[1]![0].initialInput!.prompt).toBe(request.prompt);
     const manifest = JSON.parse(await fs.readFile(path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));

@@ -2692,6 +2692,10 @@ import { createInterface } from "node:readline";
 import { parse } from ${JSON.stringify(import.meta.resolve("smol-toml"))};
 import WebSocket from ${JSON.stringify(import.meta.resolve("ws"))};
 const args = process.argv.slice(2);
+if (args.length === 1 && args[0] === "--version") {
+  console.log("codex-cli 0.153.4");
+  process.exit(0);
+}
 fs.writeFileSync(path.join(process.env.FORGE_FIXTURE_RECEIPTS, "native-start-" + process.pid + ".json"), JSON.stringify({ mode: args.includes("app-server") ? "app-server" : "tui" }));
 const sessionFile = id => path.join(process.env.CODEX_HOME, "sessions", "fixture", "rollout-" + id + ".jsonl");
 function readConversation(id) {

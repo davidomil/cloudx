@@ -75,12 +75,15 @@ export default defineConfig({
     },
   },
   resolve: {
-    alias: {
-      "@cloudx/shared": path.join(repoRoot, "packages/shared/src/index.ts"),
-      "@cloudx/plugin-api": path.join(
-        repoRoot,
-        "packages/plugin-api/src/index.ts",
-      ),
-    },
+    alias: [
+      {
+        find: /^@cloudx\/shared$/,
+        replacement: path.join(repoRoot, "packages/shared/src/index.ts"),
+      },
+      {
+        find: "@cloudx/plugin-api",
+        replacement: path.join(repoRoot, "packages/plugin-api/src/index.ts"),
+      },
+    ],
   },
 });

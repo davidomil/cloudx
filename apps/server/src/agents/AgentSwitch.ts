@@ -3,6 +3,7 @@ import {
   agentProviderLabel,
   isAgentProviderId,
   readAgentSelection,
+  resolveClaudeLaunchMode,
   type AgentProviderId,
   type AgentSwitchRequest
 } from "@cloudx/shared";
@@ -10,6 +11,7 @@ import {
 import type { AgentAccountStore } from "./AgentAccountStore.js";
 import { readAgentTranscript, writeAgentHandoff } from "./AgentHandoff.js";
 import { isClaudeModel } from "./claude/ClaudeLaunch.js";
+import { ClaudeConversationPolicies } from "./claude/ClaudeConversationPolicies.js";
 import { MissingTranscriptError } from "./missingTranscript.js";
 import { resumeSessionId } from "./resumeInput.js";
 
@@ -22,7 +24,7 @@ export interface AgentSwitchContext {
 }
 
 // Per-launch bookkeeping that must not carry over to the next runner.
-const LAUNCH_ONLY_KEYS = ["prompt", "resume", "model", "reasoningEffort", "agent", "agentHandoff", "codexExecutionId", "codexIdentityError", "codexRecovered"];
+const LAUNCH_ONLY_KEYS = ["prompt", "resume", "model", "reasoningEffort", "agent", "agentHandoff", "codexExecutionId", "codexIdentityError", "codexRecovered", "claudeLaunchMode", "claudeLaunchPolicy", "claudeLaunchModeSource", "historicalClaudeConversation"];
 
 // Returns the startup input that relaunches a tab on the requested account.
 // The caller checks that no turn is running before switching.
@@ -47,6 +49,17 @@ export async function prepareAgentSwitch(context: AgentSwitchContext, request: A
   next.agent = { providerId: target.providerId, accountId: target.id };
 
   if (current.providerId === target.providerId) {
+    if (target.providerId === "claude") {
+      const recorded = sessionId ? await new ClaudeConversationPolicies(context.accounts.dataDir).read(sessionId) : undefined;
+      if (recorded && recorded.accountId !== target.id)
+        throw new Error("This Claude conversation must keep its recorded account and launch mode. Open a new conversation on the other account; the running session has not changed.");
+      if (recorded) next.claudeLaunchMode = recorded.policy.mode;
+      else if (previous.claudeLaunchMode !== undefined) {
+        const mode = resolveClaudeLaunchMode(previous.claudeLaunchMode).mode;
+        if (sessionId && mode === "cloudx-managed") throw new Error("This historical Claude conversation has no verified managed launch policy. Start a new conversation on the other account.");
+        next.claudeLaunchMode = mode;
+      }
+    }
     const model = request.model ?? previous.model;
     if (model !== undefined) next.model = model;
     if (previous.reasoningEffort !== undefined) next.reasoningEffort = previous.reasoningEffort;

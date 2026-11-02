@@ -1849,5 +1849,213 @@
     "description": "Save loaded threads during managed daemon shutdown.",
     "reason": "Internal native host control. CloudX owns app-server lifecycle and transport; this is not a persistent user preference.",
     "internal": true
+  },
+  {
+    "path": "codex app-server --cloud-skills-snapshot",
+    "command": "codex app-server",
+    "flag": "--cloud-skills-snapshot",
+    "scope": "launch",
+    "description": "cloud skills snapshot",
+    "reason": "Native frozen cloud-skill snapshot path; not part of CloudX selected-skill ownership. Unsupported for managed CloudX launches."
+  },
+  {
+    "path": "codex app-server --print-startup-config",
+    "command": "codex app-server",
+    "flag": "--print-startup-config",
+    "scope": "launch",
+    "description": "print startup config",
+    "reason": "Read-only native startup validation operation; not a persistent setting or a managed CloudX session."
+  },
+  {
+    "path": "codex app-server --startup-client-info",
+    "command": "codex app-server",
+    "flag": "--startup-client-info",
+    "scope": "launch",
+    "description": "startup client info",
+    "reason": "Client identity is supplied by the CloudX integration, not a user preference."
+  },
+  {
+    "path": "codex app-server --startup-sign-out",
+    "command": "codex app-server",
+    "flag": "--startup-sign-out",
+    "scope": "launch",
+    "description": "startup sign out",
+    "reason": "Native managed authentication operation; CloudX does not sign out while reading settings. Use the native authentication flow."
+  },
+  {
+    "path": "codex queue --cd",
+    "command": "codex queue",
+    "flag": "--cd",
+    "scope": "launch",
+    "description": "Native cd",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --config",
+    "command": "codex queue",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Native config",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --disable",
+    "command": "codex queue",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Native disable",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --enable",
+    "command": "codex queue",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Native enable",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --help",
+    "command": "codex queue",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "Native help",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --message",
+    "command": "codex queue",
+    "flag": "--message",
+    "scope": "launch",
+    "description": "Native message",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --profile",
+    "command": "codex queue",
+    "flag": "--profile",
+    "scope": "launch",
+    "description": "Native profile",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --remote",
+    "command": "codex queue",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Native remote",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --remote-auth-token-env",
+    "command": "codex queue",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Native remote auth token env",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --resume",
+    "command": "codex queue",
+    "flag": "--resume",
+    "scope": "launch",
+    "description": "Native resume",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --strict-config",
+    "command": "codex queue",
+    "flag": "--strict-config",
+    "scope": "launch",
+    "description": "Native strict config",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex queue --thread",
+    "command": "codex queue",
+    "flag": "--thread",
+    "scope": "launch",
+    "description": "Native thread",
+    "reason": "Native queue delivery and optional resume operate outside CloudX tab ownership. Use CloudX tab/Forge delivery controls; this native operation is unsupported as a managed CloudX launch."
+  },
+  {
+    "path": "codex doctor --all",
+    "command": "codex doctor",
+    "flag": "--all",
+    "scope": "launch",
+    "description": "Native all",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --ascii",
+    "command": "codex doctor",
+    "flag": "--ascii",
+    "scope": "launch",
+    "description": "Native ascii",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --config",
+    "command": "codex doctor",
+    "flag": "--config",
+    "scope": "launch",
+    "description": "Native config",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --disable",
+    "command": "codex doctor",
+    "flag": "--disable",
+    "scope": "launch",
+    "description": "Native disable",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --enable",
+    "command": "codex doctor",
+    "flag": "--enable",
+    "scope": "launch",
+    "description": "Native enable",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --help",
+    "command": "codex doctor",
+    "flag": "--help",
+    "scope": "launch",
+    "description": "Native help",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --json",
+    "command": "codex doctor",
+    "flag": "--json",
+    "scope": "launch",
+    "description": "Native json",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --network-only",
+    "command": "codex doctor",
+    "flag": "--network-only",
+    "scope": "launch",
+    "description": "Native network only",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --no-color",
+    "command": "codex doctor",
+    "flag": "--no-color",
+    "scope": "launch",
+    "description": "Native no color",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex doctor --summary",
+    "command": "codex doctor",
+    "flag": "--summary",
+    "scope": "launch",
+    "description": "Native summary",
+    "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
   }
 ]
