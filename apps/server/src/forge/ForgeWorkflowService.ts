@@ -2924,7 +2924,7 @@ export class ForgeWorkflowService {
         accountId: worker.kind === "issue" ? settings.workerAccountId : settings.reviewAccountId,
         claudeLaunchMode: worker.kind === "issue" ? settings.workerClaudeLaunchMode : settings.reviewClaudeLaunchMode,
         prompt,
-        ...(worker.batch ? { preserveConversation: true as const } : {}),
+        ...(worker.kind === "issue" ? { preserveConversation: true as const } : {}),
         ...placement,
       },
       signal,

@@ -35,7 +35,6 @@ import { RulesSkillsCatalogService } from "../rulesSkills/RulesSkillsCatalogServ
 import { SessionStore } from "../sessionStore.js";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import type { TerminalProcess } from "../terminal/TerminalProcess.js";
-import { TerminalSupervisor } from "../terminal/TerminalSupervisor.js";
 import { WorkspaceCommandService } from "../workspace/WorkspaceCommandService.js";
 import { WorkspaceLayoutStore } from "../workspace/WorkspaceLayoutStore.js";
 import { ForgeRuntime, type ForgeRuntimeDependencies } from "./ForgeRuntime.js";
@@ -539,6 +538,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const history = await fixture.workflow.workerHistory(started.id);
     expect(history).toMatchObject({ tabId: started.tabId, screen: { data: expect.stringContaining("FORGE_FIXTURE_EARLY_EXIT") } });
     expect(await new ForgeRuntime(fixture.runtimeDependencies).workerHistory(started.id)).toEqual(history);
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
+    expect(await fixture.sessionRequests("thread/inject_items")).toHaveLength(1);
     expect(fixture.factory.processes).toHaveLength(1);
     await expect(terminal.terminate()).resolves.toBeUndefined();
     expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
@@ -838,7 +839,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
       await restarted.close(started.tabId!);
       expect(await restarted.workerHistory(started.id)).toEqual(history);
       expect(fixture.factory.processes).toHaveLength(1);
-      await expectMissing(path.dirname(contextPath), receipt.codexHome);
+      await expectMissing(path.dirname(contextPath));
+      await fixture.expectRetiredConversationView(receipt);
       expect((await fs.stat(started.worktreePath!)).isDirectory()).toBe(true);
     } finally {
       await originalFile.close();
@@ -1045,8 +1047,15 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     fixture.models.workerReasoningEffort = "high";
     const resumed = await fixture.workflow.resume(started.id, fixture.placement);
     expect(resumed.tabId).not.toBe(started.tabId);
-    await expectMissing(first.codexHome, first.tabContextPath);
+    await fixture.expectFinishedAttempt(first);
     const second = await fixture.completedAssistantTurn(resumed);
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(second.sessionPath).toBe(first.sessionPath);
+    expect(second.previousMessages).toEqual([
+      ...first.previousMessages!,
+      { role: "user", content: first.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining('"kind":"issue"') },
+    ]);
     expect(second.args.slice(second.args.indexOf("--model"), second.args.indexOf("--model") + 4)).toEqual(["--model", "gpt-5.6-sol", "--config", 'model_reasoning_effort="high"']);
     expect(second.context.item.comments.map((comment) => comment.id)).toContain("issue-feedback");
     expect(second.context.change?.comments.map((comment) => comment.id)).toContain("review-feedback");
@@ -1084,6 +1093,14 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     const approved = await fixture.workflow.resume(started.id, fixture.placement);
     await expectMissing(second.codexHome, second.tabContextPath);
     const third = await fixture.completedAssistantTurn(approved);
+    expect(third.sessionId).toBe(first.sessionId);
+    expect(third.sessionPath).toBe(first.sessionPath);
+    expect(third.previousMessages).toEqual([
+      ...second.previousMessages!,
+      { role: "user", content: second.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining("Added and verified the empty-input regression.") },
+    ]);
+    expect(await fixture.sessionRequests("thread/start")).toHaveLength(1);
     expect(third.context.change?.approved).toBe(true);
     expect(third.headSha).toBe(revised.headSha);
     await fixture.workflow.poll();
@@ -1093,7 +1110,8 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await git(fixture.origin, "rev-parse", "main")).toBe(revised.headSha);
     await expectMissing(fixture.repositoryPath);
     expect(fixture.gitAccessRoles.every((role) => role === "worker")).toBe(true);
-    await expectMissing(revised.worktreePath!, first.codexHome, second.codexHome, third.codexHome, third.reportPath, third.contextPath, third.tabContextPath);
+    await expectMissing(revised.worktreePath!);
+    for (const receipt of [first, second, third]) await fixture.expectFinishedAttempt(receipt);
     expect(fixture.sessions.listTabs()).toEqual([]);
     expect(fixture.workspace.getActiveWindow().layout.root).toMatchObject({ type: "pane", pane: { tabIds: [] } });
     expect(await fixture.store.read()).toEqual([]);
@@ -1358,9 +1376,15 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     });
     expect((await fixture.store.read()).find(worker => worker.id === started.id)?.rebaseRecovery).toEqual(resolving.rebaseRecovery);
     const resolution = await fixture.completedAssistantTurn(resolving);
+    expect(resolution.sessionId).toBe(implementation.sessionId);
+    expect(resolution.resumedSessionId).toBe(implementation.sessionId);
+    expect(resolution.sessionPath).toBe(implementation.sessionPath);
+    expect(resolution.previousMessages).toEqual([
+      ...implementation.previousMessages!,
+      { role: "user", content: implementation.args.at(-1) },
+      { role: "assistant", content: expect.stringContaining('"kind":"issue"') },
+    ]);
     if (batch) {
-      expect(resolution.sessionId).toBe(implementation.sessionId);
-      expect(resolution.resumedSessionId).toBe(implementation.sessionId);
       expect(resolution.previousMessages).toEqual(expect.arrayContaining([{ role: "assistant", content: expect.stringContaining('"issueResults"') }]));
       expect(resolution.context.issues).toEqual([...fixture.provider.issues.values()]);
     }
@@ -2290,16 +2314,17 @@ class LifecycleFixture {
   }
 
   async startIssueThatExitsBeforeRegistration(exitCode: number): Promise<ForgeWorker> {
-    await fs.writeFile(path.join(this.root, "fixture-assistant.mjs"), `#!/bin/sh\ncase "$*" in *app-server*) cat >/dev/null;; *) printf 'FORGE_FIXTURE_EARLY_EXIT\\n'; exit ${exitCode};; esac\n`, { mode: 0o700 });
-    const ready = TerminalSupervisor.prototype.ready;
-    const readiness = vi.spyOn(TerminalSupervisor.prototype, "ready").mockImplementation(async function(this: TerminalSupervisor) {
-      await ready.call(this);
-      await this.completion;
+    vi.stubEnv("FORGE_FIXTURE_EARLY_EXIT", String(exitCode));
+    const spawn = this.factory.spawn.bind(this.factory);
+    const spawning = vi.spyOn(this.factory, "spawn").mockImplementation(async (...args) => {
+      const terminal = await spawn(...args);
+      await new Promise<void>(resolve => terminal.onExit(() => resolve()));
+      return terminal;
     });
     try {
       return await this.workflow.startIssue(repository, 1, this.placement);
     } finally {
-      readiness.mockRestore();
+      spawning.mockRestore();
     }
   }
 
@@ -2367,19 +2392,23 @@ class LifecycleFixture {
     expect(this.sessions.getTab(worker.tabId!).pluginMetadata?.["rules-skills"]?.selectedTemplateId).toBe(receipt.templateId);
     expect(receipt.args.filter((argument) => argument.includes("Write only valid JSON"))).toHaveLength(1);
     expect(receipt.trustedProjectPath).toBe(await fs.realpath(worker.worktreePath!));
-    if (worker.kind === "review" || worker.batch) {
-      expect(receipt.sessionId).toMatch(/^[a-f0-9-]{36}$/);
-      expect(receipt.resumedSessionId).toBe(receipt.sessionId);
-      expect(receipt.args.slice(receipt.args.indexOf("resume"), -1)).toEqual(["resume", receipt.sessionId, "--"]);
-      expect(receipt.previousMessages).toEqual(expect.any(Array));
-      const setup = receipt.previousMessages![0]!;
-      expect(setup).toEqual({ role: "user", content: expect.stringContaining(JSON.stringify(worker.worktreePath)) });
-      expect(setup.content).toContain(worker.batch ? "Wait for the batch request before starting work." : "Wait for the review request before starting work.");
-      expect((await this.sessionRequests("thread/inject_items")).filter(request => request.threadId === receipt.sessionId)).toEqual([{
-        threadId: receipt.sessionId,
-        items: [{ type: "message", role: "user", content: [{ type: "input_text", text: setup.content }] }],
-      }]);
-    }
+    expect(receipt.sessionId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(receipt.resumedSessionId).toBe(receipt.sessionId);
+    expect(receipt.args.slice(receipt.args.indexOf("resume"), -1)).toEqual(["resume", receipt.sessionId, "--"]);
+    expect(receipt.previousMessages).toEqual(expect.any(Array));
+    const setup = receipt.previousMessages![0]!;
+    expect(setup).toEqual({ role: "user", content: expect.stringContaining(JSON.stringify(worker.worktreePath)) });
+    expect(setup.content).toContain(worker.kind === "review" ? "Wait for the review request before starting work." : "Wait for the batch request before starting work.");
+    expect(await this.workspaceRecord(worker.id)).toMatchObject({
+      [worker.kind === "review" ? "reviewConversation" : "batchConversation"]: {
+        creating: false, threadId: receipt.sessionId,
+        source: { sourceId: "shared", home: this.codexHome },
+      },
+    });
+    expect((await this.sessionRequests("thread/inject_items")).filter(request => request.threadId === receipt.sessionId)).toEqual([{
+      threadId: receipt.sessionId,
+      items: [{ type: "message", role: "user", content: [{ type: "input_text", text: setup.content }] }],
+    }]);
     if (worker.kind === "review") {
       expect(receipt.context.item).not.toHaveProperty("diff");
       expect(receipt.localReview).toMatchObject({ baseSha: receipt.context.item.baseSha, headSha: worker.headSha });
@@ -2483,7 +2512,14 @@ test("retains the target behavior and issue fix", () => {
       return;
     }
     await expectMissing(receipt.tabContextPath);
-    if ((!receipt.localReview && !receipt.context.batch) || !receipt.sessionPath?.startsWith(`${receipt.codexHome}${path.sep}`)) {
+    await this.expectRetiredConversationView(receipt);
+  }
+
+  async expectRetiredConversationView(receipt: AssistantReceipt): Promise<void> {
+    expect((await fs.stat(receipt.sessionPath!)).isFile()).toBe(true);
+    expect(await fs.readFile(path.join(this.codexHome, "auth.json"), "utf8")).toBe(sourceAuth);
+    expect(await fs.readFile(path.join(this.codexHome, "config.toml"), "utf8")).toBe(sourceConfig);
+    if (!receipt.sessionPath!.startsWith(`${receipt.codexHome}${path.sep}`)) {
       await expectMissing(receipt.codexHome);
       return;
     }
@@ -2494,8 +2530,6 @@ test("retains the target behavior and issue fix", () => {
       expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
       expect(await fs.realpath(link)).toBe(path.join(this.codexHome, name));
     }
-    expect((await fs.stat(receipt.sessionPath)).isFile()).toBe(true);
-    expect(await fs.readFile(path.join(this.codexHome, "auth.json"), "utf8")).toBe(sourceAuth);
   }
 
   async dispose(): Promise<void> {
@@ -2764,6 +2798,10 @@ if (args.includes("app-server")) {
     }
   }
 } else {
+if (process.env.FORGE_FIXTURE_EARLY_EXIT !== undefined) {
+  console.log("FORGE_FIXTURE_EARLY_EXIT");
+  process.exit(Number(process.env.FORGE_FIXTURE_EARLY_EXIT));
+}
 const trustedProjectPath = fs.realpathSync(process.cwd());
 const config = parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "config.toml"), "utf8"));
 if (config.projects?.[trustedProjectPath]?.trust_level !== "trusted") {
@@ -2805,11 +2843,10 @@ if (process.env.FORGE_FIXTURE_LARGE_OUTPUT === "true") {
 }
 const isReview = prompt.startsWith("Review the exact checked-out commit");
 const resumedSessionId = args.includes("resume") ? args[args.indexOf("resume") + 1] : undefined;
-if (context.batch && !resumedSessionId) throw new Error("The batch must resume its exact Codex conversation.");
-const conversation = resumedSessionId ? readConversation(resumedSessionId) : (await request("thread/start", { cwd: trustedProjectPath, runtimeWorkspaceRoots: [trustedProjectPath], ephemeral: false })).thread;
-if (isReview && !conversation) throw new Error("The reviewer must resume its exact Codex conversation.");
-if (isReview && !conversation.messages.length) throw new Error("The reviewer setup item must be persisted before a TUI turn.");
-if (conversation && conversation.cwd !== trustedProjectPath) throw new Error("The resumed conversation belongs to a different checkout.");
+if (!resumedSessionId) throw new Error("Every Forge turn must resume its exact Codex conversation.");
+const conversation = readConversation(resumedSessionId);
+if (!conversation.messages.length) throw new Error("The worker setup item must be persisted before a TUI turn.");
+if (conversation.cwd !== trustedProjectPath) throw new Error("The resumed conversation belongs to a different checkout.");
 const { turn } = await request("turn/start", { threadId: conversation.id, input: [{ type: "text", text: prompt }] });
 if (isReview && process.env.FORGE_FIXTURE_HOLD_REVIEW === "true") {
   console.log("FORGE_FIXTURE_REVIEW_WAITING");

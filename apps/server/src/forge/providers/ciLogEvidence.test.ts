@@ -3,6 +3,7 @@ import type { ForgeCiDiagnostic, ForgeRepository } from "@cloudx/shared";
 import { ForgeCredentials } from "./ForgeCredentials.js";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 import { classifyCiLog, classifyDiagnostic, maxCiLogBytes, maxCiLogScanBytes, readCiLog } from "./ciEvidence.js";
+import { playwrightAssertions, playwrightFailureReport } from "./playwrightFailure.fixture.js";
 
 const source = "a".repeat(40);
 const moved = "b".repeat(40);
@@ -144,10 +145,39 @@ describe("complete CI log evidence with bounded excerpts", () => {
 });
 
 describe("Playwright failure classification", () => {
+  it.each(playwrightAssertions)("scopes real Playwright $name failure attachments in direct and streaming evidence", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    expect(report).toContain(`expect(received)${assertion.name}(expected)`);
+    expect(report).toMatch(/Documentation service unavailable[^\n]+\.\.\./);
+    for (const chunkSize of [1, 7, 1024]) {
+      const log = report.split("\n").map(line => `2026-11-02T06:50:53.6174080Z \x1b[1A\x1b[2K${line}`).join("\n");
+      const { evidence, diagnostic } = await diagnoseStream(checkout() + log, chunkSize);
+      expect({ direct: classifyCiLog(report), streaming: evidence.classification, diagnostic: diagnostic.state })
+        .toEqual({ direct: "code", streaming: "code", diagnostic: "actionable" });
+      expect(evidence.log).toContain(`expect(received)${assertion.name}(expected)`);
+      expect(evidence.checkout).toEqual({ shas: [source], invalid: false });
+    }
+  });
+
+  it.each(playwrightAssertions)("preserves independent operational blockers around a real Playwright $name failure", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    for (const [classification, blocker] of [
+      ["infrastructure", "Runner lost communication with the server"], ["infrastructure", "no space left on device"],
+      ["credentials", "fatal: authentication failed"], ["policy", "Workflow is disabled; approval required"],
+    ]) {
+      for (const log of [blocker + "\n" + report, report.replace(/(\n    attachment #[^\n]+\n)/, `$1${blocker}\n`), report + blocker]) {
+        const { evidence, diagnostic } = await diagnoseStream(checkout() + log);
+        expect(evidence.classification).toBe(classification);
+        expect(diagnostic.state).toBe("blocked");
+      }
+    }
+  });
+
   it.each([
     browserFailure,
     "Error: expect(locator).toBeVisible() failed\nLocator: getByRole('button')\nExpected: visible\nReceived: hidden\n",
     "Error: expect(locator).toHaveText(expected)\nExpected string: \"ready\"\nReceived string: \"waiting\"\nAssertion failed",
+    "Error: expect(received).toBe(expected) // Object.is equality\nExpected: \"NEXT\"\nReceived: \"three\"\n",
   ])("recognizes browser action and assertion failures", log => {
     expect(classifyCiLog(log)).toBe("code");
   });
@@ -206,6 +236,80 @@ describe("Playwright failure classification", () => {
   it.each(["fatal: authentication failed", "approval required", "Runner lost communication with the server", "service unavailable"])("keeps independent job control %s authoritative inside and outside attachments", async blocker => {
     for (const log of [report() + blocker, report().replace("\n─────────────────────", `\n##[error]${blocker}\n─────────────────────`)])
       expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("blocked");
+  });
+
+  describe("Playwright attachment provenance boundaries", () => {
+    it.each([
+      ["nonsequential numbering", report().replace("1) [mobile", "99) [mobile")],
+      ["unknown content type", report().replace("text/plain", "application/octet-stream")],
+      ["other text attachment", report().replace("terminal-recovery-server.log", "dependency-response.txt")],
+      ["attachment before the cause", report("Unknown failure").replace("1 failed", "Error: expect(locator).toHaveText(expected) failed\n1 failed")],
+    ])("keeps %s conservative", async (_name, log) => {
+      expect((await diagnoseStream(checkout() + log)).evidence.classification).toBe("infrastructure");
+    });
+
+    it.each(["HTTP 401 unauthorized", "approval required", "Runner lost communication with the server", "no space left on device"])("retains rendered assertion comparisons with %s", async expected => {
+      const log = report().replace('Expected: "NEXT"', `Expected string: "${expected}"`).replace('Received: "three"', `Received string: "${expected} (changed)"`);
+      expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("actionable");
+    });
+
+    it.each([1, 7, 1024])("keeps reporter-shaped attachment content scoped across %i-byte chunks", async chunkSize => {
+      const log = report().replace('\n─────────────────────', '\n1 failed\nRunning 2 tests using 1 worker\nRUN v4.1.11 /fixture\n1) [mobile-chromium] › tests/browser/fake.spec.ts:1:1 › attached text\n─────────────────────');
+      expect((await diagnoseStream(checkout() + log, chunkSize)).diagnostic.state).toBe("actionable");
+    });
+
+    it("accepts a reporter attachment header whose long name leaves no separator width", async () => {
+      const log = report().replace("terminal-recovery-server.log (text/plain) ─────────────────────", `${"long-".repeat(30)}server.log (text/plain)`);
+      expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("actionable");
+    });
+
+    it("recognizes an annotated failure header without suppressing operational annotations", async () => {
+      const log = report().replace("1) [mobile", "##[error]1) [mobile");
+      expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("actionable");
+      expect((await diagnoseStream(checkout() + log.replace('\n─────────────────────', '\n##[error]service unavailable\n─────────────────────'))).evidence.classification).toBe("infrastructure");
+    });
+
+    it.each(["before", "between", "after"])("associates attachments %s the other numbered failures with their own cause", async position => {
+      const failure = report().split("\n").slice(1, -3).join("\n") + "\n";
+      const bare = "1) [mobile-chromium] › tests/browser/commands.spec.ts:10:3 › shows controls\nAssertionError: expected visible to equal hidden\n";
+      const failures = position === "before" ? [failure, bare, bare] : position === "between" ? [bare, failure, bare] : [bare, bare, failure];
+      const log = checkout() + "Running 4 tests using 2 workers\n" + failures.map((text, i) => text.replace(/^1\)/, `${i + 1})`)).join("") + "3 failed\n1 passed\n";
+      expect((await diagnoseStream(log)).diagnostic.state).toBe("actionable");
+    });
+
+    it.each([
+      ["credentials", "fatal: authentication failed"], ["policy", "approval required"],
+      ["infrastructure", "Runner lost communication with the server"], ["infrastructure", "no space left on device"],
+      ["credentials", "fatal: authentication failed while reporting failed test results"],
+      ["policy", "approval required after failed test execution"],
+      ["infrastructure", "Runner lost communication with the server after failed test execution"],
+      ["infrastructure", "no space left on device while saving failed test artifacts"],
+      ["credentials", "fatal: authentication failed while reporting AssertionError"],
+      ["policy", "approval required while reporting AssertionError"],
+      ["infrastructure", "Runner lost communication with the server while reporting AssertionError"],
+      ["infrastructure", "no space left on device while reporting AssertionError"],
+    ])("preserves independent %s controls before, inside and after the attachment", async (classification, blocker) => {
+      for (const log of [blocker + "\n" + report(), report().replace('\n─────────────────────', `\n${blocker}\n─────────────────────`), report().replace('\n─────────────────────', `\n##[error]${blocker}\n─────────────────────`), report() + blocker])
+        expect((await diagnoseStream(checkout() + log)).evidence.classification).toBe(classification);
+    });
+
+    it("retains the actual failure when both the report and attachment leave the tail", async () => {
+      const lintOutput = ("successful eslint output " + "x".repeat(150) + "\n").repeat(30);
+      const { evidence, diagnostic } = await diagnoseStream(checkout() + lintOutput + noise + report() + noise);
+      expect(diagnostic.state).toBe("actionable");
+      expect(evidence.log).toContain("terminal-mode-recovery.spec.ts:262:3");
+      expect(evidence.log).toContain("Error: expect(locator).toHaveText(expected) failed");
+      expect(evidence.log).toContain(source);
+      expect(evidence.log.length).toBeLessThanOrEqual(32_000);
+    });
+
+    it("redacts secrets from failure evidence outside the retained prefix and tail", async () => {
+      const log = report().replace('Expected: "NEXT"', 'Expected: "worker-private-token"');
+      const evidence = await scan(checkout() + noise + log + noise);
+      expect(evidence.log).toContain("[Failed-test evidence]");
+      expect(evidence.log).not.toContain("worker-private-token");
+      expect(evidence.log).toContain("[REDACTED]");
+    });
   });
 });
 

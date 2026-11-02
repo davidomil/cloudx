@@ -3890,18 +3890,23 @@ describe("ForgeRuntime Codex tabs", () => {
     expect(await runtime.recover(workspace.id)).toEqual({ workspace, tabIds: [] });
   });
 
-  it.each(["review", "batch"] as const)("resumes the saved %s conversation after its tab and runtime are replaced", async purpose => {
+  it.each(["review", "batch", "issue"] as const)("resumes the saved Codex %s conversation after its tab and runtime are replaced", async purpose => {
     const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn(async (launch, options) => {
-      await options.save(options.binding ?? conversationBinding(launch.tabId));
-      return (options.binding ?? conversationBinding(launch.tabId)).threadId!;
+      const binding = options.binding ?? { ...conversationBinding(launch.tabId), threadId: randomUUID() };
+      await options.save(binding);
+      return binding.threadId!;
     }) };
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare(`${purpose}-restart`, purpose === "review");
     const fixture = installReviewTabs(deps, workspace);
-    const request = { ...fixture.request, ...(purpose === "batch" ? { preserveConversation: true as const } : {}) };
+    const request = { ...fixture.request, ...(purpose !== "review" ? { preserveConversation: true as const } : {}) };
     const first = await runtime.launch(request);
-    if (purpose === "batch") await fs.writeFile(path.join(workspace.worktreePath, "unfinished.txt"), "Unfinished batch work\n");
+    const manifestPath = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const conversationKey = purpose === "review" ? "reviewConversation" : "batchConversation";
+    const initial = JSON.parse(await fs.readFile(manifestPath, "utf8"))[conversationKey];
+    expect(initial.threadId).toMatch(/^[a-f0-9-]{36}$/u);
+    if (purpose !== "review") await fs.writeFile(path.join(workspace.worktreePath, "unfinished.txt"), "Unfinished issue work\n");
     const firstView = fixture.launchPath();
     const firstIdentity = await fs.stat(firstView, { bigint: true });
     await runtime.close(first);
@@ -3909,30 +3914,38 @@ describe("ForgeRuntime Codex tabs", () => {
     expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
     runtime = new ForgeRuntime(deps);
 
-    const second = await runtime.launch(request);
+    const second = await runtime.launch({ ...request, attemptId: "attempt-2", prompt: "Repair the failed CI assertion in the existing request." });
 
     expect(second).not.toBe(first);
-    expect(fixture.resumedIds).toEqual([conversationBinding().threadId, conversationBinding().threadId]);
-    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].binding).toEqual(conversationBinding());
-    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].purpose).toBe(purpose);
-    if (purpose === "batch") expect(await fs.readFile(path.join(workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Unfinished batch work\n");
+    expect(fixture.resumedIds).toEqual([initial.threadId, initial.threadId]);
+    expect(JSON.parse(await fs.readFile(manifestPath, "utf8"))[conversationKey]).toEqual(initial);
+    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[0]![1].binding).toBeUndefined();
+    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].binding).toEqual(initial);
+    expect(vi.mocked(deps.reviewConversations.prepare).mock.calls[1]![1].purpose).toBe(purpose === "review" ? "review" : "batch");
+    if (purpose !== "review") expect(await fs.readFile(path.join(workspace.worktreePath, "unfinished.txt"), "utf8")).toBe("Unfinished issue work\n");
     const secondView = fixture.launchPath();
     await runtime.close(second);
     await expect(fs.stat(secondView)).rejects.toMatchObject({ code: "ENOENT" });
     expect((await fs.readdir(firstView)).sort()).toEqual([".cloudx-source.json", "archived_sessions", "sessions"]);
+    await expect(runtime.launch({ ...request, model: "claude-opus-5-5" })).rejects.toThrow("runs on Codex");
   });
 
-  it.each(["review", "batch"] as const)("keeps one Claude %s conversation id across launches without the Codex app server", async purpose => {
+  it.each(["review", "batch", "issue"] as const)("keeps one Claude %s conversation id across launches without the Codex app server", async purpose => {
     const deps = dependencies({ trustRepository: true });
     deps.reviewConversations = { prepare: vi.fn() };
     runtime = new ForgeRuntime(deps);
     const workspace = await prepare(`claude-${purpose}`, purpose === "review");
     const fixture = installReviewTabs(deps, workspace);
-    const request = { ...fixture.request, model: "claude-opus-5-5", accountId: "claude-work", claudeLaunchMode: "cloudx-managed" as const, ...(purpose === "batch" ? { preserveConversation: true as const } : {}) };
+    const request = { ...fixture.request, model: "claude-opus-5-5", accountId: "claude-work", claudeLaunchMode: "cloudx-managed" as const, ...(purpose !== "review" ? { preserveConversation: true as const } : {}) };
 
-    await runtime.close(await runtime.launch(request));
+    const first = await runtime.launch(request);
+    const manifestPath = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const initial = JSON.parse(await fs.readFile(manifestPath, "utf8")).claudeConversation;
+    expect(initial.sessionId).toBe(fixture.resumedIds[0]);
+    await runtime.close(first);
     runtime = new ForgeRuntime(deps);
-    await runtime.close(await runtime.launch(request));
+    const repairPrompt = "Repair the failed CI assertion in the existing request.";
+    await runtime.close(await runtime.launch({ ...request, attemptId: "attempt-2", prompt: repairPrompt }));
 
     expect(deps.reviewConversations.prepare).not.toHaveBeenCalled();
     expect(fixture.resumedIds).toHaveLength(2);
@@ -3941,10 +3954,11 @@ describe("ForgeRuntime Codex tabs", () => {
     const calls = vi.mocked(deps.workspaceCommands.createTab).mock.calls;
     expect(calls[0]![0].initialInput).toMatchObject({ agent: { providerId: "claude", accountId: "claude-work" }, model: "claude-opus-5-5", claudeLaunchMode: "cloudx-managed" });
     expect(calls[1]![0].initialInput!.claudeLaunchMode).toBe("cloudx-managed");
-    expect(calls[0]![0].initialInput!.prompt).toMatch(new RegExp(`^This conversation belongs to one Forge ${purpose === "batch" ? "issue batch" : "review worker"}`, "u"));
-    expect(calls[1]![0].initialInput!.prompt).toBe(request.prompt);
-    const manifest = JSON.parse(await fs.readFile(path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`), "utf8"));
-    expect(manifest.claudeConversation).toEqual({ key: purpose === "batch" ? "batchConversation" : "reviewConversation", sessionId: fixture.resumedIds[0] });
+    expect(calls[0]![0].initialInput!.prompt).toMatch(new RegExp(`^This conversation belongs to one Forge ${purpose !== "review" ? "issue batch" : "review worker"}`, "u"));
+    expect(calls[1]![0].initialInput!.prompt).toBe(repairPrompt);
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    expect(manifest.claudeConversation).toEqual(initial);
+    expect(manifest.claudeConversation).toEqual({ key: purpose !== "review" ? "batchConversation" : "reviewConversation", sessionId: fixture.resumedIds[0] });
 
     await expect(runtime.launch({ ...request, model: "gpt-6-astra" })).rejects.toThrow("runs on Claude");
   });

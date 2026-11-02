@@ -5,6 +5,7 @@ import type { ForgeChangeRequest, ForgeRepository } from "@cloudx/shared";
 import { createForgeProvider, ForgeCredentials } from "./index.js";
 import { ForgeHttpClient } from "./ForgeHttpClient.js";
 import { maxCiLogBytes } from "./ciEvidence.js";
+import { playwrightAssertions, playwrightFailureReport } from "./playwrightFailure.fixture.js";
 
 const source = "a".repeat(40);
 const target = "b".repeat(40);
@@ -59,6 +60,7 @@ function githubFixture(options: {
   run?: Record<string, unknown>;
   job?: Record<string, unknown>;
   log?: string;
+  logChunkSize?: number;
   checkout?: string;
   mergeable?: boolean | null;
   mergeRefSha?: string;
@@ -88,7 +90,19 @@ function githubFixture(options: {
         content: content.toString("base64"), sha: createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex") });
     }
     if (url.pathname === "/repos/owner/repo/actions/jobs/501/logs") return new Response(null, { status: 302, headers: { location: logDownload } });
-    if (url.origin === "https://productionresults.blob.core.windows.net") { downloads++; return new Response(`${options.checkout ?? checkout}${options.log ?? codeFailure}`); }
+    if (url.origin === "https://productionresults.blob.core.windows.net") {
+      downloads++;
+      const bytes = new TextEncoder().encode(`${options.checkout ?? checkout}${options.log ?? codeFailure}`);
+      let offset = 0;
+      return new Response(new ReadableStream({
+        pull(controller) {
+          if (offset === bytes.length) return controller.close();
+          const end = Math.min(offset + (options.logChunkSize ?? bytes.length), bytes.length);
+          controller.enqueue(bytes.subarray(offset, end));
+          offset = end;
+        },
+      }));
+    }
     if (url.pathname === "/repos/owner/repo/pulls/7") return Response.json({ number: 7, state: "open", merged: false, mergeable: options.mergeable === undefined ? true : options.mergeable, head: { sha: source }, base: { sha: target, repo: { full_name: "owner/repo" } } });
     if (url.pathname === "/repos/owner/repo/git/ref/pull/7/merge") return Response.json({ ref: "refs/pull/7/merge", object: { type: "commit", sha: options.mergeRefSha ?? tested } });
     if (url.pathname === `/repos/owner/repo/git/commits/${tested}`) return Response.json({ sha: tested, parents: (options.parents ?? [target, source]).map(sha => ({ sha })) });
@@ -121,6 +135,32 @@ function gitlabFixture(options: {
 }
 
 describe("GitHub required CI diagnostics", () => {
+  it.each(playwrightAssertions)("offers repair for a real Playwright $name report while retaining verified job identity", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    const log = report.split("\n").map(line => `2026-11-02T06:50:53.6174080Z \x1b[1A\x1b[2K${line}`).join("\n");
+    const fixture = githubFixture({ log, logChunkSize: 7 });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ repository: github, changeNumber: change.number,
+      sourceHeadSha: source, targetHeadSha: target, testedSha: tested, state: "actionable",
+      jobs: [{ runId: "100", runAttempt: 2, jobId: "501", conclusion: "failure", testedSha: tested, classification: "code" }] });
+    expect(diagnostic.jobs[0].log).toContain(`expect(received)${assertion.name}(expected)`);
+    expect(diagnostic.jobs[0].log).toContain("Documentation service unavailable");
+  });
+
+  it.each(playwrightAssertions)("keeps independent operational blockers authoritative beside a real Playwright $name report", async assertion => {
+    const report = await playwrightFailureReport(assertion);
+    for (const [classification, blocker] of [
+      ["infrastructure", "Runner lost communication with the server"], ["infrastructure", "no space left on device"],
+      ["credentials", "fatal: authentication failed"], ["policy", "Workflow is disabled; approval required"],
+    ]) {
+      for (const log of [blocker + "\n" + report, report.replace(/(\n    attachment #[^\n]+\n)/, `$1${blocker}\n`), report + blocker]) {
+        const { provider } = githubFixture({ log, logChunkSize: 7 });
+        expect(await provider.getCiFailure(change)).toMatchObject({ state: "blocked", sourceHeadSha: source, targetHeadSha: target,
+          jobs: [{ runId: "100", runAttempt: 2, jobId: "501", classification }] });
+      }
+    }
+  });
+
   it("binds a required failed job to this repository, request, source, base and run attempt before offering repair", async () => {
     const fixture = githubFixture();
     const diagnostic = await fixture.provider.getCiFailure(change);
@@ -151,14 +191,42 @@ describe("GitHub required CI diagnostics", () => {
     "  1 failed", "  1 passed (11.1m)", "",
   ].map(line => `2026-11-02T06:50:53.6174080Z ${line}`).join("\n");
 
-  it("offers repair for a verified Playwright assertion while retaining its ancillary truncated server attachment", async () => {
+  it.each([1, 7, 1024])("offers repair for a verified Playwright assertion with a truncated attachment across %i-byte chunks", async logChunkSize => {
     const log = "successful browser output\n".repeat(5_000) + browserReport;
-    const fixture = githubFixture({ log });
+    const fixture = githubFixture({ log, logChunkSize });
     const diagnostic = await fixture.provider.getCiFailure(change);
-    expect(diagnostic).toMatchObject({ state: "actionable", testedSha: tested, jobs: [{ classification: "code", testedSha: tested }] });
+    expect(diagnostic).toMatchObject({ repository: github, changeNumber: change.number, sourceHeadSha: source, targetHeadSha: target,
+      state: "actionable", testedSha: tested, jobs: [{ runId: "100", runAttempt: 2, jobId: "501", classification: "code", testedSha: tested, conclusion: "failure" }] });
     expect(diagnostic.jobs[0].log).toContain("Documentation service unavailable");
     expect(diagnostic.jobs[0].log).not.toContain("[Operational blocker evidence]");
     expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith(`/git/commits/${tested}`))).toBe(true);
+  });
+
+  it("retains a Playwright failure between long setup and teardown logs", async () => {
+    const noise = "successful browser output\n".repeat(5_000);
+    const { provider } = githubFixture({ log: noise + browserReport + noise, logChunkSize: 7 });
+    const diagnostic = await provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "actionable", testedSha: tested, sourceHeadSha: source, targetHeadSha: target });
+    expect(diagnostic.jobs[0].log).toContain("terminal-mode-recovery.spec.ts:262:3");
+    expect(diagnostic.jobs[0].log).toContain("expect(locator).toHaveText(expected)");
+    expect(diagnostic.jobs[0].log).toContain(tested);
+  });
+
+  it.each([
+    ["infrastructure", "Runner lost communication with the server"],
+    ["infrastructure", "no space left on device"],
+    ["credentials", "fatal: authentication failed"],
+    ["policy", "Workflow is disabled; approval required"],
+  ])("does not let Playwright attachments hide a separate failed job's %s blocker", async (classification, blocker) => {
+    const otherJob = { ...hubJob, id: 502, name: "other required job", check_run_url: "https://api.github.com/repos/owner/repo/check-runs/902",
+      html_url: "https://github.com/owner/repo/actions/runs/100/job/502" };
+    const { provider } = githubFixture({
+      checks: [check, { ...check, databaseId: 902, name: otherJob.name }], jobs: [hubJob, otherJob],
+      logs: { "501": checkout + browserReport, "502": checkout + blocker },
+    });
+    expect(await provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [
+      { jobId: "501", classification: "code", testedSha: tested }, { jobId: "502", name: otherJob.name, classification },
+    ] });
   });
 
   it.each([
