@@ -62,7 +62,7 @@ export function validateBlackboardAudit(state: BlackboardState): void {
     exactRecord(completion, ["boardId", "tabId", "assignmentGeneration", "startCursor", "resultingBoardRevision", "receiptOperationIds", "changedIds", "answeredEventIds", "completedAt"], ["providerTurnId", "nativeExecutionId", "attemptId", "noChangeReason"], "Turn completion");
     requireCooperation(Object.hasOwn(state.boards, completion.boardId) && isCooperationId(completion.tabId) && revision(completion.assignmentGeneration) && Number.isSafeInteger(completion.startCursor) && completion.startCursor >= 0 &&
       Number.isSafeInteger(completion.resultingBoardRevision) && completion.resultingBoardRevision >= 0 && completion.resultingBoardRevision <= state.boards[completion.boardId].revision &&
-      ids(completion.receiptOperationIds, 100) && ids(completion.changedIds) && ids(completion.answeredEventIds, 32) && date(completion.completedAt) && nativeIdentity(completion) &&
+      ids(completion.receiptOperationIds, 100) && Array.isArray(completion.changedIds) && Array.isArray(completion.answeredEventIds) && date(completion.completedAt) && nativeIdentity(completion) &&
       (completion.changedIds.length > 0 || completion.answeredEventIds.length > 0 || typeof completion.noChangeReason === "string" && completion.noChangeReason.trim().length > 0 && completion.noChangeReason.length <= 4000),
       "INTEGRITY_ERROR", "Saved cooperation completion is invalid.");
     const receipts = completion.receiptOperationIds.map(id => state.operationReceipts[`${completion.boardId}/${id}`]);
@@ -71,7 +71,9 @@ export function validateBlackboardAudit(state: BlackboardState): void {
       stored.receipt.eventCursor > completion.startCursor && stored.receipt.boardRevision <= completion.resultingBoardRevision), "INTEGRITY_ERROR", "Saved completion cites another turn's receipts.");
     const changed = new Set(receipts.flatMap(stored => stored.receipt.changedIds));
     const answered = new Set(receipts.flatMap(stored => stored.receipt.answeredEventIds));
-    requireCooperation(changed.size === completion.changedIds.length && completion.changedIds.every(id => changed.has(id)) && answered.size === completion.answeredEventIds.length && completion.answeredEventIds.every(id => answered.has(id)), "INTEGRITY_ERROR", "Saved completion must match committed board work.");
+    requireCooperation(ids(completion.changedIds, changed.size) && changed.size === completion.changedIds.length && completion.changedIds.every(id => changed.has(id)) &&
+      ids(completion.answeredEventIds, answered.size) && answered.size === completion.answeredEventIds.length && completion.answeredEventIds.every(id => answered.has(id)),
+      "INTEGRITY_ERROR", "Saved completion must match committed board work.");
   }
 }
 

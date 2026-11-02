@@ -546,6 +546,55 @@ describe("feedback delivery and completions", () => {
     expect((await service.completeTurn(board.boardId, { receiptOperationIds: [], startCursor, noChangeReason: "Waiting for the user's protected draft." }, agent())).noChangeReason).toContain("protected");
   });
 
+  it("restores a completed native turn with 33 answers from two valid receipts", async () => {
+    await apply([{ kind: "createItem", item: note() }, ...Array.from({ length: 33 }, (_, index) => ({
+      kind: "addReaction" as const, reaction: { id: `question-${index}`, kind: "question" as const, glyph: "?", description: `Explain question ${index}`,
+        target: { kind: "item" as const, id: "note" }, threadId: `thread-${index}` }
+    }))]);
+    const caller = { ...agent(), attemptId: "attempt-1", providerTurnId: "turn-1", nativeExecutionId: "execution-1" };
+    const events = service.inbox(board.boardId);
+    expect(events).toHaveLength(33);
+    for (const event of events) await service.claimEvent(board.boardId, event.eventId, caller);
+    const startCursor = service.getBoard(board.boardId).eventCursor;
+    const answerRequest = (batch: typeof events): CooperationTransaction => ({
+      ...transaction([...batch.map(event => ({ kind: "appendThreadMessage" as const, threadId: event.threadId!,
+        message: { id: `answer-${event.eventId}`, text: "This answer is committed to the board.", sourceRefs: [] } })),
+        { kind: "updateItem", itemId: "note", patch: { geometry: { ...note().geometry, x: batch.length * 20 } } }]),
+      assignmentGeneration: caller.assignmentGeneration, respondsToEventIds: batch.map(event => event.eventId)
+    });
+    await expect(service.apply(answerRequest(events), caller)).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    const receiptOperationIds: string[] = [];
+    for (const batch of [events.slice(0, 32), events.slice(32)]) {
+      const request = answerRequest(batch);
+      const receipt = await service.apply(request, caller);
+      expect(receipt.answeredEventIds).toEqual(request.respondsToEventIds);
+      receiptOperationIds.push(receipt.operationId);
+    }
+    await expect(service.completeTurn(board.boardId, { receiptOperationIds: Array(101).fill(receiptOperationIds[0]), startCursor, providerTurnId: caller.providerTurnId }, caller)).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+    const completion = await service.completeTurn(board.boardId, { receiptOperationIds: [...receiptOperationIds, receiptOperationIds[0]], startCursor, providerTurnId: caller.providerTurnId }, caller);
+    expect(completion.receiptOperationIds).toEqual(receiptOperationIds);
+    expect(completion.changedIds).toHaveLength(34);
+    expect(completion.changedIds.filter(id => id === "note")).toEqual(["note"]);
+    expect(completion.answeredEventIds).toEqual(events.map(event => event.eventId));
+    const restarted = new BlackboardService({ rootDir: root });
+    await restarted.init();
+    expect(restarted.completionsForTab(tab.tabId)).toEqual([completion]);
+    expect(restarted.inbox(board.boardId).every(event => event.state === "answered")).toBe(true);
+    const authorityPath = path.join(root, "state.json");
+    const authority = JSON.parse(await readFile(authorityPath, "utf8"));
+    for (const field of ["changedIds", "answeredEventIds"]) {
+      for (const corruption of ["uncommitted", "missing", "duplicate"]) {
+        const corrupt = structuredClone(authority);
+        const ids: string[] = corrupt.completions[0][field];
+        if (corruption === "uncommitted") ids[0] = "invented";
+        if (corruption === "missing") ids.pop();
+        if (corruption === "duplicate") ids[ids.length - 1] = ids[0];
+        await writeFile(authorityPath, JSON.stringify(corrupt));
+        await expect(new BlackboardService({ rootDir: root }).init(), `${field}: ${corruption}`).rejects.toMatchObject({ code: "INTEGRITY_ERROR" });
+      }
+    }
+  });
+
   it("binds receipts and completion to the trusted native execution and turn", async () => {
     const caller = { ...agent(), attemptId: "attempt-1", providerTurnId: "turn-1", nativeExecutionId: "execution-1" };
     const startCursor = service.getBoard(board.boardId).eventCursor;
