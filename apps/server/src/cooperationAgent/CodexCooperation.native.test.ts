@@ -77,15 +77,19 @@ it.skipIf(!codex)("native Codex receives addressed idle feedback without replaci
     for (const rule of COOPERATION_RULES) await catalog.saveSystemRule(rule);
     for (const skill of COOPERATION_SKILLS) await catalog.saveSystemSkill(skill);
     const tab: WorkspaceTab = { id: "native-codex", pluginId: "codex-terminal", title: "Native cooperation", cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "", updatedAt: "" } };
-    const contexts = new AgentCooperationContext({ dataDir, endpoint: () => "http://127.0.0.1:1/api/cooperation/agent", binding: () => ({ tabId: tab.id, boardId: "board-native", assignmentGeneration: 1, providerId: "codex" }) });
+    let executionId: string | undefined;
+    const contexts = new AgentCooperationContext({ dataDir, endpoint: () => "http://127.0.0.1:1/api/cooperation/agent", binding: () => ({ tabId: tab.id, boardId: "board-native", assignmentGeneration: 1, providerId: "codex", executionId }) });
     session = await new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, dataDir, sources, env).createSession({
       tab, cwd: root, runtimeContext: await contexts.augmentRuntimeContext(tab), initialInput: { prompt: "Begin the synthetic cooperation session." },
-      controls: { closeTab: () => undefined, setTabIndicator: () => undefined }
+      controls: { closeTab: () => undefined, setTabIndicator: () => undefined, setRestoreInput: async input => {
+        executionId = input.codexExecutionId as string;
+        await contexts.prepare(tab.id);
+      } }
     });
     const terminal = session;
     terminal.onData?.(chunk => { if (chunk.includes("\u001b[6n")) terminal.write?.("\u001b[1;1R"); });
     await expect.poll(() => visible(terminal.snapshot().recentOutput), { timeout: 20000 }).toContain("SyntheticCodexinitialanswer.");
-    const nativePath = `${contexts.contextPath(tab.id)}.native.json`;
+    const nativePath = await contexts.nativeReceiptPath(tab.id);
     await expect.poll(async () => JSON.parse(await fs.readFile(nativePath, "utf8")).currentTurn?.status, { timeout: 10000 }).toBe("completed");
     const identityPath = path.join(sources.viewPath(tab.id), ".cloudx-conversation.json");
     const original = JSON.parse(await fs.readFile(identityPath, "utf8"));

@@ -19,11 +19,17 @@ const run = promisify(execFile);
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
 async function fixture(endpoint = "http://127.0.0.1:1/api/cooperation/agent") {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-coop-context-"));
   cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
   let binding: CooperationAgentBinding | undefined = {
-    tabId: "tab-1", boardId: "board-1", assignmentGeneration: 3, providerId: "codex", ownerPluginId: "forge", logicalRunId: "worker-1", attemptId: "attempt-1"
+    tabId: "tab-1", boardId: "board-1", assignmentGeneration: 3, providerId: "codex", ownerPluginId: "forge", logicalRunId: "worker-1", attemptId: "attempt-1", executionId: "execution-1"
   };
   const options = { dataDir: root, endpoint: () => endpoint, binding: (tabId: string) => binding?.tabId === tabId ? binding : undefined };
   const contexts = new AgentCooperationContext(options);
@@ -86,6 +92,18 @@ it("refuses symlinked or corrupt context files and non-local endpoints", async (
   await expect(f.contexts.prepare("tab-1")).rejects.toThrow("invalid");
   const remote = new AgentCooperationContext({ ...f.options, dataDir: path.join(f.root, "remote"), endpoint: () => "https://foreign.example/api" });
   await expect(remote.prepare("tab-1")).rejects.toThrow("local HTTP");
+});
+
+it.each(["symlinked", "public"])("refuses a %s native receipt directory", async kind => {
+  const f = await fixture();
+  const directory = `${f.contexts.contextPath("tab-1")}.native`;
+  if (kind === "symlinked") {
+    const outside = path.join(f.root, "outside-native");
+    await fs.mkdir(outside);
+    await fs.rm(directory, { recursive: true });
+    await fs.symlink(outside, directory);
+  } else await fs.chmod(directory, 0o755);
+  await expect(f.contexts.prepare("tab-1")).rejects.toThrow("real private directory");
 });
 
 it("gives both provider launches their own locator while preserving the existing runtime context", async () => {
@@ -200,20 +218,20 @@ it("keeps final native observations monotonic and a retired broker cannot replac
   await old.turn({ providerTurnId: "old-turn", status: "running" });
   await old.turn({ providerTurnId: "old-turn", status: "completed" });
   await old.turn({ providerTurnId: "old-turn", status: "running" });
-  expect(JSON.parse(await fs.readFile(`${binding.contextPath}.native.json`, "utf8")).currentTurn.status).toBe("completed");
+  const oldReceiptPath = await f.contexts.nativeReceiptPath("tab-1");
+  expect(JSON.parse(await fs.readFile(oldReceiptPath, "utf8")).currentTurn.status).toBe("completed");
   f.change({ ...f.locator, executionId: "execution-2" });
   await f.contexts.prepare("tab-1");
-  const retiredReceipt = await fs.readFile(`${binding.contextPath}.native.json`, "utf8");
   await old.turn({ providerTurnId: "retired-turn", status: "running" });
   await old.boundary();
   await old.mark(["retired-event"], "unknown");
   expect(old.currentTurn.providerTurnId).toBe("old-turn");
-  expect(await fs.readFile(`${binding.contextPath}.native.json`, "utf8")).toBe(retiredReceipt);
+  await expect(fs.lstat(oldReceiptPath)).rejects.toMatchObject({ code: "ENOENT" });
   const next = await new CooperationNativeControl({ ...binding, executionId: "execution-2" }, async () => ({ state: "nativeAccepted", providerTurnId: "new-turn" })).start();
   cleanups.push(() => next.close());
   await old.close();
   await vi.waitFor(() => expect(boundaries).toHaveBeenCalledTimes(2));
-  expect(JSON.parse(await fs.readFile(`${binding.contextPath}.native.json`, "utf8"))).toMatchObject({ executionId: "execution-2", status: "ready" });
+  expect(JSON.parse(await fs.readFile(await f.contexts.nativeReceiptPath("tab-1"), "utf8"))).toMatchObject({ executionId: "execution-2", status: "ready" });
   expect(await native.deliver({ recipientTabId: "tab-1", assignmentGeneration: 3, boardId: "board-1", boardRevision: 1, eventIds: ["new-event"], text: "New addressed question", executionId: "execution-2" }))
     .toMatchObject({ state: "nativeAccepted", providerTurnId: "new-turn" });
 });
@@ -226,12 +244,13 @@ it("rejects a delayed retired broker before it can displace the replacement nati
   const binding = { contextPath: f.contexts.contextPath("tab-1"), providerId: "codex", tabId: "tab-1", executionId: "execution-current" };
   const current = await new CooperationNativeControl(binding, async () => ({ state: "nativeAccepted", providerTurnId: "current-turn" })).start();
   cleanups.push(() => current.close());
-  const currentReceipt = await fs.readFile(`${binding.contextPath}.native.json`, "utf8");
+  const receiptPath = await f.contexts.nativeReceiptPath("tab-1");
+  const currentReceipt = await fs.readFile(receiptPath, "utf8");
   const retired = new CooperationNativeControl({ ...binding, executionId: "execution-retired" }, async () => ({ state: "nativeAccepted" }));
   cleanups.push(() => retired.close());
   await expect(retired.start()).rejects.toThrow("replaced");
   expect(retired.server?.listening ?? false).toBe(false);
-  expect(await fs.readFile(`${binding.contextPath}.native.json`, "utf8")).toBe(currentReceipt);
+  expect(await fs.readFile(receiptPath, "utf8")).toBe(currentReceipt);
   const native = new NativeAgentFeedbackPort({ contexts: f.contexts });
   cleanups.push(async () => native.close());
   expect(await native.deliver({ recipientTabId: "tab-1", assignmentGeneration: 3, boardId: "board-1", boardRevision: 1, eventIds: ["current-event"], text: "Current addressed question", executionId: binding.executionId }))
@@ -256,7 +275,113 @@ it("releases a native listener when its execution is replaced during startup", a
   await expect(control.start()).rejects.toThrow("replaced");
   expect(control.server.listening).toBe(false);
   await expect(fs.lstat(control.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
-  await expect(fs.lstat(`${f.contexts.contextPath("tab-1")}.native.json`)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readdir(`${f.contexts.contextPath("tab-1")}.native`)).toEqual([]);
+});
+
+it.each(["boundary", "startup"])("keeps the replacement reachable when a retired %s publication finishes its rename last", async phase => {
+  const f = await fixture();
+  f.change({ ...f.locator, executionId: "execution-old" });
+  await f.contexts.prepare("tab-1");
+  const { CooperationNativeControl } = await import(fileURLToPath(new URL("../../helpers/cooperation-native-control.mjs", import.meta.url)));
+  const binding = { contextPath: f.contexts.contextPath("tab-1"), providerId: "codex", tabId: "tab-1", executionId: "execution-old" };
+  const old = new CooperationNativeControl(binding, async () => ({ state: "nativeAccepted" }));
+  cleanups.push(() => old.close());
+  if (phase === "boundary") await old.start();
+  const entered = deferred();
+  const release = deferred();
+  const rename = fs.rename.bind(fs);
+  const gated = vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+    if (String(target).includes(".native")) {
+      const value = JSON.parse(await fs.readFile(source, "utf8"));
+      if (value.executionId === binding.executionId && value.boundaryEpoch === (phase === "boundary" ? 1 : 0)) {
+        entered.resolve();
+        await release.promise;
+      }
+    }
+    return rename(source, target);
+  });
+  cleanups.push(async () => { release.resolve(); gated.mockRestore(); });
+  const pending = phase === "boundary" ? old.boundary() : old.start();
+  await entered.promise;
+  f.change({ ...f.locator, executionId: "execution-new" });
+  await f.contexts.prepare("tab-1");
+  const current = await new CooperationNativeControl({ ...binding, executionId: "execution-new" }, async () => ({ state: "nativeAccepted", providerTurnId: "new-turn" })).start();
+  cleanups.push(() => current.close());
+  await current.turn({ providerTurnId: "new-turn", status: "running" });
+  release.resolve();
+  if (phase === "startup") {
+    await expect(pending).rejects.toThrow("replaced");
+    expect(old.server.listening).toBe(false);
+    await expect(fs.lstat(old.socketPath)).rejects.toMatchObject({ code: "ENOENT" });
+  } else await pending;
+  await current.boundary();
+  await current.turn({ providerTurnId: "new-turn", status: "completed" });
+  const native = new NativeAgentFeedbackPort({ contexts: f.contexts });
+  cleanups.push(async () => native.close());
+  const turns = vi.fn();
+  native.onTurn(turns);
+  expect(await native.deliver({ recipientTabId: "tab-1", assignmentGeneration: 3, boardId: "board-1", boardRevision: 1, eventIds: ["event-new"], text: "Address the replacement execution.", executionId: "execution-new" }))
+    .toMatchObject({ state: "nativeAccepted", providerTurnId: "new-turn" });
+  expect(turns).toHaveBeenLastCalledWith(expect.objectContaining({ executionId: "execution-new", status: "completed" }));
+  expect(await fs.readdir(`${binding.contextPath}.native`)).toEqual([path.basename(await f.contexts.nativeReceiptPath("tab-1"))]);
+});
+
+it("cleans every execution receipt and pending temporary file when a tab is revoked", async () => {
+  const f = await fixture();
+  const { CooperationNativeControl } = await import(fileURLToPath(new URL("../../helpers/cooperation-native-control.mjs", import.meta.url)));
+  const control = await new CooperationNativeControl({ contextPath: f.contexts.contextPath("tab-1"), providerId: "codex", tabId: "tab-1", executionId: "execution-1" }, async () => ({ state: "nativeAccepted" })).start();
+  cleanups.push(() => control.close());
+  const receiptPath = await f.contexts.nativeReceiptPath("tab-1");
+  const entered = deferred();
+  const release = deferred();
+  const rename = fs.rename.bind(fs);
+  const gated = vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+    if (target === receiptPath) { entered.resolve(); await release.promise; }
+    return rename(source, target);
+  });
+  cleanups.push(async () => { release.resolve(); gated.mockRestore(); });
+  const pending = control.boundary();
+  await entered.promise;
+  const unrelated = path.join(path.dirname(f.contexts.contextPath("tab-1")), "unrelated.json");
+  await fs.writeFile(unrelated, "retained");
+  await f.contexts.revoke("tab-1");
+  release.resolve();
+  await pending;
+  await expect(fs.lstat(path.dirname(receiptPath))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await fs.readFile(unrelated, "utf8")).toBe("retained");
+});
+
+it("removes a failed receipt temporary file without changing the published receipt", async () => {
+  const f = await fixture();
+  const receiptPath = await f.contexts.nativeReceiptPath("tab-1");
+  await fs.writeFile(receiptPath, "original");
+  const { writePrivateJson } = await import(fileURLToPath(new URL("../../helpers/cooperation-native-control.mjs", import.meta.url)));
+  const error = Object.assign(new Error("receipt commit denied"), { code: "EACCES" });
+  const gated = vi.spyOn(fs, "rename").mockRejectedValue(error);
+  cleanups.push(async () => gated.mockRestore());
+  await expect(writePrivateJson(receiptPath, { version: 1 })).rejects.toBe(error);
+  expect(await fs.readdir(path.dirname(receiptPath))).toEqual([path.basename(receiptPath)]);
+  expect(await fs.readFile(receiptPath, "utf8")).toBe("original");
+});
+
+it("leaves another writer's temporary file intact when exclusive creation fails", async () => {
+  const f = await fixture();
+  const receiptPath = await f.contexts.nativeReceiptPath("tab-1");
+  const { writePrivateJson } = await import(fileURLToPath(new URL("../../helpers/cooperation-native-control.mjs", import.meta.url)));
+  const error = Object.assign(new Error("another writer owns this temporary file"), { code: "EEXIST" });
+  let temporaryPath = "";
+  const open = fs.open.bind(fs);
+  const collision = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+    if (String(args[0]).startsWith(`${receiptPath}.`)) {
+      temporaryPath = String(args[0]);
+      await fs.writeFile(temporaryPath, "another writer's data");
+      throw error;
+    }
+    return open(...args);
+  });
+  cleanups.push(async () => collision.mockRestore());
+  await expect(writePrivateJson(receiptPath, { version: 1 })).rejects.toBe(error);
+  expect(await fs.readFile(temporaryPath, "utf8")).toBe("another writer's data");
 });
 
 it("keeps Claude delivery unknown when its conversation changes before a native queue acknowledgment", async () => {

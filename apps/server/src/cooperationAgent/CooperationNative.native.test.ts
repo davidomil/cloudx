@@ -31,6 +31,7 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
   let imagePath: string | undefined;
   let requestedImage = false;
   let receivedImage = false;
+  let nativeStatePath: string | undefined;
   const provider = createServer(async (request, response) => {
     let raw = "";
     for await (const chunk of request) raw += chunk;
@@ -78,15 +79,21 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
     for (const rule of COOPERATION_RULES) await catalog.saveSystemRule(rule);
     for (const skill of COOPERATION_SKILLS) await catalog.saveSystemSkill(skill);
     const tab: WorkspaceTab = { id: "native-claude", pluginId: "codex-terminal", title: "Native cooperation", cwd: root, status: "running", createdAt: "", updatedAt: "", indicator: { color: "green", label: "", updatedAt: "" } };
-    const contexts = new AgentCooperationContext({ dataDir, endpoint: () => "http://127.0.0.1:1/api/cooperation/agent", binding: () => ({ tabId: tab.id, boardId: "board-native", assignmentGeneration: 1, providerId: "claude" }) });
+    let executionId: string | undefined;
+    const contexts = new AgentCooperationContext({ dataDir, endpoint: () => "http://127.0.0.1:1/api/cooperation/agent", binding: () => ({ tabId: tab.id, boardId: "board-native", assignmentGeneration: 1, providerId: "claude", executionId }) });
     const runtimeContext = await contexts.augmentRuntimeContext(tab);
     const plugin = new CodexTerminalPlugin(new NodePtyTerminalProcessFactory(), undefined, dataDir, undefined, env, {
       accounts, claudeSettings: { read: async () => ({ ...await settings.read(), permissionMode: "acceptEdits", autoTrustWorkspace: true }) }
     });
     session = await plugin.createSession({
       tab, cwd: root, runtimeContext, initialInput: { agent: { providerId: "claude", accountId: account.id }, model: "claude-sonnet-4-5", prompt: "Begin this synthetic board session." },
-      controls: { setTabIndicator: () => undefined, closeTab: () => undefined }
+      controls: { setTabIndicator: () => undefined, closeTab: () => undefined, setRestoreInput: async input => {
+        executionId = input.codexExecutionId as string;
+        await contexts.prepare(tab.id);
+      } }
     });
+    const nativePath = await contexts.nativeReceiptPath(tab.id);
+    nativeStatePath = nativePath;
     const terminal = session;
     session.onData?.(chunk => { if (chunk.includes("\u001b[6n")) terminal.write?.("\u001b[1;1R"); });
     let acceptedSyntheticKey = false;
@@ -104,7 +111,7 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
     terminal.write?.(draft);
     native = new NativeAgentFeedbackPort({ contexts });
     await expect.poll(async () => {
-      try { return JSON.parse(await fs.readFile(`${contexts.contextPath(tab.id)}.native.json`, "utf8")).status; }
+      try { return JSON.parse(await fs.readFile(nativePath, "utf8")).status; }
       catch { return terminal.snapshot().recentOutput; }
     }, { timeout: 10000 }).toBe("ready");
     const delivery = await native.deliver({ recipientTabId: tab.id, assignmentGeneration: 1, boardId: "board-native", boardRevision: 2, eventIds: ["event-native"], text: "Explain the user's selected note section on the assigned board." });
@@ -130,7 +137,7 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
     await expect.poll(async () => {
       const records = (await fs.readFile(originalIdentity.transcriptPath, "utf8")).split("\n").slice(0, -1).filter(Boolean).map(line => JSON.parse(line));
       const submittedDraft = records.find(record => record.type === "user" && record.message?.content === draft);
-      const currentTurn = JSON.parse(await fs.readFile(`${contexts.contextPath(tab.id)}.native.json`, "utf8")).currentTurn;
+      const currentTurn = JSON.parse(await fs.readFile(nativePath, "utf8")).currentTurn;
       return { status: currentTurn?.status, matchesSubmittedDraft: Boolean(submittedDraft?.promptId && currentTurn?.providerTurnId === submittedDraft.promptId) };
     }, { timeout: 10000 }).toEqual({ status: "completed", matchesSubmittedDraft: true });
     const originalImage = await fs.readFile("docs/design/cooperation/examples/assets/reference.png");
@@ -141,7 +148,7 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
     expect(await fs.readFile(imagePath)).toEqual(originalImage);
     const imageDelivery = await native.deliver({ recipientTabId: tab.id, assignmentGeneration: 1, boardId: "board-native", boardRevision: 3, eventIds: ["event-image"], text: `Open the original board image with Read at ${imagePath}.` });
     expect(["unknown", "nativeAccepted"]).toContain(imageDelivery.state);
-    await expect.poll(async () => JSON.parse(await fs.readFile(`${contexts.contextPath(tab.id)}.native.json`, "utf8")).deliveries.find((entry: { eventIds: string[] }) => entry.eventIds.includes("event-image"))?.state,
+    await expect.poll(async () => JSON.parse(await fs.readFile(nativePath, "utf8")).deliveries.find((entry: { eventIds: string[] }) => entry.eventIds.includes("event-image"))?.state,
       { timeout: 10000 }).toBe("nativeAccepted");
     await expect.poll(() => receivedImage, { timeout: 10000 }).toBe(true);
     const transcript = await fs.readFile(originalIdentity.transcriptPath, "utf8");
@@ -165,8 +172,7 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
             hookSummary: record.subtype === "stop_hook_summary" ? record : undefined };
         } catch { return { invalidLine: true }; }
       }).slice(-40);
-      const nativeStatePath = path.join(dataDir, "cooperation-agents", `${createHash("sha256").update("native-claude").digest("hex")}.json.native.json`);
-      const nativeState = await fs.readFile(nativeStatePath, "utf8").then(JSON.parse).catch(() => undefined);
+      const nativeState = nativeStatePath ? await fs.readFile(nativeStatePath, "utf8").then(JSON.parse).catch(() => undefined) : undefined;
       await fs.mkdir(diagnostics, { recursive: true, mode: 0o700 });
       await fs.writeFile(path.join(diagnostics, `claude-${inbound}-${Date.now()}.json`), JSON.stringify({ receipts, nativeState, records,
         terminal: stripVTControlCharacters(session?.snapshot().recentOutput ?? "").slice(-12000) }, null, 2), { mode: 0o600 });

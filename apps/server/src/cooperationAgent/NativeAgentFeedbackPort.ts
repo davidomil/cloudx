@@ -5,7 +5,7 @@ import path from "node:path";
 
 import type { CooperationProvider } from "@cloudx/shared";
 
-import type { AgentCooperationContext } from "./AgentCooperationContext.js";
+import { nativeReceiptPath, type AgentCooperationContext } from "./AgentCooperationContext.js";
 
 export interface AgentFeedbackEnvelope {
   recipientTabId: string;
@@ -40,16 +40,21 @@ interface NativeControlLocator {
   socketPath: string; status: "ready" | "closed"; boundaryEpoch?: number; deliveries: NativeFeedbackObservation[];
   currentTurn?: NativeCooperationTurn;
 }
+interface NativeObservation {
+  watcher: FSWatcher;
+  pending: Promise<void>;
+}
 
 /** Talks only to the native owner already attached to the addressed tab. */
 export class NativeAgentFeedbackPort {
-  private readonly watchers = new Map<string, FSWatcher>();
+  private readonly watchers = new Map<string, NativeObservation>();
   private readonly listeners = new Set<(value: NativeFeedbackObservation) => void>();
   private readonly observed = new Map<string, string>();
   private readonly boundaries = new Map<string, string>();
   private readonly boundaryListeners = new Set<(tabId: string) => void>();
   private readonly turnListeners = new Set<(turn: NativeCooperationTurn) => void>();
   private readonly turns = new Map<string, string>();
+  private closed = false;
 
   constructor(private readonly options: { contexts: AgentCooperationContext }) {}
 
@@ -69,10 +74,10 @@ export class NativeAgentFeedbackPort {
   }
 
   async deliver(envelope: AgentFeedbackEnvelope): Promise<AgentFeedbackDelivery> {
-    const contextPath = this.options.contexts.contextPath(envelope.recipientTabId);
+    if (this.closed) return { state: "unavailable", reason: "Native feedback observation has closed." };
     await this.observe(envelope.recipientTabId);
     let locator: NativeControlLocator;
-    try { locator = await readJson(`${contextPath}.native.json`) as NativeControlLocator; }
+    try { locator = await this.readCurrentLocator(envelope.recipientTabId); }
     catch (error) {
       return { state: "unavailable", reason: (error as NodeJS.ErrnoException).code === "ENOENT"
         ? "The original AI session has not advertised a cooperation control channel." : "The original AI session control receipt is unreadable." };
@@ -90,19 +95,21 @@ export class NativeAgentFeedbackPort {
   }
 
   async observe(tabId: string): Promise<void> {
-    if (this.watchers.has(tabId)) return;
+    if (this.closed) return;
+    const current = this.watchers.get(tabId);
+    if (current) return current.pending;
     const contextPath = this.options.contexts.contextPath(tabId);
-    const filename = `${path.basename(contextPath)}.native.json`;
-    const watcher = watch(path.dirname(contextPath), (_event, name) => {
-      if (name?.toString() === filename) void this.readObservation(tabId);
+    const watcher = watch(`${contextPath}.native`, (_event, name) => {
+      if (name?.toString().endsWith(".json")) void this.enqueueObservation(tabId, observation);
     });
-    watcher.on("error", () => { watcher.close(); this.watchers.delete(tabId); });
-    this.watchers.set(tabId, watcher);
-    await this.readObservation(tabId);
+    const observation = { watcher, pending: Promise.resolve() };
+    watcher.on("error", () => { if (this.watchers.get(tabId) === observation) this.forget(tabId); });
+    this.watchers.set(tabId, observation);
+    await this.enqueueObservation(tabId, observation);
   }
 
   forget(tabId: string): void {
-    this.watchers.get(tabId)?.close();
+    this.watchers.get(tabId)?.watcher.close();
     this.watchers.delete(tabId);
     this.boundaries.delete(tabId);
     this.turns.delete(tabId);
@@ -110,7 +117,8 @@ export class NativeAgentFeedbackPort {
   }
 
   close(): void {
-    for (const watcher of this.watchers.values()) watcher.close();
+    this.closed = true;
+    for (const observation of this.watchers.values()) observation.watcher.close();
     this.watchers.clear();
     this.listeners.clear();
     this.boundaryListeners.clear();
@@ -120,16 +128,35 @@ export class NativeAgentFeedbackPort {
     this.boundaries.clear();
   }
 
-  private async readObservation(tabId: string): Promise<void> {
+  private enqueueObservation(tabId: string, observation: NativeObservation): Promise<void> {
+    observation.pending = observation.pending.catch(() => undefined).then(async () => {
+      if (this.watchers.get(tabId) === observation) await this.readObservation(tabId, observation);
+    });
+    return observation.pending;
+  }
+
+  private async readCurrentLocator(tabId: string): Promise<NativeControlLocator> {
+    const receiptPath = await this.options.contexts.nativeReceiptPath(tabId);
+    const locator = await readJson(receiptPath) as NativeControlLocator;
+    if (locator.version !== 1 || locator.tabId !== tabId ||
+      nativeReceiptPath(this.options.contexts.contextPath(tabId), locator) !== receiptPath ||
+      await this.options.contexts.nativeReceiptPath(tabId) !== receiptPath)
+      throw new Error("The original native execution changed during observation.");
+    return locator;
+  }
+
+  private async readObservation(tabId: string, observation: NativeObservation): Promise<void> {
     let locator: NativeControlLocator;
-    try { locator = await readJson(`${this.options.contexts.contextPath(tabId)}.native.json`) as NativeControlLocator; }
+    try { locator = await this.readCurrentLocator(tabId); }
     catch { return; }
+    if (this.watchers.get(tabId) !== observation) return;
     if (locator.version !== 1 || locator.tabId !== tabId || !Array.isArray(locator.deliveries)) return;
     const boundary = JSON.stringify([locator.providerId, locator.executionId, locator.boundaryEpoch ?? 0]);
     if (this.boundaries.get(tabId) !== boundary && locator.status === "ready") {
       this.boundaries.set(tabId, boundary);
       for (const listener of this.boundaryListeners) listener(tabId);
     }
+    if (this.watchers.get(tabId) !== observation) return;
     if (locator.currentTurn?.providerTurnId) {
       const currentTurn = { ...locator.currentTurn, tabId, providerId: locator.providerId, executionId: locator.executionId };
       const fingerprint = JSON.stringify(currentTurn);
@@ -139,6 +166,7 @@ export class NativeAgentFeedbackPort {
       }
     }
     for (const delivery of locator.deliveries) {
+      if (this.watchers.get(tabId) !== observation) return;
       if (!Array.isArray(delivery.eventIds) || !["nativeAccepted", "unknown"].includes(delivery.state)) continue;
       const identity = JSON.stringify([tabId, locator.executionId, delivery.eventIds]);
       const fingerprint = JSON.stringify(delivery);

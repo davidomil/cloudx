@@ -48,6 +48,12 @@ export class AgentCooperationContext {
     return path.join(this.directory, `${createHash("sha256").update(tabId).digest("hex")}.json`);
   }
 
+  async nativeReceiptPath(tabId: string): Promise<string> {
+    const context = await this.readLocator(tabId);
+    if (!context) throw new Error("The native cooperation context is unavailable.");
+    return nativeReceiptPath(this.contextPath(tabId), context);
+  }
+
   prepare(tabId: string): Promise<CooperationAgentLocator> {
     const task = this.queue.then(async () => {
       const binding = await this.options.binding(tabId);
@@ -56,6 +62,11 @@ export class AgentCooperationContext {
       const stat = await fs.lstat(this.directory);
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Cooperation contexts require a real private directory.");
       const previous = await this.readLocator(tabId);
+      const nativeDirectory = `${this.contextPath(tabId)}.native`;
+      await fs.mkdir(nativeDirectory, { recursive: true, mode: 0o700 });
+      const nativeStat = await fs.lstat(nativeDirectory);
+      if (!nativeStat.isDirectory() || nativeStat.isSymbolicLink() || (nativeStat.mode & 0o077))
+        throw new Error("Native cooperation receipts require a real private directory.");
       const assetRoot = `${this.contextPath(tabId)}.assets`;
       const sameLease = previous && leaseIdentity(previous) === leaseIdentity(binding);
       if (previous && !sameLease)
@@ -72,6 +83,13 @@ export class AgentCooperationContext {
           ? previous.capability : randomBytes(32).toString("hex")
       };
       await writeTextFileAtomic(this.directory, this.contextPath(tabId), `${JSON.stringify(locator)}\n`, "Cooperation context", 0o600);
+      if (previous && (previous.providerId !== locator.providerId || previous.executionId !== locator.executionId)) {
+        const currentName = locator.providerId && locator.executionId ? path.basename(nativeReceiptPath(this.contextPath(tabId), locator)) : undefined;
+        for (const name of await fs.readdir(nativeDirectory)) {
+          if (/^[a-f0-9]{64}\.json$/.test(name) && name !== currentName)
+            await fs.rm(path.join(nativeDirectory, name), { force: true });
+        }
+      }
       return locator;
     });
     this.queue = task.catch(() => undefined);
@@ -112,7 +130,7 @@ export class AgentCooperationContext {
   async revoke(tabId: string): Promise<void> {
     await this.queue;
     await fs.rm(this.contextPath(tabId), { force: true });
-    await fs.rm(`${this.contextPath(tabId)}.native.json`, { force: true });
+    await fs.rm(`${this.contextPath(tabId)}.native`, { recursive: true, force: true });
     await fs.rm(`${this.contextPath(tabId)}.assets`, { recursive: true, force: true });
   }
 
@@ -174,6 +192,13 @@ export class AgentCooperationContext {
 }
 
 export const COOPERATION_HELPER_PATH = fileURLToPath(new URL("../../helpers/cooperation-helper.mjs", import.meta.url));
+
+export function nativeReceiptPath(contextPath: string, binding: Pick<CooperationAgentBinding, "providerId" | "executionId">): string {
+  if (!["codex", "claude"].includes(binding.providerId ?? "") || typeof binding.executionId !== "string" || !binding.executionId || binding.executionId.length > 512)
+    throw new Error("A native provider and execution identity are required.");
+  const identity = createHash("sha256").update(JSON.stringify([binding.providerId, binding.executionId])).digest("hex");
+  return path.join(`${contextPath}.native`, `${identity}.json`);
+}
 
 export function cooperationLaunchEnv(context?: WorkspaceRuntimeContext): Record<string, string> {
   const runtime = context?.pluginRuntime?.cooperation;

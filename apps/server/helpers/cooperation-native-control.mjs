@@ -16,6 +16,10 @@ export class CooperationNativeControl {
     this.publication = Promise.resolve();
     this.boundaryEpoch = 0;
     this.turnObservations = Promise.resolve();
+    if (!["codex", "claude"].includes(binding.providerId) || typeof binding.executionId !== "string" || !binding.executionId || binding.executionId.length > 512)
+      throw new Error("A native provider and execution identity are required.");
+    const identity = createHash("sha256").update(JSON.stringify([binding.providerId, binding.executionId])).digest("hex");
+    this.receiptPath = path.join(`${binding.contextPath}.native`, `${identity}.json`);
   }
 
   async start() {
@@ -91,18 +95,28 @@ export class CooperationNativeControl {
         return;
       }
       if (!replace) {
-        const current = await readPrivateJson(`${this.binding.contextPath}.native.json`).catch(error => {
+        const current = await readPrivateJson(this.receiptPath).catch(error => {
           if (error.code === "ENOENT") return undefined;
           throw error;
         });
         if (current?.socketPath !== this.socketPath) return;
       }
-      await writePrivateJson(`${this.binding.contextPath}.native.json`, {
-      version: 1, providerId: this.binding.providerId, tabId: this.binding.tabId,
-      executionId: this.binding.executionId, socketPath: this.socketPath,
-      status: this.closed ? "closed" : "ready", boundaryEpoch: this.boundaryEpoch, currentTurn: this.currentTurn,
-      deliveries: [...this.deliveries.values()]
-      });
+      try {
+        await writePrivateJson(this.receiptPath, {
+          version: 1, providerId: this.binding.providerId, tabId: this.binding.tabId,
+          executionId: this.binding.executionId, socketPath: this.socketPath,
+          status: this.closed ? "closed" : "ready", boundaryEpoch: this.boundaryEpoch, currentTurn: this.currentTurn,
+          deliveries: [...this.deliveries.values()]
+        });
+      } catch (error) {
+        if (await this.ownsCurrentContext()) throw error;
+        if (replace) throw new Error("The original native execution has been replaced.");
+        return;
+      }
+      if (!await this.ownsCurrentContext()) {
+        await fs.rm(this.receiptPath, { force: true });
+        if (replace) throw new Error("The original native execution has been replaced.");
+      }
     });
     return this.publication;
   }
@@ -165,8 +179,7 @@ export class CooperationNativeControl {
   }
 
   ownsContext(context) {
-    return context.tabId === this.binding.tabId && (!context.providerId || context.providerId === this.binding.providerId) &&
-      (!context.executionId || context.executionId === this.binding.executionId);
+    return context.tabId === this.binding.tabId && context.providerId === this.binding.providerId && context.executionId === this.binding.executionId;
   }
 
   async ownsCurrentContext() {
@@ -189,7 +202,9 @@ export async function readPrivateJson(filePath, maxBytes = 1024 * 1024) {
 export async function writePrivateJson(filePath, value) {
   const temporary = `${filePath}.${randomBytes(8).toString("hex")}.tmp`;
   const handle = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-  try { await handle.writeFile(`${JSON.stringify(value)}\n`); await handle.sync(); }
-  finally { await handle.close(); }
-  await fs.rename(temporary, filePath);
+  try {
+    try { await handle.writeFile(`${JSON.stringify(value)}\n`); await handle.sync(); }
+    finally { await handle.close(); }
+    await fs.rename(temporary, filePath);
+  } finally { await fs.rm(temporary, { force: true }); }
 }
