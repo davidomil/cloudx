@@ -1312,7 +1312,7 @@ test("Codex update displays already-current and actionable failure results on na
 const settingsNavigations = ["category switches", "search filtering"] as const;
 
 for (const navigation of settingsNavigations) {
-  test(`Codex Settings keeps drafts across ${navigation} and discards them when Settings closes`, async ({
+  test(`Codex Settings keeps drafts across ${navigation} and saves their original revision`, async ({
     page,
     isMobile,
   }) => {
@@ -1362,17 +1362,6 @@ for (const navigation of settingsNavigations) {
       service_tier: "default",
       features: { fast_mode: true },
     });
-
-    await model.fill("discarded-draft-model");
-    await fastMode.selectOption({ label: "Flex" });
-    await page
-      .getByRole("button", { name: "Close settings", exact: true })
-      .click();
-    await expect(page.locator(".codex-settings-panel")).toHaveCount(0);
-    await openCodexSettings(page, isMobile);
-    await expect(model).toHaveValue("unsaved-draft-model");
-    await expect(fastMode).toHaveValue("default");
-    await expect(save).toBeDisabled();
   });
 
   test(`Codex Settings keeps a rejected stale draft and its revision across ${navigation} until Reload`, async ({
@@ -1477,6 +1466,39 @@ for (const navigation of settingsNavigations) {
     expect(savedConfig).toContain(unrelatedSettings);
   });
 }
+
+test("Codex Settings discards unsaved drafts when Settings closes", async ({
+  page,
+  isMobile,
+}) => {
+  const configPath = path.join(testRoot, "codex-home", "config.toml");
+  const savedConfig =
+    'model = "unsaved-draft-model"\nservice_tier = "default"\n[features]\nfast_mode = true\n';
+  await fs.writeFile(configPath, savedConfig);
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const model = settings.getByRole("textbox", { name: "Default model" });
+  const fastMode = settings.getByRole("combobox", { name: "Fast mode" });
+  const save = settings.getByRole("button", {
+    name: "Save Codex settings",
+    exact: true,
+  });
+  await expect(model).toHaveValue("unsaved-draft-model");
+  await expect(fastMode).toHaveValue("default");
+  await expect(save).toBeDisabled();
+
+  await model.fill("discarded-draft-model");
+  await fastMode.selectOption({ label: "Flex" });
+  await page
+    .getByRole("button", { name: "Close settings", exact: true })
+    .click();
+  await expect(page.locator(".codex-settings-panel")).toHaveCount(0);
+  await openCodexSettings(page, isMobile);
+  await expect(model).toHaveValue("unsaved-draft-model");
+  await expect(fastMode).toHaveValue("default");
+  await expect(save).toBeDisabled();
+  expect(await fs.readFile(configPath, "utf8")).toBe(savedConfig);
+});
 
 for (const serviceTier of ["priority", "default", "flex"]) {
   test(`Codex Settings enables disabled fast mode support with the saved ${serviceTier} tier unchanged`, async ({
