@@ -238,6 +238,7 @@ export function App() {
   const activeWindowIdRef = useRef<string | undefined>(undefined);
   const layoutRef = useRef<TabLayoutState>(initialLayout);
   const activeTabIdRef = useRef<string | undefined>(undefined);
+  const workspaceUpdateVersionRef = useRef(0);
   const createTargetPaneIdRef = useRef<string | undefined>(undefined);
   const pendingLayoutPersistWindowIdRef = useRef<string | undefined>(undefined);
   const pendingLayoutBaseRef = useRef<TabLayoutState | undefined>(undefined);
@@ -273,6 +274,7 @@ export function App() {
     const closeWorkspaceSocket = subscribeWorkspaceUpdates(
       (update) => {
         if (update.windows && update.templates && update.activeWindowId) {
+          workspaceUpdateVersionRef.current += 1;
           applyWorkspaceState({
             tabs: update.tabs,
             activeTabId: update.activeTabId,
@@ -440,6 +442,7 @@ export function App() {
   }, [uiScale]);
 
   async function refresh() {
+    const workspaceUpdateVersion = workspaceUpdateVersionRef.current;
     setConnectionStatus("checking");
     try {
       const [pluginList, workspaceState, configState, activeTriggers, notificationHistory] = await Promise.all([
@@ -454,7 +457,9 @@ export function App() {
       setConfig(configState);
       setActiveAutomationTriggerIds(activeTriggers);
       setNotifications(notificationHistory);
-      applyWorkspaceState(workspaceState);
+      if (workspaceUpdateVersionRef.current === workspaceUpdateVersion) {
+        applyWorkspaceState(workspaceState);
+      }
       setConnectionStatus("connected");
       setError(undefined);
     } catch (err) {

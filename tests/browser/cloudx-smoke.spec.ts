@@ -556,6 +556,116 @@ test.describe("CloudX shipped shell", () => {
     await page.getByRole("button", { name: "Cancel", exact: true }).click();
   });
 
+  test("keeps the selected tab when an older startup workspace response arrives", async ({
+    page,
+  }) => {
+    const tabs = await createFileTransferTabs(page, "Startup");
+    let liveActiveTabId: string | undefined;
+    page.on("websocket", (socket) => {
+      if (new URL(socket.url()).pathname !== "/ws/workspace") return;
+      socket.on("framereceived", ({ payload }) => {
+        const update = JSON.parse(String(payload));
+        if (update.type === "workspace") liveActiveTabId = update.activeTabId;
+      });
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let captured!: () => void;
+    const workspaceCaptured = new Promise<void>((resolve) => {
+      captured = resolve;
+    });
+    await page.route("**/api/workspace", async (route) => {
+      const response = await route.fetch();
+      expect((await response.json()).activeTabId).toBe(tabs.other.id);
+      captured();
+      await held;
+      await route.fulfill({ response });
+    });
+
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await workspaceCaptured;
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.other.title,
+      );
+      const selectionPersisted = page.waitForResponse(
+        (response) =>
+          response.request().method() === "PATCH" &&
+          /^\/api\/windows\/[^/]+$/.test(new URL(response.url()).pathname),
+      );
+      await page
+        .locator(".tab-activation")
+        .filter({ hasText: tabs.source.title })
+        .click();
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.source.title,
+      );
+      expect((await selectionPersisted).status()).toBe(200);
+      await expect.poll(() => liveActiveTabId).toBe(tabs.source.id);
+      release();
+      await expect(page.locator(".file-browser-panel:visible")).toHaveCount(1);
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.source.title,
+      );
+    } finally {
+      release();
+      await page.unrouteAll({ behavior: "wait" });
+      for (const tab of [tabs.source, tabs.other]) {
+        await page.request.delete(`${baseUrl}/api/tabs/${tab.id}`);
+      }
+    }
+  });
+
+  test("loads the startup window layout after a tabs-only live update", async ({
+    page,
+  }) => {
+    const tabs = await createFileTransferTabs(page, "Partial");
+    const workspace = (await (
+      await page.request.get(`${baseUrl}/api/workspace`)
+    ).json()) as WorkspaceStateResponse;
+    const window = workspace.windows.find(
+      (candidate) => candidate.id === workspace.activeWindowId,
+    )!;
+    await page.routeWebSocket("**/ws/workspace", (socket) => {
+      socket.send(
+        JSON.stringify({
+          type: "tabs",
+          tabs: workspace.tabs,
+          activeTabId: workspace.activeTabId,
+        }),
+      );
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route("**/api/workspace", async (route) => {
+      const response = await route.fetch();
+      await held;
+      await route.fulfill({ response });
+    });
+
+    try {
+      await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+      await expect(page.locator(".tab-button.selected .tab-title")).toHaveText(
+        tabs.other.title,
+      );
+      release();
+      await expect(page.locator(".workspace-pane")).toHaveAttribute(
+        "data-pane-id",
+        window.layout.activePaneId,
+      );
+    } finally {
+      release();
+      await page.unrouteAll({ behavior: "wait" });
+      for (const tab of [tabs.source, tabs.other]) {
+        await page.request.delete(`${baseUrl}/api/tabs/${tab.id}`);
+      }
+    }
+  });
+
   test("keeps queued uploads and their progress with the original tab while switching tabs", async ({
     page,
     isMobile,
