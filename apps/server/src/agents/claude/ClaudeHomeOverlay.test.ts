@@ -18,6 +18,34 @@ async function fixture() {
 }
 
 describe("Claude personal configuration inheritance", () => {
+  it("rejects unsupported root exclusions before generating or changing an overlay", async () => {
+    const input = await fixture();
+    const personal = path.join(input.providerHome, "CLAUDE.md");
+    const settings = path.join(input.providerHome, "settings.json");
+    const content = JSON.stringify({ claudeMdExcludes: [personal] });
+    await fs.writeFile(personal, "ORIGINAL_PERSONAL_MARKER\n");
+    await fs.writeFile(settings, content);
+    await expect(materializeClaudeHomeOverlay(input)).rejects.toThrow(`claudeMdExcludes in ${settings}`);
+    await expect(fs.stat(input.dataDir)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(personal, "utf8")).toBe("ORIGINAL_PERSONAL_MARKER\n");
+    expect(await fs.readFile(settings, "utf8")).toBe(content);
+  });
+
+  it("preserves an existing tab's generated files and native decisions when new root exclusions block a later launch", async () => {
+    const input = await fixture();
+    const personal = path.join(input.providerHome, "CLAUDE.md");
+    await fs.writeFile(personal, "ORIGINAL_PERSONAL_MARKER\n");
+    const overlay = await materializeClaudeHomeOverlay(input);
+    const state = path.join(overlay.configDir, ".claude.json");
+    await fs.writeFile(state, JSON.stringify({ hasCompletedOnboarding: true, copyOnSelect: true, projects: { "/private": { hasTrustDialogAccepted: false } } }));
+    const paths = [state, overlay.settingsPath, overlay.instructionsPath];
+    const original = await Promise.all(paths.map(file => fs.readFile(file, "utf8")));
+    await fs.writeFile(path.join(input.providerHome, "settings.json"), JSON.stringify({ claudeMdExcludes: [personal] }));
+    await expect(materializeClaudeHomeOverlay(input)).rejects.toThrow("claudeMdExcludes");
+    expect(await Promise.all(paths.map(file => fs.readFile(file, "utf8")))).toEqual(original);
+    expect(await fs.readlink(path.join(overlay.configDir, "CLAUDE.md"))).toBe(personal);
+  });
+
   it.each([false, true])("preserves only the current project's native import approval (%s) and keeps later tab decisions", async approved => {
     const input = await fixture();
     const cwd = path.join(input.root, "project");

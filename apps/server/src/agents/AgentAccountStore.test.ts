@@ -24,7 +24,7 @@ esac
   await fs.writeFile(claude, `#!/bin/sh
 if [ "$1" = "--settings" ]; then shift 2; fi
 case "$1 $2" in
-  "--version "*) echo "9.9.9 (Claude Code)";;
+  "--version "*) echo "2.1.316 (Claude Code)";;
   "auth status")
     if [ -n "$ANTHROPIC_API_KEY" ]; then method=api_key; logged=true;
     elif [ -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then method=claude.ai; logged=true;
@@ -46,6 +46,28 @@ async function setup() {
 }
 
 describe("AgentAccountStore", () => {
+  it("keeps the selected account and native credentials when an unreviewed version blocks login, status and model launch", async () => {
+    const { root, env, store } = await setup();
+    const account = await store.create({ providerId: "claude", label: "Saved choice", kind: "subscription" });
+    const credentials = path.join(store.home(account), ".credentials.json");
+    const original = JSON.stringify({ claudeAiOauth: { accessToken: "fake-owned-token" } });
+    await fs.writeFile(credentials, original);
+    await store.verify(account.id);
+    const saved = await store.list();
+    const unexpected = path.join(root, "unexpected-auth-or-model");
+    await fs.writeFile(env.CLOUDX_CLAUDE_BIN!, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "2.1.317 (Claude Code)"; exit 0; fi
+touch ${unexpected}
+exit 1
+`, { mode: 0o755 });
+    for (const action of [() => store.loginCommand(account.id), () => store.verify(account.id), () => store.defaultClaudeLaunch()])
+      await expect(action()).rejects.toThrow("reviewed for native 2.1.316");
+    expect(await store.list()).toEqual(saved);
+    expect((await store.resolve("claude")).id).toBe(account.id);
+    expect(await fs.readFile(credentials, "utf8")).toBe(original);
+    await expect(fs.stat(unexpected)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("imports existing provider logins once as default accounts", async () => {
     const { env, dataDir, store } = await setup();
     await fs.mkdir(path.join(env.HOME!, ".codex"));

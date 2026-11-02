@@ -30,7 +30,7 @@ it("shows historical account/version/arguments and source evidence without claim
   await view.fill("../escape"); expect(view.button.disabled).toBe(true);
   await view.fill("worker-1"); await act(async () => view.button.click());
   expect(view.call).toHaveBeenCalledExactlyOnceWith("claude-settings.inspect-launch", { tabId: "worker-1" });
-  for (const text of ["2.1.316", "account-1", "execution-1", "ANTHROPIC_API_KEY", "SHA-256", "missing", "Prompt text", "later skill discovery", "docx", "synced", "Missing"]) expect(view.container.textContent).toContain(text);
+  for (const text of ["2.1.316", "account-1", "execution-1", "ANTHROPIC_API_KEY", "SHA-256", "missing", "Prompt text", "later skill discovery", "docx", "synced", "Missing", "Fresh CloudX default", "Launch selection", "Not selected", "Allowed"]) expect(view.container.textContent).toContain(text);
 });
 
 it("does not substitute current settings for a missing record", async () => {

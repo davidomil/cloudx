@@ -5,17 +5,20 @@ import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { assertClaudeNativeAccountStatus, inspectClaudeNativeSettings, verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
 import { resolveClaudeAccountPolicy } from "./claudeAccountPolicy.js";
-import type { AgentCliOptions } from "../agentCli.js";
+import type { AgentCliOptions, AgentCliResult } from "../agentCli.js";
 
 const input = { command: "claude", settingsPath: "/selected/settings.json", cwd: "/workspace", env: {} };
 const policy = resolveClaudeAccountPolicy({}, "/selected", { ANTHROPIC_API_KEY: "fake-selected" });
 const status = { loggedIn: true, authMethod: "api_key", apiProvider: "firstParty", configDirectory: "/selected", apiKeySource: "ANTHROPIC_API_KEY" };
+const nativeVersion = { code: 0, stdout: "2.1.316 (Claude Code)\n", stderr: "" };
+const accountRunner = (result: AgentCliResult) => vi.fn(async (_command: string, args: string[]) => args[0] === "--version" ? nativeVersion : result);
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))); });
 
 it("reads native authentication without starting a session or exposing private output", async () => {
-  const run = vi.fn(async () => ({ code: 0, stdout: JSON.stringify(status), stderr: "" }));
+  const run = accountRunner({ code: 0, stdout: JSON.stringify(status), stderr: "" });
   await verifyClaudeNativeAccount(input, policy, run);
+  expect(run.mock.calls[0]).toEqual(["claude", ["--version"], expect.objectContaining({ timeoutMs: 5_000 })]);
   expect(run).toHaveBeenCalledWith("claude", ["--settings", input.settingsPath, "auth", "status", "--json"], expect.objectContaining({ cwd: input.cwd, timeoutMs: 15_000 }));
 });
 
@@ -28,16 +31,23 @@ it.each([
 });
 
 it("never echoes native status output containing credential values", async () => {
-  await expect(verifyClaudeNativeAccount(input, policy, async () => ({ code: 1, stdout: "never-print-key", stderr: "never-print-secret" }))).rejects.not.toThrow(/never-print/);
+  await expect(verifyClaudeNativeAccount(input, policy, accountRunner({ code: 1, stdout: "never-print-key", stderr: "never-print-secret" }))).rejects.not.toThrow(/never-print/);
 });
 
 it.each([null, 1, 2, 137])("rejects a failed native auth-status process (%s) even if stdout resembles a successful status", async code => {
-  await expect(verifyClaudeNativeAccount(input, policy, async () => ({ code, stdout: JSON.stringify(status), stderr: "never-print-crash-details" }))).rejects.toThrow("did not exit normally");
+  await expect(verifyClaudeNativeAccount(input, policy, accountRunner({ code, stdout: JSON.stringify(status), stderr: "never-print-crash-details" }))).rejects.toThrow("did not exit normally");
 });
 
 it("accepts the native unauthenticated exit without claiming the selected subscription is logged in", async () => {
   const selected = resolveClaudeAccountPolicy({}, "/selected", {});
-  await expect(verifyClaudeNativeAccount(input, selected, async () => ({ code: 1, stdout: JSON.stringify({ ...status, loggedIn: false, authMethod: "none" }), stderr: "" }))).resolves.toBeUndefined();
+  await expect(verifyClaudeNativeAccount(input, selected, accountRunner({ code: 1, stdout: JSON.stringify({ ...status, loggedIn: false, authMethod: "none" }), stderr: "" }))).resolves.toBeUndefined();
+});
+
+it.each(["2.1.315 (Claude Code)", "2.1.317 (Claude Code)", "9.9.9", "private-malformed-version"])("rejects an unreviewed version before authentication or startup hooks: %s", async version => {
+  const run = vi.fn(async () => ({ code: 0, stdout: version, stderr: "never-print-private-native-output" }));
+  await expect(verifyClaudeNativeAccount(input, policy, run)).rejects.toThrow("reviewed for native 2.1.316");
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(run.mock.calls[0]).toEqual(["claude", ["--version"], expect.objectContaining({ timeoutMs: 5_000 })]);
 });
 
 it.each(["bedrock", "mantle", "anthropicAws", "vertex", "foundry"] as const)("accepts explicit native %s service authentication", provider => {
@@ -109,6 +119,8 @@ it.skipIf(!claude).each([
 
 it.skipIf(!claude).each([
   [{ allowManagedHooksOnly: true }, { managedOnly: true }],
+  // The SDK gate suppresses non-managed commands without the file-tier allDisabled flag.
+  [{ disableAllHooks: true }, { allDisabled: false }],
 ])("native 2.1.316 honors host-managed hook policy %j without running non-managed receipt commands", async (managed, expected) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-managed-hook-readback-")); roots.push(root);
   const marker = path.join(root, "hook-ran");
@@ -123,3 +135,20 @@ it.skipIf(!claude).each([
   expect(result.sources.map(source => source.source)).toContain("policySettings");
   await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
 }, 30_000);
+
+it.skipIf(!claude)("native 2.1.316 respects a user disableAllHooks setting over generated receipt commands", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-user-hook-policy-")); roots.push(root);
+  const configDir = path.join(root, "config"); await fs.mkdir(configDir);
+  const original = JSON.stringify({ disableAllHooks: true });
+  await fs.writeFile(path.join(configDir, "settings.json"), original);
+  const settingsPath = path.join(root, "launch.json");
+  const marker = path.join(root, "hook-ran");
+  await fs.writeFile(settingsPath, JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ type: "command", command: `touch ${marker}` }] }] } }));
+  const result = await inspectClaudeNativeSettings({ command: claude!, settingsPath, cwd: root,
+    env: { PATH: process.env.PATH, HOME: root, CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_API_KEY: "fake-no-model", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" }
+  });
+  expect(result.hooks.policy).toMatchObject({ allDisabled: true });
+  expect(result.sources).toContainEqual(expect.objectContaining({ source: "userSettings", settings: expect.objectContaining({ disableAllHooks: true }) }));
+  expect(await fs.readFile(path.join(configDir, "settings.json"), "utf8")).toBe(original);
+  await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+});

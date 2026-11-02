@@ -68,11 +68,14 @@ Codex does not automatically inline the file's contents. The Claude fixture
 checks the text file's contents included by its native `@` expansion. Image
 request assertions run after native Backspace removes the earlier image.
 
-## Required release evidence
+## Automated evidence and independent physical follow-up
 
 Keep an entry for every selected native version and platform. Record the commit,
 Node/browser/native versions, exact command, resource limits, test outcome and
-artifact paths. A skipped or unavailable case remains open.
+artifact paths. A skipped or unavailable case remains explicitly unverified.
+The owner decision of 2 November 2026 moves physical-device sign-off to
+[#253](https://github.com/davidomil/cloudx/issues/253), independently of this
+implementation batch. Automated browser/PTY/native correctness remains required.
 
 | Boundary                | Required checks                                                                                                                                       | Current evidence scope                                                                                                        |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
@@ -108,5 +111,8 @@ after insertion, remove image chips or file-reference text in the native prompt.
 infer attachment state from rendered text or send guessed removal keystrokes.
 
 Use [the physical acceptance checklist](terminal-physical-checklist.md) for the
-remaining device evidence. Unexecuted rows stay open; browser emulation and the
-Linux fixture must not be entered as physical-device results.
+device evidence tracked independently in #253. All physical rows remain **Not run**;
+browser emulation and the Linux fixture must not be entered as physical-device
+results. Recorded automated native runs cover Codex 0.160.0, 0.162.1 and 0.166.0,
+and Claude 2.1.316 in ordinary/fullscreen mode. These are exact-version Linux
+fixture observations, not platform-wide support certification.

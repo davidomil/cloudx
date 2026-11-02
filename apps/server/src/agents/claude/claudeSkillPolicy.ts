@@ -32,7 +32,6 @@ export interface ClaudeSkillPolicy {
   settings: Record<string, unknown>;
   // Personal skills and commands to link into the tab, as paths below the home.
   personalLinks: string[];
-  linkSynced: boolean;
 }
 
 export interface ClaudeSkillPolicyInput {
@@ -43,35 +42,47 @@ export interface ClaudeSkillPolicyInput {
   cloudxSkillNames: readonly string[];
 }
 
-// Claude tabs get the skills CloudX chooses, as Codex tabs do: CloudX skills
-// plus personal or synced skills the user allowed in Settings → Claude.
-// Bundled skills, plugins, project skills and commands, and auto-memory are
-// turned off for the launch only; the user's own Claude settings are not
-// changed. skillOverrides matches plain names, so one entry also hides nested
-// skills of that name that Claude loads later in the session.
+// CloudX skills and selected personal skills are materialized separately.
+// Synced background loading cannot preserve that source boundary and is
+// rejected. Exact-name overrides cover discovered project names, not later
+// project discovery; they are not a session-wide default-deny policy.
 export async function claudeSkillPolicy(input: ClaudeSkillPolicyInput): Promise<ClaudeSkillPolicy> {
   const allowed = new Set(input.allowedSkills);
   const user = await discoverClaudeUserSkills(input.providerHome);
   const project = input.cwd ? await discoverProjectSkills(input.cwd) : { names: [], settingsDirectories: [] };
-  const kept = new Set([...input.cloudxSkillNames, ...allowed]);
+  assertSelectedSkillSources(input, user, project.names);
+  const personal = user.filter(skill => skill.origin === "personal" && allowed.has(skill.name));
+  const kept = new Set([...input.cloudxSkillNames, ...personal.map(skill => skill.name)]);
   const hidden = [...new Set([...user.map(skill => skill.name), ...project.names, ...BUILT_IN_PLUGIN_SKILLS].filter(name => !kept.has(name)))].sort();
   const plugins = await enabledPlugins([
     path.join(input.providerHome, "settings.json"),
     ...project.settingsDirectories.flatMap(directory => ["settings.json", "settings.local.json"].map(name => path.join(directory, ".claude", name)))
   ]);
-  const linkSynced = user.some(skill => skill.origin === "synced" && allowed.has(skill.name));
   return {
     settings: {
       disableBundledSkills: true,
       autoMemoryEnabled: false,
       syncClaudeAiPlugins: false,
-      ...(linkSynced ? {} : { syncClaudeAiSkills: false }),
+      syncClaudeAiSkills: false,
       ...(hidden.length ? { skillOverrides: Object.fromEntries(hidden.map(name => [name, "off"])) } : {}),
       ...(plugins.length ? { enabledPlugins: Object.fromEntries(plugins.map(plugin => [plugin, false])) } : {})
     },
-    personalLinks: user.filter(skill => skill.origin === "personal" && allowed.has(skill.name)).map(skill => skill.source),
-    linkSynced
+    personalLinks: personal.map(skill => skill.source)
   };
+}
+
+function assertSelectedSkillSources(input: ClaudeSkillPolicyInput, user: ClaudeUserSkill[], projectNames: string[]): void {
+  const selected = new Set(input.allowedSkills);
+  const cloudx = new Set(input.cloudxSkillNames);
+  for (const name of new Set([...selected, ...cloudx])) {
+    const sources = selected.has(name) ? user.filter(skill => skill.name === name) : [];
+    const origins = [...sources.map(skill => skill.source), ...(cloudx.has(name) ? ["CloudX"] : []), ...(projectNames.includes(name) ? ["project"] : [])];
+    if (origins.length > 1)
+      throw new Error(`Claude skill "${name}" has conflicting sources (${origins.join(", ")}). Native name-only overrides cannot authorize one source without authorizing the others. Remove the collision before launching. Saved skill selections are unchanged.`);
+  }
+  const synced = user.filter(skill => skill.origin === "synced" && selected.has(skill.name));
+  if (synced.length)
+    throw new Error(`Selected synced Claude skills (${synced.map(skill => skill.name).join(", ")}) require a native background-sync mode that cannot enforce the CloudX skill allowlist. This launch is blocked before linking the synced directory or starting Claude. Review the selection in Settings → Claude; saved selections and account choices are unchanged.`);
 }
 
 // Personal skills in <home>/skills/<dir>/, personal commands in

@@ -72,13 +72,14 @@ async function instructionFixture() {
   await fs.mkdir(env.HOME);
   return {
     root, cwd, providerHome, accountHome, env, statePath,
+    requestCount: () => requests.length,
     write: async (relative: string, content: string) => {
       const target = path.join(providerHome, relative);
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, content);
       return target;
     },
-    probe: async (overlay: boolean, target?: string) => {
+    probe: async (overlay: boolean, target?: string, workingDirectory = cwd) => {
       requests.length = 0;
       readFile = target;
       let configDir = providerHome;
@@ -86,7 +87,7 @@ async function instructionFixture() {
       if (overlay) {
         const materialized = await materializeClaudeHomeOverlay({
           dataDir: path.join(root, "data"), tabId: "native", accountHome, providerHome, userStatePath: statePath,
-          executionId: "11111111-1111-4111-8111-111111111111", cwd, trustProject: true, launchEnv: env,
+          executionId: "11111111-1111-4111-8111-111111111111", cwd: workingDirectory, trustProject: true, launchEnv: env,
           resolved: {
             source: "default", template: { id: "fixture", name: "Fixture", color: "green", ruleIds: [], skillIds: [] },
             rules: [{ id: "fixture", description: "Fixture", text: "CLOUDX_ADDITION_MARKER", scope: "user" }], skills: []
@@ -95,7 +96,7 @@ async function instructionFixture() {
         configDir = materialized.configDir;
         args.push("--settings", materialized.settingsPath, "--append-system-prompt-file", materialized.instructionsPath);
       }
-      const child = execFile(claude!, [...args, "--", "Run the local instruction fixture."], { cwd, env: { ...env, CLAUDE_CONFIG_DIR: configDir }, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
+      const child = execFile(claude!, [...args, "--", "Run the local instruction fixture."], { cwd: workingDirectory, env: { ...env, CLAUDE_CONFIG_DIR: configDir }, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
       child.stdin?.end();
       await new Promise<void>((resolve, reject) => child.once("error", reject).once("exit", code => code === 0 ? resolve() : reject(new Error(`Native Claude fixture exited ${code}.`))));
       expect(requests.length).toBe(target ? 2 : 1);
@@ -161,18 +162,29 @@ native("keeps unconditional, nested and path-scoped personal rules at native use
   } finally { await fixture.close(); }
 }, 90_000);
 
-native("records #237 unsupported original-root claudeMdExcludes identity", async () => {
+native.each(["user", "project", "local", "worktree-local"])("rejects the original-root %s exclusion combination before starting the overlay native client", async layer => {
   const fixture = await instructionFixture();
   try {
     const personal = await fixture.write("CLAUDE.md", "EXCLUDED_PERSONAL_MARKER\n@docs/import.md\n");
     await fixture.write("docs/import.md", "EXCLUDED_IMPORT_MARKER\n");
-    await fixture.write("settings.json", JSON.stringify({ claudeMdExcludes: [personal] }));
-    const plain = JSON.stringify(await fixture.probe(false));
-    const overlay = JSON.stringify(await fixture.probe(true));
+    let cwd = fixture.cwd;
+    if (layer === "worktree-local") {
+      cwd = path.join(fixture.root, "linked-project");
+      await run("git", ["init", "-q", fixture.cwd]);
+      await run("git", ["-C", fixture.cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "Fixture"]);
+      await run("git", ["-C", fixture.cwd, "worktree", "add", "-qb", "linked", cwd]);
+    }
+    const settings = layer === "user" ? path.join(fixture.providerHome, "settings.json") : path.join(fixture.cwd, ".claude", layer === "project" ? "settings.json" : "settings.local.json");
+    await fs.mkdir(path.dirname(settings), { recursive: true });
+    const content = JSON.stringify({ claudeMdExcludes: [personal] });
+    await fs.writeFile(settings, content);
+    const plain = JSON.stringify(await fixture.probe(false, undefined, cwd));
     expect(plain).not.toContain("EXCLUDED_PERSONAL_MARKER");
     expect(plain).not.toContain("EXCLUDED_IMPORT_MARKER");
-    expect(overlay).toContain("EXCLUDED_PERSONAL_MARKER");
-    expect(overlay).toContain("EXCLUDED_IMPORT_MARKER");
+    await expect(fixture.probe(true, undefined, cwd)).rejects.toThrow(`claudeMdExcludes in ${settings}`);
+    expect(fixture.requestCount()).toBe(0);
+    await expect(fs.stat(path.join(fixture.root, "data"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(settings, "utf8")).toBe(content);
   } finally { await fixture.close(); }
 }, 90_000);
 

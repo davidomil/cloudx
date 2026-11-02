@@ -70,6 +70,22 @@ describe("native settings persistence through the hook boundary", () => {
     await expect(f.call("codex-settings.inspect-launch", { tabId: "policy-tab" })).rejects.toThrow();
     expect(await fs.readFile(f.configPath, "utf8")).toBe(before);
   });
+  it("reports the same fresh imagegen default for skill directories and SKILL.md paths", async () => {
+    const f = await fixture();
+    const imagegen = path.join(f.home, "skills", ".system", "imagegen");
+    await fs.mkdir(imagegen, { recursive: true });
+    await fs.writeFile(path.join(imagegen, "SKILL.md"), "---\nname: imagegen\ndescription: Fixture image skill.\n---\n");
+    await materializeCodexHomeOverlay({ dataDir: f.sources.dataDir, sources: f.sources, source: await f.sources.resolve(), tabId: "imagegen-tab", cwd: f.root, baseEnv: { HOME: f.home } });
+    const generated = path.join(f.sources.viewPath("imagegen-tab"), "config.toml");
+    const original = await fs.readFile(generated, "utf8");
+    const directory = path.join(f.sources.viewPath("imagegen-tab"), "skills", "cloudx-exceptions", "imagegen");
+    for (const skillPath of [directory, path.join(directory, "SKILL.md")]) {
+      await fs.writeFile(generated, original + `\n[[skills.config]]\npath=${JSON.stringify(skillPath)}\nenabled=false\n`);
+      const inspection = await f.service.inspectLaunch("imagegen-tab");
+      expect(inspection.skills).toContainEqual(expect.objectContaining({ path: skillPath, source: "native-vendor-cache", available: true, enabled: false, freshDefault: "enabled" }));
+    }
+    expect(validateNativeCodexConfiguration).not.toHaveBeenCalled();
+  });
   it.each([
     ["model", "model", "gpt-6-sol", "gpt-6-astra"],
     ["serviceTier", "service_tier", "priority", "flex"],

@@ -7,6 +7,16 @@ export const CLAUDE_ACCOUNT_POLICY_REVIEW = {
   sources: ["https://code.claude.com/docs/en/env-vars", "https://code.claude.com/docs/en/settings-reference", "https://platform.claude.com/docs/en/manage-claude/wif-reference"],
 } as const;
 
+// A version bump requires review of the native provider/env/settings registry
+// and the no-model plus synthetic-provider boundary fixtures.
+export const CLAUDE_ACCOUNT_POLICY_VERSIONS = [CLAUDE_ACCOUNT_POLICY_REVIEW.nativeVersion] as const;
+
+export function assertClaudeAccountPolicyVersion(version: string): void {
+  const selected = version.trim().match(/^(\d+\.\d+\.\d+)(?: \(Claude Code\))?$/u)?.[1];
+  if (!CLAUDE_ACCOUNT_POLICY_VERSIONS.some(supported => supported === selected))
+    throw new Error(`Claude account/provider isolation is reviewed for native ${CLAUDE_ACCOUNT_POLICY_VERSIONS.join(", ")}. The selected executable has an unsupported or unrecognized version. Select a reviewed native version or update the CloudX account policy review before login or model work; CloudX has not changed accounts, settings or the native installation.`);
+}
+
 export const CLAUDE_ACCOUNT_CREDENTIAL_KEYS = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
   "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES",

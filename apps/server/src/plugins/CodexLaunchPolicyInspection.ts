@@ -17,12 +17,13 @@ export async function inspectCodexLaunchPolicy(sources: CodexStateSources, tabId
     if (signal?.aborted) throw new Error("Codex launch inspection cancelled.");
     if (!entry || typeof entry !== "object" || typeof entry.path !== "string" || typeof entry.enabled !== "boolean") continue;
     const source = skillSource(entry.path, sources.viewPath(tabId));
+    const skillDirectory = path.basename(entry.path) === "SKILL.md" ? path.dirname(entry.path) : entry.path;
     let available = false;
     try { available = (await fs.stat(path.basename(entry.path) === "SKILL.md" ? entry.path : path.join(entry.path, "SKILL.md"))).isFile(); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT" && (error as NodeJS.ErrnoException).code !== "ENOTDIR") throw error; }
     skills.push({
       path: entry.path, source, available, enabled: entry.enabled,
-      freshDefault: source === "cloudx-system" ? "enabled" : source === "selected-template" ? "template-dependent" : source === "native-vendor-cache" ? path.basename(entry.path) === "imagegen" ? "enabled" : "disabled" : "native-config",
+      freshDefault: source === "cloudx-system" ? "enabled" : source === "selected-template" ? "template-dependent" : source === "native-vendor-cache" ? path.basename(skillDirectory) === "imagegen" ? "enabled" : "disabled" : "native-config",
       provenance: source === "native-vendor-cache" ? "Shared-cache artifact; selected-CLI version provenance unverified" : source === "native-config" ? "Explicit/discovered native path recorded in the generated configuration" : "CloudX generated launch selection",
     });
   }

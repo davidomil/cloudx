@@ -37,11 +37,25 @@ Credential values remain hidden; managed settings remain read-only.
 | CloudX system catalog | Materialize system skills | Materialize system skills |
 | Selected template | Materialize selected catalog skills | Materialize selected catalog skills |
 | Native vendor cache/bundle | Shared skills/.system files are availability evidence only; selected-version provenance is unverified. Materialize selected available entries. Missing enabled entries block launch. Disable native bundled discovery. | Disable bundled discovery |
-| Personal | Materialize selected catalog sources. Disable discovered .agents/skills paths unless an explicit native skills.config entry owns the path. | Link individually selected allowed skill names |
+| Personal | Materialize selected catalog sources. Disable discovered .agents/skills paths unless an explicit native skills.config entry owns the path. | Link individually selected allowed skill names; reject discovered source/name collisions before launch |
 | Project/nested project | Disable discovered .agents/skills and .codex/skills files at launch unless explicitly configured; a later-discovered set is not measured by global Settings. | Launch-time discovered names are disabled; later-discovery containment requires independent native validation |
-| Synced | Global vendor-cache view does not enumerate or verify synced loading | Selected synced sources and later arrival require containment validation; global Settings is not proof of the loaded set |
+| Synced | Global vendor-cache view does not enumerate or verify synced loading | Reject selected synced sources before materialization: background sync cannot enforce the selected source/account boundary. Preserve saved selections; never link the mutable synced root |
 | Plugin | Native configuration remains a separate layer; loaded plugin skills are not observed in global Settings | Generated launch disables known enabled plugins and native plugin sync |
 | Managed | Enforced administrator requirements win; discovered /etc/codex/skills paths are disabled unless explicitly configured | Managed policy remains authoritative and is not editable here |
+
+Native Claude 2.1.316 still has no proven session-wide source allowlist for
+project discovery (#240). Exact-name overrides block only names already known;
+a newly created project skill is advertised after reload even with no selected
+external skills. Filtered personal links do preserve selected-file updates, omit
+unselected personal arrivals and retain CloudX skills; account changes and
+revocation apply to future tabs. They do not contain later project discovery.
+A native probe of `--setting-sources user,local` suppresses project skills but also
+removes project `CLAUDE.md` and rules, so CloudX does not use it as a containment
+fix. Disabling all slash commands or using managed plugin-only policy also drops
+allowed/CloudX categories. Completion requires upstream source-aware native
+allowlisting, or an explicit owner decision for an opt-in restricted scope that
+forgoes shared project settings/instructions/rules. Name enumeration, watchers
+and hook timing are not default-deny enforcement.
 
 Availability, a fresh default selection, a saved launch selection and observed
 native loading are different facts. The global source matrix deliberately marks
@@ -57,7 +71,9 @@ Both provider panels can also inspect a launch-time record by tab or worker tab
 ID. New launches record the execution ID, selected account ID, native command,
 pre-launch version probe, reviewed arguments, environment variable names and
 bounded configuration-file SHA-256 fingerprints. Claude records external skill
-choices and file availability separately from actual native loading. Prompt text,
+choices and file availability separately from actual native loading. Its inspector
+shows the fresh external-skill default (not selected) beside the historical launch
+choice; an allowed choice is not evidence that the native client loaded it. Prompt text,
 environment values, remote connection targets, arbitrary arguments and inline
 configuration values are omitted. Records use private files; inspection does not
 start a native client. An older launch without a record stays unobserved rather
@@ -122,11 +138,16 @@ the original personal CLAUDE.md and appends CloudX-only instructions through the
 native append-system-prompt-file flag. This retains the original source directory
 without adding an import hop. Native 2.1.316 fixtures verify relative imports,
 escaped spaces, the fourth/fifth import-depth boundary, nested/path-scoped rules,
-and approved/denied external project imports. The native loader still identifies
-the root through its overlay alias when applying `claudeMdExcludes`; a pattern
-naming only the original root can therefore differ from plain Claude. Full
-root-source identity remains unresolved under #237. CloudX does not rewrite
-exclusions or emulate the native glob matcher. The overlay inherits only the
+and approved/denied external project imports. Native 2.1.316 applies
+`claudeMdExcludes` to the overlay root alias before resolving its symlink. CloudX
+therefore rejects a personal `CLAUDE.md` combined with nonempty file-based
+`claudeMdExcludes` before creating overlay state or starting native work. The
+diagnostic names the source/key and asks the user to choose a configuration
+without this unsupported combination; it does not change their policy. The check
+includes user, ancestor/project/local and file-based managed sources, including
+the main checkout local settings for a linked worktree. No root file or no
+exclusions retains normal native behavior. CloudX does not rewrite exclusions or
+emulate the native glob matcher. The overlay inherits only the
 current project's typed trust/import decisions, preserving subsequent per-tab
 decisions without copying credentials, allowed tools or other projects.
 
@@ -139,7 +160,13 @@ exact-version observations separate from reference defaults and unknown values.
 
 ## Selected Claude accounts and service routing
 
-The reviewed account-policy registry covers current credential, provider, endpoint,
+The account-policy registry is reviewed for Claude **2.1.316**. Terminal and
+account login/status/automation paths check `--version` without starting a
+session and reject an unreviewed or malformed version before native account or
+model work. The error names the supported version and leaves saved accounts and
+files intact; CloudX does not update or select another binary automatically.
+
+The reviewed registry covers credential, provider, endpoint,
 refresh-token, federation/profile, config-directory and cloud-chain variables.
 A resolved launch object supplies the process environment, the values reapplied
 following login-shell initialization, and the private native settings overlay.
@@ -190,9 +217,19 @@ are primary evidence, reviewed on 1 November 2026. Native behavior was probed wi
 enable CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST implicitly because it also changes
 native model-policy and feature behavior.
 
-Complete remote/server-managed, MDM and registry lifecycle, policy-helper results,
-late policy updates and cloud credential-chain identity remain unestablished.
-Unsupported known combinations fail clearly; full selected-account acceptance
-still requires current-session identity/endpoint evidence and version-matched
-fixtures for those other sources. No paid native turn or live credential was
-used in this validation.
+Supported native lifecycle fixtures bind the real SessionStart receipt, observe
+running and continued turns at a local synthetic Messages endpoint, and receive
+Stop success and StopFailure failure receipts. Selected endpoint/header/key
+fixtures cross process, login-shell and native user/project/local settings
+boundaries with fake values. A persistent native process is used for failure
+receipts: one-shot print can exit before its asynchronous StopFailure delivery.
+These checks establish the supported contract; arbitrary future remote/MDM/registry
+policy changes and real cloud credential chains remain unobserved, not certified.
+Known incompatible managed combinations fail clearly before launch. No personal
+credentials or paid requests were used.
+
+Physical terminal sign-off remains **Not run** and is tracked independently in
+[#253](https://github.com/davidomil/cloudx/issues/253), by the owner decision of
+2 November 2026. Automated browser, PTY and exact-version Linux native evidence
+remains separate; it does not establish physical macOS/Windows/iOS/Android, IME,
+external-keyboard or platform-editor behavior.

@@ -22,7 +22,7 @@ import { resolveCodexHome } from "../rulesSkills/CodexHomeOverlay.js";
 import type { EnforcedEnv } from "../terminal/ShellLaunch.js";
 import { agentCommand, claudeAccountLaunch, readAgentProviderStatus, runAgentCli } from "./agentCli.js";
 import { assertClaudeAccountCompatibility } from "./claude/ClaudeAccountPreflight.js";
-import { parseClaudeNativeAccountStatus } from "./claude/ClaudeNativeSettings.js";
+import { parseClaudeNativeAccountStatus, verifyClaudeAccountPolicyVersion } from "./claude/ClaudeNativeSettings.js";
 
 const ACCOUNTS_FILE = "agent-accounts.json";
 const ACCOUNTS_DIRECTORY = "agent-accounts";
@@ -214,6 +214,7 @@ export class AgentAccountStore {
   private async claudeAccountCommand(account: AgentAccount, baseEnv: NodeJS.ProcessEnv = this.env) {
     const home = this.home(account);
     const launch = claudeAccountLaunch(baseEnv, home, await this.launchEnv(account));
+    await verifyClaudeAccountPolicyVersion(agentCommand("claude", baseEnv), launch.env);
     await assertClaudeAccountCompatibility(launch.policy);
     const text = `${JSON.stringify(launch.policy.settings, null, 2)}\n`;
     const directory = path.join(home, ".cloudx-account-policy");

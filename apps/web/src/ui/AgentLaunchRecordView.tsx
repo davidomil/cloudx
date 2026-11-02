@@ -15,8 +15,8 @@ export function AgentLaunchRecordView({ record }: { record: AgentLaunchRecord })
     <p>A source fingerprint establishes which file bytes were present, not whether native trust or managed precedence applied them. A missing record is never filled with today's settings.</p>
     {record.skillSelections.length ? <>
       <h4>External skill choices at launch</h4>
-      <table><thead><tr><th>Name</th><th>Source</th><th>Selection</th><th>File availability</th></tr></thead><tbody>
-        {record.skillSelections.map((skill, index) => <tr key={`${index}-${skill.source}-${skill.name}`}><th>{skill.name}</th><td>{skill.source}</td><td>{skill.selected ? "Allowed" : "Not selected"}</td><td>{skill.available ? "Present" : "Missing"}</td></tr>)}
+      <table><thead><tr><th>Name</th><th>Source</th><th>Fresh CloudX default</th><th>Launch selection</th><th>File availability</th></tr></thead><tbody>
+        {record.skillSelections.map((skill, index) => <tr key={`${index}-${skill.source}-${skill.name}`}><th>{skill.name}</th><td>{skill.source}</td><td>Not selected</td><td>{skill.selected ? "Allowed" : "Not selected"}</td><td>{skill.available ? "Present" : "Missing"}</td></tr>)}
       </tbody></table>
       <p>These are saved external choices observed at launch. CloudX/system template skills have their separate source policy. Native loading, later arrivals and name collisions require the native skill-policy contract; selection alone does not prove containment.</p>
     </> : null}

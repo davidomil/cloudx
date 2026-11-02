@@ -23,6 +23,7 @@ import { claudeSkillPolicy, type ClaudeSkillPolicy } from "./claudeSkillPolicy.j
 import { resolveClaudeAccountPolicy, type ClaudeAccountPolicy } from "./claudeAccountPolicy.js";
 import { assertClaudeAccountCompatibility } from "./ClaudeAccountPreflight.js";
 import { assertClaudeHookCompatibility } from "./ClaudeHookPolicy.js";
+import { assertClaudeInstructionSourceCompatibility } from "./ClaudeInstructionPolicy.js";
 import { ClaudeGlobalPreferences } from "./ClaudeGlobalPreferences.js";
 
 export const CLAUDE_FORGE_TURN_BINDING = ".cloudx-forge-turn.json";
@@ -107,10 +108,21 @@ export function claudeOverlayPath(dataDir: string, tabId: string): string {
 }
 
 export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOptions): Promise<ClaudeHomeOverlay> {
+  await assertClaudeInstructionSourceCompatibility(options.providerHome, options.cwd);
   await assertClaudeHookCompatibility(options.providerHome, options.cwd);
   const configDir = claudeOverlayPath(options.dataDir, options.tabId);
   const accountPolicy = options.accountPolicy ?? resolveClaudeAccountPolicy(options.launchEnv ?? {}, configDir, options.launchEnv?.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: options.launchEnv.ANTHROPIC_API_KEY } : {});
   await assertClaudeAccountCompatibility(accountPolicy);
+  const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
+  const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
+  const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
+  const generated = generatedSkills(rulesSkillsRoot, options.resolved, systemSkills);
+  const policy = await claudeSkillPolicy({
+    providerHome: options.providerHome,
+    cwd: options.cwd,
+    allowedSkills: options.allowedSkills ?? [],
+    cloudxSkillNames: generated.map(skill => skill.directory)
+  });
   await fsp.mkdir(path.dirname(configDir), { recursive: true, mode: 0o700 });
   await fsp.mkdir(configDir, { recursive: true, mode: 0o700 });
   const projectsDir = path.join(options.providerHome, "projects");
@@ -123,16 +135,6 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   const trusted = options.trustProject === true || projectTrust.hasTrustDialogAccepted === true;
   await new ClaudeGlobalPreferences(options.dataDir).seed(configDir, options.userStatePath, state => seedClaudeState(state, options.cwd, trusted, projectTrust));
 
-  const rulesSkillsRoot = rulesSkillsRootPath(options.dataDir);
-  const systemRules = await listCloudxSystemRules(rulesSkillsRoot);
-  const systemSkills = await listCloudxSystemSkills(rulesSkillsRoot);
-  const generated = generatedSkills(rulesSkillsRoot, options.resolved, systemSkills);
-  const policy = await claudeSkillPolicy({
-    providerHome: options.providerHome,
-    cwd: options.cwd,
-    allowedSkills: options.allowedSkills ?? [],
-    cloudxSkillNames: generated.map(skill => skill.directory)
-  });
   await materializeSkills(configDir, options.providerHome, generated, policy);
   await replaceLink(path.join(options.providerHome, "CLAUDE.md"), path.join(configDir, "CLAUDE.md"));
   const instructionsPath = await writeInstructions(configDir, options.resolved, systemRules);
@@ -209,7 +211,7 @@ async function materializeSkills(
     if (skill.catalogResources) await writeCatalogSkillEntrypoint(skill.source, target);
     else await fsp.cp(skill.source, target, { recursive: true, dereference: false, verbatimSymlinks: true });
   }
-  for (const source of [...policy.personalLinks, ...(policy.linkSynced ? ["skills/synced"] : [])]) {
+  for (const source of policy.personalLinks) {
     const target = path.join(configDir, ...source.split("/"));
     if (await optionalLstat(target)) continue;
     await fsp.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });

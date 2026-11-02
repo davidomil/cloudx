@@ -129,6 +129,16 @@ describe("ClaudeSettingsPanel", () => {
     expect(callHook).toHaveBeenCalledWith("claude-settings.update", { expectedRevision: "a".repeat(64), allowedSkills: ["release-notes"] });
   });
 
+  it("distinguishes installed synced skills from launch support without resetting saved selections", async () => {
+    const callHook = hooks();
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    expect((control(container, "Allow docx") as HTMLInputElement).checked).toBe(true);
+    expect(container.textContent).toContain("Selecting this skill blocks new Claude launches");
+    expect(container.textContent).toContain("Saved choices remain unchanged");
+    expect(container.textContent).toContain("New project skills discovered later remain an unresolved native policy gap");
+    expect(callHook.mock.calls.some(([hookId]) => hookId === "claude-settings.update")).toBe(false);
+  });
+
   it("explains user values, model limits, permission rules and activation timing without promising effective runtime state", async () => {
     const container = await render(createElement(ClaudeSettingsPanel, { callHook: hooks({ ...saved, legacyEffortLevel: "xhigh" }) as never }));
     expect(container.textContent).toContain("not observed values for an open tab");

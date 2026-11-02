@@ -18,6 +18,7 @@ describe("Claude automation exec through the server composition", () => {
     const capture = path.join(root, "claude-call.json");
     const claude = path.join(root, "claude");
     await fs.writeFile(claude, `#!${process.execPath}
+if (process.argv[2] === "--version") { console.log("2.1.316 (Claude Code)"); process.exit(0); }
 require("node:fs").writeFileSync(${JSON.stringify(capture)}, JSON.stringify({ args: process.argv.slice(2), configDir: process.env.CLAUDE_CONFIG_DIR }));
 process.stdout.write(JSON.stringify({ type: "result", result: "done" }));
 `, { mode: 0o755 });

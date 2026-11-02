@@ -1,8 +1,13 @@
 # Physical terminal acceptance record
 
-Use this record on physical devices after the automated terminal suite passes.
+Physical-device sign-off is tracked independently in [#253](https://github.com/davidomil/cloudx/issues/253),
+following the owner decision of 2 November 2026. These rows are follow-up work,
+not completion prerequisites for the twenty-member implementation batch.
 No physical device was available in the Linux Forge worker. Every result below
-starts **not run**. Pixel emulation and Linux PTY tests are separate evidence.
+remains **Not run**. Pixel emulation and Linux PTY tests are separate evidence.
+Automated native evidence covers Codex 0.160.0, 0.162.1 and 0.166.0, and Claude
+2.1.316 (ordinary/fullscreen); it establishes only the recorded Linux fixture
+behavior. It does not certify these versions on untested physical platforms.
 
 Record the tested commit, device model, OS version, browser/version, keyboard and
 IME, CloudX server platform, and exact Codex/Claude versions before testing. Run

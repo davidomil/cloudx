@@ -4,10 +4,18 @@ import path from "node:path";
 import { afterEach, expect, it } from "vitest";
 import { claudeAccountLaunch } from "../agentCli.js";
 import { assertClaudeAccountCompatibility } from "./ClaudeAccountPreflight.js";
-import { CLAUDE_ACCOUNT_ENV_KEYS, CLAUDE_AUTH_HELPER_KEYS, resolveClaudeAccountPolicy } from "./claudeAccountPolicy.js";
+import { CLAUDE_ACCOUNT_ENV_KEYS, CLAUDE_AUTH_HELPER_KEYS, assertClaudeAccountPolicyVersion, resolveClaudeAccountPolicy } from "./claudeAccountPolicy.js";
 
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))); });
+
+it("uses the reviewed native registry only and never echoes an unsupported executable's output", () => {
+  expect(() => assertClaudeAccountPolicyVersion("2.1.316 (Claude Code)\n")).not.toThrow();
+  for (const version of ["2.1.315", "2.1.317", "9.9.9 (Claude Code)", "never-print-private-version"]) {
+    expect(() => assertClaudeAccountPolicyVersion(version)).toThrow("reviewed for native 2.1.316");
+    expect(() => assertClaudeAccountPolicyVersion(version)).not.toThrow("never-print");
+  }
+});
 
 it("pins selected credentials, refresh/profile/federation selectors and the SDK config directory through every launch boundary", () => {
   const inherited = { PATH: "/bin", ANTHROPIC_API_KEY: "fake-parent", ANTHROPIC_AUTH_TOKEN: "fake-bearer", CLAUDE_CODE_OAUTH_REFRESH_TOKEN: "fake-refresh", CLAUDE_CODE_OAUTH_SCOPES: "fake-scopes", ANTHROPIC_PROFILE: "unrelated", ANTHROPIC_FEDERATION_RULE_ID: "fake-rule", ANTHROPIC_IDENTITY_TOKEN: "fake-identity", ANTHROPIC_CONFIG_DIR: "/other/profile" };

@@ -1,7 +1,7 @@
 import { isRecord } from "@cloudx/shared";
 
 import { runAgentCli, type AgentCliOptions, type AgentCliResult } from "../agentCli.js";
-import type { ClaudeAccountPolicy } from "./claudeAccountPolicy.js";
+import { assertClaudeAccountPolicyVersion, type ClaudeAccountPolicy } from "./claudeAccountPolicy.js";
 
 type Runner = (command: string, args: string[], options: AgentCliOptions) => Promise<AgentCliResult>;
 export interface ClaudeNativeInspectionInput {
@@ -58,10 +58,16 @@ export async function inspectClaudeNativeSettings(input: ClaudeNativeInspectionI
 
 /** Native auth status reads merged authentication policy without executing session hooks or a model turn. */
 export async function verifyClaudeNativeAccount(input: ClaudeNativeInspectionInput, policy: ClaudeAccountPolicy, run: Runner = runAgentCli): Promise<void> {
+  await verifyClaudeAccountPolicyVersion(input.command, input.env, run, input.signal);
   const result = await run(input.command, ["--settings", input.settingsPath, "auth", "status", "--json"], {
     env: input.env, cwd: input.cwd, signal: input.signal, timeoutMs: 15_000
   });
   parseClaudeNativeAccountStatus(result, policy);
+}
+
+export async function verifyClaudeAccountPolicyVersion(command: string, env: NodeJS.ProcessEnv, run: Runner = runAgentCli, signal?: AbortSignal): Promise<void> {
+  const result = await run(command, ["--version"], { env, signal, timeoutMs: 5_000 });
+  assertClaudeAccountPolicyVersion(result.code === 0 ? result.stdout : "");
 }
 
 export function parseClaudeNativeAccountStatus(result: AgentCliResult, policy: ClaudeAccountPolicy): { loggedIn: boolean; authMethod: string } {

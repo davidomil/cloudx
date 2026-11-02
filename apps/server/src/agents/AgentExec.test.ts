@@ -13,6 +13,7 @@ async function setup() {
   const argsLog = path.join(root, "args.txt");
   // Records its arguments and stdin, then answers like `claude -p --output-format json`.
   await fs.writeFile(claude, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo "2.1.316 (Claude Code)"; exit 0; fi
 printf '%s\\n' "$@" > ${argsLog}
 cat > ${argsLog}.stdin
 echo "CONFIG=$CLAUDE_CONFIG_DIR KEY=$ANTHROPIC_API_KEY" > ${argsLog}.env

@@ -226,7 +226,7 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
 
       <fieldset className="codex-settings-group" disabled={busy !== null}>
         <legend>Claude skills outside CloudX</legend>
-        <small>CloudX adds system and selected-template skills. Its launch overlay disables bundled skills, known enabled plugins, known project skill names and auto-memory. Personal and synced choices below apply at the next launch; revoking a choice does not restart open tabs. Later project or synced names are not fully contained by the current native name-based policy.</small>
+        <small>CloudX adds system and selected-template skills. Personal choices apply at the next launch; revoking a choice does not restart open tabs. Selected synced skills and conflicting source names block a new launch because native controls cannot enforce that selection. Saved choices remain unchanged. Bundled skills, known enabled plugins, known project names and auto-memory receive launch exclusions. New project skills discovered later remain an unresolved native policy gap.</small>
         {settings.skills.map(skill => <label className="codex-settings-toggle" key={skill.name}>
           <input
             type="checkbox"
@@ -237,7 +237,7 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
               ? [...draft.allowedSkills, skill.name].sort()
               : draft.allowedSkills.filter(name => name !== skill.name))}
           />
-          <span>{skill.name}<small>{skill.available ? skill.origin === "synced" ? "Synced from claude.ai." : "Personal skill." : "Not installed."}</small></span>
+          <span>{skill.name}<small>{skill.available ? skill.origin === "synced" ? "Synced from claude.ai. Selecting this skill blocks new Claude launches: native background sync cannot enforce this selection." : "Personal skill." : "Not installed."}</small></span>
         </label>)}
         {!settings.skills.length ? <p>No personal or synced Claude skills are installed.</p> : null}
       </fieldset>
