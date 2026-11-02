@@ -1608,7 +1608,7 @@ function NodeInspector({ node, connectedInputIds, onChange }: { node: FlowNode; 
             />
           ) : row.port?.options?.values.length ? (
             <select disabled={connectedInputIds.has(row.key)} value={String(row.value ?? "")} onChange={(event) => onChange({ ...config, [row.key]: coerceConfigValue(row.value, event.target.value, row.port) })}>
-              {!row.port.required ? <option value="">Unset</option> : null}
+              {!row.port.required && !row.port.options.values.some(option => option.value === "") ? <option value="">Unset</option> : null}
               {row.port.options.values.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}

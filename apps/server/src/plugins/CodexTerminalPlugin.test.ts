@@ -167,6 +167,17 @@ describe("CodexTerminalPlugin", () => {
     });
   });
 
+  it.each(["codex", "claude"] as const)("reports live %s capture and execution capabilities from session options", providerId => {
+    let executionId = "first-execution";
+    const session = new CodexTerminalSession(tab, new FakeTerminalProcess(), undefined, {
+      closeOnExit: false, providerId, restoreInput: () => ({ codexExecutionId: executionId }),
+      ...(providerId === "codex" ? { commandDetails: async () => ({ version: 1 as const, tabId: tab.id, executionId, status: "available" as const, commands: [] }) } : {})
+    });
+    expect(session.snapshot().state?.terminalCapabilities).toEqual({ tabId: tab.id, providerId, executionId, commandCapture: providerId === "codex" });
+    executionId = "second-execution";
+    expect(session.snapshot().state?.terminalCapabilities).toMatchObject({ executionId });
+  });
+
   it.each([false, true])("checks ownership availability without changing an attached terminal when ended=%s", async ended => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ownership-availability-"));
     const sources = new CodexStateSources(root);

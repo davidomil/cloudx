@@ -113,6 +113,7 @@ export class NativeCodexCopySession {
   static async create(
     codex: string,
     bridgeDiagnostics = false,
+    fullscreenTranscript = true,
   ): Promise<NativeCodexCopySession> {
     const fixture = new NativeCodexCopySession(
       codex,
@@ -126,9 +127,45 @@ export class NativeCodexCopySession {
       const port = (fixture.provider.address() as { port: number }).port;
       await fs.mkdir(fixture.home, { mode: 0o700 });
       await fs.writeFile(
+        path.join(fixture.root, "editor.mjs"),
+        `import fs from "node:fs";\nfs.appendFileSync(process.argv[2], " editor edit");\nfs.appendFileSync(${JSON.stringify(path.join(fixture.root, "editor-invocations"))}, "invoked\\n");\n`,
+      );
+      const catalogPath = path.join(fixture.home, "models.json");
+      await fs.writeFile(
+        catalogPath,
+        JSON.stringify({
+          models: [
+            {
+              slug: "gpt-6.1-sol",
+              display_name: "GPT-6.1 Sol",
+              default_reasoning_level: "low",
+              supported_reasoning_levels: [
+                { effort: "low", description: "low" },
+              ],
+              shell_type: "shell_command",
+              visibility: "list",
+              supported_in_api: true,
+              priority: 0,
+              input_modalities: ["text", "image"],
+              model_messages: {
+                instructions_template:
+                  "Respond using the isolated local test provider.",
+              },
+              support_verbosity: true,
+              default_verbosity: "medium",
+              supports_reasoning_summaries: true,
+              supports_reasoning_summary_parameter: true,
+              truncation_policy: { mode: "tokens", limit: 10000 },
+              experimental_supported_tools: [],
+            },
+          ],
+        }),
+      );
+      await fs.writeFile(
         path.join(fixture.home, "config.toml"),
         [
           'model = "gpt-6.1-sol"',
+          `model_catalog_json = ${JSON.stringify(catalogPath)}`,
           'model_provider = "cloudx-copy"',
           "check_for_update_on_startup = false",
           "[model_providers.cloudx-copy]",
@@ -137,7 +174,7 @@ export class NativeCodexCopySession {
           'wire_api = "responses"',
           "requires_openai_auth = false",
           "[tui]",
-          "fullscreen_transcript = true",
+          `fullscreen_transcript = ${fullscreenTranscript}`,
           'copy_on_select = "never"',
           `[projects.${JSON.stringify(fixture.root)}]`,
           'trust_level = "trusted"',
@@ -160,7 +197,7 @@ export class NativeCodexCopySession {
     output: (chunk: string) => void,
   ): Promise<void> {
     let command = this.codex;
-    let args: string[] = [];
+    let args: string[] = ["--no-daemon"];
     if (this.bridgeDiagnostics) {
       const wrapper = path.join(this.root, "codex-diagnostics.mjs");
       await fs.writeFile(
@@ -213,6 +250,8 @@ if (process.argv.includes('app-server')) setInterval(() => {
           TERM: "xterm-256color",
           SHELL: "/bin/sh",
           SSH_TTY: "/dev/pts/cloudx-isolated-copy",
+          VISUAL: `${process.execPath} ${JSON.stringify(path.join(this.root, "editor.mjs"))}`,
+          EDITOR: `${process.execPath} ${JSON.stringify(path.join(this.root, "editor.mjs"))}`,
         },
       },
     );
@@ -220,6 +259,27 @@ if (process.argv.includes('app-server')) setInterval(() => {
       this.output = (this.output + chunk).slice(-256_000);
       output(chunk);
     });
+  }
+
+  async uploadFile(relativePath: string, bytes: Buffer): Promise<string> {
+    const filename = path.resolve(this.root, relativePath);
+    if (!filename.startsWith(`${this.root}${path.sep}`))
+      throw new Error("Image must stay inside the isolated workspace.");
+    await fs.mkdir(path.dirname(filename), { recursive: true });
+    await fs.writeFile(filename, bytes);
+    return filename;
+  }
+
+  async editorInvocations(): Promise<string> {
+    try {
+      return await fs.readFile(
+        path.join(this.root, "editor-invocations"),
+        "utf8",
+      );
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+      throw error;
+    }
   }
 
   async emitBackendDiagnostics(): Promise<string> {

@@ -140,6 +140,37 @@ describe("GitHub required CI diagnostics", () => {
     expect(await provider.getCiFailure(change)).toMatchObject({ state: "actionable", jobs: [{ conclusion: "timed_out", classification: "code" }] });
   });
 
+  const browserReport = [
+    "Running 2 tests using 1 worker, shard 2 of 2",
+    "\x1b[1A\x1b[2K  1) [mobile-chromium] › tests/browser/terminal-mode-recovery.spec.ts:262:3 › preserves scroll margins after socket reconnect",
+    "    Error: \x1b[2mexpect(locator).toHaveText(expected)\x1b[22m failed",
+    '    Expected: "NEXT"', '    Received: "three"',
+    "    attachment #2: terminal-recovery-server.log (text/plain) ─────────────────────",
+    '    {"level":50,"err":{"type":"DocumentationServiceUnavailableError","message":"Documentation service unavailable at http://127.0.0.1:9/enrichment/pending: fet...',
+    "    ─────────────────────",
+    "  1 failed", "  1 passed (11.1m)", "",
+  ].map(line => `2026-11-02T06:50:53.6174080Z ${line}`).join("\n");
+
+  it("offers repair for a verified Playwright assertion while retaining its ancillary truncated server attachment", async () => {
+    const log = "successful browser output\n".repeat(5_000) + browserReport;
+    const fixture = githubFixture({ log });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "actionable", testedSha: tested, jobs: [{ classification: "code", testedSha: tested }] });
+    expect(diagnostic.jobs[0].log).toContain("Documentation service unavailable");
+    expect(diagnostic.jobs[0].log).not.toContain("[Operational blocker evidence]");
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith(`/git/commits/${tested}`))).toBe(true);
+  });
+
+  it.each([
+    ["infrastructure", "Error: service unavailable at https://dependency.example"],
+    ["infrastructure", "##[error]Runner lost communication with the server"],
+    ["credentials", "fatal: authentication failed"],
+    ["policy", "Workflow is disabled; approval required"],
+  ])("keeps an independent %s blocker beside the same Playwright attachment", async (classification, blocker) => {
+    const fixture = githubFixture({ log: browserReport + blocker });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [{ classification }] });
+  });
+
   it.each([
     { checkout: "", reason: "checkout revision" },
     { checkout: `${checkout}${checkout.replace(tested, source)}`, reason: "checkout revision" },

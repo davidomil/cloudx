@@ -56,6 +56,55 @@ import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
 
 describe("buildServer", () => {
+  it("serves source citations from agent tabs as bounded inert text through the production route", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-agent-citation-route-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const now = new Date().toISOString();
+    const tab = { id: "citation-agent", pluginId: "codex-terminal", title: "Agent", cwd: root, status: "running" as const,
+      contextPath: path.join(root, "context.md"), indicator: { color: "green" as const, label: "OK", updatedAt: now }, createdAt: now, updatedAt: now };
+    vi.spyOn(services.sessions, "getTab").mockReturnValue(tab);
+    const app = await buildServer(config, services);
+    try {
+      await fs.writeFile(path.join(root, "café.ts"), 'const café = "<script>inert</script>";\n');
+      const response = await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/files/text?relativePath=caf%C3%A9.ts` });
+      expect(response.statusCode).toBe(200);
+      expect(response.headers).toMatchObject({ "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" });
+      expect(response.body).toBe('const café = "<script>inert</script>";\n');
+      expect((await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/files/raw?relativePath=caf%C3%A9.ts` })).statusCode).not.toBe(200);
+      const escape = await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/files/text?relativePath=..%2Foutside.ts` });
+      expect(escape.statusCode).not.toBe(200);
+      expect(escape.body).toContain("outside");
+      await fs.writeFile(path.join(root, "large.md"), "x".repeat(512_001));
+      const large = await app.inject({ method: "GET", url: `/api/tabs/${tab.id}/files/text?relativePath=large.md` });
+      expect(large.statusCode).not.toBe(200);
+      expect(large.body).toContain("512 KB");
+    } finally { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it("reads current terminal capture support without requesting command details", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-capabilities-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const handleAction = vi.fn();
+    let capabilities = { tabId: "agent-capability", providerId: "claude", executionId: "claude-execution", commandCapture: false };
+    const snapshot = vi.fn(() => ({ state: { terminalCapabilities: capabilities } }));
+    vi.spyOn(services.sessions, "getSession").mockReturnValue({ tab: { id: "agent-capability", pluginId: "codex-terminal" }, snapshot, handleAction } as unknown as ReturnType<SessionStore["getSession"]>);
+    const app = await buildServer(config, services);
+    try {
+      const read = () => app.inject({ method: "GET", url: "/api/tabs/agent-capability/terminal-capabilities" });
+      const claude = await read();
+      expect(claude.statusCode).toBe(200);
+      expect(claude.headers["cache-control"]).toBe("no-store");
+      expect(claude.json()).toEqual(capabilities);
+      capabilities = { ...capabilities, providerId: "codex", executionId: "codex-execution", commandCapture: true };
+      expect((await read()).json()).toEqual(capabilities);
+      expect(handleAction).not.toHaveBeenCalled();
+      capabilities = { ...capabilities, tabId: "different-tab" };
+      expect((await read()).statusCode).toBe(500);
+    } finally { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("reads command details without recording an action or changing terminal input", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-command-details-route-"));
     const config = testConfig(root);
@@ -8168,3 +8217,29 @@ function fakePluginGit(fixture: string, commit = "deadbeef"): PluginGitClient {
     },
   };
 }
+
+describe("agent usage shutdown", () => {
+  it("waits for usage persistence after sessions stop", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-usage-shutdown-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const order: string[] = [];
+    const disposeSessions = services.sessions.dispose.bind(services.sessions);
+    vi.spyOn(services.sessions, "dispose").mockImplementation(async () => { await disposeSessions(); order.push("sessions"); });
+    const disposeUsage = services.disposeAgentUsage!;
+    let release!: () => void;
+    const hold = new Promise<void>(resolve => { release = resolve; });
+    services.disposeAgentUsage = async () => { order.push("usage"); await hold; await disposeUsage(); };
+    const app = await buildServer(config, services);
+    let finished = false;
+    const closing = app.close().then(() => { finished = true; });
+    try {
+      await vi.waitFor(() => expect(order).toEqual(["sessions", "usage"]));
+      expect(finished).toBe(false);
+    } finally {
+      release();
+      await closing;
+    }
+    expect(finished).toBe(true);
+  });
+});

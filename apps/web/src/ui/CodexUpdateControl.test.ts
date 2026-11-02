@@ -87,6 +87,17 @@ async function enterVersion(container: HTMLElement, value: string) {
 }
 
 describe("Codex CLI update in Settings", () => {
+  it("shows exact Settings coverage before Apply while permitting an explicitly unreviewed release", async () => {
+    const catalog: CodexReleaseCatalog = { latestStable: "0.166.0", versions: [{ version: "0.166.0", prerelease: false }, { version: "0.167.0", prerelease: false }] };
+    const panel = await mount(undefined, undefined, false, async () => catalog);
+    expect(panel.container.textContent).toContain("Reviewed Settings catalog: 0.166.0");
+    expect(panel.starts).not.toHaveBeenCalled();
+    await enterVersion(panel.container, "0.167.0");
+    expect(panel.container.textContent).toContain("No reviewed Settings catalog for 0.167.0");
+    expect(panel.container.textContent).toContain("native option writes will be blocked");
+    expect(panel.updateButton().disabled).toBe(false);
+    expect(panel.starts).not.toHaveBeenCalled();
+  });
   it("requires an explicit selection, previews upgrades and downgrades, and applies only the exact chosen release", async () => {
     const panel = await mount(undefined, undefined, false, undefined, false);
     expect(panel.updateButton().disabled).toBe(true);

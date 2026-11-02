@@ -4,6 +4,7 @@ import type { AgentProviderId, AgentProviderStatus } from "@cloudx/shared";
 import { agentProviderLabel } from "@cloudx/shared";
 
 import { buildToolEnv, resolveAssistantCommand, resolveClaudeCommand, type EnforcedEnv } from "../terminal/ShellLaunch.js";
+import { CLAUDE_ACCOUNT_CREDENTIAL_KEYS, CLAUDE_ACCOUNT_ENV_KEYS, resolveClaudeAccountPolicy } from "./claude/claudeAccountPolicy.js";
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -96,7 +97,7 @@ export async function readAgentProviderStatus(providerId: AgentProviderId, env: 
 // own children. A CloudX server started from inside Claude Code would
 // otherwise launch tabs that act as child sessions and skip their transcripts.
 const CLAUDE_INHERITED_ENV = [
-  "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CODEX_HOME",
+  ...CLAUDE_ACCOUNT_CREDENTIAL_KEYS, "CODEX_HOME",
   "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_EXECPATH",
   "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_SESSION_ATTENDED",
   "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"
@@ -104,12 +105,19 @@ const CLAUDE_INHERITED_ENV = [
 
 // Environment for a Claude launch. Credentials come only from the selected account.
 export function claudeLaunchEnv(baseEnv: NodeJS.ProcessEnv, configDir: string, accountEnv: Record<string, string>): NodeJS.ProcessEnv {
-  const env = { ...baseEnv };
-  for (const name of CLAUDE_INHERITED_ENV) delete env[name];
-  return { ...env, ...accountEnv, CLAUDE_CONFIG_DIR: configDir };
+  return claudeAccountLaunch(baseEnv, configDir, accountEnv).env;
 }
 
 // The same selection, re-applied after a login shell's profile has run.
-export function claudeEnforcedEnv(configDir: string, accountEnv: Record<string, string>): EnforcedEnv {
-  return { set: { ...accountEnv, CLAUDE_CONFIG_DIR: configDir }, unset: CLAUDE_INHERITED_ENV };
+export function claudeEnforcedEnv(configDir: string, accountEnv: Record<string, string>, baseEnv: NodeJS.ProcessEnv = process.env): EnforcedEnv {
+  return claudeAccountLaunch(baseEnv, configDir, accountEnv).enforced;
+}
+
+export function claudeAccountLaunch(baseEnv: NodeJS.ProcessEnv, configDir: string, accountEnv: Record<string, string>) {
+  const policy = resolveClaudeAccountPolicy(baseEnv, configDir, accountEnv);
+  const unset = [...new Set([...CLAUDE_INHERITED_ENV, ...CLAUDE_ACCOUNT_ENV_KEYS])];
+  const env = { ...baseEnv };
+  for (const key of unset) delete env[key];
+  Object.assign(env, policy.env);
+  return { env, policy, enforced: { set: policy.env, unset } };
 }

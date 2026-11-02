@@ -1,13 +1,15 @@
 import schema01600 from "./codexConfigurationSchema-0.160.0.json" with { type: "json" };
 import schema01621 from "./codexConfigurationSchema-0.162.1.json" with { type: "json" };
+import schema01660 from "./codexConfigurationSchema-0.166.0.json" with { type: "json" };
 import mapping from "./codexConfigurationMapping.json" with { type: "json" };
 import versions from "./codexConfigurationVersions.json" with { type: "json" };
 import featureDefaults from "./codexConfigurationFeatures.json" with { type: "json" };
+import sourceDefaults from "./codexConfigurationDefaults.json" with { type: "json" };
 import cliOptions from "./codexConfigurationCliOptions.json" with { type: "json" };
 import cliMapping from "./codexConfigurationCliMapping.json" with { type: "json" };
 import type { CodexConfigurationValue } from "./codexSettings.js";
 
-export type CodexConfigurationVersion = "0.160.0" | "0.162.1";
+export type CodexConfigurationVersion = "0.160.0" | "0.162.1" | "0.166.0";
 export type CodexConfigurationStatus = "stable" | "experimental" | "deprecated";
 export type CodexConfigurationPlatform = "all" | "linux" | "macos" | "windows";
 export type CodexConfigurationScope = "user" | "user/project" | "profile" | "secret";
@@ -26,7 +28,8 @@ export interface CodexConfigurationEntry {
   type: CodexConfigurationType;
   enum?: CodexConfigurationValue[];
   default?: CodexConfigurationValue | null;
-  defaultSource: "schema" | "native-feature" | "runtime";
+  defaultSource: "schema" | "native-feature" | "native-source" | "runtime";
+  defaultProvenance?: string;
   defaultDescription: string;
 }
 
@@ -58,18 +61,23 @@ export interface CodexConfigurationSchema {
   oneOf?: (CodexConfigurationSchema | boolean)[];
 }
 
-export const CODEX_CONFIGURATION_BASELINE_VERSION: CodexConfigurationVersion = "0.162.1";
+export const CODEX_CONFIGURATION_BASELINE_VERSION: CodexConfigurationVersion = "0.166.0";
 export const CODEX_CONFIGURATION_VERSIONS = versions;
 export const CODEX_CONFIGURATION_CLI_OPTIONS = cliOptions;
 export const CODEX_CONFIGURATION_SCHEMAS: Record<CodexConfigurationVersion, CodexConfigurationSchema> = {
   "0.160.0": schema01600 as unknown as CodexConfigurationSchema,
   "0.162.1": schema01621 as unknown as CodexConfigurationSchema,
+  "0.166.0": schema01660 as unknown as CodexConfigurationSchema,
 };
 
-export const CODEX_PERMISSIONS_SCHEMA_SOURCE = "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/config/src/permissions_toml.rs";
-export const CODEX_RUNTIME_CONSTRAINTS_SOURCE = "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/config/mod.rs";
+export function codexConfigurationVersionReviewed(version: string): version is CodexConfigurationVersion {
+  return Object.hasOwn(CODEX_CONFIGURATION_SCHEMAS, version);
+}
 
-/** The native schema drops serde(flatten) map values. These map types are identical in both pinned tags. */
+export const CODEX_PERMISSIONS_SCHEMA_SOURCE = versions[CODEX_CONFIGURATION_BASELINE_VERSION].permissionsSourceUrl;
+export const CODEX_RUNTIME_CONSTRAINTS_SOURCE = versions[CODEX_CONFIGURATION_BASELINE_VERSION].defaultsSourceUrl;
+
+/** The native schema drops serde(flatten) map values; resolve their types within the selected tag. */
 export function codexConfigurationValidationSchema(version: string): CodexConfigurationSchema {
   const schema = structuredClone(codexConfigurationSchema(version));
   const maps: Record<string, CodexConfigurationSchema> = {
@@ -86,11 +94,13 @@ export function codexConfigurationValidationSchema(version: string): CodexConfig
   }
   const compactPercent = schema.properties?.model_post_turn_compact_threshold_percent;
   if (compactPercent && typeof compactPercent === "object") compactPercent.maximum = 100;
+  const credentialFile = schema.definitions?.ModelProviderInfo?.properties?.credential_file;
+  if (credentialFile && typeof credentialFile === "object") credentialFile.pattern = "^(?:/|[A-Za-z]:[\\\\/]|\\\\\\\\)";
   return schema;
 }
 
 export function codexConfigurationSchema(version: string): CodexConfigurationSchema {
-  if (!Object.hasOwn(CODEX_CONFIGURATION_SCHEMAS, version))
+  if (!codexConfigurationVersionReviewed(version))
     throw new Error(`Codex ${version} has no reviewed configuration catalog. Supported versions: ${Object.keys(CODEX_CONFIGURATION_SCHEMAS).join(", ")}.`);
   return CODEX_CONFIGURATION_SCHEMAS[version as CodexConfigurationVersion];
 }
@@ -126,9 +136,18 @@ export function inventoryCodexConfiguration(schema: CodexConfigurationSchema): M
   return paths;
 }
 
-export function codexConfigurationCoverage(schema: CodexConfigurationSchema, entries: readonly Pick<CodexConfigurationEntry, "path">[]): string[] {
-  const mapped = new Set(entries.map(entry => entry.path));
-  return [...inventoryCodexConfiguration(schema).keys()].filter(path => !mapped.has(path)).sort();
+export function codexConfigurationCoverage(schema: CodexConfigurationSchema, entries: readonly (Pick<CodexConfigurationEntry, "path"> & Partial<Pick<CodexConfigurationEntry, "type" | "enum">>)[]): string[] {
+  const mapped = new Map(entries.map(entry => [entry.path, entry]));
+  return [...inventoryCodexConfiguration(schema)].flatMap(([path, nodes]) => {
+    const entry = mapped.get(path);
+    if (!entry) return [path];
+    const types = [...new Set(nodes.flatMap(node => typeof node.type === "string" ? [node.type] : node.type ?? []))];
+    const type = types.length === 1 ? types[0] : "mixed";
+    const choices = [...new Set(nodes.flatMap(node => node.enum ?? []).map(value => JSON.stringify(value)))].sort();
+    if (types.length && entry.type && entry.type !== type) return [`${path} (type changed)`];
+    if (types.length && entry.type && JSON.stringify((entry.enum ?? []).map(value => JSON.stringify(value)).sort()) !== JSON.stringify(choices)) return [`${path} (enum changed)`];
+    return [];
+  }).sort();
 }
 
 export function codexConfigurationCliCatalog(version: string = CODEX_CONFIGURATION_BASELINE_VERSION): CodexConfigurationCliEntry[] {
@@ -168,10 +187,11 @@ export function codexConfigurationCatalog(version: string = CODEX_CONFIGURATION_
       ? nativeFeature.stage !== "Removed" : mappedEditable && nativeFeature?.stage !== "Removed";
     const feature = /^features\.([^.]+)$/.exec(localPath)?.[1];
     const nativeDefault = feature ? (nativeFeatures as Record<string, { default: boolean | null; defaultDescription: string; stage: string }>)[feature] : undefined;
+    const sourceDefault = (sourceDefaults[version as CodexConfigurationVersion] as Record<string, CodexSourceDefault>)[localPath];
     const types = [...new Set(nodes.flatMap(node => typeof node.type === "string" ? [node.type] : node.type ?? []))];
     const choices = nodes.flatMap(node => node.enum ?? []);
     const uniqueChoices = choices.filter((value, index) => choices.findIndex(other => JSON.stringify(value) === JSON.stringify(other)) === index);
-    const defaultSource: CodexConfigurationEntry["defaultSource"] = schemaDefault && schemaDefault.default !== null ? "schema" : nativeDefault ? "native-feature" : "runtime";
+    const defaultSource: CodexConfigurationEntry["defaultSource"] = sourceDefault ? "native-source" : schemaDefault && schemaDefault.default !== null ? "schema" : nativeDefault ? "native-feature" : "runtime";
     return {
       path, family: path.split(".")[0]!, group,
       description: described ?? `Native ${path.replaceAll(".", " ").replaceAll("_", " ")} configuration.`,
@@ -180,9 +200,11 @@ export function codexConfigurationCatalog(version: string = CODEX_CONFIGURATION_
       platform, scope, editable, ...(reason ? { reason } : {}),
       type: types.length === 1 ? types[0] as CodexConfigurationType : "mixed",
       ...(uniqueChoices.length ? { enum: uniqueChoices } : {}),
-      ...(defaultSource === "schema" ? { default: schemaDefault!.default } : nativeDefault?.default !== null && nativeDefault?.default !== undefined ? { default: nativeDefault.default } : {}),
+      ...(sourceDefault ? { default: sourceDefault.value } : defaultSource === "schema" ? { default: schemaDefault!.default } : nativeDefault?.default !== null && nativeDefault?.default !== undefined ? { default: nativeDefault.default } : {}),
       defaultSource,
-      defaultDescription: defaultSource === "schema" ? `Schema default: ${JSON.stringify(schemaDefault!.default)}.`
+      ...(sourceDefault ? { defaultProvenance: sourceDefault.source } : {}),
+      defaultDescription: sourceDefault ? `Native ${version} ${sourceDefault.kind === "keymap" ? "inherited bindings" : "default"}: ${JSON.stringify(sourceDefault.value)}. ${sourceDefault.description ?? ""}`.trim()
+        : defaultSource === "schema" ? `Schema default for ${version}: ${JSON.stringify(schemaDefault!.default)}.`
         : nativeDefault?.defaultDescription ?? runtimeDefaultDescription(localPath, described),
     };
   }).sort((a, b) => a.path.localeCompare(b.path));
@@ -197,7 +219,27 @@ function runtimeDefaultDescription(path: string, description: string | undefined
     return "Unset/inherit: Codex resolves this from the selected model/provider and higher-priority layers; only model-advertised capabilities are effective.";
   if (description && /default|when unset|when omitted/i.test(description))
     return `Unset/inherit: ${description}`;
-  return "Unset/inherit: no literal default is declared in the pinned schema; Codex resolves the native value from runtime context and configuration layers.";
+  return "Unset/inherit: a literal native default has not been established by this source review. The native client resolves this option; project, environment and administrator layers may change it.";
+}
+
+interface CodexSourceDefault {
+  value: CodexConfigurationValue;
+  source: string;
+  kind: string;
+  description?: string;
+}
+
+/** A saved user/profile projection, not an observation of a running client's key dispatcher. */
+export function codexKeymapSelection(version: string, path: string, values: Record<string, CodexConfigurationValue>): { value: CodexConfigurationValue | undefined; source: string } {
+  codexConfigurationSchema(version);
+  const [, , context, action] = path.split(".");
+  const keymap = (values.tui as Record<string, unknown> | undefined)?.keymap as Record<string, Record<string, CodexConfigurationValue>> | undefined;
+  const configured = keymap?.[context!]?.[action!];
+  if (configured !== undefined) return { value: configured, source: `Saved ${context} override${Array.isArray(configured) && !configured.length ? " (explicitly unbound)" : ""}` };
+  if (context === "composer" && ["submit", "queue", "toggle_shortcuts"].includes(action!) && keymap?.global?.[action!] !== undefined)
+    return { value: keymap.global[action!], source: "Saved global override; a context override takes precedence" };
+  const inherited = (sourceDefaults[version as CodexConfigurationVersion] as Record<string, CodexSourceDefault>)[path];
+  return { value: inherited?.value, source: inherited ? `Inherited native ${version} bindings` : "Native binding not established" };
 }
 
 const protectedPatterns = (mapping as MappingRow[]).filter(row => row[4] === "secret").map(row => row[0].split("."));

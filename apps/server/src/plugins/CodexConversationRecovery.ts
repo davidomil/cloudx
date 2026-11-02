@@ -17,6 +17,7 @@ export interface CodexConversationIdentity {
   transcriptPath?: string;
   cwd: string;
   selection?: { tabId: string; executionId: string };
+  historicalClaudeConversation?: boolean;
 }
 
 /** Reads native selection receipts and legacy last-prompt receipts without confusing their authority. */
@@ -70,6 +71,7 @@ export class CodexConversationRecovery {
     return {
       sessionId: value.sessionId, cwd: value.cwd,
       ...(typeof value.transcriptPath === "string" ? { transcriptPath: value.transcriptPath } : {}),
+      ...(typeof value.historicalClaudeConversation === "boolean" ? { historicalClaudeConversation: value.historicalClaudeConversation } : {}),
       ...(selected ? { selection: { tabId: value.tabId as string, executionId: value.executionId as string } } : {})
     };
   }

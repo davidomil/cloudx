@@ -161,6 +161,52 @@ describe("Playwright failure classification", () => {
   it("keeps expected HTTP errors in assertions classified as code", () => {
     expect(classifyCiLog("AssertionError: expected HTTP 403 to equal received HTTP 401")).toBe("code");
   });
+
+  const report = (cause = "Error: expect(locator).toHaveText(expected) failed", closeAttachment = true, summary = "1 failed") => [
+    "Running 2 tests using 1 worker",
+    "1) [mobile-chromium] › tests/browser/terminal-mode-recovery.spec.ts:262:3 › preserves scroll margins after socket reconnect",
+    cause,
+    "Locator: locator('.xterm-rows > div').nth(3)",
+    'Expected: "NEXT"', 'Received: "three"',
+    "attachment #2: terminal-recovery-server.log (text/plain) ─────────────────────",
+    '{"level":50,"err":{"type":"DocumentationServiceUnavailableError","message":"Documentation service unavailable at http://127.0.0.1:9/enrichment/pending: fet...',
+    ...(closeAttachment ? ["─────────────────────"] : []),
+    summary, "1 passed (11.1m)", "",
+  ].join("\n");
+
+  it.each(["plain", "ansi", "gh-rendered"])("keeps %s Playwright attachment output separate from the reported assertion", async format => {
+    const log = report().split("\n").map(line => format === "plain" ? line :
+      `2026-11-02T06:50:53.6174080Z ${format === "ansi" ? "\x1b[1A\x1b[2K" : "^[[1A^[[2K"}${line}`).join("\n");
+    const { evidence, diagnostic } = await diagnoseStream(checkout() + log, 1);
+    expect(evidence.classification).toBe("code");
+    expect(diagnostic.state).toBe("actionable");
+    expect(evidence.log).toContain("Documentation service unavailable");
+  });
+
+  it.each([
+    report().replace("Running 2 tests using 1 worker\n", ""),
+    report(undefined, false),
+    report(undefined, true, "2 failed"),
+    report(undefined, true, ""),
+    report("Unknown failure"),
+    report().replace("1 failed", "##[endgroup]\n1 failed"),
+    report().replace("1 failed", "Running 2 tests using 1 worker\n1 failed"),
+    report().replace("1 failed", "1) [mobile-chromium] › tests/browser/terminal-mode-recovery.spec.ts:262:3 › duplicate failure\n1 failed"),
+  ])("retains attachment blockers when failure provenance is incomplete", async log => {
+    expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("blocked");
+  });
+
+  it.each(["before", "cause", "after"])("preserves a real outage %s the attachment", async position => {
+    const outage = "Error: service unavailable at https://dependency.example";
+    const log = (position === "before" ? outage + "\n" : "") + report(position === "cause" ? outage : undefined) +
+      (position === "after" ? outage + "\n" : "");
+    expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("blocked");
+  });
+
+  it.each(["fatal: authentication failed", "approval required", "Runner lost communication with the server", "service unavailable"])("keeps independent job control %s authoritative inside and outside attachments", async blocker => {
+    for (const log of [report() + blocker, report().replace("\n─────────────────────", `\n##[error]${blocker}\n─────────────────────`)])
+      expect((await diagnoseStream(checkout() + log)).diagnostic.state).toBe("blocked");
+  });
 });
 
 const testRun = " RUN  v4.1.11 /work/repository\n";

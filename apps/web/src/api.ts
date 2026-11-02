@@ -45,7 +45,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseCodexCommandDetailsSnapshot, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
+import { parseTerminalCapabilities, type TerminalCapabilities, parseCodexCommandDetailsSnapshot, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -140,6 +140,11 @@ export async function downloadFileBrowserEntries(tabId: string, relativePaths: s
 export function fileBrowserRawFileUrl(tabId: string, relativePath: string): string {
   const params = new URLSearchParams({ relativePath });
   return `/api/tabs/${encodeURIComponent(tabId)}/files/raw?${params.toString()}`;
+}
+
+export function terminalFileTextUrl(tabId: string, relativePath: string): string {
+  const params = new URLSearchParams({ relativePath });
+  return `/api/tabs/${encodeURIComponent(tabId)}/files/text?${params.toString()}`;
 }
 
 export async function uploadFileBrowserFile(tabId: string, relativePath: string, file: Blob, onProgress?: (progress: FileUploadProgress) => void): Promise<FileUploadResponse> {
@@ -1066,4 +1071,10 @@ function audioFilenameForMimeType(mimeType: string): string {
     return "voice.ogg";
   }
   return "voice.webm";
+}
+
+export async function readTerminalCapabilities(tabId: string, signal?: AbortSignal): Promise<TerminalCapabilities> {
+  const capabilities = parseTerminalCapabilities(await fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/terminal-capabilities`, { signal, cache: "no-store" }));
+  if (capabilities.tabId !== tabId) throw new Error("Terminal capabilities belong to another tab.");
+  return capabilities;
 }

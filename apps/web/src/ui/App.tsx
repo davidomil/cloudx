@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactElement, type RefObject } from "react";
 import { AlertTriangle, Bell, BellRing, Bot, CheckCheck, ChevronDown, Columns2, GitBranch, LayoutTemplate, Maximize2, Mic, MicOff, Minimize2, MoreHorizontal, PanelTopOpen, Pencil, Play, Plus, RefreshCw, Rows3, Save, Search, Settings, SquarePlus, Trash2, Wifi, WifiOff, Wrench, X } from "lucide-react";
 
-import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_TERMINAL_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, isAgentProviderId, type AgentAccountsState, type AgentProviderId, type AgentSelection, DEFAULT_WORKSPACE_MAX_PANES, combineAgentUsage, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
+import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_TERMINAL_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, isAgentProviderId, type AgentAccountsState, type AgentProviderId, type AgentSelection, DEFAULT_WORKSPACE_MAX_PANES, isAgentTab, type AgentUsageReadResult, RULES_SKILLS_PLUGIN_ID, UI_RENDERER_ICON_BUTTON, UI_RENDERER_STATUS_DOT, readWorkspaceUiInstruction, type AutomationRunSummary, type CloudxConfigResponse, type CloudxConfigValues, type CloudxNotification, type CloudxRule, type CodexSessionResumeMode, type ConfigValue, type CreateTabRequest, type PersonalityTemplate, type PluginDescriptor, type PluginId, type RulesSkillsGitState, type RulesSkillsStore, type StatePersistenceStatus, type TabLayoutState, type UiContributionDescriptor, type UiContributionSlot, type VoiceExecutionResult, type WorkspaceLayoutTemplate, type WorkspaceStateResponse, type WorkspaceTab, type WorkspaceTabsUpdate, type WorkspaceUiInstruction, type WorkspaceWindow } from "@cloudx/shared";
 
 import {
   applyLayoutTemplate,
@@ -82,6 +82,8 @@ import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
 import { agentSelection, agentTabChoices } from "./agentTabChoice.js";
+import { ClaudeLaunchModeControl, claudeLaunchModeLabel } from "./ClaudeLaunchModeControl.js";
+import { CLAUDE_SETTINGS_HOOKS, type ClaudeGlobalSettings, type ClaudeLaunchMode } from "@cloudx/shared";
 import { UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
 import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
@@ -1776,10 +1778,8 @@ export function WindowSwitcher({
   const [error, setError] = useState<string | undefined>();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const tabsById = useMemo(() => new Map(tabs.map((tab) => [tab.id, tab])), [tabs]);
-  const agentTabIds = useMemo(() => tabs.filter(isAgentTab).map(tab => tab.id), [tabs]);
-  const usage = useAgentUsage(callHook, open && agentTabIds.length ? { tabIds: agentTabIds } : undefined);
+  const usage = useAgentUsage(callHook, open ? { windowIds: windows.map(window => window.id) } : undefined);
   const usageHover = useUsageHover();
-  const windowAgentTabIds = (window: WorkspaceWindow) => windowTabIds(window, tabsById).filter(tabId => isAgentTab(tabsById.get(tabId)!));
 
   useOutsidePointerDismiss(open, rootRef, () => onOpenChange(false));
 
@@ -1900,13 +1900,12 @@ export function WindowSwitcher({
           <div className="window-list">
             {visibleWindows.map((window) => {
               const tabCount = tabCountForWindow(window, tabsById);
-              const agentIds = windowAgentTabIds(window);
               return (
                 <div key={window.id} className={`window-menu-row ${window.id === activeWindow?.id ? "selected" : ""}`}>
                   <button type="button" className="window-row-main" onClick={() => void onSelect(window.id)}
-                    {...(usage ? usageHover.handlers(window.name, { tabIds: agentIds }) : {})}>
+                    {...(usage ? usageHover.handlers(window.name, { windowIds: [window.id] }) : {})}>
                     <span>{window.name}</span>
-                    <small>{tabCount} tabs{windowUsageText(agentIds, usage)} · {window.defaultCwd}</small>
+                    <small>{tabCount} tabs{windowUsageText(window.id, usage)} · {window.defaultCwd}</small>
                   </button>
                   <ControlButton type="button" className="compact-icon-button" size="compact" iconOnly onClick={() => openEditDialog(window)} title={`Edit ${window.name}`} aria-label={`Edit ${window.name}`}>
                     <Wrench size={14} />
@@ -1980,10 +1979,9 @@ function tabCountForWindow(window: WorkspaceWindow, tabsById: Map<string, Worksp
   return windowTabIds(window, tabsById).length;
 }
 
-function windowUsageText(tabIds: string[], usage: AgentUsageReadResult | undefined): string {
-  const summaries = tabIds.map(tabId => usage?.tabs[tabId]).filter(summary => summary !== undefined);
-  const total = combineAgentUsage(summaries);
-  return total.totals.requests ? ` · ${usageLine(total)}` : "";
+export function windowUsageText(windowId: string, usage: AgentUsageReadResult | undefined): string {
+  const total = usage?.windows[windowId];
+  return total?.totals.requests ? ` · ${usageLine(total)}` : "";
 }
 
 function WindowDeleteWarning({ window, tabCount, onCancel, onConfirm }: { window: WorkspaceWindow; tabCount: number; onCancel: () => void; onConfirm: () => void }) {
@@ -2776,7 +2774,7 @@ function workspaceSocketReconnectDelayMs(attempt: number): number {
   return Math.min(WORKSPACE_SOCKET_RECONNECT_BASE_MS * 2 ** attempt, WORKSPACE_SOCKET_RECONNECT_MAX_MS);
 }
 
-function CreateTabDialog({
+export function CreateTabDialog({
   plugins,
   callHook,
   templates,
@@ -2806,12 +2804,16 @@ function CreateTabDialog({
   const [agentAccounts, setAgentAccounts] = useState<AgentAccountsState>();
   const [agentProviderId, setAgentProviderId] = useState<AgentProviderId>();
   const [agentAccountId, setAgentAccountId] = useState<string>();
+  const [claudeLaunchMode, setClaudeLaunchMode] = useState<ClaudeLaunchMode | "">("");
+  const [savedClaudeLaunchMode, setSavedClaudeLaunchMode] = useState<ClaudeLaunchMode | null>();
+  const [claudeModeReadFailed, setClaudeModeReadFailed] = useState(false);
   const selectedPlugin = creatablePlugins.find((plugin) => plugin.id === pluginId);
   const agentChoices = useMemo(() => agentTabChoices(agentAccounts), [agentAccounts]);
   const agentChoice = agentChoices.find((choice) => choice.providerId === agentProviderId) ?? agentChoices[0];
   const isLocalWeb = selectedPlugin?.panelKind === "web-viewer";
   const isCodex = selectedPlugin?.id === AGENT_TERMINAL_PLUGIN_ID;
   const isClaude = isCodex && agentChoice?.providerId === "claude";
+  const resumeMode = isClaude && (codexResumeMode === "picker" || codexResumeMode === "last") ? "new" : codexResumeMode;
   const requiresDirectory = selectedPlugin?.requiresDirectory ?? true;
   const titlePlaceholder = defaultTabTitlePlaceholder(selectedPlugin, cwd, localWebUrl);
 
@@ -2837,6 +2839,17 @@ function CreateTabDialog({
   }, [requiresDirectory]);
 
   useEffect(() => {
+    if (!isClaude || !callHook) return;
+    let disposed = false;
+    setClaudeModeReadFailed(false);
+    setSavedClaudeLaunchMode(undefined);
+    callHook<{ settings: ClaudeGlobalSettings }>(CLAUDE_SETTINGS_HOOKS.read, {})
+      .then(result => { if (!disposed) setSavedClaudeLaunchMode(result.settings.launchMode); })
+      .catch(() => { if (!disposed) setClaudeModeReadFailed(true); });
+    return () => { disposed = true; };
+  }, [isClaude, callHook]);
+
+  useEffect(() => {
     if (!isCodex) {
       setTemplateId("");
       setCodexResumeMode("new");
@@ -2853,8 +2866,9 @@ function CreateTabDialog({
         ? { url: localWebUrl.trim() }
         : isCodex
           ? agentTabInitialInput(
-            codexTabInitialInput(codexResumeMode, codexResumeSessionId, codexResumeAll && !isClaude, codexResumeIncludeNonInteractive && !isClaude),
-            agentSelection(agentChoice, agentAccountId)
+            codexTabInitialInput(resumeMode, codexResumeSessionId, codexResumeAll && !isClaude, codexResumeIncludeNonInteractive && !isClaude),
+            agentSelection(agentChoice, agentAccountId),
+            isClaude ? claudeLaunchMode || undefined : undefined
           )
           : undefined;
       await onCreate({
@@ -2872,7 +2886,7 @@ function CreateTabDialog({
 
   return (
     <div className="dialog-backdrop">
-      <div className="dialog">
+      <div className={`dialog${isClaude ? " claude-launch-dialog" : ""}`}>
         <h2>New tab</h2>
         <label>
           Plugin
@@ -2935,10 +2949,17 @@ function CreateTabDialog({
         {isCodex && templates.length > 0 ? (
           <TemplateSelect value={templateId} templates={templates} onChange={setTemplateId} label="Template" includeInherited />
         ) : null}
+        {isClaude ? <>
+          <ClaudeLaunchModeControl value={claudeLaunchMode} inheritedLabel={savedClaudeLaunchMode === undefined
+            ? "Inherit saved mode (resolved by server at launch)"
+            : savedClaudeLaunchMode === null ? "Inherit · Native project (fresh CloudX default)" : `Inherit saved · ${claudeLaunchModeLabel(savedClaudeLaunchMode)}`} onChange={setClaudeLaunchMode} />
+          {claudeModeReadFailed ? <small role="status">The saved mode could not be read here. Inherit still resolves on the server before launch; no mode has been changed.</small> : null}
+          {resumeMode !== "new" ? <small>Resume preserves the original recorded launch policy. An incompatible mode or an unverified historical managed session is rejected before work.</small> : null}
+        </> : null}
         {isCodex ? (
           <label>
             Session
-            <select aria-label="Session" value={codexResumeMode} onChange={(event) => {
+            <select aria-label="Session" value={resumeMode} onChange={(event) => {
               const mode = event.target.value as CodexSessionResumeMode;
               setCodexResumeMode(mode);
               if (mode === "new") {
@@ -2948,19 +2969,22 @@ function CreateTabDialog({
               }
             }}>
               <option value="new">New session</option>
-              <option value="picker">Resume picker</option>
-              <option value="last">Resume last</option>
+              {!isClaude ? <>
+                <option value="picker">Resume picker</option>
+                <option value="last">Resume last</option>
+              </> : null}
               <option value="session">Resume ID</option>
             </select>
           </label>
         ) : null}
-        {isCodex && codexResumeMode === "session" ? (
+        {isClaude ? <small>Resume picker and Resume last cannot verify the conversation policy before launch. Use Resume ID with the exact conversation UUID, or start a new session.</small> : null}
+        {isCodex && resumeMode === "session" ? (
           <label>
             Session ID
-            <input value={codexResumeSessionId} onChange={(event) => setCodexResumeSessionId(event.target.value)} placeholder="UUID or thread name" {...noSystemTextAssistProps} />
+            <input value={codexResumeSessionId} onChange={(event) => setCodexResumeSessionId(event.target.value)} placeholder={isClaude ? "UUID" : "UUID or thread name"} {...noSystemTextAssistProps} />
           </label>
         ) : null}
-        {isCodex && !isClaude && codexResumeMode !== "new" && codexResumeMode !== "session" ? (
+        {isCodex && !isClaude && resumeMode !== "new" && resumeMode !== "session" ? (
           <>
             <label className="checkbox-row">
               <input type="checkbox" checked={codexResumeAll} onChange={(event) => setCodexResumeAll(event.target.checked)} />
@@ -2984,7 +3008,7 @@ function CreateTabDialog({
         ) : null}
         <div className="dialog-actions">
           <ControlButton onClick={onCancel}>Cancel</ControlButton>
-          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && codexResumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
+          <ControlButton className="primary-button" tone="primary" onClick={() => void submit()} disabled={!selectedPlugin || (requiresDirectory && !cwd.trim()) || (isCodex && resumeMode === "session" && !codexResumeSessionId.trim()) || busy}>
             Create
           </ControlButton>
         </div>
@@ -3005,9 +3029,11 @@ function agentPluginOptionValue(providerId: AgentProviderId): string {
 
 export function agentTabInitialInput(
   initialInput: CreateTabRequest["initialInput"],
-  agent: AgentSelection | undefined
+  agent: AgentSelection | undefined,
+  claudeLaunchMode?: ClaudeLaunchMode
 ): CreateTabRequest["initialInput"] {
-  return agent ? { ...initialInput, agent } : initialInput;
+  const mode = agent?.providerId === "claude" && claudeLaunchMode ? { claudeLaunchMode } : {};
+  return agent ? { ...initialInput, agent, ...mode } : initialInput;
 }
 
 export function codexTabInitialInput(

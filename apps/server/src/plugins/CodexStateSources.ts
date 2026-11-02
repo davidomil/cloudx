@@ -262,6 +262,17 @@ export class CodexStateSources {
     return this.work(signal, (check) => this.bindingChecked(tabId, check));
   }
 
+  readLaunchConfig(tabId: string, signal?: AbortSignal): Promise<string> {
+    return this.work(signal, async check => {
+      if (!await this.bindingChecked(tabId, check)) throw new Error("Codex launch source binding is missing.");
+      const view = await this.directory(this.viewPath(tabId), check);
+      const text = await this.readText(path.join(view.home, "config.toml"), 524_288, check);
+      await this.requireIdentity(view, check);
+      if (!text?.startsWith("# CloudX managed Codex defaults for this tab.")) throw new Error("Codex generated launch configuration is unavailable.");
+      return text;
+    });
+  }
+
   ownershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
     return directoryOwnershipAvailability(() => this.previewOwnership(tabId));
   }

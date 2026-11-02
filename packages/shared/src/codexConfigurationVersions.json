@@ -11,7 +11,20 @@
       "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/utils/cli/src/shared_options.rs",
       "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/exec/src/cli.rs"
     ],
-    "nativeCliVersion": "0.160.0"
+    "nativeCliVersion": "0.160.0",
+    "defaultsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/core/src/config/mod.rs",
+    "keymapSourceUrl": "https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/tui/src/keymap.rs",
+    "sourceSha256": {
+      "cli/src/main.rs": "dc0356a131108ace0f63f7e9f5040b1f0fc19a71057eeeb4108e04623267c502",
+      "config/src/permissions_toml.rs": "f410e2da8b23102c3236ea47d37637666b2e07ea37d4dbb8be5ad0566b632810",
+      "core/src/config/mod.rs": "854f5a6b184714740500b8d3eae2bb04cb88172efccf11d38a74f2f6189c0341",
+      "utils/cli/src/shared_options.rs": "6eefb5fcf0545fca54ffa1f80a6d3630c8d9b61ec449466d5834ac9c489f76d8",
+      "exec/src/cli.rs": "6abb86feb8fac2a192b34a617634527d0747b6d7fa09ee4827c0dc95abbe2f75",
+      "tui/src/cli.rs": "991791014d57197ec734d743d15bf2aff6f04e161e60ad9c2c07ac5f97cc1a55",
+      "tui/src/keymap.rs": "af8edcd1afa0510da8ac596d4adfe082dabb9ac3d2dd2e9a5b97bed17dd3acd1",
+      "tui/src/keymap/vim_search.rs": "53ab93f56589dd212439d0f4134133b841f9313bed091d388952ff2965f1897a",
+      "features/src/lib.rs": "124c76d1fbad7b05fd78a62b89a28282c7ecab1de7426ac18696987024ddeae0"
+    }
   },
   "0.162.1": {
     "schemaUrl": "https://raw.githubusercontent.com/openai/codex/rust-v0.162.1/codex-rs/core/config.schema.json",
@@ -25,6 +38,57 @@
       "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/utils/cli/src/shared_options.rs",
       "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/exec/src/cli.rs"
     ],
-    "nativeCliVersion": "0.162.1"
+    "nativeCliVersion": "0.162.1",
+    "defaultsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/core/src/config/mod.rs",
+    "keymapSourceUrl": "https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/tui/src/keymap.rs",
+    "sourceSha256": {
+      "cli/src/main.rs": "9eb1067f5a4c270baf677537dc2ef4603ffda186c918ad65ce454177f95dd785",
+      "config/src/permissions_toml.rs": "f410e2da8b23102c3236ea47d37637666b2e07ea37d4dbb8be5ad0566b632810",
+      "core/src/config/mod.rs": "32babb117ff4bf0dc08050c4a755f5996f57f51fcebb82595c81648420394259",
+      "utils/cli/src/shared_options.rs": "6eefb5fcf0545fca54ffa1f80a6d3630c8d9b61ec449466d5834ac9c489f76d8",
+      "exec/src/cli.rs": "66643e8b3d5964b70cb8f231fb309312376272fb3ea87bcb6849f44cf112f8f6",
+      "tui/src/cli.rs": "991791014d57197ec734d743d15bf2aff6f04e161e60ad9c2c07ac5f97cc1a55",
+      "tui/src/keymap.rs": "c5b45b1a11cf1ddb9514de8a7a78e3244c0af40902b7c335596a1471cba5f0aa",
+      "tui/src/keymap/vim_search.rs": "53ab93f56589dd212439d0f4134133b841f9313bed091d388952ff2965f1897a",
+      "features/src/lib.rs": "b2d81978097a0bcc53750ef7e3fb3dfae655c3cb1b26250525d02980ee09811f"
+    }
+  },
+  "0.166.0": {
+    "schemaUrl": "https://raw.githubusercontent.com/openai/codex/rust-v0.166.0/codex-rs/core/config.schema.json",
+    "schemaSha256": "211bec2282459fcd70e4905af948721177b6ec7a03e0df84cd8b7c131006a6ca",
+    "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.166.0",
+    "featureRegistryUrl": "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/features/src/lib.rs",
+    "permissionsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/config/src/permissions_toml.rs",
+    "cliSourceUrls": [
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/cli/src/main.rs",
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/cli.rs",
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/utils/cli/src/shared_options.rs",
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/exec/src/cli.rs",
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/startup_config.rs",
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/cli/src/queue_cmd.rs",
+      "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/cli/src/doctor.rs"
+    ],
+    "nativeCliVersion": "0.166.0",
+    "reviewedAt": "2026-11-01",
+    "latestStableCheckedAt": "2026-11-01",
+    "releasePublishedAt": "2026-10-29T19:47:53Z",
+    "defaultsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/mod.rs",
+    "keymapSourceUrl": "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/keymap.rs",
+    "sourceSha256": {
+      "cli/src/main.rs": "5ee91f58936c04cf1a7a666d583242273e9145484d7628b290ea9b033e210682",
+      "config/src/permissions_toml.rs": "b382e3c8c74b124b81b36646f7ad53eebd226e980b90bed3146e11e31979c5c8",
+      "core/src/config/mod.rs": "e027e9fb2e4cd101abdb3984768eef07d1d0ac7c8aa631989011cd17bda0c6df",
+      "utils/cli/src/shared_options.rs": "6eefb5fcf0545fca54ffa1f80a6d3630c8d9b61ec449466d5834ac9c489f76d8",
+      "exec/src/cli.rs": "66643e8b3d5964b70cb8f231fb309312376272fb3ea87bcb6849f44cf112f8f6",
+      "tui/src/cli.rs": "05afbda6b0149a7a1ebc23eafefbc8d393811b293530aa2b13e4eda1f2b5a553",
+      "tui/src/keymap.rs": "293a9fd36461c4f65635e5de5ae6c2b493c6593d19afa4cdf10344f22104652d",
+      "tui/src/keymap/leader.rs": "3ff4d6275d5354390a507f21482b8535990ba59909de08c5230536ec45809f6c",
+      "tui/src/keymap/vim_search.rs": "53ab93f56589dd212439d0f4134133b841f9313bed091d388952ff2965f1897a",
+      "tui/src/keymap/chords/leader_defaults.rs": "c40517399ad84604861b5e033307c3c840d0185813f278f4deeca5b5304727a9",
+      "features/src/lib.rs": "092fa6e9bd6b53d4a63aec2130fdfb90b74b28f222135ff34c499b58a53dc963",
+      "app-server/src/startup_config.rs": "fda9fa408bc2870ea1519f025cf37220a6e15f62767866da107da5b04385790a",
+      "cli/src/queue_cmd.rs": "773fdb564580445ad2905aafacd424fb3befe035444f364a8f1f5ec3b6b41843",
+      "cli/src/doctor.rs": "034b53a33555c5c11d77b404b19ca4302735e1bbf4a9cbff160b294764ff24b0"
+    }
   }
 }

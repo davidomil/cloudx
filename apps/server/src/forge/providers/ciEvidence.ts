@@ -164,12 +164,43 @@ class CiLogClassifier {
   classification: CiJob["classification"] = "unknown";
   readonly blockers: BlockerEvidence = new Map();
   private run?: { output: Map<string, BlockerEvidence>; failedTests: Set<string>; reporting: boolean; consoleTest?: string };
+  private browser?: {
+    failures: Map<number, { codeCause: boolean; attachmentBlockers: BlockerEvidence }>;
+    current?: number; attachment: boolean; malformed: boolean;
+  };
 
   add(line: string, clean: string): void {
-    if (/^RUN\s+v\d+\./.test(line)) {
+    if (/^Running \d+ tests? using \d+ workers?(?:, shard \d+ of \d+)?$/.test(line)) {
+      this.finishRun();
+      this.browser = { failures: new Map(), attachment: false, malformed: false };
+      return;
+    } else if (/^RUN\s+v\d+\./.test(line)) {
       this.finishRun();
       this.run = { output: new Map(), failedTests: new Set(), reporting: false };
     } else if (/^(?:##\[(?:end)?group\]|section_(?:start|end):)/.test(line)) this.finishRun();
+
+    if (this.browser) {
+      const failure = /^(\d+)\) (?:\[[^\]]+\] › )?.+\.(?:test|spec)\.[^ :]+:\d+:\d+ › .+$/.exec(line);
+      if (failure) {
+        const id = Number(failure[1]);
+        if (this.browser.attachment || this.browser.failures.has(id)) this.browser.malformed = true;
+        this.browser.current = id;
+        this.browser.attachment = false;
+        if (!this.browser.failures.has(id)) this.browser.failures.set(id, { codeCause: false, attachmentBlockers: new Map() });
+        return;
+      }
+      if (this.browser.current !== undefined && /^attachment #\d+: .+ \([^)]+\) ─{3,}$/.test(line)) {
+        if (this.browser.attachment) this.browser.malformed = true;
+        this.browser.attachment = true;
+        return;
+      }
+      if (this.browser.attachment && /^─{3,}$/.test(line)) {
+        this.browser.attachment = false;
+        return;
+      }
+      const summary = /^(\d+) failed$/.exec(line);
+      if (summary) { this.finishBrowserReport(Number(summary[1])); return; }
+    }
 
     const consoleTest = /^(?:stdout|stderr) \| (.+)$/.exec(line);
     const failedTest = /^FAIL\s+(.+\.(?:test|spec)\.[^ >]+(?: > .+)?)$/.exec(line);
@@ -184,11 +215,14 @@ class CiLogClassifier {
     }
     if (consoleTest && this.run) return;
     const applicationError = applicationErrorCause(line);
-    const jobControl = applicationError === undefined ? undefined : classifyJobControlCause(applicationError);
+    const jobControl = applicationError === undefined ?
+      this.browser?.attachment ? classifyJobControlCause(line) : undefined : classifyJobControlCause(applicationError);
     const classification = jobControl ?? classifyCiLine(line);
     if (classification === "unknown") return;
     if (classification === "code") {
       this.record(classification);
+      if (this.browser?.current !== undefined && !this.browser.attachment)
+        this.browser.failures.get(this.browser.current)!.codeCause = true;
       // Only a completed report can disassociate application output from the failure.
       const summary = /^Tests\s+(\d+) failed\b/.exec(line);
       if (summary) this.finishRun(Number(summary[1]) > 0 && Number(summary[1]) === this.run?.failedTests.size);
@@ -197,7 +231,10 @@ class CiLogClassifier {
     const match = operationalCiBlockers[classification].exec(clean);
     const context = match ? clean.slice(Math.max(0, match.index - 300), match.index + 700).trim() : "[REDACTED blocker text]";
     const evidence = `[${classification}] ${context}\n`;
-    if (this.run && !jobControl && (this.run.consoleTest || !this.run.reporting && applicationError !== undefined)) {
+    if (this.browser?.attachment && this.browser.current !== undefined && !jobControl && !/^##\[(?:error|warning)\]/.test(line)) {
+      const blockers = this.browser.failures.get(this.browser.current)!.attachmentBlockers;
+      if (!blockers.has(classification)) blockers.set(classification, evidence);
+    } else if (this.run && !jobControl && (this.run.consoleTest || !this.run.reporting && applicationError !== undefined)) {
       const test = this.run.consoleTest ?? "";
       let output = this.run.output.get(test);
       if (!output) this.run.output.set(test, output = new Map());
@@ -206,6 +243,7 @@ class CiLogClassifier {
   }
 
   finishRun(complete = false): void {
+    this.finishBrowserReport();
     if (!this.run) return;
     for (const [test, output] of this.run.output) {
       const failed = test && [...this.run.failedTests].some(name => testOutputMatchesFailure(test, name));
@@ -213,6 +251,17 @@ class CiLogClassifier {
         for (const [classification, evidence] of output) this.record(classification, evidence);
     }
     this.run = undefined;
+  }
+
+  private finishBrowserReport(failedCount?: number): void {
+    if (!this.browser) return;
+    const complete = !this.browser.attachment && !this.browser.malformed && failedCount === this.browser.failures.size;
+    // A closed attachment accompanies an assertion; it does not identify its cause.
+    // Incomplete reports and failures without a recognized code cause stay conservative.
+    for (const failure of this.browser.failures.values())
+      if (!complete || !failure.codeCause)
+        for (const [classification, evidence] of failure.attachmentBlockers) this.record(classification, evidence);
+    this.browser = undefined;
   }
 
   private record(classification: CiJob["classification"], evidence?: string): void {
@@ -231,7 +280,7 @@ function ciLogLine(raw: string): string {
 }
 
 function ciLogText(raw: string): string {
-  return raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim().replace(/^[·✓×↓x*\s-]+/, "");
+  return raw.replace(/(?:\x1b|\^\[)\[[0-?]*[ -/]*[@-~]/g, "").replace(/^\d{4}-\d\d-\d\dT[^ ]+ /, "").trim().replace(/^[·✓×↓x*\s-]+/, "");
 }
 
 function testOutputMatchesFailure(output: string, failure: string): boolean {

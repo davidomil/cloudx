@@ -64,6 +64,7 @@ const TAR_BLOCK_SIZE = 512;
 const TAR_END_BLOCKS = 2;
 const FILE_BROWSER_PLUGIN_ID = "file-browser";
 const SYMLINK_DOWNLOAD_ERROR = "Symbolic links are not supported for file downloads.";
+const TEXT_PREVIEW_MAX_BYTES = 512_000;
 
 export class FileTransferService {
   constructor(private readonly pathPolicy: PathPolicy) {}
@@ -106,6 +107,37 @@ export class FileTransferService {
       contentType: inlineContentTypeForPath(entry.resolvedPath),
       stream: file.stream
     };
+  }
+
+  async createTextPreview(tab: WorkspaceTab, relativePath: unknown): Promise<RawFileResult> {
+    if (tab.pluginId !== FILE_BROWSER_PLUGIN_ID && !isAgentTab(tab)) {
+      throw new Error("File citation previews require an agent or file-browser tab.");
+    }
+    const entry = await this.resolveExistingPath(tab, parseRelativePath(relativePath, "relativePath"));
+    if (!entry.stat.isFile()) throw new Error("File citation target must be a file.");
+    const file = await openTransferFileNoFollow(entry.resolvedPath, entry.stat);
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    try {
+      if (file.stat.size > TEXT_PREVIEW_MAX_BYTES) throw new Error("File exceeds the 512 KB text preview limit.");
+      for await (const chunk of file.stream) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += buffer.byteLength;
+        if (bytes > TEXT_PREVIEW_MAX_BYTES) throw new Error("File exceeds the 512 KB text preview limit.");
+        chunks.push(buffer);
+      }
+    } finally {
+      file.stream.destroy();
+    }
+    const body = Buffer.concat(chunks);
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    } catch {
+      throw new Error("File citation previews require UTF-8 text.");
+    }
+    if (/[\u0000-\u0008\u000b\u000e-\u001f]/u.test(text)) throw new Error("File citation previews require UTF-8 text.");
+    return { contentType: "text/plain; charset=utf-8", stream: Readable.from([body]) };
   }
 
   async upload(tab: WorkspaceTab, relativePath: unknown, body: unknown, options: FileUploadOptions = {}): Promise<FileUploadResult> {

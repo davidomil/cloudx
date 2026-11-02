@@ -2,13 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
-import { isAgentTab, terminalInputMessages, type RecoverTabRequest, type TabRecovery, type WorkspaceTab } from "@cloudx/shared";
+import { isAgentTab, terminalInputMessages, agentProviderLabel, type TerminalCapabilities, type RecoverTabRequest, type TabRecovery, type WorkspaceTab } from "@cloudx/shared";
 import { installTerminalMobileScroller } from "./terminalMobileScroll.js";
 import { bottomRevealScrollDelta, rowsFittingTerminalViewport, shouldFocusTerminalAfterFit, visualViewportBottomInset } from "./terminalSizing.js";
 import { readTerminalColorTheme } from "./theme.js";
 import { registerTerminalView, unregisterTerminalView } from "./terminalViewStore.js";
 import { DEFAULT_UI_SCALE, scaledTerminalFontSize } from "./uiScale.js";
-import { uploadFileBrowserFile } from "../api.js";
+import { readTerminalCapabilities } from "../api.js";
+import { TerminalLinks } from "./terminalLinks.js";
+import { TerminalAttachments } from "./terminalAttachments.js";
+import { readTerminalPreferences, onTerminalPreferencesChanged, TERMINAL_DEFAULTS } from "./terminalPreferences.js";
+import { TerminalInputHelp } from "./TerminalInputHelp.js";
 import { TerminalSelectionCopy } from "./terminalSelectionCopy.js";
 import { TerminalClipboardRequest } from "./terminalClipboardRequest.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
@@ -26,6 +30,7 @@ interface TerminalView {
   reconnectTimer?: number;
   reconnectAttempt: number;
   disposed: boolean;
+  active: boolean;
   container?: HTMLDivElement;
   fitFrame?: number;
   keyboardInsetFrame?: number;
@@ -33,7 +38,11 @@ interface TerminalView {
   pendingFitFocus?: boolean;
   keyboardInsetStyleValue?: string;
   releaseMobileScroll?: () => void;
-  releaseImagePaste?: () => void;
+  attachments?: TerminalAttachments;
+  links?: TerminalLinks;
+  releasePreferences?: () => void;
+  providerId?: string;
+  onReconnect?: () => void;
   selectionCopy?: TerminalSelectionCopy;
   clipboardRequest?: TerminalClipboardRequest;
   uiScale: number;
@@ -46,27 +55,12 @@ interface TerminalConnectionError {
   message: string;
 }
 
-interface PastedTerminalImage {
-  extension: string;
-  file: File;
-}
-
 const terminalViews = new Map<string, TerminalView>();
 const TERMINAL_SOCKET_RECONNECT_BASE_MS = 500;
 const TERMINAL_SOCKET_RECONNECT_MAX_MS = 5_000;
 const TERMINAL_RESET_SEQUENCE = "\x1bc";
 const TERMINAL_KEYBOARD_INSET_PROPERTY = "--terminal-mobile-keyboard-inset";
 const TERMINAL_VISIBILITY_MARGIN_PX = 14;
-const CODEX_PASTED_IMAGE_DIRECTORY = ".cloudx/pasted-images";
-const CODEX_PASTED_IMAGE_EXTENSIONS = new Map([
-  ["image/png", "png"],
-  ["image/jpeg", "jpg"],
-  ["image/jpg", "jpg"],
-  ["image/webp", "webp"],
-  ["image/gif", "gif"]
-]);
-let pastedImageSequence = 0;
-
 export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   tab: WorkspaceTab;
   active: boolean;
@@ -78,6 +72,35 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   const activeRef = useRef(active);
   const tabRef = useRef(tab);
   const [connectionError, setConnectionError] = useState<string>();
+  const [connectionRevision, setConnectionRevision] = useState(0);
+  const [runtimeRevision, setRuntimeRevision] = useState(0);
+  const [capabilityResult, setCapabilityResult] = useState<{ scope: string; capabilities: TerminalCapabilities }>();
+  const starting = tab.status === "starting";
+  const capabilityScope = `${tab.id}:${tab.pluginId}:${tab.nativeWork?.executionId ?? ""}:${active}`;
+  const capabilities = !starting && capabilityResult?.scope === capabilityScope ? capabilityResult.capabilities : undefined;
+  useEffect(() => {
+    if (!active || !isAgentTab(tab) || starting) {
+      setCapabilityResult(undefined);
+      return;
+    }
+    const request = new AbortController();
+    let disposed = false;
+    void readTerminalCapabilities(tab.id, request.signal).then(next => {
+      if (!disposed) setCapabilityResult({ scope: capabilityScope, capabilities: next });
+    }).catch(() => { if (!disposed) setCapabilityResult(undefined); });
+    return () => { disposed = true; request.abort(); };
+  }, [capabilityScope, connectionRevision, tab.id, tab.pluginId, tab.updatedAt, active, starting]);
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !capabilities) return;
+    if (view.providerId && capabilities.providerId && view.providerId !== capabilities.providerId || view.executionId && capabilities.executionId && view.executionId !== capabilities.executionId) {
+      disposeTerminalViewInternal(tab.id);
+      setRuntimeRevision(value => value + 1);
+    } else {
+      view.providerId = capabilities.providerId;
+      view.executionId = capabilities.executionId ?? view.executionId;
+    }
+  }, [tab.id, capabilities?.providerId, capabilities?.executionId]);
   const recovery: TabRecovery | undefined = onRecover ? tab.recovery ?? (connectionError || tab.status === "failed" ? {
     state: "unavailable",
     message: connectionError ?? tab.statusMessage ?? "The terminal could not be restored. Check its connection to determine whether its process is still running."
@@ -106,8 +129,10 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     }
     if (!containerRef.current) return;
 
-    const view = getTerminalView(tab, containerRef.current, uiScale);
+    const view = getTerminalView(tab, containerRef.current, uiScale, capabilities);
+    view.active = activeRef.current;
     viewRef.current = view;
+    view.onReconnect = () => setConnectionRevision(value => value + 1);
     view.clipboardRequest?.setActive(activeRef.current);
     view.terminal.options.disableStdin = preserveOutput;
     if (preserveOutput) {
@@ -144,13 +169,15 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
       clearTerminalKeyboardInset(view);
       releaseTerminalContainerBindings(view);
       view.onConnectionError = undefined;
+      view.onReconnect = undefined;
       viewRef.current = null;
     };
-  }, [tab.id, tab.cwd, tab.title, tab.nativeWork?.executionId, uiScale, needsRecovery, recoveryEnabled, preserveOutput]);
+  }, [tab.id, tab.cwd, tab.title, tab.nativeWork?.executionId, uiScale, needsRecovery, recoveryEnabled, preserveOutput, runtimeRevision]);
 
   useEffect(() => {
     const view = viewRef.current;
     if (view) {
+      view.active = active;
       if (!active) view.selectionCopy?.clear();
       view.clipboardRequest?.setActive(active);
       scheduleFitAndResize(view, shouldFocusTerminalAfterFit({ active, trigger: "activation" }));
@@ -167,7 +194,8 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   </div> : recoveryPanel ?? <div className="terminal-panel" ref={containerRef} />;
   return tab.pluginId === "codex-terminal" ? <div className="codex-terminal-view">
     <CodexNativeWorkPanel tab={tab} onRecover={onRecover} />
-    <CodexCommandDetails tabId={tab.id} tabTitle={tab.title} active={active && !needsRecovery} />
+    <TerminalInputHelp provider={capabilities?.providerId} terminal={() => viewRef.current?.terminal} />
+    {capabilities?.commandCapture && <CodexCommandDetails key={`${capabilities.providerId}:${capabilities.executionId ?? ""}`} tabId={tab.id} tabTitle={tab.title} providerLabel={capabilities.providerId ? agentProviderLabel(capabilities.providerId) : "Agent"} active={active && !needsRecovery} />}
     {content}
   </div> : content;
 }
@@ -182,15 +210,18 @@ function disposeTerminalViewInternal(tabId: string): void {
   cancelTerminalInputReveal(view);
   clearTerminalKeyboardInset(view);
   releaseTerminalContainerBindings(view);
+  view.links?.dispose();
+  view.releasePreferences?.();
   view.socket.close();
   view.terminal.dispose();
   terminalViews.delete(tabId);
   unregisterTerminalView(tabId);
 }
 
-function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: number): TerminalView {
+function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: number, capabilities?: TerminalCapabilities): TerminalView {
   let existing = terminalViews.get(tab.id);
-  if (existing && existing.executionId !== tab.nativeWork?.executionId) {
+  const executionId = capabilities?.executionId ?? tab.nativeWork?.executionId ?? existing?.executionId;
+  if (existing && (existing.executionId !== executionId || existing.providerId && capabilities?.providerId && existing.providerId !== capabilities.providerId)) {
     disposeTerminalViewInternal(tab.id);
     existing = undefined;
   }
@@ -198,13 +229,18 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
     existing.uiScale = uiScale;
     existing.tabId = tab.id;
     existing.pluginId = tab.pluginId;
+    existing.executionId = executionId;
+    existing.providerId = capabilities?.providerId ?? existing.providerId;
     attachTerminalView(existing, container);
     return existing;
   }
 
+  const preferences = { ...TERMINAL_DEFAULTS, ...readTerminalPreferences() };
   const terminal = new Terminal({
     cursorBlink: true,
-    fontFamily: "JetBrains Mono, SFMono-Regular, Consolas, monospace",
+    fontFamily: preferences.fontFamily,
+    scrollback: preferences.scrollback,
+    macOptionIsMeta: preferences.macOptionIsMeta,
     fontSize: responsiveTerminalFontSize(container, uiScale),
     macOptionClickForcesSelection: true,
     lineHeight: 1.25,
@@ -214,8 +250,22 @@ function getTerminalView(tab: WorkspaceTab, container: HTMLDivElement, uiScale: 
   terminal.loadAddon(fit);
 
   const socket = createTerminalSocket(tab.id);
-  const view: TerminalView = { tabId: tab.id, tabUpdatedAt: tab.updatedAt, executionId: tab.nativeWork?.executionId, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false };
+  const view: TerminalView = { tabId: tab.id, tabUpdatedAt: tab.updatedAt, executionId, providerId: capabilities?.providerId, pluginId: tab.pluginId, terminal, fit, socket, uiScale, reconnectAttempt: 0, disposed: false, active: true };
   terminalViews.set(tab.id, view);
+  view.links = new TerminalLinks(terminal, { tabId: tab.id, cwd: tab.cwd });
+  terminal.attachCustomKeyEventHandler(event => {
+    if (!isAgentTab(view) || event.key !== "Enter" || !event.shiftKey || event.ctrlKey || event.altKey || event.metaKey || event.isComposing || event.keyCode === 229) return true;
+    if (event.type === "keydown" && !event.repeat && view.active && !view.terminal.options.disableStdin) sendTerminalInput(view, readTerminalPreferences().shiftEnter === "ctrl-j" ? "\n" : "\x1b[13;2u");
+    event.preventDefault();
+    return false;
+  });
+  view.releasePreferences = onTerminalPreferencesChanged(() => {
+    const next = { ...TERMINAL_DEFAULTS, ...readTerminalPreferences() };
+    terminal.options.macOptionIsMeta = next.macOptionIsMeta;
+    terminal.options.fontFamily = next.fontFamily;
+    terminal.options.scrollback = next.scrollback;
+    scheduleFitAndResize(view);
+  });
   registerTerminalView(tab.id, {
     dispose: () => disposeTerminalViewInternal(tab.id),
     applyColorTheme: (theme) => {
@@ -268,6 +318,7 @@ function subscribeTerminalSocket(view: TerminalView): void {
   socket.addEventListener("open", () => {
     if (!isCurrentSocket()) return;
     view.reconnectAttempt = 0;
+    view.onReconnect?.();
     fitAndResize(view);
   });
   socket.addEventListener("close", (event) => {
@@ -328,14 +379,14 @@ function attachTerminalView(view: TerminalView, container: HTMLDivElement): void
       container.appendChild(view.terminal.element);
     }
     installMobileScrollForView(view, container);
-    installImagePasteForView(view);
+    installAttachmentsForView(view);
     installSelectionCopyForView(view, container);
     return;
   }
   view.terminal.open(container);
   removeInactiveTerminalElements(container, view.terminal.element);
   installMobileScrollForView(view, container);
-  installImagePasteForView(view);
+  installAttachmentsForView(view);
   installSelectionCopyForView(view, container);
 }
 
@@ -370,110 +421,31 @@ function releaseTerminalContainerBindings(view: TerminalView): void {
   view.clipboardRequest = undefined;
   view.releaseMobileScroll?.();
   view.releaseMobileScroll = undefined;
-  view.releaseImagePaste?.();
-  view.releaseImagePaste = undefined;
+  view.attachments?.dispose();
+  view.attachments = undefined;
+  view.links?.dismiss();
   view.container = undefined;
 }
 
-function installImagePasteForView(view: TerminalView): void {
-  view.releaseImagePaste?.();
-  view.releaseImagePaste = undefined;
-  if (!isAgentTab(view) || !view.terminal.element) {
-    return;
+function installAttachmentsForView(view: TerminalView): void {
+  view.attachments?.dispose();
+  view.attachments = undefined;
+  if (isAgentTab(view) && view.terminal.element && view.container) {
+    view.attachments = new TerminalAttachments(view.terminal, view.container, { tabId: view.tabId, connection: () => view.socket, connected: () => view.active && !view.disposed && view.socket.readyState === WebSocket.OPEN && !view.terminal.options.disableStdin });
   }
-  const terminalElement = view.terminal.element;
-  const onPaste = (event: ClipboardEvent) => {
-    const images = pastedTerminalImagesFrom(event);
-    if (images.length === 0) {
-      return;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    void uploadAndInsertPastedTerminalImages(view, images);
-  };
-  terminalElement.addEventListener("paste", onPaste, true);
-  view.releaseImagePaste = () => terminalElement.removeEventListener("paste", onPaste, true);
-}
-
-function pastedTerminalImagesFrom(event: ClipboardEvent): PastedTerminalImage[] {
-  const clipboardData = event.clipboardData;
-  if (!clipboardData) {
-    return [];
-  }
-  const itemImages = Array.from(clipboardData.items ?? []).flatMap((item) => {
-    const image = pastedTerminalImageFromItem(item);
-    return image ? [image] : [];
-  });
-  if (itemImages.length > 0) {
-    return itemImages;
-  }
-  return Array.from(clipboardData.files ?? []).flatMap((file) => {
-    const image = pastedTerminalImageFromFile(file);
-    return image ? [image] : [];
-  });
-}
-
-function pastedTerminalImageFromItem(item: DataTransferItem): PastedTerminalImage | undefined {
-  if (item.kind !== "file") {
-    return undefined;
-  }
-  const extension = CODEX_PASTED_IMAGE_EXTENSIONS.get(item.type.toLowerCase());
-  if (!extension) {
-    return undefined;
-  }
-  const file = item.getAsFile();
-  return file ? { extension, file } : undefined;
-}
-
-function pastedTerminalImageFromFile(file: File): PastedTerminalImage | undefined {
-  const extension = CODEX_PASTED_IMAGE_EXTENSIONS.get(file.type.toLowerCase());
-  return extension ? { extension, file } : undefined;
-}
-
-async function uploadAndInsertPastedTerminalImages(view: TerminalView, images: PastedTerminalImage[]): Promise<void> {
-  if (view.socket.readyState !== WebSocket.OPEN) {
-    reportImagePasteFailure(view, "terminal is not connected");
-    return;
-  }
-  const pastedAt = new Date();
-  const pasteSequence = ++pastedImageSequence;
-  try {
-    const references: string[] = [];
-    for (const [index, image] of images.entries()) {
-      const relativePath = pastedImageRelativePath(image.extension, pastedAt, pasteSequence, index);
-      const upload = await uploadFileBrowserFile(view.tabId, relativePath, image.file);
-      references.push(`@${upload.relativePath}`);
-    }
-    if (references.length > 0 && !sendTerminalInput(view, ` ${references.join(" ")}`)) {
-      reportImagePasteFailure(view, "terminal disconnected before image reference could be inserted");
-    }
-  } catch (error) {
-    reportImagePasteFailure(view, error instanceof Error ? error.message : String(error));
-  }
-}
-
-function pastedImageRelativePath(extension: string, pastedAt: Date, pasteSequence: number, imageIndex: number): string {
-  const timestamp = pastedAt.toISOString().replace(/\D/gu, "").slice(0, 17);
-  return `${CODEX_PASTED_IMAGE_DIRECTORY}/pasted-image-${timestamp}-${pasteSequence}-${imageIndex + 1}.${extension}`;
 }
 
 function sendTerminalInput(view: TerminalView, data: string): boolean {
-  if (view.socket.readyState !== WebSocket.OPEN) {
-    return false;
-  }
+  if (view.socket.readyState !== WebSocket.OPEN) return false;
   for (const message of terminalInputMessages(data)) view.socket.send(message);
   return true;
-}
-
-function reportImagePasteFailure(view: TerminalView, message: string): void {
-  view.terminal.writeln(`\r\nCloudx image paste failed: ${message}`);
 }
 
 function fitAndResize(view: TerminalView, focus = false): void {
   if (!view.terminal.element || !view.container) {
     return;
   }
-  focus = focus && !document.querySelector(".codex-command-dialog[open]");
+  focus = focus && !document.querySelector("dialog[open]");
   const fontSize = responsiveTerminalFontSize(view.container, view.uiScale);
   if (view.terminal.options.fontSize !== fontSize) {
     view.selectionCopy?.preserveBeforeRedraw();

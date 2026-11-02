@@ -41,11 +41,13 @@ export interface AgentUsageSummary {
 
 export interface AgentUsageReadRequest {
   tabIds?: string[];
+  windowIds?: string[];
   forgeWorkerIds?: string[];
 }
 
 export interface AgentUsageReadResult {
   tabs: Record<string, AgentUsageSummary>;
+  windows: Record<string, AgentUsageSummary>;
   forgeWorkers: Record<string, AgentUsageSummary>;
   total: AgentUsageSummary;
 }

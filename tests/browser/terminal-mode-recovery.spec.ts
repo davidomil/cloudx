@@ -170,6 +170,44 @@ test("waits for delayed workspace bootstrap before creating the fixture terminal
   }
 });
 
+test("keeps scroll margins while restored execution capabilities are revalidated", async ({
+  page,
+}) => {
+  const revalidated = Promise.withResolvers<void>();
+  let delayCapabilities = false;
+  let pendingCapabilities = 0;
+  await page.route("**/api/tabs/*/terminal-capabilities", async (route) => {
+    if (delayCapabilities) {
+      pendingCapabilities++;
+      await revalidated.promise;
+    }
+    await route.continue();
+  });
+  try {
+    await openFixtureTerminal(page);
+    await page.keyboard.type("s");
+    const rows = page.locator(".xterm-rows > div");
+    await expect(rows.nth(4)).toHaveText("FOOTER");
+    delayCapabilities = true;
+
+    await recoverTerminal(page, "web-server restoration");
+    await expect.poll(() => pendingCapabilities).toBeGreaterThan(0);
+    await page.keyboard.type("t");
+
+    await expect(rows.nth(3)).toHaveText("NEXT");
+    await expect(rows.nth(0)).toHaveText("HEADER");
+    await expect(rows.nth(1)).toHaveText("two");
+    await expect(rows.nth(2)).toHaveText("three");
+    await expect(rows.nth(4)).toHaveText("FOOTER");
+    await expect(
+      page.getByLabel("Codex command details", { exact: true }),
+    ).toBeVisible();
+  } finally {
+    revalidated.resolve();
+    await page.unrouteAll({ behavior: "wait" });
+  }
+});
+
 test("preserves real xterm screen and input modes after replay truncation, reconnect, server restart, and reload", async ({
   page,
 }) => {
@@ -346,6 +384,21 @@ async function openFixtureTerminal(page: Page) {
     cwd: path.join(root, "workspace"),
   });
   expect(created.status(), await created.text()).toBe(201);
+  await expect(
+    page.getByLabel("Codex command details", { exact: true }),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.locator(".terminal-panel").evaluate((panel) => {
+        const screen = panel.querySelector(".xterm-screen")!;
+        const viewport = panel.querySelector(".xterm-viewport")!;
+        return (
+          screen.getBoundingClientRect().height <=
+          viewport.getBoundingClientRect().height + 0.5
+        );
+      }),
+    )
+    .toBe(true);
   await expect(page.locator(".xterm-rows")).toContainText("READY");
   await page.locator(".xterm-helper-textarea").focus();
 }

@@ -5,10 +5,13 @@ import { PassThrough } from "node:stream";
 import { execFileSync } from "node:child_process";
 
 import { describe, expect, it, vi } from "vitest";
+import { CLAUDE_ACCOUNT_POLICY_REVIEW } from "../apps/server/src/agents/claude/claudeAccountPolicy.ts";
+import { CLAUDE_MANAGED_VERSION } from "../apps/server/src/agents/claude/ClaudeManagedPolicy.ts";
 
 import {
   CUDA_12_MIN_DRIVER_VERSION,
   CODEX_CLI_VERSION,
+  CLAUDE_CODE_VERSION,
   CLOUDX_NPM_GLOBAL_DIR,
   GIT_CORE_PPA,
   InstallerRunner,
@@ -1911,4 +1914,11 @@ describe("Claude Code environment", () => {
     expect(buildEnvLines({ ...base, claudeBin: "/npm/bin/claude" })).toContain("CLOUDX_CLAUDE_BIN=/npm/bin/claude");
     expect(buildEnvLines(base).some(line => line.startsWith("CLOUDX_CLAUDE_BIN="))).toBe(false);
   });
+});
+
+
+it("installs the exact Claude version reviewed by the account, receipt and managed-source contracts", () => {
+  expect(CLAUDE_CODE_VERSION).toBe("2.1.316");
+  expect(CLAUDE_CODE_VERSION).toBe(CLAUDE_ACCOUNT_POLICY_REVIEW.nativeVersion);
+  expect(CLAUDE_CODE_VERSION).toBe(CLAUDE_MANAGED_VERSION);
 });

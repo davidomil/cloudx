@@ -9,6 +9,8 @@ import { AgentUsageService } from "./AgentUsageService.js";
 import { ClaudeUsageReader } from "./ClaudeUsageReader.js";
 import { CodexUsageReader } from "./CodexUsageReader.js";
 import { AgentPricing } from "./pricing.js";
+import { AgentUsagePlugin } from "../../plugins/AgentUsagePlugin.js";
+import { HookRegistry } from "../../hooks/HookRegistry.js";
 
 const ROOT = "01a0d020-ce73-7ac0-aa53-fae268f725a0";
 const CHILD = "01a0d37e-68ab-7d00-b67b-f247568d358f";
@@ -159,6 +161,86 @@ describe("AgentUsageService", () => {
     await expect(new AgentPricing(dataDir).updateOverrides({ "gpt-x": { input: -1 } })).rejects.toThrow("non-negative");
   });
 
+  it("retains mixed-provider window totals after the last tab closes and the service restarts", async () => {
+    const { ledger, usage, dataDir, setNow } = await service();
+    setNow(0);
+    await ledger.open({ tabId: "codex", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+    await ledger.open({ tabId: "claude", windowId: "window-1" }, { providerId: "claude", accountKind: "api-key", sessionId: CLAUDE_SESSION });
+    const before = (await usage.read({ windowIds: ["window-1"] })).windows["window-1"]!;
+    setNow(35);
+    await ledger.close("codex");
+    await ledger.prune(new Set(["claude"]), undefined, new Set(["window-1"]));
+    expect((await usage.read({ windowIds: ["window-1"] })).windows["window-1"]).toEqual(before);
+    await ledger.close("claude");
+    await ledger.prune(new Set(), undefined, new Set(["window-1"]));
+    expect((await usage.read({ windowIds: ["window-1"] })).windows["window-1"]).toEqual(before);
+
+    const restarted = new AgentUsageService(new AgentUsageLedger(dataDir), new AgentPricing(dataDir), {
+      codex: new CodexUsageReader(() => codex), claude: new ClaudeUsageReader(() => claude)
+    });
+    const codex = await codexHome();
+    const claude = await claudeHome();
+    const result = await restarted.read({ windowIds: ["window-1", "unrelated"], tabIds: ["codex", "claude"] });
+    expect(result.windows["window-1"]).toEqual(before);
+    expect(result.total).toEqual(before);
+    expect(result.windows.unrelated!.totals.requests).toBe(0);
+
+    await ledger.prune(new Set(), new Set(), new Set());
+    expect(await ledger.segments({ windowId: "window-1" })).toEqual([]);
+  });
+
+  it("counts continued work once when a closed conversation resumes in another tab", async () => {
+    const { ledger, usage, setNow } = await service();
+    setNow(10);
+    await ledger.open({ tabId: "old", windowId: "window-1", forgeWorkerId: "worker" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+    setNow(25);
+    await ledger.close("old");
+    await ledger.open({ tabId: "new", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+    const result = await usage.read({ windowIds: ["window-1"], tabIds: ["old", "new"], forgeWorkerIds: ["worker"] });
+    expect(result.windows["window-1"]!.totals.requests).toBe(2);
+    expect(result.tabs.old!.totals.requests).toBe(1);
+    expect(result.tabs.new!.totals.requests).toBe(1);
+    expect(result.total).toEqual(result.windows["window-1"]);
+  });
+
+  it("leaves recorded usage in its window when a running tab moves", async () => {
+    const { ledger, usage, setNow } = await service();
+    await ledger.open({ tabId: "moving", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+    setNow(25);
+    await ledger.synchronizeWindows(new Map([["moving", "window-2"]]));
+    await ledger.synchronizeWindows(new Map([["moving", "window-2"]]));
+    const result = await usage.read({ windowIds: ["window-1", "window-2"] });
+    expect(result.windows["window-1"]!.totals.requests).toBe(1);
+    expect(result.windows["window-2"]!.totals.requests).toBe(1);
+    expect(await ledger.segments({ tabId: "moving" })).toHaveLength(2);
+  });
+
+  it("keeps a long-lived window's earliest usage beyond the former segment cap", async () => {
+    const { dataDir } = await service();
+    const segment = { tabId: "closed", windowId: "window-1", providerId: "codex", accountKind: "subscription", sessionId: ROOT, from: T0, to: T0 + 1 };
+    await fs.writeFile(path.join(dataDir, "agent-usage-ledger.json"), JSON.stringify({ version: 1, segments: Array.from({ length: 20_001 }, (_, n) => ({ ...segment, tabId: `closed-${n}` })) }));
+    const ledger = new AgentUsageLedger(dataDir);
+    await ledger.open({ tabId: "new", windowId: "window-1" }, { providerId: "claude", accountKind: "api-key", sessionId: CLAUDE_SESSION });
+    expect(await ledger.segments({ tabId: "closed-0" })).toHaveLength(1);
+    expect(await new AgentUsageLedger(dataDir).segments({ windowId: "window-1" })).toHaveLength(20_002);
+  });
+
+  it("serves retained windows through the validated public hook with no open tabs", async () => {
+    const { ledger, usage, dataDir, setNow } = await service();
+    await ledger.open({ tabId: "closed", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+    setNow(35);
+    await ledger.close("closed");
+    const hooks = new HookRegistry();
+    const plugin = new AgentUsagePlugin(usage, ledger, new AgentPricing(dataDir), () => ({ tabIds: [], windowIds: ["window-1"], tabWindows: new Map() }));
+    for (const hook of plugin.hooks) hooks.register(hook);
+    const context = { caller: { kind: "ui" } } as never;
+    const result = await hooks.call("agent-usage.read", { windowIds: ["window-1"] }, context);
+    expect(result).toMatchObject({ usage: { windows: { "window-1": { totals: { requests: 2 }, costUsd: 3.26 } } } });
+    await expect(hooks.call("agent-usage.read", { windowIds: [42] }, context)).rejects.toThrow();
+    await expect(hooks.call("agent-usage.read", { windowIds: Array(501).fill("window-1") }, context)).rejects.toThrow();
+    expect(await ledger.segments({ windowId: "window-1" })).toHaveLength(1);
+  });
+
   it("drops closed tabs from the ledger but keeps Forge worker history", async () => {
     const { ledger } = await service();
     await ledger.open({ tabId: "tab-1", forgeWorkerId: "issue-7" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
@@ -170,6 +252,42 @@ describe("AgentUsageService", () => {
 });
 
 describe("AgentUsageRecorder", () => {
+  it("attributes prepared tabs to the requested window, then follows published placement", async () => {
+    const { AgentUsageRecorder } = await import("./AgentUsageRecorder.js");
+    const opened: unknown[] = [];
+    const placement = new Map<string, string>();
+    const recorder = new AgentUsageRecorder(
+      { open: async owner => { opened.push(owner); }, close: async () => undefined },
+      { list: async () => [] }, undefined,
+      (tabId, launchWindow) => placement.get(tabId) ?? launchWindow
+    );
+    recorder.conversationStarted({ id: "prepared" } as never, "codex", undefined, ROOT, "requested");
+    placement.set("prepared", "moved");
+    recorder.conversationStarted({ id: "prepared" } as never, "claude", undefined, CLAUDE_SESSION, "requested");
+    await recorder.flush();
+    expect(opened).toEqual([{ tabId: "prepared", windowId: "requested" }, { tabId: "prepared", windowId: "moved" }]);
+  });
+
+  it("captures the originating window and closes after an asynchronous account lookup", async () => {
+    const { AgentUsageRecorder } = await import("./AgentUsageRecorder.js");
+    const calls: unknown[] = [];
+    let finishLookup!: (accounts: never[]) => void;
+    let windowId = "original";
+    const recorder = new AgentUsageRecorder(
+      { open: async owner => { calls.push(owner); }, close: async tabId => { calls.push({ closed: tabId }); } },
+      { list: () => new Promise(resolve => { finishLookup = resolve; }) },
+      undefined
+    );
+    recorder.conversationStarted({ id: "tab" } as never, "claude", "account", CLAUDE_SESSION, windowId);
+    recorder.ended("tab");
+    windowId = "different";
+    await Promise.resolve();
+    expect(calls).toEqual([]);
+    finishLookup([]);
+    await recorder.flush();
+    expect(calls).toEqual([{ tabId: "tab", windowId: "original" }, { closed: "tab" }]);
+  });
+
   it("records the account kind and Forge worker of a tab's conversation", async () => {
     const { AgentUsageRecorder } = await import("./AgentUsageRecorder.js");
     const opened: unknown[] = [];

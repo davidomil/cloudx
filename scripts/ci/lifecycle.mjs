@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -26,7 +26,6 @@ const command = (executable, args, options = {}) =>
     stdio: ["ignore", "pipe", "pipe"],
     ...options,
   });
-const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const readJson = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
 const writeJson = (file, value) =>
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
@@ -95,28 +94,96 @@ async function waitForWeb() {
   throw new Error("Web readiness deadline exceeded", { cause: last });
 }
 
-function frontendEvidence(repoRoot) {
+async function frontendResponse(url, collect = false) {
+  const child = spawn(
+    "curl",
+    [
+      "--fail",
+      "--silent",
+      "--show-error",
+      "--insecure",
+      "--max-time",
+      "60",
+      url,
+    ],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 65_000,
+      killSignal: "SIGKILL",
+    },
+  );
+  const hash = createHash("sha256");
+  const chunks = [];
+  const maximum = collect ? 1024 * 1024 : 64 * 1024 * 1024;
+  let length = 0,
+    diagnostic = "",
+    failure;
+  await new Promise((resolve, reject) => {
+    child.on("error", (error) => {
+      failure ??= error;
+    });
+    child.stderr.on("data", (chunk) => {
+      diagnostic = (diagnostic + chunk).slice(-16_384);
+    });
+    child.stdout.on("data", (chunk) => {
+      if (failure) return;
+      length += chunk.length;
+      if (length > maximum) {
+        failure = new Error(`Served frontend exceeds ${maximum} bytes: ${url}`);
+        child.kill("SIGKILL");
+        return;
+      }
+      hash.update(chunk);
+      if (collect) chunks.push(chunk);
+    });
+    child.on("close", (code, signal) =>
+      failure
+        ? reject(failure)
+        : code === 0
+          ? resolve()
+          : reject(
+              new Error(
+                `Frontend request failed (${code ?? signal}): ${diagnostic}`,
+              ),
+            ),
+    );
+  });
+  return {
+    sha256: hash.digest("hex"),
+    ...(collect ? { body: Buffer.concat(chunks) } : {}),
+  };
+}
+
+async function fileDigest(file) {
+  const hash = createHash("sha256");
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+export async function frontendEvidence(repoRoot, origin = baseURL) {
   const directory = path.join(repoRoot, "apps/web/dist");
-  const html = request(baseURL, true);
+  const html = await frontendResponse(origin, true);
   const assets = [
-    ...html.toString().matchAll(/(?:src|href)="(\/assets\/[^"?#]+)"/g),
+    ...html.body.toString().matchAll(/(?:src|href)="(\/assets\/[^"?#]+)"/g),
   ].map((match) => match[1]);
   assert.ok(
     assets.some((asset) => asset.endsWith(".js")),
     "The application did not serve its built frontend",
   );
-  return ["/index.html", ...new Set(assets)].map((relative) => ({
-    path: relative,
-    diskSha256: digest(fs.readFileSync(path.join(directory, relative))),
-    servedSha256: digest(
-      relative === "/index.html"
-        ? html
-        : request(`${baseURL}${relative}`, true),
-    ),
-  }));
+  const evidence = [];
+  for (const relative of ["/index.html", ...new Set(assets)])
+    evidence.push({
+      path: relative,
+      diskSha256: await fileDigest(path.join(directory, relative)),
+      servedSha256:
+        relative === "/index.html"
+          ? html.sha256
+          : (await frontendResponse(`${origin}${relative}`)).sha256,
+    });
+  return evidence;
 }
 
-function installationEvidence(repoRoot) {
+async function installationEvidence(repoRoot) {
   const dataDir = path.join(repoRoot, ".cloudx");
   const readiness = Object.fromEntries(
     Object.entries({
@@ -159,7 +226,7 @@ function installationEvidence(repoRoot) {
     terminalProbeCleaned: !fs
       .readdirSync(dataDir)
       .some((name) => name.startsWith("terminal-readiness-")),
-    frontend: frontendEvidence(repoRoot),
+    frontend: await frontendEvidence(repoRoot),
   };
   return observed;
 }
@@ -274,7 +341,7 @@ async function install({
     version: codexVersion,
   });
   await waitForWeb();
-  const observed = installationEvidence(repoRoot);
+  const observed = await installationEvidence(repoRoot);
   writeJson(path.join(evidenceDir, "installed.json"), observed);
   requireReadyInstallation(
     observed,
@@ -292,7 +359,7 @@ async function exercise({
   const home = os.homedir(),
     dataDir = path.join(repoRoot, ".cloudx");
   await waitForWeb();
-  const before = installationEvidence(repoRoot);
+  const before = await installationEvidence(repoRoot);
   requireReadyInstallation(
     before,
     scenario === "upgrade" ? sourceSha : targetSha,
@@ -419,7 +486,7 @@ async function exercise({
       profile.updateRunId,
       "The durable record differs from the launched update",
     );
-    const after = installationEvidence(repoRoot);
+    const after = await installationEvidence(repoRoot);
     writeJson(path.join(evidenceDir, "updated.json"), after);
     writeJson(path.join(evidenceDir, "coordinator.json"), {
       coordinatorSurvivedStop,

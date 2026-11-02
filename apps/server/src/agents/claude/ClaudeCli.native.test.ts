@@ -5,12 +5,29 @@ import path from "node:path";
 import { expect, it } from "vitest";
 
 import { AgentAccountStore } from "../AgentAccountStore.js";
-import { runAgentCli } from "../agentCli.js";
+import { claudeAccountLaunch, runAgentCli } from "../agentCli.js";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 
 // Contract checks against a real Claude Code binary. They make no model
 // requests, so CI runs them without credentials.
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+
+it.skipIf(!claude)("native account policy suppresses user credential helpers without starting a model turn", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-claude-account-policy-"));
+  try {
+    await fs.writeFile(path.join(root, "settings.json"), JSON.stringify({ apiKeyHelper: "printf fake-unrelated-helper-token" }));
+    const base = { PATH: process.env.PATH, HOME: root, CLAUDE_CONFIG_DIR: root, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
+    const original = await runAgentCli(claude!, ["auth", "status", "--json"], { env: base, cwd: root });
+    expect(JSON.parse(original.stdout)).toMatchObject({ loggedIn: true, authMethod: "api_key_helper" });
+    const launch = claudeAccountLaunch(base, root, {});
+    const settings = path.join(root, ".cloudx-settings.json");
+    await fs.writeFile(settings, JSON.stringify(launch.policy.settings), { mode: 0o600 });
+    const selected = await runAgentCli(claude!, ["--settings", settings, "auth", "status", "--json"], { env: launch.env, cwd: root });
+    expect(JSON.parse(selected.stdout)).toMatchObject({ loggedIn: false, authMethod: "none", configDirectory: root });
+    expect(selected.stdout).not.toContain("fake-unrelated-helper-token");
+    expect(JSON.parse(await fs.readFile(path.join(root, "settings.json"), "utf8"))).toEqual({ apiKeyHelper: "printf fake-unrelated-helper-token" });
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
 
 it.skipIf(!claude)("native Claude Code accepts every flag CloudX passes", async () => {
   const help = await runAgentCli(claude!, ["--help"], { timeoutMs: 30_000 });

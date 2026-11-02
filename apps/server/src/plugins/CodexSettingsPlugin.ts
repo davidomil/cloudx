@@ -25,6 +25,15 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
   constructor(settings: CodexSettingsService, updates: CodexUpdateService, repairs: CodexConfigRepairService) {
     this.hooks = [
       {
+        id: "codex-settings.inspect-launch",
+        owner: { kind: "plugin", pluginId: this.id },
+        title: "Inspect generated Codex launch policy",
+        description: "Read an owned tab or worker's redacted generated configuration and skill selection without starting or changing a client.",
+        exposures: ["ui", "http"],
+        inputSchema: { type: "object", properties: { tabId: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$" } }, required: ["tabId"], additionalProperties: false },
+        execute: async (input, context) => ({ inspection: await settings.inspectLaunch(input.tabId as string, context.signal) }),
+      },
+      {
         id: "codex-settings.read",
         owner: { kind: "plugin", pluginId: this.id },
         title: "Read global Codex settings",

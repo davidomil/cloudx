@@ -13,9 +13,14 @@ import { readCodexConfiguration, validateCodexNativeOptions } from "./CodexConfi
 import { validateNativeCodexConfiguration } from "./CodexConfigurationProbe.js";
 import { editCodexConfiguration, mergeCodexConfigurationLayers, parseCodexConfiguration, preserveHiddenCodexValues, withCodexLaunchModelDefault } from "./CodexConfigurationDocument.js";
 import { resolveCodexConfigurationPaths } from "./CodexConfigurationPaths.js";
+import { inspectCodexLaunchPolicy } from "./CodexLaunchPolicyInspection.js";
 
 export class CodexSettingsService {
   constructor(private readonly sources: CodexStateSources, private readonly env: NodeJS.ProcessEnv = process.env) {}
+
+  inspectLaunch(tabId: string, signal?: AbortSignal) {
+    return inspectCodexLaunchPolicy(this.sources, tabId, this.env, signal);
+  }
 
   async read(signal?: AbortSignal, targetProfile?: string): Promise<CodexGlobalSettings> {
     codexConfigurationFilename(targetProfile);

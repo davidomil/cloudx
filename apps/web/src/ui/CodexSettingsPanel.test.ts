@@ -103,6 +103,12 @@ describe("global Codex settings editor", () => {
     expect(checkbox(container, "Enable browser").checked).toBe(false);
     expect(container.textContent).toContain("Bypasses the sandbox and approval prompts.");
     expect(container.textContent).toContain("Explicitly untrusted workspaces are rejected");
+    expect(container.textContent).toContain("Defaults and launch policy");
+    expect(container.textContent).toContain("Selected CLI version provenance is unverified");
+    expect(container.textContent).toContain("Source: native shared cache");
+    expect(container.textContent).toContain("Saved launch selection: enabled");
+    expect(container.textContent).toContain("unsupported as managed CloudX resources");
+    expect(container.textContent).toContain("does not observe a running native session");
   });
 
   it("saves only changed permissions, skills, and native defaults", async () => {
@@ -200,7 +206,7 @@ describe("global Codex settings editor", () => {
 
   it("shows an empty skill catalog without inventing selectable skills", async () => {
     const { container } = await mount({ ...initial, defaultSkills: [] });
-    expect(container.textContent).toContain("No default skills are provided by this Codex installation.");
+    expect(container.textContent).toContain("No native vendor skills are present in the shared cache.");
     expect(checkbox(container, "Enable imagegen")).toBeNull();
   });
 

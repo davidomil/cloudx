@@ -10,7 +10,7 @@ interface CommandSelection {
   key: string;
 }
 
-export function CodexCommandDetails({ tabId, tabTitle, active }: { tabId: string; tabTitle: string; active: boolean }) {
+export function CodexCommandDetails({ tabId, tabTitle, active, providerLabel = "Codex" }: { tabId: string; tabTitle: string; active: boolean; providerLabel?: string }) {
   const [snapshot, setSnapshot] = useState<CodexCommandDetailsSnapshot>();
   const [error, setError] = useState<string>();
   const [selected, setSelected] = useState<CommandSelection>();
@@ -65,10 +65,10 @@ export function CodexCommandDetails({ tabId, tabTitle, active }: { tabId: string
     ? commands.find(item => commandKey(item) === opened.key)
     : undefined;
 
-  return <section className="codex-command-details" aria-label="Codex command details">
+  return <section className="codex-command-details" aria-label={`${providerLabel} command details`}>
     <FileText size={14} aria-hidden="true" />
     {command && snapshot ? <>
-      {commands.length > 1 ? <select aria-label="Recent Codex commands" value={commandKey(command)} onChange={event => {
+      {commands.length > 1 ? <select aria-label={`Recent ${providerLabel} commands`} value={commandKey(command)} onChange={event => {
         setSelected({ executionId: snapshot.executionId, key: event.target.value });
       }}>
         {commands.map((item, index) => <option key={commandKey(item)} value={commandKey(item)}>{index + 1}. {commandSummary(item.command)}</option>)}

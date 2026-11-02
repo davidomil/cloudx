@@ -76,6 +76,48 @@ function isCompletionList(source: CompletionSource | readonly Completion[]): sou
 }
 
 describe("AutomationPanel helpers", () => {
+  it("shows the Claude launch contract before selecting and retains the explicit mode in graph configuration", async () => {
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    const catalog: AutomationCatalogResponse = { nodes: [{
+      typeId: "primitive:codex.exec", kind: "primitive", title: "Run Codex Exec", description: "Run the selected provider.", inputs: [
+        { id: "claudeLaunchMode", label: "Claude launch mode", kind: "data", direction: "input", type: { kind: "string" }, defaultValue: "", options: { values: [
+          { value: "", label: "Inherit Claude Settings" }, { value: "native-project", label: "Native project" }, { value: "cloudx-managed", label: "CloudX-managed (exclusive skills)" },
+        ] }, description: "CloudX-managed omits shared project settings, project CLAUDE.md, project rules, local settings and CLAUDE.local.md. Native project additions are not an exclusive allowlist." },
+      ], outputs: [],
+    }] };
+    const group = groupFixture();
+    group.graph.nodes = [{ id: "claude", typeId: "primitive:codex.exec", position: { x: 0, y: 0 }, config: { model: "claude-opus-5-5", prompt: "summarize" } }];
+    group.graph.edges = [];
+    const flow = flowFromGraph(group, catalog);
+    let current: AutomationPanelState = { ...createInitialAutomationPanelState(), loaded: true, catalog, groups: [group], selectedGroupId: group.id, nodes: flow.nodes, edges: [], selectedNodeId: "claude" };
+    function Panel() {
+      const [state, setState] = useState(current);
+      return createElement(AutomationPanel, { tab: workspaceTab(), state, onStateChange: update => setState(previous => current = typeof update === "function" ? update(previous) : update) });
+    }
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => root.render(createElement(Panel)));
+      await flushPanelEffects();
+      const label = [...container.querySelectorAll(".automation-node-inspector label")].find(label => label.textContent?.startsWith("Claude launch mode"))!;
+      const select = label.querySelector("select")!;
+      expect([...select.options].map(option => option.value)).toEqual(["", "native-project", "cloudx-managed"]);
+      expect(select.options[0].textContent).toBe("Inherit Claude Settings");
+      expect(label.textContent).toContain("project CLAUDE.md");
+      expect(label.textContent).toContain("CLAUDE.local.md");
+      expect(label.textContent).toContain("not an exclusive allowlist");
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")!.set!.call(select, "cloudx-managed");
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      expect(current.nodes[0].data.config).toMatchObject({ claudeLaunchMode: "cloudx-managed" });
+      expect(automationGraphFromPanelState(current.nodes, current.edges, group.graph, group.graph.allowedSafety).nodes[0].config).toMatchObject({ claudeLaunchMode: "cloudx-managed" });
+    } finally {
+      await act(async () => root.unmount());
+    }
+  });
+
   it("routes minimap colors through theme variables", () => {
     expect(automationMiniMapTheme).toMatchObject({
       bgColor: "var(--automation-minimap-background)",

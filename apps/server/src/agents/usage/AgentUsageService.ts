@@ -39,10 +39,12 @@ export class AgentUsageService {
     };
     const tabs: Record<string, AgentUsageSummary> = {};
     for (const tabId of request.tabIds ?? []) tabs[tabId] = await summarizeOwner(await this.ledger.segments({ tabId }));
+    const windows: Record<string, AgentUsageSummary> = {};
+    for (const windowId of request.windowIds ?? []) windows[windowId] = await summarizeOwner(await this.ledger.segments({ windowId }));
     const forgeWorkers: Record<string, AgentUsageSummary> = {};
     for (const forgeWorkerId of request.forgeWorkerIds ?? []) forgeWorkers[forgeWorkerId] = await summarizeOwner(await this.ledger.segments({ forgeWorkerId }));
     // A Forge worker's tab and the worker share segments; count each response once.
-    return { tabs, forgeWorkers, total: summarize(uniqueRecords(everything), price) };
+    return { tabs, windows, forgeWorkers, total: summarize(uniqueRecords(everything), price) };
   }
 
   private async recordsIn(segments: UsageSegment[]): Promise<AttributedRecord[]> {
