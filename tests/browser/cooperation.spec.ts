@@ -339,6 +339,47 @@ test("no active tool pans empty canvas and moves items; Hand pans without editin
     from: { itemId: "gesture-from", port: "east" },
     to: { itemId: "gesture-to", port: "west" },
   });
+  const northPort = page.locator(
+    '[data-nodeid="gesture-from"][data-handleid="north"]',
+  );
+  const southPort = page.locator(
+    '[data-nodeid="gesture-to"][data-handleid="south"]',
+  );
+  await expect(northPort).toHaveClass(/connectablestart/);
+  const beforePortClicks = writes.length;
+  await northPort.click();
+  await southPort.click();
+  await expect.poll(() => boards.getBoard(id).connections.length).toBe(3);
+  await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+    "Saved",
+  );
+  expect(writes).toHaveLength(beforePortClicks + 1);
+  expect(boards.getBoard(id).connections.at(-1)).toMatchObject({
+    from: { itemId: "gesture-from", port: "north" },
+    to: { itemId: "gesture-to", port: "south" },
+  });
+  await expect(page.locator(".cooperation-board-error:visible")).toHaveCount(0);
+  await expect(northPort).toHaveClass(/connectablestart/);
+  await northPort.click();
+  await page.keyboard.press("Escape");
+  await expect(tools.locator('[aria-pressed="true"]')).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Connect items (L)", exact: true })
+    .click();
+  await expect(fromPort).toHaveClass(/connectablestart/);
+  const beforeCancelledConnection = writes.length;
+  await fromPort.click();
+  await toPort.click();
+  await expect.poll(() => boards.getBoard(id).connections.length).toBe(4);
+  await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+    "Saved",
+  );
+  expect(writes).toHaveLength(beforeCancelledConnection + 1);
+  expect(boards.getBoard(id).connections.at(-1)).toMatchObject({
+    from: { itemId: "gesture-from", port: "east" },
+    to: { itemId: "gesture-to", port: "west" },
+  });
+  await expect(page.locator(".cooperation-board-error:visible")).toHaveCount(0);
   const edge = page
     .locator(".cooperation-board:visible .react-flow__edge-path")
     .first();

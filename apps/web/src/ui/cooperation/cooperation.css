@@ -32,7 +32,8 @@
 .cooperation-canvas:not(.tool-none):not(.tool-select) .react-flow__nodesselection-rect { pointer-events: none; }
 .cooperation-canvas .react-flow__handle { height: 9px; width: 9px; min-width: 0; min-height: 0; border: 2px solid var(--color-accent-tertiary); background: var(--color-background); opacity: 0; transition: opacity 90ms linear; }
 .cooperation-canvas .react-flow__handle { pointer-events: none; }
-.cooperation-canvas.tool-connection .react-flow__handle { opacity: 1; pointer-events: all; }
+.cooperation-canvas.tool-connection .react-flow__handle { opacity: 1; }
+.cooperation-canvas.tool-connection .react-flow__handle.connectable { pointer-events: all; }
 .cooperation-item-shell { position: relative; }
 .cooperation-item { display: flex; flex-direction: column; transform-origin: center; background: var(--color-card); border: 1px solid color-mix(in srgb, var(--color-muted-foreground) 70%, var(--color-border)); border-radius: 5px; box-shadow: 0 5px 14px color-mix(in srgb, var(--color-background) 75%, transparent); overflow: hidden; }
 .cooperation-item-shell.is-selected .cooperation-item { border-color: var(--color-warning); }

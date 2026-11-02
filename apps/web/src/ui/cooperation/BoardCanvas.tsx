@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction, type MouseEvent, type PointerEvent } from "react";
 import {
   Background, BackgroundVariant, BaseEdge, ConnectionMode, EdgeLabelRenderer, Handle, MiniMap,
-  Position, ReactFlow, ViewportPortal, applyNodeChanges, useReactFlow, useUpdateNodeInternals,
+  Position, ReactFlow, ViewportPortal, applyNodeChanges, useReactFlow, useStoreApi, useUpdateNodeInternals,
   type Connection, type Edge, type EdgeChange, type EdgeProps, type Node as FlowNode, type NodeChange, type NodeProps, type ReactFlowInstance, type Viewport
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -47,6 +47,7 @@ interface BoardCanvasProps {
 export function BoardCanvas(props: BoardCanvasProps) {
   const { board, tool, selected, readOnly, busy, ink, setInk } = props;
   const flow = useReactFlow<CanvasNode, CanvasEdge>();
+  const store = useStoreApi<CanvasNode, CanvasEdge>();
   const root = useRef<HTMLDivElement>(null);
   const pen = useRef<number | undefined>(undefined);
   const dragRevision = useRef<number | undefined>(undefined);
@@ -55,7 +56,10 @@ export function BoardCanvas(props: BoardCanvasProps) {
   const moving = tool === "none" || tool === "select";
   const panning = tool === "none" || tool === "pan";
   const connecting = tool === "connection" && !readOnly && !busy;
-  useEffect(() => setConnectionStart(undefined), [tool]);
+  useEffect(() => {
+    setConnectionStart(undefined);
+    store.setState({ connectionClickStartHandle: null });
+  }, [tool, readOnly, store]);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const onSelection = props.onSelection;
@@ -148,7 +152,7 @@ export function BoardCanvas(props: BoardCanvasProps) {
         dragRevision.current = undefined;
       }}
       onNodeClick={(event, node) => {
-        if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select")) return;
+        if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select, .react-flow__handle")) return;
         if (tool === "connection") connectItem(node); else if (!moving) event.preventDefault();
       }}
       onNodeDoubleClick={(_event, node) => props.onInspect({ kind: "item", id: node.id })}
