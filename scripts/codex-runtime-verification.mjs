@@ -1,12 +1,13 @@
 import { pathToFileURL } from "node:url";
 import { CODEX_STATE_ERROR_PREFIX, CodexStateVerificationError } from "./codex-state-errors.mjs";
+import { CODEX_RUNTIME_ERROR_PREFIX, CodexRuntimeVerificationError } from "./codex-runtime-errors.mjs";
 
 export async function verifyCodexRuntime(options) {
   let runtime;
   try {
     runtime = await import("../apps/server/dist/plugins/CodexRuntimeVerification.js");
   } catch (error) {
-    throw new Error("CloudX's native runtime verifier could not load. Build the server with npm run build -w @cloudx/server before verifying a Codex update.", { cause: error });
+    throw new CodexRuntimeVerificationError({ stage: "load", code: "failed" }, { cause: error });
   }
   return runtime.verifyCodexRuntime(options);
 }
@@ -30,8 +31,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
     await verifyCodexRuntime(options);
   } catch (error) {
+    console.error("Codex native runtime verification failed:", error);
     if (error instanceof CodexStateVerificationError) console.error(`${CODEX_STATE_ERROR_PREFIX}${JSON.stringify(error.diagnostic)}`);
-    console.error(`Codex native runtime verification failed: ${error.message}`);
+    if (error instanceof CodexRuntimeVerificationError) console.error(`${CODEX_RUNTIME_ERROR_PREFIX}${JSON.stringify(error.diagnostic)}`);
     process.exitCode = 1;
   }
 }

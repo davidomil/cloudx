@@ -43,7 +43,7 @@ it.each([
   const plugins = path.join(root, "apps/server/dist/plugins");
   await Promise.all([scripts, plugins].map(directory => fs.mkdir(directory, { recursive: true })));
   await fs.writeFile(path.join(root, "package.json"), '{"type":"module"}');
-  for (const name of ["codex-state-errors.mjs", "codex-runtime-verification.mjs"]) await fs.copyFile(new URL(name, import.meta.url), path.join(scripts, name));
+  for (const name of ["codex-state-errors.mjs", "codex-runtime-errors.mjs", "codex-runtime-verification.mjs"]) await fs.copyFile(new URL(name, import.meta.url), path.join(scripts, name));
   await fs.writeFile(path.join(plugins, "CodexRuntimeVerification.js"), `import { CodexStateVerificationError } from '../../../../scripts/codex-state-errors.mjs'; export async function verifyCodexRuntime() { throw new CodexStateVerificationError(${JSON.stringify(diagnostic)}); }`);
   let failure;
   try { execFileSync(process.execPath, [path.join(scripts, "codex-runtime-verification.mjs"), "/isolated/codex"], { stdio: "pipe" }); }

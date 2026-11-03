@@ -296,13 +296,22 @@ test("no active tool pans empty canvas and moves items; Hand pans without editin
   await page.getByRole("button", { name: "Pan (H)", exact: true }).click();
   await expect(tools.locator('[aria-pressed="true"]')).toHaveCount(0);
   await page
+    .getByRole("button", { name: "Fit board to view", exact: true })
+    .click();
+  await page
     .getByRole("button", { name: "Connect items (L)", exact: true })
     .click();
-  await source.click({ position: { x: 20, y: 20 } });
+  bounds = (await source.boundingBox())!;
+  await source.click({
+    position: { x: bounds.width * 0.75, y: bounds.height / 2 },
+  });
   const beforeInspect = writes.length;
-  await page
-    .getByRole("button", { name: "Inspect Destination", exact: true })
-    .click();
+  const inspectDestination = page.getByRole("button", {
+    name: "Inspect Destination",
+    exact: true,
+  });
+  await expect(inspectDestination).toBeInViewport({ ratio: 1 });
+  await inspectDestination.click();
   await expect(page.getByLabel("Inspector", { exact: true })).toBeVisible();
   await expect(page.locator(".cooperation-save-state:visible")).toContainText(
     "Saved",
@@ -314,6 +323,9 @@ test("no active tool pans empty canvas and moves items; Hand pans without editin
     .locator('[data-item-id="gesture-to"] .cooperation-shape')
     .click({ position: { x: 20, y: 20 } });
   await expect.poll(() => boards.getBoard(id).connections.length).toBe(1);
+  await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+    "Saved",
+  );
   const fromPort = page.locator(
     '[data-nodeid="gesture-from"][data-handleid="east"]',
   );
@@ -321,6 +333,7 @@ test("no active tool pans empty canvas and moves items; Hand pans without editin
     '[data-nodeid="gesture-to"][data-handleid="west"]',
   );
   await expect(fromPort).toHaveClass(/connectablestart/);
+  await expect(fromPort).toHaveClass(/\bconnectable\b/);
   const fromBounds = (await fromPort.boundingBox())!;
   const toBounds = (await toPort.boundingBox())!;
   await page.mouse.move(

@@ -89,6 +89,7 @@ function checkout({ includeInstaller = false } = {}) {
       "codex-updater.mjs",
       "codex-selection.mjs",
       "codex-state-errors.mjs",
+      "codex-runtime-errors.mjs",
       "install-update.mjs",
       "install-terminal-upgrade.mjs",
       "install-runtime.mjs",

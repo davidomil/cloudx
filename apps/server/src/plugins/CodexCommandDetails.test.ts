@@ -87,6 +87,45 @@ describe("native command capture", () => {
     expect(observer.snapshot().commands[0]).toMatchObject({ output, outputTruncated: false });
   });
 
+  it("marks 0.166.0 paginated history as truncated when native persistence keeps only 64 KiB", () => {
+    const observer = capture();
+    const marker = "\n... command output truncated for persistence ...\n";
+    const retained = 64 * 1024 - marker.length;
+    const output = "a".repeat(Math.floor(retained / 2)) + marker + "b".repeat(Math.ceil(retained / 2));
+    observer.fromClient({ id: 1, method: "thread/items/list", params: { threadId: "thread" } });
+    observer.fromServer({ id: 1, result: { data: [{ turnId: "turn", item: { ...item, status: "completed", aggregatedOutput: output, exitCode: 0 } }] } });
+    expect(Buffer.byteLength(output)).toBe(64 * 1024);
+    expect(observer.snapshot().commands[0].output === output).toBe(true);
+    expect(observer.snapshot().commands[0]).toMatchObject({ outputTruncated: true, status: "completed", exitCode: 0 });
+  });
+
+  it("recognizes persistence truncation at UTF-8 boundaries without replacing fuller streamed output", () => {
+    const marker = "\n... command output truncated for persistence ...\n";
+    const side = "🙂".repeat(Math.floor((64 * 1024 - marker.length) / 2 / 4));
+    const output = side + marker + side;
+    const historyOnly = capture();
+    historyOnly.fromServer(event("item/completed", { item: { ...item, status: "completed", aggregatedOutput: output } }));
+    expect(Buffer.byteLength(output)).toBeLessThan(64 * 1024);
+    expect(historyOnly.snapshot().commands[0].output === output).toBe(true);
+    expect(historyOnly.snapshot().commands[0].outputTruncated).toBe(true);
+
+    const live = capture();
+    const fullOutput = side + "preserved middle".repeat(100) + side;
+    live.fromServer(event("item/started"));
+    live.fromServer(event("item/commandExecution/outputDelta", { itemId: "item", delta: fullOutput }));
+    live.fromServer(event("item/completed", { item: { ...item, status: "completed", aggregatedOutput: output } }));
+    expect(live.snapshot().commands[0].output === fullOutput).toBe(true);
+    expect(live.snapshot().commands[0].outputTruncated).toBe(false);
+  });
+
+  it.each([0, 64 * 1024])("preserves a literal persistence marker in complete output with %s surrounding bytes", bytes => {
+    const observer = capture();
+    const output = "x".repeat(bytes) + "\n... command output truncated for persistence ...\ntext";
+    observer.fromServer(event("item/completed", { item: { ...item, status: "completed", aggregatedOutput: output } }));
+    expect(observer.snapshot().commands[0].output === output).toBe(true);
+    expect(observer.snapshot().commands[0].outputTruncated).toBe(false);
+  });
+
   it("keeps the streaming retention warning when native completion is also capped", () => {
     const observer = capture();
     observer.fromServer(event("item/started"));

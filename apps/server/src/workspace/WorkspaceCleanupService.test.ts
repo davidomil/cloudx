@@ -408,7 +408,10 @@ describe("reviewed workspace cleanup", () => {
   });
   it.each(["cwd and open file", "open file only"])("protects preview and deletion while a zombie leader has a surviving thread using the %s", async activity => {
     const directory = await checkout("surviving-thread");
-    const observed = observedService();
+    const fixtureProcesses = path.join(root, "fixture-proc");
+    await fs.mkdir(fixtureProcesses);
+    const processActivity = new WorkspaceProcessActivity({ procDirectory: fixtureProcesses });
+    const observed = observedService(processActivity);
     const reviewed = await observed.preview();
     const reviewedCandidate = reviewed.candidates.find(item => item.path === directory);
     expect(reviewedCandidate, reviewedCandidate?.reason).toMatchObject({ eligible: true });
@@ -423,11 +426,13 @@ describe("reviewed workspace cleanup", () => {
       const ready = await new Promise<string>((resolve, reject) => { child.stdout.once("data", data => resolve(String(data).trim())); child.once("error", reject); });
       const [tid, descriptor] = ready.split(" ");
       const procDirectory = `/proc/${child.pid}`;
+      // Read the real fixture's proc entries without requiring unrelated test workers to stay inactive.
+      await fs.symlink(procDirectory, path.join(fixtureProcesses, String(child.pid)));
       await expect.poll(async () => (await fs.readFile(path.join(procDirectory, "stat"), "utf8")).split(") ")[1]!.split(" ")[0]).toBe("Z");
       expect(await fs.readFile(path.join(procDirectory, "status"), "utf8")).toMatch(/^Threads:\s+2$/mu);
       expect(await fs.readlink(`/proc/${tid}/cwd`)).toBe(activity === "cwd and open file" ? directory : root);
       expect(await fs.readlink(`/proc/${tid}/fd/${descriptor}`)).toBe(path.join(directory, "source.ts"));
-      const inspecting = observedService();
+      const inspecting = observedService(processActivity);
       const protectedPreview = await inspecting.preview();
       const candidate = protectedPreview.candidates.find(item => item.path === directory)!;
       expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true });
@@ -438,6 +443,7 @@ describe("reviewed workspace cleanup", () => {
       expect(await fs.readFile(path.join(directory, "source.ts"), "utf8")).toBe("original\n");
       child.stdin.write("x");
       await stopped;
+      await fs.unlink(path.join(fixtureProcesses, String(child.pid)));
       const inactive = await observed.preview();
       const inactiveCandidate = inactive.candidates.find(item => item.path === directory);
       expect(inactiveCandidate, inactiveCandidate?.reason).toMatchObject({ eligible: true, sizeUnavailable: undefined });
@@ -448,6 +454,32 @@ describe("reviewed workspace cleanup", () => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
       await stopped;
     }
+  });
+  it.each(["preview", "deletion revalidation"])("preserves an inactive checkout when an unrelated process changes identity during %s", async stage => {
+    const completed = await checkout("changing-process-identity");
+    const { observed, directory } = await processFixture({ name: "node", files: [root] });
+    const reviewed = await observed.preview();
+    expect(reviewed.candidates.find(item => item.path === completed)).toMatchObject({ eligible: true });
+    const statFile = path.join(directory, "stat");
+    const stat = await fs.readFile(statFile, "utf8");
+    const readlink = fs.readlink;
+    const renamed = vi.spyOn(fs, "readlink").mockImplementation(async (...args: Parameters<typeof fs.readlink>) => {
+      if (String(args[0]) === path.join(directory, "cwd")) await fs.writeFile(statFile, stat.replace("(node)", "(renamed-node)"));
+      return readlink(...args);
+    });
+    try {
+      if (stage === "preview") {
+        const preview = await observed.preview();
+        const candidate = preview.candidates.find(item => item.path === completed)!;
+        expect(candidate).toMatchObject({ eligible: false, sizeUnavailable: true, reason: expect.stringContaining("Process identity changed during inspection") });
+        await expect(observed.start({ ...selection(preview), candidateIds: [candidate.id] })).rejects.toThrow("protected or unknown");
+      } else {
+        await observed.start(selection(reviewed)); await observed.settled();
+        expect((await observed.status())?.results.find(item => item.path === completed)).toMatchObject({ status: "skipped", reason: expect.stringContaining("Process identity changed during inspection") });
+      }
+      expect(await fs.readFile(path.join(completed, "source.ts"), "utf8")).toBe("original\n");
+      expect(workers[0]!.retainedWorkspace?.worktreePath).toBe(completed);
+    } finally { renamed.mockRestore(); }
   });
   it.each([{ state: "Z", threads: 2 }, { state: "X", threads: 2 }, { state: "x", threads: 2 }, { state: "Z", threads: null }, { state: "Z", threads: 0 }])("preserves unresolved thread-group activity even when the leader's paths appear inactive: %j", async options => {
     const completed = await checkout("unresolved-thread-group");

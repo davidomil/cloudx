@@ -125,8 +125,8 @@ docker run --rm \
 
 ## Native Codex contract
 
-The required native CI matrix runs the installer-pinned Codex 0.157.1
-and Codex 0.156.1 through the production tab launcher, generated overlay,
+The required native CI matrix runs the installer-pinned Codex 0.157.1,
+Codex 0.156.1 and Codex 0.166.0 through the production tab launcher, generated overlay,
 bridge and PTY. Its `installer` lane reads the installer's `CODEX_CLI_VERSION`,
 installs that exact npm release and checks the executable against the same
 version. The tests
@@ -134,7 +134,7 @@ use an isolated home and a synthetic local provider; they do not use
 personal credentials or an external model service.
 
 Build the server with `npm run typecheck`, then run
-`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.157.1 npm run test:codex-recovery`.
+`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.166.0 npm run test:codex-recovery`.
 The runner records the installed version in CI logs and rejects missing binaries,
 unsupported or mismatched versions, failures and skipped native cases.
 
@@ -142,9 +142,26 @@ Native cases require a selected-conversation receipt before the first
 model prompt. Synthetic turns verify effective permissions and roots
 across startup, `/new`, idle `/resume`, fork, prompt editing and process-loss resume.
 Resume must preserve saved roots even when the source configuration
-changes. Effective persisted roots are read from
-`turn_context.workspace_roots`; the initial `session_meta` header does
-not describe later settings changes.
+changes. The production transcript reader binds root evidence to the matching
+completed turn. Codex 0.156.1 and 0.157.1 record roots in
+`turn_context.workspace_roots`. Codex 0.166.0 records them in the XML
+`world_state.payload.state.environments.filesystem` snapshot. The reader
+resolves full and delta state for that turn. An unchanged turn can inherit
+state already bound to an earlier completed native turn. Compaction and rollback
+clear that baseline. Missing, malformed, unbound or mismatched evidence fails.
+An atomic filesystem replacement in a delta supplies its complete root evidence.
+The initial `session_meta` header does not describe
+later settings changes. See the versioned
+[0.166.0 environment-state writer](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/context/world_state/environment.rs)
+and [filesystem renderer](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/context/environment_context.rs).
+The [native state writer](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/context_manager/history.rs)
+omits a delta when the comparison state is unchanged.
+
+Fork interaction tests verify roots from the exact synthetic provider request
+for each completed turn. Codex 0.166.0 can keep inherited fork history outside
+the child's local rollout through
+[bounded parent lineage](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/thread-store/src/local/rollout_lineage.rs).
+The updater's isolated verifier still requires transcript root evidence.
 
 The supported remote TUI leaves workspace-root resolution to the native
 server. The bridge forwards omitted or null roots, adds the CloudX
@@ -163,9 +180,9 @@ of retained SQLite state.
 
 Installer lifecycle validation can invoke
 `node scripts/codex-runtime-verification.mjs /absolute/path/to/installer-selected/codex`
-against the built server. The native CI matrix validates the
-installer-pinned release; it does not execute the host installer
-lifecycle.
+against the built server. Every native CI lane runs this production verifier
+after its required native suites. The native matrix does not execute the
+host installer lifecycle.
 
 ## Useful Area Coverage
 

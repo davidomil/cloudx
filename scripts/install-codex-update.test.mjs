@@ -105,7 +105,7 @@ describe("updating only Codex", () => {
     await expect(runInstaller({ ...options, dryRun: false,
       runner: new InstallerRunner({ cwd: root, log: () => {} }),
       env: { HOME: home, PATH: `${tools}:/usr/bin`, ...(source === "default" ? {} : inherited) },
-    })).rejects.toThrow("failed CloudX tab launch");
+    })).rejects.toThrow("failed native verification stage");
 
     expect(verification.args).toEqual([path.join(process.cwd(), "scripts/codex-runtime-verification.mjs"), assistantBin,
       "--shared-state-home", expected.CODEX_HOME, "--cloudx-data-dir", expected.CLOUDX_DATA_DIR]);
@@ -309,7 +309,7 @@ console.log('codex-cli ' + version);\n`,
       );
       expect(result.status).toBe(1);
       expect(result.stdout).not.toContain("Codex CLI update complete");
-      if (outcome === "runtime verification failure") expect(result.stderr).toContain("failed CloudX tab launch");
+      if (outcome === "runtime verification failure") expect(result.stderr).toContain("native verification");
       const candidateRoot = path.join(prefix, ".cloudx-codex");
       const candidate = path.join(candidateRoot, fs.readdirSync(candidateRoot)[0]);
       expect(fs.readFileSync(commandLog, "utf8").trim().split("\n").filter(line => line.startsWith("npm ") || line === "codex --version")).toEqual([

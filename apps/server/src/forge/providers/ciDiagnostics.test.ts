@@ -726,6 +726,7 @@ const productionJobNames = [
   "Isolated verifier (coverage-3)", "Isolated verifier (coverage-4)",
   "Isolated verifier (static)", "Isolated verifier (asr)", "Isolated verifier (documentation)",
   "Isolated verifier (browser-1)", "Isolated verifier (browser-2)", "Merged isolated coverage",
+  "Codex native recovery (0.166.0)",
 ];
 const productionJobs = productionJobNames.map((name, index) => ({
   ...hubJob, id: 501 + index, name,
