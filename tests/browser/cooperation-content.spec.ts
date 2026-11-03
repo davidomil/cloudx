@@ -126,6 +126,69 @@ async function boardViewport(page: Page) {
     });
 }
 
+async function dragTextToBoard(
+  page: Page,
+  text: string,
+  format: "selection" | "text/plain" | "text/uri-list",
+  target = page.getByTestId("cooperation-canvas"),
+) {
+  await page.evaluate(
+    ({ text, format }) => {
+      const source = document.createElement("p");
+      source.id = "board-drag-source";
+      source.textContent = text;
+      source.style.cssText =
+        "position:fixed;left:20px;top:10px;z-index:10000;margin:0;padding:8px;background:white;color:black;font:12px monospace;white-space:pre;user-select:text";
+      source.draggable = format !== "selection";
+      source.addEventListener("dragstart", (event) => {
+        if (format !== "selection") event.dataTransfer!.setData(format, text);
+        source.dataset.types = JSON.stringify([...event.dataTransfer!.types]);
+      });
+      source.addEventListener("dragend", () => {
+        source.dataset.ended = "true";
+      });
+      document.querySelector(".cooperation-board")!.addEventListener(
+        "drop",
+        () => {
+          source.dataset.dropped = "true";
+        },
+        { capture: true, once: true },
+      );
+      document.body.append(source);
+      if (format === "selection") {
+        const range = document.createRange();
+        range.selectNodeContents(source);
+        window.getSelection()!.removeAllRanges();
+        window.getSelection()!.addRange(range);
+      }
+    },
+    { text, format },
+  );
+  const source = page.locator("#board-drag-source");
+  const from = (await source.boundingBox())!;
+  const canvas = (await target.boundingBox())!;
+  const point = {
+    x: Math.round(canvas.x + canvas.width * 0.65),
+    y: Math.round(canvas.y + canvas.height * 0.55),
+  };
+  const view = await boardViewport(page);
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(from.x + from.width / 2 + 8, from.y + from.height / 2, {
+    steps: 2,
+  });
+  await page.mouse.move(point.x - 5, point.y, { steps: 8 });
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.up();
+  await expect(source).toHaveAttribute("data-ended", "true");
+  const types: string[] = JSON.parse(
+    (await source.getAttribute("data-types"))!,
+  );
+  const dropped = (await source.getAttribute("data-dropped")) === "true";
+  await source.evaluate((element) => element.remove());
+  return { point, view, types, dropped };
+}
+
 function wave() {
   const bytes = Buffer.alloc(44 + 8000);
   bytes.write("RIFF", 0);
@@ -537,6 +600,87 @@ test("clipboard files and dropped files or web links use the shared content path
   expect(
     (await boards.resolveAsset(id, pasted.content.assetId)).bytes.toString(),
   ).toBe("Original pasted evidence");
+});
+
+for (const format of ["selection", "text/plain", "text/uri-list"] as const) {
+  test(`real ${format} URL drags create one link at the drop position`, async ({
+    page,
+  }) => {
+    const id = await createBoard(page, `URL drag ${format}`);
+    const url = "https://example.com/dragged";
+    const { point, view, types, dropped } = await dragTextToBoard(
+      page,
+      url,
+      format,
+    );
+    expect(types).toContain(format === "selection" ? "text/plain" : format);
+    if (format === "selection") {
+      expect(types).toContain("text/html");
+      expect(types).not.toContain("text/uri-list");
+    }
+    expect(dropped).toBe(true);
+    await expect.poll(() => boards.getBoard(id).items.length).toBe(1);
+    const item = boards.getBoard(id).items[0]!;
+    expect(item.kind).toBe("link");
+    expect(item.content).toMatchObject({ url });
+    expect(item.geometry.x).toBeCloseTo(
+      Math.round((point.x - view.left - view.x) / view.zoom / 20) * 20,
+    );
+    expect(item.geometry.y).toBeCloseTo(
+      Math.round((point.y - view.top - view.y) / view.zoom / 20) * 20,
+    );
+    await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+      "Saved",
+    );
+  });
+}
+
+test("real plain-text drags reject ordinary text and unsafe URLs", async ({
+  page,
+}) => {
+  const id = await createBoard(page, "Rejected URL drags");
+  let writes = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().endsWith("/transactions"))
+      writes++;
+  });
+  for (const text of [
+    "Ordinary text",
+    "javascript:alert(1)",
+    "https://user:secret@example.com/",
+  ]) {
+    const { types, dropped } = await dragTextToBoard(page, text, "text/plain");
+    expect(types).toEqual(["text/plain"]);
+    expect(dropped).toBe(true);
+  }
+  expect(writes).toBe(0);
+  expect(boards.getBoard(id).items).toEqual([]);
+});
+
+test("real URL text drops edit a note field without creating another item", async ({
+  page,
+}) => {
+  const id = await createBoard(page, "Editor URL drag");
+  await page
+    .getByRole("button", { name: "Board outline", exact: true })
+    .click();
+  await page.getByRole("button", { name: "Note", exact: true }).click();
+  await expect(page.locator(".cooperation-save-state:visible")).toContainText(
+    "Saved",
+  );
+  const editor = page.getByLabel("Text block 1", { exact: true });
+  await editor.scrollIntoViewIfNeeded();
+  const url = "https://example.com/editor";
+  const { dropped } = await dragTextToBoard(page, url, "text/plain", editor);
+  expect(dropped).toBe(true);
+  await expect(editor).toHaveValue(url);
+  expect(boards.getBoard(id).items).toHaveLength(1);
+  expect(boards.getBoard(id).items[0]!.kind).toBe("note");
+  await page.getByRole("button", { name: "Save changes", exact: true }).click();
+  await expect
+    .poll(() => boards.getBoard(id).items[0]!.content)
+    .toMatchObject({ blocks: [{ text: url }] });
+  expect(boards.getBoard(id).items).toHaveLength(1);
 });
 
 test("file headers move with no selected tool and native controls do not move the item", async ({
