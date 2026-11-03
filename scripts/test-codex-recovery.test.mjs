@@ -31,8 +31,8 @@ it("rejects a selected executable that cannot report its version", () => {
 });
 
 it.each([
-  ["0.153.4", undefined, "Expected supported Codex 0.156.1 or 0.157.1; found 0.153.4"],
-  ["0.155.1", undefined, "Expected supported Codex 0.156.1 or 0.157.1; found 0.155.1"],
+  ["0.153.4", undefined, "Expected supported Codex 0.156.1 or 0.157.1 or 0.166.0; found 0.153.4"],
+  ["0.155.1", undefined, "Expected supported Codex 0.156.1 or 0.157.1 or 0.166.0; found 0.155.1"],
   ["0.156.1", "0.157.1", "Expected supported Codex 0.157.1; found 0.156.1"]
 ])("rejects unsupported or mismatched native version %s", async (version, expected, diagnostic) => {
   const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-version-"));
@@ -45,10 +45,10 @@ it.each([
   expect(result.stdout).not.toContain("RUN");
 });
 
-it.each(["installer", "0.156.1"])("CI installs and validates the exact %s native version", async release => {
+it.each(["installer", "0.156.1", "0.166.0"])("CI installs and validates the exact %s native version", async release => {
   const workflow = parse(await fs.readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
   const job = workflow.jobs["codex-native"];
-  expect(job.strategy.matrix.codex).toEqual(["installer", "0.156.1"]);
+  expect(job.strategy.matrix.codex).toEqual(["installer", "0.156.1", "0.166.0"]);
   const install = job.steps.find(step => step.id === "codex");
   expect(install.env.CODEX_RELEASE).toBe("${{ matrix.codex }}");
   expect(job.steps.find(step => step.env?.CLOUDX_NATIVE_CODEX_VERSION).env.CLOUDX_NATIVE_CODEX_VERSION)
@@ -91,7 +91,7 @@ import { syncBuiltinESMExports } from "node:module";
 const scenario = ${JSON.stringify(scenario)};
 childProcess.spawnSync = (command, args, options) => {
   fs.appendFileSync(${JSON.stringify(commandLog)}, JSON.stringify({ command, args, timeout: options.timeout }) + "\\n");
-  if (args[0] === "--version") return { status: 0, stdout: "codex-cli 0.157.1\\n" };
+  if (args[0] === "--version") return { status: 0, stdout: "codex-cli " + (scenario.version ?? "0.157.1") + "\\n" };
   if (args[1] === "run") {
     if ((scenario.durationMs ?? 60_000) > options.timeout)
       return { error: Object.assign(new Error("Native suite deadline exceeded"), { code: "ETIMEDOUT" }), status: null, signal: "SIGTERM" };
@@ -113,7 +113,7 @@ childProcess.spawnSync = (command, args, options) => {
 syncBuiltinESMExports();
 `);
   const result = spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, runner], {
-    env: { ...process.env, CLOUDX_NATIVE_CODEX: path.join(fixture, "codex"), CLOUDX_NATIVE_CODEX_VERSION: "0.157.1" },
+    env: { ...process.env, CLOUDX_NATIVE_CODEX: path.join(fixture, "codex"), CLOUDX_NATIVE_CODEX_VERSION: scenario.version ?? "0.157.1" },
     encoding: "utf8", timeout: 5_000
   });
   const commands = (await fs.readFile(commandLog, "utf8")).trim().split("\n").map(line => JSON.parse(line));
@@ -123,8 +123,8 @@ syncBuiltinESMExports();
   return { ...result, commands };
 }
 
-it("lets the complete serial native suite finish beyond two minutes before checking the built verifier", async () => {
-  const result = await runNativeValidation({ durationMs: 180_000 });
+it.each(["0.156.1", "0.157.1", "0.166.0"])("runs the complete serial native suite and built verifier for supported %s", async version => {
+  const result = await runNativeValidation({ version, durationMs: 180_000 });
   expect(result.status, result.stderr).toBe(0);
   const suiteArgs = result.commands[1].args;
   expect(suiteArgs.slice(2, suiteArgs.indexOf("--maxWorkers=1"))).toEqual([

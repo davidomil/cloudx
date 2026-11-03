@@ -27,6 +27,16 @@ beforeEach(() => {
       if (process.env.TEST_MODE === 'runtime') {
         console.error('SECRET-TOKEN: selected conversation was not saved'); process.exit(1);
       }
+      if (process.env.TEST_MODE.startsWith('runtime-diagnostic-')) {
+        console.error('SECRET-TOKEN: private native transcript detail');
+        const mode = process.env.TEST_MODE.slice('runtime-diagnostic-'.length);
+        const diagnostic = { stage: 'interactive-evidence', code: mode === 'roots' ? 'workspace-roots' : 'transcript', message: 'SECRET-TOKEN', path: '/private' };
+        if (mode === 'unknown') diagnostic.code = 'SECRET-TOKEN';
+        console.error('CLOUDX_CODEX_RUNTIME_ERROR=' + (mode === 'malformed' ? '{SECRET-TOKEN' : JSON.stringify(diagnostic)));
+        if (mode === 'duplicate') console.error('CLOUDX_CODEX_RUNTIME_ERROR=' + JSON.stringify(diagnostic));
+        if (mode === 'conflict') console.error('CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify({ stage: 'verify', code: 'candidate-state' }));
+        process.exit(1);
+      }
       if (['snapshot-size', 'snapshot-budget', 'candidate-state', 'invalid-state-diagnostic'].includes(process.env.TEST_MODE)) {
         const diagnostic = process.env.TEST_MODE === 'candidate-state' ? { stage: 'verify', code: 'candidate-state' }
           : { stage: 'snapshot', code: process.env.TEST_MODE === 'snapshot-size' ? 'database-size' : 'snapshot-budget', observedBytes: 8589934593, limitBytes: 8589934592 };
@@ -560,12 +570,37 @@ describe("shared Codex update", () => {
     const fixture = installation({ mode: "runtime", version });
     const output = [];
     const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
-    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: version, message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: version, message: expect.stringMatching(/failed native verification stage.*private update log/) });
     expect(error.message).not.toContain("SECRET-TOKEN");
     expect(output.join("")).toContain("SECRET-TOKEN: selected conversation was not saved");
     expect(fs.readFileSync(fixture.env.TEST_RUNTIME_LOG, "utf8")).toContain(version === "1.1.0" ? fixture.assistantBin : ".cloudx-codex/1.1.0-");
     expect(fs.readFileSync(fixture.env.TEST_VERSION_LOG, "utf8").trim().split("\n")).toHaveLength(version === "1.1.0" ? 1 : 2);
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
+  });
+
+  it.each(["transcript", "roots"])("preserves the active selection and reports the reached evidence stage for %s failure", async cause => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const before = fs.readFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"));
+    fixture.env.TEST_MODE = `runtime-diagnostic-${cause}`;
+    const output = [];
+
+    const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
+
+    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: "1.0.0", message: expect.stringContaining("failed at interactive turn evidence") });
+    expect(error.message).toContain(cause === "roots" ? "workspace and CloudX skills roots" : "missing, malformed, stale or mismatched");
+    expect(error.message).toContain("The active selection is unchanged");
+    expect(error.message).not.toMatch(/Forge|shared-state|SECRET-TOKEN|\/private/);
+    expect(output.join("")).toContain("SECRET-TOKEN: private native transcript detail");
+    expect(fs.readFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"))).toEqual(before);
+    expect(await readCodexVersion(resolveSelectedCodexCommand(fixture.assistantBin), { env: fixture.env })).toBe("1.0.0");
+  });
+
+  it.each(["unknown", "malformed", "duplicate", "conflict"])("rejects %s runtime diagnostic output without exposing private detail or claiming a stage", async mode => {
+    const fixture = installation({ mode: `runtime-diagnostic-${mode}` });
+    const error = await updateCodexInstallation(fixture).catch(error => error);
+    expect(error).toMatchObject({ code: "runtime-verification", usableVersion: "1.0.0", message: expect.stringContaining("could not identify the failed native verification stage") });
+    expect(error.message).not.toMatch(/Forge|shared-state|SECRET-TOKEN|\/private/);
   });
 
   it.each(["snapshot-size", "snapshot-budget"])("preserves the verified selection and reports the precise %s preparation cause", async mode => {
