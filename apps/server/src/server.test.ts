@@ -3920,7 +3920,7 @@ describe("buildServer", () => {
         )
         .map((node: { typeId: string }) => node.typeId)
         .sort();
-      expect(catalogNodes).toHaveLength(129);
+      expect(catalogNodes).toHaveLength(135);
       expect(portsMissingDescriptions).toEqual([]);
       expect(weakPortDescriptions).toEqual([]);
       expect(execOnlyFunctionNodes).toEqual([

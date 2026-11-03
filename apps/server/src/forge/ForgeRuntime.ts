@@ -12,6 +12,7 @@ import {
   isAgentTab,
   isForgeTurnCompletion,
   isRecord,
+  parseHardwareOwner,
   validateForgeDiagnosticSnapshotInput,
   type ClaudeLaunchMode,
   type ForgeDiagnosticSnapshotInput,
@@ -33,6 +34,7 @@ import {
   type WorkspaceTab,
   type DirectoryOwnershipPreview,
   type DirectoryOwnershipReconciliation,
+  type AgentOwner,
 } from "@cloudx/shared";
 
 import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliation.js";
@@ -78,6 +80,10 @@ export interface ForgePublicationLease {
 }
 
 export interface ForgeRuntimeDependencies {
+  hardware?: {
+    owner(tabId: string): Promise<AgentOwner | undefined>;
+    ended(owner: AgentOwner): Promise<void>;
+  };
   cooperation?: {
     begin(tabId: string): Promise<boolean>;
     transfer(oldTabId: string, newTabId: string): Promise<void>;
@@ -214,6 +220,7 @@ interface OwnedTab {
   quiescent: boolean;
   execution?: ForgeExecution;
   observedBootId?: string;
+  hardwareOwner?: AgentOwner;
 }
 
 /** Owns Git checkouts and Codex tabs; the service owns issue/review decisions. */
@@ -234,6 +241,15 @@ export class ForgeRuntime {
   async workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
     await this.readOwned(id);
     return this.history.read(id);
+  }
+
+  async hardwareOwnerState(owner: AgentOwner): Promise<"confirmed_ended" | "unknown"> {
+    if (owner.ownerPluginId !== "forge" || !owner.workerId || !owner.attemptId) return "unknown";
+    const owned = this.ownedTabs.get(owner.tabId) ?? await this.tabManifest(owner.tabId).read<OwnedTab>();
+    if (!owned?.hardwareOwner || owned.tabId !== owner.tabId || owned.workerId !== owner.workerId || owned.attemptId !== owner.attemptId) return "unknown";
+    const recorded = parseHardwareOwner(owned.hardwareOwner);
+    if (recorded.kind !== "agent" || (["tabId", "providerId", "executionId", "ownerPluginId", "logicalRunId", "workerId", "attemptId"] as const).some(field => recorded[field] !== owner[field])) return "unknown";
+    return owned.quiescent === true ? "confirmed_ended" : "unknown";
   }
 
   async pendingCheckoutRemoval(id: string): Promise<boolean> {
@@ -907,8 +923,7 @@ export class ForgeRuntime {
       await this.requireWorkerTab(tabId);
       if (!owned?.quiescent) await this.dependencies.sessions.executePluginAction(tabId, "stop", {});
       if (owned) {
-        owned.quiescent = true;
-        await this.tabManifest(tabId).write(owned);
+        await this.recordQuiescence(tabId, owned);
       }
       await this.captureHistory(tabId);
       if (owned?.context) await this.assertContextIdentity(owned.context);
@@ -926,8 +941,7 @@ export class ForgeRuntime {
         if (owned.observedBootId === bootId)
           throw new Error("Worker process ownership is unresolved after its terminal disappeared: no durable execution evidence was recorded. Reboot the host, then Resume to prove the old execution ended. Local resources were preserved.");
       }
-      owned.quiescent = true;
-      await this.tabManifest(tabId).write(owned);
+      await this.recordQuiescence(tabId, owned);
     }
     await this.dependencies.workspace.state(() => ({ tabs: this.dependencies.sessions.listTabs(), activeTabId: this.dependencies.sessions.getActiveTabId() }));
     if (owned && !owned.closed) {
@@ -2747,13 +2761,14 @@ export class ForgeRuntime {
     );
   }
 
-  private async recordQuiescence(tabId: string): Promise<void> {
-    const owned =
+  private async recordQuiescence(tabId: string, captured?: OwnedTab): Promise<void> {
+    const owned = captured ??
       this.ownedTabs.get(tabId) ??
       (await this.tabManifest(tabId).read<OwnedTab>());
     if (!owned) throw new Error("Worker tab ownership record is missing.");
     owned.quiescent = true;
     await this.tabManifest(tabId).write(owned);
+    if (owned.hardwareOwner) await this.dependencies.hardware?.ended(owned.hardwareOwner);
   }
 
   private async captureHistory(tabId: string): Promise<void> {
@@ -2768,6 +2783,12 @@ export class ForgeRuntime {
   }
 
   private async captureTab(tab: WorkspaceTab, owned: OwnedTab): Promise<void> {
+    const hardwareOwner = await this.dependencies.hardware?.owner(tab.id);
+    if (hardwareOwner) {
+      if (hardwareOwner.ownerPluginId !== "forge" || hardwareOwner.workerId !== owned.workerId || hardwareOwner.attemptId !== owned.attemptId)
+        throw new Error("Hardware owner does not match the exact Forge worker attempt.");
+      owned.hardwareOwner = hardwareOwner;
+    }
     owned.observedBootId ??= (await executionEnvironment()).bootId;
     const contextPath = tab.contextPath
       ? path.resolve(tab.contextPath)

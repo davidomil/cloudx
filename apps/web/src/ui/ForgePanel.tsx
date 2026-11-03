@@ -28,7 +28,7 @@ const WorkerContinuations = createContext<{
   setMessage: (workerId: string, message?: string) => void;
 } | null>(null);
 
-export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, showUsage = false, onOpenBlackboard }: {
+export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, workerTabs, active, uiScale, repositorySettingsKey, repositoryChangePending, showUsage = false, onOpenBlackboard, ownerRequest }: {
   callHook: CallHook;
   tab: WorkspaceTab;
   windowId: string;
@@ -38,6 +38,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   // Reads token usage and cost per worker; requires the agent usage plugin.
   showUsage?: boolean;
   onOpenBlackboard?: (boardId: string, title: string) => void;
+  ownerRequest?: { tabId: string; requestId: string };
   active: boolean;
   uiScale: number;
   repositorySettingsKey: string;
@@ -84,6 +85,17 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const [pendingWorkers, setPendingWorkers] = useState(new Set<string>());
   const mounted = useRef(false);
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
+  const openedOwnerRequest = useRef<string>(undefined);
+
+  useEffect(() => {
+    if (!active || !ownerRequest || !repositoryReady || !dashboard || openedOwnerRequest.current === ownerRequest.requestId) return;
+    openedOwnerRequest.current = ownerRequest.requestId;
+    setView("workers");
+    const owner = dashboard.workers.find(worker => worker.tabId === ownerRequest.tabId);
+    if (!owner) { setActionError("The original Hardware owner attempt is no longer present in Forge. Inspect its reservation history."); return; }
+    setSelectedWorkerId(owner.id);
+    setTerminalWorkerId(owner.id);
+  }, [active, ownerRequest, repositoryReady, dashboard]);
 
   useEffect(() => {
     mounted.current = true;

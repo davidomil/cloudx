@@ -119,6 +119,7 @@ function forgeRepositorySettingsKey(values: Record<string, ConfigValue> | undefi
 }
 
 const CooperationPanel = lazy(() => import("./cooperation/CooperationPanel.js").then(module => ({ default: module.CooperationPanel })));
+const HardwarePanel = lazy(() => import("./hardware/HardwarePanel.js").then(module => ({ default: module.HardwarePanel })));
 const AutomationPanel = lazy(() => import("./AutomationPanel.js").then((module) => ({ default: module.AutomationPanel })));
 const DocumentationPanel = lazy(() => import("./DocumentationPanel.js").then((module) => ({ default: module.DocumentationPanel })));
 const FileBrowserPanel = lazy(() => import("./FileBrowserPanel.js").then((module) => ({ default: module.FileBrowserPanel })));
@@ -197,6 +198,7 @@ export function App() {
   const [plugins, setPlugins] = useState<PluginDescriptor[]>([]);
   const [config, setConfig] = useState<CloudxConfigResponse | undefined>();
   const [forgeRepositoryChange, setForgeRepositoryChange] = useState({ version: 0, pending: false });
+  const [hardwareOwnerRequest, setHardwareOwnerRequest] = useState<{ tabId: string; panelId: string; requestId: string }>();
   const [rulesSkillsStore, setRulesSkillsStore] = useState<RulesSkillsStore | undefined>();
   const rulesSkillsStoreRef = useRef<RulesSkillsStore | undefined>(undefined);
   const rulesSkillsQueue = useRef(Promise.resolve());
@@ -803,6 +805,31 @@ export function App() {
     await handleCreate({ pluginId: "forge" });
   }
 
+  async function openHardwareOwner(tabId: string) {
+    try {
+      const owner = tabsRef.current.find(tab => tab.id === tabId);
+      if (!owner) throw new Error("The original Hardware owner tab is no longer available.");
+      if (owner.ownerPluginId === "forge") {
+        await openForge();
+        const panelId = activeTabIdRef.current;
+        if (!panelId || !tabsRef.current.some(tab => tab.id === panelId && tab.pluginId === "forge")) throw new Error("The Forge owner panel is unavailable.");
+        setHardwareOwnerRequest({ tabId, panelId, requestId: createBrowserId("hardware-owner") });
+        return;
+      }
+      const target = owner.ownerPluginId ? tabsRef.current.find(tab => tab.pluginId === owner.ownerPluginId && !tab.ownerPluginId) : owner;
+      if (!target) throw new Error("The Hardware owner's plugin panel is unavailable.");
+      for (const window of windowsRef.current) {
+        const pane = findPaneContainingTab(window.layout.root, target.id);
+        if (!pane) continue;
+        if (window.id !== activeWindowIdRef.current) await handleSelectWindow(window.id);
+        setMaximizedPaneId(undefined);
+        await activateTab(target.id, pane.id);
+        return;
+      }
+      throw new Error("The Hardware owner has no workspace pane.");
+    } catch (error) { setError(error instanceof Error ? error.message : String(error)); }
+  }
+
   async function handleCreate(input: Omit<CreateTabRequest, "windowId" | "paneId">) {
     setError(undefined);
     try {
@@ -1307,6 +1334,7 @@ export function App() {
     },
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
     "cooperation.panel": (_contribution, context) => context.tab ? <Suspense fallback={<div className="empty-pane">Loading blackboard…</div>}><CooperationPanel tab={context.tab} tabs={tabs} active={context.active === true} onOpenBoard={openBlackboard} /></Suspense> : null,
+    "hardware.panel": (_contribution, context) => context.tab ? <Suspense fallback={<div className="empty-pane">Loading hardware…</div>}><HardwarePanel tab={context.tab} tabs={tabs} onOpenOwner={tabId => { void openHardwareOwner(tabId); }} /></Suspense> : null,
     "jira.panel": (_contribution, context) => context.callHook ? (
       <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
         <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />
@@ -1316,7 +1344,7 @@ export function App() {
       const pane = context.tab ? findPaneContainingTab(layout.root, context.tab.id) : undefined;
       if (!context.callHook || !context.tab || !activeWindowId || !pane) return <div className="empty-pane">Forge workspace is unavailable.</div>;
       return <Suspense fallback={<div className="empty-pane">Loading Forge...</div>}>
-        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} showUsage={usageAvailable} onOpenBlackboard={cooperationEnabled ? (boardId, title) => { void openBlackboard(boardId, title); } : undefined} />
+        <ForgePanel key={context.tab.id} callHook={context.callHook} tab={context.tab} windowId={activeWindowId} paneId={pane.id} workerTabs={tabs} active={context.active === true} uiScale={uiScale} repositorySettingsKey={`${forgeRepositoryChange.version}:${forgeRepositorySettingsKey(config?.values.plugins.forge)}`} repositoryChangePending={forgeRepositoryChange.pending} onOpenSettings={() => setSettingsOpen(true)} showUsage={usageAvailable} ownerRequest={hardwareOwnerRequest?.panelId === context.tab.id ? hardwareOwnerRequest : undefined} onOpenBlackboard={cooperationEnabled ? (boardId, title) => { void openBlackboard(boardId, title); } : undefined} />
       </Suspense>;
     },
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),

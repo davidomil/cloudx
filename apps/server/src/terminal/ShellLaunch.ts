@@ -28,7 +28,7 @@ export function buildToolEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Proce
     ...splitPath(env.PATH)
   ].filter((entry): entry is string => Boolean(entry));
   return {
-    ...env,
+    ...Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith("CLOUDX_HARDWARE_CREDENTIAL_"))),
     PATH: dedupe(pathEntries).join(path.delimiter)
   };
 }

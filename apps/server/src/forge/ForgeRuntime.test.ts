@@ -12,7 +12,7 @@ import { createRoot } from "react-dom/client";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
-import type { DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeReviewRevision, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
+import type { AgentOwner, DirectoryOwnershipPreview, DirectoryOwnershipReconciliation, ForgeChangeRequest, ForgeReviewRevision, ForgeTurnCompletion, ForgeWorker, WorkspaceTab } from "@cloudx/shared";
 
 import { PathPolicy } from "../pathPolicy.js";
 import { ForgeCheckoutEvidence } from "./ForgeCheckoutEvidence.js";
@@ -4528,6 +4528,140 @@ describe("ForgeRuntime Codex tabs", () => {
   });
 });
 
+
+describe("ForgeRuntime hardware ownership", () => {
+  async function hardwareWorker(providerId: AgentOwner["providerId"] = "codex") {
+    const deps = dependencies();
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare("hardware-worker");
+    const tab = workerTab(workspace);
+    const attemptId = "hardware-attempt-1";
+    const ownerAtLaunch: AgentOwner = { kind: "agent", tabId: tab.id, providerId, executionId: randomUUID(), ownerPluginId: "forge", logicalRunId: workspace.id, workerId: workspace.id, attemptId };
+    let currentOwner = ownerAtLaunch;
+    const tabFile = path.join(deps.dataDir, "forge-workers", "tabs", `${tab.id}.json`);
+    const readTab = async () => JSON.parse(await fs.readFile(tabFile, "utf8"));
+    const ended = vi.fn(async (owner: AgentOwner) => {
+      expect((await readTab()).quiescent).toBe(true);
+      expect(owner).toEqual(ownerAtLaunch);
+    });
+    deps.hardware = { owner: vi.fn(async () => currentOwner), ended };
+    vi.mocked(deps.sessions.getTab).mockReturnValue(tab);
+    vi.mocked(deps.sessions.listTabs).mockReturnValue([tab]);
+    vi.mocked(deps.sessions.discardPreparedTab).mockImplementation(async () => { vi.mocked(deps.sessions.listTabs).mockReturnValue([]); });
+    let execution!: { executionId: string; directory: string; bootId: string; pidNamespace: string };
+    vi.mocked(deps.workspaceCommands.createTab).mockImplementation(async (_request, options) => {
+      execution = await options!.prepareTerminalExecution!(tab.id);
+      expect((await readTab()).hardwareOwner).toEqual(ownerAtLaunch);
+      expect(ended).not.toHaveBeenCalled();
+      return { tab } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
+    });
+    await runtime.launch({ id: workspace.id, worktreePath: workspace.worktreePath, templateId: "worker", model: providerId === "claude" ? "claude-opus-5-5" : codingModel.model,
+      reasoningEffort: codingModel.reasoningEffort, attemptId, prompt: "Validate reserved hardware.", windowId: "window", paneId: "pane" });
+    const tracking = vi.mocked(deps.workspaceCommands.createTab).mock.calls[0]![1]!.agentTurn!;
+    const completion: ForgeTurnCompletion = { workerId: workspace.id, attemptId, threadId: randomUUID(), turnId: randomUUID(), status: "completed" };
+    await fs.writeFile(tracking.receiptPath, JSON.stringify(completion));
+    const processStat = await fs.readFile(`/proc/${process.pid}/stat`, "utf8");
+    const supervisor = { executionId: execution.executionId, bootId: execution.bootId, pidNamespace: execution.pidNamespace,
+      pid: process.pid, started: processStat.slice(processStat.lastIndexOf(")") + 2).split(" ")[19] };
+    await fs.writeFile(path.join(execution.directory, "ready.json"), JSON.stringify(supervisor));
+    const confirmQuiescence = () => fs.writeFile(path.join(execution.directory, "complete.json"), JSON.stringify({ ...supervisor, exitCode: 0 }));
+    return { deps, workspace, tab, ownerAtLaunch, ended, completion, readTab, confirmQuiescence,
+      replaceOwner: () => { currentOwner = { ...ownerAtLaunch, providerId: "claude", executionId: randomUUID(), attemptId: "replacement-attempt" }; return currentOwner; } };
+  }
+
+  it.each(["codex", "claude"] as const)("persists the exact %s Hardware owner before worker execution can start", async providerId => {
+    const f = await hardwareWorker(providerId);
+    expect(await f.readTab()).toMatchObject({ tabId: f.tab.id, workerId: f.workspace.id, attemptId: f.ownerAtLaunch.attemptId, hardwareOwner: f.ownerAtLaunch, quiescent: false });
+    expect(f.deps.hardware!.owner).toHaveBeenCalledWith(f.tab.id);
+    expect(f.ended).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "finish", "close"] as const)("reports the original Hardware owner only after %s confirms quiescence", async action => {
+    const f = await hardwareWorker();
+    let stopping!: () => void, stopped!: () => void;
+    const began = new Promise<void>(resolve => { stopping = resolve; });
+    const confirmation = new Promise<void>(resolve => { stopped = resolve; });
+    vi.mocked(f.deps.sessions.executePluginAction).mockImplementation(async () => { stopping(); await confirmation; return {}; });
+    const pending = action === "finish" ? runtime.finish(f.tab.id, f.completion) : runtime[action](f.tab.id);
+    await began;
+    expect(f.ended).not.toHaveBeenCalled();
+    expect((await f.readTab()).quiescent).toBe(false);
+    await f.confirmQuiescence();
+    stopped();
+    await pending;
+    expect(f.ended).toHaveBeenCalledExactlyOnceWith(f.ownerAtLaunch);
+    expect((await f.readTab()).quiescent).toBe(true);
+  });
+
+  it.each(["pause", "finish", "close"] as const)("retains Hardware ownership when %s cannot terminate the worker", async action => {
+    const f = await hardwareWorker();
+    vi.mocked(f.deps.sessions.executePluginAction).mockRejectedValue(new Error("Original worker descendants are still running."));
+    await expect(action === "finish" ? runtime.finish(f.tab.id, f.completion) : runtime[action](f.tab.id)).rejects.toThrow("descendants are still running");
+    expect(f.ended).not.toHaveBeenCalled();
+    expect((await f.readTab()).quiescent).toBe(false);
+    expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
+  it.each(["finish", "close"] as const)("does not notify Hardware when %s lacks matching supervisor completion evidence", async action => {
+    const f = await hardwareWorker();
+    if (action === "close") vi.mocked(f.deps.sessions.listTabs).mockReturnValue([]);
+    runtime = new ForgeRuntime(f.deps);
+    await expect(action === "finish" ? runtime.finish(f.tab.id, f.completion) : runtime.close(f.tab.id)).rejects.toThrow("descendants stopped");
+    expect(f.ended).not.toHaveBeenCalled();
+    expect((await f.readTab()).quiescent).toBe(false);
+    expect(f.deps.sessions.discardPreparedTab).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "finish", "close"] as const)("uses the durable original Hardware execution after restart and replacement during %s", async action => {
+    const f = await hardwareWorker();
+    const replacement = f.replaceOwner();
+    const captures = vi.mocked(f.deps.hardware!.owner).mock.calls.length;
+    await f.confirmQuiescence();
+    runtime = new ForgeRuntime(f.deps);
+    if (action === "finish") await runtime.finish(f.tab.id, f.completion);
+    else await runtime[action](f.tab.id);
+    expect(f.ended).toHaveBeenCalledExactlyOnceWith(f.ownerAtLaunch);
+    expect(f.ended).not.toHaveBeenCalledWith(replacement);
+    expect(f.deps.hardware!.owner).toHaveBeenCalledTimes(captures);
+    expect((await f.readTab()).hardwareOwner).toEqual(f.ownerAtLaunch);
+    expect((await f.readTab()).quiescent).toBe(true);
+    await expect(new ForgeRuntime(f.deps).hardwareOwnerState(f.ownerAtLaunch)).resolves.toBe("confirmed_ended");
+  });
+
+  it("recovers exact Hardware quiescence after interruption between its durable checkpoint and notification", async () => {
+    const f = await hardwareWorker();
+    f.ended.mockRejectedValue(new Error("Hardware notification was interrupted after the saved checkpoint."));
+    await f.confirmQuiescence();
+    await expect(runtime.pause(f.tab.id)).rejects.toThrow("notification was interrupted");
+    expect((await f.readTab()).quiescent).toBe(true);
+    f.replaceOwner();
+    runtime = new ForgeRuntime(f.deps);
+    await expect(runtime.hardwareOwnerState(f.ownerAtLaunch)).resolves.toBe("confirmed_ended");
+    expect(f.ended).toHaveBeenCalledOnce();
+  });
+
+  it("cannot infer Hardware termination from missing or unquiescent worker evidence", async () => {
+    const f = await hardwareWorker();
+    runtime = new ForgeRuntime(f.deps);
+    await expect(runtime.hardwareOwnerState(f.ownerAtLaunch)).resolves.toBe("unknown");
+    await expect(runtime.hardwareOwnerState({ ...f.ownerAtLaunch, tabId: "missing-owned-tab" })).resolves.toBe("unknown");
+    expect(f.ended).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse a durable Hardware termination checkpoint for another execution or worker attempt", async () => {
+    const f = await hardwareWorker();
+    await f.confirmQuiescence();
+    await runtime.pause(f.tab.id);
+    runtime = new ForgeRuntime(f.deps);
+    const mismatches: Partial<AgentOwner>[] = [
+      { executionId: randomUUID() }, { attemptId: "replacement-attempt" }, { providerId: "claude" },
+      { workerId: "replacement-worker" }, { logicalRunId: "replacement-run" }, { ownerPluginId: "replacement-plugin" }, { tabId: "replacement-tab" }
+    ];
+    for (const mismatch of mismatches) expect(await runtime.hardwareOwnerState({ ...f.ownerAtLaunch, ...mismatch }), JSON.stringify(mismatch)).toBe("unknown");
+    await expect(runtime.hardwareOwnerState(f.ownerAtLaunch)).resolves.toBe("confirmed_ended");
+    expect(f.ended).toHaveBeenCalledExactlyOnceWith(f.ownerAtLaunch);
+  });
+});
 
 describe("Legacy filesystem ownership reconciliation", () => {
   beforeEach(() => {

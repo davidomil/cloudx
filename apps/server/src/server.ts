@@ -136,8 +136,21 @@ import { registerCooperationRoutes } from "./cooperationHost/CooperationRoutes.j
 import { NativeAgentFeedbackPort } from "./cooperationAgent/NativeAgentFeedbackPort.js";
 import { CooperationFeedbackDelivery } from "./cooperationAgent/CooperationFeedbackDelivery.js";
 import { ForgeCooperationFeedback } from "./cooperationHost/ForgeCooperationFeedback.js";
+import { HardwarePlugin } from "./plugins/HardwarePlugin.js";
+import { HardwareService } from "./hardware/HardwareService.js";
+import { HardwareTypeRegistry } from "./hardware/HardwareTypeRegistry.js";
+import { createHardwareProviders } from "./hardware/transports/index.js";
+import { AgentHardwareContext, ownerIdentity } from "./hardware/AgentHardwareContext.js";
+import { HardwareOwnerMonitor } from "./hardware/HardwareOwnerMonitor.js";
+import { registerHardwareRoutes } from "./hardware/HardwareRoutes.js";
+import { hardwareCredentialResolver } from "./hardware/hardwareCredentials.js";
+import { hardwareAgentReadiness } from "./hardware/HardwareAgentReadiness.js";
+import { AgentLaunchRecords } from "./agents/AgentLaunchRecords.js";
 
 export interface AppServices {
+  hardware?: HardwareService;
+  hardwareContexts?: AgentHardwareContext;
+  hardwareMonitor?: HardwareOwnerMonitor;
   cooperation?: BlackboardService;
   cooperationContexts?: AgentCooperationContext;
   cooperationReady?: Promise<void>;
@@ -272,6 +285,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       return shutdownPromise;
     }
     services.cooperationHost?.beginShutdown();
+    services.hardwareMonitor?.beginShutdown();
+    services.hardware?.beginShutdown();
     services.cooperationForge?.dispose();
     let voiceAdmissionFailure: unknown;
     try {
@@ -319,6 +334,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       failures.push(...await setupShutdown);
       failures.push(...await rulesSkillsUpdatesShutdown);
       failures.push(...await settleDisposers([() => services.cooperationHost?.dispose()]));
+      failures.push(...await settleDisposers([() => services.hardwareMonitor?.dispose(), () => services.hardware?.dispose()]));
       services.cooperationNative?.close();
       failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
       failures.push(...await sourceShutdown);
@@ -336,6 +352,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await services.cooperationReady;
     await services.pluginContributionsReady;
     await services.sessions.restore?.(services.pluginContributionsReady);
+    if (services.hardware) {
+      await services.forge?.dashboard();
+      await services.hardware.init();
+      await services.hardwareMonitor?.start();
+    }
     if (services.cooperation && services.cooperationContexts) {
       // Forge restores its embedded sessions while loading the dashboard. Its
       // polling timer is not a restoration barrier.
@@ -373,6 +394,8 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   if (services.cooperation && services.cooperationContexts) {
     await registerCooperationRoutes(app, { boards: services.cooperation, contexts: services.cooperationContexts, sessions: services.sessions, feedback: services.cooperationFeedback });
   }
+  if (services.hardware && services.hardwareContexts) await registerHardwareRoutes(app, services.hardware, services.hardwareContexts,
+    { agentReadiness: () => hardwareAgentReadiness(services.sessions, new AgentLaunchRecords(config.dataDir)) });
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer", bodyLimit: config.voiceAudioUploadMaxBytes }, (_request, body, done) => {
     done(null, body);
@@ -1475,6 +1498,25 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_DOCUMENTATION_URL ??= documentationUrl;
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
+  let hardware: HardwareService | undefined;
+  let hardwareMonitor: HardwareOwnerMonitor | undefined;
+  let forgeRuntime: ForgeRuntime | undefined;
+  const hardwareContexts = new AgentHardwareContext({
+    dataDir: config.dataDir, caPath: config.https?.certPath,
+    endpoint: () => `${config.https ? "https" : "http"}://127.0.0.1:${config.port}/api/hardware/agent`,
+    binding: tabId => {
+      if (!sessions) return undefined;
+      let tab;
+      try { tab = sessions.getTab(tabId); } catch { return undefined; }
+      if (!isAgentTab(tab)) return undefined;
+      const providerId = sessions.agentProvider(tabId);
+      const lineage = sessions.agentLineage(tabId);
+      if (!providerId || !lineage.executionId || tab.ownerPluginId && (!lineage.logicalRunId || !lineage.attemptId)) return undefined;
+      return { kind: "agent", tabId, providerId, executionId: lineage.executionId,
+        ...(tab.ownerPluginId ? { ownerPluginId: tab.ownerPluginId, logicalRunId: lineage.logicalRunId, attemptId: lineage.attemptId,
+          ...(tab.ownerPluginId === "forge" ? { workerId: lineage.logicalRunId } : {}) } : {}) };
+    }
+  });
   const cooperationContexts = new AgentCooperationContext({
     dataDir: config.dataDir,
     caPath: config.https?.certPath,
@@ -1533,6 +1575,10 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
   plugins.register(new CooperationPlugin());
+  plugins.register(new HardwarePlugin(createHardwareProviders({ pathPolicy }), (action, input, owner) => {
+    if (!hardware) throw new Error("The Hardware service is unavailable.");
+    return hardware.execute(action, input, owner);
+  }));
   plugins.register(new DocumentationPlugin(documentation, pathPolicy, documentationIngestQueue, () => documentationEnrichment));
   plugins.register(new WorktreeManagerPlugin(new WorktreeService(pathPolicy)));
   plugins.register(new WorkspaceControlPlugin());
@@ -1571,17 +1617,30 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   for (const plugin of installedPlugins.pluginsFromCatalog()) {
     plugins.register(plugin);
   }
+  hardware = new HardwareService({ dataDir: config.dataDir, pathPolicy, registry: new HardwareTypeRegistry(plugins.values()), resolveCredential: hardwareCredentialResolver(),
+    ownerState: async owner => {
+      if (owner.kind === "user") return "active";
+      if (owner.ownerPluginId === "forge" && await forgeRuntime?.hardwareOwnerState(owner) === "confirmed_ended") return "confirmed_ended";
+      const current = await hardwareContexts.owner(owner.tabId);
+      if (!current || ownerIdentity(current) !== ownerIdentity(owner)) return "unknown";
+      if (sessions?.listTabs().find(tab => tab.id === owner.tabId)?.status !== "running") return "unknown";
+      try { return sessions.getSession(owner.tabId).hasExited?.() === false ? "active" : "unknown"; }
+      catch { return "unknown"; }
+    } });
   const configService = new ConfigService(config.dataDir, () => plugins.list(), { voiceModel: config.voiceModel });
   jira = new JiraIntegrationService(configService, new JiraDashboardFilterStore(pluginData));
   sessions = new SessionStore(plugins, pathPolicy, new TabContextService(config.dataDir), configService, workspace, {
-    runtimeContextFor: async (tab, window) => cooperationContexts.augmentRuntimeContext(tab, await rulesSkills.runtimeContextFor(tab, window)),
+    runtimeContextFor: async (tab, window) => hardwareContexts.augmentRuntimeContext(tab, await cooperationContexts.augmentRuntimeContext(tab, await rulesSkills.runtimeContextFor(tab, window))),
     tabIndicatorFor: (tab, window) => rulesSkills.tabIndicatorFor(tab, window),
-    prepareExecution: async tab => { await cooperationContexts.prepare(tab.id); }
+    prepareExecution: async tab => { await cooperationContexts.prepare(tab.id); await hardwareMonitor?.executionChanged(tab.id); },
+    executionEnded: async (tab, execution) => { await hardwareMonitor?.confirmedEnded({ kind: "agent", tabId: tab.id, ...execution }); }
   }, (error, details) => {
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   }, new SessionStateStore(config.dataDir));
   const cooperationHost = new CooperationHost(cooperation, cooperationContexts, sessions,
     error => logger?.error({ err: error }, "Cooperation host synchronization failed."), cooperationNative);
+  hardwareMonitor = new HardwareOwnerMonitor({ sessions, contexts: hardwareContexts, hardware,
+    report: error => logger?.error({ err: error }, "Hardware owner synchronization failed.") });
   const workspaceCommands = new WorkspaceCommandService(sessions, workspace);
   const forgeConnections: ForgeConnectionService = new ForgeConnectionService({
     repository: () => settingsForForge.repository(),
@@ -1599,7 +1658,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     logger,
     provider: (repository, role, signal, context) => settingsForForge.provider(repository, role, signal,
       context ? diagnostic => forgeLog(logger, "warn", "provider_request_failed", { ...context, forgeRequest: diagnostic }) : undefined),
-    runtime: new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, logger, dataDir: config.dataDir, cooperation: { begin: tabId => cooperationHost.beginContinuation(tabId), transfer: (oldId, newId) => cooperationHost.transferContinuation(oldId, newId), abort: tabId => cooperationHost.abortContinuation(tabId) }, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
+    runtime: forgeRuntime = new ForgeRuntime({ sessions, workspaceCommands, workspace, rulesSkills, pathPolicy, logger, dataDir: config.dataDir, hardware: { owner: tabId => hardwareContexts.owner(tabId), ended: owner => hardwareMonitor!.confirmedEnded(owner) }, cooperation: { begin: tabId => cooperationHost.beginContinuation(tabId), transfer: (oldId, newId) => cooperationHost.transferContinuation(oldId, newId), abort: tabId => cooperationHost.abortContinuation(tabId) }, gitAccess: (repository, role, signal) => settingsForForge.gitAccess(repository, role, signal), isRepositoryTrusted: repository => settingsForForge.isRepositoryTrusted(repository) }),
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     cleanupDisposableResources: worker => forgeResources.retire(worker),
@@ -1672,7 +1731,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates };
+  return { hardware, hardwareContexts, hardwareMonitor, cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

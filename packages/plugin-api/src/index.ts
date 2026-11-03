@@ -237,6 +237,7 @@ export interface PluginTabControls {
 }
 
 export interface WorkspacePlugin {
+  hardwareTypes?: HardwareTypeProvider<unknown>[];
   id: PluginId;
   acronym: string;
   displayName: string;
@@ -401,3 +402,5 @@ export function displayTitleFromIdentifier(value: string): string {
 function snakeToCamel(value: string): string {
   return value.replace(/_([a-z0-9])/g, (_match, next: string) => next.toUpperCase());
 }
+export type { HardwareAccessContext, HardwareConnection, HardwareTypeProvider } from "./hardware.js";
+import type { HardwareTypeProvider } from "./hardware.js";

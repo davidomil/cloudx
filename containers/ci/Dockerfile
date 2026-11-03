@@ -16,7 +16,7 @@ COPY --from=node /usr/local/include/node/ /usr/local/include/node/
 COPY --from=node /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends build-essential git python3 python3-venv ripgrep \
+    && apt-get install --yes --no-install-recommends build-essential git openssh-client python3 python3-venv ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/cloudx-base
