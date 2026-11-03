@@ -40,6 +40,7 @@ export interface Invocation {
 /** Real persistence, admission, hooks and HTTP routes; deterministic device I/O only. */
 export class HardwareBrowserService {
   readonly invocations: Invocation[] = [];
+  invokeGate?: Promise<void>;
   readonly service: HardwareService;
   ssh!: HardwareItem;
   uart!: HardwareItem;
@@ -116,6 +117,7 @@ export class HardwareBrowserService {
     input: JsonObject,
   ): Promise<ProviderOutcome<JsonObject>> {
     this.invocations.push({ operationId, input: structuredClone(input) });
+    await this.invokeGate;
     if (input.script === "uncertain")
       return {
         state: "unknown",

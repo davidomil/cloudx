@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -43,7 +43,23 @@ export function HardwareInventory({
   busy: boolean;
   run: HardwareRun;
 }) {
-  const [filter, setFilter] = useState<HardwareFilter>({});
+  const [storedFilter, setFilter] = useState<HardwareFilter>({});
+  const statuses = storedFilter.statuses?.filter((predicate) =>
+    state.statusDefinitions.some(
+      (definition) => definition.id === predicate.definitionId,
+    ),
+  );
+  const filter =
+    statuses?.length === storedFilter.statuses?.length
+      ? storedFilter
+      : { ...storedFilter, statuses };
+  useEffect(() => {
+    if (filter !== storedFilter) setFilter(filter);
+  }, [filter, storedFilter]);
+  const statusRequirement = filter.statuses?.[0];
+  const statusDefinition = state.statusDefinitions.find(
+    (definition) => definition.id === statusRequirement?.definitionId,
+  );
   const [tagMode, setTagMode] = useState<"all" | "any" | "none">("all");
   const [tagIds, setTagIds] = useState<string[]>([]);
   const [descending, setDescending] = useState(false);
@@ -236,17 +252,15 @@ export function HardwareInventory({
                 ))}
               </select>
             </label>
-            {filter.statuses?.[0] ? (
+            {statusDefinition && statusRequirement ? (
               <StatusInput
                 label="Filter status value"
-                definition={state.statusDefinitions.find(
-                  (value) => value.id === filter.statuses![0]!.definitionId,
-                )!}
-                value={filter.statuses[0].equals}
+                definition={statusDefinition}
+                value={statusRequirement.equals}
                 onChange={(equals) =>
                   setFilter({
                     ...filter,
-                    statuses: [{ ...filter.statuses![0]!, equals }],
+                    statuses: [{ ...statusRequirement, equals }],
                   })
                 }
               />

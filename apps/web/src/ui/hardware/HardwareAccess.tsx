@@ -26,6 +26,7 @@ export function HardwareAccess({
   summary,
   busy,
   run,
+  receipt,
   onBack,
   onEdit,
 }: {
@@ -33,6 +34,7 @@ export function HardwareAccess({
   summary: HardwareSummary;
   busy: boolean;
   run: HardwareRun;
+  receipt?: OperationReceipt;
   onBack: () => void;
   onEdit: () => void;
 }) {
@@ -41,7 +43,6 @@ export function HardwareAccess({
     id: string;
     opening: boolean;
   }>();
-  const [receipt, setReceipt] = useState<OperationReceipt>();
   const [error, setError] = useState<string>();
   const owned = Boolean(claim && sameOwner(claim.owner, state.currentOwner));
   const active = Boolean(
@@ -49,8 +50,12 @@ export function HardwareAccess({
   );
   const confirmed = active && claim?.accessState === "open";
   const currentReceipt =
-    state.receipts.find((value) => value.requestId === receipt?.requestId) ??
-    receipt;
+    receipt?.reservation &&
+    (!claim ||
+      (receipt.reservation.reservationId === claim.reservationId &&
+        receipt.reservation.generation === claim.generation))
+      ? receipt
+      : undefined;
   useEffect(() => {
     const result =
       connectionRequest &&
@@ -63,11 +68,8 @@ export function HardwareAccess({
       opening ? "hardware.access.open" : "hardware.access.close",
       { reservationId: claim.reservationId, generation: claim.generation },
     );
-    if (result) {
-      setReceipt(result);
-      if (result.state === "running")
-        setConnectionRequest({ id: result.requestId, opening });
-    }
+    if (result?.state === "running")
+      setConnectionRequest({ id: result.requestId, opening });
   }
   async function invoke(operationId: string, input: JsonObject) {
     setError(undefined);
@@ -77,13 +79,12 @@ export function HardwareAccess({
       );
       return;
     }
-    const result = await run("hardware.access.invoke", {
+    await run("hardware.access.invoke", {
       reservationId: claim.reservationId,
       generation: claim.generation,
       operationId,
       input,
     });
-    if (result) setReceipt(result);
   }
   return (
     <section className="hardware-access">

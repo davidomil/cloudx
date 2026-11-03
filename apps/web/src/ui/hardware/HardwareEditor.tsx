@@ -100,6 +100,11 @@ export function HardwareEditor({
   const edit = (patch: Partial<HardwareItemDraft>) =>
     setDraft({ ...draft, value: { ...value, ...patch } });
   async function save() {
+    const newGroupName =
+      !held && !value.physicalResourceId
+        ? draft.newGroupName.trim()
+        : undefined;
+    const { physicalResourceId: _physicalResourceId, ...withoutGroup } = value;
     const patch = held
       ? {
           name: value.name,
@@ -108,7 +113,9 @@ export function HardwareEditor({
           tagIds: value.tagIds,
           enabled: value.enabled,
         }
-      : value;
+      : newGroupName !== undefined
+        ? withoutGroup
+        : value;
     const receipt = await run(
       item ? "hardware.items.update" : "hardware.items.create",
       item
@@ -116,6 +123,7 @@ export function HardwareEditor({
             hardwareId: item.id,
             expectedItemRevision: draft.baseRevision,
             patch,
+            ...(newGroupName !== undefined ? { newGroupName } : {}),
           }
         : {
             item: value,

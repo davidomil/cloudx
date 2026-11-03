@@ -120,6 +120,7 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
       running.current = true;
       setBusy(true);
       setError(undefined);
+      setReceipt(undefined);
       try {
         const result = await callHardwareAction<HardwareMutationResult>(
           action,
@@ -198,9 +199,11 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
   const navigate = (next: View) => {
     setView(next);
   };
+  const observedReceipt = state?.receipts.find(
+    (value) => value.requestId === receipt?.requestId,
+  );
   const currentReceipt =
-    state?.receipts.find((value) => value.requestId === receipt?.requestId) ??
-    receipt;
+    receipt?.state === "running" ? (observedReceipt ?? receipt) : receipt;
   const canOpenOwner = (tabId: string) =>
     Boolean(onOpenOwner && (!tabs || tabs.some((tab) => tab.id === tabId)));
   return (
@@ -398,6 +401,7 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
                   summary={selected}
                   busy={busy}
                   run={run}
+                  receipt={currentReceipt}
                   onBack={() => setView("inventory")}
                   onEdit={() => {
                     setEditingId(selected.item.id);

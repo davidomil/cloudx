@@ -6,6 +6,7 @@ import type { PathPolicy } from "../pathPolicy.js";
 import { HardwareError, hardwareInput, requireHardware } from "./HardwareError.js";
 import { HardwareScriptRunner, type HardwareScriptResult } from "./HardwareScriptRunner.js";
 import { emptyHardwareState, HardwareStore, type HardwareStoredState, type StoredHardwareReceipt } from "./HardwareStore.js";
+import { HardwareCapacity } from "./HardwareCapacity.js";
 
 export interface HardwareRegistry {
   values(): HardwareTypeProvider<unknown>[];
@@ -50,6 +51,8 @@ export class HardwareService {
   private disposal?: Promise<void>;
   private scheduler?: ReturnType<typeof setInterval>;
   private readonly retention: HardwareRetentionSettings;
+  private readonly capacity = new HardwareCapacity();
+  private readonly replayedRequests = new WeakSet<HardwareStoredState>();
 
   constructor(private readonly options: HardwareServiceOptions) {
     this.store = new HardwareStore(options.dataDir, error => { this.unavailableReason = error.message; this.beginShutdown(); for (const task of this.tasks.values()) task.controller.abort(error); this.notifyChange(); });
@@ -172,15 +175,22 @@ export class HardwareService {
       this.requireNoHold(next, keys);
       return item;
     }
-    fields(input, action === "hardware.items.update" ? ["requestId", "hardwareId", "expectedItemRevision", "patch"] : ["requestId", "hardwareId", "expectedItemRevision"]);
+    fields(input, action === "hardware.items.update" ? ["requestId", "hardwareId", "expectedItemRevision", "patch", "newGroupName"] : ["requestId", "hardwareId", "expectedItemRevision"]);
     const item = this.requireItem(next, hardwareInput(() => hardwareId(input.hardwareId)));
     this.requireRevision(item.revision, input.expectedItemRevision);
     const inventory = await this.inspectInventory(next), oldKeys = inventory.groupKeys.get(item.physicalResourceId)!;
     if (action === "hardware.items.delete") {
       this.requireNoHold(next, oldKeys); next.items = next.items.filter(record => record.id !== item.id); delete next.observations[item.id]; delete next.endpointKeys[item.id]; return null;
     }
-    const patch = hardwareInput(() => hardwareRecord(input.patch));
-    requireHardware(Object.keys(patch).length > 0 && Object.keys(patch).every(key => ["name", "description", "enabled", "physicalResourceId", "typeId", "configVersion", "config", "tagIds", "notes", "statuses", "hooks"].includes(key)), "INVALID_INPUT", "Item patch contains unknown fields.");
+    const patch = clone(hardwareInput(() => hardwareRecord(input.patch)));
+    requireHardware((Object.keys(patch).length > 0 || input.newGroupName !== undefined) && Object.keys(patch).every(key => ["name", "description", "enabled", "physicalResourceId", "typeId", "configVersion", "config", "tagIds", "notes", "statuses", "hooks"].includes(key)), "INVALID_INPUT", "Item patch contains unknown fields.");
+    if (input.newGroupName !== undefined) {
+      this.requireNoHold(next, oldKeys);
+      const group = { id: `group-${randomUUID()}`, revision: 1, name: hardwareInput(() => hardwareText(input.newGroupName, "Group name", 200)).trim() };
+      this.uniqueLabel(next.groups, group.name, undefined, record => record.name);
+      next.groups.push(group);
+      patch.physicalResourceId = group.id;
+    }
     const changesIdentity = ["physicalResourceId", "typeId", "configVersion", "config"].some(key => Object.hasOwn(patch, key) && canonical(patch[key]) !== canonical(item[key as keyof HardwareItem]));
     if (changesIdentity || ["statuses", "hooks"].some(key => Object.hasOwn(patch, key) && canonical(patch[key]) !== canonical(item[key as keyof HardwareItem]))) this.requireNoHold(next, oldKeys);
     const updated = hardwareInput(() => parseHardwareItem({ ...item, ...patch, revision: item.revision + 1, notesRevision: item.notesRevision + (patch.notes !== undefined && patch.notes !== item.notes ? 1 : 0) }));
@@ -328,6 +338,7 @@ export class HardwareService {
       const hold = target.kind === "reservation" ? next.reservations.find(record => record.reservationId === target.reservationId) : next.checkHolds.find(record => record.runId === target.runId);
       requireHardware(hold && hold.generation === target.generation, "STALE_RESERVATION", "The override target changed. Read the current held resource.");
       this.requireRevision(hold.revision, input.expectedHoldRevision);
+      this.capacity.assertCleanupAvailable(next, "reservationId" in hold ? { kind: "reservation", ...refOf(hold) } : { kind: "system_check", runId: hold.runId, generation: hold.generation });
       const priorUncertainty = hold.state === "recovery_required";
       const priorOperationIds = "reservationId" in hold ? [...hold.activeOperationIds] : [hold.runId];
       const priorRef = "reservationId" in hold ? refOf(hold) : undefined;
@@ -339,6 +350,7 @@ export class HardwareService {
         admitted.record.receipt.reservation = refOf(hold);
         dispatch = { runId: admitted.record.receipt.runId, hardwareId: hold.hardwareId, priorRef, currentRef: refOf(hold), generation, priorUncertainty, priorOperationIds, hook };
       } else { hold.state = "recovery_required"; hold.recoveryReason = "The previous checking generation was revoked for operator cleanup."; dispatch = { runId: admitted.record.receipt.runId, hardwareId: hold.hardwareId, checkRunId: hold.runId, generation, priorUncertainty, priorOperationIds }; }
+      if (input.acceptUnresolvedExternalActivity) admitted.record.finalCleanupTarget = "reservationId" in hold ? { kind: "reservation", ...refOf(hold) } : { kind: "system_check", runId: hold.runId, generation };
       this.addHistory(next, "override_requested", reason, owner, "reservationId" in hold ? hold : undefined, hold.hardwareId);
       return this.mutationResult(next, admitted.record.receipt);
     });
@@ -351,13 +363,14 @@ export class HardwareService {
         let diagnostics: HardwareScriptResult | undefined;
         unresolved ||= work.priorOperationIds.some(id => { const receipt = this.state.receipts.find(record => record.receipt.runId === id)?.receipt; return !receipt || ["running", "unknown"].includes(receipt.state) || receipt.state === "failed" && receipt.error?.code === "HOOK_FAILED"; });
         if (work.priorRef) {
-          const closed = await this.closeAccess({ reservationId: work.priorRef.reservationId, generation: this.access.get(work.priorRef.reservationId)?.generation ?? work.priorRef.generation }, signal);
-          unresolved ||= closed.state !== "completed";
+          try { const closed = await this.closeAccess({ reservationId: work.priorRef.reservationId, generation: this.access.get(work.priorRef.reservationId)?.generation ?? work.priorRef.generation }, signal); unresolved ||= closed.state !== "completed"; }
+          catch { unresolved = true; }
           if (work.hook) {
-            const held = this.currentClaim(work.currentRef!, ["releasing", "recovery_required"]);
-            const hook = await this.runScript(work.hook, held, "on_release", signal);
-            diagnostics = hook;
-            unresolved ||= hook.state !== "completed";
+            try {
+              const held = this.currentClaim(work.currentRef!, ["releasing", "recovery_required"]);
+              const hook = await this.runScript(work.hook, held, "on_release", signal);
+              diagnostics = hook; unresolved ||= hook.state !== "completed";
+            } catch { unresolved = true; }
           }
         } else if (work.checkRunId) {
           const check = this.state.receipts.find(record => record.receipt.runId === work.checkRunId)?.receipt;
@@ -551,7 +564,11 @@ export class HardwareService {
     for (const { ref, state, accessState } of refs) {
       if (["preparing", "active", "releasing"].includes(state)) {
         try { await this.release({ requestId: `owner-ended-${randomUUID()}`, ...ref }, owner, true); }
-        catch (error) { if (!(error instanceof HardwareError) || !["RECOVERY_REQUIRED", "STALE_RESERVATION"].includes(error.code)) throw error; await this.closeEndedOwner(ref, owner); }
+        catch (error) {
+          if (error instanceof HardwareError && error.code === "CAPACITY_EXCEEDED") { await this.requireOperatorCleanupAtCapacity(ref, owner); continue; }
+          if (!(error instanceof HardwareError) || !["RECOVERY_REQUIRED", "STALE_RESERVATION"].includes(error.code)) throw error;
+          await this.closeEndedOwner(ref, owner);
+        }
       }
       else if (accessState !== "closed") await this.closeEndedOwner(ref, owner);
       else this.cancelTasks(ref);
@@ -562,7 +579,20 @@ export class HardwareService {
     const held = this.state.reservations.find(claim => sameRef(claim, ref));
     if (!held || held.accessState === "closed" || !this.access.has(ref.reservationId)) return;
     try { await this.accessAction("hardware.access.close", { requestId: `owner-ended-close-${randomUUID()}`, ...ref }, owner, true); }
-    catch (error) { if (!(error instanceof HardwareError) || error.code !== "STALE_RESERVATION") throw error; }
+    catch (error) {
+      if (error instanceof HardwareError && error.code === "CAPACITY_EXCEEDED") await this.requireOperatorCleanupAtCapacity(ref, owner);
+      else if (!(error instanceof HardwareError) || error.code !== "STALE_RESERVATION") throw error;
+    }
+  }
+  private async requireOperatorCleanupAtCapacity(ref: ReservationRef, owner: HardwareOwner): Promise<void> {
+    await this.change(next => {
+      const held = next.reservations.find(claim => sameRef(claim, ref));
+      if (!held) return;
+      const reason = "Automatic cleanup reached Hardware capacity. The resource remains held. Inspect its activity and use an acknowledged operator override.";
+      this.recover(held, reason, "cleanup");
+      this.addHistory(next, "cleanup_capacity", reason, owner, held);
+    }, true);
+    this.cancelTasks(ref);
   }
 
   dispose(): Promise<void> { return this.disposal ??= this.shutdown(); }
@@ -609,8 +639,10 @@ export class HardwareService {
       else { requireHardware(this.ready, "STORE_UNAVAILABLE", "Hardware store is closed."); this.store.assertHeld(); }
       const next = clone(this.state);
       const result = await update(next);
+      if (this.replayedRequests.has(next)) return clone(result);
       next.revision++;
       this.pruneDetails(next);
+      this.capacity.assertMutation(this.state, next);
       try { await this.store.write(next); }
       catch (error) {
         this.unavailableReason = "Hardware could not confirm its durable state. Admission is closed until restart and reconciliation.";
@@ -631,7 +663,8 @@ export class HardwareService {
     hardwareInput(() => validateHardwareJson(input));
     const digest = createHash("sha256").update(canonical({ action, input })).digest("hex");
     const existing = next.receipts.find(record => sameOwner(record.owner, owner) && record.receipt.requestId === requestId);
-    if (existing) { requireHardware(existing.action === action && existing.digest === digest, "REQUEST_ID_REUSED", "This owner already used that request ID with a different action or payload."); return { record: existing, existing: true }; }
+    if (existing) { requireHardware(existing.action === action && existing.digest === digest, "REQUEST_ID_REUSED", "This owner already used that request ID with a different action or payload."); this.replayedRequests.add(next); return { record: existing, existing: true }; }
+    this.capacity.assertNewRequest(next, action);
     const record: StoredHardwareReceipt = { owner: clone(owner), action, digest, receipt: { requestId, runId: `run-${randomUUID()}`, state: "running", startedAt: now() } };
     next.receipts.push(record);
     return { record, existing: false };
@@ -935,6 +968,7 @@ export class HardwareService {
         const expired = this.state.receipts.some(({ receipt }) => ["succeeded", "failed"].includes(receipt.state) && receipt.result !== undefined && Date.parse(receipt.finishedAt!) < cutoff) || this.state.history.some(event => Date.parse(event.at) < cutoff && !(event.reservationId && held.has(event.reservationId) || event.runId && unresolved.has(event.runId)));
         if (expired) await this.change(() => undefined);
       }
+      if (!this.capacity.canSchedule(this.state)) return;
       const state = clone(this.state), inventory = await this.inspectInventory(state);
       for (const item of state.items) {
         const keys = inventory.groupKeys.get(item.physicalResourceId)!;
@@ -942,7 +976,7 @@ export class HardwareService {
         const due = item.statuses.filter(binding => binding.source === "command" && binding.intervalMs !== null && (!state.observations[item.id]?.some(observation => observation.definitionId === binding.definitionId && observation.bindingRevision === binding.revision && Date.parse(observation.observedAt) + binding.intervalMs! > Date.now()))).map(binding => binding.definitionId);
         if (!due.length) continue;
         try { await this.refresh({ requestId: `scheduled-${randomUUID()}`, hardwareId: item.id, statusIds: due }, { kind: "user", userId: "local" }); }
-        catch (error) { if (!(error instanceof HardwareError) || !["RESERVATION_CONFLICT", "CHECK_IN_PROGRESS", "RECOVERY_REQUIRED"].includes(error.code)) throw error; }
+        catch (error) { if (!(error instanceof HardwareError) || !["RESERVATION_CONFLICT", "CHECK_IN_PROGRESS", "RECOVERY_REQUIRED", "CAPACITY_EXCEEDED"].includes(error.code)) throw error; }
       }
     } finally { this.scheduling = false; }
   }

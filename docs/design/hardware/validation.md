@@ -38,3 +38,22 @@ npx vitest run apps/server/src/server.test.ts -t 'exposes automation catalog, gr
 npx vitest run apps/server/src/forge/ForgeRuntime.test.ts apps/server/src/forge/ForgeLifecycle.integration.test.ts -t 'records missing execution evidence once|recovers lost terminal ownership'
 npx vitest run apps/server/src/workspace/WorkspaceCleanupService.test.ts -t 'reviews an inactive completed checkout through|protects preview and deletion while a zombie leader'
 ```
+
+## Review regression results
+
+All five reported failures were reproduced before their fixes. The updated Hardware and session-owner checks pass 179 tests in 25 files. The full Hardware browser suite passes 38 cases across desktop and mobile Chromium, including deleted status filters, atomic group creation during editing, and original-receipt inspection after a lost invoke response.
+
+Controlled SerialPort 13 native closes keep the resource held and block On release until close succeeds. Failed, timed-out, and cancelled confirmation retain recovery. Capacity checks reject fresh work against a valid 100,000-receipt index without changing persisted state or writer readiness. Existing reservations and checking holds can be cleared, and duplicate requests retain their identity after restart. Byte-boundary cases preserve unknown evidence, owner-end evidence, and a final acknowledged override with maximum valid identifiers, escaped reason text, and 64 KiB hook output.
+
+The updated production build, TypeScript project build, formatting, lint, process-policy validation, and whitespace checks pass. Relevant commands executed for this revision were:
+
+``` bash
+npx vitest run apps/server/src/hardware apps/server/src/sessionStore.hardware.test.ts packages/shared/src/hardware.test.ts apps/web/src/hardwareApi.test.ts apps/web/src/ui/hardware --reporter=dot
+npx playwright test tests/browser/hardware.spec.ts --output=/tmp/cloudx-hardware-review-browser
+npm run build
+npx tsc -b --pretty false
+npm run format:check
+npm run lint
+npm run policy:validate
+git diff --check
+```

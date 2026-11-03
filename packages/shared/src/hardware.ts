@@ -307,6 +307,7 @@ export interface UpdateHardwareItem {
   hardwareId: string;
   expectedItemRevision: number;
   patch: Partial<HardwareItemDraft>;
+  newGroupName?: string;
 }
 
 export interface SetHardwareStatus {

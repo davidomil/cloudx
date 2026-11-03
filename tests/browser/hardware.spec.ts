@@ -69,6 +69,7 @@ test.beforeAll(async () => {
       port: 0,
       strictPort: false,
       proxy: { "/api": `http://127.0.0.1:${address.port}` },
+      watch: { ignored: ["**/debug_tooling/**"] },
     },
   });
   await web.listen();
@@ -1044,4 +1045,149 @@ test("shared group aliases open the originally reserved type and never issue mis
   await expect
     .poll(() => lab.invocations.map((value) => value.operationId))
     .toEqual(["ssh.exec"]);
+});
+
+test("review: deleting the selected status definition reconciles Inventory without a crash or stale filter", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  const definition = (
+    await lab.service.snapshot(operator)
+  ).statusDefinitions.find((value) => value.label === "Health")!;
+  await page
+    .getByText("Capability and status filters", { exact: true })
+    .click();
+  await label(page, "Filter status").selectOption(definition.id);
+  await expect(label(page, "Filter status value")).toHaveValue("ready");
+  await lab.mutate("hardware.statuses.delete", {
+    id: definition.id,
+    expectedRevision: definition.revision,
+  });
+  await button(page, "Refresh inventory").click();
+  await page.waitForFunction(
+    () =>
+      !document.querySelector(".hardware-panel") ||
+      (
+        document.querySelector(
+          '[aria-label="Filter status"]',
+        ) as HTMLSelectElement | null
+      )?.value === "",
+  );
+  expect(errors).toEqual([]);
+  await expect(label(page, "Filter status")).toHaveValue("");
+  await expect(label(page, "Filter status value")).toHaveCount(0);
+  await expect(button(page, "Select Atlas SSH")).toBeVisible();
+  await expect(button(page, "Select Orion UART")).toBeVisible();
+  await label(page, "Find hardware").fill("Orion");
+  await expect(button(page, "Select Orion UART")).toBeVisible();
+});
+
+test("review: editing existing hardware creates and assigns a new group in one revision-guarded update", async ({
+  page,
+}) => {
+  const before = await lab.service.snapshot(operator);
+  const writes: Array<{ action: string; input: Record<string, unknown> }> = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/hardware/actions")
+    )
+      writes.push(request.postDataJSON());
+  });
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
+  await label(page, "Physical resource group").selectOption("");
+  await label(page, "New group name").fill("Dedicated Atlas");
+  const response = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/hardware/actions") &&
+      response.request().postDataJSON().action === "hardware.items.update",
+  );
+  await button(page, "Save hardware").click();
+  expect(await (await response).json()).toMatchObject({
+    result: { receipt: { state: "succeeded" } },
+  });
+  await expect(button(page, "Select Atlas SSH")).toBeVisible();
+  const after = await lab.service.snapshot(operator);
+  const group = after.groups.find((value) => value.name === "Dedicated Atlas")!;
+  const item = after.items.find((value) => value.item.id === lab.ssh.id)!.item;
+  expect(after.groups).toHaveLength(before.groups.length + 1);
+  expect(group.id).not.toBe(lab.ssh.physicalResourceId);
+  expect(item).toMatchObject({
+    physicalResourceId: group.id,
+    revision: lab.ssh.revision + 1,
+  });
+  expect(
+    after.groups.some((value) => value.id === lab.ssh.physicalResourceId),
+  ).toBe(true);
+  expect(writes).toHaveLength(1);
+  expect(writes[0]).toMatchObject({
+    action: "hardware.items.update",
+    input: {
+      hardwareId: lab.ssh.id,
+      expectedItemRevision: lab.ssh.revision,
+      newGroupName: "Dedicated Atlas",
+    },
+  });
+  expect(writes[0]!.input.patch).not.toHaveProperty("physicalResourceId");
+});
+
+test("review: inspected lost SSH invoke receipts replace the older result in Access without replay", async ({
+  page,
+}) => {
+  await openAccess(page, "Atlas SSH");
+  await label(page, "Remote Bash script").fill("exit 7");
+  await button(page, "Run script").click();
+  const receipt = page.getByRole("article", { name: "Operation receipt" });
+  await expect(receipt).toContainText('"exitCode": 7');
+  const previousId = await receipt.locator("header code").textContent();
+  let finishInvoke!: () => void;
+  lab.invokeGate = new Promise<void>((resolve) => {
+    finishInvoke = resolve;
+  });
+  let lostRequestId = "";
+  let dispatched = 0;
+  await page.route("**/api/hardware/actions", async (route) => {
+    const body = route.request().postDataJSON();
+    if (
+      body.action !== "hardware.access.invoke" ||
+      body.input.input.script !== "uname -m"
+    ) {
+      await route.continue();
+      return;
+    }
+    lostRequestId = body.input.requestId;
+    dispatched++;
+    const response = await route.fetch({
+      url: route.request().url().replace("hardware.test", "127.0.0.1"),
+    });
+    const result = await response.json();
+    const pending = await lab.service.snapshot(operator);
+    await expect(page.locator(".hardware-footer")).toContainText(
+      `revision ${pending.revision}`,
+    );
+    finishInvoke();
+    await lab.settled(result.result.receipt);
+    await route.abort("connectionfailed");
+  });
+  await label(page, "Remote Bash script").fill("uname -m");
+  await button(page, "Run script").click();
+  await expect(page.getByRole("alert")).toContainText("OUTCOME_UNKNOWN");
+  await expect(receipt).toHaveCount(0);
+  await button(page, "Inspect original receipt").click();
+  await expect(receipt.locator("header code")).toHaveText(lostRequestId);
+  await expect(receipt).toContainText('"exitCode": 0');
+  await expect(receipt).toContainText("aarch64");
+  await expect(receipt).not.toContainText(previousId!);
+  expect(dispatched).toBe(1);
+  expect(lab.invocations).toHaveLength(2);
+  await button(page, "Reconnect").click();
+  await expect(button(page, "Run script")).toBeEnabled();
+  await label(page, "Remote Bash script").fill("exit 7");
+  await button(page, "Run script").click();
+  await expect(receipt).toContainText('"exitCode": 7');
+  await expect(receipt.locator("header code")).not.toHaveText(lostRequestId);
+  expect(dispatched).toBe(1);
+  expect(lab.invocations).toHaveLength(3);
 });

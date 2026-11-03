@@ -31,3 +31,5 @@ Close access and release after the task, including known failure. Reservations p
 ## Inspect retained outcomes
 
 Completed output and history have default bounds of 30 days and 10,000 entries; completed result payloads also share a 16 MiB budget. The panel shows applied retention settings and explicitly marks pruned output. Live and unknown receipts remain retained. The compact request identity and terminal outcome remain available so pruning cannot replay an old operation.
+
+Hardware returns `CAPACITY_EXCEEDED` at 100,000 retained requests or when new work would consume space needed for saved outcomes or cleanup. Receipt inspection remains available. If ordinary cleanup cannot fit, automatic owner cleanup leaves a recovery hold. Inspect the hold and use Force release with explicit acknowledgement of unresolved activity. The store retains old request identities, including across restart; this version has no identity archival command.

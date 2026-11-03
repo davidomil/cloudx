@@ -34,9 +34,10 @@ export const uartHardwareDescriptor: HardwareTypeDescriptor = {
 export interface HardwareSerialPort extends EventEmitter {
   readonly isOpen: boolean;
   readonly opening: boolean;
+  readonly closing: boolean;
   readonly port?: unknown;
   open(callback: (error: Error | null) => void): void;
-  close(callback: (error: Error | null) => void): void;
+  close(callback?: (error: Error | null) => void, disconnectError?: Error | null): void;
   write(data: Buffer, callback: (error?: Error | null) => void): boolean;
   drain(callback: (error: Error | null) => void): void;
 }
@@ -116,6 +117,7 @@ class UartConnection implements HardwareConnection {
   private failure?: string;
   private busy = false;
   private opening?: Promise<Error | null>;
+  private nativeClose?: Promise<boolean>;
   private readonly processes = new BoundedProcessSet();
   private closePromise?: Promise<ProviderOutcome<null>>;
 
@@ -130,6 +132,7 @@ class UartConnection implements HardwareConnection {
         rtscts: this.config.flowControl === "rtscts", xon: false, xoff: false, xany: false, lock: true, autoOpen: false, highWaterMark: 65536
       });
     } catch { return failed("UART_INVALID_CONFIGURATION", "The serial port could not be constructed."); }
+    this.observeNativeClose(this.serial);
     this.serial!.on("error", (error: Error) => { this.failure = error.message; this.dataReady.emit("changed"); });
     this.serial!.on("close", () => { if (!this.closed) this.failure = "The serial port disconnected."; this.dataReady.emit("changed"); });
     this.serial!.on("data", (data: Buffer) => {
@@ -177,20 +180,37 @@ class UartConnection implements HardwareConnection {
     this.dataReady.emit("changed");
     const processResult = await this.processes.close(signal);
     await Promise.allSettled([...this.pending]);
-    if (this.opening) {
-      const opening = await boundedSerial(this.opening, 10_000, new AbortController().signal);
-      if (!opening.completed) {
-        void this.opening.then(() => { if (this.serial?.isOpen) this.serial.close(() => {}); });
-        return unknown("UART_CLEANUP_UNKNOWN", "UART open is still unresolved; late-open cleanup is retained.");
-      }
-    }
-    if (this.serial?.isOpen) {
-      const closing = new Promise<Error | null>((resolve) => this.serial!.close(resolve));
-      const result = await boundedSerial(closing, 10_000, new AbortController().signal);
-      if (!result.completed || result.value || this.serial.isOpen) return unknown("UART_CLEANUP_UNKNOWN", "UART close did not confirm its outcome.");
-    }
+    const result = await boundedSerial(this.confirmSerialClosed(), 10_000, signal);
+    if (!result.completed || !result.value) return unknown("UART_CLEANUP_UNKNOWN", "UART open or native close did not confirm cleanup.");
     this.receivedBytes.clear();
     return processResult.state === "completed" ? completed(null) : processResult;
+  }
+
+  private async confirmSerialClosed(): Promise<boolean> {
+    const openError = await this.opening;
+    if (!this.serial || openError) return true;
+    if (!this.nativeClose && this.serial.isOpen) this.serial.close(() => {});
+    return this.nativeClose ?? false;
+  }
+
+  private observeNativeClose(serial: HardwareSerialPort): void {
+    const nativeClose = serial.close.bind(serial);
+    serial.close = (callback, disconnectError = null) => {
+      if (this.nativeClose || !serial.isOpen) return nativeClose(callback, disconnectError);
+      let confirm!: (closed: boolean) => void;
+      this.nativeClose = new Promise(resolve => { confirm = resolve; });
+      // SerialPort 13 calls close on disconnect while isOpen becomes false before
+      // the binding settles. Its callback confirms native cleanup; Duplex close
+      // events can also come from stream destruction. A successful disconnect
+      // callback carries the original disconnect error rather than null.
+      try {
+        nativeClose(error => {
+          confirm(error === disconnectError && !serial.closing && !serial.isOpen);
+          if (callback) callback.call(serial, error);
+          else if (error && error !== disconnectError) serial.emit("error", error);
+        }, disconnectError);
+      } catch (error) { confirm(false); throw error; }
+    };
   }
 
   private async read(input: JsonObject, signal: AbortSignal): Promise<ProviderOutcome<JsonObject>> {

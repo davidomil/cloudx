@@ -47,7 +47,7 @@ Catalogs and mutations.
 | `hardware.release` | ReleaseHardware. | Cleanup receipt and held/released outcome. |
 | `hardware.receipt.get` | Original request ID. | The caller’s stored operation, phase, result, or precise unknown/pruned-output state. |
 
-The panel additionally manages item, tag, status-definition, and physical-group create/update/delete; status binding and manual-value updates; and `hardware.forceRelease`. ForceReleaseHardware uses a discriminated reservation or system-check target, its generation, expectedHoldRevision, reason, and unresolved-activity acknowledgement. Every hold transition increments its revision. Every update/delete uses the current record revision. Item creation can create a group atomically. Referenced tags/groups cannot be deleted. A used status definition’s value type cannot change; create a new definition and explicitly rebind instead. Labels and descriptions can change without changing IDs.
+The panel additionally manages item, tag, status-definition, and physical-group create/update/delete; status binding and manual-value updates; and `hardware.forceRelease`. ForceReleaseHardware uses a discriminated reservation or system-check target, its generation, expectedHoldRevision, reason, and unresolved-activity acknowledgement. Every hold transition increments its revision. Every update/delete uses the current record revision. Item creation and item updates can create and assign a group atomically with `newGroupName`; update requests also require the current item revision and an unheld physical group. Referenced tags/groups cannot be deleted. A used status definition’s value type cannot change; create a new definition and explicitly rebind instead. Labels and descriptions can change without changing IDs.
 
 Reject item connection/type/group/hook/status-binding edits while affected keys are held. Allow notes, tag membership, descriptive metadata, enabled state, and manual status values to change with revisions; these changes never evict the owner. A manual value update preserves the binding revision and updates the observation. Disabling a type contribution does not delete its saved items; they become unavailable until its exact supported code returns.
 
@@ -145,6 +145,8 @@ Error contract.
 | FORBIDDEN / OWNER_CHANGED | Stop; the execution capability is absent or revoked. |
 | STALE_RESERVATION / INVALID_PHASE | Stop hardware access and inspect the exact claim. |
 | REQUEST_ID_REUSED | Reused identity has different payload; inspect original receipt. |
+| CAPACITY_EXCEEDED | New work cannot fit while preserving outcomes and cleanup. Inspect receipts; an operator can use reserved capacity for an acknowledged force release. |
+| OPERATION_IN_PROGRESS | An acknowledged override already drains this hold. Inspect the original request ID in the error details. |
 | HOOK_FAILED / OPERATION_FAILED | Inspect the saved outcome. Do not infer release or absence of effects. |
 | OUTCOME_UNKNOWN / RECOVERY_REQUIRED | Keep hardware held; reconcile or ask the operator to override. |
 | STORE_UNAVAILABLE / WRITER_LOST | No new dispatch; repair/reconcile the authority before continuing. |

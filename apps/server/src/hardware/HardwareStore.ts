@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { hardwareId, hardwareInteger, hardwareRecord, hardwareText, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type CapabilityTag, type HardwareCheckHold, type HardwareHistoryEntry, type HardwareItem, type HardwareOwner, type HardwareReservationRecord, type OperationReceipt, type PhysicalResource, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
+import { hardwareId, hardwareInteger, hardwareRecord, hardwareText, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type CapabilityTag, type HardwareCheckHold, type HardwareHistoryEntry, type HardwareHoldRef, type HardwareItem, type HardwareOwner, type HardwareReservationRecord, type OperationReceipt, type PhysicalResource, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
 import { requireSafeDirectory } from "../jsonStateFile.js";
 import { HardwareError, requireHardware } from "./HardwareError.js";
 import { HardwareWriterLease } from "./HardwareWriterLease.js";
+import { HARDWARE_STATE_BYTES } from "./HardwareCapacity.js";
 
-export interface StoredHardwareReceipt { owner: HardwareOwner; action: string; digest: string; receipt: OperationReceipt }
+export interface StoredHardwareReceipt { owner: HardwareOwner; action: string; digest: string; receipt: OperationReceipt; finalCleanupTarget?: HardwareHoldRef }
 export interface HardwareStoredState {
   schemaVersion: 1;
   revision: number;
@@ -49,7 +50,7 @@ export class HardwareStore {
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyHardwareState(); throw error; }
       try {
         const stat = await file.stat();
-        requireHardware(stat.isFile() && stat.size <= 64 * 1024 * 1024, "STORE_UNAVAILABLE", "Hardware state must be a bounded regular file.");
+        requireHardware(stat.isFile() && stat.size <= HARDWARE_STATE_BYTES, "STORE_UNAVAILABLE", "Hardware state must be a bounded regular file.");
         return validateHardwareState(JSON.parse(await file.readFile("utf8")));
       } finally { await file.close(); }
     } catch (error) { throw new HardwareError("STORE_UNAVAILABLE", `Hardware state cannot be read. Preserve it for repair. ${error instanceof Error ? error.message : ""}`); }
@@ -60,7 +61,7 @@ export class HardwareStore {
     this.writer.assertHeld();
     validateHardwareState(state);
     const text = `${JSON.stringify(state)}\n`;
-    requireHardware(Buffer.byteLength(text) <= 64 * 1024 * 1024, "LIMIT_EXCEEDED", "Hardware state exceeds its 64 MiB bound.");
+    requireHardware(Buffer.byteLength(text) <= HARDWARE_STATE_BYTES, "LIMIT_EXCEEDED", "Hardware state exceeds its 64 MiB bound.");
     const directory = await this.openDirectory();
     const temporary = `/proc/self/fd/${directory.fd}/.state-${randomUUID()}.tmp`;
     let renamed = false;
@@ -91,7 +92,8 @@ export function validateHardwareState(value: unknown): HardwareStoredState {
   const fields = Object.keys(emptyHardwareState());
   requireHardware(record.schemaVersion === 1 && Object.keys(record).length === fields.length && fields.every(field => Object.hasOwn(record, field)), "STORE_UNAVAILABLE", "Unsupported or incomplete hardware state.");
   hardwareInteger(record.revision, "Store revision", 0); hardwareInteger(record.nextGeneration, "Generation counter");
-  for (const field of ["items", "tags", "groups", "statusDefinitions", "reservations", "checkHolds", "receipts", "history"] as const) requireHardware(Array.isArray(record[field]) && record[field].length <= 100_000, "STORE_UNAVAILABLE", `Invalid hardware ${field}.`);
+  for (const field of ["items", "tags", "groups", "statusDefinitions", "reservations", "checkHolds", "history"] as const) requireHardware(Array.isArray(record[field]) && record[field].length <= 100_000, "STORE_UNAVAILABLE", `Invalid hardware ${field}.`);
+  requireHardware(Array.isArray(record.receipts), "STORE_UNAVAILABLE", "Invalid hardware receipts.");
   hardwareRecord(record.observations); hardwareRecord(record.endpointKeys);
   const state = record as unknown as HardwareStoredState;
   const timestamp = (value: unknown) => requireHardware(typeof value === "string" && Number.isFinite(Date.parse(value)), "STORE_UNAVAILABLE", "Invalid hardware observation time.");
@@ -154,6 +156,13 @@ export function validateHardwareState(value: unknown): HardwareStoredState {
     if (receipt.reservation) { hardwareId(receipt.reservation.reservationId, "Receipt reservation ID"); hardwareInteger(receipt.reservation.generation, "Receipt generation"); }
     if (receipt.result !== undefined) validateHardwareJson(receipt.result);
     if (receipt.outputPruned) { timestamp(receipt.outputPruned.at); requireHardware(["age", "count", "budget"].includes(receipt.outputPruned.reason) && ["succeeded", "failed"].includes(receipt.state) && receipt.result === undefined, "STORE_UNAVAILABLE", "Only completed receipt output can be pruned."); }
+    if (stored.finalCleanupTarget !== undefined) {
+      const target = hardwareRecord(stored.finalCleanupTarget, "Final cleanup target");
+      requireHardware(stored.action === "hardware.forceRelease" && ["reservation", "system_check"].includes(String(target.kind)) && Object.keys(target).length === 3, "STORE_UNAVAILABLE", "Only an acknowledged override can reserve final cleanup capacity.");
+      hardwareInteger(target.generation, "Final cleanup generation");
+      hardwareId(target.kind === "reservation" ? target.reservationId : target.runId, "Final cleanup target ID");
+      if (target.kind === "reservation") requireHardware(receipt.reservation && receipt.reservation.reservationId === target.reservationId && receipt.reservation.generation === target.generation, "STORE_UNAVAILABLE", "Final cleanup must match its recorded reservation generation.");
+    }
     if (receipt.error) { hardwareText(receipt.error.code, "Receipt error code", 128); hardwareText(receipt.error.message, "Receipt error message", 4096); }
     const key = JSON.stringify([owner, receipt.requestId]); requireHardware(!requests.has(key) && /^[a-f0-9]{64}$/.test(stored.digest) && ["running", "succeeded", "failed", "unknown"].includes(receipt.state), "STORE_UNAVAILABLE", "Invalid operation receipt index."); requests.add(key);
   }
