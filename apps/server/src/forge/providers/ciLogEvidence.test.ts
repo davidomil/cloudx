@@ -27,6 +27,23 @@ describe("complete CI log evidence with bounded excerpts", () => {
     expect(evidence.log.length).toBeLessThanOrEqual(32_000);
   });
 
+  it("retains a runner step timeout as infrastructure rather than a test execution failure", async () => {
+    const timeout = "##[error]The action 'Free unused runner SDKs before building the verifier' has timed out after 5 minutes.";
+    const log = `${checkout()}${noise}${timeout}\n${noise}##[error]No files were found with the provided path: container-results/results.json. No artifacts will be uploaded.\n`;
+    const evidence = await scan(log);
+    expect(classifyCiLog(log)).toBe("infrastructure");
+    expect(evidence).toMatchObject({ classification: "infrastructure", checkout: { shas: [source], invalid: false } });
+    expect(evidence.log).toContain(timeout);
+    expect(evidence.log.length).toBeLessThanOrEqual(32_000);
+    expect(classifyCiLog("Test timed out after 10000ms")).toBe("code");
+  });
+
+  it("keeps explicit verifier capacity-preflight failures in the infrastructure diagnosis", async () => {
+    const failure = "Failed to prepare runner: insufficient disk space for the verifier build: 20000000000 bytes free; 25769803776 required.";
+    expect(classifyCiLog(failure)).toBe("infrastructure");
+    expect((await scan(`${checkout()}${failure}\n`)).classification).toBe("infrastructure");
+  });
+
   it("does not hide conflicting checkouts in the omitted middle", async () => {
     const evidence = await scan(checkout() + noise + checkout(moved) + noise + browserFailure);
     expect(evidence.checkout).toEqual({ shas: [source, moved], invalid: false });

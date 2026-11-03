@@ -530,6 +530,9 @@ test("healthy fresh and restored tabs have no native header; button and keyboard
     .getByRole("button", { name: "Working Codex", exact: true })
     .click();
   await expect(
+    page.locator('[data-tab="sibling"] .xterm-helper-textarea'),
+  ).toBeFocused();
+  await expect(
     page.getByRole("region", { name: "Native work for Working Codex" }),
   ).toHaveCount(0);
   const affectedTab = page.getByRole("button", {
@@ -548,6 +551,7 @@ test("healthy fresh and restored tabs have no native header; button and keyboard
     await affectedTab.dispatchEvent("pointerup", { pointerType: "touch" });
   } else {
     await affectedTab.focus();
+    await expect(affectedTab).toBeFocused();
     await page.keyboard.press("Shift+F10");
   }
   await page
