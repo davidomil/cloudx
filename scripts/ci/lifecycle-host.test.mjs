@@ -10,6 +10,75 @@ afterEach(() => {
     fs.rmSync(directory, { recursive: true, force: true });
 });
 
+it("prepares the pinned fixture origin without starting maintenance during the permission handoff", () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx origin "));
+  directories.push(fixture);
+  const controller = path.join(fixture, "controller checkout");
+  const traceFile = path.join(fixture, "git-trace.jsonl");
+  const env = {
+    ...process.env,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_COUNT: "0",
+    GIT_AUTHOR_NAME: "Lifecycle fixture",
+    GIT_AUTHOR_EMAIL: "fixture@example.test",
+    GIT_COMMITTER_NAME: "Lifecycle fixture",
+    GIT_COMMITTER_EMAIL: "fixture@example.test",
+  };
+  const git = (...args) =>
+    execFileSync("git", args, { env, encoding: "utf8", input: "" }).trim();
+  git("init", "--quiet", controller);
+  const tree = git("-C", controller, "mktree");
+  const source = git("-C", controller, "commit-tree", tree, "-m", "source");
+  const target = git(
+    "-C",
+    controller,
+    "commit-tree",
+    tree,
+    "-p",
+    source,
+    "-m",
+    "target",
+  );
+  git("-C", controller, "update-ref", "refs/heads/main", target);
+  const host = fs.readFileSync("scripts/ci/lifecycle-host.sh", "utf8");
+  const prepare = host.slice(
+    host.indexOf('git init --bare "$fixture/origin.git"'),
+    host.indexOf('controller="$fixture/controller"'),
+  );
+
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-euc", prepare], {
+    env: {
+      ...env,
+      fixture,
+      controller,
+      source_sha: source,
+      target_sha: target,
+      evidence: fixture,
+      GIT_TRACE2_EVENT: traceFile,
+    },
+    encoding: "utf8",
+    timeout: 5000,
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  const origin = path.join(fixture, "origin.git");
+  expect(git("-C", origin, "rev-parse", "refs/heads/source")).toBe(source);
+  expect(git("-C", origin, "rev-parse", "refs/heads/main")).toBe(target);
+  expect(git("-C", origin, "symbolic-ref", "HEAD")).toBe("refs/heads/main");
+  expect(fs.statSync(origin).mode & 0o555).toBe(0o555);
+  const maintenance = fs
+    .readFileSync(traceFile, "utf8")
+    .trim()
+    .split("\n")
+    .map(JSON.parse)
+    .filter(
+      (event) =>
+        event.event === "child_start" && event.argv?.includes("maintenance"),
+    );
+  expect(maintenance).toEqual([]);
+});
+
 it.each([true, false])(
   "isolates application command lookup with an inherited runner PATH: %s",
   (hasRunnerPath) => {

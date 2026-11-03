@@ -89,7 +89,7 @@ PLAYWRIGHT_BROWSERS_PATH="$fixture/controller/browsers"
 
 # Fetch only selected immutable objects. No service ever sees the controller checkout.
 git init --bare "$fixture/origin.git" >> "$evidence/host-setup.log" 2>&1
-git -c safe.directory="$controller" -C "$fixture/origin.git" fetch "$controller" "$source_sha:refs/heads/source" "$target_sha:refs/heads/main"
+git -c safe.directory="$controller" -C "$fixture/origin.git" fetch --no-auto-maintenance "$controller" "$source_sha:refs/heads/source" "$target_sha:refs/heads/main"
 git -C "$fixture/origin.git" symbolic-ref HEAD refs/heads/main
 chmod -R a+rX "$fixture/origin.git"
 controller="$fixture/controller"
