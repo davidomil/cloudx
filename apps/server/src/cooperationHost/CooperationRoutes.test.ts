@@ -73,6 +73,40 @@ function transaction(board: CooperationBoard): CooperationTransaction {
       geometry: { x: 40, y: 50, width: 200, height: 120, rotation: 0 }, content: { title: "Evidence", blocks: [{ id: "body", revision: 1, text: "Observed response" }] } } }] };
 }
 
+async function connectHelper(provider: CooperationProvider) {
+  providerId = provider;
+  endpoint = `${await app.listen({ port: 0, host: "127.0.0.1" })}/api/cooperation/agent`;
+  const board = await create();
+  const locator = await contexts.prepare(tab.id);
+  const invoke = async (...args: string[]) => (await run(process.execPath, [COOPERATION_HELPER_PATH, ...args], {
+    env: { PATH: process.env.PATH, CLOUDX_COOPERATION_CONTEXT: contexts.contextPath(tab.id) }
+  })).stdout;
+  const helper = async (...args: string[]) => JSON.parse(await invoke(...args));
+  return { board, locator, invoke, helper };
+}
+
+async function originalFiles() {
+  const image = await fs.readFile(new URL("../../../../docs/design/cooperation/examples/assets/reference.png", import.meta.url));
+  return [
+    { name: "reference.png", mime: "image/png", bytes: image },
+    { name: "design.pdf", mime: "application/pdf", bytes: Buffer.from("%PDF-1.4\noriginal document\n%%EOF") },
+    { name: "meeting.wav", mime: "audio/wav", bytes: Buffer.from("RIFF-original-audio") },
+    { name: "demo.webm", mime: "video/webm", bytes: Buffer.from("original-video-bytes") },
+    { name: "source.bin", mime: "application/octet-stream", bytes: Buffer.from([0, 1, 255]) },
+    { name: "empty.txt", mime: "text/plain", bytes: Buffer.alloc(0) }
+  ];
+}
+
+async function expectOriginalPaths(boardId: string, invoke: (...args: string[]) => Promise<string>) {
+  const text = await invoke("read", "--format", "markdown");
+  const context = JSON.parse(await invoke("context"));
+  for (const asset of boards.getBoard(boardId).assets) {
+    expect(text).toContain(`Path: ${asset.relativePath}`);
+    const original = await fs.readFile(path.resolve(path.dirname(context.markdownPath), asset.relativePath));
+    expect(createHash("sha256").update(original).digest("hex")).toBe(asset.sha256);
+  }
+}
+
 describe("cooperation HTTP and live boundary", () => {
   it("creates and assigns atomically, rejects invalid management, and keeps closed-board exports", async () => {
     const board = await create();
@@ -226,26 +260,10 @@ describe("cooperation HTTP and live boundary", () => {
     expect(boards.getBoard(board.boardId)).toEqual(board);
   });
 
-  it.each(["codex", "claude"] as const)("shares originals in both directions through the real %s helper", async provider => {
-    providerId = provider;
-    endpoint = `${await app.listen({ port: 0, host: "127.0.0.1" })}/api/cooperation/agent`;
-    const board = await create();
-    const locator = await contexts.prepare(tab.id);
-    const invoke = async (...args: string[]) => (await run(process.execPath, [COOPERATION_HELPER_PATH, ...args], {
-      env: { PATH: process.env.PATH, CLOUDX_COOPERATION_CONTEXT: contexts.contextPath(tab.id) }
-    })).stdout;
-    const helper = async (...args: string[]) => JSON.parse(await invoke(...args));
-    const image = await fs.readFile(new URL("../../../../docs/design/cooperation/examples/assets/reference.png", import.meta.url));
-    const originals = [
-      { name: "reference.png", mime: "image/png", bytes: image },
-      { name: "design.pdf", mime: "application/pdf", bytes: Buffer.from("%PDF-1.4\noriginal document\n%%EOF") },
-      { name: "meeting.wav", mime: "audio/wav", bytes: Buffer.from("RIFF-original-audio") },
-      { name: "demo.webm", mime: "video/webm", bytes: Buffer.from("original-video-bytes") },
-      { name: "source.bin", mime: "application/octet-stream", bytes: Buffer.from([0, 1, 255]) },
-      { name: "empty.txt", mime: "text/plain", bytes: Buffer.alloc(0) }
-    ];
+  it.each(["codex", "claude"] as const)("shares agent originals with the user through the real %s helper", async provider => {
+    const { board, locator, invoke, helper } = await connectHelper(provider);
     let serial = 0;
-    for (const original of originals) {
+    for (const original of await originalFiles()) {
       const file = path.join(root, original.name);
       await fs.writeFile(file, original.bytes);
       const uploaded = await helper("upload", "--file", file, "--mime", original.mime);
@@ -268,13 +286,24 @@ describe("cooperation HTTP and live boundary", () => {
         expect(emptyRange.statusCode).toBe(416);
         expect(emptyRange.headers["content-range"]).toBe("bytes */0");
       }
+    }
+    await expectOriginalPaths(board.boardId, invoke);
+  }, 20000);
 
+  it.each(["codex", "claude"] as const)("shares user originals with the agent through the real %s helper", async provider => {
+    const { board, invoke, helper } = await connectHelper(provider);
+    let serial = 0;
+    for (const original of await originalFiles()) {
       const userStage = await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/assets`,
         payload: { mime: original.mime, name: original.name, base64: original.bytes.toString("base64") } });
       expect(userStage.statusCode).toBe(200);
       const staged = userStage.json();
+      const item = { id: `user-file-${++serial}`, kind: original.mime === "image/png" ? "image" : "file",
+        geometry: { x: serial * 240, y: 0, width: 220, height: 160, rotation: 0 }, content: original.mime === "image/png"
+          ? { title: original.name, assetId: staged.asset.id, alt: "Original image" }
+          : { title: original.name, assetId: staged.asset.id, description: "Shared original" } };
       const userTx = { ...transaction(boards.getBoard(board.boardId)), operationId: `user-attach-${serial}`,
-        operations: [{ kind: "attachAsset", stagedToken: staged.stagedToken, item: { ...item, id: `user-file-${serial}`, content: { ...item.content, assetId: staged.asset.id } } }] };
+        operations: [{ kind: "attachAsset", stagedToken: staged.stagedToken, item }] };
       expect((await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/transactions`, payload: userTx })).statusCode).toBe(200);
       const resolved = await helper("asset", "--id", staged.asset.id);
       expect(await fs.readFile(resolved.localPath)).toEqual(original.bytes);
@@ -282,6 +311,11 @@ describe("cooperation HTTP and live boundary", () => {
       expect((await fs.stat(resolved.localPath)).mode & 0o777).toBe(0o400);
       if (original.mime !== "image/png") expect(path.extname(resolved.localPath)).toBe(path.extname(original.name));
     }
+    await expectOriginalPaths(board.boardId, invoke);
+  }, 20000);
+
+  it.each(["codex", "claude"] as const)("shares links, owned zones and staged originals through the real %s helper", async provider => {
+    const { board, locator, invoke, helper } = await connectHelper(provider);
     const linkTx = { ...transaction(boards.getBoard(board.boardId)), operationId: "agent-link", assignmentGeneration: locator.assignmentGeneration,
       operations: [{ kind: "createItem", item: { id: "shared-link", kind: "link", geometry: { x: 0, y: 300, width: 300, height: 180, rotation: 0 },
         content: { title: "Design source", url: "https://example.com/design", description: "Read the design." } } }] };
@@ -309,19 +343,15 @@ describe("cooperation HTTP and live boundary", () => {
     expect(text).toContain(`owner agent:${tab.id}`);
     expect(text).toContain("- Inspect the shared originals.");
     expect(text).toContain("https://example.com/revised");
-    const boardContext = await helper("context");
-    for (const asset of boards.getBoard(board.boardId).assets) {
-      expect(text).toContain(`Path: ${asset.relativePath}`);
-      const original = await fs.readFile(path.resolve(path.dirname(boardContext.markdownPath), asset.relativePath));
-      expect(createHash("sha256").update(original).digest("hex")).toBe(asset.sha256);
-    }
     const release = { ...transaction(boards.getBoard(board.boardId)), operationId: "agent-zone-ready", assignmentGeneration: locator.assignmentGeneration,
       preconditions: [{ targetKind: "region", targetId: zone.id, expectedRevision: zone.revision }], operations: [{ kind: "markRegionReady", regionId: zone.id }] };
     await fs.writeFile(zoneFile, JSON.stringify(release));
     expect((await helper("apply", "--file", zoneFile)).receipt.changedIds).toContain(zone.id);
     expect(boards.getBoard(board.boardId).regions.find(region => region.id === zone.id)?.mode).toBe("ready");
     expect(boards.inbox(board.boardId)).toEqual([]);
-    const pending = await helper("upload", "--file", path.join(root, "source.bin"), "--mime", "application/octet-stream");
+    const file = path.join(root, "source.bin");
+    await fs.writeFile(file, Buffer.from([0, 1, 255]));
+    const pending = await helper("upload", "--file", file, "--mime", "application/octet-stream");
     expect(await helper("discard", "--token", pending.stagedToken)).toEqual({ discarded: true });
     await expect(helper("discard", "--token", pending.stagedToken)).rejects.toMatchObject({ stderr: expect.stringContaining("ASSET_INVALID") });
   }, 20000);
