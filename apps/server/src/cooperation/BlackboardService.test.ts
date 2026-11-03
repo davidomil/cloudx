@@ -317,6 +317,7 @@ describe("original images and publication", () => {
       content: { title: "Original reference", alt: "A light reference image", assetId: staged.asset.id } } }]);
     const original = await service.resolveAsset(board.boardId, staged.asset.id, agent());
     expect(original.bytes).toEqual(bytes);
+    if (original.asset.kind === "file") throw new Error("Expected the decoded image manifest.");
     expect(original.asset.width).toBe(4);
     expect(await readFile(original.localPath)).toEqual(bytes);
     await service.removeTab(tab.tabId);

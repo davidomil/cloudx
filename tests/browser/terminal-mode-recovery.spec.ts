@@ -408,6 +408,11 @@ async function recoverTerminal(
   recovery: "socket reconnect" | "web-server restoration",
 ) {
   const screens = await screenCount(page);
+  const connections = await page.evaluate(
+    () =>
+      (window as unknown as { terminalTestSockets: WebSocket[] })
+        .terminalTestSockets.length,
+  );
   if (recovery === "socket reconnect") {
     await page.evaluate(() => {
       const sockets = (
@@ -419,6 +424,14 @@ async function recoverTerminal(
     await stopTestProcess(server);
     await startServer();
   }
+  await page.waitForFunction((previousConnections) => {
+    const sockets = (window as unknown as { terminalTestSockets: WebSocket[] })
+      .terminalTestSockets;
+    return (
+      sockets.length > previousConnections &&
+      sockets.at(-1)?.readyState === WebSocket.OPEN
+    );
+  }, connections);
   await expect
     .poll(() => screenCount(page), { intervals: [100] })
     .toBeGreaterThan(screens);

@@ -1,12 +1,12 @@
 import {
   boundsIntersect, codePointOffset, itemBounds,
   type CooperationAnchor, type CooperationBoard, type CooperationGeometry, type CooperationItem,
-  type CooperationItemInput, type CooperationItemKind, type CooperationOperation, type CooperationPoint,
-  type CooperationPrecondition, type CooperationRegionInput, type CooperationTarget, type CooperationReceipt, type CooperationInboxEvent
+  type CooperationItemInput, type CooperationOperation, type CooperationPoint,
+  type CooperationPrecondition, type CooperationRegionInput, type CooperationTarget, type CooperationReceipt, type CooperationInboxEvent, type CooperationAsset
 } from "@cloudx/shared";
 
 export type BoardSelection = { kind: "item" | "connection" | "region"; id: string };
-export type BoardTool = "none" | "select" | "pan" | "note" | "code" | "image" | "pen" | "rectangle" | "diamond" | "ellipse" | "cylinder" | "connection" | "region";
+export type BoardTool = "none" | "select" | "pan" | "note" | "code" | "image" | "file" | "link" | "pen" | "rectangle" | "diamond" | "ellipse" | "cylinder" | "connection" | "region";
 export type BoardDrawer = "inspector" | "outline" | "members" | "history" | "feedback" | undefined;
 export function boardId(prefix: string): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -19,17 +19,26 @@ export function undoableOwnOperations(receipts: CooperationReceipt[], inbox: Coo
 }
 
 export function targetAuthor(board: CooperationBoard, target: CooperationTarget) {
-  if (target.kind === "item") return board.items.find(item => item.id === target.id)?.createdBy;
-  if (target.kind === "connection") return board.connections.find(connection => connection.id === target.id)?.createdBy;
-  if (target.kind === "threadMessage") return board.threads.flatMap(thread => thread.messages).find(message => message.id === target.id)?.author;
-  return undefined;
+  const live = target.kind === "item" ? board.items.find(item => item.id === target.id) : target.kind === "connection" ? board.connections.find(connection => connection.id === target.id) : target.kind === "region" ? board.regions.find(region => region.id === target.id) : board.threads.flatMap(thread => thread.messages).find(message => message.id === target.id);
+  const record = live ?? target.snapshot?.record;
+  return record && ("createdBy" in record ? record.createdBy : "author" in record ? record.author : "ownerActor" in record ? record.ownerActor : undefined);
 }
 
-export function createBoardItem(kind: Exclude<CooperationItemKind, "image" | "drawing">, point: CooperationPoint, shape: "rectangle" | "diamond" | "ellipse" | "cylinder" = "rectangle"): CooperationItemInput {
+export function createBoardItem(kind: "note" | "code" | "shape", point: CooperationPoint, shape: "rectangle" | "diamond" | "ellipse" | "cylinder" = "rectangle"): CooperationItemInput {
   const common = { id: boardId(kind), geometry: { x: point[0], y: point[1], width: kind === "shape" ? 220 : 340, height: kind === "shape" ? 110 : 210, rotation: 0 } };
   if (kind === "shape") return { ...common, kind, content: { title: "New shape", shape, label: "New shape" } };
   const text = { title: kind === "code" ? "Code" : "New note", blocks: [{ id: boardId("block"), revision: 1, text: "" }] };
   return kind === "code" ? { ...common, kind, content: { ...text, language: "typescript" } } : { ...common, kind, content: text };
+}
+
+export function createBoardLink(url: string, point: CooperationPoint, title = new URL(url).host.slice(0, 200), description = ""): Extract<CooperationItemInput, { kind: "link" }> {
+  return { id: boardId("link"), kind: "link", geometry: { x: point[0], y: point[1], width: 360, height: 200, rotation: 0 }, content: { title, url, description } };
+}
+
+export function createBoardAsset(asset: CooperationAsset, point: CooperationPoint, title: string, id = boardId("asset")): Extract<CooperationItemInput, { kind: "image" | "file" }> {
+  if (asset.kind === "file") return { id, kind: "file", geometry: { x: point[0], y: point[1], width: 380, height: asset.mime.startsWith("video/") ? 330 : asset.mime.startsWith("audio/") ? 230 : 200, rotation: 0 }, content: { title, assetId: asset.id, description: "" } };
+  const width = Math.min(asset.width, 420);
+  return { id, kind: "image", geometry: { x: point[0], y: point[1], width, height: Math.max(1, width * asset.height / asset.width), rotation: 0 }, content: { title, alt: title, assetId: asset.id } };
 }
 
 export type InkDraft = Array<{ points: [number, number, number][]; color: string; width: number }>;
@@ -51,6 +60,23 @@ export function resizedDrawing(item: Extract<CooperationItem, { kind: "drawing" 
   const sx = geometry.width / item.geometry.width;
   const sy = geometry.height / item.geometry.height;
   return { ...item.content, strokes: item.content.strokes.map(stroke => ({ ...stroke, width: stroke.width * Math.min(sx, sy), points: stroke.points.map(([x, y, pressure]) => [x * sx, y * sy, pressure]) })) };
+}
+
+export type RegionResizeDirection = "north-west" | "north" | "north-east" | "east" | "south-east" | "south" | "south-west" | "west";
+
+export function resizedRegion(geometry: CooperationGeometry, direction: RegionResizeDirection, [dx, dy]: CooperationPoint): CooperationGeometry {
+  const west = direction.includes("west"), east = direction.includes("east");
+  const north = direction.includes("north"), south = direction.includes("south");
+  const width = (east || west) && dx !== 0 ? Math.max(40, Math.min(100000, geometry.width + (east ? dx : -dx))) : geometry.width;
+  const height = (south || north) && dy !== 0 ? Math.max(40, Math.min(100000, geometry.height + (south ? dy : -dy))) : geometry.height;
+  return { ...geometry, x: west ? geometry.x + geometry.width - width : geometry.x, y: north ? geometry.y + geometry.height - height : geometry.y, width, height };
+}
+
+export function boardContentBounds(board: Pick<CooperationBoard, "items" | "regions">) {
+  const bounds = [...board.items.map(itemBounds), ...board.regions.map(region => region.geometry)];
+  if (!bounds.length) return undefined;
+  const x = Math.min(...bounds.map(bound => bound.x)), y = Math.min(...bounds.map(bound => bound.y));
+  return { x, y, width: Math.max(...bounds.map(bound => bound.x + bound.width)) - x, height: Math.max(...bounds.map(bound => bound.y + bound.height)) - y };
 }
 
 export function regionAroundItems(items: CooperationItem[], center: CooperationPoint): CooperationRegionInput {
@@ -100,6 +126,11 @@ export function preconditionsForOperations(board: CooperationBoard, operations: 
     if ("connectionId" in operation) { edge(operation.connectionId); if (operation.kind === "deleteConnection") annotations("connection", operation.connectionId); }
     if (operation.kind === "updateConnection") { if (operation.patch.from) observe("item", operation.patch.from.itemId); if (operation.patch.to) observe("item", operation.patch.to.itemId); }
     if ("regionId" in operation) { observe("region", operation.regionId); if (operation.kind === "deleteRegion") annotations("region", operation.regionId); }
+    if (operation.kind === "createRegion") for (const id of operation.region.protectedItemIds) observe("item", id);
+    if (operation.kind === "updateRegion" && operation.patch.protectedItemIds) {
+      const previous = board.regions.find(region => region.id === operation.regionId)?.protectedItemIds ?? [];
+      for (const id of [...previous, ...operation.patch.protectedItemIds]) observe("item", id);
+    }
     if ("reactionId" in operation) {
       observe("reaction", operation.reactionId);
       const reaction = board.reactions.find(reaction => reaction.id === operation.reactionId);
@@ -161,5 +192,5 @@ export function targetTitle(board: CooperationBoard, target: CooperationTarget):
   return last.text;
 }
 
-export const isBoardEditor = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest("input, textarea, select, [contenteditable=true]"));
+export const isBoardEditor = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest("input, textarea, select, audio, video, [contenteditable=true]"));
 export const pointPath = (points: readonly CooperationPoint[]) => (points.length === 1 ? [points[0]!, points[0]!] : points).map(([x, y], index) => `${index ? "L" : "M"} ${x} ${y}`).join(" ");

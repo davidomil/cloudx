@@ -31,6 +31,13 @@ async function setup(overrides: Partial<ComponentProps<typeof BoardCanvas>> = {}
 }
 
 describe("saved canvas movement", () => {
+  it("removes the empty-board welcome once the board contains a zone", async () => {
+    const snapshot = board(); snapshot.items = [];
+    const { render } = await setup({ board: snapshot });
+    expect(document.querySelector(".cooperation-canvas-welcome")).not.toBeNull();
+    await render({ board: { ...snapshot, regions: [{ id: "zone", title: "Plan", revision: 1, ownerActor: "agent:planner", mode: "wip", protectedItemIds: [], geometry: { x: 0, y: 0, width: 600, height: 400, rotation: 0 } }] } });
+    expect(document.querySelector(".cooperation-canvas-welcome")).toBeNull();
+  });
   it("saves completed keyboard positions together at the observed board revision", async () => {
     const { onOperations, change } = await setup();
     await change([{ type: "position", id: "first", position: { x: 20, y: 40 }, dragging: false }, { type: "position", id: "second", position: { x: 320, y: 40 }, dragging: false }]);
@@ -51,6 +58,14 @@ describe("saved canvas movement", () => {
     onOperations.mockClear();
     await change([{ type: "position", id: "first", position: { x: 20, y: 40 }, dragging: false }]);
     expect(onOperations).toHaveBeenCalledWith(expect.any(Array), 8);
+  });
+  it("pins the pointer down revision before its first movement and starts without dropping a coarse event", async () => {
+    const { onOperations, change, render } = await setup();
+    expect(flow.props!.nodeDragThreshold).toBe(0);
+    await act(async () => flow.props!.onNodeDragStart?.({} as never, flow.props!.nodes![0]!, flow.props!.nodes!));
+    await render({ board: { ...board(), revision: 8 } });
+    await change([{ type: "position", id: "first", position: { x: 60, y: 40 }, dragging: false }]);
+    expect(onOperations).toHaveBeenCalledWith([{ kind: "updateItem", itemId: "first", patch: { geometry: { x: 60, y: 40, width: 180, height: 100, rotation: 0 } } }], 7);
   });
 
   it("does not save selection, measurement, unchanged, incomplete or deleted-item position events", async () => {

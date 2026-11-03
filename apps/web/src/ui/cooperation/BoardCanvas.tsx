@@ -5,7 +5,7 @@ import {
   type Connection, type Edge, type EdgeChange, type EdgeProps, type Node as FlowNode, type NodeChange, type NodePositionChange, type NodeProps, type ReactFlowInstance, type Viewport
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Code2, ExternalLink, FileText, Image as ImageIcon, LockKeyhole, MessageCircle, Pencil, Sparkles } from "lucide-react";
+import { Code2, ExternalLink, FileText, Image as ImageIcon, Link2, LockKeyhole, MessageCircle, Pencil, Sparkles } from "lucide-react";
 import DOMPurify from "dompurify";
 import hljs from "highlight.js/lib/core";
 import javascript from "highlight.js/lib/languages/javascript";
@@ -14,18 +14,20 @@ import python from "highlight.js/lib/languages/python";
 import typescript from "highlight.js/lib/languages/typescript";
 import {
   connectionLabelCenter, connectionPolyline, itemPortWorld,
-  type CooperationBoard, type CooperationConnection, type CooperationItem, type CooperationOperation, type CooperationPoint, type CooperationReaction, type CooperationTarget
+  type CooperationBoard, type CooperationConnection, type CooperationFileAsset, type CooperationItem, type CooperationOperation, type CooperationPoint, type CooperationReaction, type CooperationTarget
 } from "@cloudx/shared";
 import { cooperationAssetUrl } from "../../cooperationApi.js";
 import { ControlButton } from "../Control.js";
-import { PORTS, boardId, createBoardDrawing, pointPath, targetFromSelection, type BoardSelection, type BoardTool, type InkDraft } from "./boardModel.js";
+import { PORTS, boardContentBounds, boardId, createBoardDrawing, pointPath, targetFromSelection, type BoardSelection, type BoardTool, type InkDraft } from "./boardModel.js";
+import { BoardFile, BoardLink, BoardText } from "./BoardContent.js";
+import { BoardRegion } from "./BoardRegion.js";
 
 hljs.registerLanguage("javascript", javascript);
 hljs.registerLanguage("typescript", typescript);
 hljs.registerLanguage("json", json);
 hljs.registerLanguage("python", python);
 
-type ItemData = { item: CooperationItem; boardId: string; reactions: CooperationReaction[]; showChanges: boolean; readOnly: boolean; panning: boolean; connectable: boolean; onInspect: (target: BoardSelection) => void; onThread: (target: CooperationTarget, threadId?: string) => void; onOriginal: (item: Extract<CooperationItem, { kind: "image" }>) => void };
+type ItemData = { item: CooperationItem; boardId: string; asset?: CooperationFileAsset; reactions: CooperationReaction[]; showChanges: boolean; readOnly: boolean; panning: boolean; connectable: boolean; onInspect: (target: BoardSelection) => void; onThread: (target: CooperationTarget, threadId?: string) => void; onOriginal: (item: Extract<CooperationItem, { kind: "image" }>) => void };
 type RelationData = { connection: CooperationConnection; points: CooperationPoint[]; label: CooperationPoint; reactions: CooperationReaction[]; onThread: (target: CooperationTarget, threadId?: string) => void };
 type CanvasNode = FlowNode<ItemData, "item">;
 type CanvasEdge = Edge<RelationData, "universal">;
@@ -37,7 +39,7 @@ interface BoardCanvasProps {
   ink: InkDraft; setInk: Dispatch<SetStateAction<InkDraft>>; penColor: string; penWidth: number;
   onViewport: (viewport: Viewport) => void; onReady: (canvas: BoardCanvasInstance) => void;
   onSelection: (selection: BoardSelection[]) => void; onCreate: (tool: BoardTool, point: CooperationPoint) => void;
-  onOperations: (operations: CooperationOperation[], observedRevision?: number) => void; onInspect: (selection: BoardSelection) => void;
+  onOperations: (operations: CooperationOperation[], observedRevision?: number) => Promise<boolean>; onInspect: (selection: BoardSelection) => void;
   onContext: (target: CooperationTarget, x: number, y: number) => void;
   onThread: (target: CooperationTarget, threadId?: string) => void;
   onOriginal: (item: Extract<CooperationItem, { kind: "image" }>) => void;
@@ -96,7 +98,7 @@ export function BoardCanvas(props: BoardCanvasProps) {
         measured: measured.get(item.id),
         style: { width: item.geometry.width, height: item.geometry.height }, selected: selected.some(target => target.kind === "item" && target.id === item.id),
         draggable: !readOnly && !busy && moving, connectable: connecting, dragHandle: ".cooperation-item-drag", className: tool === "connection" ? "nopan" : undefined,
-        data: { item, boardId: board.boardId, reactions: board.reactions.filter(reaction => reaction.target.kind === "item" && reaction.target.id === item.id), showChanges: props.showChanges, readOnly, panning: tool === "pan", connectable: connecting, onInspect: props.onInspect, onThread: props.onThread, onOriginal: props.onOriginal }
+        data: { item, boardId: board.boardId, asset: item.kind === "file" ? board.assets.find((asset): asset is CooperationFileAsset => asset.kind === "file" && asset.id === item.content.assetId) : undefined, reactions: board.reactions.filter(reaction => reaction.target.kind === "item" && reaction.target.id === item.id), showChanges: props.showChanges, readOnly, panning: tool === "pan", connectable: connecting, onInspect: props.onInspect, onThread: props.onThread, onOriginal: props.onOriginal }
       }));
     });
   }, [board, selectionIds, readOnly, busy, tool, props.showChanges, props.onInspect, props.onThread, props.onOriginal]);
@@ -150,13 +152,23 @@ export function BoardCanvas(props: BoardCanvasProps) {
     const pressure = event.pressure || 0.5;
     setInk(current => { const stroke = current.at(-1); const previous = stroke?.points.at(-1); return stroke && (!previous || Math.hypot(x - previous[0], y - previous[1]) >= 1) ? [...current.slice(0, -1), { ...stroke, points: [...stroke.points, [x, y, pressure]] }] : current; });
   }
+  async function initialize(instance: BoardCanvasInstance) {
+    props.onReady(instance);
+    if (props.viewport) return;
+    const bounds = boardContentBounds(board);
+    if (!bounds) return;
+    await instance.fitBounds(bounds, { padding: 0.08 });
+    if (instance.getZoom() > 1) await instance.setCenter(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, { zoom: 1 });
+    props.onViewport(instance.getViewport());
+  }
   return <div className={`cooperation-canvas tool-${tool}`} ref={root} data-testid="cooperation-canvas" aria-label="Blackboard canvas">
     <ReactFlow<CanvasNode, CanvasEdge>
       nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} connectionMode={ConnectionMode.Loose}
       defaultViewport={props.viewport ?? { x: 40, y: 40, zoom: 0.8 }} minZoom={0.08} maxZoom={3} snapToGrid={props.snap} snapGrid={[20, 20]}
-      onInit={instance => { props.onReady(instance); if (!props.viewport && board.items.length) void instance.fitView({ padding: 0.08, maxZoom: 1 }).then(() => props.onViewport(instance.getViewport())); }}
+      onInit={initialize}
       onMoveEnd={(_event, viewport) => props.onViewport(viewport)}
       onNodesChange={nodeChanges} onEdgesChange={edgeChanges}
+      onNodeDragStart={() => { dragRevision.current = board.revision; }}
       onNodeClick={(event, node) => {
         if (event.target instanceof Element && event.target.closest("button, a, input, textarea, select, .react-flow__handle")) return;
         if (tool === "connection") connectItem(node); else if (!moving) event.preventDefault();
@@ -172,23 +184,24 @@ export function BoardCanvas(props: BoardCanvasProps) {
       onPaneClick={event => { if (moving || tool === "pan") props.onSelection([]); if (!readOnly && !busy && !moving && tool !== "pan" && tool !== "connection" && tool !== "pen") props.onCreate(tool, worldPoint(event)); }}
       onConnect={connect} onEdgesDelete={deleted => { if (!readOnly) props.onOperations(deleted.map(edge => ({ kind: "deleteConnection", connectionId: edge.id }))); }}
       nodesDraggable={!readOnly && !busy && moving} nodesConnectable={connecting} elementsSelectable={moving || tool === "connection"}
+      nodeDragThreshold={0}
       panOnDrag={panning} panOnScroll selectionOnDrag={tool === "select"} selectionKeyCode="Shift" multiSelectionKeyCode={["Meta", "Control", "Shift"]} zoomOnDoubleClick={false}
       deleteKeyCode={null} onlyRenderVisibleElements={false} noDragClassName="nodrag" noPanClassName="nopan"
       aria-label="Editable blackboard" proOptions={{ hideAttribution: false }}>
       <Background color="var(--color-border)" gap={20} size={1} variant={BackgroundVariant.Dots} />
       {props.miniMap ? <MiniMap pannable zoomable bgColor="var(--color-card)" maskColor="color-mix(in srgb, var(--color-background) 70%, transparent)" nodeColor="var(--color-accent-tertiary)" /> : null}
       <ViewportPortal>
-        {board.regions.map(region => <div key={region.id} className={`cooperation-region mode-${region.mode}`} data-testid={`region-${region.id}`} style={{ left: region.geometry.x, top: region.geometry.y, width: region.geometry.width, height: region.geometry.height }}>
+        {board.regions.map(region => <BoardRegion key={region.id} region={region} boardRevision={board.revision} snap={props.snap} disabled={busy} resizable={!readOnly && moving && selected.some(target => target.kind === "region" && target.id === region.id)} onResize={(geometry, observedRevision) => props.onOperations([{ kind: "updateRegion", regionId: region.id, patch: { geometry } }], observedRevision)}>
           <button className="cooperation-region-label nodrag nopan" type="button" onClick={() => props.onInspect({ kind: "region", id: region.id })} onContextMenu={event => { event.preventDefault(); props.onContext({ kind: "region", id: region.id }, event.clientX, event.clientY); }}><LockKeyhole size={13} />{region.mode === "wip" ? "Work in progress" : "Ready"} · {region.title}</button>
           {region.mode === "wip" && !readOnly ? <ControlButton className="cooperation-region-ready nodrag nopan" size="compact" disabled={busy} onClick={() => props.onOperations([{ kind: "markRegionReady", regionId: region.id }])}>Mark ready</ControlButton> : null}
           <ReactionBadges reactions={board.reactions.filter(reaction => reaction.target.kind === "region" && reaction.target.id === region.id)} onThread={props.onThread} />
-        </div>)}
+        </BoardRegion>)}
         {ink.length > 0 ? <svg className="cooperation-ink-preview" aria-label="Unfinished ink draft">{ink.map((stroke, index) => <path key={index} d={pointPath(stroke.points.map(([x, y]) => [x, y]))} fill="none" stroke={stroke.color} strokeWidth={stroke.width} strokeLinecap="round" strokeLinejoin="round" />)}</svg> : null}
       </ViewportPortal>
     </ReactFlow>
     {tool === "pen" && !readOnly ? <div className="cooperation-pen-capture" aria-label="Draw freehand" onPointerDown={penDown} onPointerMove={penMove} onPointerUp={event => { if (pen.current === event.pointerId) pen.current = undefined; }} onPointerCancel={() => { pen.current = undefined; }} /> : null}
     {ink.some(stroke => stroke.points.length > 0) && !readOnly ? <div className="cooperation-ink-actions"><ControlButton size="compact" disabled={busy} onClick={() => { props.onOperations([{ kind: "createItem", item: createBoardDrawing(ink) }]); setInk([]); }}>Save ink</ControlButton><ControlButton size="compact" onClick={() => setInk([])}>Discard ink</ControlButton></div> : null}
-    {!board.items.length ? <div className="cooperation-canvas-welcome"><FileText size={25} /><strong>A shared place to think</strong><p>Add a note, draw a sketch, or paste an image.<br />Select a tool, then click the canvas.</p></div> : null}
+    {!board.items.length && !board.regions.length ? <div className="cooperation-canvas-welcome"><FileText size={25} /><strong>A shared place to think</strong><p>Add a note, link, sketch, or file.<br />Select a tool, then click the canvas.</p></div> : null}
   </div>;
 }
 
@@ -198,13 +211,15 @@ const ItemNode = memo(function ItemNode({ data, selected }: NodeProps<CanvasNode
   const geometry = item.geometry;
   const updateInternals = useUpdateNodeInternals();
   useEffect(() => updateInternals(item.id), [item.id, geometry.width, geometry.height, geometry.rotation, updateInternals]);
-  const Icon = item.kind === "code" ? Code2 : item.kind === "image" ? ImageIcon : item.kind === "drawing" ? Pencil : FileText;
+  const Icon = item.kind === "code" ? Code2 : item.kind === "image" ? ImageIcon : item.kind === "link" ? Link2 : item.kind === "drawing" ? Pencil : FileText;
   const changed = data.showChanges && item.updatedBy.startsWith("agent:");
   return <div className={`cooperation-item-shell ${selected ? "is-selected" : ""} ${changed ? "changed-by-agent" : ""}`} data-item-id={item.id} style={{ width: geometry.width, height: geometry.height }}>
     <article className={`cooperation-item item-${item.kind}${item.kind === "shape" ? ` shape-${item.content.shape}` : ""}`} style={{ width: geometry.width, height: geometry.height, transform: `rotate(${geometry.rotation}deg)` }}>
       {item.kind === "shape" ? <ShapeContent item={item} /> : <>
         <header className="cooperation-item-heading cooperation-item-drag"><Icon size={16} /><strong>{item.content.title}</strong>{item.kind === "code" ? <span className="cooperation-code-language">{item.content.language || "text"}</span> : null}</header>
-        {item.kind === "note" || item.kind === "code" ? <div className={`cooperation-item-text${data.panning ? "" : " nodrag nopan nowheel"}`}>{item.content.blocks.map(block => <div key={block.id} data-cooperation-block={block.id} data-cooperation-item={item.id} className={item.kind === "code" ? "cooperation-code-block" : "cooperation-note-block"}>{item.kind === "code" && hljs.getLanguage(item.content.language) ? <code dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(hljs.highlight(block.text, { language: item.content.language, ignoreIllegals: true }).value) }} /> : block.text || <span className="cooperation-empty-block">Double-click to write</span>}</div>)}</div> : null}
+        {item.kind === "note" || item.kind === "code" ? <div className={`cooperation-item-text${data.panning ? "" : " nodrag nopan nowheel"}`}>{item.content.blocks.map(block => <div key={block.id} data-cooperation-block={block.id} data-cooperation-item={item.id} className={item.kind === "code" ? "cooperation-code-block" : "cooperation-note-block"}>{item.kind === "code" && hljs.getLanguage(item.content.language) ? <code dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(hljs.highlight(block.text, { language: item.content.language, ignoreIllegals: true }).value) }} /> : block.text ? item.kind === "note" ? <BoardText text={block.text} /> : block.text : <span className="cooperation-empty-block">Double-click to write</span>}</div>)}</div> : null}
+        {item.kind === "link" ? <BoardLink content={item.content} panning={data.panning} /> : null}
+        {item.kind === "file" ? <BoardFile key={item.content.assetId} boardId={data.boardId} item={item} asset={data.asset} panning={data.panning} /> : null}
         {item.kind === "image" ? <div className="cooperation-image-content"><img src={cooperationAssetUrl(data.boardId, item.content.assetId)} alt={item.content.alt} draggable={false} onError={event => { event.currentTarget.hidden = true; const message = event.currentTarget.nextElementSibling as HTMLElement | null; if (message) message.hidden = false; }} /><p hidden>Original image unavailable. Inspect the asset record or open the original.</p><button type="button" className="cooperation-open-original nodrag nopan" onClick={() => data.onOriginal(item)}><ExternalLink size={12} />Open original</button></div> : null}
         {item.kind === "drawing" ? <svg className="cooperation-drawing" viewBox={`0 0 ${geometry.width} ${geometry.height}`} aria-label={item.content.description} preserveAspectRatio="none">{item.content.strokes.map(stroke => <path key={stroke.id} d={pointPath(stroke.points.map(([x, y]) => [x, y]))} fill="none" stroke={stroke.color} strokeWidth={stroke.width} strokeLinecap="round" strokeLinejoin="round" />)}</svg> : null}
       </>}

@@ -57,8 +57,16 @@ export class BlackboardRepository {
       const file = await fs.open(this.child(directory, path.basename(relativePath)), constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         const stat = await file.stat();
-        requireCooperation(stat.isFile() && stat.size <= COOPERATION_LIMITS.imageBytes, "ASSET_INVALID", "The original image file is invalid.");
-        return await file.readFile();
+        requireCooperation(stat.isFile() && stat.size <= COOPERATION_LIMITS.fileBytes, "ASSET_INVALID", "The original asset file is invalid.");
+        const bytes = Buffer.alloc(stat.size + 1);
+        let offset = 0;
+        while (offset < bytes.length) {
+          const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+          if (!bytesRead) break;
+          offset += bytesRead;
+        }
+        requireCooperation(offset === stat.size, "ASSET_INVALID", "The original asset changed while it was read.");
+        return bytes.subarray(0, offset);
       } finally { await file.close(); }
     });
   }
@@ -67,7 +75,7 @@ export class BlackboardRepository {
     await this.withDirectory(path.dirname(relativePath), false, async directory => {
       const target = this.child(directory, path.basename(relativePath));
       const stat = await fs.lstat(target).catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
-      requireCooperation(!stat || stat.isFile(), "INTEGRITY_ERROR", "An original image was replaced before cleanup.");
+      requireCooperation(!stat || stat.isFile(), "INTEGRITY_ERROR", "An original asset was replaced before cleanup.");
       if (stat) await fs.unlink(target);
     });
   }
@@ -144,7 +152,7 @@ export class BlackboardRepository {
 
   resolve(relativePath: string): string {
     const target = path.resolve(this.rootDir, relativePath);
-    requireCooperation(target.startsWith(`${path.resolve(this.rootDir)}${path.sep}`), "ASSET_INVALID", "The image must belong to the managed board.");
+    requireCooperation(target.startsWith(`${path.resolve(this.rootDir)}${path.sep}`), "ASSET_INVALID", "The original must belong to the managed board.");
     return target;
   }
 }

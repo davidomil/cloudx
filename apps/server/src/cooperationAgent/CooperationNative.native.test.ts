@@ -144,7 +144,7 @@ it.skipIf(!claude).each(["default", "hold", "refuse"] as const)("native Claude p
     const sourceImagePath = path.join(root, "original-board.png");
     await fs.writeFile(sourceImagePath, originalImage);
     const asset = { id: "asset-native", mime: "image/png" as const, sha256: createHash("sha256").update(originalImage).digest("hex"), byteLength: originalImage.length, width: 1200, height: 800, relativePath: "assets/reference.png" };
-    imagePath = (await contexts.materializeAsset(tab.id, 1, { asset, localPath: sourceImagePath })).localPath;
+    imagePath = (await contexts.materializeAsset(await contexts.prepare(tab.id), { asset, localPath: sourceImagePath })).localPath;
     expect(await fs.readFile(imagePath)).toEqual(originalImage);
     const imageDelivery = await native.deliver({ recipientTabId: tab.id, assignmentGeneration: 1, boardId: "board-native", boardRevision: 3, eventIds: ["event-image"], text: `Open the original board image with Read at ${imagePath}.` });
     expect(["unknown", "nativeAccepted"]).toContain(imageDelivery.state);

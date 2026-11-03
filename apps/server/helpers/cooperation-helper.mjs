@@ -8,6 +8,7 @@ import { pathToFileURL } from "node:url";
 
 const MAX_TRANSACTION_BYTES = 256 * 1024;
 const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
+const MAX_ASSET_BYTES = 32 * 1024 * 1024;
 
 export async function runCooperationHelper(args, env = process.env) {
   const contextPath = env.CLOUDX_COOPERATION_CONTEXT;
@@ -22,7 +23,10 @@ export async function runCooperationHelper(args, env = process.env) {
   if (locator.caPath !== undefined && (typeof locator.caPath !== "string" || !path.isAbsolute(locator.caPath)))
     throw new Error("Cooperation TLS trust requires an absolute certificate path.");
   const ca = endpoint.protocol === "https:" && locator.caPath ? await readFile(locator.caPath, 256 * 1024) : undefined;
-  const body = JSON.stringify({ tabId: locator.tabId, assignmentGeneration: locator.assignmentGeneration, boardId: locator.boardId, ...command });
+  const { action, ...parameters } = command;
+  if (action === "upload") endpoint.pathname += "/assets";
+  const body = JSON.stringify({ tabId: locator.tabId, assignmentGeneration: locator.assignmentGeneration, boardId: locator.boardId,
+    ...(action === "upload" ? parameters : command) });
   const { statusCode, result } = await post(endpoint, locator.capability, body, ca);
   if (statusCode < 200 || statusCode >= 300) throw new Error(`${result.code ?? "REQUEST_FAILED"}: ${result.message ?? "The cooperation request failed."}`);
   if (command.action === "read" && command.format === "markdown" && typeof result.markdown === "string") return result.markdown;
@@ -73,12 +77,18 @@ async function parseCommand(args) {
     return { action, format, ...(option("--item", false) ? { itemId: option("--item") } : {}) };
   }
   if (action === "asset") return { action, assetId: option("--id") };
+  if (action === "upload") {
+    const file = option("--file");
+    return { action, mime: option("--mime"), name: option("--name", false) ?? path.basename(file),
+      base64: (await readFile(file, MAX_ASSET_BYTES)).toString("base64") };
+  }
+  if (action === "discard") return { action: "discardAsset", stagedToken: option("--token") };
   if (action === "inbox" && rest[0] === "list") return { action: "inbox" };
   if (action === "inbox" && rest[0] === "claim") return { action: "claim", eventId: option("--event") };
   if (action === "apply") return { action, transaction: await readJson(option("--file"), MAX_TRANSACTION_BYTES) };
   if (action === "receipt") return { action, operationId: option("--operation") };
   if (action === "complete") return { action, completion: await readJson(option("--file"), MAX_TRANSACTION_BYTES) };
-  throw new Error("Use context, read, asset, inbox list, inbox claim, apply, receipt, or complete. See the cooperation-board skill protocol.");
+  throw new Error("Use context, read, asset, upload, discard, inbox list, inbox claim, apply, receipt, or complete. See the cooperation-board skill protocol.");
 }
 
 async function readJson(filePath, maxBytes) {
@@ -90,7 +100,15 @@ async function readFile(filePath, maxBytes) {
   try {
     const stat = await handle.stat();
     if (!stat.isFile() || stat.size > maxBytes) throw new Error("Cooperation input must be a bounded regular file.");
-    return await handle.readFile();
+    const bytes = Buffer.alloc(stat.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    if (offset !== stat.size) throw new Error("Cooperation input changed while it was read.");
+    return bytes.subarray(0, offset);
   } finally { await handle.close(); }
 }
 
