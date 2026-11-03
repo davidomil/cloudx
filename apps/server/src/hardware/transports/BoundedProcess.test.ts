@@ -7,6 +7,19 @@ import { BoundedProcessSet } from "./BoundedProcess.js";
 const signal = () => new AbortController().signal;
 
 describe("bounded hardware transport processes", () => {
+  it("passes only the selected transport environment and redacts secret output before enforcing its byte bound", async () => {
+    const processes = new BoundedProcessSet();
+    const result = await processes.run({ executable: process.execPath, args: ["-e", "process.stdout.write(process.env.SSH_AUTH_SOCK+':'+(process.env.HOME??'missing'));process.stderr.write('private-password')"], environment: { SSH_AUTH_SOCK: "/tmp/selected-agent" }, secrets: ["private-password"], timeoutMs: 1000, maxOutputBytes: 100, signal: signal() });
+    expect(result).toMatchObject({ state: "exited", stdout: "/tmp/selected-agent:missing", stderr: "[redacted]" });
+    const truncated = await processes.run({ executable: process.execPath, args: ["-e", "process.stdout.write('private-password')"], secrets: ["private-password"], timeoutMs: 1000, maxOutputBytes: 4, signal: signal() });
+    expect(truncated.stdout).not.toContain("priv");
+    expect(Buffer.byteLength(truncated.stdout)).toBeLessThanOrEqual(4);
+    const unicode = await processes.run({ executable: process.execPath, args: ["-e", "process.stdout.write('private-password€')"], secrets: ["private-password€"], timeoutMs: 1000, maxOutputBytes: 17, signal: signal() });
+    expect(unicode.stdout).not.toContain("private-password");
+    expect(Buffer.byteLength(unicode.stdout)).toBeLessThanOrEqual(17);
+    await processes.close(signal());
+  });
+
   it("reports actual exit status, writes stdin separately from argv, and captures both streams", async () => {
     const processes = new BoundedProcessSet();
     const result = await processes.run({ executable: process.execPath, args: ["-e", "process.stdin.pipe(process.stdout);process.stderr.write('error');process.exitCode=7"], stdin: "untrusted $(printf value)\n", timeoutMs: 1000, maxOutputBytes: 100, signal: signal() });

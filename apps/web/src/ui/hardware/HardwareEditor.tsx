@@ -10,6 +10,10 @@ import type {
 } from "@cloudx/shared";
 import { ControlButton } from "../Control.js";
 import {
+  hardwareRequestId,
+  saveHardwareSshPassword,
+} from "../../hardwareApi.js";
+import {
   emptyScript,
   HardwareDialog,
   Observation,
@@ -23,8 +27,7 @@ export const sshDefaults = (): JsonObject => ({
   host: "",
   port: 22,
   username: "",
-  auth: { kind: "agent", socketPath: "" },
-  knownHostsFile: "",
+  auth: { kind: "agent" },
   connectTimeoutMs: 5000,
 });
 export const uartDefaults = (): JsonObject => ({
@@ -92,7 +95,16 @@ export function HardwareEditor({
       },
   );
   const [deleting, setDeleting] = useState(false);
+  const [password, setPassword] = useState("");
+  const [passwordReference, setPasswordReference] = useState<string>();
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string>();
   const { value } = draft;
+  useEffect(() => {
+    setPassword("");
+    setPasswordReference(undefined);
+    setSaveError(undefined);
+  }, [value.typeId, (value.config.auth as JsonObject | undefined)?.kind]);
   useEffect(() => {
     drafts.set(key, draft);
   }, [draft, drafts, key]);
@@ -100,41 +112,83 @@ export function HardwareEditor({
   const edit = (patch: Partial<HardwareItemDraft>) =>
     setDraft({ ...draft, value: { ...value, ...patch } });
   async function save() {
-    const newGroupName =
-      !held && !value.physicalResourceId
-        ? draft.newGroupName.trim()
-        : undefined;
-    const { physicalResourceId: _physicalResourceId, ...withoutGroup } = value;
-    const patch = held
-      ? {
-          name: value.name,
-          description: value.description,
-          notes: value.notes,
-          tagIds: value.tagIds,
-          enabled: value.enabled,
+    if (saving || busy || stale) return;
+    setSaving(true);
+    setSaveError(undefined);
+    try {
+      let savedValue = value;
+      if (
+        !held &&
+        value.typeId === "hardware.ssh" &&
+        (value.config.auth as JsonObject).kind === "password"
+      ) {
+        if (password) {
+          const credentialRefId =
+            passwordReference ?? `ssh-password-${hardwareRequestId()}`;
+          setPasswordReference(credentialRefId);
+          await saveHardwareSshPassword(credentialRefId, password);
+          setPassword("");
+          setPasswordReference(undefined);
+          savedValue = {
+            ...value,
+            config: {
+              ...value.config,
+              auth: { kind: "password", credentialRefId },
+            },
+          };
+          setDraft({ ...draft, value: savedValue });
+        } else if (!(value.config.auth as JsonObject).credentialRefId) {
+          setSaveError(
+            "Enter an SSH password before saving password authentication.",
+          );
+          return;
         }
-      : newGroupName !== undefined
-        ? withoutGroup
-        : value;
-    const receipt = await run(
-      item ? "hardware.items.update" : "hardware.items.create",
-      item
+      }
+      const newGroupName =
+        !held && !savedValue.physicalResourceId
+          ? draft.newGroupName.trim()
+          : undefined;
+      const { physicalResourceId: _physicalResourceId, ...withoutGroup } =
+        savedValue;
+      const patch = held
         ? {
-            hardwareId: item.id,
-            expectedItemRevision: draft.baseRevision,
-            patch,
-            ...(newGroupName !== undefined ? { newGroupName } : {}),
+            name: value.name,
+            description: value.description,
+            notes: value.notes,
+            tagIds: value.tagIds,
+            enabled: value.enabled,
           }
-        : {
-            item: value,
-            ...(value.physicalResourceId
-              ? {}
-              : { newGroupName: draft.newGroupName }),
-          },
-    );
-    if (receipt?.state === "succeeded") {
-      drafts.delete(key);
-      onSaved();
+        : newGroupName !== undefined
+          ? withoutGroup
+          : savedValue;
+      const receipt = await run(
+        item ? "hardware.items.update" : "hardware.items.create",
+        item
+          ? {
+              hardwareId: item.id,
+              expectedItemRevision: draft.baseRevision,
+              patch,
+              ...(newGroupName !== undefined ? { newGroupName } : {}),
+            }
+          : {
+              item: savedValue,
+              ...(savedValue.physicalResourceId
+                ? {}
+                : { newGroupName: draft.newGroupName }),
+            },
+      );
+      if (receipt?.state === "succeeded") {
+        drafts.delete(key);
+        onSaved();
+      }
+    } catch (cause) {
+      setSaveError(
+        cause instanceof Error
+          ? cause.message
+          : "The SSH password could not be saved.",
+      );
+    } finally {
+      setSaving(false);
     }
   }
   return (
@@ -147,7 +201,7 @@ export function HardwareEditor({
     >
       <header className="hardware-view-heading">
         <div>
-          <ControlButton size="compact" onClick={onClose}>
+          <ControlButton size="compact" disabled={saving} onClick={onClose}>
             <ArrowLeft size={14} />
             Back to inventory
           </ControlButton>
@@ -162,13 +216,16 @@ export function HardwareEditor({
           This item changed while you were editing. Your draft is retained.
           <ControlButton
             size="compact"
-            onClick={() =>
+            onClick={() => {
+              setPassword("");
+              setPasswordReference(undefined);
+              setSaveError(undefined);
               setDraft({
                 value: editableHardware(item!),
                 baseRevision: item!.revision,
                 newGroupName: "",
-              })
-            }
+              });
+            }}
           >
             Discard draft and load current item
           </ControlButton>
@@ -180,7 +237,12 @@ export function HardwareEditor({
           is held. Notes and descriptive fields remain editable.
         </p>
       ) : null}
-      <fieldset disabled={busy} className="hardware-columns">
+      {saveError ? (
+        <p role="alert" className="hardware-banner danger">
+          {saveError}
+        </p>
+      ) : null}
+      <fieldset disabled={busy || saving} className="hardware-columns">
         <div>
           <section className="hardware-card">
             <h3>Basics</h3>
@@ -336,10 +398,15 @@ export function HardwareEditor({
                 typeId={value.typeId}
                 config={value.config}
                 onChange={(config) => edit({ config })}
+                password={password}
+                onPasswordChange={(next) => {
+                  setPassword(next);
+                  setPasswordReference(undefined);
+                  setSaveError(undefined);
+                }}
               />
               <p className="hardware-muted">
-                No connection is opened while editing. Credential values stay on
-                the host.
+                No SSH connection opens while editing.
               </p>
             </section>
             <StatusBindings
@@ -372,14 +439,14 @@ export function HardwareEditor({
             drafts.delete(key);
             onClose();
           }}
-          disabled={busy}
+          disabled={busy || saving}
         >
           Cancel
         </ControlButton>
         <ControlButton
           tone="primary"
           type="submit"
-          disabled={busy || stale || !state.types.length}
+          disabled={busy || saving || stale || !state.types.length}
         >
           <Save size={15} />
           Save hardware
@@ -433,10 +500,14 @@ function ConnectionFields({
   typeId,
   config,
   onChange,
+  password,
+  onPasswordChange,
 }: {
   typeId: string;
   config: JsonObject;
   onChange: (config: JsonObject) => void;
+  password: string;
+  onPasswordChange: (password: string) => void;
 }) {
   const set = (key: string, value: string | number | JsonObject) =>
     onChange({ ...config, [key]: value });
@@ -485,45 +556,62 @@ function ConnectionFields({
               set(
                 "auth",
                 event.target.value === "agent"
-                  ? { kind: "agent", socketPath: "" }
-                  : { kind: "identity_file", path: "" },
+                  ? { kind: "agent" }
+                  : event.target.value === "password"
+                    ? { kind: "password", credentialRefId: "" }
+                    : { kind: "identity_file", path: "" },
               )
             }
           >
-            <option value="agent">SSH agent</option>
+            <option value="agent">
+              {auth.socketPath ? "Configured SSH agent" : "Current SSH agent"}
+            </option>
             <option value="identity_file">Identity file</option>
+            <option value="password">Password</option>
           </select>
         </label>
-        <label>
-          {auth.kind === "agent"
-            ? "SSH agent socket"
-            : "Identity file reference"}
-          <input
-            aria-label={
-              auth.kind === "agent"
-                ? "SSH agent socket"
-                : "Identity file reference"
-            }
-            required
-            value={String(auth.kind === "agent" ? auth.socketPath : auth.path)}
-            onChange={(event) =>
-              set("auth", {
-                ...auth,
-                [auth.kind === "agent" ? "socketPath" : "path"]:
-                  event.target.value,
-              })
-            }
-          />
-        </label>
-        <label>
-          Known hosts file
-          <input
-            aria-label="Known hosts file"
-            required
-            value={String(config.knownHostsFile)}
-            onChange={(event) => set("knownHostsFile", event.target.value)}
-          />
-        </label>
+        {auth.kind === "identity_file" ? (
+          <label>
+            Identity file reference
+            <input
+              aria-label="Identity file reference"
+              required
+              value={String(auth.path)}
+              onChange={(event) =>
+                set("auth", {
+                  ...auth,
+                  path: event.target.value,
+                })
+              }
+            />
+          </label>
+        ) : null}
+        {auth.kind === "password" ? (
+          <label>
+            {auth.credentialRefId
+              ? "Replacement SSH password (optional)"
+              : "SSH password"}
+            <input
+              aria-label="SSH password"
+              type="password"
+              autoComplete="new-password"
+              required={!auth.credentialRefId}
+              value={password}
+              onChange={(event) => onPasswordChange(event.target.value)}
+            />
+            <span className="hardware-muted">
+              {auth.credentialRefId
+                ? "Password saved on CloudX host"
+                : "Saved privately on the CloudX host. Hardware stores only a reference."}
+            </span>
+          </label>
+        ) : auth.kind === "agent" ? (
+          <p className="hardware-muted">
+            {auth.socketPath
+              ? "Uses the item's explicitly configured SSH agent."
+              : "Uses the SSH agent available to the CloudX server."}
+          </p>
+        ) : null}
         <label>
           Connection timeout (ms)
           <input
@@ -539,7 +627,9 @@ function ConnectionFields({
           />
         </label>
         <p className="hardware-banner">
-          Strict host-key validation is required.
+          {config.knownHostsFile
+            ? "Verifies host keys against the configured known-hosts file."
+            : "New host keys are saved automatically. Changed host keys are blocked."}
         </p>
       </>
     );

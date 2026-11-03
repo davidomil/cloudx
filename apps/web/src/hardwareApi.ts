@@ -162,6 +162,41 @@ export async function callHardwareAction<T = HardwareMutationResult>(
   return body.result as T;
 }
 
+export async function saveHardwareSshPassword(
+  credentialRefId: string,
+  password: string,
+  signal?: AbortSignal,
+): Promise<{ credentialRefId: string }> {
+  let body: unknown;
+  try {
+    body = await request(
+      `/ssh-passwords/${encodeURIComponent(credentialRefId)}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password }),
+        signal,
+      },
+      credentialRefId,
+    );
+  } catch (cause) {
+    if (cause instanceof HardwareApiError && cause.code === "OUTCOME_UNKNOWN")
+      throw new HardwareApiError(
+        "The password save response was lost. Explicitly retry this same password before continuing.",
+        "OUTCOME_UNKNOWN",
+        credentialRefId,
+      );
+    throw cause;
+  }
+  if (!isRecord(body) || body.credentialRefId !== credentialRefId)
+    throw new HardwareApiError(
+      "The password save response is invalid. Explicitly retry this same password before continuing.",
+      "OUTCOME_UNKNOWN",
+      credentialRefId,
+    );
+  return { credentialRefId };
+}
+
 function validReceipt(value: unknown): value is OperationReceipt {
   return (
     isRecord(value) &&

@@ -11,6 +11,8 @@ import type {
   ProviderOutcome,
 } from "@cloudx/shared";
 import { HardwareService } from "../../../apps/server/src/hardware/HardwareService.js";
+import { HardwareSshPasswords } from "../../../apps/server/src/hardware/HardwareSshPasswords.js";
+import { hardwareCredentialResolver } from "../../../apps/server/src/hardware/hardwareCredentials.js";
 import { PathPolicy } from "../../../apps/server/src/pathPolicy.js";
 import {
   SshHardwareProvider,
@@ -40,11 +42,22 @@ export interface Invocation {
 /** Real persistence, admission, hooks and HTTP routes; deterministic device I/O only. */
 export class HardwareBrowserService {
   readonly invocations: Invocation[] = [];
+  readonly registrations: {
+    input: JsonObject;
+    reservationId: string;
+    generation: number;
+  }[] = [];
+  readonly connections: { authKind: string; credentialRefId?: string }[] = [];
+  registrationGate?: Promise<void>;
+  registrationOutcome?: ProviderOutcome<JsonObject>;
   invokeGate?: Promise<void>;
   readonly service: HardwareService;
   ssh!: HardwareItem;
   uart!: HardwareItem;
-  constructor(readonly root: string) {
+  constructor(
+    readonly root: string,
+    readonly passwords = new HardwareSshPasswords(root),
+  ) {
     const pathPolicy = new PathPolicy([root]);
     const ssh = new SshHardwareProvider({ pathPolicy });
     const uart = new UartHardwareProvider({ pathPolicy });
@@ -72,6 +85,8 @@ export class HardwareBrowserService {
         },
       },
       ownerState: () => "active",
+      resolveCredential: hardwareCredentialResolver({}, passwords),
+      discardCredential: (id) => passwords.discardRegistration(id),
     });
   }
   private provider(
@@ -95,7 +110,36 @@ export class HardwareBrowserService {
         summary: "Controlled browser-test endpoint",
         details: {},
       }),
-      connect: async (_config, context) => {
+      registerKey: async (_config, input, context) => {
+        context.registerCleanup(async () => ({
+          state: "completed",
+          value: null,
+        }));
+        if (typeof input.credentialRefId === "string")
+          await context.resolveCredential(input.credentialRefId);
+        this.registrations.push({
+          input: structuredClone(input),
+          reservationId: context.reservation.reservationId,
+          generation: context.reservation.generation,
+        });
+        await this.registrationGate;
+        return (
+          this.registrationOutcome ?? {
+            state: "completed",
+            value: { registered: true },
+          }
+        );
+      },
+      connect: async (config, context) => {
+        const auth = config.auth as JsonObject | undefined;
+        if (auth?.kind === "password")
+          await context.resolveCredential(String(auth.credentialRefId));
+        this.connections.push({
+          authKind: String(auth?.kind ?? "uart"),
+          ...(typeof auth?.credentialRefId === "string"
+            ? { credentialRefId: auth.credentialRefId }
+            : {}),
+        });
         const close = async () => ({
           state: "completed" as const,
           value: null,
@@ -217,8 +261,7 @@ export class HardwareBrowserService {
       host,
       port: 22,
       username: "root",
-      auth: { kind: "agent", socketPath: `${this.root}/agent.sock` },
-      knownHostsFile: `${this.root}/known_hosts`,
+      auth: { kind: "agent" },
       connectTimeoutMs: 5000,
     };
   }

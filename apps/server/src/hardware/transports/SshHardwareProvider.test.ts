@@ -38,6 +38,23 @@ describe("SSH configuration and batch boundaries", () => {
     expect(provider.describeAccess(config).details).not.toHaveProperty("auth");
   });
 
+  it("accepts inherited agent, default host trust and password references without accepting plaintext", async () => {
+    const defaults = { host: "example.test", port: 22, username: "tester", auth: { kind: "agent" }, connectTimeoutMs: 5000 };
+    expect(provider.parseConfig(defaults)).toEqual(defaults);
+    const args = sshArguments(provider.parseConfig(defaults));
+    expect(args).toContain("StrictHostKeyChecking=accept-new");
+    expect(args.some(value => value.startsWith("IdentityAgent=") || value.startsWith("UserKnownHostsFile="))).toBe(false);
+    const password = provider.parseConfig({ ...defaults, auth: { kind: "password", credentialRefId: "hardware-password" } });
+    const effective = await exec("/usr/bin/ssh", [...sshArguments(password), "-G", "--", password.host]);
+    expect(effective.stdout).toContain("batchmode no\n");
+    expect(effective.stdout).toContain("passwordauthentication yes\n");
+    expect(effective.stdout).toContain("pubkeyauthentication false\n");
+    expect(effective.stdout).toContain("numberofpasswordprompts 1\n");
+    expect(effective.stdout).toContain("preferredauthentications password\n");
+    expect(effective.stdout).toContain("identityagent none\n");
+    expect(() => provider.parseConfig({ ...defaults, auth: { kind: "password", value: "plaintext" } })).toThrow();
+  });
+
   it("has the expected effective host OpenSSH configuration without opening a connection", async () => {
     const effective = await exec("/usr/bin/ssh", [...sshArguments(config), "-G", "--", config.host]);
     expect(effective.stdout).toContain("batchmode yes\n");
@@ -77,6 +94,77 @@ describe("SSH configuration and batch boundaries", () => {
       await new Promise<void>((resolve, reject) => agent.close(error => error ? reject(error) : resolve()));
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("SSH password process ownership", () => {
+  let directory: string;
+  let capture: string;
+  let provider: SshHardwareProvider;
+  const config: SshConfig = { host: "example.test", port: 22, username: "tester", auth: { kind: "password", credentialRefId: "test-password" }, connectTimeoutMs: 1000 };
+
+  beforeAll(async () => {
+    directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-password-"));
+    capture = path.join(directory, "capture.json");
+    const executable = path.join(directory, "ssh");
+    await fs.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs');const {execFileSync}=require('node:child_process');let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const answer=execFileSync(process.env.SSH_ASKPASS,["tester@example.test's password: "],{env:process.env});fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({argv:process.argv.slice(2),environment:process.env,input}));process.stdout.write(answer);});\n`, { mode: 0o700 });
+    provider = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshExecutable: executable, environment: {} });
+  });
+  afterAll(async () => { await fs.rm(directory, { recursive: true, force: true }); });
+
+  it("keeps password values out of argv and environment and removes each completed password channel", async () => {
+    const context = { ...transportTestContext(), resolveCredential: async () => "private-password" };
+    const opened = await provider.connect(config, context);
+    expect(opened.state).toBe("completed");
+    if (opened.state !== "completed") throw new Error(JSON.stringify(opened));
+    try {
+      const probe = JSON.parse(await fs.readFile(capture, "utf8"));
+      expect(JSON.stringify(probe)).not.toContain("private-password");
+      expect(probe.input).toBe("exit 0\n");
+      await expect(fs.stat(probe.environment.CLOUDX_SSH_ASKPASS_SOCKET)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(opened.value.invoke("ssh.exec", { script: "printf safe", timeoutMs: 1000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "completed", value: { stdout: "[redacted]\n" } });
+      const command = JSON.parse(await fs.readFile(capture, "utf8"));
+      expect(command.input).toBe("printf safe");
+      expect(JSON.stringify(command)).not.toContain("private-password");
+      await expect(fs.stat(command.environment.SSH_ASKPASS)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null }); }
+  });
+
+  it("confirms cleanup after a pending credential lookup and never starts a cancelled SSH process", async () => {
+    await fs.rm(capture, { force: true });
+    let supply!: (password: string) => void;
+    let lookupStarted!: () => void;
+    const started = new Promise<void>(resolve => { lookupStarted = resolve; });
+    const context = { ...transportTestContext(), resolveCredential: () => { lookupStarted(); return new Promise<string>(resolve => { supply = resolve; }); } };
+    const opening = provider.connect(config, context);
+    await started;
+    let closed = false;
+    const closing = context.cleanups[0]!(signal()).then(result => { closed = true; return result; });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    supply("private-password");
+    await expect(opening).resolves.toMatchObject({ state: "failed", effects: "none" });
+    await expect(closing).resolves.toEqual({ state: "completed", value: null });
+    await expect(fs.stat(capture)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("fails credential validation before any native process starts and hides resolver errors", async () => {
+    await fs.rm(capture, { force: true });
+    for (const resolveCredential of [async () => "a\nb", async () => "a".repeat(1024), async () => { throw new Error("private-password"); }]) {
+      const context = { ...transportTestContext(), resolveCredential };
+      const result = await provider.connect(config, context);
+      expect(result).toMatchObject({ state: "failed", effects: "none", error: { code: "CREDENTIAL_UNAVAILABLE" } });
+      expect(JSON.stringify(result)).not.toContain("private-password");
+      await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
+    }
+    await expect(fs.stat(capture)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("requires usable agent keys for explicit registration and rejects plaintext action input", async () => {
+    const context = { ...transportTestContext(), resolveCredential: async () => "private-password" };
+    await expect(provider.registerKey(config, { timeoutMs: 1000 }, context)).resolves.toMatchObject({ state: "failed", effects: "none", error: { code: "SSH_AGENT_UNAVAILABLE" } });
+    await expect(provider.registerKey(config, { timeoutMs: 1000, password: "private-password" }, context)).resolves.toMatchObject({ state: "failed", effects: "none", error: { code: "INVALID_INPUT" } });
+    for (const cleanup of context.cleanups) await expect(cleanup(signal())).resolves.toEqual({ state: "completed", value: null });
   });
 });
 
@@ -207,6 +295,72 @@ describe.skipIf(!existsSync("/usr/sbin/sshd") || !existsSync("/usr/lib/openssh/s
     await expect(provider.connect({ ...config, knownHostsFile: emptyHosts }, context)).resolves.toMatchObject({ state: "unknown", error: { code: "SSH_CONNECT_UNKNOWN" } });
     await context.cleanups[0]!(signal());
     expect(await fs.readFile(emptyHosts, "utf8")).toBe("");
+  });
+
+  it("registers an already authorized configured key before connect without duplicating it", async () => {
+    const before = await fs.readFile(path.join(directory, "authorized_keys"), "utf8");
+    const context = transportTestContext();
+    await expect(provider.registerKey(config, { timeoutMs: 5000 }, context)).resolves.toEqual({ state: "completed", value: { registered: true } });
+    expect(await fs.readFile(path.join(directory, "authorized_keys"), "utf8")).toBe(before);
+    expect(context.cleanups).toHaveLength(1);
+    await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
+  });
+
+  it("preserves the configured private/public pair when its public key is a symlink to another basename", async () => {
+    const privateKey = (config.auth as { path: string }).path;
+    const alias = path.join(directory, "alias-key");
+    const publicTarget = path.join(directory, "public-only.pub");
+    await fs.symlink(privateKey, alias);
+    await fs.copyFile(`${privateKey}.pub`, publicTarget);
+    await fs.symlink(publicTarget, `${alias}.pub`);
+    const context = transportTestContext();
+    await expect(provider.registerKey({ ...config, auth: { kind: "identity_file", path: alias } }, { timeoutMs: 5000 }, context)).resolves.toEqual({ state: "completed", value: { registered: true } });
+    await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
+  });
+
+  it("rejects mismatched and encrypted identity pairs and shell-active key paths before registration", async () => {
+    const identity = path.join(directory, "other-key");
+    await exec("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", identity]);
+    await fs.copyFile(`${(config.auth as { path: string }).path}.pub`, `${identity}.pub`);
+    const encrypted = path.join(directory, "encrypted-key");
+    await exec("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "test-passphrase", "-f", encrypted]);
+    const unsafe = path.join(directory, 'quoted"key');
+    await fs.copyFile(identity, unsafe);
+    await fs.copyFile(`${identity}.pub`, `${unsafe}.pub`);
+    for (const key of [identity, encrypted, unsafe]) {
+      const context = transportTestContext();
+      await expect(provider.registerKey({ ...config, auth: { kind: "identity_file", path: key } }, { timeoutMs: 5000 }, context)).resolves.toMatchObject({ state: "failed", effects: "none" });
+      await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
+    }
+  });
+
+  it("keeps interrupted key registration unknown while cleanup confirms process exit and removes password channels", async () => {
+    const executable = path.join(directory, "pending-copy-id");
+    const marker = path.join(directory, "pending-registration.json");
+    await fs.writeFile(executable, `#!${process.execPath}\nprocess.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,askpass:process.env.SSH_ASKPASS,socket:process.env.CLOUDX_SSH_ASKPASS_SOCKET,home:process.env.HOME,argv:process.argv.slice(2)}));setInterval(()=>{},1000);\n`, { mode: 0o700 });
+    const type = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshCopyIdExecutable: executable });
+    const context = { ...transportTestContext(), resolveCredential: async () => "private-password" };
+    const registration = type.registerKey(config, { timeoutMs: 10000, credentialRefId: "registration-password" }, context);
+    const deadline = Date.now() + 3000;
+    while (!existsSync(marker)) { if (Date.now() > deadline) throw new Error("Registration did not start."); await new Promise(resolve => setTimeout(resolve, 10)); }
+    const active = JSON.parse(await fs.readFile(marker, "utf8"));
+    expect(JSON.stringify(active)).not.toContain("private-password");
+    expect(await fs.readdir(path.join(active.home, ".ssh"))).toEqual([]);
+    expect(active.argv).toEqual(expect.arrayContaining(["PubkeyAuthentication=yes", "PreferredAuthentications=password", "BatchMode=no"]));
+    expect(active.argv).not.toContain("-f");
+    await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
+    await expect(registration).resolves.toMatchObject({ state: "unknown", error: { code: "SSH_KEY_REGISTRATION_UNKNOWN" } });
+    expect(() => process.kill(active.pid, 0)).toThrow();
+    for (const location of [active.askpass, active.socket, active.home]) await expect(fs.stat(location)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not interpret a failed ssh-copy-id wrapper as a confirmed remote failure", async () => {
+    const executable = path.join(directory, "failed-copy-id");
+    await fs.writeFile(executable, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+    const type = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshCopyIdExecutable: executable });
+    const context = transportTestContext();
+    await expect(type.registerKey(config, { timeoutMs: 5000 }, context)).resolves.toMatchObject({ state: "unknown", error: { code: "SSH_KEY_REGISTRATION_UNKNOWN" } });
+    await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
   });
 });
 

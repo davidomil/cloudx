@@ -18,6 +18,7 @@ Type extensions.
 | `inspectEndpoint(config)` | Return configured/canonical endpoint conflict keys, local readiness, and blockers without opening a connection. May inspect admitted local files/device metadata. No network probe. |
 | `describeAccess(config)` | Return readable non-secret connection metadata. No network connection, serial open, or probe. |
 | `connect(config, context)` | Open a managed connection only after the service validates an active reservation. Bind all handles to that reservation generation. |
+| `registerKey?(config, input, context)` | Register SSH keys before opening access, under a user-owned active reservation and the same bounded cleanup and outcome contract. |
 | `connection.invoke(operationId, input, signal)` | Run one advertised operation with validated input. Return schema-valid JSON or a typed error. The service checks current ownership before each call. |
 | `connection.close(signal)` | Close every owned handle. Return only after known cleanup; otherwise report uncertainty. |
 
@@ -72,6 +73,12 @@ Reserve requires the observed item revision. A stale revision returns REVISION_C
 Open, invoke, and owner status refresh require an active, nonrevoked claim at admission and dispatch. Close requires the exact current held generation and matching owner; it may run in recovery or releasing to settle handles, but it cannot clear earlier uncertainty. Normal release moves active to releasing; a repeated release in releasing observes that cleanup, while recovery returns RECOVERY_REQUIRED without launching a new hook. The service resolves hardware from the claim; invocation input cannot retarget it. A user override invalidates the generation before cleanup. A delayed completion cannot make an obsolete generation active again.
 
 ## SSH operation payloads
+
+SSH configuration uses `auth: { kind: "agent" }` by default. `socketPath` is optional for an explicit agent override. Other modes are `{ kind: "identity_file", path }` and `{ kind: "password", credentialRefId }`. `knownHostsFile` is optional; omitting it uses normal OpenSSH host files with `StrictHostKeyChecking=accept-new`. An explicit override uses strict checking.
+
+The user-only management route `PUT /api/hardware/ssh-passwords/:credentialRefId` accepts `{ password }` and returns only `{ credentialRefId }`. A reference has the form `ssh-password-<UUID>` for a saved login, or `ssh-registration-<UUID>` for a temporary registration password. Repeating the same reference and value is idempotent; a different value for an existing reference is rejected. Passwords are single-line values of 1–1023 UTF-8 bytes. They are stored through the existing private config secret store, outside Hardware inventory and receipts; there is no password read endpoint.
+
+`hardware.ssh.registerKey` accepts `{ requestId, reservationId, generation, timeoutMs, credentialRefId? }`. It requires a user-owned active SSH reservation with closed access. The provider runs `ssh-copy-id` for the current agent keys or the configured identity-file pair. It skips keys that already work. The operation keeps its original request identity, reports uncertain effects as recovery, and does not change authentication mode. Temporary credential cleanup waits for actual provider and process quiescence.
 
 SSH operation payloads.
 

@@ -12,6 +12,7 @@ import { HardwareService } from "./HardwareService.js";
 import { HardwareTypeRegistry } from "./HardwareTypeRegistry.js";
 import { registerHardwareRoutes } from "./HardwareRoutes.js";
 import { PathPolicy } from "../pathPolicy.js";
+import { HardwareSshPasswords } from "./HardwareSshPasswords.js";
 
 const run = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -40,7 +41,8 @@ async function fixture() {
   const app = Fastify();
   let requests = 0;
   app.addHook("onRequest", async () => { requests++; });
-  await registerHardwareRoutes(app, hardware, contexts);
+  const sshPasswords = new HardwareSshPasswords(root);
+  await registerHardwareRoutes(app, hardware, contexts, { sshPasswords });
   await app.ready();
   cleanups.push(() => app.close());
   let sequence = 0;
@@ -54,7 +56,7 @@ async function fixture() {
   const created = await management("hardware.items.create", { item: { name: "Target", description: "Emulated", enabled: true, physicalResourceId: group.id, typeId: "fixture.device", configVersion: 1, config: {}, tagIds: [], notes: "Do not reboot. Follow the recorded deployment procedure.", statuses: [], hooks: {} } });
   expect(created.statusCode).toBe(200);
   const item = (await hardware.snapshot({ kind: "user", userId: "local" })).items[0].item;
-  return { root, hardware, app, contexts, item, management, agent, owner: () => owner, change: (next: AgentOwner) => { owner = next; }, requests: () => requests,
+  return { root, hardware, app, contexts, item, management, agent, sshPasswords, owner: () => owner, change: (next: AgentOwner) => { owner = next; }, requests: () => requests,
     listen: async () => { await app.listen({ port: 0, host: "127.0.0.1" }); endpoint = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api/hardware/agent`; } };
 }
 
@@ -91,6 +93,37 @@ it("runs the authenticated reservation, notes, managed access, and release workf
   const released = await f.agent("hardware.release", ref);
   expect((await settled(f, released.json<{ result: HardwareMutationResult }>().result.receipt)).state).toBe("succeeded");
   expect((await f.hardware.snapshot(f.owner())).items[0].availability).toBe("available");
+});
+
+it("saves an SSH password through a write-only route without adding it to Hardware state", async () => {
+  const f = await fixture();
+  const id = "ssh-password-11111111-2222-4333-8444-555555555555";
+  const password = 'private-password $`" marker';
+  const response = await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload: { password } });
+  expect(response.statusCode, response.body).toBe(200);
+  expect(response.json()).toEqual({ credentialRefId: id });
+  expect(response.headers["cache-control"]).toBe("no-store");
+  expect(await f.sshPasswords.resolve(id)).toBe(password);
+  expect((await f.app.inject({ url: "/api/hardware/state" })).body).not.toContain(password);
+  expect((await f.app.inject({ url: `/api/hardware/ssh-passwords/${id}` })).statusCode).toBe(404);
+  expect((await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload: { password } })).statusCode).toBe(200);
+  const conflict = await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload: { password: "replacement-value" } });
+  expect(conflict.statusCode).toBe(409);
+  expect(conflict.body).not.toContain(password);
+  expect(conflict.body).not.toContain("replacement-value");
+});
+
+it("rejects invalid or oversized password writes without echoing their values", async () => {
+  const f = await fixture();
+  const id = "ssh-registration-11111111-2222-4333-8444-555555555555";
+  for (const payload of [{ password: "secret\nline" }, { password: "secret", unexpected: "field" }, { password: "x".repeat(1024) }, {}]) {
+    const response = await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload });
+    expect(response.statusCode, response.body).toBe(400);
+    expect(response.body).not.toContain("secret");
+  }
+  expect((await f.app.inject({ method: "PUT", url: "/api/hardware/ssh-passwords/not-a-reference", payload: { password: "private" } })).statusCode).toBe(400);
+  expect((await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload: { password: "x".repeat(8192) } })).statusCode).toBe(413);
+  await expect(f.sshPasswords.resolve(id)).rejects.toMatchObject({ code: "CREDENTIAL_UNAVAILABLE" });
 });
 
 it("rejects spoofed owners and revokes stale execution access without giving claims to replacements", async () => {

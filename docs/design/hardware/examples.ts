@@ -21,8 +21,8 @@ export const statusDefinitions = [
 
 export const sshConfig = {
   host: "10.0.0.24", port: 22, username: "lab",
-  auth: { kind: "agent", socketPath: "/run/user/1000/ssh-agent.socket" },
-  knownHostsFile: "/home/lab/.ssh/known_hosts", connectTimeoutMs: 5000
+  auth: { kind: "agent" },
+  connectTimeoutMs: 5000
 } satisfies SshConfig;
 
 export const uartConfig = {

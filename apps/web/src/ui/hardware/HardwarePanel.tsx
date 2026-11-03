@@ -396,7 +396,7 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
             {view === "access" ? (
               selected ? (
                 <HardwareAccess
-                  key={`${selected.item.id}:${selected.reservation?.generation}`}
+                  key={`${selected.item.id}:${selected.reservation?.reservationId}:${selected.reservation?.generation}`}
                   state={state}
                   summary={selected}
                   busy={busy}

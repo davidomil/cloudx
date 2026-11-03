@@ -48,6 +48,10 @@ export class ConfigSecretStore {
     return this.readStoredSecretsSync()?.plugins?.[pluginId]?.[key];
   }
 
+  getPluginSecretKeys(pluginId: string): string[] {
+    return Object.keys(this.readStoredSecretsSync()?.plugins?.[pluginId] ?? {});
+  }
+
   async update(patch: ConfigSecretPatch): Promise<void> {
     if (!hasSecrets(patch)) {
       return;

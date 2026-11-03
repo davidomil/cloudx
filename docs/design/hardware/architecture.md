@@ -101,7 +101,9 @@ The provider wraps every effect/cleanup result in ProviderOutcome. Completed car
 
 ## SSH provider
 
-Use the host’s OpenSSH tools with one explicit authentication method and a known-hosts file. Require noninteractive authentication and strict host-key validation. Unknown or changed keys need deliberate host setup; they must not be accepted silently. The initial connection path uses no shared persistent control master and no automatic reconnect.
+Use the host’s OpenSSH tools with one selected authentication method. Default to the server's current SSH agent without requiring a socket path. Password authentication resolves an opaque private-store reference and supplies the value through a private askpass socket; it does not place the value in argv, environment, inventory, or receipts. Use the normal known-hosts files unless an explicit admitted override is configured. The default accepts and records a new key, and rejects changed keys. An explicit override uses strict checking. The connection path uses no shared persistent control master and no automatic reconnect.
+
+Key registration is a separate user action under an active reservation. The service persists its request identity before calling the provider's optional `registerKey` method. It invokes `ssh-copy-id` without requiring a prior connection and keeps uncertainty held. Temporary password cleanup waits for the provider and registered process cleanup to finish. Registration never changes authentication mode or replays an earlier request.
 
 Operations are `ssh.exec`, `ssh.upload`, and `ssh.download`. Exec accepts an explicit remote Bash script, streams it to a fixed remote Bash entrypoint, and returns bounded stdout/stderr and observed process outcome. Do not assume that local argument arrays preserve remote shell argument boundaries. The configured machine must have the selected Bash entrypoint; its absence fails clearly.
 

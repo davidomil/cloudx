@@ -4,9 +4,76 @@ import {
   getHardwareReceipt,
   getHardwareState,
   hardwareRequestId,
+  saveHardwareSshPassword,
 } from "./hardwareApi.js";
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("SSH password transport", () => {
+  const credentialRefId = "ssh-password-123e4567-e89b-42d3-a456-426614174000";
+
+  it("writes a password only to its immutable credential endpoint", async () => {
+    const fetch = vi.fn().mockResolvedValue(response({ credentialRefId }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      saveHardwareSshPassword(credentialRefId, "test-only password"),
+    ).resolves.toEqual({ credentialRefId });
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      `/api/hardware/ssh-passwords/${credentialRefId}`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: "test-only password" }),
+        signal: undefined,
+      },
+    );
+  });
+
+  it("retains the same reference after a lost password write without replay", async () => {
+    const fetch = vi.fn().mockRejectedValue(new TypeError("Response lost"));
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      saveHardwareSshPassword(credentialRefId, "test-only password"),
+    ).rejects.toMatchObject({
+      code: "OUTCOME_UNKNOWN",
+      requestId: credentialRefId,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a credential response for a different reference", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(response({ credentialRefId: "other" })),
+    );
+    await expect(
+      saveHardwareSshPassword(credentialRefId, "test-only password"),
+    ).rejects.toMatchObject({
+      code: "OUTCOME_UNKNOWN",
+      requestId: credentialRefId,
+    });
+  });
+
+  it("preserves immutable-credential conflicts without returning password content", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        response(
+          {
+            error: {
+              code: "CREDENTIAL_CONFLICT",
+              message: "This credential reference already exists.",
+            },
+          },
+          409,
+        ),
+      ),
+    );
+    await expect(
+      saveHardwareSshPassword(credentialRefId, "test-only password"),
+    ).rejects.toMatchObject({ code: "CREDENTIAL_CONFLICT" });
+  });
+});
 const response = (value: unknown, status = 200) =>
   new Response(JSON.stringify(value), {
     status,

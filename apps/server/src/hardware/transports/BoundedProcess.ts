@@ -21,6 +21,8 @@ export interface ProcessCommand {
   maxOutputBytes: number;
   signal: AbortSignal;
   inheritedFd?: number;
+  environment?: Record<string, string>;
+  secrets?: string[];
 }
 
 export class BoundedProcessSet {
@@ -46,7 +48,7 @@ export class BoundedProcessSet {
       let expiry: NodeJS.Timeout | undefined;
       const child = spawn(command.executable, command.args, {
         cwd: "/",
-        env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" },
+        env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", ...command.environment },
         detached: true,
         stdio: command.inheritedFd === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", command.inheritedFd]
       });
@@ -57,7 +59,7 @@ export class BoundedProcessSet {
         clearTimeout(escalate);
         clearTimeout(expiry);
         signal.removeEventListener("abort", stop);
-        const output = decodeOutput(stdout, stderr, command.maxOutputBytes);
+        const output = decodeOutput(stdout, stderr, command.maxOutputBytes, command.secrets ?? [], truncated);
         resolve({ state, exitCode, signal: exitSignal, ...output, truncated: truncated || output.truncated, durationMs: Date.now() - startedAt, interrupted });
       };
       const kill = (killSignal: NodeJS.Signals) => {
@@ -115,11 +117,20 @@ export class BoundedProcessSet {
   }
 }
 
-function decodeOutput(stdout: Buffer[], stderr: Buffer[], limit: number): { stdout: string; stderr: string; truncated: boolean } {
+function decodeOutput(stdout: Buffer[], stderr: Buffer[], limit: number, secrets: string[], capturedPrefix: boolean): { stdout: string; stderr: string; truncated: boolean } {
   let remaining = limit;
   let truncated = false;
   const decode = (chunks: Buffer[]) => {
-    let text = Buffer.concat(chunks).toString("utf8");
+    // Match bytes first: decoding an incomplete UTF-8 suffix can hide a captured secret prefix.
+    let captured = Buffer.concat(chunks).toString("latin1");
+    for (const secret of secrets.filter(Boolean)) {
+      const value = Buffer.from(secret).toString("latin1");
+      captured = captured.replaceAll(value, "[redacted]");
+      if (capturedPrefix) for (let length = Math.min(value.length - 1, captured.length); length > 0; length--) {
+        if (captured.endsWith(value.slice(0, length))) { captured = `${captured.slice(0, -length)}[redacted]`; break; }
+      }
+    }
+    let text = Buffer.from(captured, "latin1").toString("utf8");
     const encoded = Buffer.from(text, "utf8");
     if (encoded.length > remaining) {
       truncated = true;

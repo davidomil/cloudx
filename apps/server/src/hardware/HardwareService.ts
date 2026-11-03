@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Ajv2020 } from "ajv/dist/2020.js";
-import type { HardwareConnection, HardwareTypeProvider } from "@cloudx/plugin-api";
+import type { HardwareAccessContext, HardwareConnection, HardwareTypeProvider } from "@cloudx/plugin-api";
 import { hardwareId, hardwareInteger, hardwareRecord, hardwareText, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type BashScript, type CapabilityTag, type HardwareEndpointInspection, type HardwareFilter, type HardwareItem, type HardwareMutationResult, type HardwareOwner, type HardwareReservation, type HardwareReservationRecord, type HardwareRetentionSettings, type HardwareStateView, type HardwareSummary, type JsonObject, type OperationReceipt, type PhysicalResource, type ProviderOutcome, type ReservationRef, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
 import type { PathPolicy } from "../pathPolicy.js";
 import { HardwareError, hardwareInput, requireHardware } from "./HardwareError.js";
@@ -17,6 +17,7 @@ export interface HardwareServiceOptions {
   registry: HardwareRegistry;
   pathPolicy?: PathPolicy;
   resolveCredential?: (id: string) => Promise<string>;
+  discardCredential?: (id: string) => Promise<void>;
   ownerState?: (owner: HardwareOwner) => "active" | "confirmed_ended" | "unknown" | Promise<"active" | "confirmed_ended" | "unknown">;
   retention?: Partial<HardwareRetentionSettings>;
 }
@@ -139,6 +140,7 @@ export class HardwareService {
     if (action === "hardware.release") return this.release(input, owner);
     if (action === "hardware.forceRelease") return this.override(input, owner);
     if (action === "hardware.statuses.refresh") return this.refresh(input, owner);
+    if (action === "hardware.ssh.registerKey") return this.registerSshKey(input, owner);
     if (["hardware.access.open", "hardware.access.invoke", "hardware.access.close"].includes(action)) return this.accessAction(action, input, owner);
     if (/^hardware\.(items|tags|groups|statuses)\.(create|update|delete|set)$/.test(action)) return this.manage(action, input, owner);
     throw new HardwareError("INVALID_INPUT", `Unknown hardware action: ${action}`);
@@ -501,7 +503,7 @@ export class HardwareService {
         if (access?.generation === claim.generation && access.connection) outcome = { state: "completed", value: json({ connectionId: claim.reservationId, operations: provider!.descriptor.operations }) };
         else {
           access = { generation: claim.generation, cleanup: [] }; this.access.set(claim.reservationId, access);
-          const opened = await bounded(signal, 10_000, childSignal => provider!.connect(provider!.parseConfig(claim.acquiredItem.config), { reservation: publicClaim(claim), signal: childSignal, resolveCredential: async id => { requireHardware(this.options.resolveCredential, "CREDENTIAL_UNAVAILABLE", "The configured hardware credential cannot be resolved."); return this.options.resolveCredential(id); }, recordEvent: async event => { await this.change(next => { this.addHistory(next, event.kind, "Managed provider event.", owner, claim); }, true); }, registerCleanup: close => { this.currentClaim(work.ref, ["active"]); childSignal.throwIfAborted(); access!.cleanup.push(close); } }));
+          const opened = await bounded(signal, 10_000, childSignal => provider!.connect(provider!.parseConfig(claim.acquiredItem.config), this.accessContext(claim, childSignal, access!)));
           if (opened.state === "completed") {
             const validConnection = opened.value && typeof opened.value.invoke === "function" && typeof opened.value.close === "function";
             if (validConnection) access.connection = opened.value;
@@ -527,6 +529,78 @@ export class HardwareService {
       });
     }); }
     return result;
+  }
+
+  private async registerSshKey(input: Record<string, unknown>, owner: HardwareOwner): Promise<HardwareMutationResult> {
+    requireHardware(owner.kind === "user", "FORBIDDEN", "SSH key registration belongs to the user.");
+    fields(input, ["requestId", "reservationId", "generation", "timeoutMs", "credentialRefId"]);
+    const timeoutMs = hardwareInput(() => hardwareInteger(input.timeoutMs, "Registration deadline", 1, 3_600_000));
+    const credentialRefId = input.credentialRefId === undefined ? undefined : hardwareInput(() => hardwareId(input.credentialRefId, "SSH credential reference"));
+    requireHardware(!credentialRefId || credentialRefId.startsWith("ssh-registration-") || credentialRefId.startsWith("ssh-password-"), "INVALID_INPUT", "Choose a private SSH password reference.");
+    let dispatch: { runId: string; ref: ReservationRef; hardwareId: string } | undefined;
+    const result = await this.change(async next => {
+      const admitted = this.admit(next, "hardware.ssh.registerKey", input, owner);
+      if (admitted.existing) return this.mutationResult(next, admitted.record.receipt);
+      const claim = this.requireClaim(next, input, owner), provider = this.provider(claim.acquiredItem);
+      requireHardware(claim.state === "active" && claim.accessState === "closed" && !this.access.get(claim.reservationId)?.connection, "INVALID_PHASE", "Register the SSH key before opening managed access on an active reservation.");
+      requireHardware(provider.descriptor.id === "hardware.ssh" && typeof provider.registerKey === "function", "INVALID_INPUT", "This hardware provider does not support SSH key registration.");
+      const inventory = await this.inspectInventory(next), endpoint = inventory.endpoints.get(claim.hardwareId)!;
+      requireHardware(endpoint.inspection.ready && !inventory.conflictingGroups.has(claim.acquiredItem.physicalResourceId), "STATUS_NOT_READY", "The selected endpoint is not ready or has conflicting aliases.");
+      if (canonical(inventory.groupKeys.get(claim.acquiredItem.physicalResourceId)) !== canonical(claim.resourceKeys)) {
+        this.recover(claim, "Endpoint identity changed after acquisition. Inspect and release or reconcile this reservation.");
+        admitted.record.receipt.reservation = refOf(claim); admitted.record.receipt.state = "unknown"; admitted.record.receipt.finishedAt = now(); admitted.record.receipt.error = { code: "OUTCOME_UNKNOWN", message: claim.recoveryReason! };
+        return this.mutationResult(next, admitted.record.receipt);
+      }
+      const receipt = admitted.record.receipt; receipt.reservation = refOf(claim); claim.activeOperationIds.push(receipt.runId); claim.revision++;
+      dispatch = { runId: receipt.runId, ref: refOf(claim), hardwareId: claim.hardwareId };
+      return this.mutationResult(next, receipt);
+    });
+    if (dispatch) {
+      const work = dispatch;
+      let providerWork: Promise<ProviderOutcome<JsonObject>> | undefined, cleanupConfirmed = false;
+      this.launch(work.hardwareId, work.runId, work.ref, async signal => {
+        let claim = this.currentClaim(work.ref, ["active"]);
+        const provider = this.provider(claim.acquiredItem);
+        const inventory = await this.inspectInventory(this.state), endpoint = inventory.endpoints.get(claim.hardwareId)!;
+        signal.throwIfAborted(); claim = this.currentClaim(work.ref, ["active"]);
+        if (!endpoint.inspection.ready || inventory.conflictingGroups.has(claim.acquiredItem.physicalResourceId) || canonical(inventory.groupKeys.get(claim.acquiredItem.physicalResourceId)) !== canonical(claim.resourceKeys)) {
+          await this.finish(work.runId, work.ref, { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "The SSH endpoint identity or readiness changed before registration dispatch." } }); return;
+        }
+        requireHardware(!this.access.get(claim.reservationId)?.connection && provider.descriptor.id === "hardware.ssh" && typeof provider.registerKey === "function", "INVALID_PHASE", "SSH registration requires closed managed access and the acquired SSH provider.");
+        const access = this.access.get(claim.reservationId) ?? { generation: claim.generation, cleanup: [] };
+        requireHardware(access.generation === claim.generation, "INVALID_PHASE", "A prior access generation still requires cleanup.");
+        this.access.set(claim.reservationId, access);
+        const priorClosers = access.cleanup.length;
+        let outcome = await bounded(signal, timeoutMs, childSignal => {
+          providerWork = Promise.resolve().then(() => provider.registerKey!(provider.parseConfig(claim.acquiredItem.config), { timeoutMs, ...(credentialRefId ? { credentialRefId } : {}) }, this.accessContext(claim, childSignal, access)));
+          return providerWork;
+        });
+        const noEffects = outcome.state === "failed" && outcome.effects === "none";
+        if (noEffects && !access.cleanup.length) { this.access.delete(claim.reservationId); cleanupConfirmed = true; }
+        else { const ownCleanup = access.cleanup.length > priorClosers; cleanupConfirmed = (await this.closeAccess(work.ref, new AbortController().signal)).state === "completed" && (noEffects || ownCleanup); }
+        if (!cleanupConfirmed) outcome = { state: "unknown", error: { code: "CLEANUP_UNCONFIRMED", message: "SSH registration could not confirm that its managed processes ended." } };
+        if (outcome.state === "completed") { try { validateHardwareJson(outcome.value); } catch { outcome = { state: "unknown", error: { code: "INVALID_PROVIDER_OUTPUT", message: "SSH registration returned invalid output after dispatch." } }; } }
+        await this.finish(work.runId, work.ref, outcome, (_next, held) => { if (held) held.accessState = cleanupConfirmed ? "closed" : "unknown"; });
+      });
+      if (credentialRefId?.startsWith("ssh-registration-") && this.options.discardCredential) {
+        void this.tasks.get(work.runId)!.promise.then(async () => {
+          if (providerWork && !cleanupConfirmed) return;
+          await providerWork?.catch(() => undefined);
+          await this.options.discardCredential!(credentialRefId);
+        }).catch(async () => {
+          try { await this.change(next => this.addHistory(next, "credential_discard_failed", "A temporary SSH credential could not be removed from private storage.", owner), true); }
+          catch { /* Local credential cleanup cannot replace the saved provider outcome. */ }
+        });
+      }
+    }
+    return result;
+  }
+
+  private accessContext(claim: HardwareReservationRecord, signal: AbortSignal, access: Access): HardwareAccessContext {
+    return { reservation: publicClaim(claim), signal,
+      resolveCredential: async id => { requireHardware(this.options.resolveCredential, "CREDENTIAL_UNAVAILABLE", "The configured hardware credential cannot be resolved."); return this.options.resolveCredential(id); },
+      recordEvent: async event => { await this.change(next => this.addHistory(next, event.kind, "Managed provider event.", claim.owner, claim), true); },
+      registerCleanup: close => { this.currentClaim(refOf(claim), ["active"]); signal.throwIfAborted(); access.cleanup.push(close); } };
   }
 
   beginShutdown(): void {

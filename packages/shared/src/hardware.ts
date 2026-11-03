@@ -219,8 +219,8 @@ export interface SshConfig {
   host: string;
   port: number;
   username: string;
-  auth: { kind: "agent"; socketPath: string } | { kind: "identity_file"; path: string };
-  knownHostsFile: string;
+  auth: { kind: "agent"; socketPath?: string } | { kind: "identity_file"; path: string } | { kind: "password"; credentialRefId: string };
+  knownHostsFile?: string;
   connectTimeoutMs: number;
 }
 

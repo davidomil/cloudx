@@ -228,14 +228,15 @@ export interface HardwareTypeProvider<Config> {
   inspectEndpoint(config: Config): Promise<HardwareEndpointInspection>;
   describeAccess(config: Config): HardwareAccessDescription;
   connect(config: Config, context: HardwareAccessContext): Promise<ProviderOutcome<HardwareConnection>>;
+  registerKey?(config: Config, input: JsonObject, context: HardwareAccessContext): Promise<ProviderOutcome<JsonObject>>;
 }
 
 export interface SshConfig {
   host: string;
   port: number;
   username: string;
-  auth: { kind: "agent"; socketPath: string } | { kind: "identity_file"; path: string };
-  knownHostsFile: string;
+  auth: { kind: "agent"; socketPath?: string } | { kind: "identity_file"; path: string } | { kind: "password"; credentialRefId: string };
+  knownHostsFile?: string;
   connectTimeoutMs: number;
 }
 

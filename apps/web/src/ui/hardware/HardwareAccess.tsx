@@ -20,6 +20,7 @@ import {
   type HardwareRun,
 } from "./HardwareControls.js";
 import { ownerLabel, sameOwner, uartBytes, uartText } from "./hardwareModel.js";
+import { SshKeyRegistration } from "./SshKeyRegistration.js";
 
 export function HardwareAccess({
   state,
@@ -138,6 +139,15 @@ export function HardwareAccess({
         >
           Close access
         </ControlButton>
+        {summary.item.typeId === "hardware.ssh" ? (
+          <SshKeyRegistration
+            state={state}
+            summary={summary}
+            active={active}
+            busy={busy}
+            run={run}
+          />
+        ) : null}
         <span className="hardware-muted">
           {confirmed
             ? "Managed connection confirmed open"

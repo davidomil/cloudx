@@ -6,7 +6,13 @@ Open **Hardware** from Add tab. All panels on one CloudX host share the inventor
 
 ## Configure host access
 
-Hardware storage, script process ownership, and UART control-line handling require Linux. Install OpenSSH client tools for SSH/SFTP and Python 3 for Linux UART modem-control operations. Admit local key files, known-hosts files, UART paths, transfer paths, and script directories through `CLOUDX_ALLOWED_ROOTS`. Configure one SSH identity file or agent socket and an explicit known-hosts file. Inventory inspection does not open the endpoint.
+Hardware storage, script process ownership, and UART control-line handling require Linux. Install OpenSSH client tools for SSH/SFTP and `ssh-copy-id`, and Python 3 for Linux UART modem-control operations. Admit explicit local key files, optional known-hosts overrides, UART paths, transfer paths, and script directories through `CLOUDX_ALLOWED_ROOTS`. Inventory inspection does not open the endpoint.
+
+SSH defaults to **Current SSH agent**. It uses the agent available to the CloudX server through `SSH_AUTH_SOCK`; no socket path is required. This is the server's agent, including when the browser runs on another machine. Choose **Identity file** to use an admitted private key, or **Password** to enter a login password. Passwords are saved in CloudX's private secret store. Inventory contains an opaque reference, and editing an existing item never displays its saved password.
+
+No known-hosts path is required. SSH uses the host account's normal known-hosts files, saves a new host key on first connection, and rejects a changed key. Explicit file overrides still require an admitted regular file and strict checking.
+
+To install keys on a machine, save the item, reserve it, and choose **Register SSH key** before opening access. Enter a registration password when needed. Agent/password items register the keys loaded in the current SSH agent; identity-file items use their configured key pair. `ssh-copy-id` checks which keys already work and skips them. Registration does not change the item's authentication method or retry a failed command. A temporary registration password is discarded after the local operation and cleanup finish; interrupted temporary passwords are cleared on server startup.
 
 ## Set statuses and hooks
 

@@ -144,11 +144,13 @@ import { AgentHardwareContext, ownerIdentity } from "./hardware/AgentHardwareCon
 import { HardwareOwnerMonitor } from "./hardware/HardwareOwnerMonitor.js";
 import { registerHardwareRoutes } from "./hardware/HardwareRoutes.js";
 import { hardwareCredentialResolver } from "./hardware/hardwareCredentials.js";
+import { HardwareSshPasswords } from "./hardware/HardwareSshPasswords.js";
 import { hardwareAgentReadiness } from "./hardware/HardwareAgentReadiness.js";
 import { AgentLaunchRecords } from "./agents/AgentLaunchRecords.js";
 
 export interface AppServices {
   hardware?: HardwareService;
+  hardwarePasswords?: HardwareSshPasswords;
   hardwareContexts?: AgentHardwareContext;
   hardwareMonitor?: HardwareOwnerMonitor;
   cooperation?: BlackboardService;
@@ -355,6 +357,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     if (services.hardware) {
       await services.forge?.dashboard();
       await services.hardware.init();
+      await services.hardwarePasswords?.clearRegistrationPasswords();
       await services.hardwareMonitor?.start();
     }
     if (services.cooperation && services.cooperationContexts) {
@@ -395,7 +398,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await registerCooperationRoutes(app, { boards: services.cooperation, contexts: services.cooperationContexts, sessions: services.sessions, feedback: services.cooperationFeedback });
   }
   if (services.hardware && services.hardwareContexts) await registerHardwareRoutes(app, services.hardware, services.hardwareContexts,
-    { agentReadiness: () => hardwareAgentReadiness(services.sessions, new AgentLaunchRecords(config.dataDir)) });
+    { agentReadiness: () => hardwareAgentReadiness(services.sessions, new AgentLaunchRecords(config.dataDir)), sshPasswords: services.hardwarePasswords });
 
   app.addContentTypeParser(/^audio\/.*/, { parseAs: "buffer", bodyLimit: config.voiceAudioUploadMaxBytes }, (_request, body, done) => {
     done(null, body);
@@ -1499,6 +1502,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
   let hardware: HardwareService | undefined;
+  const hardwarePasswords = new HardwareSshPasswords(config.dataDir);
   let hardwareMonitor: HardwareOwnerMonitor | undefined;
   let forgeRuntime: ForgeRuntime | undefined;
   const hardwareContexts = new AgentHardwareContext({
@@ -1617,7 +1621,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   for (const plugin of installedPlugins.pluginsFromCatalog()) {
     plugins.register(plugin);
   }
-  hardware = new HardwareService({ dataDir: config.dataDir, pathPolicy, registry: new HardwareTypeRegistry(plugins.values()), resolveCredential: hardwareCredentialResolver(),
+  hardware = new HardwareService({ dataDir: config.dataDir, pathPolicy, registry: new HardwareTypeRegistry(plugins.values()), resolveCredential: hardwareCredentialResolver(process.env, hardwarePasswords),
+    discardCredential: id => hardwarePasswords.discardRegistration(id),
     ownerState: async owner => {
       if (owner.kind === "user") return "active";
       if (owner.ownerPluginId === "forge" && await forgeRuntime?.hardwareOwnerState(owner) === "confirmed_ended") return "confirmed_ended";
@@ -1731,7 +1736,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { hardware, hardwareContexts, hardwareMonitor, cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates };
+  return { hardware, hardwarePasswords, hardwareContexts, hardwareMonitor, cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

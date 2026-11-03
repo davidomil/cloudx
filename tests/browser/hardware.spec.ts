@@ -9,6 +9,7 @@ import type { HardwareAgentReadiness } from "@cloudx/shared";
 import { AgentHardwareContext } from "../../apps/server/src/hardware/AgentHardwareContext.js";
 import { registerHardwareRoutes } from "../../apps/server/src/hardware/HardwareRoutes.js";
 import type { HardwareService } from "../../apps/server/src/hardware/HardwareService.js";
+import { HardwareSshPasswords } from "../../apps/server/src/hardware/HardwareSshPasswords.js";
 import {
   HardwareBrowserService,
   operator,
@@ -23,6 +24,7 @@ let root: string;
 let browserUrl: string;
 let caseNumber = 0;
 let agentReadiness: HardwareAgentReadiness[] = [];
+let sshPasswords: HardwareSshPasswords;
 test.use({
   launchOptions: {
     args: [
@@ -35,6 +37,7 @@ test.use({
 test.beforeAll(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-hardware-browser-"));
   api = Fastify();
+  sshPasswords = new HardwareSshPasswords(root);
   const hardware = {
     snapshot: (...args: Parameters<HardwareService["snapshot"]>) =>
       lab.service.snapshot(...args),
@@ -48,6 +51,7 @@ test.beforeAll(async () => {
   });
   await registerHardwareRoutes(api, hardware, contexts, {
     agentReadiness: async () => agentReadiness,
+    sshPasswords,
   });
   await api.listen({ host: "127.0.0.1", port: 0 });
   const address = api.server.address();
@@ -85,7 +89,10 @@ test.afterAll(async () => {
 });
 test.beforeEach(async ({ page }) => {
   agentReadiness = [];
-  lab = new HardwareBrowserService(path.join(root, `case-${++caseNumber}`));
+  lab = new HardwareBrowserService(
+    path.join(root, `case-${++caseNumber}`),
+    sshPasswords,
+  );
   await lab.init();
   await page.goto(browserUrl);
   await expect(
@@ -100,6 +107,438 @@ const button = (page: Page, name: string) =>
   page.getByRole("button", { name, exact: true });
 const label = (page: Page, name: string) =>
   page.getByLabel(name, { exact: true });
+
+async function newSsh(page: Page, name: string) {
+  await button(page, "Add hardware").click();
+  await label(page, "Hardware name").fill(name);
+  await label(page, "Physical resource group").selectOption(
+    lab.ssh.physicalResourceId,
+  );
+  await label(page, "SSH host").fill("password.example");
+  await label(page, "SSH username").fill("tester");
+}
+
+test("SSH authentication: default agent needs no socket or known-hosts path", async ({
+  page,
+}) => {
+  await newSsh(page, "Default-agent SSH");
+  await expect(label(page, "SSH authentication")).toHaveValue("agent");
+  await expect(label(page, "SSH agent socket")).toHaveCount(0, {
+    timeout: 2000,
+  });
+  await expect(label(page, "Known hosts file")).toHaveCount(0);
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Default-agent SSH")).toBeVisible();
+  const item = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.name === "Default-agent SSH",
+  )!.item;
+  expect(item.config.auth).toEqual({ kind: "agent" });
+  expect(item.config.knownHostsFile).toBeUndefined();
+});
+
+test("SSH authentication: password saves only an opaque reference and is never restored into a draft", async ({
+  page,
+}, info) => {
+  const writes: string[] = [];
+  const actions: unknown[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "PUT" &&
+      request.url().includes("/api/hardware/ssh-passwords/")
+    )
+      writes.push(request.url());
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/hardware/actions")
+    )
+      actions.push(request.postDataJSON());
+  });
+  await newSsh(page, "Password SSH");
+  await expect(
+    label(page, "SSH authentication").locator('option[value="password"]'),
+  ).toHaveCount(1, { timeout: 2000 });
+  await label(page, "SSH authentication").selectOption("password");
+  await label(page, "SSH password").fill("fixture password only");
+  await label(page, "SSH authentication").selectOption("agent");
+  await label(page, "SSH authentication").selectOption("password");
+  await expect(label(page, "SSH password")).toHaveValue("");
+  await label(page, "SSH password").fill("fixture password only");
+  await button(page, "Back to inventory").click();
+  await button(page, "Add hardware").click();
+  await expect(label(page, "SSH password")).toHaveValue("");
+  await label(page, "SSH password").fill("fixture password only");
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Password SSH")).toBeVisible();
+  const snapshot = await lab.service.snapshot(operator);
+  const config = snapshot.items.find(
+    (value) => value.item.name === "Password SSH",
+  )!.item.config;
+  expect(config.auth).toMatchObject({
+    kind: "password",
+    credentialRefId: expect.stringMatching(/^ssh-password-/),
+  });
+  expect(JSON.stringify(snapshot)).not.toContain("fixture password only");
+  await button(page, "Select Password SSH").click();
+  await button(page, "Edit hardware").click();
+  await expect(label(page, "SSH password")).toHaveValue("");
+  await expect(
+    page.getByText("Password saved on CloudX host", { exact: true }),
+  ).toBeVisible();
+  await label(page, "SSH password").fill("discarded replacement fixture");
+  const savedItem = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.name === "Password SSH",
+  )!.item;
+  await lab.mutate("hardware.items.update", {
+    hardwareId: savedItem.id,
+    expectedItemRevision: savedItem.revision,
+    patch: { description: "Updated externally" },
+  });
+  await button(page, "Discard draft and load current item").click();
+  await expect(label(page, "SSH password")).toHaveValue("");
+  await screenshot(page, info, "08-ssh-password-editor", "SSH password");
+  await label(page, "Hardware description").fill("Password reference retained");
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Password SSH")).toBeVisible();
+  expect(writes).toHaveLength(1);
+  await button(page, "Select Password SSH").click();
+  await button(page, "Edit hardware").click();
+  await label(page, "SSH password").fill("replacement fixture only");
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Password SSH")).toBeVisible();
+  expect(writes).toHaveLength(2);
+  expect(lab.registrations).toHaveLength(0);
+  expect(new Set(writes).size).toBe(2);
+  const replaced = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.name === "Password SSH",
+  )!.item;
+  expect(replaced.config.auth).not.toEqual(config.auth);
+  await openAccess(page, "Password SSH");
+  expect(lab.connections).toContainEqual({
+    authKind: "password",
+    credentialRefId: (replaced.config.auth as { credentialRefId: string })
+      .credentialRefId,
+  });
+  await expect(button(page, "Register SSH key…")).toBeDisabled();
+  await button(page, "Close access").click();
+  await expect(button(page, "Register SSH key…")).toBeEnabled();
+  await button(page, "Register SSH key…").click();
+  await expect(label(page, "SSH registration password")).toHaveValue("");
+  await button(page, "Register key").click();
+  await expect(
+    page.getByRole("dialog", { name: "Register SSH key" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("article", { name: "Operation receipt" }),
+  ).toContainText("succeeded");
+  expect(writes).toHaveLength(2);
+  expect(JSON.stringify(actions)).not.toContain("fixture password only");
+  expect(JSON.stringify(actions)).not.toContain("fixture only");
+  expect(JSON.stringify(await lab.service.snapshot(operator))).not.toContain(
+    "fixture only",
+  );
+});
+
+test("SSH authentication: registration is explicit and available before opening access", async ({
+  page,
+}, info) => {
+  await reserve(page, "Atlas SSH");
+  await button(page, "Open access screen").click();
+  await expect(button(page, "Register SSH key…")).toBeVisible({
+    timeout: 2000,
+  });
+  await button(page, "Register SSH key…").click();
+  await expect(
+    page.getByRole("dialog", { name: "Register SSH key" }),
+  ).toBeVisible();
+  await label(page, "SSH registration password").fill(
+    "registration fixture only",
+  );
+  await button(page, "Cancel registration").click();
+  expect(lab.registrations).toHaveLength(0);
+  expect(
+    (await lab.service.snapshot(operator)).receipts.some(
+      (value) => value.result?.registered === true,
+    ),
+  ).toBe(false);
+  await button(page, "Register SSH key…").click();
+  await expect(label(page, "SSH registration password")).toHaveValue("");
+  await label(page, "SSH registration password").fill(
+    "registration fixture only",
+  );
+  await screenshot(page, info, "09-ssh-key-registration");
+  await button(page, "Register key").click();
+  await expect(
+    page.getByRole("dialog", { name: "Register SSH key" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("article", { name: "Operation receipt" }),
+  ).toContainText("succeeded");
+  const snapshot = await lab.service.snapshot(operator);
+  expect(
+    snapshot.items.find((value) => value.item.id === lab.ssh.id)!.item.config
+      .auth,
+  ).toMatchObject({ kind: "agent" });
+  expect(snapshot.reservations[0]!.accessState).toBe("closed");
+  expect(JSON.stringify(snapshot)).not.toContain("registration fixture only");
+  expect(lab.registrations).toHaveLength(1);
+  expect(lab.registrations[0]).toMatchObject({
+    reservationId: snapshot.reservations[0]!.reservationId,
+    generation: snapshot.reservations[0]!.generation,
+  });
+  const temporaryRef = String(lab.registrations[0]!.input.credentialRefId);
+  expect(temporaryRef).toMatch(/^ssh-registration-/);
+  await expect
+    .poll(async () => {
+      try {
+        await sshPasswords.resolve(temporaryRef);
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .toBe(false);
+  await label(page, "Fixture theme").selectOption("minimalist-dark");
+  await button(page, "Register SSH key…").click();
+  await screenshot(page, info, "10-ssh-key-registration-minimal");
+  await page.keyboard.press("Escape");
+  await expect(button(page, "Register SSH key…")).toBeFocused();
+});
+
+test("SSH authentication: a lost password response retries only the same immutable reference explicitly", async ({
+  page,
+}) => {
+  const writes: string[] = [];
+  const actions: unknown[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/hardware/actions")
+    )
+      actions.push(request.postDataJSON());
+  });
+  await page.route("**/api/hardware/ssh-passwords/*", async (route) => {
+    writes.push(route.request().url());
+    const response = await route.fetch({
+      url: route.request().url().replace("hardware.test", "127.0.0.1"),
+    });
+    if (writes.length === 1) await route.abort("connectionfailed");
+    else await route.fulfill({ response });
+  });
+  await newSsh(page, "Lost-password SSH");
+  await label(page, "SSH authentication").selectOption("password");
+  await label(page, "SSH password").fill("lost-response fixture");
+  await button(page, "Save hardware").click();
+  await expect(page.getByRole("alert")).toContainText(
+    "password save response was lost",
+  );
+  await expect(label(page, "SSH password")).toHaveValue(
+    "lost-response fixture",
+  );
+  expect(actions).toHaveLength(0);
+  expect(writes).toHaveLength(1);
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Lost-password SSH")).toBeVisible();
+  expect(writes).toHaveLength(2);
+  expect(new Set(writes).size).toBe(1);
+  expect(actions).toHaveLength(1);
+  expect(JSON.stringify(actions)).not.toContain("lost-response fixture");
+});
+
+test("SSH authentication: a confirmed password reference survives an item validation failure", async ({
+  page,
+}) => {
+  const writes: string[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "PUT" &&
+      request.url().includes("/api/hardware/ssh-passwords/")
+    )
+      writes.push(request.url());
+  });
+  await newSsh(page, "Staged-password SSH");
+  await label(page, "SSH host").fill("bad host");
+  await label(page, "SSH authentication").selectOption("password");
+  await label(page, "SSH password").fill("staged fixture only");
+  await button(page, "Save hardware").click();
+  await expect(page.getByRole("alert")).toContainText(
+    "SSH configuration /host",
+  );
+  await expect(label(page, "SSH password")).toHaveValue("");
+  await expect(
+    page.getByText("Password saved on CloudX host", { exact: true }),
+  ).toBeVisible();
+  await label(page, "SSH host").fill("valid.example");
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Staged-password SSH")).toBeVisible();
+  expect(writes).toHaveLength(1);
+});
+
+test("SSH authentication: lost registration responses inspect the original operation without replay", async ({
+  page,
+}) => {
+  await reserve(page, "Atlas SSH");
+  await button(page, "Open access screen").click();
+  let requestId = "";
+  let dispatched = 0;
+  await page.route("**/api/hardware/actions", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.action !== "hardware.ssh.registerKey") return route.continue();
+    requestId = body.input.requestId;
+    dispatched++;
+    expect(JSON.stringify(body)).not.toContain("lost registration fixture");
+    const response = await route.fetch({
+      url: route.request().url().replace("hardware.test", "127.0.0.1"),
+    });
+    const result = await response.json();
+    await lab.settled(result.result.receipt);
+    await route.abort("connectionfailed");
+  });
+  await button(page, "Register SSH key…").click();
+  await label(page, "SSH registration password").fill(
+    "lost registration fixture",
+  );
+  await button(page, "Register key").click();
+  await expect(
+    page.getByRole("dialog", { name: "Register SSH key" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("alert")).toContainText("OUTCOME_UNKNOWN");
+  await button(page, "Inspect original receipt").click();
+  const receipt = page.getByRole("article", { name: "Operation receipt" });
+  await expect(receipt.locator("header code")).toHaveText(requestId);
+  await expect(receipt).toContainText("succeeded");
+  await button(page, "Reconnect").click();
+  await expect(button(page, "Register SSH key…")).toBeEnabled();
+  expect(dispatched).toBe(1);
+  expect(lab.registrations).toHaveLength(1);
+});
+
+test("SSH authentication: registration never retargets a replacement reservation during password storage", async ({
+  page,
+}) => {
+  await reserve(page, "Atlas SSH");
+  await button(page, "Open access screen").click();
+  const original = (await lab.service.snapshot(operator)).reservations[0]!;
+  let releaseWrite!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseWrite = resolve;
+  });
+  let entered = false;
+  const registrations: Record<string, unknown>[] = [];
+  await page.route("**/api/hardware/ssh-passwords/*", async (route) => {
+    entered = true;
+    await gate;
+    await route.continue();
+  });
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/hardware/actions")
+    ) {
+      const body = request.postDataJSON();
+      if (body.action === "hardware.ssh.registerKey")
+        registrations.push(body.input);
+    }
+  });
+  await button(page, "Register SSH key…").click();
+  await label(page, "SSH registration password").fill(
+    "original reservation fixture",
+  );
+  await button(page, "Register key").click();
+  await expect.poll(() => entered).toBe(true);
+  await lab.settled(
+    (
+      await lab.mutate("hardware.release", {
+        reservationId: original.reservationId,
+        generation: original.generation,
+      })
+    ).receipt,
+  );
+  const replacement = await lab.mutate("hardware.reserve", {
+    hardwareId: lab.ssh.id,
+    expectedItemRevision: lab.ssh.revision,
+    purpose: "Replacement reservation",
+  });
+  await lab.settled(replacement.receipt);
+  await expect(
+    page.getByRole("dialog", { name: "Register SSH key" }),
+  ).toHaveCount(0);
+  await button(page, "Register SSH key…").click();
+  await expect(label(page, "SSH registration password")).toHaveValue("");
+  await button(page, "Cancel registration").click();
+  releaseWrite();
+  await expect.poll(() => registrations.length).toBe(1);
+  expect(registrations[0]).toMatchObject({
+    reservationId: original.reservationId,
+    generation: original.generation,
+  });
+  expect(lab.registrations).toHaveLength(0);
+  const current = (await lab.service.snapshot(operator)).reservations[0]!;
+  expect(current.reservationId).not.toBe(original.reservationId);
+  expect(current.accessState).toBe("closed");
+});
+
+test("SSH authentication: pending registration blocks duplicate clicks and a known failure keeps access closed", async ({
+  page,
+}) => {
+  let finishRegistration!: () => void;
+  lab.registrationGate = new Promise<void>((resolve) => {
+    finishRegistration = resolve;
+  });
+  lab.registrationOutcome = {
+    state: "failed",
+    effects: "none",
+    error: {
+      code: "AUTHENTICATION_FAILED",
+      message: "The registration password was rejected.",
+    },
+  };
+  await reserve(page, "Atlas SSH");
+  await button(page, "Open access screen").click();
+  await button(page, "Register SSH key…").click();
+  await label(page, "SSH registration password").fill("rejected fixture only");
+  await button(page, "Register key").click();
+  await expect(button(page, "Registering SSH key…")).toBeDisabled();
+  expect(lab.registrations).toHaveLength(1);
+  finishRegistration();
+  await expect(
+    page.getByRole("article", { name: "Operation receipt" }),
+  ).toContainText("AUTHENTICATION_FAILED");
+  await expect(button(page, "Register SSH key…")).toBeEnabled();
+  const state = await lab.service.snapshot(operator);
+  expect(state.reservations[0]!.accessState).toBe("closed");
+  expect(state.reservations[0]!.state).toBe("active");
+  expect(JSON.stringify(state)).not.toContain("rejected fixture only");
+});
+
+test("SSH authentication: existing key login can register without any password write", async ({
+  page,
+}) => {
+  let passwordWrites = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "PUT" &&
+      request.url().includes("/api/hardware/ssh-passwords/")
+    )
+      passwordWrites++;
+  });
+  await reserve(page, "Atlas SSH");
+  await button(page, "Open access screen").click();
+  await button(page, "Register SSH key…").click();
+  await expect(label(page, "SSH registration password")).not.toHaveAttribute(
+    "required",
+    "",
+  );
+  await button(page, "Register key").click();
+  await expect(
+    page.getByRole("dialog", { name: "Register SSH key" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("article", { name: "Operation receipt" }),
+  ).toContainText("succeeded");
+  expect(passwordWrites).toBe(0);
+  expect(lab.registrations).toHaveLength(1);
+  expect(lab.registrations[0]!.input.credentialRefId).toBeUndefined();
+});
 async function idle(page: Page) {
   await expect(page.locator(".hardware-content")).toBeEnabled();
 }
@@ -124,10 +563,17 @@ async function openAccess(page: Page, name: string) {
     page.getByText("Managed connection confirmed open", { exact: true }),
   ).toBeVisible();
 }
-async function screenshot(page: Page, info: TestInfo, name: string) {
-  await page.locator(".hardware-panel").evaluate((element) => {
-    element.scrollTop = 0;
-  });
+async function screenshot(
+  page: Page,
+  info: TestInfo,
+  name: string,
+  focusLabel?: string,
+) {
+  if (focusLabel) await label(page, focusLabel).scrollIntoViewIfNeeded();
+  else
+    await page.locator(".hardware-panel").evaluate((element) => {
+      element.scrollTop = 0;
+    });
   const target = info.outputPath(`${name}.png`);
   await page.screenshot({ path: target, fullPage: true });
   await info.attach(name, { path: target, contentType: "image/png" });
@@ -286,7 +732,6 @@ test("SSH editor creates, retains, saves and deletes a revision-guarded item", a
   await label(page, "SSH username").fill("tester");
   await label(page, "SSH authentication").selectOption("identity_file");
   await label(page, "Identity file reference").fill(`${lab.root}/identity`);
-  await label(page, "Known hosts file").fill(`${lab.root}/known_hosts`);
   await label(page, "SSH connection timeout").fill("4000");
   await label(page, "Capability ARM64").check();
   await label(page, "Notes for agents").fill(
@@ -309,7 +754,6 @@ test("SSH editor creates, retains, saves and deletes a revision-guarded item", a
   await button(page, "Select New SSH").click();
   await button(page, "Edit hardware").click();
   await label(page, "SSH authentication").selectOption("agent");
-  await label(page, "SSH agent socket").fill(`${lab.root}/new-agent.sock`);
   await label(page, "Hardware name").fill("Renamed SSH");
   await button(page, "Save hardware").click();
   await expect(button(page, "Select Renamed SSH")).toBeVisible();

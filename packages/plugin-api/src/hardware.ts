@@ -19,4 +19,5 @@ export interface HardwareTypeProvider<Config> {
   inspectEndpoint(config: Config): Promise<HardwareEndpointInspection>;
   describeAccess(config: Config): HardwareAccessDescription;
   connect(config: Config, context: HardwareAccessContext): Promise<ProviderOutcome<HardwareConnection>>;
+  registerKey?(config: Config, input: JsonObject, context: HardwareAccessContext): Promise<ProviderOutcome<JsonObject>>;
 }
