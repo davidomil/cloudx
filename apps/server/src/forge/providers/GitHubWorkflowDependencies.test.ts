@@ -5,15 +5,15 @@ import { GitHubWorkflowDependencies } from "./GitHubWorkflowDependencies.js";
 const terminal = (name: string, conclusion = "success") => ({ name, status: "completed", conclusion });
 
 describe("Pinned workflow dependencies", () => {
-  it("resolves the real CI aggregate's failed installed-upgrade producer, including literal matrix sibling names", async () => {
+  it.each(["Installed previous-version upgrade", "Codex native recovery (0.166.0)"])("resolves the real CI aggregate's failed %s producer, including every literal matrix sibling", async failedName => {
     const workflow = new GitHubWorkflowDependencies(await fs.readFile(".github/workflows/ci.yml", "utf8"));
     const names = ["Repository policy", "TypeScript (build, type-check, test)", "Codex native recovery (installer)",
-      "Codex native recovery (0.156.1)", "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Pinned lifecycle revisions",
+      "Codex native recovery (0.156.1)", "Codex native recovery (0.166.0)", "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Pinned lifecycle revisions",
       "Clean installation", "Installed previous-version upgrade", "Python services (pytest)",
       "Browser smoke (desktop and mobile)", "Isolated full verifier", "Trusted merge identity"];
-    const jobs = names.map(name => terminal(name, name === "Installed previous-version upgrade" ? "failure" : "success"));
+    const jobs = names.map(name => terminal(name, name === failedName ? "failure" : "success"));
     jobs.push(terminal("Unrelated optional job", "failure"));
-    expect(workflow.failedDependencies(terminal("CI aggregate", "failure"), jobs)).toEqual([jobs[7]]);
+    expect(workflow.failedDependencies(terminal("CI aggregate", "failure"), jobs)).toEqual([jobs.find(job => job.name === failedName)]);
   });
 
   it("expands literal matrices with include/exclude and chooses only failed dependencies", () => {
