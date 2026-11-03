@@ -5702,6 +5702,59 @@ describe("Forge issue auto review", () => {
     expect(f.runtime.launch).toHaveBeenCalledTimes(7);
   });
 
+  it.each([
+    ["pause", "resume"], ["pause", "continue"], ["stop", "resume"], ["stop", "continue"],
+  ] as const)("recovers %s during the manual delivery checkpoint with %s after restart", async (control, recovery) => {
+    const f = await exhaustedCiBudget();
+    const original = f.currentIssue();
+    const message = "Repair CI and preserve the cancellation diagnostics.";
+    const saving = deferred<void>();
+    const release = deferred<void>();
+    const write = f.deps.store.write;
+    let held = false;
+    f.deps.store.write = async workers => {
+      await write(workers);
+      if (!held && workers.some(worker => worker.id === f.issue.id && worker.ciRepair?.manual && worker.ciRepair.phase === "launching")) {
+        held = true;
+        saving.resolve();
+        await release.promise;
+      }
+    };
+    const deliveredAttempts = new Set<string>();
+    f.runtime.launch.mockImplementation(async (input, signal) => {
+      signal?.throwIfAborted();
+      deliveredAttempts.add(input.attemptId);
+      return "tab-1";
+    });
+    f.runtime.readTurnCompletion.mockImplementation(async (workerId, attemptId) => deliveredAttempts.has(attemptId)
+      ? { workerId, attemptId, threadId: "manual-thread", turnId: "manual-turn", status: "running" } : undefined);
+    const continuing = expect(f.service.continueWorker(f.issue.id, message, placement, { ciRepair: true })).rejects.toThrow(/Worker (paused|stopped) by user/);
+    await saving.promise;
+    const stopping = f.service[control](f.issue.id);
+    release.resolve();
+    await Promise.all([continuing, stopping]);
+    expect(deliveredAttempts.size).toBe(0);
+    expect(f.currentIssue()).toMatchObject({ status: control === "pause" ? "paused" : "stopped",
+      ciRepair: { manual: true, phase: "blocked", attempts: 2, attemptedHeads: original.ciRepair!.attemptedHeads },
+      pendingContinuation: { message, previousError: original.error, ciRepair: true } });
+    expect(f.currentIssue().pendingContinuation?.deliveryAttemptId).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(deliveredAttempts.size).toBe(0);
+    const continued = recovery === "resume" ? await restarted.resume(f.issue.id, placement)
+      : await restarted.continueWorker(f.issue.id, message, placement, { ciRepair: true });
+    expect(continued).toMatchObject({ status: "running", branch: original.branch, worktreePath: original.worktreePath,
+      changeNumber: original.changeNumber, ciRepair: { manual: true, phase: "repairing", attempts: 2,
+        attemptedHeads: original.ciRepair!.attemptedHeads } });
+    expect(continued.pendingContinuation).toBeUndefined();
+    expect(deliveredAttempts.size).toBe(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({
+      manualContinuation: { message, previousError: original.error } }));
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
   it("keeps a rejected native delivery uncertain after restart instead of repeating it", async () => {
     const f = await exhaustedCiBudget();
     f.runtime.readTurnCompletion.mockResolvedValue(undefined);

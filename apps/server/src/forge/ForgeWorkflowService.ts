@@ -3075,7 +3075,10 @@ export class ForgeWorkflowService {
       signal?.throwIfAborted();
       manualCiRepair.phase = "launching";
       worker.pendingContinuation!.deliveryAttemptId = worker.attemptId;
-      try { await this.persist(); }
+      try {
+        await this.persist();
+        signal?.throwIfAborted();
+      }
       catch (error) {
         manualCiRepair.phase = "blocked";
         worker.pendingContinuation!.deliveryAttemptId = undefined;
