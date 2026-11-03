@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isExactCodexVersion as isVersion, readCodexSelection } from "./codex-selection.mjs";
 import { CODEX_STATE_ERROR_PREFIX, CodexStateVerificationError, parseCodexStateDiagnostic } from "./codex-state-errors.mjs";
+import { CODEX_RUNTIME_ERROR_PREFIX, CodexRuntimeVerificationError, parseCodexRuntimeDiagnostic } from "./codex-runtime-errors.mjs";
 
 const UPDATE_TIMEOUT_MS = 180_000;
 const OUTPUT_LIMIT = 512 * 1024;
@@ -510,19 +511,24 @@ async function verifyCodexLaunch(assistantBin, options, previousAssistantBin, al
     });
   } catch (error) {
     if (["cancelled", "timeout", "output-limit", "log-unavailable", "cleanup-incomplete", "supervision-unavailable"].includes(error.code)) throw error;
-    const records = diagnosticTail.split(/\r?\n/).filter(line => line.startsWith(CODEX_STATE_ERROR_PREFIX));
+    const records = diagnosticTail.split(/\r?\n/).filter(line => line.startsWith(CODEX_STATE_ERROR_PREFIX) || line.startsWith(CODEX_RUNTIME_ERROR_PREFIX));
     if (records.length === 1) {
+      const runtime = records[0].startsWith(CODEX_RUNTIME_ERROR_PREFIX);
+      const prefix = runtime ? CODEX_RUNTIME_ERROR_PREFIX : CODEX_STATE_ERROR_PREFIX;
       let diagnostic;
-      try { diagnostic = parseCodexStateDiagnostic(JSON.parse(records[0].slice(CODEX_STATE_ERROR_PREFIX.length))); }
+      try { diagnostic = (runtime ? parseCodexRuntimeDiagnostic : parseCodexStateDiagnostic)(JSON.parse(records[0].slice(prefix.length))); }
       catch { /* Malformed output does not grant authority to expose private runtime errors. */ }
-      if (diagnostic) throw new CodexUpdateError(
-        diagnostic.stage === "snapshot" ? "snapshot-preparation" : "state-compatibility",
-        new CodexStateVerificationError(diagnostic).message,
-      );
+      if (diagnostic) {
+        if (runtime) throw new CodexUpdateError("runtime-verification", new CodexRuntimeVerificationError(diagnostic).message);
+        throw new CodexUpdateError(
+          diagnostic.stage === "snapshot" ? "snapshot-preparation" : "state-compatibility",
+          new CodexStateVerificationError(diagnostic).message,
+        );
+      }
     }
     throw new CodexUpdateError(
       "runtime-verification",
-      "The candidate Codex CLI failed CloudX tab launch, conversation selection, Forge turn, or shared-state compatibility verification. The active selection is unchanged. Check the private update log or installer output for the failed step before selecting a supported release.",
+      "CloudX could not identify the failed native verification stage. The active selection is unchanged. Check the private update log or installer output for the cause before selecting a supported release.",
     );
   }
 }
