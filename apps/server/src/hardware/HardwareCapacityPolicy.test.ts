@@ -75,6 +75,51 @@ describe("Hardware completion and cleanup byte allowances", () => {
     expect(next.receipts.find(saved => saved.receipt.requestId === "interrupted-cleanup")!.receipt.state).toBe("unknown");
   });
 
+  it.each([
+    { kinds: ["reservation"], sibling: undefined },
+    { kinds: ["system_check"], sibling: undefined },
+    { kinds: ["reservation", "system_check"], sibling: undefined },
+    { kinds: ["reservation"], sibling: "effects" },
+    { kinds: ["reservation"], sibling: "active" },
+    { kinds: ["reservation"], sibling: "owner" },
+  ])("funds restart bookkeeping for pending $kinds and $sibling siblings", ({ kinds, sibling }) => {
+    const pending = heldState(), claim = pending.reservations[0];
+    claim.owner = { kind: "agent", providerId: "codex", tabId: "t".repeat(128), executionId: "e".repeat(128), ownerPluginId: "p".repeat(128), logicalRunId: "l".repeat(128), workerId: "w".repeat(128), attemptId: "a".repeat(128) };
+    claim.hardwareId = "h".repeat(128); claim.acquiredItem.id = claim.hardwareId; pending.items[0].id = claim.hardwareId; claim.reservationId = "r".repeat(128);
+    if (kinds.includes("reservation")) {
+      const saved = acknowledgedOverride(pending, "reservation-final"); claim.state = "releasing"; claim.activeOperationIds = [saved.receipt.runId];
+    } else pending.reservations = [];
+    if (kinds.includes("system_check") || sibling) {
+      const item = { ...structuredClone(claim.acquiredItem), id: "c".repeat(128), physicalResourceId: "check-lab" };
+      pending.items.push(item); pending.groups.push({ id: "check-lab", revision: 1, name: "Check lab" });
+      const hold = { kind: "system_check" as const, runId: "s".repeat(128), hardwareId: item.id, generation: pending.nextGeneration++, revision: 1, resourceKeys: ["physical:check-lab"], state: "recovery_required" as const, bindingRevisions: [{ definitionId: "ready", revision: 1 }], startedAt: at, recoveryReason: "The previous checking generation was revoked for operator cleanup." };
+      pending.checkHolds.push(hold);
+      if (kinds.includes("system_check")) { const saved = record("check-final", "hardware.forceRelease"); saved.finalCleanupTarget = { kind: "system_check", runId: hold.runId, generation: hold.generation }; pending.receipts.push(saved); }
+    }
+    if (sibling) {
+      const item = { ...structuredClone(claim.acquiredItem), id: "b".repeat(128), physicalResourceId: "sibling-lab" };
+      pending.items.push(item); pending.groups.push({ id: "sibling-lab", revision: 1, name: "Sibling lab" });
+      pending.reservations.push({ ...structuredClone(claim), reservationId: "n".repeat(128), generation: pending.nextGeneration++, hardwareId: item.id, acquiredItem: item, resourceKeys: ["physical:sibling-lab"], activeOperationIds: [], state: sibling === "active" ? "active" : "recovery_required", recoveryReason: sibling === "active" ? undefined : "The previous execution requires recovery.", recoveryCause: sibling === "active" ? undefined : sibling === "owner" ? "owner" : "effects" });
+    }
+    const restored = structuredClone(pending), observedAt = "+010000-01-01T00:00:00.000Z";
+    for (const saved of restored.receipts) {
+      saved.receipt.state = "unknown"; saved.receipt.finishedAt = observedAt;
+      saved.receipt.error = { code: "OUTCOME_UNKNOWN", message: "CloudX restarted before the operation outcome was saved. The effect will not be replayed." };
+    }
+    for (const held of restored.reservations) {
+      const cleanup = held.state === "active" || held.recoveryCause === "owner", accessState = held.accessState;
+      const reason = "Automatic cleanup reached Hardware capacity. The resource remains held. Inspect its activity and use an acknowledged operator override.";
+      Object.assign(held, { state: "recovery_required", revision: held.revision + (cleanup ? 3 : 2), lastOwnerObservation: "confirmed_ended", lastOwnerObservedAt: observedAt, recoveryReason: cleanup ? reason : "Startup could not prove the exact owner and all prior effects are settled.", recoveryCause: cleanup ? "cleanup" : "restart", accessState: cleanup ? accessState : "unknown", activeOperationIds: [], ...(cleanup ? { updatedAt: observedAt } : {}) });
+      const event = { id: `event-${String(restored.history.length).padStart(36, "0")}`, at: observedAt, kind: "owner_ended", detail: "The exact execution owner has ended and its producer has quiesced.", owner: held.owner, reservationId: held.reservationId, hardwareId: held.hardwareId };
+      restored.history.push(event);
+      if (cleanup) restored.history.push({ ...event, id: `event-${String(restored.history.length).padStart(36, "0")}`, kind: "cleanup_capacity", detail: reason });
+    }
+    for (const held of restored.checkHolds) { held.revision++; held.recoveryReason = "CloudX restarted before this checking process was confirmed ended."; }
+    expect(() => validateHardwareState(pending)).not.toThrow(); expect(() => validateHardwareState(restored)).not.toThrow();
+    expect(policy.accountedBytes(pending, "bookkeeping")).toBeGreaterThanOrEqual(policy.accountedBytes(restored, "bookkeeping"));
+    expect(restored.receipts.map(saved => saved.receipt.requestId)).toEqual(pending.receipts.map(saved => saved.receipt.requestId));
+  });
+
   it("validates private final-cleanup metadata against its action and exact recorded target", () => {
     const state = heldState(); acknowledgedOverride(state, "final");
     expect(() => validateHardwareState(state)).not.toThrow();

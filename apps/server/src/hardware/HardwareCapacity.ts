@@ -40,13 +40,46 @@ export class HardwareCapacity {
   }
 
   accountedBytes(state: HardwareStoredState, use: CapacityUse = "ordinary"): number {
-    let reserved = 0;
-    const final = state.receipts.filter(record => record.receipt.state === "running" && record.finalCleanupTarget).map(record => record.finalCleanupTarget!);
-    for (const record of state.receipts) if (record.receipt.state === "running") reserved += this.completionReserve(record);
+    const running = state.receipts.filter(record => record.receipt.state === "running"), final = running.filter(record => record.finalCleanupTarget);
+    const completion = running.reduce((sum, record) => sum + this.completionReserve(record), 0);
     const allowance = (hold: HardwareHold) => use === "ordinary" ? HARDWARE_CLEANUP_RESERVE : HARDWARE_CLEANUP_COMPLETION + (use === "cleanup" ? FINAL_ADMISSION_MARGIN : this.finalAdmissionBytes(state, hold));
-    for (const claim of state.reservations) if (!final.some(target => sameTarget(target, { kind: "reservation", reservationId: claim.reservationId, generation: claim.generation }))) reserved += allowance(claim);
-    for (const hold of state.checkHolds) if (!final.some(target => sameTarget(target, { kind: "system_check", runId: hold.runId, generation: hold.generation }))) reserved += allowance(hold);
+    const holds = [...state.reservations, ...state.checkHolds];
+    let reserved = completion;
+    for (const hold of holds) {
+      const target: HardwareHoldRef = "reservationId" in hold ? { kind: "reservation", reservationId: hold.reservationId, generation: hold.generation } : { kind: "system_check", runId: hold.runId, generation: hold.generation };
+      if (!final.some(record => sameTarget(record.finalCleanupTarget!, target))) reserved += allowance(hold);
+    }
+    if (final.length) {
+      const restarted = holds.reduce((sum, hold) => sum + HARDWARE_CLEANUP_COMPLETION + this.finalAdmissionBytes(state, hold) + this.restartHoldBytes(hold), 0) + final.reduce((sum, record) => sum + this.restartReceiptBytes(record), 0);
+      // Other outcomes can complete before cleanup crashes. Keep their credits
+      // separate from the larger completion-or-restart branch for final cleanup.
+      const otherCompletions = completion - final.reduce((sum, record) => sum + this.completionReserve(record), 0);
+      reserved = Math.max(reserved, otherCompletions + restarted);
+    }
     return Buffer.byteLength(JSON.stringify(state)) + 1 + reserved;
+  }
+
+  private restartReceiptBytes(record: StoredHardwareReceipt): number {
+    const at = "+999999-12-31T23:59:59.999Z", bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+    const receipt = record.receipt;
+    return Math.max(0, bytes({ state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "CloudX restarted before the operation outcome was saved. The effect will not be replayed." }, finishedAt: at }) - bytes({ state: receipt.state, error: receipt.error, finishedAt: receipt.finishedAt }));
+  }
+
+  private restartHoldBytes(hold: HardwareHold): number {
+    const at = "+999999-12-31T23:59:59.999Z", bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+    const growth = (before: unknown, after: unknown) => Math.max(0, bytes(after) - bytes(before));
+    if (!("reservationId" in hold)) return growth({ state: hold.state, recoveryReason: hold.recoveryReason, revision: hold.revision }, { state: "recovery_required", recoveryReason: "CloudX restarted before this checking process was confirmed ended.", revision: hold.revision + 1 }) + 64;
+    const before = { state: hold.state, revision: hold.revision, lastOwnerObservation: hold.lastOwnerObservation, lastOwnerObservedAt: hold.lastOwnerObservedAt, recoveryReason: hold.recoveryReason, recoveryCause: hold.recoveryCause, accessState: hold.accessState, activeOperationIds: hold.activeOperationIds };
+    const restored = { ...before, state: "recovery_required", revision: hold.revision + 2, lastOwnerObservation: "confirmed_ended", lastOwnerObservedAt: at, recoveryReason: "Startup could not prove the exact owner and all prior effects are settled.", recoveryCause: "restart", accessState: "unknown", activeOperationIds: [] };
+    const ownerEnded = { id: `event-${"x".repeat(36)}`, at, kind: "owner_ended", detail: "The exact execution owner has ended and its producer has quiesced.", owner: hold.owner, reservationId: hold.reservationId, hardwareId: hold.hardwareId };
+    let metadata = growth(before, restored) + bytes(ownerEnded);
+    if (hold.state === "active" || hold.recoveryCause === "owner") {
+      const reason = "Automatic cleanup reached Hardware capacity. The resource remains held. Inspect its activity and use an acknowledged operator override.";
+      const deferred = { ...restored, revision: hold.revision + 3, recoveryReason: reason, recoveryCause: "cleanup", accessState: hold.accessState };
+      metadata = Math.max(metadata, growth({ ...before, updatedAt: hold.updatedAt }, { ...deferred, updatedAt: at }) + bytes(ownerEnded) + bytes({ ...ownerEnded, kind: "cleanup_capacity", detail: reason }));
+    }
+    // Include array separators and the store/hold revision counters.
+    return metadata + 64;
   }
 
   private finalAdmissionBytes(state: HardwareStoredState, hold: HardwareHold): number {

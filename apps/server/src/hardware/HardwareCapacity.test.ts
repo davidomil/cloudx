@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,7 +16,7 @@ const user: HardwareOwner = { kind: "user", userId: "local" };
 const roots: string[] = [], services: HardwareService[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.allSettled(services.splice(0).map(service => service.dispose())); for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
 
-async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresolvedBytes?: number; stateBytes?: number; interruptedFinal?: boolean; missingReleaseCredential?: boolean; unknownConnection?: boolean; maximumTarget?: boolean } = {}) {
+async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresolvedBytes?: number; stateBytes?: number; interruptedFinal?: boolean; missingReleaseCredential?: boolean; unknownConnection?: boolean; maximumTarget?: boolean; cleanupBarrier?: boolean; restartSiblings?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hardware-capacity-")); roots.push(root);
   const at = new Date().toISOString();
   const state = emptyHardwareState();
@@ -23,6 +24,7 @@ async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresol
     const item: HardwareItem = { id: name, revision: 1, name, description: "", enabled: true, physicalResourceId: `group-${name}`, typeId: "fixture", configVersion: 1, config: { endpoint: name }, tagIds: [], notes: "", notesRevision: 1, statuses: [], hooks: {} };
     if (name === "recovery" && options.missingReleaseCredential) item.hooks.onRelease = { source: "touch forbidden", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: ["unavailable"] };
     if (name === "active" && options.maximumTarget) item.hooks.onRelease = { source: "printf ran >> executions; head -c 65536 /dev/zero", cwd: root, timeoutMs: 1000, maxOutputBytes: 65536, credentialRefIds: [] };
+    if (name === "active" && options.cleanupBarrier) item.hooks.onRelease = { source: "printf ran >> executions", cwd: root, timeoutMs: 1000, maxOutputBytes: 65536, credentialRefIds: ["cleanup-barrier"] };
     state.groups.push({ id: item.physicalResourceId, revision: 1, name }); state.items.push(item);
     if (name === "scheduled" || name === "checking") item.statuses.push({ revision: 1, definitionId: "ready", source: "command", script: { source: "printf checked >> executions; printf true", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] }, maxAgeMs: 1000, intervalMs: name === "scheduled" ? 1000 : null });
     if (name === "active" || name === "recovery") {
@@ -36,10 +38,22 @@ async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresol
   state.receipts.push({ owner: user, action: "hardware.reserve", digest: createHash("sha256").update(canonical({ action: "hardware.reserve", input: originalInput })).digest("hex"), receipt: { requestId: originalInput.requestId, runId: "run-before-capacity", state: "succeeded", startedAt: at, finishedAt: at, reservation: { reservationId: "reservation-active", generation: 1 }, result: { state: "active" } } });
   for (let index = 1; index < (options.receiptCount ?? 100_000); index++) state.receipts.push({ owner: user, action: "hardware.statuses.refresh", digest: "0".repeat(64), receipt: { requestId: `request-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`, runId: `run-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`, state: options.escapedUnresolvedBytes ? "unknown" : "succeeded", startedAt: at, finishedAt: at, ...(options.escapedUnresolvedBytes ? { result: { stdout: "\0".repeat(options.escapedUnresolvedBytes) }, error: { code: "OUTCOME_UNKNOWN", message: "Unresolved evidence must be retained." } } : {}) } });
   if (options.stateBytes) {
-    state.reservations = state.reservations.filter(claim => claim.hardwareId === "active"); state.checkHolds = [];
+    state.reservations = state.reservations.filter(claim => claim.hardwareId === "active" || options.restartSiblings); if (!options.restartSiblings) state.checkHolds = [];
     for (const item of state.items) for (const binding of item.statuses) if (binding.source === "command") binding.intervalMs = null;
     const claim = state.reservations[0];
     claim.owner = { kind: "agent", providerId: "codex", tabId: "ended-tab", executionId: "ended-execution" }; claim.lastOwnerObservation = "confirmed_ended";
+    if (options.cleanupBarrier) {
+      const item = state.items.find(item => item.id === claim.hardwareId)!;
+      item.id = randomUUID(); claim.hardwareId = item.id; claim.acquiredItem.id = item.id; claim.reservationId = `reservation-${randomUUID()}`;
+      claim.owner = { kind: "agent", providerId: "codex", tabId: randomUUID(), executionId: randomUUID() };
+      originalInput.hardwareId = item.id; state.receipts[0].receipt.reservation = { reservationId: claim.reservationId, generation: claim.generation };
+      state.receipts[0].digest = createHash("sha256").update(canonical({ action: "hardware.reserve", input: originalInput })).digest("hex");
+    }
+    if (options.restartSiblings) {
+      claim.lastOwnerObservation = "active";
+      const sibling = state.reservations[1]; sibling.owner = structuredClone(claim.owner); sibling.lastOwnerObservation = "active"; sibling.state = "active";
+      delete sibling.recoveryCause; delete sibling.recoveryReason;
+    }
     if (options.maximumTarget) {
       const item = state.items.find(item => item.id === claim.hardwareId)!;
       item.id = "h".repeat(128); claim.hardwareId = item.id; claim.acquiredItem.id = item.id; claim.reservationId = "r".repeat(128);
@@ -63,7 +77,7 @@ async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresol
     connect: async (_config, context) => { const close = async () => ({ state: "completed" as const, value: null }); context.registerCleanup(close); cleanupRegistrations++; return options.unknownConnection ? { state: "unknown", error: { code: "OPEN_UNKNOWN", message: "Connection setup has an unknown outcome." } } : { state: "completed", value: { close, invoke: async () => ({ state: "completed", value: {} }) } }; },
   };
   const registry = { values: () => [provider], get: () => provider };
-  const service = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]) }); services.push(service); await service.init();
+  const service = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]), ...(options.restartSiblings ? { ownerState: () => "active" as const } : {}) }); services.push(service); await service.init();
   return { service, root, registry, originalInput, cleanupRegistrations: () => cleanupRegistrations };
 }
 
@@ -192,7 +206,96 @@ describe("Hardware retained-request capacity", () => {
     expect((await service.execute("hardware.forceRelease", input, operator) as HardwareMutationResult).receipt.runId).toBe(result.receipt.runId);
     expect(await fs.readFile(path.join(root, "executions"), "utf8")).toBe("ran");
   }, 30_000);
+
+  it("rejects an underfunded final admission without changing persisted state or writer readiness", async () => {
+    const { service, root } = await fullReceiptIndex({ receiptCount: 1, stateBytes: HARDWARE_STATE_BYTES - 528 * 1024, cleanupBarrier: true });
+    const before = await fs.readFile(path.join(root, "hardware/state.json"), "utf8"), claim = service.ownerClaims()[0];
+    const input = { requestId: randomUUID(), target: { kind: "reservation", reservationId: claim.reservationId, generation: claim.generation }, expectedHoldRevision: claim.revision, reason: "r".repeat(2000), acceptUnresolvedExternalActivity: true };
+    await expect(execute(service, "hardware.forceRelease", input)).rejects.toMatchObject({ code: "CAPACITY_EXCEEDED" });
+    expect(await fs.readFile(path.join(root, "hardware/state.json"), "utf8")).toBe(before);
+    expect((await service.snapshot(user)).readiness.state).toBe("ready");
+    expect(service.ownerClaims()[0]).toEqual(claim); await expect(fs.stat(path.join(root, "executions"))).rejects.toMatchObject({ code: "ENOENT" });
+    const final = await execute(service, "hardware.forceRelease", { ...input, requestId: randomUUID(), reason: "Accepted" });
+    expect((await settle(service, final.receipt)).state).toBe("succeeded"); expect(service.ownerClaims()).toEqual([]);
+  }, 30_000);
+
+  it.each([false, true])("keeps an actually admitted final override recoverable after its owning process is killed (siblings: %s)", async siblings => {
+    const { service, root, registry } = await fullReceiptIndex({ receiptCount: 1, stateBytes: HARDWARE_STATE_BYTES - (siblings ? 3 : 1) * 544 * 1024, cleanupBarrier: true, restartSiblings: siblings });
+    await service.dispose();
+    const file = path.join(root, "hardware/state.json"), inputId = randomUUID();
+    const source = `
+      import { HardwareService } from ${JSON.stringify(new URL("./HardwareService.ts", import.meta.url).href)};
+      const provider = { descriptor: { id: "fixture", ownerPluginId: "fixture", apiVersion: 1, configVersion: 1, displayName: "Fixture", description: "Capacity fixture", configSchema: { type: "object" }, operations: [] }, parseConfig: value => value, inspectEndpoint: async config => ({ resourceKeys: ["endpoint:" + config.endpoint], ready: true, blockers: [] }), describeAccess: () => ({ summary: "Fixture", details: {} }) };
+      const service = new HardwareService({ dataDir: ${JSON.stringify(root)}, registry: { values: () => [provider], get: () => provider }, ownerState: () => "active", resolveCredential: () => new Promise(() => {}) });
+      await service.init();
+      const claim = service.ownerClaims()[0];
+      const input = { requestId: ${JSON.stringify(inputId)}, target: { kind: "reservation", reservationId: claim.reservationId, generation: claim.generation }, expectedHoldRevision: claim.revision, reason: "r".repeat(2000), acceptUnresolvedExternalActivity: true };
+      const result = await service.execute("hardware.forceRelease", input, ${JSON.stringify(user)});
+      process.stdout.write(JSON.stringify({ input, receipt: result.receipt, writerPid: service.store.writer.child.pid }) + "\\n");
+      process.stdin.resume();
+    `;
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", source], { stdio: ["pipe", "pipe", "pipe"] });
+    let errors = ""; child.stderr.on("data", chunk => { errors += chunk; });
+    let writerPid: number | undefined;
+    try {
+      const admitted = await new Promise<{ input: Record<string, unknown>; receipt: OperationReceipt; writerPid: number }>((resolve, reject) => {
+        let output = "";
+        const cleanup = () => { clearTimeout(deadline); child.stdout.off("data", receive); child.off("error", failed); child.off("exit", exited); };
+        const failed = (error: Error) => { cleanup(); reject(error); };
+        const exited = (code: number | null) => failed(new Error(`Override process exited ${code}: ${errors}`));
+        const receive = (chunk: Buffer) => {
+          output += chunk;
+          if (!output.includes("\n")) return;
+          try { const value = JSON.parse(output.slice(0, output.indexOf("\n"))); cleanup(); resolve(value); }
+          catch (error) { failed(error as Error); }
+        };
+        const deadline = setTimeout(() => failed(new Error(`Override admission did not finish: ${errors}`)), 10_000);
+        child.stdout.on("data", receive); child.once("error", failed); child.once("exit", exited);
+      });
+      writerPid = admitted.writerPid;
+      expect(admitted.receipt.state).toBe("running");
+      const running = JSON.parse(await fs.readFile(file, "utf8"));
+      expect(running.receipts.at(-1)).toMatchObject({ finalCleanupTarget: { kind: "reservation", ...admitted.receipt.reservation }, receipt: { runId: admitted.receipt.runId, state: "running" } });
+      const ended = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGKILL"); await ended;
+      await waitForWriterExit(writerPid);
+      const resolveCredential = vi.fn();
+      const restored = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]), ownerState: () => "confirmed_ended", resolveCredential }); services.push(restored);
+      await restored.init();
+      expect((await restored.snapshot(user)).readiness.state).toBe("ready");
+      const claim = restored.ownerClaims().find(held => held.reservationId === admitted.receipt.reservation!.reservationId)!; expect(claim).toMatchObject({ state: "recovery_required", lastOwnerObservation: "confirmed_ended" });
+      if (siblings) {
+        const sibling = restored.ownerClaims().find(held => held.reservationId !== claim.reservationId)!;
+        expect(sibling).toMatchObject({ state: "recovery_required", lastOwnerObservation: "confirmed_ended" }); expect(sibling.recoveryReason).toContain("capacity");
+        expect((await restored.snapshot(user)).history.some(event => event.kind === "cleanup_capacity" && event.reservationId === sibling.reservationId)).toBe(true);
+      }
+      expect((await execute(restored, "hardware.forceRelease", admitted.input)).receipt).toMatchObject({ state: "unknown", runId: admitted.receipt.runId });
+      expect(resolveCredential).not.toHaveBeenCalled(); await expect(fs.stat(path.join(root, "executions"))).rejects.toMatchObject({ code: "ENOENT" });
+      const final = await execute(restored, "hardware.forceRelease", { ...admitted.input, requestId: randomUUID(), target: { kind: "reservation", reservationId: claim.reservationId, generation: claim.generation }, expectedHoldRevision: claim.revision });
+      expect((await settle(restored, final.receipt)).state).toBe("succeeded"); expect(restored.ownerClaims()).toHaveLength(siblings ? 1 : 0);
+      if (siblings) {
+        const sibling = restored.ownerClaims()[0], check = (await restored.snapshot(user)).checkHolds[0];
+        for (const target of [{ kind: "reservation", reservationId: sibling.reservationId, generation: sibling.generation }, { kind: "system_check", runId: check.runId, generation: check.generation }]) {
+          const result = await execute(restored, "hardware.forceRelease", { requestId: randomUUID(), target, expectedHoldRevision: target.kind === "reservation" ? sibling.revision : check.revision, reason: "Accepted", acceptUnresolvedExternalActivity: true });
+          expect((await settle(restored, result.receipt)).state).toBe("succeeded");
+        }
+        expect(restored.ownerClaims()).toEqual([]); expect((await restored.snapshot(user)).checkHolds).toEqual([]);
+      }
+      expect((await fs.stat(file)).size).toBeLessThanOrEqual(HARDWARE_STATE_BYTES);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) { const ended = new Promise<void>(resolve => child.once("exit", () => resolve())); child.kill("SIGKILL"); await ended; }
+      if (writerPid) await waitForWriterExit(writerPid);
+    }
+  }, 30_000);
 });
+
+async function waitForWriterExit(pid: number) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+    if (!stat || stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("The killed service's writer helper did not exit.");
+}
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);

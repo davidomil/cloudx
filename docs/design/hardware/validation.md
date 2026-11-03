@@ -57,3 +57,13 @@ npm run lint
 npm run policy:validate
 git diff --check
 ```
+
+## Final cleanup crash regression
+
+A real service reproduction admitted an acknowledged override with a 2,000-character printable reason, then killed the owning process before cleanup completed. The old accounting allowed the 66,572,269-byte snapshot, but restart failed during confirmed-owner reconciliation with `CAPACITY_EXCEEDED`.
+
+Final cleanup now reserves the larger of completion space and the space needed to restore every live hold, retain the unknown receipt, and save owner reconciliation. Unrelated pending operations keep their completion space. The 64 MiB physical limit and permanent request identities remain unchanged.
+
+The focused command above now passes 188 tests in 25 files. Actual `SIGKILL` cases cover a single reservation and a reservation with an active sibling and system-check hold. Both restore ready, preserve the original unknown receipt without replay, and permit fresh acknowledged cleanup. A tighter long-reason request rejects without changing the file or readiness; a shorter acknowledged cleanup still fits. Maximum identifiers and escaped hook diagnostics remain covered.
+
+Both real crash cases also pass under Node 22.23.1 with two-CPU affinity. The production build, TypeScript project build, formatting, lint, process-policy validation, and whitespace checks pass for this revision. These results use emulated hardware and local processes.
