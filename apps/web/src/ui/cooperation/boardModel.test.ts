@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { isCooperationId } from "@cloudx/shared";
 import type { CooperationBoard, CooperationItem, CooperationReceipt, CooperationInboxEvent } from "@cloudx/shared";
-import { boardId, createBoardDrawing, createBoardItem, preconditionsForOperations, protectedItemIds, regionAroundItems, resizedDrawing, selectedTextAnchor, targetAuthor, targetFromSelection, undoableOwnOperations } from "./boardModel.js";
+import { boardContentBounds, boardId, createBoardAsset, createBoardDrawing, createBoardItem, createBoardLink, isBoardEditor, preconditionsForOperations, protectedItemIds, regionAroundItems, resizedDrawing, resizedRegion, selectedTextAnchor, targetAuthor, targetFromSelection, undoableOwnOperations } from "./boardModel.js";
 
 const geometry = { x: 20, y: 30, width: 180, height: 100, rotation: 0 };
 const note = (id: string, text = "A durable queue separates work."): CooperationItem => ({ id, kind: "note", geometry, revision: 2, createdBy: "user:local", updatedBy: "user:local", content: { title: id, blocks: [{ id: `${id}-body`, revision: 3, text }] } });
@@ -35,6 +35,14 @@ describe("semantic board editing", () => {
     expect(targetAuthor(scene, { kind: "threadMessage", id: "message" })).toBe("agent:reviewer");
     expect(targetAuthor(scene, { kind: "region", id: "region" })).toBeUndefined();
   });
+  it("keeps an AI zone owner addressable after the zone is deleted", () => {
+    const scene = board();
+    const zone = { ...regionAroundItems([], [0, 0]), id: "zone", revision: 2, ownerActor: "agent:planner" as const };
+    scene.regions = [zone];
+    expect(targetAuthor(scene, { kind: "region", id: "zone" })).toBe("agent:planner");
+    scene.regions = [];
+    expect(targetAuthor(scene, { kind: "region", id: "zone", snapshot: { removedAtBoardRevision: 5, record: zone } })).toBe("agent:planner");
+  });
   it("keeps durable addressed feedback out of the editable undo stack without blocking earlier edits", () => {
     const receipt = (operationId: string, boardRevision: number, answeredEventIds: string[] = []): CooperationReceipt => ({ operationId, boardId: "board", boardRevision, eventCursor: boardRevision, actor: "user:local", changedIds: [], answeredEventIds, committedAt: "2026-11-02T00:00:00Z", projectionStatus: "published" });
     const delivery = (boardRevision: number, state: CooperationInboxEvent["state"]): CooperationInboxEvent => ({ boardId: "board", boardRevision, sequence: boardRevision, eventId: `feedback-${boardRevision}`, kind: "question", author: "user:local", target: { kind: "item", id: "note" }, targetRevision: 1, state, createdAt: "2026-11-02T00:00:00Z" });
@@ -44,6 +52,25 @@ describe("semantic board editing", () => {
     expect(createBoardItem("note", [50, 60])).toMatchObject({ kind: "note", geometry: { x: 50, y: 60 }, content: { blocks: [{ revision: 1, text: "" }] } });
     expect(createBoardItem("code", [50, 60])).toMatchObject({ kind: "code", content: { language: "typescript" } });
     expect(createBoardItem("shape", [50, 60], "cylinder")).toMatchObject({ kind: "shape", content: { shape: "cylinder" } });
+  });
+  it("creates local link previews and attaches file manifests without replacing original image semantics", () => {
+    expect(createBoardLink("https://example.com/spec", [10, 20])).toMatchObject({ kind: "link", geometry: { x: 10, y: 20 }, content: { title: "example.com", url: "https://example.com/spec", description: "" } });
+    const longUrl = `https://${["a", "b", "c", "d"].map(letter => letter.repeat(63)).join(".")}/spec`;
+    const preview = createBoardLink(longUrl, [10, 20]);
+    expect(preview.content.url).toBe(longUrl);
+    expect(preview.content.title).toHaveLength(200);
+    const common = { id: "asset", relativePath: "assets/asset.bin", sha256: "a".repeat(64), byteLength: 20 };
+    for (const mime of ["application/pdf", "audio/wav", "video/webm"]) {
+      expect(createBoardAsset({ ...common, kind: "file", name: "original", mime }, [50, 60], "Evidence", "item")).toMatchObject({ id: "item", kind: "file", geometry: { x: 50, y: 60, width: 380 }, content: { title: "Evidence", assetId: "asset", description: "" } });
+    }
+    expect(createBoardAsset({ ...common, mime: "image/png", width: 800, height: 400 }, [50, 60], "Reference", "image")).toMatchObject({ id: "image", kind: "image", geometry: { x: 50, y: 60, width: 420, height: 210 }, content: { title: "Reference", alt: "Reference", assetId: "asset" } });
+  });
+  it("lets native media keyboard controls handle their own events", () => {
+    const video = document.createElement("video");
+    const audio = document.createElement("audio");
+    expect(isBoardEditor(video)).toBe(true);
+    expect(isBoardEditor(audio)).toBe(true);
+    expect(isBoardEditor(document.createElement("article"))).toBe(false);
   });
   it("retains pressure samples and keeps round ink inside its persisted geometry", () => {
     const drawing = createBoardDrawing([{ points: [[5, 9, 0.2], [10, 20, 0.9], [25, 14, 0.5]], color: "#ffffff", width: 6 }]);
@@ -94,5 +121,44 @@ describe("semantic board editing", () => {
     snapshot.reactions = [{ id: "review", revision: 3, kind: "idea", glyph: "+", description: "Coworker feedback", author: "user:local", target: { kind: "item", id: "goal" } }];
     const observed = preconditionsForOperations(snapshot, [{ kind: "updateReaction", reactionId: "review", patch: { description: "My draft" } }], { observedPreconditions: [{ targetKind: "reaction", targetId: "review", expectedRevision: 2 }] });
     expect(observed).toEqual([{ targetKind: "reaction", targetId: "review", expectedRevision: 2 }]);
+  });
+  it("observes existing protected items when creating a zone while allowing items from the same transaction", () => {
+    const snapshot = board();
+    const region = { ...regionAroundItems([], [0, 0]), protectedItemIds: ["goal", "new-item"] };
+    const item = { ...createBoardItem("note", [0, 0]), id: "new-item" };
+    expect(preconditionsForOperations(snapshot, [{ kind: "createItem", item }, { kind: "createRegion", region }])).toEqual([{ targetKind: "item", targetId: "goal", expectedRevision: 2 }]);
+  });
+  it("observes changed zone membership without requiring unrelated items for a title edit", () => {
+    const snapshot = board();
+    snapshot.regions = [{ ...regionAroundItems([], [0, 0]), id: "zone", revision: 5, ownerActor: "agent:planner", protectedItemIds: ["goal"] }];
+    expect(preconditionsForOperations(snapshot, [{ kind: "updateRegion", regionId: "zone", patch: { protectedItemIds: ["worker"] } }])).toEqual([{ targetKind: "region", targetId: "zone", expectedRevision: 5 }, { targetKind: "item", targetId: "goal", expectedRevision: 2 }, { targetKind: "item", targetId: "worker", expectedRevision: 2 }]);
+    expect(preconditionsForOperations(snapshot, [{ kind: "updateRegion", regionId: "zone", patch: { title: "Revised plan" } }])).toEqual([{ targetKind: "region", targetId: "zone", expectedRevision: 5 }]);
+    expect(preconditionsForOperations(snapshot, [{ kind: "updateRegion", regionId: "zone", patch: { protectedItemIds: [] } }])).toEqual([{ targetKind: "region", targetId: "zone", expectedRevision: 5 }, { targetKind: "item", targetId: "goal", expectedRevision: 2 }]);
+  });
+  it("resizes each zone edge without moving its opposite anchor", () => {
+    const original = { x: 100, y: 200, width: 400, height: 300, rotation: 0 };
+    expect(resizedRegion(original, "south-east", [60, 40])).toEqual({ ...original, width: 460, height: 340 });
+    expect(resizedRegion(original, "north-west", [60, 40])).toEqual({ x: 160, y: 240, width: 340, height: 260, rotation: 0 });
+    expect(resizedRegion(original, "west", [-50, 80])).toEqual({ ...original, x: 50, width: 450 });
+    expect(resizedRegion(original, "north", [80, -50])).toEqual({ ...original, y: 150, height: 350 });
+    expect(resizedRegion(original, "north-west", [1000, 1000])).toEqual({ x: 460, y: 460, width: 40, height: 40, rotation: 0 });
+    expect(resizedRegion(original, "south-east", [200000, 200000])).toEqual({ ...original, width: 100000, height: 100000 });
+    expect(resizedRegion(original, "south-west", [-50, 30])).toEqual({ ...original, x: 50, width: 450, height: 330 });
+    expect(resizedRegion(original, "north-east", [50, 30])).toEqual({ ...original, y: 230, width: 450, height: 270 });
+    expect(resizedRegion(original, "east", [50, 30])).toEqual({ ...original, width: 450 });
+    expect(resizedRegion(original, "south", [50, 30])).toEqual({ ...original, height: 330 });
+  });
+  it("includes empty zones and rotated items when fitting the board", () => {
+    const region = { ...regionAroundItems([], [-100, -200]), revision: 1, ownerActor: "agent:planner" as const };
+    expect(boardContentBounds({ items: [], regions: [region] })).toEqual({ x: -100, y: -200, width: 600, height: 400 });
+    const item = { ...note("rotated"), geometry: { x: 600, y: 100, width: 100, height: 200, rotation: 90 } };
+    expect(boardContentBounds({ items: [item], regions: [region] })).toEqual({ x: -100, y: -200, width: 850, height: 450 });
+    expect(boardContentBounds({ items: [], regions: [] })).toBeUndefined();
+  });
+  it("preserves small zone dimensions on untouched axes and unchanged gestures", () => {
+    const small = { x: 10, y: 20, width: 12, height: 8, rotation: 0 };
+    expect(resizedRegion(small, "east", [50, 70])).toEqual({ ...small, width: 62 });
+    expect(resizedRegion(small, "south", [50, 70])).toEqual({ ...small, height: 78 });
+    expect(resizedRegion(small, "south-east", [0, 0])).toEqual(small);
   });
 });

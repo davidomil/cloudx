@@ -316,7 +316,7 @@ test("full workspace assigns both providers, keeps the panel, updates remote bad
     .toBe("closed");
   await expect(
     panel.getByText(
-      "This board is closed. Your saved work and original images remain available.",
+      "This board is closed. Your saved work and original files remain available.",
       { exact: true },
     ),
   ).toBeVisible();

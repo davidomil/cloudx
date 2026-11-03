@@ -41,4 +41,14 @@ describe("coworker note drafts", () => {
     await act(async () => container.querySelector<HTMLFormElement>("form")!.requestSubmit());
     expect(onOperations).toHaveBeenCalledWith([{ kind: "updateItem", itemId: "note", patch: { geometry: { x: 1, y: 2, width: 300, height: 180, rotation: 0 }, content: { title: "Decision: receipt only", blocks: [{ id: "body", revision: 1, text: "Current text" }] } } }]);
   });
+  it("edits a link URL and description through the existing revision checked save", async () => {
+    const scene = board();
+    scene.items = [{ ...scene.items[0]!, kind: "link", content: { title: "Specification", url: "https://example.com/old", description: "Old section" } }];
+    const onOperations = vi.fn(async () => true);
+    const container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+    await act(async () => root.render(createElement(BoardInspector, { board: scene, selection: { kind: "item", id: "note" }, drafts: new Map(), readOnly: false, busy: false, onOperations, onFeedback: vi.fn(), onDirty: vi.fn() })));
+    await change(container.querySelector<HTMLInputElement>('[aria-label="Link URL"]')!, "https://example.com/new");
+    await act(async () => container.querySelector<HTMLFormElement>("form")!.requestSubmit());
+    expect(onOperations).toHaveBeenCalledWith([{ kind: "updateItem", itemId: "note", patch: { geometry: scene.items[0]!.geometry, content: { title: "Specification", url: "https://example.com/new", description: "Old section" } } }]);
+  });
 });

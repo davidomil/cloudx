@@ -1,5 +1,5 @@
 import {
-  COOPERATION_BOARD_SCHEMA, COOPERATION_LIMITS, COOPERATION_GEOMETRY_EPSILON, connectionLabelBounds, connectionPolyline, cooperationAnchorMatches, isCooperationId, itemBounds, parseCooperationBoard,
+  COOPERATION_BOARD_SCHEMA, COOPERATION_LIMITS, COOPERATION_GEOMETRY_EPSILON, connectionLabelBounds, connectionPolyline, cooperationAnchorMatches, isCooperationFileName, isCooperationId, isCooperationLinkUrl, itemBounds, parseCooperationBoard,
   type CooperationBoard, type CooperationItem, type CooperationTarget, type CooperationTransaction
 } from "@cloudx/shared";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -23,7 +23,7 @@ export function validateBoard(board: CooperationBoard): void {
       bounds.x + bounds.width <= COOPERATION_LIMITS.coordinate + COOPERATION_GEOMETRY_EPSILON && bounds.y + bounds.height <= COOPERATION_LIMITS.coordinate + COOPERATION_GEOMETRY_EPSILON,
     "INVALID_REQUEST", `Item ${item.id} exceeds the rendered world boundary.`);
     if (item.kind === "note" || item.kind === "code") for (const block of item.content.blocks) unique(block.id);
-    if (item.kind === "image") requireCooperation(board.assets.some(asset => asset.id === item.content.assetId), "ASSET_INVALID", "Image items require a committed original asset.");
+    validateItemContent(board, item);
     if (item.kind === "drawing") for (const stroke of item.content.strokes) {
       unique(stroke.id);
       points += stroke.points.length;
@@ -62,18 +62,31 @@ export function validateBoard(board: CooperationBoard): void {
     validateTarget(board, thread.target);
     if (thread.questionReactionId) requireCooperation(board.reactions.some(reaction => reaction.id === thread.questionReactionId && reaction.threadId === thread.id), "TARGET_STALE", "The thread question no longer exists.");
   }
-  let imageBytes = 0;
+  let assetBytes = 0;
   for (const asset of board.assets) {
     unique(asset.id);
-    imageBytes += asset.byteLength;
-    requireCooperation(asset.width * asset.height <= COOPERATION_LIMITS.imagePixels, "ASSET_INVALID", "The original image exceeds the pixel budget.");
-    const extension = asset.mime === "image/jpeg" ? "jpg" : asset.mime.slice(6);
-    requireCooperation(asset.relativePath === `assets/${asset.id}.${extension}`, "ASSET_INVALID", "The original image path must match its managed identity.");
+    assetBytes += asset.byteLength;
+    if (asset.kind === "file") {
+      requireCooperation(isCooperationFileName(asset.name), "ASSET_INVALID", "Use a bounded original file name without directories or control characters.");
+      requireCooperation(asset.relativePath === `assets/${asset.id}.bin`, "ASSET_INVALID", "The original file path must match its managed identity.");
+    } else {
+      requireCooperation(asset.width * asset.height <= COOPERATION_LIMITS.imagePixels, "ASSET_INVALID", "The original image exceeds the pixel budget.");
+      const extension = asset.mime === "image/jpeg" ? "jpg" : asset.mime.slice(6);
+      requireCooperation(asset.relativePath === `assets/${asset.id}.${extension}`, "ASSET_INVALID", "The original image path must match its managed identity.");
+    }
   }
-  requireCooperation(imageBytes <= COOPERATION_LIMITS.boardImageBytes, "LIMIT_EXCEEDED", "The board exceeds its original image byte budget.");
+  requireCooperation(assetBytes <= COOPERATION_LIMITS.boardAssetBytes, "LIMIT_EXCEEDED", "The board exceeds its original asset byte budget.");
   const members = new Set(board.members.map(member => member.tabId));
   requireCooperation(members.size === board.members.length && board.members.length <= 64, "INVALID_REQUEST", "Board members must be unique and bounded.");
   requireCooperation(board.members.filter(member => member.role === "responder").length <= 1, "INVALID_REQUEST", "A board has one selected responder.");
+}
+
+function validateItemContent(board: CooperationBoard, item: CooperationItem): void {
+  if (item.kind === "image" || item.kind === "file") {
+    const asset = board.assets.find(asset => asset.id === item.content.assetId);
+    requireCooperation(asset && (asset.kind === "file") === (item.kind === "file"), "ASSET_INVALID", "Image and file items require a committed original of the same kind.");
+  }
+  if (item.kind === "link") requireCooperation(isCooperationLinkUrl(item.content.url), "INVALID_REQUEST", "Use an absolute HTTP(S) link without credentials, whitespace or control characters.");
 }
 
 export function targetRecord(board: CooperationBoard, target: CooperationTarget) {
@@ -91,9 +104,7 @@ export function validateTarget(board: CooperationBoard, target: CooperationTarge
   if (target.snapshot) {
     requireCooperation(!live && target.snapshot.record.id === target.id && target.snapshot.removedAtBoardRevision <= board.revision,
       "TARGET_STALE", "Deleted evidence must match its target and board revision.");
-    if (target.kind === "item" && "kind" in target.snapshot.record && target.snapshot.record.kind === "image") {
-      requireCooperation(board.assets.some(asset => asset.id === (target.snapshot!.record as Extract<CooperationItem, { kind: "image" }>).content.assetId), "ASSET_INVALID", "Deleted image evidence requires its original bytes.");
-    }
+    if (target.kind === "item") validateItemContent(board, target.snapshot.record as CooperationItem);
   }
   if (!target.anchor) return;
   requireCooperation(target.kind === "item", "INVALID_REQUEST", "Selected text can anchor only to a note or code item.");
@@ -127,7 +138,7 @@ function inputRecord(name: string, removed: string[]): JsonSchema {
 function operationSchema(kind: string, fields: JsonSchema, required = Object.keys(fields)): JsonSchema {
   return { type: "object", additionalProperties: false, properties: { kind: { const: kind }, ...fields }, required: ["kind", ...required] };
 }
-const itemInputSchema = { oneOf: ["noteItem", "codeItem", "imageItem", "shapeItem", "drawingItem"].map(name => inputRecord(name, ["revision", "createdBy", "updatedBy"])) };
+const itemInputSchema = { oneOf: ["noteItem", "codeItem", "imageItem", "fileItem", "linkItem", "shapeItem", "drawingItem"].map(name => inputRecord(name, ["revision", "createdBy", "updatedBy"])) };
 const patchSchema = (properties: JsonSchema): JsonSchema => ({ type: "object", additionalProperties: false, minProperties: 1, properties });
 const idRef = ref("id");
 const recipientRef = { anyOf: [idRef, { type: "null" }] };
@@ -140,7 +151,7 @@ const validateTransactionSchema = new Ajv2020({ allErrors: true, strict: false }
     respondsToEventIds: { type: "array", maxItems: 32, uniqueItems: true, items: idRef },
     operations: { type: "array", minItems: 1, maxItems: COOPERATION_LIMITS.operations, items: { oneOf: [
       operationSchema("createItem", { item: itemInputSchema }),
-      operationSchema("updateItem", { itemId: idRef, patch: patchSchema({ geometry: ref("geometry"), content: { oneOf: ["noteContent", "codeContent", "imageContent", "shapeContent", "drawingContent"].map(ref) } }) }),
+      operationSchema("updateItem", { itemId: idRef, patch: patchSchema({ geometry: ref("geometry"), content: { oneOf: ["noteContent", "codeContent", "imageContent", "fileContent", "linkContent", "shapeContent", "drawingContent"].map(ref) } }) }),
       operationSchema("deleteItem", { itemId: idRef }),
       operationSchema("createConnection", { connection: inputRecord("connection", ["revision", "createdBy", "updatedBy"]) }),
       operationSchema("updateConnection", { connectionId: idRef, patch: patchSchema(Object.fromEntries(Object.entries(definitions.connection.properties as JsonSchema).filter(([key]) => ["from", "to", "direction", "description", "waypoints"].includes(key)))) }),
@@ -155,7 +166,7 @@ const validateTransactionSchema = new Ajv2020({ allErrors: true, strict: false }
       operationSchema("appendThreadMessage", { threadId: idRef, message: inputRecord("threadMessage", ["author"]), requestResponse: { type: "boolean" }, recipientTabId: recipientRef }, ["threadId", "message"]),
       operationSchema("resolveThread", { threadId: idRef, resolved: { type: "boolean" } }, ["threadId"]),
       operationSchema("reattachTarget", { targetKind: { enum: ["reaction", "thread"] }, targetId: idRef, target: ref("target") }),
-      operationSchema("attachAsset", { stagedToken: idRef, item: inputRecord("imageItem", ["revision", "createdBy", "updatedBy"]) }),
+      operationSchema("attachAsset", { stagedToken: idRef, item: { oneOf: ["imageItem", "fileItem"].map(name => inputRecord(name, ["revision", "createdBy", "updatedBy"])) } }),
       operationSchema("undoOwnOperation", { operationId: idRef })
     ] } }
   }, required: ["schemaVersion", "operationId", "boardId", "expectedBoardRevision", "preconditions", "operations", "respondsToEventIds"]

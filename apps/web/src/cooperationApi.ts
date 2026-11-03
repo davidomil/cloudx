@@ -69,14 +69,14 @@ export const cooperationAssetUrl = (boardId: string, assetId: string) => `${boar
 export const getCooperationEvents = (boardId: string, after = 0) => requestJson<CooperationEvent[]>(`${boardPath(boardId)}/events?after=${after}`);
 export const getCooperationInbox = (boardId: string) => requestJson<CooperationInboxEvent[]>(`${boardPath(boardId)}/inbox`);
 
-export async function stageCooperationImage(boardId: string, file: File): Promise<CooperationStagedAsset> {
+export async function stageCooperationAsset(boardId: string, file: File): Promise<CooperationStagedAsset> {
   const base64 = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(",", 2)[1]!);
-    reader.onerror = () => reject(new Error("Could not read the image. Your image draft is still here."));
+    reader.onerror = () => reject(new Error("Could not read the file. Your file draft is still here."));
     reader.readAsDataURL(file);
   });
-  return requestJson<CooperationStagedAsset>(`${boardPath(boardId)}/assets`, { method: "POST", body: JSON.stringify({ mime: file.type, base64 }) });
+  return requestJson<CooperationStagedAsset>(`${boardPath(boardId)}/assets`, { method: "POST", body: JSON.stringify({ mime: file.type || "application/octet-stream", base64, name: file.name || "Pasted image" }) });
 }
 
 export function subscribeCooperationBoard(boardId: string, handlers: {
@@ -116,6 +116,8 @@ export function downloadCooperationDocument(board: CooperationBoard): void {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
+export const cooperationTextExportUrl = (boardId: string) => `${boardPath(boardId)}/export?format=markdown`;
+
 export interface CooperationAgentStatus {
   tabId: string; state: "queued" | "nativeAccepted" | "unknown" | "unavailable"; reason?: string; providerTurnId?: string;
   currentTurn?: { providerTurnId: string; status: "running" | "completed" | "failed" | "interrupted" };
@@ -130,9 +132,9 @@ export async function getCooperationReceipt(boardId: string, operationId: string
   if (receipt === null) return null;
   return parseReceipt(receipt, boardId, operationId);
 }
-export const discardCooperationImageStage = (boardId: string, token: string) => requestJson<{ discarded: true }>(`${boardPath(boardId)}/staged-assets/${encodeURIComponent(token)}`, { method: "DELETE" });
-export async function discardRetiredCooperationImageStage(boardId: string, token: string, operationId?: string) {
-  try { await discardCooperationImageStage(boardId, token); }
+export const discardCooperationAssetStage = (boardId: string, token: string) => requestJson<{ discarded: true }>(`${boardPath(boardId)}/staged-assets/${encodeURIComponent(token)}`, { method: "DELETE" });
+export async function discardRetiredCooperationAssetStage(boardId: string, token: string, operationId?: string) {
+  try { await discardCooperationAssetStage(boardId, token); }
   catch (cause) {
     if (cause instanceof CooperationSaveError && cause.code === "ASSET_INVALID" && operationId && await getCooperationReceipt(boardId, operationId)) return;
     throw cause;

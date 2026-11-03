@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { isAgentTab, isRecord, type CooperationAsset, type CooperationCaller, type CooperationProvider, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
+import { COOPERATION_LIMITS, isAgentTab, isRecord, type CooperationAsset, type CooperationCaller, type CooperationProvider, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { writeTextFileAtomic } from "../jsonStateFile.js";
 
@@ -26,6 +26,8 @@ export interface CooperationAgentLocator extends CooperationAgentBinding {
   assetRoot: string;
   caPath?: string;
 }
+
+export type CooperationAgentRequest = Pick<CooperationAgentLocator, "tabId" | "boardId" | "assignmentGeneration" | "capability">;
 
 export interface AgentCooperationContextOptions {
   dataDir: string;
@@ -127,49 +129,65 @@ export class AgentCooperationContext {
     };
   }
 
-  async revoke(tabId: string): Promise<void> {
-    await this.queue;
-    await fs.rm(this.contextPath(tabId), { force: true });
-    await fs.rm(`${this.contextPath(tabId)}.native`, { recursive: true, force: true });
-    await fs.rm(`${this.contextPath(tabId)}.assets`, { recursive: true, force: true });
+  revoke(tabId: string): Promise<void> {
+    const task = this.queue.then(async () => {
+      await fs.rm(this.contextPath(tabId), { force: true });
+      await fs.rm(`${this.contextPath(tabId)}.native`, { recursive: true, force: true });
+      await fs.rm(`${this.contextPath(tabId)}.assets`, { recursive: true, force: true });
+    });
+    this.queue = task.catch(() => undefined);
+    return task;
   }
 
-  async materializeAsset(tabId: string, generation: number, original: { asset: CooperationAsset; localPath: string }): Promise<{ asset: CooperationAsset; localPath: string }> {
-    const context = await this.prepare(tabId);
-    if (context.assignmentGeneration !== generation || !context.boardId)
-      throw Object.assign(new Error("The blackboard assignment changed before image access."), { code: "ASSIGNMENT_CHANGED", statusCode: 409 });
-    if (!/^[a-f0-9]{64}$/.test(original.asset.sha256) || !["image/png", "image/jpeg", "image/webp"].includes(original.asset.mime))
-      throw new Error("The original board image metadata is invalid.");
-    const source = await fs.open(original.localPath, constants.O_RDONLY | constants.O_NOFOLLOW);
-    let bytes: Buffer;
-    try {
-      const stat = await source.stat();
-      if (!stat.isFile() || stat.size !== original.asset.byteLength || stat.size > 10 * 1024 * 1024) throw new Error("The original board image is invalid.");
-      bytes = await source.readFile();
-    } finally { await source.close(); }
-    if (createHash("sha256").update(bytes).digest("hex") !== original.asset.sha256) throw new Error("The original board image hash changed.");
-    const extension = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[original.asset.mime];
-    const localPath = path.join(context.assetRoot, `${original.asset.sha256}.${extension}`);
-    let target;
-    try {
-      target = await fs.open(localPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o400);
-      await target.writeFile(bytes);
-      await target.sync();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const cached = await fs.open(localPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  materializeAsset(request: CooperationAgentRequest, original: { asset: CooperationAsset; localPath: string }): Promise<{ asset: CooperationAsset; localPath: string }> {
+    const task = this.queue.then(async () => {
+      await this.authenticate(request);
+      const context = await this.readLocator(request.tabId);
+      if (!context?.boardId) throw new Error("The original file context is unavailable.");
+      const { asset } = original;
+      if (!/^[a-f0-9]{64}$/.test(asset.sha256) || asset.kind !== "file" && !["image/png", "image/jpeg", "image/webp"].includes(asset.mime))
+        throw new Error("The original board file metadata is invalid.");
+      const maxBytes = asset.kind === "file" ? COOPERATION_LIMITS.fileBytes : COOPERATION_LIMITS.imageBytes;
+      const bytes = await readOriginal(original.localPath, asset.byteLength, maxBytes, "The original board file is invalid.");
+      if (createHash("sha256").update(bytes).digest("hex") !== asset.sha256) throw new Error("The original board file hash changed.");
+      const fileExtension = asset.kind === "file" ? path.extname(asset.name).slice(1) : "";
+      const extension = asset.kind === "file" ? (/^[a-z0-9]{1,12}$/i.test(fileExtension) ? fileExtension : "bin")
+        : { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" }[asset.mime];
+      const assetRoot = `${this.contextPath(request.tabId)}.assets`;
+      if (context.assetRoot !== assetRoot) throw new Error("The original file cache is outside this tab's managed directory.");
+      const directory = await fs.open(assetRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try {
-        const stat = await cached.stat();
-        if (!stat.isFile() || stat.size !== bytes.length || createHash("sha256").update(await cached.readFile()).digest("hex") !== original.asset.sha256)
-          throw new Error("The per-tab original image copy was modified.");
-      } finally { await cached.close(); }
-    } finally { await target?.close(); }
-    const current = await this.options.binding(tabId);
-    if (!current || leaseIdentity(current) !== leaseIdentity(context)) {
-      await fs.rm(localPath, { force: true });
-      throw Object.assign(new Error("The blackboard assignment changed during image access."), { code: "ASSIGNMENT_CHANGED", statusCode: 409 });
-    }
-    return { asset: original.asset, localPath };
+        const directoryStat = await directory.stat();
+        if (!directoryStat.isDirectory() || directoryStat.mode & 0o077) throw new Error("Original files require a private cache directory.");
+        const name = `${asset.sha256}.${extension}`;
+        const localPath = path.join(assetRoot, name);
+        const managedPath = `/proc/self/fd/${directory.fd}/${name}`;
+        let created = false;
+        try {
+          let target;
+          try {
+            target = await fs.open(managedPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o400);
+            created = true;
+            await target.writeFile(bytes);
+            await target.sync();
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            const cached = await readOriginal(managedPath, bytes.length, maxBytes, "The per-tab original file copy was modified.");
+            if (createHash("sha256").update(cached).digest("hex") !== asset.sha256) throw new Error("The per-tab original file copy was modified.");
+          } finally { await target?.close(); }
+          await this.authenticate(request);
+          const current = await fs.lstat(assetRoot);
+          if (!current.isDirectory() || current.mode & 0o077 || current.dev !== directoryStat.dev || current.ino !== directoryStat.ino)
+            throw new Error("The original file cache directory changed during access.");
+          return { asset, localPath };
+        } catch (error) {
+          if (created) await fs.rm(managedPath, { force: true });
+          throw error;
+        }
+      } finally { await directory.close(); }
+    });
+    this.queue = task.catch(() => undefined);
+    return task;
   }
 
   private async readLocator(tabId: string): Promise<CooperationAgentLocator | undefined> {
@@ -192,6 +210,23 @@ export class AgentCooperationContext {
 }
 
 export const COOPERATION_HELPER_PATH = fileURLToPath(new URL("../../helpers/cooperation-helper.mjs", import.meta.url));
+
+async function readOriginal(filePath: string, expectedBytes: number, maxBytes: number, message: string): Promise<Buffer> {
+  const handle = await fs.open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size !== expectedBytes || stat.size > maxBytes) throw new Error(message);
+    const bytes = Buffer.alloc(expectedBytes + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, offset);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    if (offset !== expectedBytes) throw new Error(message);
+    return bytes.subarray(0, offset);
+  } finally { await handle.close(); }
+}
 
 export function nativeReceiptPath(contextPath: string, binding: Pick<CooperationAgentBinding, "providerId" | "executionId">): string {
   if (!["codex", "claude"].includes(binding.providerId ?? "") || typeof binding.executionId !== "string" || !binding.executionId || binding.executionId.length > 512)

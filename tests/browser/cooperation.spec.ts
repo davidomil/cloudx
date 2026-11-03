@@ -1732,13 +1732,11 @@ test("real view retirement releases uncommitted image stages and preserves origi
       ).stagedAssets as Record<string, { boardId: string }>,
     ).filter((stage) => stage.boardId === boardId).length;
   const upload = async () =>
-    page
-      .locator('.cooperation-board:visible input[type="file"]')
-      .setInputFiles({
-        name: "retired.png",
-        mimeType: "image/png",
-        buffer: original,
-      });
+    page.getByLabel("Choose board images", { exact: true }).setInputFiles({
+      name: "retired.png",
+      mimeType: "image/png",
+      buffer: original,
+    });
   const failedId = await create(page, "Retired image");
   await page.route(
     `**/api/cooperation/boards/${failedId}/transactions`,
@@ -1754,7 +1752,7 @@ test("real view retirement releases uncommitted image stages and preserves origi
   await upload();
   await expect(
     page.getByText(
-      "Image not saved. Your original file remains in this local draft.",
+      "File not saved. Your original file remains in this local draft.",
       { exact: true },
     ),
   ).toBeVisible();
@@ -1779,7 +1777,7 @@ test("real view retirement releases uncommitted image stages and preserves origi
   await upload();
   await expect(
     page.getByText(
-      "Image not saved. Your original file remains in this local draft.",
+      "File not saved. Your original file remains in this local draft.",
       { exact: true },
     ),
   ).toBeVisible();

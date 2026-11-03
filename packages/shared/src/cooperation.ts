@@ -9,7 +9,7 @@ export const COOPERATION_LIMITS = {
   transactionBytes: 256 * 1024, operations: 100, events: 4096,
   items: 2000, connections: 4000, regions: 200, reactions: 8000, threads: 4000, assets: 512,
   drawingPoints: 200000, imageBytes: 10 * 1024 * 1024, imagePixels: 40000000,
-  boardImageBytes: 256 * 1024 * 1024, coordinate: 1000000
+  fileBytes: 32 * 1024 * 1024, boardAssetBytes: 256 * 1024 * 1024, coordinate: 1000000
 } as const;
 
 export type CooperationActor = `user:${string}` | `agent:${string}`;
@@ -22,6 +22,8 @@ export interface CooperationItemContent {
   note: { title: string; blocks: CooperationBlock[] };
   code: { title: string; language: string; blocks: CooperationBlock[] };
   image: { title: string; assetId: string; alt: string };
+  file: { title: string; assetId: string; description: string };
+  link: { title: string; url: string; description: string };
   shape: { title: string; shape: "rectangle" | "diamond" | "ellipse" | "cylinder"; label: string };
   drawing: { title: string; description: string; strokes: CooperationStroke[] };
 }
@@ -64,10 +66,15 @@ export interface CooperationThread {
   id: string; revision: number; target: CooperationTarget; questionReactionId?: string;
   status: "open" | "answered" | "resolved"; messages: CooperationThreadMessage[];
 }
-export interface CooperationAsset {
+export interface CooperationImageAsset {
+  kind?: never;
   id: string; mime: "image/png" | "image/jpeg" | "image/webp"; sha256: string;
   byteLength: number; width: number; height: number; relativePath: string;
 }
+export interface CooperationFileAsset {
+  kind: "file"; id: string; name: string; mime: string; sha256: string; byteLength: number; relativePath: string;
+}
+export type CooperationAsset = CooperationImageAsset | CooperationFileAsset;
 export interface CooperationMember {
   tabId: string; providerId: CooperationProvider; label: string; assignmentGeneration: number; role: "responder" | "observer";
 }
@@ -102,7 +109,7 @@ export type CooperationOperation =
   | { kind: "appendThreadMessage"; threadId: string; message: Omit<CooperationThreadMessage, "author">; requestResponse?: boolean; recipientTabId?: string | null }
   | { kind: "resolveThread"; threadId: string; resolved?: boolean }
   | { kind: "reattachTarget"; targetKind: "reaction" | "thread"; targetId: string; target: CooperationTarget }
-  | { kind: "attachAsset"; stagedToken: string; item: Extract<CooperationItemInput, { kind: "image" }> }
+  | { kind: "attachAsset"; stagedToken: string; item: Extract<CooperationItemInput, { kind: "image" | "file" }> }
   | { kind: "undoOwnOperation"; operationId: string };
 export interface CooperationTransaction {
   schemaVersion: 1; operationId: string; boardId: string; expectedBoardRevision: number;
@@ -151,6 +158,18 @@ export interface CooperationFailure { code: CooperationErrorCode; message: strin
 
 export function isCooperationId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+export function isCooperationLinkUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 4096 || !/^https?:\/\//i.test(value) || /[\s\\\u0000-\u001f\u007f-\u009f]/u.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return ["http:", "https:"].includes(url.protocol) && Boolean(url.hostname) && !url.username && !url.password;
+  } catch { return false; }
+}
+
+export function isCooperationFileName(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0 && Array.from(value).length <= 200 && value !== "." && value !== ".." && !/[/\\\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value);
 }
 
 let cachedBoardValidator: ValidateFunction | undefined;
