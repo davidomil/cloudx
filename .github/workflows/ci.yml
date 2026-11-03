@@ -113,18 +113,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/lifecycle-install"
           printf '{"scenario":"install","sourceSha":"%s","targetSha":"%s","result":"setup-started"}\n' "$SOURCE_SHA" "$TARGET_SHA" > "$RUNNER_TEMP/lifecycle-install/request.json"
           printf 'PLAYWRIGHT_BROWSERS_PATH=%s/cloudx-lifecycle-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Free unused runner SDKs for lifecycle staging
-        id: lifecycle-space
-        timeout-minutes: 5
-        run: |
-          df -B1 / > "$RUNNER_TEMP/lifecycle-install/disk-space-before.txt"
-          sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
-          df -B1 / > "$RUNNER_TEMP/lifecycle-install/disk-space-after.txt"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.lifecycle-revisions.outputs.target-sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Free unused runner SDKs for lifecycle staging
+        id: lifecycle-space
+        timeout-minutes: 5
+        run: |
+          df -B1 / > "$RUNNER_TEMP/lifecycle-install/disk-space-before.txt"
+          bash scripts/ci/prepare-verifier-disk.sh
+          df -B1 / > "$RUNNER_TEMP/lifecycle-install/disk-space-after.txt"
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 22.23.1
@@ -156,18 +156,18 @@ jobs:
           mkdir -p "$RUNNER_TEMP/lifecycle-upgrade"
           printf '{"scenario":"upgrade","sourceSha":"%s","targetSha":"%s","result":"setup-started"}\n' "$SOURCE_SHA" "$TARGET_SHA" > "$RUNNER_TEMP/lifecycle-upgrade/request.json"
           printf 'PLAYWRIGHT_BROWSERS_PATH=%s/cloudx-lifecycle-browsers\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-      - name: Free unused runner SDKs for lifecycle staging
-        id: lifecycle-space
-        timeout-minutes: 5
-        run: |
-          df -B1 / > "$RUNNER_TEMP/lifecycle-upgrade/disk-space-before.txt"
-          sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
-          df -B1 / > "$RUNNER_TEMP/lifecycle-upgrade/disk-space-after.txt"
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
           ref: ${{ needs.lifecycle-revisions.outputs.target-sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Free unused runner SDKs for lifecycle staging
+        id: lifecycle-space
+        timeout-minutes: 5
+        run: |
+          df -B1 / > "$RUNNER_TEMP/lifecycle-upgrade/disk-space-before.txt"
+          bash scripts/ci/prepare-verifier-disk.sh
+          df -B1 / > "$RUNNER_TEMP/lifecycle-upgrade/disk-space-after.txt"
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: 22.23.1
