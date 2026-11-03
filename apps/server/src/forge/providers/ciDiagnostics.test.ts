@@ -758,6 +758,33 @@ describe("GitHub shared failed producers in the pinned CloudX workflow", () => {
     expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/522/logs"))).toHaveLength(1);
   });
 
+  it("replaces an older browser failure with the third head's coverage producer while downstream gates fail", async () => {
+    const historical = await productionAggregateFixture().provider.getCiFailure(change);
+    expect(historical.jobs.map(job => job.name)).toEqual(["Isolated verifier (browser-2)"]);
+    const thirdHead = "f".repeat(40);
+    const jobs = productionJobs.map(job => ({ ...job,
+      conclusion: job.name === "Isolated verifier (browser-2)" ? "success" :
+        job.name === "Isolated verifier (coverage-4)" ? "failure" : job.conclusion,
+    }));
+    const original = productionAggregateFixture({ jobs,
+      logs: Object.fromEntries(jobs.map(job => [job.id, job.name === "Isolated verifier (coverage-4)"
+        ? `${checkout}AssertionError: WorkspaceCleanupService.test.ts:443 surviving-thread cleanup eligibility\n`
+        : "Process completed with exit code 1.\n"])),
+    });
+    const fixture = harness(github, async (url, init) => {
+      const response = await original.fetcher(url, init);
+      return new Response((await response.text()).replaceAll(source, thirdHead), { status: response.status, headers: response.headers });
+    });
+    const diagnostic = await fixture.provider.getCiFailure({ ...change, headSha: thirdHead });
+    expect(diagnostic).toMatchObject({ state: "actionable", sourceHeadSha: thirdHead, targetHeadSha: target, testedSha: tested,
+      jobs: [{ name: "Isolated verifier (coverage-4)", jobId: "517", runId: "100", runAttempt: 2,
+        classification: "code", log: expect.stringContaining("WorkspaceCleanupService.test.ts:443"),
+        requiredGate: { name: "CI aggregate" } }] });
+    expect(diagnostic.jobs).toHaveLength(1);
+    expect(diagnostic.failureKey).not.toBe(historical.failureKey);
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/522/logs"))).toBe(false);
+  });
+
   it("rejects actual cycles between failed gates", async () => {
     const workflow = pinnedWorkflow.replace("needs:\n      - isolated-lanes", "needs:\n      - aggregate");
     expect(await productionAggregateFixture({ workflow }).provider.getCiFailure(change))

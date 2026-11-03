@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Check, ExternalLink, Plus, Unplug } from "lucide-react";
 import type { CooperationBoardSummary, WorkspaceTab } from "@cloudx/shared";
-import { assignCooperationBoard, createCooperationBoard, type CooperationTemplate } from "../../cooperationApi.js";
+import { assignCooperationBoard, createCooperationBoard } from "../../cooperationApi.js";
 import { useCooperationBoards } from "./cooperationBoards.js";
 
 export function BlackboardAssignment({ tab, onOpenBoard, onClose }: { tab: WorkspaceTab; onOpenBoard: (boardId: string, title: string) => void; onClose: () => void }) {
@@ -9,7 +9,6 @@ export function BlackboardAssignment({ tab, onOpenBoard, onClose }: { tab: Works
   const [search, setSearch] = useState("");
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState("New blackboard");
-  const [template, setTemplate] = useState<CooperationTemplate>("blank");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const current = boards.find(board => board.members.some(member => member.tabId === tab.id));
@@ -26,7 +25,7 @@ export function BlackboardAssignment({ tab, onOpenBoard, onClose }: { tab: Works
     if (!title.trim()) return;
     setBusy(true); setError(undefined);
     try {
-      const board = await createCooperationBoard(title.trim(), template, tab.id);
+      const board = await createCooperationBoard(title.trim(), tab.id);
       onOpenBoard(board.boardId, board.title); onClose();
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
@@ -44,7 +43,6 @@ export function BlackboardAssignment({ tab, onOpenBoard, onClose }: { tab: Works
     {!loading && !boards.filter(board => board.title.toLocaleLowerCase().includes(search.toLocaleLowerCase())).length ? <p className="agent-switch-hint">No matching blackboards.</p> : null}
     {creating ? <form className="cooperation-assignment-create" onSubmit={event => { event.preventDefault(); void create(); }}>
       <label>Blackboard name<input value={title} maxLength={240} onChange={event => setTitle(event.target.value)} autoFocus /></label>
-      <label>Template<select aria-label="Template" value={template} onChange={event => setTemplate(event.target.value as CooperationTemplate)}><option value="blank">Blank canvas</option><option value="system-design">System design</option><option value="decision-review">Decision review</option><option value="sketch-wip">Sketch and work in progress</option></select></label>
       <button type="submit" role="menuitem" disabled={busy || !title.trim()}><Plus size={14} />Create and assign blackboard</button>
       <button type="button" role="menuitem" onClick={() => setCreating(false)}>Cancel creation</button>
     </form> : <button type="button" role="menuitem" disabled={busy} onClick={() => setCreating(true)}><Plus size={14} />Create and assign</button>}

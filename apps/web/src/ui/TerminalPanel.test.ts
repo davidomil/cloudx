@@ -185,6 +185,26 @@ describe("TerminalPanel", () => {
     vi.useRealTimers();
   });
 
+  it("inspects healthy native work from the compact terminal control without restarting or replacing the terminal", async () => {
+    const healthy: WorkspaceTab = { ...tab, pluginId: "codex-terminal", nativeWork: { version: 1, tabId: tab.id, executionId: "healthy-execution", threadId: "healthy-thread", updatedAt: tab.updatedAt, turnStatus: "running", goalStatus: "active" } };
+    const onRecover = vi.fn();
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: healthy, active: true, uiScale: 1, onRecover })));
+    const terminal = terminalPanelMocks.terminals[0];
+    const socket = TestWebSocket.latest;
+    expect(host!.querySelector(".codex-native-work")).toBeNull();
+    const button = host!.querySelector<HTMLButtonElement>('[aria-label="Open native work details for Shell"]')!;
+    expect(button.closest(".terminal-input-help")).not.toBeNull();
+    await act(async () => button.click());
+    expect(host!.querySelector(".codex-native-work")?.textContent).toContain("Native turn: Running");
+    expect(terminalPanelMocks.terminals).toEqual([terminal]);
+    expect(TestWebSocket.latest).toBe(socket);
+    const close = [...host!.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "Close native work details")!;
+    await act(async () => close.click());
+    expect(host!.querySelector(".codex-native-work")).toBeNull();
+    expect(terminal.disposed).toBe(false);
+    expect(onRecover).not.toHaveBeenCalled();
+  });
+
   it("releases DOM-bound mobile scroll handlers when a cached terminal panel unmounts", () => {
     act(() => {
       root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 }));

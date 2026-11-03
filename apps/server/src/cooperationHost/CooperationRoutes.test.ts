@@ -108,6 +108,22 @@ async function expectOriginalPaths(boardId: string, invoke: (...args: string[]) 
 }
 
 describe("cooperation HTTP and live boundary", () => {
+  it("creates empty drafts and rejects the removed template field before creating or assigning a board", async () => {
+    const response = await app.inject({ method: "POST", url: "/api/cooperation/boards", payload: { title: "Empty draft" } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ title: "Empty draft", status: "draft", members: [], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] });
+    const assigned = await create();
+    expect(assigned).toMatchObject({ status: "active", members: [expect.objectContaining({ tabId: tab.id })], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] });
+    const assignment = boards.assignmentForTab(tab.id);
+    for (const template of ["blank", "system-design", "decision-review", "sketch-wip"]) {
+      const rejected = await app.inject({ method: "POST", url: "/api/cooperation/boards", payload: { title: "Removed option", template, tabId: tab.id } });
+      expect(rejected.statusCode).toBe(400);
+      expect(rejected.json()).toMatchObject({ code: "INVALID_REQUEST" });
+    }
+    expect(boards.listBoards()).toHaveLength(2);
+    expect(boards.assignmentForTab(tab.id)).toEqual(assignment);
+  });
+
   it("creates and assigns atomically, rejects invalid management, and keeps closed-board exports", async () => {
     const board = await create();
     expect(board.members).toEqual([expect.objectContaining({ tabId: tab.id, providerId: "codex" })]);

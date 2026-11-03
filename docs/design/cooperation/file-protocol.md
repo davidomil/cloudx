@@ -20,7 +20,7 @@ A projection is a real UTF-8 file, not a FIFO or OS-level virtual filesystem. No
 
 ## Snapshot shape and stable addresses
 
-The strict [snapshot schema](examples/blackboard.schema.json) and [scenario examples](examples/README.md) are the design reference for scene serialization. A snapshot contains schemaVersion, boardId, title, revision, status, eventCursor, members, items, connections, regions, reactions, threads, and assets. Every object has a stable ID. Editable records have an integer revision. Member entries include a stable tab ID, provider, assignment generation, label, and responder/observer role.
+The strict [snapshot schema](examples/blackboard.schema.json) is the design reference for scene serialization. A snapshot contains schemaVersion, boardId, title, revision, status, eventCursor, members, items, connections, regions, reactions, threads, and assets. Every object has a stable ID. Editable records have an integer revision. Member entries include a stable tab ID, provider, assignment generation, label, and responder/observer role.
 
 Actor strings use `user:<localUserId>` or `agent:<stableTabId>`. The service supplies them; callers cannot choose attribution. Resolve a current author recipient by the stable tab ID in that actor and the current board assignment. Provider names, tab labels, or a string such as architect never resolve identity. Retain immutable author IDs when a tab leaves. Operation/inbox receipts capture provider, owner, logical run and attempt lineage at the time of the action, so a later provider switch does not rewrite history. An absent former author is not a delivery target.
 
@@ -55,7 +55,7 @@ Validate that exact equals the selected block slice at the stated revision. Pres
 
 Every target whose object is absent must include snapshot = {removedAtBoardRevision, record}. The strict record shape matches target.kind: the full last item, connection, region, or thread message, with the same ID. Deletion captures this record for all affected reactions/threads in the same transaction and marks any text anchor stale. The snapshot is immutable evidence, not an editable scene object. A deleted connection keeps its description/endpoints/route; a deleted image keeps its original asset reference; a deleted note keeps its blocks. Snapshot asset references pin the original bytes until the board is explicitly deleted. JSON, Markdown, the outline, and normal feedback reads expose this evidence. A missing ID without a snapshot is invalid, rather than an empty tombstone.
 
-The examples include “🔎 Review café receipt routing with Claude.” The selected “café receipt” begins at code-point offset 9 and ends at 21. This exercises the difference between browser string indices and the stored contract. Region feedback targets the region; image feedback targets the image item. A future sub-image selector needs a separately specified coordinate contract; whole-image questions work in v1.
+In “🔎 Review café receipt routing with Claude.”, the selected “café receipt” begins at code-point offset 9 and ends at 21. This exercises the difference between browser string indices and the stored contract. Region feedback targets the region; image feedback targets the image item. A future sub-image selector needs a separately specified coordinate contract; whole-image questions work in v1.
 
 ## Tab context and proposed helper surface
 

@@ -22,8 +22,8 @@ describe("cooperation transport boundaries", () => {
   it("creates and assigns in the same durable request and validates returned documents", async () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify(board)));
     vi.stubGlobal("fetch", fetch);
-    await expect(createCooperationBoard("Review", "decision-review", "agent")).resolves.toEqual(board);
-    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards", expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "Review", template: "decision-review", tabId: "agent" }) }));
+    await expect(createCooperationBoard("Review", "agent")).resolves.toEqual(board);
+    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards", expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "Review", tabId: "agent" }) }));
     fetch.mockResolvedValueOnce(new Response(JSON.stringify({ ...board, schemaVersion: 7 })));
     await expect(createCooperationBoard("Review")).rejects.toThrow();
   });

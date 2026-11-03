@@ -4,7 +4,6 @@ import type {
 } from "@cloudx/shared";
 import { isCooperationId, isRecord, parseCooperationBoard } from "@cloudx/shared";
 
-export type CooperationTemplate = "blank" | "system-design" | "decision-review" | "sketch-wip";
 const boardPath = (boardId: string) => `/api/cooperation/boards/${encodeURIComponent(boardId)}`;
 
 export class CooperationSaveError extends Error {
@@ -46,8 +45,8 @@ export function subscribeCooperationBoards(handlers: { boards: (boards: Cooperat
 export async function getCooperationBoard(boardId: string): Promise<CooperationBoard> {
   return parseCooperationBoard(await requestJson<unknown>(boardPath(boardId)));
 }
-export async function createCooperationBoard(title: string, template: CooperationTemplate = "blank", tabId?: string): Promise<CooperationBoard> {
-  return parseCooperationBoard(await requestJson<unknown>("/api/cooperation/boards", { method: "POST", body: JSON.stringify({ title, template, ...(tabId ? { tabId } : {}) }) }));
+export async function createCooperationBoard(title: string, tabId?: string): Promise<CooperationBoard> {
+  return parseCooperationBoard(await requestJson<unknown>("/api/cooperation/boards", { method: "POST", body: JSON.stringify({ title, ...(tabId ? { tabId } : {}) }) }));
 }
 export async function updateCooperationBoard(boardId: string, patch: { title?: string; responderTabId?: string }): Promise<CooperationBoard> {
   return parseCooperationBoard(await requestJson<unknown>(boardPath(boardId), { method: "PATCH", body: JSON.stringify(patch) }));

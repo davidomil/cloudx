@@ -43,6 +43,25 @@ async function render(element: ReturnType<typeof createElement>) {
 }
 
 describe("AgentSwitchMenu", () => {
+  it("opens read-only details for the menu tab without account switching", async () => {
+    const nativeTab = { ...tab, ownerPluginId: "forge", nativeWork: { version: 1 as const, tabId: tab.id, executionId: "execution", threadId: "conversation", updatedAt: tab.updatedAt } };
+    const onOpenNativeWork = vi.fn();
+    const onClose = vi.fn();
+    const onSwitched = vi.fn();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const container = await render(createElement(AgentSwitchMenu, {
+      tab: nativeTab, x: 10, y: 10, accountsEnabled: false, onOpenNativeWork, onSwitched, onOpenAccounts: vi.fn(), onClose
+    }));
+    const item = container.querySelector<HTMLButtonElement>('[role="menuitem"]')!;
+    expect(item.textContent).toBe("Open native work details");
+    await act(async () => item.click());
+    expect(onOpenNativeWork).toHaveBeenCalledExactlyOnceWith(nativeTab);
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onSwitched).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("lists accounts of installed providers and switches through the server", async () => {
     const switched = { ...tab, status: "starting" as const };
     const fetchMock = vi.fn(async () => new Response(JSON.stringify(switched), { headers: { "content-type": "application/json" } }));
@@ -92,6 +111,17 @@ describe("Blackboard access from every agent tab", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/cooperation/assignments/tab-1", expect.objectContaining({ method: "PUT", body: JSON.stringify({ boardId: "design" }) }));
     expect(onClose).toHaveBeenCalled();
   });
+  it("opens native-work actions without optional account or blackboard plugins", async () => {
+    function Trigger() {
+      const menu = useAgentSwitchMenu(false);
+      const nativeTab = { ...tab, nativeWork: { version: 1 as const, tabId: tab.id, executionId: "execution", threadId: "conversation", updatedAt: tab.updatedAt } };
+      return createElement("div", null, createElement("button", { ...menu.tabHandlers(nativeTab) }, "Codex"), menu.position ? createElement("span", { role: "status" }, menu.position.tabId) : null);
+    }
+    const container = await render(createElement(Trigger));
+    await act(async () => container.querySelector("button")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ContextMenu", bubbles: true })));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(tab.id);
+  });
+
   it("opens an owned tab's menu with Shift+F10 and restores focus on dismissal", async () => {
     function Trigger() {
       const menu = useAgentSwitchMenu(true);

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import sharp from "sharp";
-import { boundsIntersect, connectionLabelBounds, connectionPolyline, itemBounds, segmentIntersectsBounds, type CooperationBoard, type CooperationCaller, type CooperationItemInput, type CooperationOperation, type CooperationTransaction } from "@cloudx/shared";
+import type { CooperationBoard, CooperationCaller, CooperationItemInput, CooperationOperation, CooperationTransaction } from "@cloudx/shared";
 import { BlackboardService } from "./BlackboardService.js";
 import { BoardFileProjection } from "./BoardFileProjection.js";
 import { BlackboardRepository } from "./BlackboardRepository.js";
@@ -446,20 +446,34 @@ describe("original images and publication", () => {
     expect((await restarted.readBoard(board.boardId)).board.items).toHaveLength(1);
   });
 
-  it.each(["system-design", "decision-review", "sketch-wip"])("creates the %s template with retained originals and an atomic initial assignment", async template => {
-    const created = await service.createBoard({ title: template, template, tab: { tabId: "template-tab", providerId: "claude", label: "Claude" } });
-    expect(created.members.map(member => member.tabId)).toEqual(["template-tab"]);
-    expect(created.items.length).toBeGreaterThan(0);
-    expect(created.items.every(item => item.createdBy === "user:local")).toBe(true);
-    for (const connection of created.connections) {
-      const label = connectionLabelBounds(connection, created.items);
-      expect(created.items.filter(item => boundsIntersect(itemBounds(item), label)).map(item => item.id), `${template}: ${connection.id} label covers an item`).toEqual([]);
-      const points = connectionPolyline(connection, created.items);
-      const crossed = created.items.filter(item => item.id !== connection.from.itemId && item.id !== connection.to.itemId && points.slice(1).some((point, index) => segmentIntersectsBounds(points[index], point, itemBounds(item))));
-      expect(crossed.map(item => item.id), `${template}: ${connection.id} crosses an unrelated item`).toEqual([]);
-    }
-    for (const asset of created.assets) expect((await service.resolveAsset(created.boardId, asset.id)).bytes.length).toBe(asset.byteLength);
+  it("creates empty drafts and commits the optional initial assignment with the board", async () => {
+    const draft = await service.createBoard({ title: "  Empty draft  " });
+    expect(draft).toMatchObject({ title: "Empty draft", status: "draft", members: [], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] });
+    const coworker = { tabId: "initial-tab", providerId: "claude" as const, label: "Claude" };
+    const created = await service.createBoard({ title: "Empty assigned board", tab: coworker });
+    expect(created).toMatchObject({ status: "active", members: [expect.objectContaining(coworker)], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] });
+    const restarted = new BlackboardService({ rootDir: root }); await restarted.init();
+    expect(restarted.getBoard(created.boardId)).toEqual(created);
+    expect(restarted.assignmentForTab(coworker.tabId)).toMatchObject({ ...coworker, boardId: created.boardId });
     expect(service.getBoard(board.boardId).members.map(member => member.tabId)).toEqual([tab.tabId]);
+  });
+
+  it("reloads populated boards with their scene, WIP, discussions, assignment and original image bytes intact", async () => {
+    const bytes = await sharp({ create: { width: 4, height: 3, channels: 4, background: "#d0d0d0" } }).png().toBuffer();
+    const staged = await service.stageAsset(board.boardId, { mime: "image/png", bytes });
+    await apply([
+      { kind: "createItem", item: note() },
+      { kind: "attachAsset", stagedToken: staged.stagedToken, item: { id: "retained-image", kind: "image", geometry: { ...note().geometry, x: 400 }, content: { title: "Original reference", alt: "Saved reference", assetId: staged.asset.id } } },
+      { kind: "createConnection", connection: { id: "reference-link", from: { itemId: "note", port: "east" }, to: { itemId: "retained-image", port: "west" }, direction: "none", description: "Uses original reference", waypoints: [] } },
+      { kind: "createRegion", region: { id: "saved-wip", title: "Unfinished notes", geometry: { x: 0, y: 0, width: 300, height: 240, rotation: 0 }, mode: "wip", protectedItemIds: ["note"] } },
+      { kind: "addReaction", reaction: { id: "saved-question", kind: "question", glyph: "?", description: "Keep this evidence?", target: { kind: "item", id: "retained-image" }, threadId: "saved-thread" } }
+    ]);
+    const saved = service.getBoard(board.boardId);
+    const assignment = service.assignmentForTab(tab.tabId);
+    const restarted = new BlackboardService({ rootDir: root }); await restarted.init();
+    expect((await restarted.readBoard(board.boardId)).board).toEqual(saved);
+    expect(restarted.assignmentForTab(tab.tabId)).toEqual(assignment);
+    expect((await restarted.resolveAsset(board.boardId, staged.asset.id)).bytes).toEqual(bytes);
   });
 
   it("refuses a symbolic authority and never invents a blank replacement", async () => {

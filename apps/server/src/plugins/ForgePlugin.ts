@@ -221,10 +221,11 @@ export class ForgePlugin implements WorkspacePlugin {
         "worker.continue",
         "Continue worker with a message",
         "external",
-        { id, message: { type: "string", minLength: 1, maxLength: MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, pattern: "\\S" }, ...placement },
+        { id, message: { type: "string", minLength: 1, maxLength: MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, pattern: "\\S" }, ciRepair: { const: true }, ...placement },
         ["id", "message", "windowId", "paneId"],
         async (input) => ({
-          worker: await this.service().workflow.continueWorker(String(input.id), String(input.message), place(input)),
+          worker: await this.service().workflow.continueWorker(String(input.id), String(input.message), place(input),
+            ...(input.ciRepair === true ? [{ ciRepair: true }] as const : [] as const)),
         }),
       ),
       hook("worker.ownershipAvailability", "Check directory ownership recovery availability", "read", { id }, ["id"], async input => ({

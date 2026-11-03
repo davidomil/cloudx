@@ -461,22 +461,32 @@ function parseCiRepair(value: unknown, worker: ForgeWorker): ForgeCiRepair {
   if (new Set(attemptedHeads.map(head => head.toLowerCase())).size !== attemptedHeads.length)
     throw new Error("CI repair attempted heads must be unique.");
   const diagnostic = input.diagnostic === undefined ? undefined : parseCiDiagnostic(input.diagnostic, worker);
+  if (input.manual !== undefined && input.manual !== true) throw new Error("Invalid manual CI repair intent.");
+  const manual = input.manual === true;
+  const diagnosticStatus = input.diagnosticStatus;
+  if (diagnosticStatus !== undefined && diagnosticStatus !== "current" && diagnosticStatus !== "stale" && diagnosticStatus !== "unavailable")
+    throw new Error("Invalid CI diagnostic freshness.");
+  if (diagnosticStatus === "current" && !diagnostic || diagnosticStatus === "stale" && !diagnostic)
+    throw new Error("Current or historical CI evidence requires a diagnostic snapshot.");
   const attemptId = input.attemptId === undefined ? undefined : nonblankText(input.attemptId, "CI repair attempt identity", 36);
-  if (attemptId !== undefined && (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(attemptId) || !attempts))
+  if (attemptId !== undefined && (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(attemptId) || !attempts && !manual))
     throw new Error("Invalid CI repair attempt identity.");
   const repairedHeadSha = input.repairedHeadSha === undefined ? undefined : commitSha(input.repairedHeadSha, "CI repaired head");
   if (phase !== "diagnosing" && phase !== "blocked" && diagnostic?.state !== "actionable" ||
-    phase === "diagnosing" && diagnostic?.state === "actionable" ||
-    ["launching", "repairing", "publishing", "reviewing"].includes(phase) && !attempts ||
-    ["launching", "repairing", "publishing", "reviewing"].includes(phase) &&
+    phase === "diagnosing" && diagnostic?.state === "actionable" && diagnosticStatus !== "stale" ||
+    ["launching", "repairing", "publishing", "reviewing"].includes(phase) && !attempts && !manual ||
+    ["launching", "repairing", "publishing", "reviewing"].includes(phase) && !manual &&
       diagnostic!.sourceHeadSha.toLowerCase() !== attemptedHeads.at(-1)?.toLowerCase() ||
     ["repairing", "publishing", "reviewing"].includes(phase) && !attemptId ||
     ["publishing", "reviewing"].includes(phase) && !repairedHeadSha ||
-    phase === "ready" && attempts === MAX_FORGE_CI_REPAIR_ATTEMPTS ||
-    repairedHeadSha !== undefined && (!attempts || repairedHeadSha.toLowerCase() === attemptedHeads.at(-1)?.toLowerCase()))
+    phase === "ready" && attempts === MAX_FORGE_CI_REPAIR_ATTEMPTS && !manual ||
+    repairedHeadSha !== undefined && (!attempts && !manual || repairedHeadSha.toLowerCase() === diagnostic?.sourceHeadSha.toLowerCase()))
     throw new Error("CI repair phase must match its diagnostic and attempt evidence.");
   return {
     phase, attempts: Number(attempts), attemptedHeads,
+    ...(manual ? { manual: true as const } : {}),
+    ...(diagnosticStatus === undefined ? {} : { diagnosticStatus }),
+    ...(input.diagnosticReason === undefined ? {} : { diagnosticReason: nonblankText(input.diagnosticReason, "CI diagnostic freshness reason", 4096) }),
     ...(diagnostic === undefined ? {} : { diagnostic }), ...(attemptId === undefined ? {} : { attemptId }),
     ...(repairedHeadSha === undefined ? {} : { repairedHeadSha }),
     ...(input.reason === undefined ? {} : { reason: nonblankText(input.reason, "CI repair reason", 4096) }),
@@ -710,8 +720,11 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     }
     if (worker.pendingContinuation !== undefined) {
       const continuation = object(worker.pendingContinuation);
+      if (continuation.ciRepair !== undefined && continuation.ciRepair !== true)
+        throw new Error("Invalid CI repair continuation intent.");
       parsed.pendingContinuation = {
         message: nonblankText(continuation.message, "pending recovery message", 20_000),
+        ...(continuation.ciRepair === true ? { ciRepair: true as const } : {}),
         ...(continuation.deliveryAttemptId === undefined ? {} : { deliveryAttemptId: nonblankText(continuation.deliveryAttemptId, "recovery delivery attempt", 36) }),
         ...(continuation.previousError === undefined ? {} : { previousError: text(continuation.previousError, "recovery error") }),
       };

@@ -4,6 +4,7 @@ import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_AT
 import type { AgentUsageSummary, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { openNativeWorkDetails } from "./nativeWorkDetails.js";
 import { useCooperationBoards } from "./cooperation/cooperationBoards.js";
 import { ControlButton } from "./Control.js";
 import { DirectoryOwnershipRecovery } from "./DirectoryOwnershipRecovery.js";
@@ -180,7 +181,11 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       </ForgeWorkerTabs> : (view === "issues" || view === "changes") && dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
       {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onOpenBlackboard={onOpenBlackboard} onClose={() => setTerminalWorkerId(undefined)} /> : null}
     </> : null}
-    {blackboardMenu.position && onOpenBlackboard ? (() => { const tab = workerTabs.find(tab => tab.id === blackboardMenu.position?.tabId); return tab ? <AgentSwitchMenu tab={tab} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={onOpenBlackboard} onClose={blackboardMenu.close} /> : null; })() : null}
+    {blackboardMenu.position ? (() => { const tab = workerTabs.find(tab => tab.id === blackboardMenu.position?.tabId); return tab ? <AgentSwitchMenu tab={tab} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled={Boolean(onOpenBlackboard)} onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={onOpenBlackboard} onOpenNativeWork={tab => {
+      const worker = workers.find(worker => worker.tabId === tab.id);
+      if (worker) onViewWorker(worker.id);
+      openNativeWorkDetails(tab);
+    }} onClose={blackboardMenu.close} /> : null; })() : null}
   </section></WorkerContinuations.Provider></WorkerActions.Provider></WorkerUsage.Provider>;
 }
 
@@ -420,6 +425,7 @@ function autoReviewProgress(worker: ForgeWorker) {
   if (!worker.autoReview?.enabled) return undefined;
   if (worker.completion?.continuationRequired) return "Auto review is waiting for implementation. Continue with message to finish the work.";
   const action = worker.pendingPublication ? "Retry publication" : "Resume";
+  if (["paused", "stopped"].includes(worker.status) && worker.ciRepair?.phase === "blocked") return "Auto review is waiting for CI repair. Continue CI repair to start implementation; Resume only rechecks the loop.";
   if (["paused", "stopped"].includes(worker.status)) return `Auto review is enabled. ${action} to continue the loop.`;
   if (["failed", "cleanup_failed"].includes(worker.status)) return `Auto review is waiting for attention. ${action} after resolving the error.`;
   return `Auto review · ${{ implementing: "Implementing changes", reviewing: "Reviewing changes", merging: "Waiting to merge" }[worker.autoReview.phase]}`;
@@ -545,14 +551,37 @@ function MergeQueueStatus({ worker, workers }: { worker: ForgeWorker; workers: F
   </section>;
 }
 
-function CiRepairStatus({ repair }: { repair: NonNullable<ForgeWorker["ciRepair"]> }) {
-  return <section aria-label="CI repair">
-    <p role="status">CI repair · {repair.phase} · {repair.attempts}/{MAX_FORGE_CI_REPAIR_ATTEMPTS} attempts used</p>
-    {repair.reason || repair.diagnostic?.reason ? <p>{repair.reason ?? repair.diagnostic!.reason}</p> : null}
-    {repair.diagnostic ? <p className="forge-muted">Source <code>{repair.diagnostic.sourceHeadSha.slice(0, 8)}</code> · Target <code>{repair.diagnostic.targetHeadSha.slice(0, 8)}</code></p> : null}
-    {repair.diagnostic?.jobs.length ? <ul>{repair.diagnostic.jobs.map(job => <li key={`${job.runId}:${job.runAttempt}:${job.jobId}`}>
-      <a href={job.url} target="_blank" rel="noreferrer">{job.name}</a> · {job.conclusion} · Run {job.runId}, attempt {job.runAttempt}
+function CiRepairStatus({ worker, onContinue, disabled, blocker }: {
+  worker: ForgeWorker; onContinue: () => void; disabled: boolean; blocker?: string;
+}) {
+  const repair = worker.ciRepair!;
+  const diagnostic = repair.diagnostic;
+  const current = repair.diagnosticStatus === "current" && diagnostic?.sourceHeadSha === worker.headSha;
+  const exhausted = repair.attempts >= MAX_FORGE_CI_REPAIR_ATTEMPTS;
+  const evidence = diagnostic ? <>
+    <p className="forge-muted">Source <code>{diagnostic.sourceHeadSha.slice(0, 8)}</code> · Target <code>{diagnostic.targetHeadSha.slice(0, 8)}</code>{diagnostic.testedSha ? <> · Tested <code>{diagnostic.testedSha.slice(0, 8)}</code></> : null}</p>
+    {diagnostic.jobs.length ? <ul>{diagnostic.jobs.map(job => <li key={`${job.runId}:${job.runAttempt}:${job.jobId}`}>
+      <a href={job.url} target="_blank" rel="noreferrer">{job.name}</a> · {job.conclusion} · Run {job.runId}, attempt {job.runAttempt} · Job {job.jobId}
+      {job.testedSha ? <> · Tested <code>{job.testedSha.slice(0, 8)}</code></> : null}
+      {job.requiredGate ? <p className="forge-muted">Downstream required gate: <a href={job.requiredGate.url} target="_blank" rel="noreferrer">{job.requiredGate.name}</a>. Inspect the producer lane above.</p> : null}
     </li>)}</ul> : null}
+  </> : null;
+  return <section aria-label="CI repair">
+    <p role="status">CI repair · {repair.manual ? "Manual repair · " : ""}{repair.phase} · {repair.attempts}/{MAX_FORGE_CI_REPAIR_ATTEMPTS} automatic attempts used</p>
+    {exhausted ? <p>The automatic CI repair budget is exhausted. Resume only rechecks the existing loop; it cannot replenish the automatic budget.</p> : null}
+    {repair.reason ? <p>{repair.reason}</p> : null}
+    {current ? <div aria-label="Current CI failure">
+      <p><strong>Current CI diagnosis</strong>{diagnostic?.reason ? `: ${diagnostic.reason}` : ""}</p>
+      {evidence}
+    </div> : <>
+      <p role="status">Current CI evidence is unavailable. {repair.diagnosticReason ?? "Refresh the current request before using a saved diagnosis."}</p>
+      {diagnostic ? <details><summary>Historical CI diagnosis · not the current failure</summary>{evidence}</details> : null}
+    </>}
+    {worker.kind === "issue" && worker.changeNumber && repair.phase === "blocked" ? <>
+      <ControlButton size="compact" disabled={disabled || !!blocker} title={blocker} onClick={onContinue}><Play size={14} /> Continue CI repair</ControlButton>
+      <p className="forge-muted">Start a deliberate implementation turn with fresh pinned CI evidence and current review findings. Automatic attempt history is preserved.</p>
+      {blocker ? <p role="status">{blocker}</p> : null}
+    </> : null}
   </section>;
 }
 
@@ -562,6 +591,8 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
   const continuing = continuation.messages[worker.id] !== undefined;
   const continuationMessage = continuation.messages[worker.id] ?? "";
   const continuationBlocker = forgeWorkerContinuationBlocker(worker, workers);
+  const ciRepairBlocker = continuationBlocker ?? (worker.pendingPublication || worker.mergeAttempted || ["creating", "uncertain"].includes(worker.publicationState ?? "")
+    ? "Reconcile the pending publication or merge with Resume before continuing CI repair." : undefined);
   async function continueWorker() {
     if (busy || continuationBlocker || !continuationMessage.trim() || continuationMessage.length > MAX_FORGE_CONTINUATION_MESSAGE_LENGTH) return;
     const successful = await runAction(() => request("forge.worker.continue", { id: worker.id, message: continuationMessage, ...placement }));
@@ -621,7 +652,9 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
     {!archivedDraft ? <MergeQueueStatus worker={worker} workers={workers} /> : null}
-    {!archivedDraft && worker.ciRepair ? <CiRepairStatus repair={worker.ciRepair} /> : null}
+    {!archivedDraft && worker.ciRepair ? <CiRepairStatus worker={worker} disabled={busy} blocker={ciRepairBlocker} onContinue={() => void runAction(() => request("forge.worker.continue", {
+      id: worker.id, message: "Continue CI repair using the current pinned failure evidence and actionable review findings.", ciRepair: true, ...placement,
+    }))} /> : null}
     {!archivedDraft && progress ? <p role="status" className="forge-auto-review-status">{progress}</p> : !archivedDraft && !conflict && worker.status === "awaiting_review" ? <p role="status">Ready for review. Resume after feedback to address comments and check approval.</p> : null}
     {!archivedDraft && ["paused", "failed", "stopped", "cleanup_failed"].includes(worker.status) ? <DirectoryOwnershipRecovery key={worker.id}
       disabled={busy || controlling || reviewRunning}
