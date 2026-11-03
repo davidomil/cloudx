@@ -163,7 +163,7 @@ describe("buildServer", () => {
     }
   });
 
-  it.each([false, true])("waits for plugin setup writes before closing (setup fails: %s)", async (fails) => {
+  it.each([false, true])("admits startup only after mandatory plugin setup succeeds (setup fails: %s)", async (fails) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-setup-shutdown-"));
     const config = testConfig(root);
     const services = buildServices(config);
@@ -177,66 +177,56 @@ describe("buildServer", () => {
       if (fails) throw setupFailure;
       return saveContributions(...args);
     });
+    const restoreSessions = vi.spyOn(services.sessions, "restore");
+    const disposeSessions = vi.spyOn(services.sessions, "dispose");
     const disposeAutomation = vi.spyOn(services.automation!, "dispose");
-    const app = await buildServer(config, services);
-    let closed = false;
-    let closeFailure: unknown;
-    let closing: Promise<void> | undefined;
+    let app: Awaited<ReturnType<typeof buildServer>> | undefined;
+    let startupFailure: unknown;
+    let settled = false;
+    const starting = buildServer(config, services).then(value => { app = value; settled = true; }, error => { startupFailure = error; settled = true; });
     try {
       await writeStarted.promise;
-      closing = app.close().then(() => { closed = true; }, (error: unknown) => {
-        closed = true;
-        closeFailure = error;
-      });
-      await vi.waitFor(() => expect(disposeAutomation).toHaveResolved());
-      expect(closed).toBe(false);
+      await new Promise(resolve => setImmediate(resolve));
+      expect(settled).toBe(false);
+      expect(restoreSessions).not.toHaveBeenCalled();
 
       releaseWrite.resolve(undefined);
-      await closing;
-      expect(closed).toBe(true);
+      await starting;
       if (fails) {
-        expect(closeFailure).toBeInstanceOf(AggregateError);
-        expect((closeFailure as AggregateError).errors).toEqual([setupFailure]);
+        expect(startupFailure).toBe(setupFailure);
+        expect(app).toBeUndefined();
+        expect(restoreSessions).not.toHaveBeenCalled();
+        expect(disposeSessions).toHaveResolved();
+        expect(disposeAutomation).toHaveResolved();
       } else {
-        expect(closeFailure).toBeUndefined();
+        expect(startupFailure).toBeUndefined();
+        expect(restoreSessions).toHaveBeenCalledOnce();
+        expect((await app!.inject({ url: "/api/health" })).statusCode).toBe(200);
         expect(await fs.readFile(path.join(config.dataDir, "rules-skills", "system-skills", "documentation-search", "SKILL.md"), "utf8")).toContain("Documentation Search");
+        await app!.close();
       }
       await fs.rm(root, { recursive: true, force: true });
       await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       releaseWrite.resolve(undefined);
-      await services.pluginContributionsReady?.catch(() => undefined);
-      await closing;
-      await app.close().catch(() => undefined);
+      await starting;
+      await app?.close().catch(() => undefined);
       save.mockRestore();
       await fs.rm(root, { recursive: true, force: true });
     }
   });
 
-  it.each([false, true])("drains the final startup catalog refresh before closing (refresh fails: %s)", async (fails) => {
+  it.each([false, true])("drains a catalog refresh started after startup before closing (refresh fails: %s)", async (fails) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-catalog-refresh-shutdown-"));
     const config = testConfig(root);
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const services = buildServices(config, logger);
     const catalog = services.rulesSkills!;
     const listCatalog = catalog.list.bind(catalog);
-    const list = vi.spyOn(catalog, "list");
     const finalSkill = services.plugins.values().flatMap((plugin) => plugin.skillContributions ?? []).at(-1)!;
-    const finalSaveStarted = deferred<void>();
-    const releaseFinalSave = deferred<void>();
-    const releaseSetup = deferred<void>();
     const refreshStarted = deferred<void>();
     const releaseRefresh = deferred<void>();
     const refreshFailure = new Error("Catalog refresh failed.");
-    const saveContributions = catalog.saveSystemContributions.bind(catalog);
-    const save = vi.spyOn(catalog, "saveSystemContributions").mockImplementation(async (input) => {
-      if (!input.skills.some(skill => skill.id === finalSkill.id)) return saveContributions(input);
-      finalSaveStarted.resolve(undefined);
-      await releaseFinalSave.promise;
-      const store = await saveContributions(input);
-      await releaseSetup.promise;
-      return store;
-    });
     const createSession = vi.spyOn(services.plugins.get("codex-terminal"), "createSession").mockImplementation(({ tab }) => ({
       tab,
       snapshot: () => ({ tabId: tab.id, pluginId: tab.pluginId, title: tab.title, cwd: tab.cwd, status: tab.status }),
@@ -248,10 +238,10 @@ describe("buildServer", () => {
     const disposeSessions = vi.spyOn(services.sessions, "dispose");
     const disposeAutomation = vi.spyOn(services.automation!, "dispose");
     const app = await buildServer(config, services);
+    const list = vi.spyOn(catalog, "list");
     let closing: Promise<void> | undefined;
     let closed = false;
     try {
-      await finalSaveStarted.promise;
       await services.sessions.createTab({ pluginId: "codex-terminal", cwd: root });
       list.mockImplementationOnce(async () => {
         refreshStarted.resolve(undefined);
@@ -259,13 +249,11 @@ describe("buildServer", () => {
         if (fails) throw refreshFailure;
         return listCatalog();
       });
-      releaseFinalSave.resolve(undefined);
+      await catalog.saveSystemSkill(finalSkill);
       await refreshStarted.promise;
       closing = app.close().then(() => { closed = true; });
       await vi.waitFor(() => expect(disposeSessions).toHaveResolved());
       expect(services.sessions.listTabs()).toEqual([]);
-      releaseSetup.resolve(undefined);
-      await services.pluginContributionsReady;
       await vi.waitFor(() => expect(disposeAutomation).toHaveResolved());
       await new Promise((resolve) => setImmediate(resolve));
       expect(closed).toBe(false);
@@ -284,15 +272,74 @@ describe("buildServer", () => {
       await Promise.allSettled(refresh.mock.results.map((result) => result.value));
       await expect(fs.stat(root)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
-      releaseFinalSave.resolve(undefined);
-      releaseSetup.resolve(undefined);
       releaseRefresh.resolve(undefined);
       await closing;
       await app.close();
       await Promise.allSettled(refresh.mock.results.map((result) => result.value));
       list.mockRestore();
-      save.mockRestore();
       createSession.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("defers restored feedback and early owner readiness until the helper HTTP endpoint is listening", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-cooperation-listen-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    await Promise.all([services.pluginContributionsReady, services.cooperationReady]);
+    vi.spyOn(services.documentation!, "pendingEnrichments").mockResolvedValue([]);
+    vi.spyOn(services.plugins.get("codex-terminal"), "createSession").mockImplementation(({ tab, initialInput }) => ({
+      tab, restoreInput: () => initialInput,
+      snapshot: () => ({ tabId: tab.id, pluginId: tab.pluginId, title: tab.title, cwd: tab.cwd, status: tab.status }),
+      voiceContext: () => ({ kind: "codex-terminal", cwd: tab.cwd, summary: "Fixture native session." }),
+      handleAction: async () => ({}), terminate: async () => undefined
+    }));
+    const tab = await services.sessions.createTab({ pluginId: "codex-terminal", cwd: root, initialInput: { codexExecutionId: "execution", agent: { providerId: "codex" } } });
+    const boards = services.cooperation!;
+    const contexts = services.cooperationContexts!;
+    const board = await boards.createBoard({ title: "Restored feedback", tab: { tabId: tab.id, providerId: "codex", label: tab.title } });
+    await boards.apply({ schemaVersion: 1, operationId: "waiting-question", boardId: board.boardId, expectedBoardRevision: board.revision,
+      preconditions: [], respondsToEventIds: [], operations: [
+        { kind: "createItem", item: { id: "note", kind: "note", geometry: { x: 0, y: 0, width: 200, height: 100, rotation: 0 }, content: { title: "Pending question", blocks: [{ id: "body", revision: 1, text: "Explain the startup boundary." }] } } },
+        { kind: "addReaction", reaction: { id: "question", kind: "question", glyph: "?", description: "Please explain", target: { kind: "item", id: "note" }, threadId: "discussion" } }
+      ] }, { kind: "user", userId: "local" });
+    let app: Awaited<ReturnType<typeof buildServer>> | undefined;
+    const reached: unknown[] = [];
+    const deliver = vi.spyOn(services.cooperationNative!, "deliver").mockImplementation(async () => {
+      expect(app?.server.listening).toBe(true);
+      const locator = await contexts.prepare(tab.id);
+      const port = (app!.server.address() as { port: number }).port;
+      reached.push(await new Promise<unknown>((resolve, reject) => {
+        const request = http.request({ hostname: "127.0.0.1", port, path: "/api/cooperation/agent", method: "POST",
+          headers: { host: "localhost", "content-type": "application/json", authorization: `Bearer ${locator.capability}` } }, response => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", chunk => { body += chunk; });
+          response.on("error", reject);
+          response.on("end", () => {
+            try { expect(response.statusCode).toBe(200); resolve(JSON.parse(body)); } catch (error) { reject(error); }
+          });
+        });
+        request.on("error", reject);
+        request.end(JSON.stringify({ action: "context", tabId: tab.id, boardId: locator.boardId, assignmentGeneration: locator.assignmentGeneration }));
+      }));
+      return { state: "nativeAccepted", providerTurnId: "feedback-turn" };
+    });
+    const prepare = vi.spyOn(contexts, "prepare");
+    try {
+      services.cooperationFeedback!.boundary(tab.id);
+      await Promise.resolve();
+      expect(prepare).not.toHaveBeenCalled();
+      app = await buildServer(config, services);
+      await app.ready();
+      expect(deliver).not.toHaveBeenCalled();
+      await app.listen({ host: "127.0.0.1", port: 0 });
+      await vi.waitFor(() => expect(boards.inbox(board.boardId)[0].state).toBe("nativeAccepted"));
+      expect(deliver).toHaveBeenCalledOnce();
+      expect(reached).toEqual([expect.objectContaining({ boardId: board.boardId, tabId: tab.id })]);
+    } finally {
+      await app?.close();
+      prepare.mockRestore();
       await fs.rm(root, { recursive: true, force: true });
     }
   });
@@ -1856,16 +1903,19 @@ describe("buildServer", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
     const services = buildServices(testConfig(root));
     const disposeJiraOwner = services.jiraPolling!.dispose.bind(services.jiraPolling);
+    // Restoration is a startup barrier. Gate the final owner write below so
+    // shutdown must drain it before disposing sessions.
+    await services.forge!.dashboard();
     const disposeForgeOwner = vi.fn(services.forge!.dispose.bind(services.forge));
     const disposeAutomationOwner = services.automation!.dispose.bind(services.automation);
-    const pollWriteStarted = deferred<void>();
-    const releasePollWrite = deferred<void>();
+    const forgeWriteStarted = deferred<void>();
+    const releaseForgeWrite = deferred<void>();
     const events: string[] = [];
     const writePluginData = services.pluginData!.write.bind(services.pluginData);
     const writes = vi.spyOn(services.pluginData!, "write").mockImplementation(async (pluginId, value) => {
       if (pluginId === "forge") {
-        pollWriteStarted.resolve(undefined);
-        await releasePollWrite.promise;
+        forgeWriteStarted.resolve(undefined);
+        await releaseForgeWrite.promise;
       }
       await writePluginData(pluginId, value);
       if (pluginId === "forge") events.push("forge:persisted");
@@ -1937,7 +1987,7 @@ describe("buildServer", () => {
       automationRelease.resolve(undefined);
       documentationRelease.resolve(undefined);
       voiceRelease.resolve(undefined);
-      releasePollWrite.resolve(undefined);
+      releaseForgeWrite.resolve(undefined);
       try {
         await (cleanup ??= cleanUpFixture());
       } finally {
@@ -1947,9 +1997,6 @@ describe("buildServer", () => {
     });
 
     await vi.advanceTimersByTimeAsync(2_000);
-    await pollWriteStarted.promise;
-    expect(writes).toHaveBeenCalledWith("forge", []);
-    expect(await services.pluginData!.read("forge")).toBeUndefined();
 
     let closed = false;
     const close = app.close().then(() => {
@@ -1963,12 +2010,15 @@ describe("buildServer", () => {
 
     forgeRelease.resolve(undefined);
     await vi.waitFor(() => expect(disposeForgeOwner).toHaveBeenCalledTimes(1));
+    await forgeWriteStarted.promise;
+    expect(writes).toHaveBeenCalledWith("forge", []);
+    expect(await services.pluginData!.read("forge")).toEqual([]);
     expect(events).not.toContain("forge:end");
     expect(events).not.toContain("sessions:start");
     expect(closed).toBe(false);
     expect((await fs.stat(root)).isDirectory()).toBe(true);
 
-    releasePollWrite.resolve(undefined);
+    releaseForgeWrite.resolve(undefined);
     await vi.waitFor(() => expect(events).toContain("sessions:start"));
     expect(events.indexOf("forge:persisted")).toBeGreaterThan(events.indexOf("forge:start"));
     expect(events.lastIndexOf("forge:persisted")).toBeLessThan(events.indexOf("forge:end"));

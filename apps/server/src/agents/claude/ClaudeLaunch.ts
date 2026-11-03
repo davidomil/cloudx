@@ -33,6 +33,7 @@ export interface ClaudeLaunchArgsOptions {
   deferPrompt?: boolean;
   // Starts a new conversation under this id.
   newSessionId?: string;
+  cooperationMcpConfig?: string;
 }
 
 export function buildClaudeLaunchArgs(initialInput: Record<string, unknown> | undefined, options: ClaudeLaunchArgsOptions): string[] {
@@ -41,6 +42,7 @@ export function buildClaudeLaunchArgs(initialInput: Record<string, unknown> | un
   if (prompt !== undefined && (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0"))) throw new Error("Claude initial prompt must be a non-empty string without null bytes.");
   if (resume?.mode === "session" && !SESSION_ID_PATTERN.test(resume.sessionId ?? "")) throw new Error("Claude resume requires an exact session id.");
   const args = ["--settings", options.settingsPath];
+  if (options.cooperationMcpConfig) args.push("--mcp-config", options.cooperationMcpConfig);
   if (options.instructionsPath) args.push("--append-system-prompt-file", options.instructionsPath);
   args.push(...options.configurationArgs ?? []);
   for (const directory of options.addDirs) args.push("--add-dir", directory);

@@ -130,6 +130,7 @@ it("lets the complete serial native suite finish beyond two minutes before check
   expect(suiteArgs.slice(2, suiteArgs.indexOf("--maxWorkers=1"))).toEqual([
     "apps/server/src/plugins/CodexConversationRecovery.native.test.ts",
     "apps/server/src/plugins/CodexWorkerBridge.native.test.ts",
+    "apps/server/src/cooperationAgent/CodexCooperation.native.test.ts",
     "apps/server/src/plugins/CodexCommandDetails.native.test.ts",
     "apps/server/src/plugins/CodexModelDefaults.native.test.ts",
     "apps/server/src/rulesSkills/CodexHomeOverlay.native.test.ts",

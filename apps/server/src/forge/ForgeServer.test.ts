@@ -22,7 +22,7 @@ describe("Forge in the composed CloudX server", () => {
     });
     const services = buildServices(config);
     await services.pluginContributionsReady;
-    const app = await buildServer(config, services);
+    let app: Awaited<ReturnType<typeof buildServer>> | undefined;
     const worker: ForgeWorker = {
       id: "33333333-3333-4333-8333-333333333333", attemptId: "44444444-4444-4444-8444-444444444444",
       tabId: "missing-worker-tab", kind: "issue", number: 7, title: "Repair deployment", status: "running",
@@ -38,6 +38,7 @@ describe("Forge in the composed CloudX server", () => {
     try {
       const store = new ForgeWorkflowStore(services.pluginData!);
       await store.write([worker]);
+      app = await buildServer(config, services);
       for (let attempt = 0; attempt < 3; attempt++) {
         const response = await app.inject({
           method: "POST", url: "/api/hooks/forge.worker.resume", headers: { host: "127.0.0.1:3001" },
@@ -54,7 +55,7 @@ describe("Forge in the composed CloudX server", () => {
       close.mockRestore();
       launch.mockRestore();
       fetcher.mockRestore();
-      await app.close();
+      await app?.close();
       await fs.rm(root, { recursive: true, force: true });
     }
   });
@@ -154,7 +155,7 @@ describe("Forge in the composed CloudX server", () => {
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const services = buildServices(config, logger);
     await services.pluginContributionsReady;
-    const app = await buildServer(config, services);
+    let app: Awaited<ReturnType<typeof buildServer>> | undefined;
     const repository: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "fixture/project" };
     const workerId = "33333333-3333-4333-8333-333333333333";
     const attemptId = "44444444-4444-4444-8444-444444444444";
@@ -171,6 +172,7 @@ describe("Forge in the composed CloudX server", () => {
         status: "completed", baseBranch: "main", templateId: "review", autoPost: false,
         startedAt: "2026-09-15T12:00:00.000Z", updatedAt: "2026-09-15T12:00:00.000Z",
       }]);
+      app = await buildServer(config, services);
       await services.forge!.poll();
       expect(logger.warn).toHaveBeenCalledWith(expect.objectContaining({ event: "provider_request_failed", workerId, attemptId,
         forgeRequest: expect.objectContaining({ operation, failure: "rate_limited", httpStatus: 429, retryAfterMs: 120_000, rateLimitLimit: 5000, rateLimitRemaining: 0, providerRequestId: "ABCD:1234:ABCD:1234:ABCD" }),
@@ -182,7 +184,7 @@ describe("Forge in the composed CloudX server", () => {
     } finally {
       fetcher.mockRestore();
       credential.mockRestore();
-      await app.close();
+      await app?.close();
       await fs.rm(root, { recursive: true, force: true });
     }
   });

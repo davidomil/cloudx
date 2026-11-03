@@ -59,6 +59,8 @@ export interface ForgeSettings {
   maxRunMinutes: number;
 }
 interface Runtime {
+  beginCooperationContinuation?(tabId: string): Promise<boolean>;
+  abortCooperationContinuation?(tabId: string): Promise<void>;
   createDiagnosticSnapshot?(
     workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
     attemptId: string,
@@ -129,6 +131,7 @@ interface Runtime {
       claudeLaunchMode?: ClaudeLaunchMode;
       prompt: string;
       preserveConversation?: true;
+      cooperationContinuationOf?: string;
       windowId: string;
       paneId: string;
     },
@@ -288,9 +291,16 @@ export class ForgeWorkflowService {
   private readonly requestedActions = new Map<string, { phase: string; queuedAt: number; startedAt?: number }>();
   private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
+  private readonly cooperationContinuations = new Map<string, string>();
+  private readonly stateListeners = new Set<(workers: ForgeWorker[]) => void>();
   private readonly nextAutoReviewCheckAt = new Map<string, number>();
   private readonly providerRecoveries = new Map<string, ProviderRecovery>();
   constructor(private readonly deps: ForgeWorkflowDependencies) {}
+
+  onStateChange(listener: (workers: ForgeWorker[]) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
 
   start(): void {
     if (this.timer || this.disposed) return;
@@ -980,6 +990,8 @@ export class ForgeWorkflowService {
       if (issue && (issue.number !== parent!.number || issue.state !== "open"))
         throw new Error("Continuation requires the original issue to remain open.");
       controller.signal.throwIfAborted();
+      if (worker.tabId && await this.deps.runtime.beginCooperationContinuation?.(worker.tabId))
+        this.cooperationContinuations.set(worker.id, worker.tabId);
       for (const member of members) {
         await this.recoverResources(member);
         await this.quiesce(member, { retainReport: Boolean(member.completion && !member.completion.readyAt) });
@@ -1028,6 +1040,10 @@ export class ForgeWorkflowService {
     } catch (error) {
       await this.fail(worker, error, { retryProvider: false });
       throw error;
+    } finally {
+      const source = this.cooperationContinuations.get(worker.id);
+      this.cooperationContinuations.delete(worker.id);
+      if (source) await this.deps.runtime.abortCooperationContinuation?.(source);
     }
 
   }
@@ -2925,6 +2941,7 @@ export class ForgeWorkflowService {
         claudeLaunchMode: worker.kind === "issue" ? settings.workerClaudeLaunchMode : settings.reviewClaudeLaunchMode,
         prompt,
         ...(worker.kind === "issue" ? { preserveConversation: true as const } : {}),
+        ...(this.cooperationContinuations.has(worker.id) ? { cooperationContinuationOf: this.cooperationContinuations.get(worker.id)! } : {}),
         ...placement,
       },
       signal,
@@ -3340,7 +3357,7 @@ export class ForgeWorkflowService {
       this.reserveWorker(this.requireWorker(id));
       requested.startedAt = Date.now();
       return operation();
-    }).finally(() => this.requestedActions.delete(id));
+    }).finally(() => { this.requestedActions.delete(id); this.emitStateChange(); });
   }
   private relatedWorkers(worker: ForgeWorker): ForgeWorker[] {
     const number = changeNumber(worker);
@@ -3387,8 +3404,10 @@ export class ForgeWorkflowService {
     this.reserveWorker(worker);
     try { return await operation(); }
     finally {
+      let released = false;
       for (const [id, reservation] of this.reservations)
-        if (reservation.owner === owner && !existing.has(id)) this.releaseWorker(id);
+        if (reservation.owner === owner && !existing.has(id)) { this.releaseWorker(id); released = true; }
+      if (released) this.emitStateChange();
     }
   }
   private async waitForWorkerIO<T>(worker: ForgeWorker, phase: string, operation: () => Promise<T>): Promise<T> {
@@ -3451,6 +3470,7 @@ export class ForgeWorkflowService {
     for (const worker of this.workers)
       if (!this.isReserved(worker) && worker.status !== "running") worker.updatedAt = now;
     await this.deps.store.write(this.workers);
+    this.emitStateChange();
     for (const worker of this.workers) {
       const state = JSON.stringify([worker.status, worker.attemptId, worker.autoReview?.phase, worker.draft?.status]);
       if (this.loggedWorkerStates.get(worker.id) !== state) {
@@ -3478,6 +3498,13 @@ export class ForgeWorkflowService {
         )
       )
         this.operations.delete(worker.id);
+  }
+  private emitStateChange(): void {
+    if (this.disposed) return;
+    for (const listener of this.stateListeners) {
+      try { listener(this.workerSnapshots()); }
+      catch (error) { forgeLog(this.deps.logger, "warn", "worker_state_listener_failed", forgeErrorFields(error)); }
+    }
   }
   private exclusive<T>(operation: () => Promise<T>): Promise<T> {
     const queuedAt = Date.now();
@@ -3557,9 +3584,11 @@ export class ForgeWorkflowService {
       return operation();
     }, () => {
       const owner = this.queue.current();
+      let released = false;
       for (const [id, reservation] of this.reservations)
-        if (reservation.owner === owner) this.releaseWorker(id);
+        if (reservation.owner === owner) { this.releaseWorker(id); released = true; }
       if (owner) this.operationTimes.delete(owner);
+      if (released) this.emitStateChange();
     });
   }
 }

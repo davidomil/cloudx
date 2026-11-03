@@ -1,0 +1,448 @@
+{
+  "schemaVersion": 1,
+  "boardId": "board-sketch-wip",
+  "title": "Draft template: Sketch with protected work in progress",
+  "revision": 8,
+  "status": "active",
+  "eventCursor": 16,
+  "members": [
+    {
+      "tabId": "tab-codex",
+      "providerId": "codex",
+      "label": "Codex Architect",
+      "assignmentGeneration": 1,
+      "role": "responder"
+    },
+    {
+      "tabId": "tab-claude",
+      "providerId": "claude",
+      "label": "Claude Reviewer",
+      "assignmentGeneration": 1,
+      "role": "observer"
+    }
+  ],
+  "items": [
+    {
+      "id": "manual-drawing",
+      "kind": "drawing",
+      "revision": 1,
+      "geometry": {
+        "x": 120,
+        "y": 170,
+        "width": 570,
+        "height": 270,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "David's unfinished browser-service-store sketch",
+        "description": "Work in progress. Three hand-drawn boxes and an unfinished arrow show a possible browser, service, and receipt store. The layout and labels are not final. Stroke coordinates are relative to this drawing item's local origin.",
+        "strokes": [
+          {
+            "id": "stroke-browser",
+            "points": [
+              [
+                20,
+                30,
+                0.5
+              ],
+              [
+                150,
+                32,
+                0.6
+              ],
+              [
+                148,
+                110,
+                0.5
+              ],
+              [
+                18,
+                108,
+                0.4
+              ],
+              [
+                20,
+                30,
+                0.5
+              ]
+            ],
+            "color": "#E0E0E0",
+            "width": 2.5
+          },
+          {
+            "id": "stroke-service",
+            "points": [
+              [
+                240,
+                34,
+                0.5
+              ],
+              [
+                380,
+                32,
+                0.6
+              ],
+              [
+                382,
+                112,
+                0.5
+              ],
+              [
+                238,
+                110,
+                0.4
+              ],
+              [
+                240,
+                34,
+                0.5
+              ]
+            ],
+            "color": "#E0E0E0",
+            "width": 2.5
+          },
+          {
+            "id": "stroke-store",
+            "points": [
+              [
+                430,
+                160,
+                0.5
+              ],
+              [
+                540,
+                160,
+                0.5
+              ],
+              [
+                542,
+                240,
+                0.6
+              ],
+              [
+                432,
+                242,
+                0.4
+              ],
+              [
+                430,
+                160,
+                0.5
+              ]
+            ],
+            "color": "#E0E0E0",
+            "width": 2.5
+          },
+          {
+            "id": "stroke-arrow",
+            "points": [
+              [
+                152,
+                72,
+                0.3
+              ],
+              [
+                190,
+                70,
+                0.6
+              ],
+              [
+                218,
+                71,
+                0.2
+              ]
+            ],
+            "color": "#F59E0B",
+            "width": 3
+          }
+        ]
+      }
+    },
+    {
+      "id": "sketch-reference",
+      "kind": "image",
+      "revision": 1,
+      "geometry": {
+        "x": 120,
+        "y": 500,
+        "width": 460,
+        "height": 290,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "Generated visual reference (concept)",
+        "assetId": "reference",
+        "alt": "Concept image of a CloudX board with proposal notes and a payment-system flowchart. This is not evidence of a working payment service."
+      }
+    },
+    {
+      "id": "draft-diamond",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 760,
+        "y": 200,
+        "width": 210,
+        "height": 130,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "Receipt valid? (unfinished)",
+        "shape": "diamond",
+        "label": "Receipt valid? (unfinished)"
+      }
+    },
+    {
+      "id": "outside-comment",
+      "kind": "note",
+      "revision": 1,
+      "geometry": {
+        "x": 1150,
+        "y": 160,
+        "width": 400,
+        "height": 190,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-claude",
+      "updatedBy": "agent:tab-claude",
+      "content": {
+        "title": "Comment outside your work area",
+        "blocks": [
+          {
+            "id": "outside-comment-block",
+            "revision": 1,
+            "text": "When you mark the region Ready, I can propose editable shapes from the sketch. I will leave the unfinished drawing and its layout unchanged while you work."
+          }
+        ]
+      }
+    },
+    {
+      "id": "receive-shape",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 1100,
+        "y": 500,
+        "width": 180,
+        "height": 100,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Receive",
+        "shape": "ellipse",
+        "label": "Receive"
+      }
+    },
+    {
+      "id": "validate-shape",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 1390,
+        "y": 500,
+        "width": 180,
+        "height": 100,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Validate",
+        "shape": "rectangle",
+        "label": "Validate"
+      }
+    },
+    {
+      "id": "store-shape",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 1680,
+        "y": 500,
+        "width": 180,
+        "height": 100,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Store receipt",
+        "shape": "cylinder",
+        "label": "Store receipt"
+      }
+    }
+  ],
+  "connections": [
+    {
+      "id": "receive-to-validate",
+      "revision": 1,
+      "from": {
+        "itemId": "receive-shape",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "validate-shape",
+        "port": "west"
+      },
+      "direction": "forward",
+      "description": "Proposed: check the receipt",
+      "waypoints": [],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    },
+    {
+      "id": "validate-to-store",
+      "revision": 1,
+      "from": {
+        "itemId": "validate-shape",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "store-shape",
+        "port": "west"
+      },
+      "direction": "forward",
+      "description": "Proposed: store a validated receipt",
+      "waypoints": [],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    },
+    {
+      "id": "sketch-to-diamond",
+      "revision": 1,
+      "from": {
+        "itemId": "manual-drawing",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "draft-diamond",
+        "port": "west"
+      },
+      "direction": "none",
+      "description": "User's unfinished interpretation",
+      "waypoints": [],
+      "createdBy": "user:david",
+      "updatedBy": "user:david"
+    }
+  ],
+  "regions": [
+    {
+      "id": "david-wip",
+      "revision": 1,
+      "title": "Work in progress: David is editing",
+      "geometry": {
+        "x": 60,
+        "y": 100,
+        "width": 970,
+        "height": 750,
+        "rotation": 0
+      },
+      "ownerActor": "user:david",
+      "mode": "wip",
+      "protectedItemIds": [
+        "manual-drawing",
+        "sketch-reference",
+        "draft-diamond"
+      ]
+    },
+    {
+      "id": "ready-flow",
+      "revision": 1,
+      "title": "Editable proposal outside the reserved area",
+      "geometry": {
+        "x": 1060,
+        "y": 440,
+        "width": 850,
+        "height": 220,
+        "rotation": 0
+      },
+      "ownerActor": "user:david",
+      "mode": "ready",
+      "protectedItemIds": []
+    }
+  ],
+  "reactions": [
+    {
+      "id": "wip-question",
+      "revision": 1,
+      "kind": "question",
+      "glyph": "?",
+      "description": "Should this diagram branch before storage? Comment outside the reserved area.",
+      "target": {
+        "kind": "region",
+        "id": "david-wip"
+      },
+      "author": "user:david",
+      "threadId": "thread-wip"
+    },
+    {
+      "id": "wip-custom",
+      "revision": 1,
+      "kind": "custom",
+      "glyph": "✎",
+      "description": "I am still arranging these objects.",
+      "target": {
+        "kind": "item",
+        "id": "manual-drawing"
+      },
+      "author": "user:david"
+    },
+    {
+      "id": "idea-flow",
+      "revision": 1,
+      "kind": "idea",
+      "glyph": "+",
+      "description": "This separate proposal can be discussed while the sketch remains protected.",
+      "target": {
+        "kind": "connection",
+        "id": "receive-to-validate"
+      },
+      "author": "agent:tab-codex"
+    }
+  ],
+  "threads": [
+    {
+      "id": "thread-wip",
+      "revision": 1,
+      "target": {
+        "kind": "region",
+        "id": "david-wip"
+      },
+      "questionReactionId": "wip-question",
+      "status": "open",
+      "messages": [
+        {
+          "id": "msg-wip-question",
+          "author": "user:david",
+          "text": "Should this diagram branch before storage? Comment outside the reserved area.",
+          "sourceRefs": []
+        },
+        {
+          "id": "msg-wip-comment",
+          "author": "agent:tab-claude",
+          "text": "A validity branch is one possible design. I left a separate proposal outside your region and have not changed your draft. We can compare it when you mark the sketch Ready.",
+          "sourceRefs": []
+        }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "id": "reference",
+      "mime": "image/png",
+      "sha256": "2d06be8acfe419c5a8878300d2aa653323a838b3c28da2f55ebf0d6893baacbf",
+      "byteLength": 1510788,
+      "width": 1586,
+      "height": 992,
+      "relativePath": "assets/reference.png"
+    }
+  ]
+}

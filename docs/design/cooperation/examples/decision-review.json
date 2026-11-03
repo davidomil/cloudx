@@ -1,0 +1,436 @@
+{
+  "schemaVersion": 1,
+  "boardId": "board-decision-review",
+  "title": "Draft template: Decision review",
+  "revision": 21,
+  "status": "active",
+  "eventCursor": 42,
+  "members": [
+    {
+      "tabId": "tab-codex",
+      "providerId": "codex",
+      "label": "Codex Architect",
+      "assignmentGeneration": 1,
+      "role": "responder"
+    },
+    {
+      "tabId": "tab-claude",
+      "providerId": "claude",
+      "label": "Claude Reviewer",
+      "assignmentGeneration": 1,
+      "role": "observer"
+    }
+  ],
+  "items": [
+    {
+      "id": "review-decision",
+      "kind": "note",
+      "revision": 1,
+      "geometry": {
+        "x": 120,
+        "y": 100,
+        "width": 580,
+        "height": 280,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Proposal: durable queue",
+        "blocks": [
+          {
+            "id": "review-return",
+            "revision": 1,
+            "text": "Proposal: checkout returns after the payment receipt is durable."
+          },
+          {
+            "id": "review-replay",
+            "revision": 1,
+            "text": "The proposed ledger worker can replay failed work."
+          },
+          {
+            "id": "review-open",
+            "revision": 1,
+            "text": "Open question: does replay touch the payment provider?"
+          }
+        ]
+      }
+    },
+    {
+      "id": "unicode-note",
+      "kind": "note",
+      "revision": 1,
+      "geometry": {
+        "x": 120,
+        "y": 450,
+        "width": 580,
+        "height": 130,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "Anchor example",
+        "blocks": [
+          {
+            "id": "unicode-block",
+            "revision": 1,
+            "text": "🔎 Review café receipt routing with Claude."
+          }
+        ]
+      }
+    },
+    {
+      "id": "provider-shape",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 870,
+        "y": 110,
+        "width": 240,
+        "height": 110,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Payment provider",
+        "shape": "rectangle",
+        "label": "Payment provider"
+      }
+    },
+    {
+      "id": "review-ledger",
+      "kind": "shape",
+      "revision": 1,
+      "geometry": {
+        "x": 870,
+        "y": 390,
+        "width": 240,
+        "height": 110,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Ledger worker",
+        "shape": "rectangle",
+        "label": "Ledger worker"
+      }
+    },
+    {
+      "id": "dedupe-code",
+      "kind": "code",
+      "revision": 1,
+      "geometry": {
+        "x": 1190,
+        "y": 100,
+        "width": 420,
+        "height": 230,
+        "rotation": 0
+      },
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex",
+      "content": {
+        "title": "Pseudocode: receipt handling",
+        "language": "text",
+        "blocks": [
+          {
+            "id": "dedupe-block",
+            "revision": 1,
+            "text": "if receipt is already recorded:\n    acknowledge the existing result\nelse:\n    record the receipt\n\nProposal only: transaction boundary still needs design."
+          }
+        ]
+      }
+    },
+    {
+      "id": "review-reference",
+      "kind": "image",
+      "revision": 1,
+      "geometry": {
+        "x": 1190,
+        "y": 400,
+        "width": 400,
+        "height": 250,
+        "rotation": 0
+      },
+      "createdBy": "user:david",
+      "updatedBy": "user:david",
+      "content": {
+        "title": "Generated visual reference (concept)",
+        "assetId": "reference",
+        "alt": "Concept image of a CloudX board with proposal notes and a payment-system flowchart. This is not evidence of a working payment service."
+      }
+    }
+  ],
+  "connections": [
+    {
+      "id": "provider-to-review-ledger",
+      "revision": 1,
+      "from": {
+        "itemId": "provider-shape",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "review-ledger",
+        "port": "west"
+      },
+      "direction": "forward",
+      "description": "Proposal: record receipt only; do not charge during replay",
+      "waypoints": [
+        [
+          1150,
+          165
+        ],
+        [
+          1150,
+          445
+        ]
+      ],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    },
+    {
+      "id": "code-explains-replay",
+      "revision": 1,
+      "from": {
+        "itemId": "dedupe-code",
+        "port": "east"
+      },
+      "to": {
+        "itemId": "review-ledger",
+        "port": "west"
+      },
+      "direction": "both",
+      "description": "Review the proposed handling rule alongside this worker",
+      "waypoints": [],
+      "createdBy": "agent:tab-codex",
+      "updatedBy": "agent:tab-codex"
+    }
+  ],
+  "regions": [],
+  "reactions": [
+    {
+      "id": "question-replay",
+      "revision": 1,
+      "kind": "question",
+      "glyph": "?",
+      "description": "Could replay charge a customer twice?",
+      "target": {
+        "kind": "item",
+        "id": "review-decision",
+        "anchor": {
+          "blockId": "review-replay",
+          "blockRevision": 1,
+          "start": 31,
+          "end": 49,
+          "exact": "replay failed work",
+          "prefix": "The proposed ledger worker can ",
+          "suffix": ".",
+          "status": "attached"
+        }
+      },
+      "author": "user:david",
+      "threadId": "thread-replay"
+    },
+    {
+      "id": "question-unicode",
+      "revision": 1,
+      "kind": "question",
+      "glyph": "?",
+      "description": "Does this anchor survive emoji and accented text?",
+      "target": {
+        "kind": "item",
+        "id": "unicode-note",
+        "anchor": {
+          "blockId": "unicode-block",
+          "blockRevision": 1,
+          "start": 9,
+          "end": 21,
+          "exact": "café receipt",
+          "prefix": "🔎 Review ",
+          "suffix": " routing with Claude.",
+          "status": "attached"
+        }
+      },
+      "author": "user:david",
+      "threadId": "thread-unicode"
+    },
+    {
+      "id": "concern-evidence",
+      "revision": 1,
+      "kind": "concern",
+      "glyph": "!",
+      "description": "This boundary is a proposal until checked against an implementation.",
+      "target": {
+        "kind": "connection",
+        "id": "provider-to-review-ledger"
+      },
+      "author": "agent:tab-claude"
+    },
+    {
+      "id": "agree-explanation",
+      "revision": 1,
+      "kind": "agree",
+      "glyph": "✓",
+      "description": "The distinction is clear; keep the evidence gap visible.",
+      "target": {
+        "kind": "threadMessage",
+        "id": "msg-replay-answer"
+      },
+      "author": "user:david"
+    },
+    {
+      "id": "question-removed-connection",
+      "revision": 1,
+      "kind": "question",
+      "glyph": "?",
+      "description": "Why was this replay connection removed?",
+      "target": {
+        "kind": "connection",
+        "id": "removed-provider-replay",
+        "snapshot": {
+          "removedAtBoardRevision": 20,
+          "record": {
+            "id": "removed-provider-replay",
+            "revision": 3,
+            "from": {
+              "itemId": "provider-shape",
+              "port": "east"
+            },
+            "to": {
+              "itemId": "review-ledger",
+              "port": "west"
+            },
+            "direction": "forward",
+            "description": "Withdrawn proposal: call the payment provider during replay",
+            "waypoints": [],
+            "createdBy": "agent:tab-former-reviewer",
+            "updatedBy": "agent:tab-former-reviewer"
+          }
+        }
+      },
+      "author": "user:david",
+      "threadId": "thread-removed-connection"
+    }
+  ],
+  "threads": [
+    {
+      "id": "thread-replay",
+      "revision": 2,
+      "target": {
+        "kind": "item",
+        "id": "review-decision",
+        "anchor": {
+          "blockId": "review-replay",
+          "blockRevision": 1,
+          "start": 31,
+          "end": 49,
+          "exact": "replay failed work",
+          "prefix": "The proposed ledger worker can ",
+          "suffix": ".",
+          "status": "attached"
+        }
+      },
+      "questionReactionId": "question-replay",
+      "status": "answered",
+      "messages": [
+        {
+          "id": "msg-replay-question",
+          "author": "user:david",
+          "text": "Could replay charge a customer twice?",
+          "sourceRefs": []
+        },
+        {
+          "id": "msg-replay-answer",
+          "author": "agent:tab-codex",
+          "text": "In this proposal, replay updates the ledger from a receipt and does not call the payment provider. That is an intended boundary, not verified behavior. The implementation must demonstrate it before we rely on it.",
+          "sourceRefs": []
+        }
+      ]
+    },
+    {
+      "id": "thread-unicode",
+      "revision": 1,
+      "target": {
+        "kind": "item",
+        "id": "unicode-note",
+        "anchor": {
+          "blockId": "unicode-block",
+          "blockRevision": 1,
+          "start": 9,
+          "end": 21,
+          "exact": "café receipt",
+          "prefix": "🔎 Review ",
+          "suffix": " routing with Claude.",
+          "status": "attached"
+        }
+      },
+      "questionReactionId": "question-unicode",
+      "status": "open",
+      "messages": [
+        {
+          "id": "msg-unicode-question",
+          "author": "user:david",
+          "text": "Does this anchor survive emoji and accented text?",
+          "sourceRefs": []
+        }
+      ]
+    },
+    {
+      "id": "thread-removed-connection",
+      "revision": 2,
+      "target": {
+        "kind": "connection",
+        "id": "removed-provider-replay",
+        "snapshot": {
+          "removedAtBoardRevision": 20,
+          "record": {
+            "id": "removed-provider-replay",
+            "revision": 3,
+            "from": {
+              "itemId": "provider-shape",
+              "port": "east"
+            },
+            "to": {
+              "itemId": "review-ledger",
+              "port": "west"
+            },
+            "direction": "forward",
+            "description": "Withdrawn proposal: call the payment provider during replay",
+            "waypoints": [],
+            "createdBy": "agent:tab-former-reviewer",
+            "updatedBy": "agent:tab-former-reviewer"
+          }
+        }
+      },
+      "questionReactionId": "question-removed-connection",
+      "status": "answered",
+      "messages": [
+        {
+          "id": "msg-removed-question",
+          "author": "user:david",
+          "text": "Why was this replay connection removed?",
+          "sourceRefs": []
+        },
+        {
+          "id": "msg-removed-answer",
+          "author": "agent:tab-codex",
+          "text": "The removed connector represented a charge call during replay. That proposal was withdrawn; the current proposal keeps replay within receipt-based ledger work. The stored connector preserves what your question referred to. These are design proposals, not verified payment behavior.",
+          "sourceRefs": []
+        }
+      ]
+    }
+  ],
+  "assets": [
+    {
+      "id": "reference",
+      "mime": "image/png",
+      "sha256": "2d06be8acfe419c5a8878300d2aa653323a838b3c28da2f55ebf0d6893baacbf",
+      "byteLength": 1510788,
+      "width": 1586,
+      "height": 992,
+      "relativePath": "assets/reference.png"
+    }
+  ]
+}

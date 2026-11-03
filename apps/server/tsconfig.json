@@ -10,5 +10,5 @@
     { "path": "../../packages/shared" },
     { "path": "../../packages/plugin-api" }
   ],
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.json"]
 }

@@ -23,6 +23,7 @@ tab list.
 | [Documentation](documentation.md)          | New tab                   | Import source material, search and inspect the archive.         |
 | [Jira](jira.md)                            | New tab                   | Read assigned work and act on issues.                           |
 | [Forge Workers](forge.md)                  | New tab                   | Run issue and review workers against GitHub or GitLab.          |
+| [Cooperation](../design/cooperation/runtime.md) | New tab / AI tab menu | Design, draw, ask questions, and review work with your agents. |
 | [Automation](automation.md)                | New tab                   | Connect triggers, hooks and execution steps in a graph.         |
 | [Rules & Skills](rules-skills.md)          | New tab / window settings | Manage reusable Codex instructions and templates.               |
 | [Codex Settings](codex-settings.md)        | Settings \> Codex         | Set shared model and service-tier defaults for future sessions. |
@@ -32,7 +33,7 @@ tab list.
 | [Audio AI](audio-ai.md)                    | Toolbar / command console | Use optional typed commands and microphone control.             |
 | [Notifications](notifications.md)          | Toolbar bell / Automation | Show local workflow messages and optional browser alerts.       |
 
-Ten tab plugins and six supporting plugins.
+Eleven tab plugins and six supporting plugins.
 
 ## Combine plugins
 

@@ -1,0 +1,16 @@
+direction: down
+browser: "CloudX browser\nCanvas + text outline"
+plugin: "CooperationPlugin\nUI contributions + hooks + skills"
+service: "BlackboardService\ncommands + membership + WIP + inbox"
+store: "BlackboardRepository\natomic state.json + original assets"
+files: "BoardFileProjection\nblackboard.json + blackboard.md"
+agent: "Codex / Claude tab\ncontext locator + cooperation skills"
+port: "AgentFeedbackPort\nprovider + managed-run control"
+recipient: "Addressed AI session\nSame tab receives feedback"
+browser -> plugin: "validated commands"
+plugin -> service
+agent -> service: "helper reads / transactions"
+service -> store: "single durable authority"
+service -> files: "derived virtual files"
+service -> port: "addressed feedback"
+port -> recipient: "control channel"

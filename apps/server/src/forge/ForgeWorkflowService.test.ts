@@ -112,6 +112,8 @@ function fixture(issueNumber = 1) {
     launch: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["launch"]>[0], _signal?: AbortSignal) => "tab-1"),
     readTurnCompletion: vi.fn(async (workerId: string, attemptId: string): Promise<ForgeTurnCompletion | undefined> => ({ workerId, attemptId, threadId: `thread-${workerId}`, turnId: `turn-${attemptId}`, status: (await reports.read.getMockImplementation()?.(attemptId) ? "completed" : "running") as "running" | "completed" | "interrupted" | "failed", error: undefined as string | undefined })),
     finish: vi.fn(async (_tabId: string, _completion: Parameters<ForgeWorkflowDependencies["runtime"]["finish"]>[1]) => {}),
+    beginCooperationContinuation: vi.fn(async (_tabId: string) => false),
+    abortCooperationContinuation: vi.fn(async (_tabId: string) => {}),
     pause: vi.fn(async () => {}),
     close: vi.fn(async () => {}),
     cleanup: vi.fn(async (_input: Parameters<ForgeWorkflowDependencies["runtime"]["cleanup"]>[0]): ReturnType<ForgeWorkflowDependencies["runtime"]["cleanup"]> => {}),
@@ -1388,6 +1390,47 @@ describe("Manual worker continuation", () => {
     expect(f.runtime.launch.mock.calls.at(-1)![0].prompt).toContain("Do not push");
     expect(f.runtime.publishBranch).not.toHaveBeenCalled();
     expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("holds the assigned cooperation board across the owner's old-tab close and transfers only this worker's launch", async () => {
+    const f = await pausedIssue();
+    f.runtime.beginCooperationContinuation.mockResolvedValue(true);
+    const continued = await f.service.continueWorker(f.worker.id, "Answer the addressed board question.", placement);
+    expect(f.runtime.beginCooperationContinuation).toHaveBeenCalledExactlyOnceWith(f.worker.tabId);
+    expect(f.runtime.launch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.worker.id, preserveConversation: true, cooperationContinuationOf: f.worker.tabId }), expect.any(AbortSignal));
+    expect(f.runtime.beginCooperationContinuation.mock.invocationCallOrder[0]).toBeLessThan(f.runtime.close.mock.invocationCallOrder[0]);
+    expect(f.runtime.abortCooperationContinuation).toHaveBeenCalledExactlyOnceWith(f.worker.tabId);
+    expect(continued.status).toBe("running");
+  });
+
+  it("releases the cooperation continuation scope on a failed replacement without trying another turn", async () => {
+    const f = await pausedIssue();
+    f.runtime.beginCooperationContinuation.mockResolvedValue(true);
+    f.runtime.launch.mockRejectedValueOnce(new Error("The replacement launch failed."));
+    await expect(f.service.continueWorker(f.worker.id, "Answer the board question.", placement)).rejects.toThrow("replacement launch failed");
+    expect(f.runtime.abortCooperationContinuation).toHaveBeenCalledExactlyOnceWith(f.worker.tabId);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.stored()[0].status).toBe("failed");
+  });
+
+  it("publishes owner readiness after persistence and lets subscribers detach", async () => {
+    const f = fixture();
+    const observed: ForgeWorker[][] = [];
+    const unsubscribe = f.service.onStateChange(workers => {
+      expect(workers.map(({ activity: _activity, ...worker }) => worker)).toEqual(f.stored());
+      observed.push(workers);
+    });
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    expect(observed.some(workers => workers.some(current => current.id === worker.id && current.status === "running"))).toBe(true);
+    observed.at(-1)![0].title = "Subscriber mutation";
+    expect((await f.service.dashboard()).workers[0].title).not.toBe("Subscriber mutation");
+    await f.service.pause(worker.id);
+    expect(observed.at(-1)![0]).toMatchObject({ status: "paused" });
+    expect(observed.at(-1)![0].activity).toBeUndefined();
+    unsubscribe();
+    const count = observed.length;
+    await f.service.stop(worker.id);
+    expect(observed).toHaveLength(count);
   });
 
   it("includes the previous failure alongside the user's message", async () => {

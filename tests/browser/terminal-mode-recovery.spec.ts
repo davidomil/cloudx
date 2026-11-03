@@ -419,7 +419,9 @@ async function recoverTerminal(
     await stopTestProcess(server);
     await startServer();
   }
-  await expect.poll(() => screenCount(page)).toBeGreaterThan(screens);
+  await expect
+    .poll(() => screenCount(page), { intervals: [100] })
+    .toBeGreaterThan(screens);
   await page.locator(".xterm-helper-textarea").focus();
 }
 
@@ -532,7 +534,7 @@ async function startServer() {
           () => 0,
         );
       },
-      { timeout: 10_000 },
+      { timeout: 10_000, intervals: [100] },
     )
     .toBe(200);
 }

@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentAccountsState, WorkspaceTab } from "@cloudx/shared";
 
-import { AgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
 import { AgentAccountsPanel } from "./AgentAccountsPanel.js";
 
 let root: Root | undefined;
@@ -72,6 +72,38 @@ describe("AgentSwitchMenu", () => {
     await act(async () => container.querySelector<HTMLButtonElement>('[role="menuitem"]')!.click());
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("still active");
     expect(onClose).not.toHaveBeenCalled();
+  });
+});
+
+describe("Blackboard access from every agent tab", () => {
+  it("assigns a plugin-owned agent with account management unavailable", async () => {
+    const summary = { boardId: "design", title: "Shared design", revision: 1, status: "active", eventCursor: 1, members: [], itemCount: 0, openQuestions: 0 };
+    vi.stubGlobal("WebSocket", class { addEventListener() {} close() {} });
+    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/boards") ? [summary] : { assignment: { boardId: "design" } })));
+    vi.stubGlobal("fetch", fetchMock);
+    const callHook = vi.fn();
+    const onClose = vi.fn();
+    const container = await render(createElement(AgentSwitchMenu, { tab: { ...tab, ownerPluginId: "forge" }, x: 10, y: 10, callHook, accountsEnabled: false, cooperationEnabled: true, onOpenBoard: vi.fn(), onSwitched: vi.fn(), onOpenAccounts: vi.fn(), onClose }));
+    expect(callHook).not.toHaveBeenCalled();
+    expect(container.textContent).not.toContain("Manage accounts");
+    const option = container.querySelector<HTMLButtonElement>('[role="menuitemradio"]')!;
+    expect(option.textContent).toContain("Shared design");
+    await act(async () => option.click());
+    expect(fetchMock).toHaveBeenCalledWith("/api/cooperation/assignments/tab-1", expect.objectContaining({ method: "PUT", body: JSON.stringify({ boardId: "design" }) }));
+    expect(onClose).toHaveBeenCalled();
+  });
+  it("opens an owned tab's menu with Shift+F10 and restores focus on dismissal", async () => {
+    function Trigger() {
+      const menu = useAgentSwitchMenu(true);
+      return createElement("div", null, createElement("button", { ...menu.tabHandlers({ ...tab, ownerPluginId: "forge" }), onClick: menu.close }, "Owned agent"), menu.position ? createElement("span", { role: "status" }, menu.position.tabId) : null);
+    }
+    const container = await render(createElement(Trigger));
+    const trigger = container.querySelector<HTMLButtonElement>("button")!;
+    trigger.focus();
+    await act(async () => trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true })));
+    expect(container.querySelector('[role="status"]')?.textContent).toBe(tab.id);
+    await act(async () => trigger.click());
+    expect(container.querySelector('[role="status"]')).toBeNull();
   });
 });
 

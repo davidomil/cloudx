@@ -253,8 +253,18 @@ jobs:
           claude_version="$(node --input-type=module -e 'import { CLAUDE_CODE_VERSION } from "./scripts/install-cloudx.mjs"; console.log(CLAUDE_CODE_VERSION)')"
           npm install --global --prefix "$RUNNER_TEMP/claude" --no-audit --no-fund "@anthropic-ai/claude-code@$claude_version"
       - name: Require the CLI flags, login status and hook receipts CloudX relies on
+        env:
+          CLOUDX_COOPERATION_NATIVE_DIAGNOSTICS_DIR: ${{ runner.temp }}/claude-native-diagnostics
         run: |
-          CLOUDX_NATIVE_CLAUDE="$RUNNER_TEMP/claude/bin/claude" npx vitest run apps/server/src/agents
+          CLOUDX_NATIVE_CLAUDE="$RUNNER_TEMP/claude/bin/claude" npx vitest run apps/server/src/agents apps/server/src/cooperationAgent/CooperationNative.native.test.ts
+      - name: Retain Claude native failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: claude-native-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/claude-native-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 14
   terminal-stress:
     name: Terminal stress (Node 22, 2 CPUs, 7 GiB)
     runs-on: ubuntu-24.04
@@ -492,6 +502,13 @@ jobs:
         if: startsWith(matrix.lane, 'coverage-')
         working-directory: source
         run: git fetch --no-tags origin 465896c9ec4da70af5f312db3a35d2c137a5513c
+      - name: Free unused runner SDKs before building the verifier
+        if: runner.environment == 'github-hosted'
+        timeout-minutes: 5
+        run: |
+          df -B1 /
+          sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
+          df -B1 /
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Build the exact controller with immutable dependency layers
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
@@ -574,6 +591,13 @@ jobs:
           path: lane-results
       - name: Require all exact coverage shards before reading blobs
         run: node controller/containers/ci/aggregate.mjs "${{ github.sha }}" lane-results coverage-input coverage
+      - name: Free unused runner SDKs before building the verifier
+        if: runner.environment == 'github-hosted'
+        timeout-minutes: 5
+        run: |
+          df -B1 /
+          sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet
+          df -B1 /
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069
       - name: Build the exact controller with immutable dependency layers
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc

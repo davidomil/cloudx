@@ -43,6 +43,7 @@ export function stepRuns(condition, context, jobFailed) {
   const text = String(condition).trim();
   if (text === "always()") return true;
   if (text === "failure()") return jobFailed;
+  if (text === "runner.environment == 'github-hosted'") return !jobFailed && context.runnerEnvironment === "github-hosted";
   const prefix = /^startsWith\(matrix\.lane,\s*'([^']+)'\)$/u.exec(text);
   if (prefix) return !jobFailed && Boolean(context.lane?.startsWith(prefix[1]));
   throw new Error(`Unsupported step condition: ${text}`);

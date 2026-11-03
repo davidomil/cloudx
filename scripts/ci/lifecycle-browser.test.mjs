@@ -11,6 +11,124 @@ import {
   NativeLifecycleProvider,
 } from "./lifecycle-browser.mjs";
 
+describe("post-upgrade Settings readiness", () => {
+  async function fixture({ delayed = "backups", rejected } = {}) {
+    const evidenceDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "cloudx-update-readiness-"),
+    );
+    const targetSha = "b".repeat(40);
+    const preview = {
+      currentCommit: targetSha,
+      target: { commit: targetSha },
+      runtime: { commit: targetSha, verification: "verified" },
+      state: "current",
+    };
+    const profile = new LifecycleBrowserProfile({ evidenceDir });
+    profile.verifyPreservedProfile = vi.fn(async () => ({
+      settingsPreserved: true,
+    }));
+    const enabled = vi.fn(async () => {});
+    const panel = { getByRole: vi.fn(() => "update-button") };
+    profile.openUpdates = vi.fn(async () => panel);
+    profile.expect = (button) => ({
+      toBeEnabled: async () => {
+        expect(button).toBe("update-button");
+        await enabled();
+      },
+    });
+    let finishInventory;
+    const inventory = new Promise((resolve) => {
+      finishInventory = resolve;
+    });
+    const response = (route, body, status = 200) => ({
+      url: () => `http://localhost/api/system/update/${route}`,
+      request: () => ({ method: () => "GET" }),
+      status: () => status,
+      json: vi.fn(async () => (route === delayed ? inventory : body)),
+    });
+    const responses = [
+      response("preview", preview),
+      response("backups", { backups: [] }, rejected === "backups" ? 503 : 200),
+      response(
+        "backups/cleanup",
+        null,
+        rejected === "backups/cleanup" ? 503 : 200,
+      ),
+    ];
+    profile.page = {
+      waitForResponse: vi.fn(async (matches) => {
+        const selected = responses.find(matches);
+        if (!selected)
+          throw new Error("An unexpected Settings response was requested.");
+        return selected;
+      }),
+      screenshot: vi.fn(async () => {}),
+    };
+    return {
+      profile,
+      enabled,
+      preview,
+      responses,
+      finishInventory,
+      targetSha,
+      remove: () => fs.rm(evidenceDir, { recursive: true, force: true }),
+    };
+  }
+
+  it.each(["backups", "backups/cleanup"])(
+    "waits for the complete %s response before asserting the update can start again",
+    async (delayed) => {
+      const f = await fixture({ delayed });
+      try {
+        const verification = f.profile.verify({
+          targetSha: f.targetSha,
+          requiresInterruption: false,
+        });
+        await vi.waitFor(() =>
+          expect(
+            f.responses.find((response) => response.url().endsWith(delayed))
+              .json,
+          ).toHaveBeenCalledOnce(),
+        );
+        expect(f.enabled).not.toHaveBeenCalled();
+        expect(f.profile.page.screenshot).not.toHaveBeenCalled();
+        f.finishInventory(delayed === "backups" ? { backups: [] } : null);
+        await expect(verification).resolves.toMatchObject({
+          settingsPreserved: true,
+          nextPreflight: f.preview,
+        });
+        expect(f.enabled).toHaveBeenCalledOnce();
+        expect(f.profile.page.screenshot).toHaveBeenCalledOnce();
+        const [, inventoryOptions] =
+          f.profile.page.waitForResponse.mock.calls[1];
+        expect(inventoryOptions).toEqual({ timeout: 120_000 });
+      } finally {
+        await f.remove();
+      }
+    },
+  );
+
+  it.each(["backups", "backups/cleanup"])(
+    "rejects failed %s before claiming the updated Settings are ready",
+    async (rejected) => {
+      const f = await fixture({ rejected });
+      try {
+        await expect(
+          f.profile.verify({
+            targetSha: f.targetSha,
+            requiresInterruption: false,
+          }),
+        ).rejects.toThrow(/retained update backup/);
+        expect(f.enabled).not.toHaveBeenCalled();
+        expect(f.profile.page.screenshot).not.toHaveBeenCalled();
+      } finally {
+        f.finishInventory({ backups: [] });
+        await f.remove();
+      }
+    },
+  );
+});
+
 it("propagates a missing Settings response so lifecycle cleanup can retain the browser trace", () => {
   const result = spawnSync(
     process.execPath,

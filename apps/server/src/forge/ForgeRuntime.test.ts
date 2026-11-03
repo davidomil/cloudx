@@ -28,6 +28,7 @@ import { ForgeSettingsService } from "./ForgeSettingsService.js";
 import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { ForgeWorkerHistoryStore } from "./ForgeWorkerHistoryStore.js";
+import { BlackboardService } from "../cooperation/BlackboardService.js";
 import {
   ForgeRuntime,
   ForgeBranchConflictError,
@@ -3620,6 +3621,47 @@ if (hangMerge || hangFetch) {
 }
 
 describe("ForgeRuntime Codex tabs", () => {
+  it("transfers the cooperation board before a same-worker replacement reaches native execution", async () => {
+    const deps = dependencies();
+    const boards = new BlackboardService({ rootDir: path.join(deps.dataDir, "cooperation") }); await boards.init();
+    const board = await boards.createBoard({ title: "Worker architecture" });
+    const order: string[] = [];
+    deps.cooperation = {
+      begin: async tabId => { order.push("begin"); return boards.beginContinuation(tabId, { ownerPluginId: "forge", logicalRunId: "issue-1" }); },
+      transfer: async (source, target) => { order.push("transfer"); await boards.transferAssignment(source, { tabId: target, providerId: "codex", label: "Replacement" }, { ownerPluginId: "forge", logicalRunId: "issue-1", attemptId: "attempt-replacement" }); },
+      abort: async tabId => { order.push("abort"); await boards.abortContinuation(tabId); }
+    };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const source = workerTab(workspace);
+    const tabs = new Map([[source.id, source]]);
+    vi.mocked(deps.sessions.getTab).mockImplementation(id => tabs.get(id)!);
+    vi.mocked(deps.sessions.listTabs).mockImplementation(() => [...tabs.values()]);
+    await createWorkerContext(deps, source);
+    vi.mocked(deps.sessions.discardPreparedTab).mockImplementation(async id => { await boards.removeTab(id); tabs.delete(id); });
+    await runtime.recover(workspace.id);
+    await boards.assign({ tabId: source.id, providerId: "codex", label: "Source" }, board.boardId);
+    await runtime.pause(source.id);
+    expect(await runtime.beginCooperationContinuation(source.id)).toBe(true);
+    await runtime.close(source.id);
+    expect(boards.getBoard(board.boardId).status).toBe("active");
+    expect(boards.continuationForTab(source.id)?.sourceRemoved).toBe(true);
+    const target = { ...workerTab(workspace), id: "replacement-tab" };
+    vi.mocked(deps.workspaceCommands.createTab).mockImplementation(async (_request, options) => {
+      tabs.set(target.id, target); await createWorkerContext(deps, target);
+      await options!.prepareTerminalExecution!(target.id);
+      expect(boards.getBoard(board.boardId).members.map(member => member.tabId)).toEqual([target.id]);
+      order.push("native execution boundary");
+      return { tab: target } as Awaited<ReturnType<typeof deps.workspaceCommands.createTab>>;
+    });
+    expect(await runtime.launch({ id: workspace.id, attemptId: "attempt-replacement", worktreePath: workspace.worktreePath, templateId: "worker", ...codingModel,
+      prompt: "Answer the board", cooperationContinuationOf: source.id, windowId: "window", paneId: "pane" })).toBe(target.id);
+    await runtime.abortCooperationContinuation(source.id);
+    expect(order).toEqual(["begin", "transfer", "native execution boundary", "abort"]);
+    expect(boards.getBoard(board.boardId).status).toBe("active");
+    expect(boards.continuationForTab(source.id)).toBeUndefined();
+  });
+
   it.each(["pause", "close"] as const)("retains final terminal output through %s, tab cleanup and runtime restart", async action => {
     const deps = dependencies();
     runtime = new ForgeRuntime(deps);

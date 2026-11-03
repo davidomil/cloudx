@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions, type PluginTabControls } from "@cloudx/plugin-api";
 import { isForgeTurnCompletion, readAgentSelection, type ClaudeLaunchMode, type AgentSelection, type TabIndicatorUpdate } from "@cloudx/shared";
@@ -19,6 +20,7 @@ import type { TerminalProcessFactory } from "../../terminal/TerminalProcess.js";
 import { buildEnforcedLoginShellLaunch, buildToolEnv, resolveClaudeCommand } from "../../terminal/ShellLaunch.js";
 import type { AgentAccountStore } from "../AgentAccountStore.js";
 import type { AgentUsageRecorder } from "../usage/AgentUsageRecorder.js";
+import { cooperationLaunchEnv } from "../../cooperationAgent/AgentCooperationContext.js";
 import { claudeAccountLaunch, readAgentProviderStatus } from "../agentCli.js";
 import { AgentLaunchRecords } from "../AgentLaunchRecords.js";
 import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
@@ -105,7 +107,7 @@ export class ClaudeTerminal {
         throw new Error("Forge workers on Claude run without permission prompts. Accept Claude Code's bypass-permissions warning in Settings → Claude, then resume the worker.");
       account = await accounts.resolve("claude", agent.accountId);
       accountLaunch = claudeAccountLaunch(buildToolEnv(this.env), configDir, await accounts.launchEnv(account));
-      env = accountLaunch.env;
+      env = { ...accountLaunch.env, ...cooperationLaunchEnv(input.runtimeContext) };
       ({ launchInput, newSessionId } = await this.selectConversation(input, env));
       const resume = codexResumeInput(launchInput);
       if (resume && resume.mode !== "session") throw new Error("Select an exact saved Claude conversation to preserve its launch policy. Picker/last launches cannot verify the policy before work.");
@@ -141,9 +143,18 @@ export class ClaudeTerminal {
     let args: string[];
     try {
       await writeForgeTurnBinding(configDir, input.agentTurn, input.prepareAgentSession ? newSessionId ?? codexResumeInput(launchInput)?.sessionId : undefined);
+      const cooperationMcpConfig = env.CLOUDX_COOPERATION_CONTEXT ? path.join(configDir, ".cloudx-cooperation-mcp.json") : undefined;
+      if (cooperationMcpConfig) await writeTextFileAtomic(configDir, cooperationMcpConfig, `${JSON.stringify({ mcpServers: {
+        "cloudx-cooperation": {
+          command: process.execPath,
+          args: [fileURLToPath(new URL("../../../helpers/cooperation-claude-broker.mjs", import.meta.url)), configDir, input.tab.id, executionId],
+          env: { CLOUDX_COOPERATION_CONTEXT: env.CLOUDX_COOPERATION_CONTEXT, ...(input.agentTurn ? { CLOUDX_COOPERATION_OWNED: "1" } : {}) }
+        }
+      } })}\n`, "Claude cooperation MCP config", 0o600);
       args = buildClaudeLaunchArgs(launchInput, {
-        settings, settingsPath: overlay.settingsPath, instructionsPath: overlay.instructionsPath, configurationArgs: overlay.configurationArgs, addDirs: [overlay.rulesSkillsRoot], newSessionId,
-        deferPrompt: Boolean(input.agentTurn)
+        settings, settingsPath: overlay.settingsPath, instructionsPath: overlay.instructionsPath, configurationArgs: overlay.configurationArgs,
+        addDirs: [overlay.rulesSkillsRoot, ...(env.CLOUDX_COOPERATION_ASSETS ? [env.CLOUDX_COOPERATION_ASSETS] : [])],
+        newSessionId, cooperationMcpConfig, deferPrompt: Boolean(input.agentTurn)
       });
     } catch (error) {
       throw new PluginSessionNotStartedError(error);
@@ -160,7 +171,7 @@ export class ClaudeTerminal {
     await fs.rm(agentTurnReceiptPath(configDir), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
     // The selected account wins over credentials the user's profile exports.
-    const enforced = { set: accountLaunch.enforced.set,
+    const enforced = { set: { ...accountLaunch.enforced.set, ...cooperationLaunchEnv(input.runtimeContext) },
       unset: [...accountLaunch.enforced.unset, ...(mode.mode === "cloudx-managed" ? CLAUDE_MANAGED_SOURCE_ENV_KEYS : [])],
       rejectNonempty: ["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] };
     const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, enforced);

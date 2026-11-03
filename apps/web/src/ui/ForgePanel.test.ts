@@ -147,6 +147,32 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("opens blackboard assignment from managed worker tabs and from the native terminal header", async () => {
+    const summary = { boardId: "design", title: "Payment design", revision: 1, status: "active", eventCursor: 1, members: [{ tabId: workerTab.id, providerId: "codex", label: "Worker", assignmentGeneration: 1, role: "responder" }], itemCount: 0, openQuestions: 0 };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify([summary])));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("WebSocket", class { addEventListener() {} close() {} });
+    try {
+      const onOpenBlackboard = vi.fn();
+      const panel = await renderPanel(fixture({ workers: [worker] }), { workerTabs: [workerTab], onOpenBlackboard });
+      await click(panel, "Workers (1)");
+      const workerButton = panel.querySelector<HTMLButtonElement>('[role="tab"]')!;
+      await act(async () => workerButton.dispatchEvent(new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true })));
+      expect(panel.querySelector('[role="menu"]')?.textContent).toContain("Payment design");
+      expect(panel.querySelector('[role="menu"]')?.textContent).not.toContain("Manage accounts");
+      await click(panel, "Open assigned board");
+      expect(onOpenBlackboard).toHaveBeenLastCalledWith("design", "Payment design");
+      await click(panel, "Open blackboard Payment design");
+      expect(onOpenBlackboard).toHaveBeenCalledTimes(2);
+      await click(panel, "View worker");
+      const dialog = panel.querySelector<HTMLDialogElement>("dialog")!;
+      await act(async () => dialog.querySelector<HTMLElement>("header > div")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ContextMenu", bubbles: true })));
+      expect(dialog.querySelector('[role="menu"]')?.textContent).toContain("Payment design");
+      await click(dialog, "Open assigned board");
+      expect(onOpenBlackboard).toHaveBeenCalledTimes(3);
+      expect(dialog.open).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("shows the saved CI repair phase, finite budget and failing job identity without rendering logs", async () => {
     const repairing: ForgeWorker = { ...worker, ciRepair: {
       phase: "repairing", attempts: 1, attemptedHeads: [change.headSha], attemptId: "repair-attempt",

@@ -39,6 +39,7 @@ import { codexResumeInput } from "../agents/resumeInput.js";
 import { ClaudeTerminal } from "../agents/claude/ClaudeTerminal.js";
 import type { ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 import type { AgentUsageRecorder } from "../agents/usage/AgentUsageRecorder.js";
+import { cooperationLaunchEnv } from "../cooperationAgent/AgentCooperationContext.js";
 import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
 import { readAgentProviderStatus } from "../agents/agentCli.js";
 
@@ -169,7 +170,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
       ? await readCodexSkillOverrides(this.sources.viewPath(input.tab.id), { cwd: input.cwd, homeDir: this.env.HOME })
       : input.initialInput?.codexNativeSkillOverrides === undefined ? undefined : parseCodexSkillOverrides(input.initialInput.codexNativeSkillOverrides);
     const template = templateFromRuntimeContext(runtimeContext);
-    const baseEnv = { ...this.env };
+    const cooperationEnv = cooperationLaunchEnv(input.runtimeContext);
+    const baseEnv = { ...this.env, ...cooperationEnv };
     let launchTemplate: MaterializedCodexTemplate;
     let initialArgs: string[];
     let authHome: string | undefined;
@@ -238,7 +240,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     }
     // The tab's CODEX_HOME overlay wins over one the user's profile exports.
     const codexHome = launchTemplate.env.CODEX_HOME;
-    const enforced: EnforcedEnv = { set: codexHome ? { CODEX_HOME: codexHome } : {}, unset: [] };
+    const enforced: EnforcedEnv = { set: { ...(codexHome ? { CODEX_HOME: codexHome } : {}), ...cooperationEnv }, unset: [] };
     const launch = useBridge
       ? buildEnforcedLoginShellLaunch(process.execPath, [
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
@@ -246,6 +248,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           preparationMs: performance.now() - preparationStarted,
           ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
+          ...(selection && cooperationEnv.CLOUDX_COOPERATION_CONTEXT ? { cooperation: {
+            contextPath: cooperationEnv.CLOUDX_COOPERATION_CONTEXT, tabId: input.tab.id, executionId: selection.executionId,
+            skills: launchTemplate.overlay ? ["cooperation-board", "cooperation-feedback"].map(name => ({
+              name, path: cloudxSystemSkillFilePath(launchTemplate.overlay!.rulesSkillsRoot, name)
+            })) : []
+          } } : {}),
           ...(forks && selection ? { forks: { ...selection, receiptPath: forks.receiptPath,
             resumeArgs: buildCodexRemoteTuiArgs(launchTemplate.args, []) } } : {}),
           ...(selection && work ? { workHealth: {
@@ -260,7 +268,10 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
           startupPicker: resume?.mode === "picker",
           permissions: {
             yoloMode: launchTemplate.args.includes("--yolo"),
-            additionalWritableRoots: launchTemplate.overlay ? [launchTemplate.overlay.rulesSkillsRoot] : []
+            additionalWritableRoots: [
+              ...(launchTemplate.overlay ? [launchTemplate.overlay.rulesSkillsRoot] : []),
+              ...(cooperationEnv.CLOUDX_COOPERATION_ASSETS ? [cooperationEnv.CLOUDX_COOPERATION_ASSETS] : [])
+            ]
           },
           command,
           configurationNotice: launchTemplate.configurationNotice,
