@@ -19,12 +19,26 @@ export interface HardwareScriptResult {
 export class HardwareScriptRunner {
   constructor(private readonly options: { pathPolicy?: Pick<PathPolicy, "ensureDirectory">; resolveCredential?: (id: string) => Promise<string> }) {}
 
+  async validateWorkingDirectory(candidate: string): Promise<string> {
+    try {
+      const cwd = this.options.pathPolicy ? await this.options.pathPolicy.ensureDirectory(candidate, false) : await fs.realpath(candidate);
+      if (!(await fs.stat(cwd)).isDirectory()) throw new Error("Not a directory");
+      return cwd;
+    } catch {
+      throw new HardwareError("INVALID_INPUT", "Script working directory must exist, be a directory, and be inside the configured CloudX allowed roots.");
+    }
+  }
+
   async run(candidate: BashScript, context: JsonObject, signal: AbortSignal): Promise<HardwareScriptResult> {
     const script = parseHardwareScript(candidate);
     requireHardware(process.platform === "linux", "OPERATION_FAILED", "Hardware script process ownership requires Linux.");
     signal.throwIfAborted();
-    const cwd = this.options.pathPolicy ? await this.options.pathPolicy.ensureDirectory(script.cwd, false) : await fs.realpath(script.cwd);
-    requireHardware((await fs.stat(cwd)).isDirectory(), "INVALID_INPUT", "Script working directory must exist.");
+    let cwd: string;
+    try { cwd = await this.validateWorkingDirectory(script.cwd); }
+    catch (error) {
+      if (!(error instanceof HardwareError) || error.code !== "INVALID_INPUT") throw error;
+      return { state: "failed", exitCode: null, stdout: "", stderr: error.message, timedOut: false, cancelled: false, cleanupConfirmed: true, errorCode: "INVALID_INPUT" };
+    }
     const env: NodeJS.ProcessEnv = { PATH: "/usr/local/bin:/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8" };
     const secrets: string[] = [];
     for (const id of script.credentialRefIds) {

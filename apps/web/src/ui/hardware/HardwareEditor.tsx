@@ -774,7 +774,7 @@ export function HookFields({
       ))}
       <p className="hardware-muted">
         Hook context always travels as JSON on stdin. Saving never runs a
-        script.
+        script. Working directories must exist within a CloudX allowed root.
       </p>
     </section>
   );
@@ -922,8 +922,19 @@ export function StatusBindings({
                   </label>
                 </div>
                 <p className="hardware-muted">
-                  Exit zero and one JSON value are required. Scheduled checks
-                  skip held groups.
+                  Exit zero after printing the result to stdout.{" "}
+                  {definition.valueType === "boolean" ? (
+                    <>
+                      Output one JSON boolean: <code>true</code> or{" "}
+                      <code>false</code>.
+                    </>
+                  ) : definition.valueType === "text" ? (
+                    "Output one JSON string, including quotes."
+                  ) : (
+                    "Output one JSON string matching an allowed enum value."
+                  )}{" "}
+                  Use an existing directory within a CloudX allowed root.
+                  Scheduled checks skip held groups.
                 </p>
               </>
             )}

@@ -1,5 +1,12 @@
 import { useEffect, useState } from "react";
-import { RefreshCw, Save } from "lucide-react";
+import {
+  ChevronDown,
+  Info,
+  LockKeyhole,
+  RefreshCw,
+  Save,
+  Server,
+} from "lucide-react";
 import type {
   HardwareItem,
   HardwareStateView,
@@ -14,7 +21,7 @@ import {
   StatusInput,
   type HardwareRun,
 } from "./HardwareControls.js";
-import { sameOwner } from "./hardwareModel.js";
+import { ownerLabel, sameOwner } from "./hardwareModel.js";
 
 export interface StatusEditDraft {
   statuses: HardwareItem["statuses"];
@@ -25,6 +32,7 @@ export function HardwareStatuses({
   state,
   selectedId,
   onSelect,
+  onInspectHold,
   drafts,
   busy,
   run,
@@ -32,6 +40,7 @@ export function HardwareStatuses({
   state: HardwareStateView;
   selectedId?: string;
   onSelect: (id: string) => void;
+  onInspectHold: (id: string) => void;
   drafts: Map<string, StatusEditDraft>;
   busy: boolean;
   run: HardwareRun;
@@ -39,21 +48,69 @@ export function HardwareStatuses({
   const selected = state.items.find((value) => value.item.id === selectedId);
   return (
     <>
-      <label className="hardware-item-picker">
-        Hardware
-        <select
-          aria-label="Configure hardware statuses"
-          value={selectedId ?? ""}
-          onChange={(event) => onSelect(event.target.value)}
-        >
-          <option value="">Choose hardware</option>
-          {state.items.map((value) => (
-            <option key={value.item.id} value={value.item.id}>
-              {value.item.name}
-            </option>
-          ))}
-        </select>
-      </label>
+      <section
+        className="hardware-card hardware-target"
+        aria-label="Hardware configuration target"
+      >
+        <div className="hardware-target-picker">
+          <Server size={25} aria-hidden="true" />
+          <label className="hardware-item-picker">
+            Hardware
+            <span className="hardware-select-control">
+              <select
+                aria-label="Configure hardware statuses"
+                value={selectedId ?? ""}
+                onChange={(event) => onSelect(event.target.value)}
+              >
+                <option value="">Choose hardware</option>
+                {state.items.map((value) => (
+                  <option key={value.item.id} value={value.item.id}>
+                    {value.item.name}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown size={17} aria-hidden="true" />
+            </span>
+          </label>
+        </div>
+        {selected ? (
+          <dl
+            className="hardware-target-details"
+            aria-label="Selected hardware details"
+          >
+            <div>
+              <dt>Type</dt>
+              <dd>
+                {state.types.find((type) => type.id === selected.item.typeId)
+                  ?.displayName ?? selected.item.typeId}
+              </dd>
+            </div>
+            <div>
+              <dt>Physical group</dt>
+              <dd>
+                {state.groups.find(
+                  (group) => group.id === selected.item.physicalResourceId,
+                )?.name ?? selected.item.physicalResourceId}
+              </dd>
+            </div>
+            <div>
+              <dt>Endpoint</dt>
+              <dd>
+                {String(
+                  selected.item.config.host ??
+                    selected.item.config.devicePath ??
+                    "—",
+                )}
+              </dd>
+            </div>
+          </dl>
+        ) : (
+          <p className="hardware-muted">
+            Choose a hardware item to edit its status bindings and reservation
+            hooks.
+          </p>
+        )}
+      </section>
       {selected ? (
         <StatusConfiguration
           key={selected.item.id}
@@ -62,6 +119,7 @@ export function HardwareStatuses({
           drafts={drafts}
           busy={busy}
           run={run}
+          onInspectHold={onInspectHold}
         />
       ) : (
         <div className="hardware-empty">
@@ -78,12 +136,14 @@ function StatusConfiguration({
   drafts,
   busy,
   run,
+  onInspectHold,
 }: {
   state: HardwareStateView;
   summary: HardwareSummary;
   drafts: Map<string, StatusEditDraft>;
   busy: boolean;
   run: HardwareRun;
+  onInspectHold: (id: string) => void;
 }) {
   const [draft, setDraft] = useState(
     () =>
@@ -127,11 +187,18 @@ function StatusConfiguration({
           });
         }}
       >
-        {held || stale ? (
+        {held ? (
+          <ConfigurationHold
+            state={state}
+            summary={summary}
+            busy={busy}
+            onInspectHold={onInspectHold}
+          />
+        ) : null}
+        {stale ? (
           <p className="hardware-banner warning" role="status">
-            {held
-              ? "Status bindings and hooks cannot change while this resource is held."
-              : "This item changed. Your configuration draft is retained; load the current item before saving."}
+            This item changed. Your configuration draft is retained; load the
+            current item before saving.
           </p>
         ) : null}
         <fieldset disabled={busy || held} className="hardware-columns">
@@ -234,6 +301,95 @@ function StatusConfiguration({
         )}
       />
     </>
+  );
+}
+
+function ConfigurationHold({
+  state,
+  summary,
+  busy,
+  onInspectHold,
+}: {
+  state: HardwareStateView;
+  summary: HardwareSummary;
+  busy: boolean;
+  onInspectHold: (id: string) => void;
+}) {
+  const check = summary.checkHold;
+  const reservation = summary.reservation;
+  const hold = check ?? reservation;
+  if (!hold) return null;
+  let title: string;
+  let detail: string;
+  if (check) {
+    title =
+      check.state === "checking"
+        ? "Status check is running."
+        : "Status check needs recovery.";
+    detail =
+      check.state === "checking"
+        ? "Editing resumes when this check finishes. Inspect the hold to see its operation and recovery controls."
+        : (check.recoveryReason ??
+          "The checking outcome is uncertain. Inspect the hold and its operation before releasing it.");
+  } else {
+    const claim = reservation!;
+    switch (claim.state) {
+      case "preparing":
+        title = "Reservation preparation is running.";
+        detail =
+          "Preparation must finish before the reservation can be released. Statuses and hooks stay locked while it is held.";
+        break;
+      case "releasing":
+        title = "Reservation release is running.";
+        detail =
+          "CloudX is closing access and running cleanup. Editing resumes when release finishes.";
+        break;
+      case "recovery_required":
+        title = "Reservation needs recovery.";
+        detail =
+          claim.recoveryReason ??
+          "Inspect the reservation and its operations before releasing it.";
+        break;
+      case "active":
+        title = sameOwner(claim.owner, state.currentOwner)
+          ? "Reserved by you."
+          : `Reserved by ${ownerLabel(claim.owner)}.`;
+        detail = sameOwner(claim.owner, state.currentOwner)
+          ? "Release your reservation before changing statuses or hooks."
+          : "Statuses and hooks unlock after this reservation ends.";
+    }
+  }
+  const heldThrough =
+    state.items.find((entry) => entry.item.id === hold.hardwareId)?.item.name ??
+    hold.hardwareId;
+  return (
+    <div
+      className="hardware-banner warning hardware-configuration-hold"
+      role="status"
+    >
+      <LockKeyhole size={18} aria-hidden="true" />
+      <div>
+        <strong>{title}</strong>
+        <p>{detail}</p>
+        {reservation ? <small>Purpose: {reservation.purpose}</small> : null}
+        {hold.hardwareId !== summary.item.id ? (
+          <small>Held through {heldThrough} in the same physical group.</small>
+        ) : null}
+        {check ? (
+          <small>Started {new Date(check.startedAt).toLocaleString()}</small>
+        ) : null}
+      </div>
+      <ControlButton
+        size="compact"
+        disabled={busy}
+        onClick={() =>
+          onInspectHold(check?.runId ?? reservation!.reservationId)
+        }
+      >
+        <Info size={14} />
+        Inspect hold
+      </ControlButton>
+    </div>
   );
 }
 

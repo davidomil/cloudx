@@ -51,6 +51,7 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
   }>();
   const [view, setView] = useState<View>("inventory");
   const [selectedId, setSelectedId] = useState<string>();
+  const [inspectedHoldId, setInspectedHoldId] = useState<string>();
   const [editingId, setEditingId] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [receipt, setReceipt] = useState<OperationReceipt>();
@@ -197,6 +198,7 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
   const selected = state?.items.find((value) => value.item.id === selectedId);
   const edited = state?.items.find((value) => value.item.id === editingId);
   const navigate = (next: View) => {
+    if (next === "reservations") setInspectedHoldId(undefined);
     setView(next);
   };
   const observedReceipt = state?.receipts.find(
@@ -379,6 +381,10 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
                 state={state}
                 selectedId={selectedId}
                 onSelect={setSelectedId}
+                onInspectHold={(id) => {
+                  setInspectedHoldId(id);
+                  setView("reservations");
+                }}
                 drafts={statusDrafts.current}
                 busy={busy}
                 run={run}
@@ -387,6 +393,7 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
             {view === "reservations" ? (
               <HardwareReservations
                 state={state}
+                initialSelectedId={inspectedHoldId}
                 busy={busy}
                 run={run}
                 onOpenOwner={onOpenOwner}

@@ -957,6 +957,223 @@ test("UART reads bounded windows, writes exact bytes, controls lines, and clears
   await expect(button(page, "Read bytes")).toBeDisabled();
 });
 
+test("status hardware selection shows resource context and keeps each draft", async ({
+  page,
+}, info) => {
+  await button(page, "Statuses & hooks").click();
+  const picker = page.getByRole("combobox", {
+    name: "Configure hardware statuses",
+    exact: true,
+  });
+  const target = page.getByRole("region", {
+    name: "Hardware configuration target",
+    exact: true,
+  });
+  await expect(target).toBeVisible();
+  await picker.focus();
+  await picker.press("ArrowDown");
+  await expect(picker).toHaveValue(lab.ssh.id);
+  const details = page.getByLabel("Selected hardware details", { exact: true });
+  await expect(details).toContainText("SSH");
+  await expect(details).toContainText("Rack A");
+  await expect(details).toContainText("atlas.example");
+  await label(page, "Up manual value").selectOption("false");
+  await picker.selectOption(lab.uart.id);
+  await expect(details).toContainText("UART");
+  await expect(details).toContainText("Rack B");
+  await expect(details).not.toContainText("atlas.example");
+  await label(page, "Status definition to add").selectOption(
+    lab.ssh.statuses[0]!.definitionId,
+  );
+  await button(page, "Add status").click();
+  await label(page, "Up manual value").selectOption("true");
+  await picker.selectOption(lab.ssh.id);
+  await expect(label(page, "Up manual value")).toHaveValue("false");
+  await picker.selectOption(lab.uart.id);
+  await expect(label(page, "Up manual value")).toHaveValue("true");
+  await picker.selectOption(lab.ssh.id);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  for (const theme of ["cloudx-neon", "minimalist-dark"]) {
+    await label(page, "Fixture theme").selectOption(theme);
+    await picker.focus();
+    await expect(picker).toBeFocused();
+    await expect(target).toBeVisible();
+    const colors = await picker.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { color: style.color, background: style.backgroundColor };
+    });
+    expect(colors.color).not.toEqual(colors.background);
+    expect(
+      await page
+        .locator(".hardware-panel")
+        .evaluate((element) => element.scrollWidth <= element.clientWidth),
+    ).toBe(true);
+    await screenshot(page, info, `status-target-${theme}`);
+  }
+});
+
+test("status editor identifies the selected alias hold and keeps reservations locked", async ({
+  page,
+}, info) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  const alias = await lab.addItem({
+    name: "Atlas console",
+    physicalResourceId: lab.ssh.physicalResourceId,
+    typeId: "hardware.uart",
+    config: { ...lab.uart.config, devicePath: `${lab.root}/atlas-console` },
+  });
+  await lab.mutate("hardware.reserve", {
+    hardwareId: lab.uart.id,
+    expectedItemRevision: lab.uart.revision,
+    purpose: "Separate board validation",
+  });
+  await lab.mutate(
+    "hardware.reserve",
+    {
+      hardwareId: lab.ssh.id,
+      expectedItemRevision: lab.ssh.revision,
+      purpose: "Worker status validation",
+    },
+    worker,
+  );
+  await refresh(page);
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(alias.id);
+  const banner = page
+    .locator(".hardware-panel")
+    .getByRole("status")
+    .filter({ hasText: "Reserved by" });
+  await expect(banner).toContainText("claude");
+  await expect(banner).toContainText("Worker status validation");
+  await expect(banner).toContainText("Held through Atlas SSH");
+  await expect(label(page, "Enable Before reserve")).toBeDisabled();
+  await expect(button(page, "Save configuration")).toBeDisabled();
+  const claims = (await lab.service.snapshot(operator)).reservations;
+  const claim = claims.find((value) => value.hardwareId === lab.ssh.id)!;
+  for (const theme of ["cloudx-neon", "minimalist-dark"]) {
+    await label(page, "Fixture theme").selectOption(theme);
+    await screenshot(page, info, `status-held-${theme}`);
+  }
+  await button(page, "Inspect hold").click();
+  const hold = page.getByRole("region", { name: "Hold details", exact: true });
+  await expect(hold).toContainText(claim.reservationId);
+  await expect(hold).toContainText("Atlas SSH");
+  await expect(hold).toBeFocused();
+  await expect(button(page, "Release own reservation")).toBeDisabled();
+  expect((await lab.service.snapshot(operator)).reservations).toEqual(claims);
+  await button(page, "Statuses & hooks").click();
+  await expect(label(page, "Configure hardware statuses")).toHaveValue(
+    alias.id,
+  );
+  await label(page, "Configure hardware statuses").selectOption(lab.uart.id);
+  await expect(
+    page.locator(".hardware-panel").getByRole("status"),
+  ).toContainText("Reserved by you");
+  await button(page, "Inspect hold").click();
+  await expect(hold).toContainText(
+    claims.find((value) => value.hardwareId === lab.uart.id)!.reservationId,
+  );
+  await expect(button(page, "Release own reservation")).toBeEnabled();
+});
+
+test("status editor explains check recovery and restores editing after explicit release", async ({
+  page,
+}, info) => {
+  await lab.mutate("hardware.items.update", {
+    hardwareId: lab.ssh.id,
+    expectedItemRevision: lab.ssh.revision,
+    patch: {
+      statuses: [
+        {
+          revision: 2,
+          definitionId: lab.ssh.statuses[0]!.definitionId,
+          source: "command",
+          script: {
+            source: "sleep 5; printf true",
+            cwd: lab.root,
+            timeoutMs: 100,
+            maxOutputBytes: 4096,
+            credentialRefIds: [],
+          },
+          maxAgeMs: 60000,
+          intervalMs: null,
+        },
+      ],
+    },
+  });
+  await refresh(page);
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+  await button(page, "Refresh Up").click();
+  await expect
+    .poll(
+      async () => (await lab.service.snapshot(operator)).checkHolds[0]?.state,
+    )
+    .toBe("recovery_required");
+  await expect(
+    page.locator(".hardware-panel").getByRole("status"),
+  ).toContainText("Status check needs recovery");
+  await expect(
+    page.locator(".hardware-panel").getByRole("status"),
+  ).toContainText("uncertain outcome");
+  await expect(label(page, "Up source")).toBeDisabled();
+  await expect(button(page, "Save configuration")).toBeDisabled();
+  await screenshot(page, info, "status-check-recovery");
+  const check = (await lab.service.snapshot(operator)).checkHolds[0]!;
+  await button(page, "Inspect hold").click();
+  const hold = page.getByRole("region", { name: "Hold details", exact: true });
+  await expect(hold).toContainText(check.runId);
+  await button(page, "Force release…").click();
+  await label(page, "Force release reason").fill(
+    "Inspect ended local check before editing",
+  );
+  await expect(button(page, "Confirm force release")).toBeDisabled();
+  await label(page, "I accept unresolved external activity.").check();
+  await button(page, "Confirm force release").click();
+  await expect
+    .poll(async () => (await lab.service.snapshot(operator)).checkHolds.length)
+    .toBe(0);
+  await button(page, "Statuses & hooks").click();
+  await expect(label(page, "Up source")).toBeEnabled();
+  await expect(button(page, "Save configuration")).toBeEnabled();
+  await expect(button(page, "Inspect hold")).toHaveCount(0);
+});
+
+test("status configuration rejects a disallowed directory without holding hardware or losing the draft", async ({
+  page,
+}) => {
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+  await label(page, "Up source").selectOption("command");
+  await label(page, "Up status command").fill("printf true");
+  await label(page, "Up status command working directory").fill("/");
+  await button(page, "Save configuration").click();
+  await expect(page.getByRole("alert")).toContainText("CloudX allowed roots");
+  await expect(label(page, "Up source")).toBeEnabled();
+  await expect(label(page, "Up status command")).toHaveValue("printf true");
+  await expect(label(page, "Up status command working directory")).toHaveValue(
+    "/",
+  );
+  const rejected = await lab.service.snapshot(operator);
+  expect(rejected.checkHolds).toEqual([]);
+  expect(rejected.reservations).toEqual([]);
+  expect(
+    rejected.items.find((value) => value.item.id === lab.ssh.id)!.item
+      .statuses[0]!.source,
+  ).toBe("manual");
+  await label(page, "Up status command working directory").fill(lab.root);
+  await button(page, "Save configuration").click();
+  await button(page, "Refresh Up").click();
+  await expect(
+    page
+      .locator(".hardware-observation-row")
+      .filter({ hasText: "Up" })
+      .locator(".hardware-observation"),
+  ).toHaveText("true · fresh");
+  await expect(button(page, "Save configuration")).toBeEnabled();
+  expect((await lab.service.snapshot(operator)).checkHolds).toEqual([]);
+});
+
 test("status bindings, exact manual values and real Bash reservation hooks work", async ({
   page,
 }, info) => {
@@ -981,6 +1198,12 @@ test("status bindings, exact manual values and real Bash reservation hooks work"
     .toBe(false);
   await button(page, "Discard draft and load current configuration").click();
   await label(page, "Up source").selectOption("command");
+  await expect(page.locator(".hardware-status-editor").first()).toContainText(
+    "Output one JSON boolean: true or false.",
+  );
+  await expect(page.locator(".hardware-status-editor").first()).toContainText(
+    "existing directory within a CloudX allowed root",
+  );
   await label(page, "Up status command").fill("printf true");
   await label(page, "Up status command working directory").fill(lab.root);
   await label(page, "Up status command deadline").fill("1000");
@@ -1099,7 +1322,16 @@ test("monitor navigates to a Forge worker and requires explicit recovery overrid
     worker,
   );
   await refresh(page);
-  await button(page, "Reservations").click();
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+  const recoveryBanner = page.locator(".hardware-panel").getByRole("status");
+  await expect(recoveryBanner).toContainText("Reservation needs recovery");
+  const recovered = (await lab.service.snapshot(operator)).reservations[0]!;
+  await expect(recoveryBanner).toContainText(recovered.recoveryReason!);
+  await button(page, "Inspect hold").click();
+  await expect(
+    page.getByRole("region", { name: "Hold details", exact: true }),
+  ).toContainText(recovered.reservationId);
   await label(page, "Reservation state filter").selectOption(
     "recovery_required",
   );
@@ -1383,9 +1615,17 @@ test("checking holds show exact targets and stale force-release dialogs cannot c
     .poll(async () => (await lab.service.snapshot(operator)).checkHolds.length)
     .toBe(1);
   await expect(button(page, "Reserve hardware")).toBeDisabled();
-  await button(page, "Reservations").click();
-  await label(page, "Reservation state filter").selectOption("checking");
-  await button(page, "Details").click();
+  await button(page, "Statuses & hooks").click();
+  await expect(
+    page.locator(".hardware-panel").getByRole("status"),
+  ).toContainText("Status check is running");
+  await expect(label(page, "Up source")).toBeDisabled();
+  await expect(button(page, "Save configuration")).toBeDisabled();
+  const checking = (await lab.service.snapshot(operator)).checkHolds[0]!;
+  await button(page, "Inspect hold").click();
+  await expect(
+    page.getByRole("region", { name: "Hold details", exact: true }),
+  ).toContainText(checking.runId);
   await expect(
     page.getByRole("cell", { name: "System check", exact: true }),
   ).toBeVisible();
@@ -1419,7 +1659,7 @@ test("checking holds show exact targets and stale force-release dialogs cannot c
     .toBe(0);
 });
 
-test("preparation remains visibly held until its Bash hook completes", async ({
+test("preparation and release remain visibly held until their Bash hooks complete", async ({
   page,
 }) => {
   await lab.mutate("hardware.items.update", {
@@ -1429,6 +1669,13 @@ test("preparation remains visibly held until its Bash hook completes", async ({
       hooks: {
         beforeReserve: {
           source: "while [ ! -f prepare-finish ]; do sleep 0.02; done",
+          cwd: lab.root,
+          timeoutMs: 10000,
+          maxOutputBytes: 4096,
+          credentialRefIds: [],
+        },
+        onRelease: {
+          source: "while [ ! -f release-finish ]; do sleep 0.02; done",
           cwd: lab.root,
           timeoutMs: 10000,
           maxOutputBytes: 4096,
@@ -1447,19 +1694,28 @@ test("preparation remains visibly held until its Bash hook completes", async ({
     page.locator(".hardware-badge.state-preparing").first(),
   ).toBeVisible();
   await expect(button(page, "Open access screen")).toBeDisabled();
-  await button(page, "Reservations").click();
-  await label(page, "Reservation state filter").selectOption("preparing");
-  await button(page, "Details").click();
+  await button(page, "Statuses & hooks").click();
+  await expect(
+    page.locator(".hardware-panel").getByRole("status"),
+  ).toContainText("Reservation preparation is running");
+  await button(page, "Inspect hold").click();
   await expect(button(page, "Release own reservation")).toBeDisabled();
   await fs.writeFile(path.join(lab.root, "prepare-finish"), "done");
   await label(page, "Reservation state filter").selectOption("active");
   await expect(button(page, "Release own reservation")).toBeEnabled();
   await button(page, "Release own reservation").click();
+  await button(page, "Statuses & hooks").click();
+  await expect(
+    page.locator(".hardware-panel").getByRole("status"),
+  ).toContainText("Reservation release is running");
+  await expect(button(page, "Save configuration")).toBeDisabled();
+  await fs.writeFile(path.join(lab.root, "release-finish"), "done");
   await expect
     .poll(
       async () => (await lab.service.snapshot(operator)).reservations.length,
     )
     .toBe(0);
+  await expect(button(page, "Save configuration")).toBeEnabled();
 });
 
 test("shared group aliases open the originally reserved type and never issue mismatched access operations", async ({

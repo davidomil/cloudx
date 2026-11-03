@@ -170,6 +170,7 @@ export class HardwareService {
       if (input.newGroupName !== undefined) { const group = { id: `group-${randomUUID()}`, revision: 1, name: hardwareInput(() => hardwareText(input.newGroupName, "Group name", 200)).trim() }; this.uniqueLabel(next.groups, group.name, undefined, record => record.name); next.groups.push(group); raw.physicalResourceId = group.id; }
       const item = hardwareInput(() => parseHardwareItem({ ...raw, id: `hardware-${randomUUID()}`, revision: 1, notesRevision: 1 }));
       this.validateItemReferences(next, item); this.provider(item);
+      await this.validateItemScripts(item);
       next.items.push(item); this.manualObservations(next, item);
       const inventory = await this.inspectInventory(next);
       requireHardware(!inventory.conflictingGroups.has(item.physicalResourceId), "ENDPOINT_CONFLICT", "An endpoint belongs to another physical group. Group its aliases together.");
@@ -203,6 +204,7 @@ export class HardwareService {
       requireHardware(canonical(before) === canonical(after) ? binding.revision >= previous.revision : binding.revision > previous.revision, "REVISION_CONFLICT", "A changed status binding requires a greater binding revision so old measurements cannot satisfy it.");
     }
     this.validateItemReferences(next, updated); this.provider(updated);
+    if (Object.hasOwn(patch, "statuses") || Object.hasOwn(patch, "hooks")) await this.validateItemScripts(updated);
     next.items[next.items.indexOf(item)] = updated;
     const prospective = await this.inspectInventory(next);
     requireHardware(!changesIdentity || !prospective.conflictingGroups.has(updated.physicalResourceId), "ENDPOINT_CONFLICT", "An endpoint belongs to another physical group.");
@@ -814,6 +816,10 @@ export class HardwareService {
       }
       return previous.filter(observation => observation.definitionId === binding.definitionId && observation.bindingRevision === binding.revision);
     });
+  }
+  private async validateItemScripts(item: HardwareItem): Promise<void> {
+    const scripts = [...item.statuses.flatMap(binding => binding.source === "command" ? [binding.script] : []), ...Object.values(item.hooks)];
+    for (const script of scripts) await this.scripts.validateWorkingDirectory(script.cwd);
   }
   private addHistory(next: HardwareStoredState, kind: string, detail: string, owner?: HardwareOwner, claim?: HardwareReservationRecord, hardwareIdValue?: string, runId?: string): void {
     next.history.push({ id: `event-${randomUUID()}`, at: now(), kind, detail, ...(owner ? { owner: clone(owner) } : {}), ...(claim ? { reservationId: claim.reservationId } : {}), ...(claim || hardwareIdValue ? { hardwareId: claim?.hardwareId ?? hardwareIdValue } : {}), ...(runId ? { runId } : {}) });

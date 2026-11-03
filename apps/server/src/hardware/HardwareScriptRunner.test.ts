@@ -36,9 +36,21 @@ describe("bounded Hardware Bash execution", () => {
     expect(truncated.errorCode).toBe("OUTPUT_LIMIT");
   });
 
-  it("refuses working directories outside the host roots before executing", async () => {
-    const { runner, script } = await fixture();
-    await expect(runner.run({ ...script, cwd: "/etc" }, {}, new AbortController().signal)).rejects.toThrow();
+  it.each(["outside", "missing", "file"])("rejects a %s working directory as a known input failure before executing", async kind => {
+    const { root, runner, script } = await fixture();
+    const cwd = kind === "outside" ? "/etc" : path.join(root, kind);
+    if (kind === "file") await fs.writeFile(cwd, "not a directory");
+    expect(await runner.run({ ...script, cwd, source: `printf executed > '${path.join(root, "executed")}'` }, {}, new AbortController().signal)).toMatchObject({ state: "failed", errorCode: "INVALID_INPUT", stderr: expect.stringContaining("working directory"), cleanupConfirmed: true });
+    await expect(fs.stat(path.join(root, "executed"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps directory-policy internals out of configuration errors and script diagnostics", async () => {
+    const { script } = await fixture();
+    const runner = new HardwareScriptRunner({ pathPolicy: { ensureDirectory: async () => { throw new Error("private-policy-detail-marker"); } } });
+    await expect(runner.validateWorkingDirectory(script.cwd)).rejects.toMatchObject({ code: "INVALID_INPUT", message: expect.stringContaining("configured CloudX allowed roots") });
+    const result = await runner.run(script, {}, new AbortController().signal);
+    expect(result).toMatchObject({ state: "failed", errorCode: "INVALID_INPUT", cleanupConfirmed: true });
+    expect(JSON.stringify(result)).not.toContain("private-policy-detail-marker");
   });
 
   it("terminates a TERM-resistant local process group and retains uncertain timeout effects", async () => {

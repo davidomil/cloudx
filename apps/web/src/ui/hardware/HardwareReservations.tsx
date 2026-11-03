@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Info, Trash2 } from "lucide-react";
 import type {
   HardwareCheckHold,
@@ -30,18 +30,27 @@ const targetFor = (hold: Hold): HardwareHoldRef =>
 
 export function HardwareReservations({
   state,
+  initialSelectedId,
   busy,
   run,
   onOpenOwner,
   canOpenOwner,
 }: {
   state: HardwareStateView;
+  initialSelectedId?: string;
   busy: boolean;
   run: HardwareRun;
   onOpenOwner?: (tabId: string) => void;
   canOpenOwner?: (tabId: string) => boolean;
 }) {
-  const [selectedId, setSelectedId] = useState<string>();
+  const [selectedId, setSelectedId] = useState(initialSelectedId);
+  const details = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (initialSelectedId) {
+      details.current?.focus({ preventScroll: true });
+      details.current?.scrollIntoView({ block: "nearest" });
+    }
+  }, [initialSelectedId]);
   const [phase, setPhase] = useState("");
   const [ownOnly, setOwnOnly] = useState(false);
   const [override, setOverride] = useState<Hold>();
@@ -197,7 +206,12 @@ export function HardwareReservations({
       ) : null}
       {selected ? (
         <div className="hardware-columns">
-          <section className="hardware-card">
+          <section
+            className="hardware-card hardware-hold-details"
+            aria-label="Hold details"
+            tabIndex={-1}
+            ref={details}
+          >
             <h2>
               {state.items.find(
                 (value) => value.item.id === selected.hardwareId,

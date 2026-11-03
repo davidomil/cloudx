@@ -18,6 +18,24 @@ To install keys on a machine, save the item, reserve it, and choose **Register S
 
 In **Statuses & hooks**, bind a boolean, text, or enum definition to a manual value or host Bash command. A status command must exit zero and print one JSON value of its declared type. Set freshness, scheduling, and an exact required value when it gates reservation; `false` is a valid requirement. Before reserve and On release run in their configured host directory with bounded output and a deadline. They receive JSON context on stdin.
 
+Choose an existing working directory inside the server's allowed roots. CloudX validates it when saving and again before running. A rejected directory leaves the configuration editable. While a reservation or check holds the resource, **Inspect hold** opens its exact entry in Reservations, including its state and recovery reason.
+
+Plain `ping` prints diagnostic text. For a boolean online check, use a bounded probe that prints JSON instead. For example, set a script deadline above two seconds and use:
+
+```bash
+if ping -n -c 1 -W 1 -w 2 192.168.8.100 >/dev/null; then
+  printf 'true\n'
+else
+  ping_status=$?
+  case "$ping_status" in
+    1) printf 'false\n' ;;
+    *) exit "$ping_status" ;;
+  esac
+fi
+```
+
+This distinguishes no reply from an execution error. The [iputils documentation](https://github.com/iputils/iputils/blob/20240117/doc/ping.xml) defines the ping exit statuses; an execution error remains a failed check.
+
 ## Resolve script credentials
 
 Configure only the references a script needs. Reference `lab-token` resolves the server-startup environment variable `CLOUDX_HARDWARE_CREDENTIAL_LAB_TOKEN`. References normalize punctuation to underscores and letters to uppercase. Restart the server after changing its credential environment. Selected scripts receive the requested variables; captured script diagnostics redact their values. Missing references fail explicitly. Inventory and skills contain reference IDs rather than credential values.

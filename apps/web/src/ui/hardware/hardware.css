@@ -641,8 +641,86 @@
   margin-top: 14px;
   padding-top: 5px;
 }
-.hardware-item-picker {
-  max-width: 420px;
+.hardware-target {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+  gap: 24px;
+}
+.hardware-target-picker {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 0;
+}
+.hardware-target-picker > svg {
+  flex-shrink: 0;
+  color: var(--color-warning);
+}
+.hardware-panel .hardware-item-picker {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: var(--color-muted-foreground);
+}
+.hardware-select-control {
+  position: relative;
+}
+.hardware-panel .hardware-select-control select {
+  appearance: none;
+  min-height: 42px;
+  padding: 10px 36px 10px 12px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.hardware-select-control > svg {
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--color-muted-foreground);
+  pointer-events: none;
+}
+.hardware-panel .hardware-target-details {
+  grid-template-columns: minmax(0, 0.45fr) minmax(0, 1fr) minmax(0, 1.3fr);
+  gap: 18px;
+}
+.hardware-target-details dt,
+.hardware-target-details dd {
+  border: 0;
+  padding: 0;
+}
+.hardware-target-details dt {
+  color: var(--color-muted-foreground);
+  font-size: 10px;
+  margin-bottom: 4px;
+}
+.hardware-target-details dd {
+  font-size: 12px;
+}
+.hardware-target > p {
+  margin-bottom: 0;
+}
+.hardware-configuration-hold {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+}
+.hardware-configuration-hold > svg {
+  flex-shrink: 0;
+  color: var(--color-warning);
+}
+.hardware-configuration-hold p {
+  margin: 4px 0 0;
+}
+.hardware-configuration-hold small {
+  display: block;
+  margin-top: 5px;
+}
+.hardware-hold-details:focus-visible {
+  outline: 2px solid var(--color-accent-tertiary);
+  outline-offset: 2px;
 }
 .hardware-catalog-row {
   display: flex;
@@ -853,6 +931,20 @@
   }
 }
 @container hardware (max-width: 550px) {
+  .hardware-target {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .hardware-panel .hardware-target-details {
+    gap: 12px;
+  }
+  .hardware-configuration-hold {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .hardware-configuration-hold > button {
+    grid-column: 2;
+    justify-self: start;
+  }
   .hardware-header {
     align-items: flex-start;
   }
