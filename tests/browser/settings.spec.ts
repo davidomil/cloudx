@@ -1006,7 +1006,52 @@ test("Codex configuration repair keeps settings controls reachable after applyin
   await captureSample(page, testInfo, "codex-config-repair-layout");
 });
 
-test("Codex version selection searches releases, previews a downgrade, and explicitly restores the previous version", async ({
+test("Codex version selection searches releases and rejects invalid versions before activation", async ({
+  page,
+  isMobile,
+}) => {
+  const starts: unknown[] = [];
+  await page.route("**/api/hooks/codex-update.start", async (route) => {
+    starts.push(route.request().postDataJSON());
+    await route.fulfill({ json: { result: { update: installedCodex } } });
+  });
+  await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+  const settings = await openCodexSettings(page, isMobile);
+  const control = settings.getByRole("region", { name: "Codex CLI update" });
+  const apply = control.getByRole("button", { name: "Apply selected version" });
+  const exact = control.getByRole("textbox", {
+    name: "Exact version",
+    exact: true,
+  });
+  await expect(apply).toBeDisabled();
+  await control
+    .getByRole("searchbox", { name: "Search published releases" })
+    .fill("rc");
+  const releases = control.getByRole("combobox", {
+    name: "Published releases",
+    exact: true,
+  });
+  await expect(releases.locator("option")).toHaveText([
+    "Select a published release",
+    "1.2.0-rc.1 (prerelease)",
+  ]);
+  await releases.selectOption("1.2.0-rc.1");
+  await expect(exact).toHaveValue("1.2.0-rc.1");
+  await expect(control).toContainText("This is a prerelease");
+  await exact.fill("latest");
+  await expect(apply).toBeDisabled();
+  await expect(control.getByRole("alert")).toContainText(
+    "Enter an exact version",
+  );
+  await exact.fill("9.9.9");
+  await expect(apply).toBeDisabled();
+  await expect(control.getByRole("alert")).toContainText(
+    "not in the published releases",
+  );
+  expect(starts).toEqual([]);
+});
+
+test("Codex version selection previews a downgrade and explicitly restores the previous version through stale polling", async ({
   page,
   isMobile,
 }) => {
@@ -1047,27 +1092,6 @@ test("Codex version selection searches releases, previews a downgrade, and expli
   await control
     .getByRole("searchbox", { name: "Search published releases" })
     .fill("rc");
-  const releases = control.getByRole("combobox", {
-    name: "Published releases",
-    exact: true,
-  });
-  await expect(releases.locator("option")).toHaveText([
-    "Select a published release",
-    "1.2.0-rc.1 (prerelease)",
-  ]);
-  await releases.selectOption("1.2.0-rc.1");
-  await expect(exact).toHaveValue("1.2.0-rc.1");
-  await expect(control).toContainText("This is a prerelease");
-  await exact.fill("latest");
-  await expect(apply).toBeDisabled();
-  await expect(control.getByRole("alert")).toContainText(
-    "Enter an exact version",
-  );
-  await exact.fill("9.9.9");
-  await expect(apply).toBeDisabled();
-  await expect(control.getByRole("alert")).toContainText(
-    "not in the published releases",
-  );
   await control
     .getByRole("button", {
       name: "Select previous verified (0.9.0)",

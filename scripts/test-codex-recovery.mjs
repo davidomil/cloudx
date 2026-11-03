@@ -15,7 +15,7 @@ if (version.error || version.status !== 0 || !/^codex-cli \S+\s*$/u.test(version
   process.exit(1);
 }
 const installedVersion = version.stdout.trim().slice("codex-cli ".length);
-const supportedVersions = ["0.156.1", "0.157.1"];
+const supportedVersions = ["0.156.1", "0.157.1", "0.166.0"];
 if (!supportedVersions.includes(installedVersion) || process.env.CLOUDX_NATIVE_CODEX_VERSION && installedVersion !== process.env.CLOUDX_NATIVE_CODEX_VERSION) {
   console.error(`Expected supported Codex ${process.env.CLOUDX_NATIVE_CODEX_VERSION ?? supportedVersions.join(" or ")}; found ${installedVersion}.`);
   process.exit(1);

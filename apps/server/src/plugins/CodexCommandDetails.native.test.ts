@@ -114,6 +114,12 @@ it.skipIf(!codex)("retains a real native multiline command and its large output 
       threadId: snapshot.commands[0].threadId, turnId: snapshot.commands[0].turnId, id: snapshot.commands[0].id,
       command: capturedCommand, status: "completed", exitCode: 0, outputTruncated: true
     });
+    const restoredOutput = history.commands[0].output;
+    expect(restoredOutput.length).toBeLessThan(expectedOutput.length);
+    expect(restoredOutput.startsWith(`${header}\nrow 0: preserved  whitespace\n`)).toBe(true);
+    expect(restoredOutput.endsWith("row 39999: preserved  whitespace\n")).toBe(true);
+    expect(restoredOutput).not.toContain("row 20000: preserved  whitespace");
+    expect(restoredOutput).toMatch(/\n\.\.\. (?:[1-9]\d* bytes omitted|command output truncated for persistence) \.\.\.\n/);
   } catch (error) {
     console.error(JSON.stringify({ recentOutput: terminal?.snapshot().recentOutput?.slice(-4_096) }));
     throw error;

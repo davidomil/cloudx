@@ -11,6 +11,9 @@ const MAX_ID_CHARS = 1024;
 const MAX_HISTORY_REQUESTS = 32;
 // Native unified exec retains a 1 MiB head/tail aggregate, even when deltas contain more.
 const NATIVE_AGGREGATE_BYTES = 1024 * 1024;
+// Paginated native history keeps 64 KiB, including its persistence marker.
+const NATIVE_PERSISTED_BYTES = 64 * 1024;
+const PERSISTENCE_OMISSION = "\n... command output truncated for persistence ...\n";
 
 /** Observes command items without interpreting terminal rows or changing native messages. */
 export class CodexCommandDetailsCapture {
@@ -106,8 +109,10 @@ export class CodexCommandDetailsCapture {
     if (typeof item.aggregatedOutput === "string") {
       const output = boundedText(item.aggregatedOutput, MAX_OUTPUT_BYTES);
       const aggregateBytes = Buffer.byteLength(item.aggregatedOutput);
-      const moreStreamedOutput = aggregateBytes >= NATIVE_AGGREGATE_BYTES && Buffer.byteLength(command.output) > aggregateBytes;
-      const nativeOmission = aggregateBytes >= NATIVE_AGGREGATE_BYTES && /\n\.\.\. [1-9]\d* bytes omitted \.\.\.\n/.test(item.aggregatedOutput);
+      // The two UTF-8 boundaries can reduce the persisted cap by up to six bytes.
+      const persistenceOmission = aggregateBytes >= NATIVE_PERSISTED_BYTES - 6 && aggregateBytes <= NATIVE_PERSISTED_BYTES && item.aggregatedOutput.includes(PERSISTENCE_OMISSION);
+      const nativeOmission = persistenceOmission || aggregateBytes >= NATIVE_AGGREGATE_BYTES && /\n\.\.\. [1-9]\d* bytes omitted \.\.\.\n/.test(item.aggregatedOutput);
+      const moreStreamedOutput = (nativeOmission || aggregateBytes >= NATIVE_AGGREGATE_BYTES) && Buffer.byteLength(command.output) > aggregateBytes;
       if (!moreStreamedOutput) {
         command.output = output.text;
         command.outputTruncated = output.truncated || nativeOmission;

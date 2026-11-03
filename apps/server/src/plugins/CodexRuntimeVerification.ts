@@ -16,6 +16,7 @@ import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { CodexStateCompatibility } from "./CodexStateCompatibility.js";
 import { assertNoRunningCodexSessions } from "./CodexRunningSessions.js";
 import { completedVerificationTurn, readVerificationTranscript, type VerificationTranscriptEvent } from "./CodexVerificationTranscript.js";
+import { CodexRuntimeVerificationError, type CodexRuntimeDiagnostic } from "../../../../scripts/codex-runtime-errors.mjs";
 
 export interface CodexRuntimeVerificationOptions {
   assistantBin: string;
@@ -29,6 +30,18 @@ export interface CodexRuntimeVerificationOptions {
 }
 
 class CodexNativeStartupError extends Error {}
+
+function verificationEvidence<T>(stage: CodexRuntimeDiagnostic["stage"], code: CodexRuntimeDiagnostic["code"], read: () => T): T {
+  try { return read(); }
+  catch (cause) { throw new CodexRuntimeVerificationError({ stage, code }, { cause }); }
+}
+
+export function assertNativeLaunchEvidence(turn: NonNullable<ReturnType<typeof completedVerificationTurn>>, cwd: string, skillsRoot: string, stage: "interactive-evidence" | "forge-evidence") {
+  verificationEvidence(stage, "cwd", () => assert.equal(turn.context.cwd, cwd, "The native turn lost its working directory."));
+  verificationEvidence(stage, "approval-policy", () => assert.equal(turn.context.approval_policy, "never", "The native turn lost CloudX's configured approval policy."));
+  verificationEvidence(stage, "sandbox-policy", () => assert.equal(isRecord(turn.context.sandbox_policy) ? turn.context.sandbox_policy.type : undefined, "danger-full-access", "The native turn lost CloudX's launch sandbox policy."));
+  verificationEvidence(stage, "workspace-roots", () => assert.ok([cwd, skillsRoot].every(root => turn.workspaceRoots.includes(root)), "The native turn lost its workspace or CloudX skills root."));
+}
 
 /** Verify the installed binary through the same isolated overlay, PTY and bridge as a new tab. */
 export async function verifyCodexRuntime(options: CodexRuntimeVerificationOptions): Promise<void> {
@@ -48,7 +61,7 @@ export async function verifyCodexRuntime(options: CodexRuntimeVerificationOption
           const baselineSessionId = await verifyIsolatedCodexRuntime({ ...options, assistantBin: options.previousAssistantBin! }, sqliteHome);
           await compatibility.verifyConversation(sqliteHome, baselineSessionId);
         } catch (error) {
-          if (!(error instanceof CodexNativeStartupError)) throw error;
+          if (!(error instanceof CodexRuntimeVerificationError && error.cause instanceof CodexNativeStartupError)) throw error;
           await assertNoRunningCodexSessions(options.previousAssistantBin!, options.signal);
           options.onOutput?.("Original Codex already fails native startup on retained state; no original sessions are running. Verifying the requested replacement independently.\n");
           preserveOriginal = false;
@@ -86,8 +99,8 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
   const requests: string[] = [];
   const startedAt = performance.now();
   const phases: Array<{ phase: string; elapsedMs: number }> = [];
-  let phase = "launch";
-  const enterPhase = (name: string) => { phase = name; phases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) }); };
+  let phase: CodexRuntimeDiagnostic["stage"] = "launch";
+  const enterPhase = (name: CodexRuntimeDiagnostic["stage"]) => { phase = name; phases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) }); };
   enterPhase(phase);
   let transcript: VerificationTranscriptEvent[] = [];
   let confirmedTurn: { threadId: string; turnId: string } | undefined;
@@ -139,24 +152,29 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
     await session.handleAction("wait_until_ready", { timeoutMs: Math.max(1, Math.floor(deadline - performance.now())) }, { signal });
     enterPhase("interactive-turn");
     await session.handleAction("enter_text", { text: "Verify this isolated CloudX launch.", submit: true });
-    const completeTurn = async (firstNewEvent: number) => {
+    const completeTurn = async (firstNewEvent: number, evidenceStage: "interactive-evidence" | "forge-evidence") => {
       let completed: ReturnType<typeof completedVerificationTurn>;
       await waitFor("The synthetic local-provider turn did not complete", async () => {
         const selected = recovery.read();
-        assert.equal(selected?.sessionId, identity.sessionId, "Verification changed the selected native conversation.");
-        assert.equal(selected?.selection?.executionId, session!.restoreInput?.()?.codexExecutionId);
-        transcript = await readVerificationTranscript(selected?.transcriptPath);
-        completed = completedVerificationTurn(transcript, firstNewEvent, identity.sessionId, answer);
+        verificationEvidence(evidenceStage, "conversation", () => {
+          assert.equal(selected?.sessionId, identity.sessionId, "Verification changed the selected native conversation.");
+          assert.equal(selected?.selection?.executionId, session!.restoreInput?.()?.codexExecutionId);
+        });
+        try {
+          transcript = await readVerificationTranscript(selected?.transcriptPath);
+          completed = completedVerificationTurn(transcript, firstNewEvent, identity.sessionId, answer);
+        } catch (cause) {
+          enterPhase(evidenceStage);
+          throw new CodexRuntimeVerificationError({ stage: evidenceStage, code: "transcript" }, { cause });
+        }
         return Boolean(completed);
       });
       confirmedTurn = { threadId: completed!.threadId, turnId: completed!.turnId };
-      return completed!.context;
+      enterPhase(evidenceStage);
+      assertNativeLaunchEvidence(completed!, root, path.join(data, "rules-skills"), evidenceStage);
+      return completed!;
     };
-    const context = await completeTurn(0);
-    assert.equal(context?.approval_policy, "never", "The native turn lost CloudX's configured approval policy.");
-    assert.equal(isRecord(context?.sandbox_policy) ? context.sandbox_policy.type : undefined, "danger-full-access", "The native turn lost CloudX's launch sandbox policy.");
-    const roots = context?.workspace_roots;
-    assert.ok(Array.isArray(roots) && [root, path.join(data, "rules-skills")].every(value => roots.includes(value)), "The native turn lost its workspace or CloudX skills root.");
+    const initialTurn = await completeTurn(0, "interactive-evidence");
     assert.equal(requests.filter(value => value === "conversation").length, 1);
     assert.equal(recovery.read()!.sessionId, identity.sessionId);
     onOutput?.("Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.\n");
@@ -172,10 +190,10 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
     session.onData?.(text => { if (text.includes("\u001b[6n")) session!.write!("\u001b[1;1R"); });
     await waitFor("Codex did not confirm the exact resumed conversation", () => Boolean(recovery.read()?.selection));
     enterPhase("forge-turn");
-    const resumedContext = await completeTurn(firstNewEvent);
-    assert.equal(resumedContext.approval_policy, context?.approval_policy);
-    assert.deepEqual(resumedContext.sandbox_policy, context?.sandbox_policy);
-    assert.deepEqual(resumedContext.workspace_roots, context?.workspace_roots);
+    const resumedTurn = await completeTurn(firstNewEvent, "forge-evidence");
+    verificationEvidence("forge-evidence", "sandbox-policy", () => assert.deepEqual(resumedTurn.context.sandbox_policy, initialTurn.context.sandbox_policy));
+    verificationEvidence("forge-evidence", "workspace-roots", () => assert.deepEqual(resumedTurn.workspaceRoots, initialTurn.workspaceRoots));
+    enterPhase("forge-turn");
     await waitFor("Forge did not save the exact native completion receipt", async () => {
       try { receipt = JSON.parse(await fs.readFile(receiptPath, "utf8")); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
@@ -226,7 +244,8 @@ async function verifyIsolatedCodexRuntime({ assistantBin, env = process.env, sig
     } catch {
       onOutput?.("Private native verification diagnostics could not be saved.\n");
     }
-    throw error;
+    if (signal?.aborted || error instanceof CodexRuntimeVerificationError) throw error;
+    throw new CodexRuntimeVerificationError({ stage: phase, code: "failed" }, { cause: error });
   } finally {
     try {
       await session?.terminate?.();

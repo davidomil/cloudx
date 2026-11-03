@@ -34,6 +34,11 @@ beforeEach(() => {
         console.error('synthetic-private-runtime-detail: selected conversation was not saved');
         process.exit(1);
       }
+      if (process.env.CLOUDX_TEST_FAILURE?.startsWith('runtime-evidence-')) {
+        console.error('synthetic-private-runtime-detail: native transcript assertion at /private/path');
+        console.error('CLOUDX_CODEX_RUNTIME_ERROR=' + JSON.stringify({ stage: 'interactive-evidence', code: process.env.CLOUDX_TEST_FAILURE === 'runtime-evidence-roots' ? 'workspace-roots' : 'transcript', message: 'synthetic-private-runtime-detail' }));
+        process.exit(1);
+      }
       if (process.env.CLOUDX_TEST_FAILURE?.startsWith('snapshot-')) {
         console.log('Selected conversation saved before any model prompt.');
         console.log('Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.');
@@ -235,7 +240,7 @@ describe("server-owned Codex updates", () => {
     const updates = f.service();
     await updates.start(f.env.CLOUDX_TEST_LATEST!);
     const failed = await finished(updates);
-    expect(failed).toMatchObject({ phase: "failed", outcome: null, activeVersion: "1.0.0", installedVersion: current ? "1.0.0" : "1.1.0", message: expect.stringMatching(/CloudX tab launch.*private update log/) });
+    expect(failed).toMatchObject({ phase: "failed", outcome: null, activeVersion: "1.0.0", installedVersion: current ? "1.0.0" : "1.1.0", message: expect.stringMatching(/failed native verification stage.*private update log/) });
     expect(JSON.stringify(failed)).not.toContain("synthetic-private");
     expect(await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8")).toContain("synthetic-private-runtime-detail");
     expect(await updates.read()).toEqual(failed);
@@ -248,6 +253,28 @@ describe("server-owned Codex updates", () => {
     const retry = f.service();
     await retry.start(f.env.CLOUDX_TEST_LATEST!);
     expect(await finished(retry)).toMatchObject({ phase: "succeeded", outcome: current ? "current" : "updated", installedVersion: current ? "1.0.0" : "1.1.0" });
+  });
+
+  it.each(["transcript", "roots"])("persists the reached interactive evidence stage and safe %s cause for Settings", async cause => {
+    const f = await installation();
+    const initial = f.service();
+    await initial.start("1.0.0");
+    expect(await finished(initial)).toMatchObject({ phase: "succeeded", activeVersion: "1.0.0" });
+    const selectionPath = path.join(f.env.CLOUDX_NPM_GLOBAL_DIR!, ".cloudx-codex-selection.json");
+    const before = await fs.readFile(selectionPath);
+    f.env.CLOUDX_TEST_FAILURE = `runtime-evidence-${cause}`;
+    const updates = f.service();
+
+    await updates.start("1.1.0");
+    const failed = await finished(updates);
+
+    expect(failed).toMatchObject({ phase: "failed", activeVersion: "1.0.0", installedVersion: "1.1.0", outcome: null, message: expect.stringContaining("failed at interactive turn evidence") });
+    expect(failed.message).toContain(cause === "roots" ? "workspace and CloudX skills roots" : "missing, malformed, stale or mismatched");
+    expect(failed.message).not.toMatch(/Forge|shared-state|synthetic-private|\/private/);
+    expect(await fs.readFile(selectionPath)).toEqual(before);
+    expect(await updates.read()).toEqual(failed);
+    expect(await f.service().read()).toEqual(failed);
+    expect(await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8")).toContain("synthetic-private-runtime-detail: native transcript assertion at /private/path");
   });
 
   it.each(["snapshot-size", "snapshot-budget"])("persists the specific %s cause in status and the private log without changing the active selection", async failure => {

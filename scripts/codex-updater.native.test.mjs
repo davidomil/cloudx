@@ -130,7 +130,11 @@ else if (process.argv[2] === 'i') {
     execFileSync("python3", ["-I", "-S", "-c", "import sqlite3, sys; sqlite3.connect(sys.argv[1]).close()", path.join(sharedStateHome, "state_5.sqlite")]);
     await fs.writeFile(commandLog, "");
     const { verifyCodexRuntime } = await import("./codex-runtime-verification.mjs");
-    await expect(verifyCodexRuntime({ assistantBin: selected.active.assistantBin, previousAssistantBin: assistantBin, env, sharedStateHome })).rejects.toThrow("did not save a selected conversation");
+    await expect(verifyCodexRuntime({ assistantBin: selected.active.assistantBin, previousAssistantBin: assistantBin, env, sharedStateHome })).rejects.toMatchObject({
+      name: "CodexRuntimeVerificationError", diagnostic: { stage: "launch", code: "failed" },
+      message: expect.stringContaining("failed at native tab launch and conversation selection"),
+      cause: expect.objectContaining({ message: expect.stringContaining("did not save a selected conversation") }),
+    });
     const compatibilityLaunches = (await fs.readFile(commandLog, "utf8")).trim().split("\n");
     expect(compatibilityLaunches.slice(0, 8)).toEqual(Array(8).fill("B"));
     expect(compatibilityLaunches.slice(8)).toContain("A");

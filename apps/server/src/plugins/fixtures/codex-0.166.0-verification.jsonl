@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"selected-thread","cli_version":"0.166.0","cwd":"/workspace"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"new"}}
+{"type":"world_state","payload":{"full":true,"state":{"environments":{"environments":{"local":{"cwd":"/workspace","status":"available","shell":"bash"}},"current_date":"2026-11-03","timezone":"Etc/UTC","filesystem":"<filesystem><workspace_roots><root>/workspace</root><root>/workspace/data/rules-skills</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>"}}}}
+{"type":"turn_context","payload":{"turn_id":"new","root_turn_id":"new","disabled_plugin_ids":[],"cwd":"/workspace","approval_policy":"never","approvals_reviewer":"user","sandbox_policy":{"type":"danger-full-access"},"permission_profile":{"type":"disabled"},"active_permission_profile":{"id":":danger-full-access"},"model":"cloudx-native"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"new","last_agent_message":"answer"}}

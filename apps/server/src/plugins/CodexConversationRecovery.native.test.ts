@@ -7,13 +7,13 @@ import { stripVTControlCharacters } from "node:util";
 import { createServer } from "node:http";
 import { expect, it, vi } from "vitest";
 
-import type { WorkspaceTab } from "@cloudx/shared";
+import { isRecord, type WorkspaceTab } from "@cloudx/shared";
 import { AppServerClient, StdioAppServerTransport } from "../appServer/AppServerClient.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexStateSources } from "./CodexStateSources.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
-import { completedVerificationTurn, readVerificationTranscript } from "./CodexVerificationTranscript.js";
+import { completedNativeTurn, completedVerificationTurn, filesystemWorkspaceRoots, readVerificationTranscript } from "./CodexVerificationTranscript.js";
 import type { PluginSession, PluginTabControls } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcess, NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import { SessionStateStore } from "../workspace/SessionStateStore.js";
@@ -178,11 +178,13 @@ it.skipIf(!codexBinary).each([
     const firstNewEvent = (await readTranscript()).length;
     const threadId = recovery.read()!.sessionId;
     await terminal!.handleAction("enter_text", { text, submit: true });
-    await expect.poll(async () => completedVerificationTurn(
-      await readTranscript(), firstNewEvent, threadId, "The conversation is saved."
-    ), { timeout: 10_000 }).toMatchObject({ threadId, turnId: expect.any(String) });
+    let completed: ReturnType<typeof completedVerificationTurn>;
+    await expect.poll(async () => {
+      completed = completedVerificationTurn(await readTranscript(), firstNewEvent, threadId, "The conversation is saved.");
+      return completed;
+    }, { timeout: 10_000 }).toMatchObject({ threadId, turnId: expect.any(String) });
     await terminal!.handleAction("wait_until_ready", { timeoutMs: 10_000 });
-    return readTranscript();
+    return completed!;
   };
   try {
     await fs.mkdir(home, { mode: 0o700 });
@@ -210,14 +212,14 @@ it.skipIf(!codexBinary).each([
     stopObserving = new CodexConversationRecovery(sources.viewPath(tab.id)).observe(identity => { observed = identity.sessionId; }, error => { throw error; });
     expect(observed).toBe(original);
     stopObserving();
-    const transcript = await completeTurn("Save this native test conversation.");
+    const initialTurn = await completeTurn("Save this native test conversation.");
     await expect.poll(() => requests.includes("title"), { timeout: 5_000 }).toBe(true);
     await expect.poll(() => plugin.describeRecovery(input)).toMatchObject({ canResume: true, conversationId: original });
-    expect(transcript.find(item => item.type === "turn_context")?.payload).toMatchObject({
+    expect(initialTurn.context).toMatchObject({
       approval_policy: transition === "configured" ? "on-request" : "never",
       sandbox_policy: { type: transition === "configured" ? "read-only" : "danger-full-access" }
     });
-    expect(transcript.find(item => item.type === "turn_context")?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
+    expect(initialTurn.workspaceRoots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
 
     let selected = original;
     if (transition !== "new") {
@@ -240,22 +242,22 @@ it.skipIf(!codexBinary).each([
       selected = recovery.read()!.sessionId;
       expect(selected).toBeTruthy();
       output = "";
-      const restrictedTranscript = await completeTurn(transition === "edit" ? "" : "Save the selected restricted conversation.");
-      expect(restrictedTranscript.filter(item => item.type === "turn_context").at(-1)?.payload).toMatchObject({
+      const restrictedTurn = await completeTurn(transition === "edit" ? "" : "Save the selected restricted conversation.");
+      expect(restrictedTurn.context).toMatchObject({
         approval_policy: "on-request", sandbox_policy: { type: "workspace-write", writable_roots: expect.arrayContaining([skills]) }
       });
-      expect(restrictedTranscript.filter(item => item.type === "turn_context").at(-1)?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
+      expect(restrictedTurn.workspaceRoots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
     } else {
       submit("/new");
       await expect.poll(() => recovery.read()?.sessionId, { timeout: 5_000 }).not.toBe(original);
       expect(recovery.read()!.sessionId).toBeTruthy();
       expect(requests.filter(value => value === "conversation")).toHaveLength(1);
       output = "";
-      const newTranscript = await completeTurn("Save the new unrestricted conversation.");
-      expect(newTranscript.find(item => item.type === "turn_context")?.payload).toMatchObject({
+      const newTurn = await completeTurn("Save the new unrestricted conversation.");
+      expect(newTurn.context).toMatchObject({
         approval_policy: "never", sandbox_policy: { type: "danger-full-access" }
       });
-      expect(newTranscript.find(item => item.type === "turn_context")?.payload.workspace_roots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
+      expect(newTurn.workspaceRoots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
       submit(`/resume ${original}`);
       await expect.poll(() => recovery.read()?.sessionId === original ? original : output, { timeout: 5_000 }).toBe(original);
     }
@@ -282,14 +284,13 @@ it.skipIf(!codexBinary).each([
     }, { timeout: 10_000 }).toMatchObject({ sessionId: selected, selection: { executionId: restartedExecutionId } });
     expect(requests.filter(value => value === "conversation")).toHaveLength(conversationCount);
     output = "";
-    const restoredTranscript = await completeTurn("Verify the restored conversation permissions and saved roots.");
-    const restoredContext = restoredTranscript.filter(item => item.type === "turn_context").at(-1)?.payload;
-    expect(restoredContext).toMatchObject({
+    const restoredTurn = await completeTurn("Verify the restored conversation permissions and saved roots.");
+    expect(restoredTurn.context).toMatchObject({
       approval_policy: transition === "new" ? "never" : "on-request",
-      sandbox_policy: { type: transition === "new" ? "danger-full-access" : "workspace-write" },
-      workspace_roots: expect.arrayContaining([root, configuredRoot, skills])
+      sandbox_policy: { type: transition === "new" ? "danger-full-access" : "workspace-write" }
     });
-    expect(restoredContext.workspace_roots).not.toContain(replacementRoot);
+    expect(restoredTurn.workspaceRoots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
+    expect(restoredTurn.workspaceRoots).not.toContain(replacementRoot);
     expect(recovery.read()!.sessionId).toBe(selected);
   } finally {
     stopObserving?.();
@@ -634,19 +635,35 @@ it.skipIf(!codexBinary)("opens confirmed native forks independently while source
   const complete = async (branch: Branch, text: string) => {
     await branch.terminal.handleAction("wait_until_ready", { timeoutMs: 10_000 });
     const firstNewEvent = (await transcript(branch)).length;
+    const firstNewRequest = requests.length;
     const threadId = branch.recovery.read()!.sessionId;
     await branch.terminal.handleAction("enter_text", { text, submit: true });
-    await expect.poll(async () => completedVerificationTurn(await transcript(branch), firstNewEvent, threadId, answer), { timeout: 10_000 })
+    let completed: ReturnType<typeof completedNativeTurn>;
+    await expect.poll(async () => {
+      completed = completedNativeTurn(await transcript(branch), firstNewEvent, threadId, answer);
+      return completed;
+    }, { timeout: 10_000 })
       .toMatchObject({ threadId, turnId: expect.any(String) });
     await branch.terminal.handleAction("wait_until_ready", { timeoutMs: 10_000 });
-    return transcript(branch);
+    const submitted = requests.slice(firstNewRequest).filter(request => !request.text?.format?.schema?.properties?.title);
+    expect(submitted).toHaveLength(1);
+    const input = submitted[0]!.input;
+    expect(Array.isArray(input)).toBe(true);
+    const messages = (input as unknown[]).filter(isRecord);
+    const textOf = (message: Record<string, unknown>) => Array.isArray(message.content)
+      ? message.content.filter(isRecord).flatMap(content => typeof content.text === "string" ? [content.text] : []).join("\n") : "";
+    expect(messages.some(message => message.role === "user" && textOf(message) === text)).toBe(true);
+    // Paginated fork rollouts can omit inherited roots. Inspect the native model input for this exact submission.
+    const filesystem = messages.flatMap(message => [...textOf(message).matchAll(/<filesystem>[\s\S]*?<\/filesystem>/gu)].map(match => match[0])).at(-1);
+    expect(filesystem).toBeDefined();
+    return { ...completed!, workspaceRoots: filesystemWorkspaceRoots(filesystem!), events: await transcript(branch) };
   };
-  const expectRestricted = (events: Awaited<ReturnType<typeof transcript>>) => {
-    expect(events.filter(item => item.type === "turn_context").at(-1)?.payload).toMatchObject({
+  const expectRestricted = (turn: Awaited<ReturnType<typeof complete>>) => {
+    expect(turn.context).toMatchObject({
       model: "cloudx-native", approval_policy: "on-request", active_permission_profile: { id: ":workspace" },
-      sandbox_policy: { type: "workspace-write", writable_roots: expect.arrayContaining([skills]) },
-      workspace_roots: expect.arrayContaining([root, configuredRoot, skills])
+      sandbox_policy: { type: "workspace-write", writable_roots: expect.arrayContaining([skills]) }
     });
+    expect(turn.workspaceRoots).toEqual(expect.arrayContaining([root, configuredRoot, skills]));
   };
   try {
     await fs.mkdir(home, { mode: 0o700 });
@@ -664,8 +681,8 @@ it.skipIf(!codexBinary)("opens confirmed native forks independently while source
     await expect.poll(() => source.recovery.read()?.sessionId ?? source.output, { timeout: 15_000 }).toMatch(/^[a-f0-9-]{36}$/u);
     const original = source.recovery.read()!.sessionId;
     const executionId = source.terminal.restoreInput!()!.codexExecutionId;
-    const originalTranscript = await complete(source, "This message is shared history at the native fork point.");
-    expect(originalTranscript.filter(item => item.type === "turn_context").at(-1)?.payload).toMatchObject({
+    const originalTurn = await complete(source, "This message is shared history at the native fork point.");
+    expect(originalTurn.context).toMatchObject({
       approval_policy: "never", sandbox_policy: { type: "danger-full-access" }
     });
     source.output = "";
@@ -686,13 +703,13 @@ it.skipIf(!codexBinary)("opens confirmed native forks independently while source
     expect(source.terminal.restoreInput!()).toMatchObject({ codexExecutionId: executionId, resume: { mode: "session", sessionId: original } });
     expect(child.terminal.restoreInput!()).toMatchObject({ resume: { mode: "session", sessionId: childId } });
     expect(conversationRequests()).toHaveLength(1);
-    const childTranscript = await complete(child, "This message belongs only to the child branch.");
-    expectRestricted(childTranscript);
-    expect(childTranscript[0]?.payload).toMatchObject({ forked_from_id: original });
+    const childTurn = await complete(child, "This message belongs only to the child branch.");
+    expectRestricted(childTurn);
+    expect(childTurn.events[0]?.payload).toMatchObject({ forked_from_id: original });
     expect(JSON.stringify(conversationRequests().at(-1)?.input).includes("This message is shared history at the native fork point.")).toBe(true);
     expect(JSON.stringify(await transcript(source))).not.toContain("This message belongs only to the child branch.");
-    const sourceTranscript = await complete(source, "This message belongs only to the original source.");
-    expectRestricted(sourceTranscript);
+    const sourceTurn = await complete(source, "This message belongs only to the original source.");
+    expectRestricted(sourceTurn);
     expect(JSON.stringify(await transcript(child))).not.toContain("This message belongs only to the original source.");
     source.terminal.write!("\u001b[200~/fork\u001b[201~\r");
     await expect.poll(() => branches.length, { timeout: 15_000 }).toBe(2);
@@ -711,10 +728,10 @@ it.skipIf(!codexBinary)("opens confirmed native forks independently while source
       const restored = await launch(branch.tab.id, input);
       await expect.poll(() => restored.recovery.read()?.sessionId ?? restored.output, { timeout: 10_000 }).toBe(identity.sessionId);
       expect(restored.terminal.restoreInput!()!.codexExecutionId).not.toBe(identity.selection!.executionId);
-      const restoredTranscript = await complete(restored, `Continue the restored ${branch.tab.id} independently.`);
-      expectRestricted(restoredTranscript);
-      if (identity.sessionId === childId) expect(JSON.stringify(restoredTranscript)).not.toContain("This message belongs only to the original source.");
-      else expect(JSON.stringify(restoredTranscript)).not.toContain("This message belongs only to the child branch.");
+      const restoredTurn = await complete(restored, `Continue the restored ${branch.tab.id} independently.`);
+      expectRestricted(restoredTurn);
+      if (identity.sessionId === childId) expect(JSON.stringify(restoredTurn.events)).not.toContain("This message belongs only to the original source.");
+      else expect(JSON.stringify(restoredTurn.events)).not.toContain("This message belongs only to the child branch.");
     }
     expect(conversationRequests()).toHaveLength(6);
     expect(controls.openSiblingTab).toHaveBeenCalledTimes(2);
