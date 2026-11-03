@@ -25,7 +25,7 @@ const summary: HardwareSummary = {
         definitionId: "up",
         source: "command",
         script: {
-          source: "printf true",
+          source: "false",
           cwd: "/lab",
           timeoutMs: 1000,
           maxOutputBytes: 100,
@@ -125,7 +125,7 @@ describe("Hardware operation and observation views", () => {
           ...summary.observations[0]!,
           state: "error" as const,
           value: undefined,
-          errorCode: "INVALID_STATUS_JSON",
+          errorCode: "SPAWN_FAILED",
         },
       ],
     };
@@ -137,7 +137,7 @@ describe("Hardware operation and observation views", () => {
           detailed: true,
         }),
       ),
-    ).toContain("Error: INVALID_STATUS_JSON");
+    ).toContain("Error: SPAWN_FAILED");
   });
 
   it("shows execution readiness only when a live execution needs attention", () => {

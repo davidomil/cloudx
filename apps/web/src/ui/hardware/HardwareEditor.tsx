@@ -922,16 +922,16 @@ export function StatusBindings({
                   </label>
                 </div>
                 <p className="hardware-muted">
-                  Exit zero after printing the result to stdout.{" "}
                   {definition.valueType === "boolean" ? (
                     <>
-                      Output one JSON boolean: <code>true</code> or{" "}
-                      <code>false</code>.
+                      Exit <code>0</code> means <code>true</code>; a normal
+                      nonzero exit means <code>false</code>. Stdout is
+                      diagnostic output.
                     </>
                   ) : definition.valueType === "text" ? (
-                    "Output one JSON string, including quotes."
+                    "Exit zero and output one JSON string, including quotes."
                   ) : (
-                    "Output one JSON string matching an allowed enum value."
+                    "Exit zero and output one JSON string matching an allowed enum value."
                   )}{" "}
                   Use an existing directory within a CloudX allowed root.
                   Scheduled checks skip held groups.

@@ -24,7 +24,7 @@ Fault-inject after each persistence/dispatch boundary: before claim write, after
 
 Implement editable status definitions, manual bindings, command bindings, freshness, admission requirements, refresh, and scheduled checks. Use the same exclusion gate for checks and reservations. Implement the bounded host-side Bash runner and structured stdin context, with explicit credential references and private/redacted logs.
 
-Test boolean/text/enum values, false with exit zero, configured equals:false, mismatched text/enum requirements, nonzero exit, invalid/multiple JSON values, empty stdout, truncation, deadlines, cancellation, unsafe working directories, and missing credentials. Check that stale/error observations do not satisfy requirements. Check that a manual Free to use update cannot remove a claim.
+Test boolean exit zero as true and normal nonzero exits as false, with empty, noisy, and misleading JSON stdout. Check configured equals:true and equals:false, replacement of an earlier success, and captured exit/output diagnostics. Text and enum commands still require exit zero and one typed JSON value; test malformed, multiple, empty, and invalid enum output. Cover truncation, deadlines, cancellation, signal termination without an exit code, unsafe working directories, and missing credentials. Check that stale/error observations do not satisfy requirements. Check that a manual Free to use update cannot remove a claim.
 
 Use controlled test scripts and barriers to prove claim-before-hook ordering, one dispatch per request, no arbitrary code interpolation, known process cleanup, blocked competing reserve during a check, owner-only refresh while held, skipped scheduled checks, and failed/unknown release remaining held. A timed-out shell with unconfirmed descendants must not be declared stopped.
 
@@ -76,7 +76,7 @@ Requirement coverage.
 | Start with SSH and UART; later PCIe | API operation tables and provider boundaries. | Milestone 4 transport checks; no initial PCIe claim. |
 | Notes include login/capabilities/restrictions | Product notes workflow; typed examples; skill drafts. | Milestones 6 and 7. |
 | Editable capability catalog and AI discovery | Catalog actions; all/any/none filters. | Milestones 1, 5, and 6. |
-| Configurable manual or Bash statuses | StatusDefinition/Binding/Observation; stdout/freshness contract. | Milestone 3. |
+| Configurable manual or Bash statuses | StatusDefinition/Binding/Observation; boolean exit codes, text/enum JSON output, and freshness. | Milestone 3. |
 | List all hardware and custom filters | Paginated list/get/catalog actions. | Milestones 1 and 5. |
 | Find suitable available hardware | Availability and admission predicates. | Milestone 7. |
 | Reserve with optional script and internal exclusion | Atomic claim algorithm; phase table; request receipts. | Milestones 2 and 3 race/barrier checks. |

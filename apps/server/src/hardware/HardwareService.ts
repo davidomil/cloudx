@@ -434,9 +434,10 @@ export class HardwareService {
         diagnostics.push({ definitionId: binding.definitionId, ...scriptDiagnostics(result, Math.floor(64 * 1024 / work.bindings.length)) });
         const observation: StatusObservation = { definitionId: binding.definitionId, bindingRevision: binding.revision, state: "error", observedAt: now(), expiresAt: new Date(Date.now() + binding.maxAgeMs).toISOString(), runId: work.runId };
         try {
-          requireHardware(result.state === "completed", "STATUS_CHECK_FAILED", "Status command did not complete successfully.");
-          const value: unknown = JSON.parse(result.stdout);
           const definition = this.state.statusDefinitions.find(definition => definition.id === binding.definitionId)!;
+          const normalExit = result.exitCode !== null && result.cleanupConfirmed && !result.timedOut && !result.cancelled && (result.state === "completed" || result.state === "failed" && result.errorCode === "EXIT_CODE");
+          requireHardware(normalExit && (definition.valueType === "boolean" || result.state === "completed" && result.exitCode === 0), "STATUS_CHECK_FAILED", "Status command did not complete successfully.");
+          const value: unknown = definition.valueType === "boolean" ? result.exitCode === 0 : JSON.parse(result.stdout);
           validateHardwareStatusValue(value, definition);
           observation.state = "known"; observation.value = value;
         } catch { observation.errorCode = result.errorCode ?? "INVALID_STATUS_VALUE"; measurementError = true; }

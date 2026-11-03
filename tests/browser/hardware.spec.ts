@@ -957,6 +957,199 @@ test("UART reads bounded windows, writes exact bytes, controls lines, and clears
   await expect(button(page, "Read bytes")).toBeDisabled();
 });
 
+for (const check of [
+  {
+    name: "empty success",
+    script: "true",
+    exitCode: 0,
+    stdout: "",
+    value: true,
+  },
+  {
+    name: "empty false result",
+    script: "false",
+    exitCode: 1,
+    stdout: "",
+    value: false,
+  },
+  {
+    name: "printed false with success",
+    script: "printf false",
+    exitCode: 0,
+    stdout: "false",
+    value: true,
+  },
+  {
+    name: "noisy exit 7",
+    script: "printf 'probe offline\\n'; exit 7",
+    exitCode: 7,
+    stdout: "probe offline\n",
+    value: false,
+  },
+  {
+    name: "noisy success",
+    script: "printf 'probe completed\\n'",
+    exitCode: 0,
+    stdout: "probe completed\n",
+    value: true,
+  },
+]) {
+  test(`boolean status commands use their exit code: ${check.name}`, async ({
+    page,
+  }, info) => {
+    await button(page, "Statuses & hooks").click();
+    await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+    await label(page, "Up source").selectOption("command");
+    await label(page, "Up status command").fill(check.script);
+    await label(page, "Up status command working directory").fill(lab.root);
+    await button(page, "Save configuration").click();
+    await button(page, "Refresh Up").click();
+    await expect(
+      page
+        .locator(".hardware-observation-row")
+        .filter({ hasText: "Up" })
+        .locator(".hardware-observation"),
+    ).toHaveText(`${check.value} · fresh`);
+    const state = await lab.service.snapshot(operator);
+    const observation = state.items
+      .find((value) => value.item.id === lab.ssh.id)!
+      .observations.find(
+        (value) => value.definitionId === lab.ssh.statuses[0]!.definitionId,
+      )!;
+    expect(observation).toMatchObject({ state: "known", value: check.value });
+    const receipt = state.receipts.find(
+      (value) => value.runId === observation.runId,
+    )!;
+    expect(receipt).toMatchObject({
+      state: "succeeded",
+      result: {
+        diagnostics: [
+          expect.objectContaining({
+            exitCode: check.exitCode,
+            stdout: check.stdout,
+          }),
+        ],
+      },
+    });
+    expect(state.checkHolds).toEqual([]);
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    await expect(button(page, "Save configuration")).toBeEnabled();
+    if (check.exitCode === 7) {
+      await screenshot(page, info, "boolean-exit7-editor", "Up status command");
+      await screenshot(
+        page,
+        info,
+        "boolean-exit7-receipt",
+        "Operation receipt",
+      );
+    }
+  });
+}
+
+test("a fresh false command result satisfies an exact false reservation requirement", async ({
+  page,
+}) => {
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+  await label(page, "Up source").selectOption("command");
+  await label(page, "Up status command").fill("false");
+  await label(page, "Up status command working directory").fill(lab.root);
+  await label(page, "Require Up for reservation").check();
+  await label(page, "Up required value").selectOption("false");
+  await button(page, "Save configuration").click();
+  await idle(page);
+  await button(page, "Inventory").click();
+  await label(page, "Reservation purpose").fill("Check exact false admission");
+  await expect(button(page, "Reserve hardware")).toBeDisabled();
+  await button(page, "Statuses & hooks").click();
+  await button(page, "Refresh Up").click();
+  await expect(
+    page
+      .locator(".hardware-observation-row")
+      .filter({ hasText: "Up" })
+      .locator(".hardware-observation"),
+  ).toHaveText("false · fresh");
+  await button(page, "Inventory").click();
+  await label(page, "Reservation purpose").fill(
+    "Use the observed false result",
+  );
+  await expect(button(page, "Reserve hardware")).toBeEnabled();
+  await button(page, "Reserve hardware").click();
+  await expect(button(page, "Open access screen")).toBeEnabled();
+  await button(page, "Reservations").click();
+  await button(page, "Details").click();
+  await button(page, "Release own reservation").click();
+  await expect
+    .poll(
+      async () => (await lab.service.snapshot(operator)).reservations.length,
+    )
+    .toBe(0);
+});
+
+test("text and enum command statuses retain zero-exit typed JSON results", async ({
+  page,
+}) => {
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+  const definitions = (await lab.service.snapshot(operator)).statusDefinitions;
+  for (const check of [
+    {
+      label: "OS",
+      script: "printf '\"Linux\"'",
+      guidance: "Exit zero and output one JSON string, including quotes.",
+    },
+    {
+      label: "Health",
+      script: "printf '\"ready\"'",
+      guidance:
+        "Exit zero and output one JSON string matching an allowed enum value.",
+    },
+  ]) {
+    await label(page, "Status definition to add").selectOption(
+      definitions.find((value) => value.label === check.label)!.id,
+    );
+    await button(page, "Add status").click();
+    await label(page, `${check.label} source`).selectOption("command");
+    await expect(
+      page
+        .locator(".hardware-status-editor")
+        .filter({ has: label(page, `${check.label} source`) }),
+    ).toContainText(check.guidance);
+    await label(page, `${check.label} status command`).fill(check.script);
+    await label(page, `${check.label} status command working directory`).fill(
+      lab.root,
+    );
+  }
+  await button(page, "Save configuration").click();
+  for (const check of [
+    { label: "OS", value: "Linux" },
+    { label: "Health", value: "ready" },
+  ]) {
+    await button(page, `Refresh ${check.label}`).click();
+    await expect(
+      page
+        .locator(".hardware-observation-row")
+        .filter({
+          has: page.locator("strong", {
+            hasText: new RegExp(`^${check.label}$`),
+          }),
+        })
+        .locator(".hardware-observation"),
+    ).toHaveText(`${check.value} · fresh`);
+  }
+  await label(page, "Health status command").fill("printf ready");
+  await button(page, "Save configuration").click();
+  await button(page, "Refresh Health").click();
+  await expect(
+    page
+      .locator(".hardware-observation-row")
+      .filter({ has: page.locator("strong", { hasText: /^Health$/ }) })
+      .locator(".hardware-observation"),
+  ).toHaveText("Error");
+  await expect(page.getByRole("alert")).toContainText("STATUS_CHECK_FAILED");
+  expect((await lab.service.snapshot(operator)).checkHolds).toEqual([]);
+});
+
 test("status hardware selection shows resource context and keeps each draft", async ({
   page,
 }, info) => {
@@ -1089,7 +1282,7 @@ test("status editor explains check recovery and restores editing after explicit 
           definitionId: lab.ssh.statuses[0]!.definitionId,
           source: "command",
           script: {
-            source: "sleep 5; printf true",
+            source: "sleep 5; true",
             cwd: lab.root,
             timeoutMs: 100,
             maxOutputBytes: 4096,
@@ -1145,12 +1338,12 @@ test("status configuration rejects a disallowed directory without holding hardwa
   await button(page, "Statuses & hooks").click();
   await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
   await label(page, "Up source").selectOption("command");
-  await label(page, "Up status command").fill("printf true");
+  await label(page, "Up status command").fill("true");
   await label(page, "Up status command working directory").fill("/");
   await button(page, "Save configuration").click();
   await expect(page.getByRole("alert")).toContainText("CloudX allowed roots");
   await expect(label(page, "Up source")).toBeEnabled();
-  await expect(label(page, "Up status command")).toHaveValue("printf true");
+  await expect(label(page, "Up status command")).toHaveValue("true");
   await expect(label(page, "Up status command working directory")).toHaveValue(
     "/",
   );
@@ -1199,12 +1392,12 @@ test("status bindings, exact manual values and real Bash reservation hooks work"
   await button(page, "Discard draft and load current configuration").click();
   await label(page, "Up source").selectOption("command");
   await expect(page.locator(".hardware-status-editor").first()).toContainText(
-    "Output one JSON boolean: true or false.",
+    "Exit 0 means true; a normal nonzero exit means false.",
   );
   await expect(page.locator(".hardware-status-editor").first()).toContainText(
     "existing directory within a CloudX allowed root",
   );
-  await label(page, "Up status command").fill("printf true");
+  await label(page, "Up status command").fill("true");
   await label(page, "Up status command working directory").fill(lab.root);
   await label(page, "Up status command deadline").fill("1000");
   await page
@@ -1253,7 +1446,7 @@ test("status bindings, exact manual values and real Bash reservation hooks work"
   await label(page, "On release Bash script working directory").fill(lab.root);
   await button(page, "Inventory").click();
   await button(page, "Statuses & hooks").click();
-  await expect(label(page, "Up status command")).toHaveValue("printf true");
+  await expect(label(page, "Up status command")).toHaveValue("true");
   await screenshot(page, info, "04-statuses-hooks");
   await button(page, "Save configuration").click();
   await idle(page);
@@ -1595,8 +1788,7 @@ test("checking holds show exact targets and stale force-release dialogs cannot c
           definitionId,
           source: "command",
           script: {
-            source:
-              "while [ ! -f check-finish ]; do sleep 0.02; done; printf true",
+            source: "while [ ! -f check-finish ]; do sleep 0.02; done; true",
             cwd: lab.root,
             timeoutMs: 10000,
             maxOutputBytes: 4096,

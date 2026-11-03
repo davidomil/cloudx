@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HardwareTypeProvider } from "@cloudx/plugin-api";
-import type { HardwareItemDraft, HardwareMutationResult, HardwareOwner, OperationReceipt } from "@cloudx/shared";
+import type { HardwareItemDraft, HardwareMutationResult, HardwareOwner, OperationReceipt, StatusDefinition, StatusValue } from "@cloudx/shared";
 import { HardwareService, type HardwareServiceOptions } from "./HardwareService.js";
 import { HardwareStore } from "./HardwareStore.js";
 import { HardwareScriptRunner, type HardwareScriptResult } from "./HardwareScriptRunner.js";
@@ -161,11 +161,11 @@ describe("hardware status checks and recovery", () => {
     await expect(mutate(service, "hardware.statuses.refresh", { hardwareId: item.id, reservationId: claim.reservationId, generation: claim.generation + 1 }, alice)).rejects.toMatchObject({ code: "STALE_RESERVATION" });
   });
 
-  it("holds a free group during a status script and stores exact JSON observations", async () => {
+  it("holds a free group during a status script and stores an exact exit-status observation", async () => {
     const { service, root } = await fixture();
     await mutate(service, "hardware.statuses.create", { label: "Up", valueType: "boolean" });
     const definition = (await service.snapshot(user)).statusDefinitions[0];
-    const item = await addItem(service, { statuses: [{ revision: 1, definitionId: definition.id, source: "command", script: { source: 'while [ ! -f measured ]; do sleep 0.02; done; printf false', cwd: root, timeoutMs: 5000, maxOutputBytes: 4096, credentialRefIds: [] }, maxAgeMs: 1000, intervalMs: null, requiredForReserve: { equals: false } }] });
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId: definition.id, source: "command", script: { source: 'while [ ! -f measured ]; do sleep 0.02; done; exit 1', cwd: root, timeoutMs: 5000, maxOutputBytes: 4096, credentialRefIds: [] }, maxAgeMs: 1000, intervalMs: null, requiredForReserve: { equals: false } }] });
     const check = await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id }, alice);
     expect((await service.snapshot(user)).checkHolds).toHaveLength(1);
     await expect(mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Validation" }, bob)).rejects.toMatchObject({ code: "CHECK_IN_PROGRESS" });
@@ -208,6 +208,128 @@ describe("hardware status checks and recovery", () => {
     expect((await restored.snapshot(user)).reservations[0].state).toBe("active");
     const claim = (await restored.snapshot(user)).reservations[0];
     await expect(mutate(restored, "hardware.access.open", { reservationId: claim.reservationId, generation: claim.generation }, { ...alice, executionId: "replacement" })).rejects.toMatchObject({ code: "OWNER_CHANGED" });
+  });
+});
+
+describe("hardware command status values", () => {
+  async function statusFixture(source: string, options: { valueType?: StatusDefinition["valueType"]; required?: StatusValue; maxOutputBytes?: number; timeoutMs?: number } = {}) {
+    const { service, root } = await fixture();
+    const valueType = options.valueType ?? "boolean";
+    await mutate(service, "hardware.statuses.create", { label: "Observed", valueType, ...(valueType === "enum" ? { enumValues: ["ready", "busy"] } : {}) });
+    const definition = (await service.snapshot(user)).statusDefinitions[0];
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId: definition.id, source: "command", script: { source, cwd: root, timeoutMs: options.timeoutMs ?? 1000, maxOutputBytes: options.maxOutputBytes ?? 4096, credentialRefIds: [] }, maxAgeMs: 60_000, intervalMs: null, ...(options.required === undefined ? {} : { requiredForReserve: { equals: options.required } }) }] });
+    const refresh = async () => settled(service, (await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id })).receipt);
+    return { service, root, item, refresh };
+  }
+
+  it.each([
+    { source: "exit 0", exitCode: 0, value: true },
+    { source: "printf 'PING fixture: host is reachable'; exit 0", exitCode: 0, value: true },
+    { source: "printf false; exit 0", exitCode: 0, value: true },
+    { source: "printf true; exit 1", exitCode: 1, value: false },
+    ...[2, 7, 126, 127, 143, 255].map(exitCode => ({ source: `exit ${exitCode}`, exitCode, value: false })),
+  ])("measures $value from normal exit $exitCode for $source", async ({ source, exitCode, value }) => {
+    const { service, refresh } = await statusFixture(source);
+    expect(await refresh()).toMatchObject({ state: "succeeded", result: { diagnostics: [{ exitCode, cleanupConfirmed: true }] } });
+    const state = await service.snapshot(user);
+    expect(state.items[0].observations).toMatchObject([{ state: "known", value }]);
+    expect(state.checkHolds).toEqual([]);
+  });
+
+  it.each([
+    { exitCode: 0, required: true, availability: "available" },
+    { exitCode: 1, required: false, availability: "available" },
+    { exitCode: 0, required: false, availability: "ineligible" },
+    { exitCode: 1, required: true, availability: "ineligible" },
+  ] as const)("gates required $required against exit $exitCode as $availability", async ({ exitCode, required, availability }) => {
+    const { service, item, refresh } = await statusFixture(`exit ${exitCode}`, { required });
+    expect((await refresh()).state).toBe("succeeded");
+    expect((await service.snapshot(user)).items[0].availability).toBe(availability);
+    const reserve = mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Verify exact status gate" });
+    if (availability === "available") expect((await reserve).reservation?.state).toBe("active");
+    else await expect(reserve).rejects.toMatchObject({ code: "STATUS_NOT_READY" });
+  });
+
+  it("replaces a successful true measurement with the latest false exit without changing the binding", async () => {
+    const { service, root, refresh } = await statusFixture("test -f online", { required: true });
+    await fs.writeFile(path.join(root, "online"), "reachable");
+    const first = await refresh(); expect(first.state).toBe("succeeded");
+    expect((await service.snapshot(user)).items[0].availability).toBe("available");
+    await fs.rm(path.join(root, "online"));
+    const latest = await refresh(); expect(latest.state).toBe("succeeded");
+    const state = await service.snapshot(user);
+    expect(state.items[0].observations).toMatchObject([{ state: "known", value: false, bindingRevision: 1, runId: latest.runId }]);
+    expect(state.items[0].availability).toBe("ineligible"); expect(state.checkHolds).toEqual([]);
+  });
+
+  it.each([
+    { source: "kill -TERM $$", maxOutputBytes: 4096, errorCode: "EXIT_CODE" },
+    { source: "printf overflow", maxOutputBytes: 1, errorCode: "OUTPUT_LIMIT" },
+    { source: "sleep 10 & exit 1", maxOutputBytes: 4096, errorCode: "DESCENDANTS_RUNNING" },
+  ])("keeps $errorCode as a check error rather than a false measurement", async ({ source, maxOutputBytes, errorCode }) => {
+    const { service, refresh } = await statusFixture(source, { maxOutputBytes, required: false });
+    expect(await refresh()).toMatchObject({ state: "failed", result: { diagnostics: [{ errorCode }] } });
+    const state = await service.snapshot(user);
+    expect(state.items[0].observations).toMatchObject([{ state: "error", errorCode }]);
+    expect(state.items[0].observations[0]).not.toHaveProperty("value");
+    expect(state.items[0].availability).toBe("ineligible"); expect(state.checkHolds).toEqual([]);
+  });
+
+  it.each([
+    { state: "failed", exitCode: null, errorCode: "SPAWN_FAILED", cleanupConfirmed: true },
+    { state: "failed", exitCode: 1, errorCode: "STDIN_FAILED", cleanupConfirmed: true },
+    { state: "unknown", exitCode: 1, errorCode: "CLEANUP_UNKNOWN", cleanupConfirmed: false },
+  ] satisfies Array<Pick<HardwareScriptResult, "state" | "exitCode" | "errorCode" | "cleanupConfirmed">>)("preserves $errorCode runner failures independently of numeric exits", async result => {
+    const { service, refresh } = await statusFixture("exit 0", { required: false });
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockResolvedValueOnce({ ...result, stdout: "false", stderr: "", timedOut: false, cancelled: false });
+    expect((await refresh()).state).toBe(result.state === "unknown" ? "unknown" : "failed");
+    const state = await service.snapshot(user);
+    expect(state.items[0].observations).toMatchObject([{ state: "error", errorCode: result.errorCode }]);
+    expect(state.items[0].observations[0]).not.toHaveProperty("value");
+    if (result.state === "unknown") expect(state.checkHolds).toMatchObject([{ state: "recovery_required" }]);
+    else expect(state.checkHolds).toEqual([]);
+  });
+
+  it("retains cancelled status execution as an unknown receipt and recovery hold", async () => {
+    const { service, root, item } = await statusFixture("printf started > started; sleep 10", { timeoutMs: 5000, required: false });
+    const check = await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id });
+    for (let attempt = 0; attempt < 100; attempt++) { if (await fs.stat(path.join(root, "started")).then(() => true, () => false)) break; await new Promise(resolve => setTimeout(resolve, 10)); }
+    expect(await fs.readFile(path.join(root, "started"), "utf8")).toBe("started");
+    await service.dispose();
+    const state = JSON.parse(await fs.readFile(path.join(root, "hardware/state.json"), "utf8"));
+    expect(state.receipts.find((record: { receipt: OperationReceipt }) => record.receipt.runId === check.receipt.runId).receipt).toMatchObject({ state: "unknown", result: { diagnostics: [{ cancelled: true, errorCode: "CANCELLED" }] } });
+    expect(state.checkHolds).toMatchObject([{ state: "recovery_required" }]);
+    expect(state.observations[item.id][0]).not.toHaveProperty("value");
+  });
+
+  it.each(["text", "enum"] as const)("keeps %s commands on successful typed JSON output", async valueType => {
+    const { service, refresh } = await statusFixture(`printf '"ready"'`, { valueType, required: "ready" });
+    expect((await refresh()).state).toBe("succeeded");
+    expect((await service.snapshot(user)).items[0]).toMatchObject({ availability: "available", observations: [{ state: "known", value: "ready" }] });
+  });
+
+  it.each([
+    { valueType: "text", source: "printf malformed", errorCode: "INVALID_STATUS_VALUE" },
+    { valueType: "text", source: `printf '"ready" "another"'`, errorCode: "INVALID_STATUS_VALUE" },
+    { valueType: "enum", source: "printf malformed", errorCode: "INVALID_STATUS_VALUE" },
+    { valueType: "enum", source: `printf '"ready" "another"'`, errorCode: "INVALID_STATUS_VALUE" },
+    { valueType: "enum", source: `printf '"unknown"'`, errorCode: "INVALID_STATUS_VALUE" },
+    { valueType: "enum", source: "printf false", errorCode: "INVALID_STATUS_VALUE" },
+    { valueType: "text", source: `printf '"ready"'; exit 1`, errorCode: "EXIT_CODE" },
+    { valueType: "enum", source: `printf '"ready"'; exit 1`, errorCode: "EXIT_CODE" },
+  ] as const)("rejects invalid $valueType execution: $source", async ({ valueType, source, errorCode }) => {
+    const { service, refresh } = await statusFixture(source, { valueType });
+    expect((await refresh()).state).toBe("failed");
+    expect((await service.snapshot(user)).items[0].observations).toMatchObject([{ state: "error", errorCode }]);
+  });
+
+  it("keeps a nonzero release hook as a failure rather than a boolean measurement", async () => {
+    const { service, root } = await fixture();
+    const item = await addItem(service, { hooks: { onRelease: { source: "exit 7", cwd: root, timeoutMs: 1000, maxOutputBytes: 4096, credentialRefIds: [] } } });
+    const reserved = await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Verify hook semantics" });
+    const claim = reserved.reservation!;
+    expect(await settled(service, (await mutate(service, "hardware.release", { reservationId: claim.reservationId, generation: claim.generation })).receipt)).toMatchObject({ state: "failed", error: { code: "HOOK_FAILED" }, result: { diagnostics: { exitCode: 7 } } });
+    expect((await service.snapshot(user)).reservations).toMatchObject([{ state: "recovery_required" }]);
   });
 });
 
@@ -427,23 +549,23 @@ describe("hardware discovery, observations, and retained evidence", () => {
     await expect(service.execute("hardware.items.list", { limit: 1, tags: { all: [tags[0].id], none: [] }, cursor: first.nextCursor }, alice)).rejects.toMatchObject({ code: "CURSOR_STALE" });
   });
 
-  it("keeps unknown, stale, failed, and mismatched status values ineligible without coercion", async () => {
+  it("keeps unknown, stale, and mismatched status values ineligible without coercion", async () => {
     const { service, root } = await fixture();
     await mutate(service, "hardware.statuses.create", { label: "Ready", valueType: "boolean" }); const definition = (await service.snapshot(user)).statusDefinitions[0];
-    const item = await addItem(service, { statuses: [{ revision: 1, definitionId: definition.id, source: "command", script: { source: "printf false", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] }, intervalMs: null, maxAgeMs: 1000, requiredForReserve: { equals: false } }] });
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId: definition.id, source: "command", script: { source: "exit 1", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] }, intervalMs: null, maxAgeMs: 1000, requiredForReserve: { equals: false } }] });
     expect((await service.snapshot(user)).items[0].availability).toBe("ineligible");
     const check = await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id }, alice); await settled(service, check.receipt, alice);
     expect((await service.snapshot(user)).items[0].availability).toBe("available");
     const current = Date.now(); const clock = vi.spyOn(Date, "now").mockReturnValue(current + 2000);
     expect((await service.snapshot(user)).items[0].blockers.some(blocker => blocker.includes("stale"))).toBe(true); clock.mockRestore();
     await expect(service.execute("hardware.items.list", { statuses: [{ definitionId: definition.id, equals: "false", requireFresh: true }] }, alice)).rejects.toMatchObject({ code: "INVALID_FILTER" });
-    const binding = { ...item.statuses[0], script: { ...(item.statuses[0].source === "command" ? item.statuses[0].script : {}), source: 'printf \'"false"\'' } };
+    const binding = { ...item.statuses[0], script: { ...(item.statuses[0].source === "command" ? item.statuses[0].script : {}), source: "exit 0" } };
     await expect(mutate(service, "hardware.items.update", { hardwareId: item.id, expectedItemRevision: item.revision, patch: { statuses: [binding] } })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
     await mutate(service, "hardware.items.update", { hardwareId: item.id, expectedItemRevision: item.revision, patch: { statuses: [{ ...binding, revision: 2 }] } });
     expect((await service.snapshot(user)).items[0].observations).toEqual([]);
-    const invalid = await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id }, alice);
-    expect((await settled(service, invalid.receipt, alice)).state).toBe("failed");
-    expect((await service.snapshot(user)).items[0].observations[0]).toMatchObject({ state: "error", errorCode: "INVALID_STATUS_VALUE" });
+    const mismatched = await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id }, alice);
+    expect((await settled(service, mismatched.receipt, alice)).state).toBe("succeeded");
+    expect((await service.snapshot(user)).items[0]).toMatchObject({ availability: "ineligible", observations: [{ state: "known", value: true }] });
     expect((await service.snapshot(user)).checkHolds).toEqual([]);
   });
 
