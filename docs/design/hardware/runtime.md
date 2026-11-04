@@ -36,7 +36,11 @@ Configure only the references a script needs. Reference `lab-token` resolves the
 
 ## Use the AI workflow
 
-New Codex, Claude, and Forge launches receive four system skills: `hardware-discover`, `hardware-reserve`, `hardware-access`, and `hardware-release`. The panel identifies existing executions that need deliberate relaunch. An agent discovers candidates, reads notes, reserves an exact item revision, waits for an active claim, rereads notes, then opens managed access. Every mutation records a unique request ID. After a lost response, inspect that original receipt; do not start replacement work.
+Use this workflow for hardware registered with the Hardware plugin. If the user requests hardware that is not managed by the plugin, use ordinary SSH, UART, or host tools without registering it or obtaining a Hardware reservation. The Hardware helper is not required for that unmanaged access. Existing host controls and higher-priority instructions still apply.
+
+When checking whether a target is managed, inspect the complete inventory and its known physical aliases. An availability-filtered list can omit a registered item. Disabled, held, ineligible, or unavailable hardware remains managed. A missing helper or failed lookup does not prove that a target is unmanaged. A denied reservation or unknown outcome does not authorize raw access to managed hardware.
+
+New Codex, Claude, and Forge launches receive four system skills: `hardware-discover`, `hardware-reserve`, `hardware-access`, and `hardware-release`. The panel identifies existing executions that need deliberate relaunch before managed access. For registered hardware, an agent discovers candidates, reads notes, reserves an exact item revision, waits for an active claim, rereads notes, then opens managed access. Every mutation records a unique request ID. After a lost response, inspect that original receipt; do not start replacement work.
 
 ## Run and transfer
 
