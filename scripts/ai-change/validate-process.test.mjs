@@ -314,6 +314,11 @@ jobs:
     "missing disk preparation",
     "unbounded disk preparation",
     "broad SDK deletion",
+    "missing shared disk guard",
+    "late disk helper checkout",
+    "moving disk helper checkout",
+    "missing disk before evidence",
+    "missing disk after evidence",
   ])("rejects an optional or unpinned lifecycle gate: %s", (scenario) => {
     const workflow = parseDocument(
       fs.readFileSync(".github/workflows/ci.yml", "utf8"),
@@ -347,10 +352,40 @@ jobs:
     if (scenario === "broad SDK deletion") {
       const space = job.steps.find((step) => step.id === "lifecycle-space");
       space.run = space.run.replace(
-        "/usr/local/lib/android/sdk",
-        "/usr/local/lib",
+        "bash scripts/ci/prepare-verifier-disk.sh",
+        "sudo rm -rf -- /usr/local/lib /usr/share/dotnet",
       );
     }
+    if (scenario === "missing shared disk guard") {
+      const space = job.steps.find((step) => step.id === "lifecycle-space");
+      space.run = space.run.replace(
+        "bash scripts/ci/prepare-verifier-disk.sh\n",
+        "",
+      );
+    }
+    if (scenario === "late disk helper checkout") {
+      const index = job.steps.findIndex((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      );
+      const [checkout] = job.steps.splice(index, 1);
+      job.steps.splice(
+        job.steps.findIndex((step) => step.id === "lifecycle-space") + 1,
+        0,
+        checkout,
+      );
+    }
+    if (scenario === "moving disk helper checkout")
+      job.steps.find((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      ).with.ref = "main";
+    for (const phase of ["before", "after"])
+      if (scenario === `missing disk ${phase} evidence`) {
+        const space = job.steps.find((step) => step.id === "lifecycle-space");
+        space.run = space.run
+          .split("\n")
+          .filter((line) => !line.includes(`disk-space-${phase}.txt`))
+          .join("\n");
+      }
     const issues = [];
     validateWorkflow(process.cwd(), "ci.yml", workflow, issues);
     expect(issues).toContainEqual(

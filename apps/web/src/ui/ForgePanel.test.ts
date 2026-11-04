@@ -175,6 +175,20 @@ function deferred<T>() {
 }
 
 describe("ForgePanel", () => {
+  it("opens the exact worker tab requested by a Hardware owner link", async () => {
+    const second = { ...worker, id: "work-2", tabId: "other-worker", title: "Different worker" };
+    const panel = await renderPanel(fixture({ workers: [second, worker] }), { workerTabs: [workerTab], ownerRequest: { tabId: workerTab.id, requestId: "hardware-request-1" } });
+    await vi.waitFor(() => expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull());
+    expect(panel.querySelector('[data-terminal-tab="other-worker"]')).toBeNull();
+  });
+
+  it("does not redirect an absent original Hardware attempt to a replacement worker", async () => {
+    const replacement = { ...worker, tabId: "replacement-worker" };
+    const panel = await renderPanel(fixture({ workers: [replacement] }), { workerTabs: [{ ...workerTab, id: "replacement-worker" }], ownerRequest: { tabId: workerTab.id, requestId: "hardware-request-2" } });
+    await vi.waitFor(() => expect(panel.textContent).toContain("original Hardware owner attempt is no longer present"));
+    expect(panel.querySelector('[data-terminal-tab="replacement-worker"]')).toBeNull();
+  });
+
   it("opens blackboard assignment from managed worker tabs and from the native terminal header", async () => {
     const summary = { boardId: "design", title: "Payment design", revision: 1, status: "active", eventCursor: 1, members: [{ tabId: workerTab.id, providerId: "codex", label: "Worker", assignmentGeneration: 1, role: "responder" }], itemCount: 0, openQuestions: 0 };
     const fetchMock = vi.fn(async () => new Response(JSON.stringify([summary])));

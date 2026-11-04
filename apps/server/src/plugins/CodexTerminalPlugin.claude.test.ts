@@ -16,6 +16,7 @@ import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
 import { ClaudeConversationPolicies } from "../agents/claude/ClaudeConversationPolicies.js";
 import { runAgentCli } from "../agents/agentCli.js";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
+import { hardwareLaunchEnv } from "../hardware/AgentHardwareContext.js";
 
 vi.mock("../agents/claude/ClaudeNativeSettings.js", () => ({ verifyClaudeNativeAccount: vi.fn(async () => undefined) }));
 
@@ -97,6 +98,19 @@ async function setup() {
 }
 
 describe("CodexTerminalPlugin on Claude", () => {
+  it("launches Claude with an exact execution Hardware context enforced after account and shell setup", async () => {
+    const { plugin, factory, tab, cwd, controls, root } = await setup();
+    const runtimeContext = { pluginRuntime: { hardware: { directory: path.join(root, "hardware-agent"), helperPath: path.join(root, "hardware-helper.mjs") } } };
+    const session = await plugin.createSession({ tab, cwd, controls, runtimeContext, initialInput: { agent: { providerId: "claude" } } });
+    try {
+      const executionId = session.restoreInput?.()?.codexExecutionId as string;
+      const env = hardwareLaunchEnv(runtimeContext, executionId);
+      expect(factory.last.env).toMatchObject(env);
+      expect(factory.last.env.CLOUDX_ENFORCED_CLOUDX_HARDWARE_CONTEXT).toBe(env.CLOUDX_HARDWARE_CONTEXT);
+      expect(factory.last.env.CLOUDX_ENFORCED_CLOUDX_HARDWARE_HELPER).toBe(env.CLOUDX_HARDWARE_HELPER);
+    } finally { session.stop?.(); }
+  });
+
   it("stops an unacknowledged Forge prompt without admitting the worker or replaying the prompt", async () => {
     const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
     await claudeSettings.acceptBypass();

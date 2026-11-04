@@ -21,6 +21,7 @@ import { buildEnforcedLoginShellLaunch, buildToolEnv, resolveClaudeCommand } fro
 import type { AgentAccountStore } from "../AgentAccountStore.js";
 import type { AgentUsageRecorder } from "../usage/AgentUsageRecorder.js";
 import { cooperationLaunchEnv } from "../../cooperationAgent/AgentCooperationContext.js";
+import { hardwareLaunchEnv } from "../../hardware/AgentHardwareContext.js";
 import { claudeAccountLaunch, readAgentProviderStatus } from "../agentCli.js";
 import { AgentLaunchRecords } from "../AgentLaunchRecords.js";
 import { agentTurnReceiptPath, readClaudeTurnState } from "../agentTurn.js";
@@ -107,7 +108,7 @@ export class ClaudeTerminal {
         throw new Error("Forge workers on Claude run without permission prompts. Accept Claude Code's bypass-permissions warning in Settings → Claude, then resume the worker.");
       account = await accounts.resolve("claude", agent.accountId);
       accountLaunch = claudeAccountLaunch(buildToolEnv(this.env), configDir, await accounts.launchEnv(account));
-      env = { ...accountLaunch.env, ...cooperationLaunchEnv(input.runtimeContext) };
+      env = { ...accountLaunch.env, ...cooperationLaunchEnv(input.runtimeContext), ...hardwareLaunchEnv(input.runtimeContext, executionId) };
       ({ launchInput, newSessionId } = await this.selectConversation(input, env));
       const resume = codexResumeInput(launchInput);
       if (resume && resume.mode !== "session") throw new Error("Select an exact saved Claude conversation to preserve its launch policy. Picker/last launches cannot verify the policy before work.");
@@ -171,7 +172,7 @@ export class ClaudeTerminal {
     await fs.rm(agentTurnReceiptPath(configDir), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
     // The selected account wins over credentials the user's profile exports.
-    const enforced = { set: { ...accountLaunch.enforced.set, ...cooperationLaunchEnv(input.runtimeContext) },
+    const enforced = { set: { ...accountLaunch.enforced.set, ...cooperationLaunchEnv(input.runtimeContext), ...hardwareLaunchEnv(input.runtimeContext, executionId) },
       unset: [...accountLaunch.enforced.unset, ...(mode.mode === "cloudx-managed" ? CLAUDE_MANAGED_SOURCE_ENV_KEYS : [])],
       rejectNonempty: ["CLAUDE_CODE_RESUME_INTERRUPTED_TURN"] };
     const launch = buildEnforcedLoginShellLaunch(resolveClaudeCommand(env), args, env, enforced);
