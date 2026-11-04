@@ -47,7 +47,8 @@ export function assertPinnedTerminalRuntime({ dataDir, role, service, state, rea
   }
 }
 
-export function inspectRuntimeUpdate({ paths, commands, target, targetRuntime, inspectCapacity, signal, log, readFile = fs.readFileSync }) {
+/** Service metadata determines consent without scanning retained recovery data. */
+export function inspectRuntimeServices({ paths, commands, target, targetRuntime, readFile = fs.readFileSync }) {
   const webService = target.kind === "web" ? target.serviceNames[0] : "cloudx.service";
   const web = inspectTerminalService(commands, webService);
   const broker = inspectTerminalService(commands, "cloudx-terminal.service");
@@ -76,10 +77,17 @@ export function inspectRuntimeUpdate({ paths, commands, target, targetRuntime, i
       try { assertMigrationService(entry); }
       catch (error) { plan.blockers.push({ service: entry.service, message: error.message }); }
     }
-    if (!plan.blockers.length) {
-      try { plan.recovery = inspectTerminalRecovery({ dataDir: paths.dataDir, allowLegacyState: true, inspectCapacity, signal, log }); }
-      catch (error) { plan.blockers.push({ service: "recovery", message: error.message }); }
-    }
+  }
+  return plan;
+}
+
+/** Run bulk inspection in the update worker before interrupting services. */
+export function inspectRuntimeUpdate(options) {
+  const plan = inspectRuntimeServices(options);
+  if (plan.requiresInterruption && !plan.blockers.length) {
+    try { plan.recovery = inspectTerminalRecovery({ dataDir: options.paths.dataDir, allowLegacyState: true,
+      inspectCapacity: options.inspectCapacity, signal: options.signal, log: options.log }); }
+    catch (error) { plan.blockers.push({ service: "recovery", message: error.message }); }
   }
   return plan;
 }

@@ -51,6 +51,8 @@ Codex updates have no default aggregate or retained-state verification deadline.
 
 Capacity probes inspect filesystem availability and user/group quotas. The existing probe reports project quotas as unavailable. Runtime ENOSPC/EDQUOT failures still stop copying and prevent activation; a preflight estimate cannot reserve against concurrent storage use.
 
+Settings status and update-start helpers retain a 30-second control-request deadline. They inspect service metadata and active Forge ownership, not opaque retained histories. Interruption consent therefore does not hash conversation files. The detached update worker performs full recovery inspection and capacity checks, publishes scan progress, and repeats validation before marking the installation as mutating. Unsaved legacy tabs remain disclosed in the consent notice. `settings-update-recovery.test.mjs` exercises the production Settings caller with a valid 258 MiB transcript and an injected scan duration above 30 seconds; `managed-update-recovery-inspection.test.mjs` covers pre-stop failures, progress, and resume.
+
 Terminal attachment verification has no aggregate 60-second deadline. Each broker acknowledgement still has a 10-second timeout, so checking more healthy sessions does not consume a fixed elapsed-time allowance.
 
 Both internal snapshot helpers now return variable results in private files and a constant acknowledgement on stdout. Their callers and helpers must ship together. These internal CLI contracts changed; no compatibility path was added.

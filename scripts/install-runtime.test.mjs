@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
-import { assertPinnedTerminalRuntime, assertStoppedService, inspectRuntimeUpdate, prepareRuntimeUpdate } from "./install-runtime.mjs";
+import { assertPinnedTerminalRuntime, assertStoppedService, inspectRuntimeServices, inspectRuntimeUpdate, prepareRuntimeUpdate } from "./install-runtime.mjs";
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -81,6 +81,16 @@ it("keeps the broker alive if recovery state cannot be backed up", () => {
   };
   expect(() => prepareRuntimeUpdate({ paths: { dataDir: root, repoRoot: "/repo" }, commands, target: { kind: "standard" }, migrateTerminals: true, log: () => {} })).toThrow("Invalid recovery state");
   expect(actions).toEqual([]);
+});
+it("plans interruption consent from service metadata and defers recovery inspection to the worker", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-runtime-consent-")); roots.push(root);
+  fs.writeFileSync(path.join(root, "workspace.json"), "{invalid");
+  const options = { paths: { dataDir: root, repoRoot: "/repo" }, target: { kind: "standard" },
+    commands: { inspect: () => Object.entries(state).map(([key, value]) => `${key}=${value}`).join("\n") } };
+  expect(inspectRuntimeServices(options)).toMatchObject({ requiresInterruption: true, blockers: [], recovery: undefined });
+  expect(inspectRuntimeUpdate(options).blockers).toEqual([{ service: "recovery", message: expect.stringContaining("Invalid recovery state") }]);
+  const foreign = { ...options, paths: { ...options.paths, repoRoot: "/another-checkout" } };
+  expect(inspectRuntimeServices(foreign).blockers).toContainEqual({ service: "cloudx.service", message: "The web service belongs to another checkout." });
 });
 it.each(["space", "quota", "inodes"])("leaves both services running when terminal recovery lacks destination %s", constraint => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-migrate-capacity-")); roots.push(root);

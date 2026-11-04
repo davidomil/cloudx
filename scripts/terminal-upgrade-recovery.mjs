@@ -27,10 +27,10 @@ export class ForgeUpdateBlockedError extends Error {
   }
 }
 
-/** Forge ownership also blocks hot updates that preserve the terminal broker. */
+/** Check Forge ownership without scanning unrelated retained history. */
 export function assertTerminalMigrationSafe(options) {
   const snapshot = new RecoverySnapshot(options);
-  snapshot.readForgeState();
+  snapshot.readForgeState({ includeHistory: false });
 }
 
 /** Inspect all recovery data and destination capacity before interrupting services. */
@@ -87,17 +87,22 @@ class RecoverySnapshot {
   }
 
   json(relative, optional = false) {
-    const captured = this.capture(relative, optional);
-    if (captured === undefined) return undefined;
-    const bytes = readFile(captured.source, STATE_LIMIT);
+    const bytes = readFile(path.join(this.dataDir, relative), STATE_LIMIT, optional);
+    if (bytes === undefined) return undefined;
+    const captured = this.capture(relative);
     if (createHash("sha256").update(bytes).digest("hex") !== captured.sha256)
       throw new Error(`Recovery source changed during snapshot: ${relative}`);
     try { return JSON.parse(bytes.toString("utf8")); }
     catch { throw new Error(`Invalid recovery state: ${relative}. Repair the original state before replacing the broker.`); }
   }
 
-  readForgeState() {
-    try { this.readForgeRecords(); }
+  readForgeState({ includeHistory = true } = {}) {
+    try {
+      this.readForgeRecords();
+      if (includeHistory)
+        for (const directory of ["executions", "turns", "history"])
+          for (const relative of this.stateFiles(`forge-workers/${directory}`)) this.capture(relative);
+    }
     catch (error) {
       if (error instanceof ForgeUpdateBlockedError) throw error;
       throw new ForgeUpdateBlockedError(`Forge recovery evidence could not be verified. ${error.message}`);
@@ -141,8 +146,6 @@ class RecoverySnapshot {
       if (!tab || tab.workerId !== worker.id || tab.attemptId !== undefined && tab.attemptId !== worker.attemptId && !this.completedAttempt(worker, tab))
         throw new ForgeUpdateBlockedError(`Forge worker ${worker.id} has missing or conflicting terminal ownership. ${WORKER_GUIDANCE}`, worker);
     }
-    for (const directory of ["executions", "turns", "history"])
-      for (const relative of this.stateFiles(`forge-workers/${directory}`)) this.capture(relative);
   }
 
   completedAttempt(worker, tab) {

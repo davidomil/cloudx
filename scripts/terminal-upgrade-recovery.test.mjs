@@ -114,6 +114,20 @@ async function launchViewFixture(selected = false) {
 }
 
 describe("controlled terminal replacement snapshots", () => {
+  it("checks active Forge ownership without opening opaque retained history", () => {
+    const f = fixture();
+    const retained = f.write("forge-workers/history/worker-1/retained.json", "opaque history");
+    const open = fs.openSync;
+    vi.spyOn(fs, "openSync").mockImplementation((file, ...options) => {
+      if (file === retained) throw new Error("Bulk history belongs to the durable worker");
+      return open(file, ...options);
+    });
+    expect(() => assertTerminalMigrationSafe(f)).not.toThrow();
+    expect(() => inspectTerminalRecovery(f)).toThrow("Bulk history belongs to the durable worker");
+    f.write(forgeState, [{ id: f.owned.id, status: "running" }]);
+    expect(() => assertTerminalMigrationSafe(f)).toThrow("active or has unresolved work");
+  });
+
   it("streams transcripts above 256 MiB and aggregate history above 512 MiB without buffering them", () => {
     const f = fixture();
     const hash = createHash("sha256").update(fs.readFileSync(f.transcriptPath));
