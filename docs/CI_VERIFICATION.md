@@ -18,6 +18,15 @@ tests. Each container has two CPUs, 7 GiB of memory, no network, a
 private writable workspace and read-only candidate source. The trusted
 controller alone writes the attestation.
 
+Before either verifier image build, hosted runners measure available disk
+capacity. The preparation script reserves 24 GiB for the verifier image,
+Buildx layers and Docker's loaded image. Runners that already meet the
+reserve keep their unused SDKs. Below the reserve, preparation removes
+only the Android and .NET SDK directories, then checks capacity again.
+The step fails if measurement, cleanup or the final capacity check fails,
+and retains its five-minute timeout. Local and self-hosted jobs skip this
+hosted-runner preparation.
+
 Repository policy owns policy validation, formatting, lint and the
 networked dependency audit. The static isolated lane owns type checking
 and the production build. Each test lane builds its own runtime when its

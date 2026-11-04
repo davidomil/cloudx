@@ -113,30 +113,43 @@ test.beforeEach(async ({ page }) => {
   await page.goto(`${browserUrl}/tests/browser/fixtures/cooperation.html`);
 });
 
-async function create(
-  page: Page,
-  title: string,
-  template = "blank",
-  agent = "",
-) {
+async function create(page: Page, title: string, agent = "") {
   await page
     .getByRole("button", { name: "New blackboard", exact: true })
     .click();
   await page.getByLabel("Blackboard name", { exact: true }).fill(title);
-  await page.getByLabel("Template", { exact: true }).selectOption(template);
+  await expect(page.getByLabel("Template", { exact: true })).toHaveCount(0);
   await page.getByLabel("Assign to", { exact: true }).selectOption(agent);
+  const creating = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().endsWith("/api/cooperation/boards"),
+  );
   await page
     .getByRole("button", { name: "Create blackboard", exact: true })
     .click();
+  expect((await creating).postDataJSON()).toEqual({
+    title,
+    ...(agent ? { tabId: agent } : {}),
+  });
   await expect(
     page.getByRole("region", { name: `Blackboard ${title}`, exact: true }),
   ).toBeVisible();
   await expect(page.locator(".cooperation-save-state:visible")).toContainText(
     "Saved",
   );
-  return (await page
+  const id = (await page
     .locator(".cooperation-board:visible")
     .getAttribute("data-board-id"))!;
+  expect(boards.getBoard(id)).toMatchObject({
+    items: [],
+    connections: [],
+    regions: [],
+    reactions: [],
+    threads: [],
+    assets: [],
+  });
+  return id;
 }
 async function snapshot(id: string) {
   return boards.getBoard(id);
@@ -184,6 +197,253 @@ async function apply(id: string, operations: CooperationOperation[]) {
   };
   await boards.apply(transaction, { kind: "user", userId: "local" });
 }
+
+async function fitPopulatedBoard(page: Page, itemId: string) {
+  await expect(page.locator(`[data-item-id="${itemId}"]`)).toBeVisible();
+  await page
+    .getByRole("button", { name: "Fit board to view", exact: true })
+    .click();
+}
+
+async function addFeedbackTargets(page: Page, id: string) {
+  await apply(id, [
+    {
+      kind: "createItem",
+      item: {
+        id: "review-decision",
+        kind: "note",
+        geometry: { x: 80, y: 50, width: 500, height: 220, rotation: 0 },
+        content: {
+          title: "Proposal: durable queue",
+          blocks: [
+            {
+              id: "review-replay",
+              revision: 1,
+              text: "The proposed ledger worker can replay failed work.",
+            },
+          ],
+        },
+      },
+    },
+    {
+      kind: "createItem",
+      item: {
+        id: "unicode-note",
+        kind: "note",
+        geometry: { x: 80, y: 310, width: 500, height: 120, rotation: 0 },
+        content: {
+          title: "Anchor example",
+          blocks: [
+            {
+              id: "unicode-block",
+              revision: 1,
+              text: "🔎 Review café receipt routing with Claude.",
+            },
+          ],
+        },
+      },
+    },
+    {
+      kind: "createItem",
+      item: {
+        id: "provider-shape",
+        kind: "shape",
+        geometry: { x: 900, y: 70, width: 260, height: 110, rotation: 0 },
+        content: {
+          title: "Payment provider",
+          shape: "rectangle",
+          label: "Payment provider",
+        },
+      },
+    },
+  ]);
+  await fitPopulatedBoard(page, "unicode-note");
+}
+
+async function addGroupingShapes(page: Page, id: string) {
+  await apply(id, [
+    {
+      kind: "createItem",
+      item: {
+        id: "checkout-api",
+        kind: "shape",
+        geometry: { x: 80, y: 230, width: 240, height: 130, rotation: 0 },
+        content: {
+          title: "Checkout API",
+          shape: "rectangle",
+          label: "Checkout API",
+        },
+      },
+    },
+    {
+      kind: "createItem",
+      item: {
+        id: "event-queue",
+        kind: "shape",
+        geometry: { x: 560, y: 230, width: 240, height: 130, rotation: 0 },
+        content: {
+          title: "Event queue",
+          shape: "cylinder",
+          label: "Event queue",
+        },
+      },
+    },
+  ]);
+  await fitPopulatedBoard(page, "checkout-api");
+}
+
+async function addProtectedSketch(page: Page, id: string) {
+  const bytes = await fs.readFile(
+    path.join(
+      repoRoot,
+      "docs/design/cooperation/examples/assets/reference.png",
+    ),
+  );
+  const staged = await boards.stageAsset(id, { mime: "image/png", bytes });
+  await apply(id, [
+    {
+      kind: "createItem",
+      item: {
+        id: "manual-drawing",
+        kind: "drawing",
+        geometry: { x: 100, y: 130, width: 570, height: 270, rotation: 0 },
+        content: {
+          title: "Unfinished sketch",
+          description: "Keep this drawing protected until Ready.",
+          strokes: [
+            {
+              id: "sketch-stroke",
+              points: [
+                [20, 30, 0.5],
+                [150, 32, 0.6],
+                [148, 110, 0.5],
+              ],
+              color: "#E0E0E0",
+              width: 2.5,
+            },
+          ],
+        },
+      },
+    },
+    {
+      kind: "attachAsset",
+      stagedToken: staged.stagedToken,
+      item: {
+        id: "sketch-reference",
+        kind: "image",
+        geometry: { x: 100, y: 450, width: 420, height: 250, rotation: 0 },
+        content: {
+          title: "Original reference",
+          assetId: staged.asset.id,
+          alt: "Saved reference image",
+        },
+      },
+    },
+    {
+      kind: "createItem",
+      item: {
+        id: "outside-comment",
+        kind: "note",
+        geometry: { x: 900, y: 80, width: 360, height: 170, rotation: 0 },
+        content: {
+          title: "Discuss outside the reserved area",
+          blocks: [
+            {
+              id: "outside-comment-block",
+              revision: 1,
+              text: "The protected drawing stays unchanged.",
+            },
+          ],
+        },
+      },
+    },
+    {
+      kind: "createRegion",
+      region: {
+        id: "sketch-wip",
+        title: "Your sketch in progress",
+        geometry: { x: 60, y: 60, width: 760, height: 730, rotation: 0 },
+        mode: "wip",
+        protectedItemIds: ["manual-drawing", "sketch-reference"],
+      },
+    },
+  ]);
+  await fitPopulatedBoard(page, "manual-drawing");
+}
+
+test("empty creation rejects removed options and reloading preserves a populated board and its originals", async ({
+  page,
+}) => {
+  const id = await create(page, "Retained populated board", "fixture-codex");
+  await addProtectedSketch(page, id);
+  await apply(id, [
+    {
+      kind: "createConnection",
+      connection: {
+        id: "saved-reference-link",
+        from: { itemId: "outside-comment", port: "west" },
+        to: { itemId: "sketch-reference", port: "east" },
+        direction: "none",
+        description: "Refers to original image",
+        waypoints: [],
+      },
+    },
+    {
+      kind: "addReaction",
+      reaction: {
+        id: "saved-question",
+        kind: "question",
+        glyph: "?",
+        description: "Keep the original?",
+        target: { kind: "item", id: "sketch-reference" },
+        threadId: "saved-thread",
+      },
+    },
+  ]);
+  const saved = boards.getBoard(id);
+  const binding = boards.assignmentForTab("fixture-codex");
+  const original = await boards.resolveAsset(id, saved.assets[0]!.id);
+  const rejected = await page.request.post(
+    `${baseUrl}/api/cooperation/boards`,
+    {
+      data: {
+        title: "Removed option",
+        template: "blank",
+        tabId: "fixture-codex",
+      },
+    },
+  );
+  expect(rejected.status()).toBe(400);
+  expect(await rejected.json()).toMatchObject({ code: "INVALID_REQUEST" });
+  await boards.init();
+  await page.reload();
+  await page
+    .locator(`.cooperation-manager-row[data-board-id="${id}"]`)
+    .getByRole("button", { name: "Open board", exact: true })
+    .click();
+  await expect(
+    page.getByRole("region", {
+      name: "Blackboard Retained populated board",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.locator('[data-item-id="sketch-reference"] img'),
+  ).toBeVisible();
+  expect(
+    await (
+      await page.request.get(`${baseUrl}/api/cooperation/boards/${id}`)
+    ).json(),
+  ).toEqual(saved);
+  expect(boards.assignmentForTab("fixture-codex")).toEqual(binding);
+  expect(
+    await (
+      await page.request.get(
+        `${baseUrl}/api/cooperation/boards/${id}/assets/${original.asset.id}`,
+      )
+    ).body(),
+  ).toEqual(original.bytes);
+});
 
 test("no active tool pans empty canvas and moves items; Hand pans without editing and connections follow dragging", async ({
   page,
@@ -609,16 +869,11 @@ for (const [label, kind, shape] of [
 test("manager and owned agent menu create, rename, assign, detach, reopen, export and delete real boards", async ({
   page,
 }, testInfo) => {
-  const id = await create(
-    page,
-    "Assignment study",
-    "system-design",
-    "fixture-codex",
-  );
+  const id = await create(page, "Assignment study", "fixture-codex");
   expect((await snapshot(id)).members.map((member) => member.tabId)).toEqual([
     "fixture-codex",
   ]);
-  await captured(page, testInfo, "system-design");
+  await captured(page, testInfo, "empty-assigned-board");
   await page
     .getByRole("button", { name: "Claude Reviewer", exact: true })
     .focus();
@@ -683,7 +938,6 @@ test("manager and owned agent menu create, rename, assign, detach, reopen, expor
   );
   await boards.createBoard({
     title: "Decision review",
-    template: "decision-review",
     tab: {
       tabId: "fixture-claude",
       providerId: "claude",
@@ -692,7 +946,6 @@ test("manager and owned agent menu create, rename, assign, detach, reopen, expor
   });
   const savedSketch = await boards.createBoard({
     title: "Sketch exploration",
-    template: "sketch-wip",
   });
   await boards.closeBoard(savedSketch.boardId);
   await captured(page, testInfo, "assignment-and-manager");
@@ -834,7 +1087,8 @@ test("notes, code, shapes, exact connectors, text feedback, reactions, threads a
 test("WIP, freehand ink, original images, collapse controls, drafts and remote conflicts remain usable in a narrow pane", async ({
   page,
 }, testInfo) => {
-  const id = await create(page, "Sketch study", "sketch-wip");
+  const id = await create(page, "Sketch study");
+  await addProtectedSketch(page, id);
   await boards.assign(
     { tabId: "fixture-codex", providerId: "codex", label: "Codex Architect" },
     id,
@@ -1123,7 +1377,8 @@ test("inspector editing covers blocks, every shape, geometry, ports and manual r
 test("all emotes can be edited, messages retain sources, and deleted targets can be explicitly reattached", async ({
   page,
 }, testInfo) => {
-  const id = await create(page, "Feedback controls", "decision-review");
+  const id = await create(page, "Feedback controls");
+  await addFeedbackTargets(page, id);
   const note = boards
     .getBoard(id)
     .items.find((item) => item.id === "unicode-note")!;
@@ -1414,7 +1669,7 @@ test("paste, drop, upload failures, disconnect drafts and uncertain save receipt
   expect(boards.getBoard(id).items.length).toBe(beforeDraft + 2);
 });
 
-test("touch assignment, template creation, theme changes and keyboard focus use the same working controls", async ({
+test("touch assignment, empty creation, theme changes and keyboard focus use the same working controls", async ({
   page,
 }, testInfo) => {
   const agent = page.getByRole("button", {
@@ -1451,15 +1706,22 @@ test("touch assignment, template creation, theme changes and keyboard focus use 
   await page
     .getByLabel("Blackboard name", { exact: true })
     .fill("Touch design");
-  await page
-    .getByLabel("Template", { exact: true })
-    .selectOption("decision-review");
+  await expect(page.getByLabel("Template", { exact: true })).toHaveCount(0);
+  const creating = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      request.url().endsWith("/api/cooperation/boards"),
+  );
   await page
     .getByRole("menuitem", {
       name: "Create and assign blackboard",
       exact: true,
     })
     .click();
+  expect((await creating).postDataJSON()).toEqual({
+    title: "Touch design",
+    tabId: "fixture-claude",
+  });
   await expect(
     page.getByRole("region", { name: "Blackboard Touch design", exact: true }),
   ).toBeVisible();
@@ -1469,6 +1731,15 @@ test("touch assignment, template creation, theme changes and keyboard focus use 
   expect(boards.getBoard(id).members.map((member) => member.tabId)).toEqual([
     "fixture-claude",
   ]);
+  expect(boards.getBoard(id)).toMatchObject({
+    items: [],
+    connections: [],
+    regions: [],
+    reactions: [],
+    threads: [],
+    assets: [],
+  });
+  await addFeedbackTargets(page, id);
   await page
     .getByLabel("Fixture theme", { exact: true })
     .selectOption("minimalist-dark");
@@ -1513,12 +1784,8 @@ test("touch assignment, template creation, theme changes and keyboard focus use 
 test("multi-selection alignment, WIP grouping and inspector Ready produce the expected durable region notice", async ({
   page,
 }) => {
-  const id = await create(
-    page,
-    "Grouping controls",
-    "system-design",
-    "fixture-codex",
-  );
+  const id = await create(page, "Grouping controls", "fixture-codex");
+  await addGroupingShapes(page, id);
   const first = boards
     .getBoard(id)
     .items.find((item) => item.id === "checkout-api")!;
@@ -1608,12 +1875,8 @@ test("multi-selection alignment, WIP grouping and inspector Ready produce the ex
 test("feedback and reply drafts survive drawer and target changes, and an unassigned question stays in the inbox", async ({
   page,
 }, testInfo) => {
-  const id = await create(
-    page,
-    "Decision review",
-    "decision-review",
-    "fixture-claude",
-  );
+  const id = await create(page, "Decision review", "fixture-claude");
+  await addFeedbackTargets(page, id);
   const proposal = page.locator('[data-item-id="review-decision"]');
   const askProposal = async () => {
     const block = proposal.locator('[data-cooperation-block="review-replay"]');
@@ -1841,7 +2104,7 @@ test("real view retirement releases uncommitted image stages and preserves origi
 test("Undo skips addressed questions and keeps their discussion and native delivery evidence", async ({
   page,
 }) => {
-  const id = await create(page, "Editable undo", "blank", "fixture-codex");
+  const id = await create(page, "Editable undo", "fixture-codex");
   await page
     .getByRole("button", { name: "Board outline", exact: true })
     .click();
@@ -1888,7 +2151,8 @@ test("Undo skips addressed questions and keeps their discussion and native deliv
 test("reaction edits refresh saved feedback and retain concurrent drafts until explicit review", async ({
   page,
 }) => {
-  const id = await create(page, "Concurrent feedback", "decision-review");
+  const id = await create(page, "Concurrent feedback");
+  await addFeedbackTargets(page, id);
   const target = { kind: "item" as const, id: "unicode-note" };
   await apply(id, [
     {
@@ -2032,7 +2296,8 @@ test("reaction edits refresh saved feedback and retain concurrent drafts until e
 test("reopening feedback while its save finishes clears the committed question", async ({
   page,
 }) => {
-  const id = await create(page, "Feedback save lifecycle", "decision-review");
+  const id = await create(page, "Feedback save lifecycle");
+  await addFeedbackTargets(page, id);
   await page
     .locator('[data-item-id="unicode-note"]')
     .click({ button: "right" });

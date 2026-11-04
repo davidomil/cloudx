@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Info } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 
@@ -18,6 +19,8 @@ import { TerminalClipboardRequest } from "./terminalClipboardRequest.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 import { CodexCommandDetails } from "./CodexCommandDetails.js";
 import { CodexNativeWorkPanel } from "./CodexNativeWorkPanel.js";
+import { ControlButton } from "./Control.js";
+import { openNativeWorkDetails } from "./nativeWorkDetails.js";
 
 interface TerminalView {
   tabId: string;
@@ -193,8 +196,8 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     <div className="terminal-panel" ref={containerRef} role="region" aria-label="Codex terminal output" />
   </div> : recoveryPanel ?? <div className="terminal-panel" ref={containerRef} />;
   return tab.pluginId === "codex-terminal" ? <div className="codex-terminal-view">
-    <CodexNativeWorkPanel tab={tab} onRecover={onRecover} />
-    <TerminalInputHelp provider={capabilities?.providerId} terminal={() => viewRef.current?.terminal} />
+    <CodexNativeWorkPanel tab={tab} onRecover={onRecover} onDismiss={() => { if (active) viewRef.current?.terminal.focus(); }} />
+    <TerminalInputHelp provider={capabilities?.providerId} terminal={() => viewRef.current?.terminal} actions={tab.nativeWork ? <ControlButton size="compact" iconOnly aria-label={`Open native work details for ${tab.title}`} title="Native work details" onClick={() => openNativeWorkDetails(tab)}><Info size={14} aria-hidden="true" /></ControlButton> : undefined} />
     {capabilities?.commandCapture && <CodexCommandDetails key={`${capabilities.providerId}:${capabilities.executionId ?? ""}`} tabId={tab.id} tabTitle={tab.title} providerLabel={capabilities.providerId ? agentProviderLabel(capabilities.providerId) : "Agent"} active={active && !needsRecovery} />}
     {content}
   </div> : content;

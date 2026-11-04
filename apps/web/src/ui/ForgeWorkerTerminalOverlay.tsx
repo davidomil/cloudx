@@ -50,7 +50,7 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
     if (terminal && terminalRef.current?.contains(document.activeElement)) event.preventDefault();
   }} onClose={event => { if (!event.currentTarget.open) onClose(); }}>
     <header className="forge-worker-overlay-header" {...(terminal ? blackboardMenu.tabHandlers(terminal) : {})}>
-      <div tabIndex={terminal && onOpenBlackboard ? 0 : undefined}><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
+      <div tabIndex={terminal && (onOpenBlackboard || terminal.nativeWork) ? 0 : undefined}><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
       {terminal && onOpenBlackboard ? (() => { const board = blackboards.boards.find(board => board.members.some(member => member.tabId === terminal.id)); return board ? <ControlButton size="compact" aria-label={`Open blackboard ${board.title}`} onClick={() => { dialogRef.current?.close(); onOpenBlackboard(board.boardId, board.title); }}><Monitor size={14} />{board.title}</ControlButton> : null; })() : null}
       <ControlButton size="compact" iconOnly aria-label="Close worker terminal" title="Close worker terminal" onClick={() => dialogRef.current!.close()}><X size={18} /></ControlButton>
     </header>
@@ -66,6 +66,6 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
           <ForgeWorkerHistoryPanel history={history} uiScale={uiScale} />
         </Suspense> : <p role="status" className="forge-empty">{worker.tabId ? "The worker terminal is unavailable." : "No saved worker terminal history is available."}</p>}
     </div>
-    {blackboardMenu.position && terminal && onOpenBlackboard ? <AgentSwitchMenu tab={terminal} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={(boardId, title) => { dialogRef.current?.close(); onOpenBlackboard(boardId, title); }} onClose={blackboardMenu.close} /> : null}
+    {blackboardMenu.position && terminal ? <AgentSwitchMenu tab={terminal} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled={Boolean(onOpenBlackboard)} onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={onOpenBlackboard ? (boardId, title) => { dialogRef.current?.close(); onOpenBlackboard(boardId, title); } : undefined} onClose={blackboardMenu.close} /> : null}
   </dialog>;
 }

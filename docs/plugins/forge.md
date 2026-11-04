@@ -74,6 +74,20 @@ disabled **Auto review** prevent automatic repair. GitHub issue worker
 Apps need **Actions: read** permission to collect logs; approve the
 updated permission on existing installations before continuing setup.
 
+After the automatic budget is exhausted, Forge still refreshes the current
+CI diagnosis. The card shows the budget separately from the failing producer
+lane and any downstream required gate. If current evidence is unavailable,
+older job links remain under **Historical CI diagnosis**.
+
+Select **Continue CI repair** to request another implementation turn on the
+same issue, checkout, conversation and PR/MR. Forge collects fresh pinned
+failure evidence and current review findings before launch. This action
+preserves the automatic attempt history. **Resume** only rechecks the loop;
+it cannot replenish the automatic budget. Pending publication, merge,
+review or uncertain native launch outcomes must be reconciled first.
+A manual repair still requires publication, review and fresh passing CI
+before merge.
+
 ## Batch related issues
 
 In **Issues**, select the checkboxes beside related issues, enter a

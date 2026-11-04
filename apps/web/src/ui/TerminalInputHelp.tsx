@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { Terminal } from "@xterm/xterm";
 import { agentProviderLabel, type AgentProviderId } from "@cloudx/shared";
 import { copyTextToClipboard } from "./clipboard.js";
 import { onTerminalPreferencesChanged, terminalPreferenceState } from "./terminalPreferences.js";
 
-export function TerminalInputHelp({ provider, terminal }: { provider?: AgentProviderId; terminal: () => Terminal | undefined }) {
+export function TerminalInputHelp({ provider, terminal, actions }: { provider?: AgentProviderId; terminal: () => Terminal | undefined; actions?: ReactNode }) {
   const [preferences, setPreferences] = useState(terminalPreferenceState);
   useEffect(() => onTerminalPreferencesChanged(() => setPreferences(terminalPreferenceState())), []);
   const [selection, setSelection] = useState<string>();
@@ -12,6 +12,7 @@ export function TerminalInputHelp({ provider, terminal }: { provider?: AgentProv
   const [selectedText, setSelectedText] = useState("");
   const label = provider ? agentProviderLabel(provider) : "Agent";
   return <div className="terminal-input-help">
+    {actions}
     {preferences.error && <p role="alert">Saved terminal preferences could not be used. Open Settings → Terminal to inspect and reset them; host defaults are active.</p>}
     <details><summary>{label} shortcuts</summary>
       <p>CloudX host: Shift+Enter sends {preferences.preferences.shiftEnter === "ctrl-j" ? "Ctrl+J" : "modified Enter (CSI-u)"}; Enter and Ctrl+J keep their native meanings. Native custom bindings and focused dialogs can change the action.</p>

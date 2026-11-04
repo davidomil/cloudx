@@ -49,9 +49,9 @@ export async function registerCooperationRoutes(app: FastifyInstance, services: 
 
     scope.get("/api/cooperation/boards", () => boards.listBoards());
     scope.post("/api/cooperation/boards", async request => {
-      const body = fields(request.body, ["title", "template", "tabId"]);
+      const body = fields(request.body, ["title", "tabId"]);
       const tab = body.tabId === undefined ? undefined : cooperationHostTab(sessions, text(body.tabId));
-      const board = await boards.createBoard({ title: text(body.title), ...(body.template === undefined ? {} : { template: text(body.template) }), ...(tab ? { tab } : {}) });
+      const board = await boards.createBoard({ title: text(body.title), ...(tab ? { tab } : {}) });
       if (tab) await contexts.prepare(tab.tabId);
       return board;
     });

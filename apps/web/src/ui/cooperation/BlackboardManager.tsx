@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Check, Download, ExternalLink, Info, Monitor, Pencil, Plus, RefreshCw, Search, Trash2, Users, X } from "lucide-react";
 import { isAgentTab, type CooperationBoardSummary, type WorkspaceTab } from "@cloudx/shared";
-import { assignCooperationBoard, closeCooperationBoard, createCooperationBoard, deleteCooperationBoard, downloadCooperationDocument, getCooperationBoard, updateCooperationBoard, type CooperationTemplate } from "../../cooperationApi.js";
+import { assignCooperationBoard, closeCooperationBoard, createCooperationBoard, deleteCooperationBoard, downloadCooperationDocument, getCooperationBoard, updateCooperationBoard } from "../../cooperationApi.js";
 import { CooperationDialog } from "./CooperationDialog.js";
 import { ControlButton } from "../Control.js";
 import { useCooperationBoards } from "./cooperationBoards.js";
@@ -14,7 +14,6 @@ export function BlackboardManager({ tabs, onOpenBoard }: BlackboardManagerProps)
   const [filter, setFilter] = useState("all");
   const [creating, setCreating] = useState(false);
   const [title, setTitle] = useState("");
-  const [template, setTemplate] = useState<CooperationTemplate>("blank");
   const [tabId, setTabId] = useState("");
   const [renaming, setRenaming] = useState<string>();
   const [renameTitle, setRenameTitle] = useState("");
@@ -31,9 +30,8 @@ export function BlackboardManager({ tabs, onOpenBoard }: BlackboardManagerProps)
   const visible = boards.filter(board => (filter === "all" || board.status === filter) && board.title.toLocaleLowerCase().includes(search.toLocaleLowerCase()));
   return <section className="cooperation-manager" aria-label="Blackboards" aria-busy={busy}>
     <header className="cooperation-manager-heading"><div><p className="cooperation-eyebrow"><Users size={15} />Cooperation</p><h1>Blackboards</h1><p>Design together. Keep notes, diagrams, and decisions beside the work.</p></div><ControlButton tone="primary" onClick={() => { setTitle(""); setCreating(true); }}><Plus size={16} />New blackboard</ControlButton></header>
-    {creating ? <form className="cooperation-create-form" onSubmit={event => { event.preventDefault(); void perform(async () => { const board = await createCooperationBoard(title.trim(), template, tabId || undefined); setCreating(false); onOpenBoard(board.boardId, board.title); }); }}>
+    {creating ? <form className="cooperation-create-form" onSubmit={event => { event.preventDefault(); void perform(async () => { const board = await createCooperationBoard(title.trim(), tabId || undefined); setCreating(false); onOpenBoard(board.boardId, board.title); }); }}>
       <label>Blackboard name<input autoFocus required maxLength={240} value={title} onChange={event => setTitle(event.target.value)} placeholder="Payments design" /></label>
-      <label>Template<select aria-label="Template" value={template} onChange={event => setTemplate(event.target.value as CooperationTemplate)}><option value="blank">Blank canvas</option><option value="system-design">System design</option><option value="decision-review">Decision review</option><option value="sketch-wip">Sketch and work in progress</option></select></label>
       <label>Assign to<select aria-label="Assign to" value={tabId} onChange={event => setTabId(event.target.value)}><option value="">No tab · keep as draft</option>{tabs.filter(isAgentTab).map(tab => <option key={tab.id} value={tab.id}>{tab.title}</option>)}</select></label>
       <div className="cooperation-form-actions"><ControlButton onClick={() => setCreating(false)} disabled={busy}>Cancel</ControlButton><ControlButton tone="primary" type="submit" disabled={busy || !title.trim()}>Create blackboard</ControlButton></div>
     </form> : null}

@@ -12,7 +12,7 @@ const renderedCiAssertion = /^(?:##\[(?:error|warning)\]\s*)?(?:AssertionError\b
 const operationalCiBlockers = {
   credentials: /bad credentials|invalid (?:access )?token|authentication failed|permission denied \(publickey\)|could not read username|token (?:has )?expired|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:401|403)\b|\b(?:401 unauthorized|403 forbidden|E401|E403|ERR_PNPM_FETCH_401|ERR_PNPM_FETCH_403)\b|\b(?:error|fatal):\s*(?:unauthorized|forbidden)\b/i,
   policy: /billing|spending limit|approval required|must approve|policy violation|workflow (?:is )?disabled|not permitted to run/i,
-  infrastructure: /runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i,
+  infrastructure: /The action '[^\r\n]+' has timed out after [1-9]\d* minutes\.|runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device|network is unreachable|connection (?:refused|reset|timed out)|could not resolve host|temporary failure in name resolution|service unavailable|\b502 bad gateway\b|\b(?:HTTP(?:\/\d(?:\.\d)?)?|status(?: code)?)\s*[:=]?\s*(?:502|503)\b/i,
 };
 
 export interface CiLogEvidence {
@@ -328,7 +328,7 @@ function applicationErrorCause(line: string): string | undefined {
 function classifyJobControlCause(cause: string): OperationalClassification | undefined {
   for (const classification of ["credentials", "policy"] as const)
     if (operationalCiBlockers[classification].test(cause)) return classification;
-  if (/runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device/i.test(cause))
+  if (/The action '[^\r\n]+' has timed out after [1-9]\d* minutes\.|runner (?:lost|offline|unavailable)|lost communication with|failed to (?:start|prepare) (?:runner|environment)|system failure|no space left on device/i.test(cause))
     return "infrastructure";
 }
 

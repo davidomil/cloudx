@@ -175,8 +175,15 @@ describe("Forge plugin boundary", () => {
     expect(logs).not.toContain("Continue with the failing test.");
   });
 
+  it("admits an explicitly requested CI repair through the existing continuation hook", async () => {
+    const { hooks, workflow } = await fixture();
+    await hooks.call("forge.worker.continue", { id: "worker", message: "Repair current CI.", ciRepair: true,
+      windowId: "window", paneId: "pane" }, { caller: { kind: "ui" } });
+    expect(workflow.continueWorker).toHaveBeenCalledExactlyOnceWith("worker", "Repair current CI.", { windowId: "window", paneId: "pane" }, { ciRepair: true });
+  });
+
   it.each([
-    { message: undefined }, { message: null }, { message: 7 }, { message: "" }, { message: " \n\t" }, { message: "x".repeat(20_001) },
+    { ciRepair: false }, { ciRepair: "true" }, { message: undefined }, { message: null }, { message: 7 }, { message: "" }, { message: " \n\t" }, { message: "x".repeat(20_001) },
     { id: undefined }, { id: "" }, { id: 7 }, { id: "x".repeat(129) },
     { windowId: undefined }, { windowId: "" }, { paneId: undefined }, { paneId: "" },
     { repositoryPath: "/untrusted" }, { headSha: "a".repeat(40) },

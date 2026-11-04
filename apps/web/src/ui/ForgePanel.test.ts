@@ -173,9 +173,32 @@ describe("ForgePanel", () => {
       expect(dialog.open).toBe(false);
     } finally { vi.unstubAllGlobals(); }
   });
+  it("opens the exact managed worker's native details from its tab menu without blackboard support", async () => {
+    const second = { ...worker, id: "second-worker", number: 9, tabId: "second-tab" };
+    const nativeTab: WorkspaceTab = { ...workerTab, id: second.tabId, pluginMetadata: { "forge-workers": { workerId: second.id } },
+      nativeWork: { version: 1, tabId: second.tabId, executionId: "execution-2", threadId: "thread-2", updatedAt: "2026-11-03", turnStatus: "running" } };
+    const key = `cloudx.nativeWork.details:${JSON.stringify([nativeTab.id, "execution-2", "thread-2"])}`;
+    sessionStorage.removeItem(key);
+    try {
+      const f = fixture({ workers: [worker, second] });
+      const panel = await renderPanel(f, { workerTabs: [workerTab, nativeTab] });
+      await click(panel, "Workers (2)");
+      const trigger = panel.querySelectorAll<HTMLButtonElement>('[role="tab"]')[1]!;
+      await act(async () => trigger.dispatchEvent(new KeyboardEvent("keydown", { key: "F10", shiftKey: true, bubbles: true })));
+      await click(panel, "Open native work details");
+      const dialog = panel.querySelector<HTMLDialogElement>("dialog")!;
+      expect(dialog.open).toBe(true);
+      expect(dialog.querySelector("h2")?.textContent).toContain("Issue #9");
+      expect(dialog.querySelector("[data-terminal-tab]")?.getAttribute("data-terminal-tab")).toBe(nativeTab.id);
+      expect(JSON.parse(sessionStorage.getItem(key)!)).toMatchObject({ explicitOpen: true });
+      expect(f.calls.some(call => ["forge.worker.resume", "forge.worker.continue"].includes(call.hook))).toBe(false);
+      await act(async () => dialog.querySelector<HTMLElement>("header > div")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ContextMenu", bubbles: true })));
+      expect(dialog.querySelector('[role="menu"]')?.textContent).toContain("Open native work details");
+    } finally { sessionStorage.removeItem(key); }
+  });
   it("shows the saved CI repair phase, finite budget and failing job identity without rendering logs", async () => {
-    const repairing: ForgeWorker = { ...worker, ciRepair: {
-      phase: "repairing", attempts: 1, attemptedHeads: [change.headSha], attemptId: "repair-attempt",
+    const repairing: ForgeWorker = { ...worker, headSha: change.headSha, ciRepair: {
+      phase: "repairing", attempts: 1, attemptedHeads: [change.headSha], attemptId: "repair-attempt", diagnosticStatus: "current",
       diagnostic: { repository, changeNumber: change.number, sourceHeadSha: change.headSha, targetHeadSha: change.targetHeadSha,
         failureKey: "ci-failure", state: "actionable", jobs: [{ runId: "101", runAttempt: 2, jobId: "201",
           name: "TypeScript checks", url: "https://github.com/cloudx/example/actions/runs/101/job/201", conclusion: "failure",
@@ -185,11 +208,86 @@ describe("ForgePanel", () => {
     expect(panel.querySelector(".forge-item-workers")!.textContent).toContain("CI repair · repairing · 1/2 attempts");
     await click(panel, "Workers (1)");
     const status = panel.querySelector('[aria-label="CI repair"]')!;
-    expect(status.textContent).toContain("CI repair · repairing · 1/2 attempts used");
+    expect(status.textContent).toContain("CI repair · repairing · 1/2 automatic attempts used");
     expect(status.textContent).toContain("Source aaaaaaaa · Target bbbbbbbb");
     expect(status.textContent).toContain("Run 101, attempt 2");
     expect(status.querySelector("a")?.getAttribute("href")).toBe(repairing.ciRepair!.diagnostic!.jobs[0]!.url);
     expect(panel.textContent).not.toContain("Internal sanitized failure evidence");
+  });
+  function exhaustedWorker(): ForgeWorker {
+    return { ...worker, status: "paused", changeNumber: change.number, headSha: "c".repeat(40), ciRepair: {
+      phase: "blocked", attempts: 2, attemptedHeads: ["a".repeat(40), "b".repeat(40)], diagnosticStatus: "current",
+      reason: "The 2-attempt CI repair budget is exhausted.",
+      diagnostic: { repository, changeNumber: change.number, sourceHeadSha: "c".repeat(40), targetHeadSha: "d".repeat(40), testedSha: "e".repeat(40),
+        failureKey: "coverage-failure", state: "actionable", reason: "coverage-4 failed in WorkspaceCleanupService.test.ts", jobs: [{
+          runId: "303", runAttempt: 3, jobId: "404", name: "coverage-4", url: "https://github.com/cloudx/example/actions/runs/303/job/404",
+          conclusion: "failure", testedSha: "e".repeat(40), classification: "code", log: "Private failure log",
+          requiredGate: { jobId: "405", name: "Full checks", url: "https://github.com/cloudx/example/actions/runs/303/job/405", log: "Downstream log" },
+        }] },
+    } };
+  }
+  it("separates the exhausted automatic budget from the current producer failure and sends a deliberate repair request once", async () => {
+    const exhausted = exhaustedWorker();
+    const pending = deferred<unknown>();
+    const f = fixture({ workers: [exhausted] }, hook => hook === "forge.worker.continue" ? pending.promise : undefined);
+    const panel = await renderPanel(f);
+    await click(panel, "Workers (1)");
+    const status = panel.querySelector('[aria-label="CI repair"]')!;
+    expect(status.textContent).toContain("2/2 automatic attempts used");
+    expect(status.textContent).toContain("Resume only rechecks the existing loop");
+    const current = status.querySelector('[aria-label="Current CI failure"]')!;
+    expect(current.textContent).toContain("coverage-4 failed in WorkspaceCleanupService.test.ts");
+    expect(current.textContent).toContain("Source cccccccc · Target dddddddd · Tested eeeeeeee");
+    expect(current.textContent).toContain("Run 303, attempt 3 · Job 404");
+    expect(current.textContent).toContain("Downstream required gate: Full checks. Inspect the producer lane above.");
+    expect(status.textContent).not.toContain("Private failure log");
+    await click(status, "Continue CI repair");
+    await click(status, "Continue CI repair");
+    expect(button(status, "Continue CI repair").disabled).toBe(true);
+    expect(f.calls.filter(call => call.hook === "forge.worker.continue")).toEqual([{
+      hook: "forge.worker.continue", input: { id: exhausted.id, ciRepair: true,
+        message: "Continue CI repair using the current pinned failure evidence and actionable review findings.", windowId: "window-1", paneId: "pane-2" }, tabId: tab.id,
+    }]);
+    await act(async () => {
+      const running = { ...exhausted, status: "running" as const, ciRepair: { ...exhausted.ciRepair!, manual: true as const, phase: "repairing" as const } };
+      f.dashboard.workers = [running];
+      pending.resolve({ worker: running });
+    });
+    expect(panel.querySelector('[aria-label="CI repair"]')!.textContent).toContain("Manual repair · repairing · 2/2 automatic attempts used");
+  });
+  it.each(["stale", "unavailable", undefined] as const)("keeps %s evidence historical instead of presenting an old job as current", async diagnosticStatus => {
+    const historical = exhaustedWorker();
+    historical.ciRepair!.diagnosticStatus = diagnosticStatus;
+    historical.ciRepair!.diagnosticReason = "Current run logs could not be read.";
+    const panel = await renderPanel(fixture({ workers: [historical] }));
+    await click(panel, "Workers (1)");
+    const status = panel.querySelector('[aria-label="CI repair"]')!;
+    expect(status.querySelector('[aria-label="Current CI failure"]')).toBeNull();
+    expect(status.textContent).toContain("Current CI evidence is unavailable. Current run logs could not be read.");
+    expect(status.querySelector("details")?.open).toBe(false);
+    expect(status.querySelector("summary")?.textContent).toContain("Historical CI diagnosis · not the current failure");
+  });
+  it("does not label a different-head snapshot current and disables manual repair while a reviewer runs", async () => {
+    const exhausted = exhaustedWorker();
+    exhausted.ciRepair!.diagnostic!.sourceHeadSha = "a".repeat(40);
+    const reviewer = { ...reviewWorker, status: "running" as const };
+    const panel = await renderPanel(fixture({ workers: [exhausted, reviewer] }));
+    await click(panel, "Workers (2)");
+    const status = panel.querySelector('[aria-label="CI repair"]')!;
+    expect(status.querySelector('[aria-label="Current CI failure"]')).toBeNull();
+    expect(button(status, "Continue CI repair").disabled).toBe(true);
+    expect(status.textContent).toContain("Finish the existing review");
+  });
+  it.each(["publication", "merge", "uncertain"])("keeps manual CI repair disabled during a pending %s outcome", async pending => {
+    const exhausted = exhaustedWorker();
+    if (pending === "publication") exhausted.pendingPublication = publishingWorker.pendingPublication;
+    if (pending === "merge") exhausted.mergeAttempted = true;
+    if (pending === "uncertain") exhausted.publicationState = "uncertain";
+    const panel = await renderPanel(fixture({ workers: [exhausted] }));
+    await click(panel, "Workers (1)");
+    const status = panel.querySelector('[aria-label="CI repair"]')!;
+    expect(button(status, "Continue CI repair").disabled).toBe(true);
+    expect(status.textContent).toContain("Reconcile the pending publication or merge with Resume");
   });
   it("shows the pending terminal phase and queue delay while an unrelated CI-paused worker remains actionable", async () => {
     const finishing: ForgeWorker = { ...worker, activity: {

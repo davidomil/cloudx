@@ -148,6 +148,11 @@ async function workers(
         const worker = entries.find((entry) => entry.id === body.input.id);
         if (!worker) throw new Error(`Unknown worker ${body.input.id}`);
         worker.status = "running";
+        if (body.input.ciRepair && worker.ciRepair) {
+          worker.ciRepair.manual = true;
+          worker.ciRepair.phase = "repairing";
+          delete worker.ciRepair.reason;
+        }
         delete worker.error;
         return route.fulfill({ json: { worker } });
       }
@@ -170,6 +175,153 @@ async function workers(
       }),
   };
 }
+
+function exhaustedRepair(): Partial<ForgeWorker> {
+  return {
+    status: "paused",
+    changeNumber: 12,
+    headSha: "c".repeat(40),
+    error: "The automatic CI repair budget is exhausted.",
+    ciRepair: {
+      phase: "blocked",
+      attempts: 2,
+      attemptedHeads: ["a".repeat(40), "b".repeat(40)],
+      diagnosticStatus: "current",
+      reason: "The automatic CI repair budget is exhausted.",
+      diagnostic: {
+        repository: {
+          provider: "github",
+          apiUrl: "https://api.github.com",
+          projectPath: "cloudx/example",
+        },
+        changeNumber: 12,
+        sourceHeadSha: "c".repeat(40),
+        targetHeadSha: "d".repeat(40),
+        testedSha: "e".repeat(40),
+        failureKey: "coverage-4",
+        state: "actionable",
+        reason: "coverage-4 failed in WorkspaceCleanupService.test.ts",
+        jobs: [
+          {
+            runId: "303",
+            runAttempt: 3,
+            jobId: "404",
+            name: "coverage-4",
+            url: "https://github.com/cloudx/example/actions/runs/303/job/404",
+            conclusion: "failure",
+            classification: "code",
+            requiredGate: {
+              jobId: "405",
+              name: "CI aggregate",
+              url: "https://github.com/cloudx/example/actions/runs/303/job/405",
+              log: "Downstream failure",
+            },
+          },
+        ],
+      },
+    },
+  };
+}
+
+test("shows the third-head producer failure after two automatic repairs and deliberately continues with evidence", async ({
+  page,
+}, testInfo) => {
+  const fixture = await workers(page, { issueWorker: exhaustedRepair() });
+  const worker = page.getByRole("article", { name: "issue worker #7" });
+  const status = worker.getByRole("region", { name: "CI repair", exact: true });
+  await expect(status).toContainText("2/2 automatic attempts used");
+  await expect(status).toContainText(
+    "Resume only rechecks the existing loop; it cannot replenish the automatic budget.",
+  );
+  await expect(status.getByLabel("Current CI failure")).toContainText(
+    "coverage-4 failed in WorkspaceCleanupService.test.ts",
+  );
+  await expect(status).toContainText(
+    "Source cccccccc · Target dddddddd · Tested eeeeeeee",
+  );
+  await expect(
+    status.getByRole("link", { name: "coverage-4", exact: true }),
+  ).toHaveAttribute("href", /job\/404$/);
+  await expect(status).toContainText(
+    "Downstream required gate: CI aggregate. Inspect the producer lane above.",
+  );
+  await worker.getByRole("button", { name: "Resume", exact: true }).click();
+  await expect(status).toContainText("2/2 automatic attempts used");
+  expect(fixture.continuations).toEqual([]);
+  expect(fixture.resumes).toHaveLength(1);
+  const screenshot = testInfo.outputPath("exhausted-ci-current-evidence.png");
+  await status.screenshot({ path: screenshot });
+  await testInfo.attach("exhausted-ci-current-evidence", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await status
+    .getByRole("button", { name: "Continue CI repair", exact: true })
+    .click();
+  await expect(status).toContainText(
+    "Manual repair · repairing · 2/2 automatic attempts used",
+  );
+  await expect(
+    status.getByRole("button", { name: "Continue CI repair", exact: true }),
+  ).toHaveCount(0);
+  expect(fixture.continuations).toEqual([
+    {
+      input: {
+        id: "issue-worker",
+        ciRepair: true,
+        message:
+          "Continue CI repair using the current pinned failure evidence and actionable review findings.",
+        windowId: "window-1",
+        paneId: "pane-2",
+      },
+      tabId: "forge-tab",
+    },
+  ]);
+});
+
+test("keeps an unavailable diagnosis historical and prevents duplicate explicit continuation delivery", async ({
+  page,
+}) => {
+  const issueWorker = exhaustedRepair();
+  issueWorker.ciRepair!.diagnosticStatus = "stale";
+  issueWorker.ciRepair!.diagnosticReason = "Current run logs are unavailable.";
+  const fixture = await workers(page, {
+    issueWorker,
+    holdFirstContinuation: true,
+  });
+  const status = page.getByRole("region", { name: "CI repair", exact: true });
+  await expect(status.getByLabel("Current CI failure")).toHaveCount(0);
+  await expect(status).toContainText(
+    "Current CI evidence is unavailable. Current run logs are unavailable.",
+  );
+  await expect(
+    status.getByRole("link", { name: "coverage-4", exact: true }),
+  ).toBeHidden();
+  await status
+    .getByText("Historical CI diagnosis · not the current failure", {
+      exact: true,
+    })
+    .click();
+  await expect(
+    status.getByRole("link", { name: "coverage-4", exact: true }),
+  ).toBeVisible();
+  const button = status.getByRole("button", {
+    name: "Continue CI repair",
+    exact: true,
+  });
+  await button.click();
+  await fixture.pending;
+  await expect(button).toBeDisabled();
+  expect(fixture.continuations).toHaveLength(1);
+  await fixture.fail();
+  await expect(
+    page
+      .getByRole("alert")
+      .filter({ hasText: "The checkout needs attention." }),
+  ).toContainText("The checkout needs attention.");
+  await expect(button).toBeEnabled();
+  expect(fixture.continuations).toHaveLength(1);
+});
 
 test("shows retained checkout files without offering another worker attempt", async ({
   page,

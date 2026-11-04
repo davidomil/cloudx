@@ -2,11 +2,11 @@
 
 ## Open a shared board
 
-Cooperation is a built-in CloudX panel for editable blackboards. Open it from the new-tab menu to manage boards, or assign a board directly from an AI tab. The original [design package](README.md) and [visual concepts](visual-templates.md) describe the intended interaction.
+Cooperation is a built-in CloudX panel for editable blackboards. Open it from the new-tab menu to manage boards, or assign a board directly from an AI tab. The original [design package](README.md) describes the intended interaction.
 
 The cooperation skills ask agents to use short titles and bullet points for notes, decisions, and thread answers. They follow ASD-STE100 principles: short sentences, active voice, and consistent terms. Each bullet carries one fact, action, or question. Source links, conditions, uncertainty, code, and quotations retain their meaning.
 
-Right-click an AI tab, press Shift+F10 while its tab button has focus, or long-press its touch header. Under **Blackboard**, choose an existing board or **Create and assign**. Pick a blank canvas or a system-design, decision-review, or sketch template. Codex and Claude tabs can share the same board; each AI tab has one current assignment.
+Right-click an AI tab, press Shift+F10 while its tab button has focus, or long-press its touch header. Under **Blackboard**, choose an existing board or **Create and assign**. Enter a name to create an empty canvas. The manager also permits an initial AI tab assignment. **Create and assign** creates the empty board and assigns that exact tab in one operation. Codex and Claude tabs can share the same board; each AI tab has one current assignment. Existing saved boards keep their content and original files when reopened.
 
 Closing the final assigned AI tab closes live collaboration and retains the saved board and original files. Closing a viewer does not remove an AI assignment. Use the manager to reopen a closed board and assign a coworker. Permanent deletion requires a closed board.
 

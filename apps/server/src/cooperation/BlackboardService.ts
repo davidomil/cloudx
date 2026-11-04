@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
 import {
@@ -9,9 +8,6 @@ import {
   type CooperationOperation, type CooperationPrecondition, type CooperationReceipt, type CooperationRecordKind, type CooperationRegion,
   type CooperationTarget, type CooperationTransaction, type CooperationTurnCompletion
 } from "@cloudx/shared";
-import systemDesign from "./templates/system-design.json" with { type: "json" };
-import decisionReview from "./templates/decision-review.json" with { type: "json" };
-import sketchWip from "./templates/sketch-wip.json" with { type: "json" };
 import { BoardFileProjection, boardMarkdown } from "./BoardFileProjection.js";
 import { BoardUndoHistory } from "./BoardUndoHistory.js";
 import { validateBlackboardAudit } from "./BlackboardAuditValidation.js";
@@ -105,7 +101,7 @@ export class BlackboardService {
       ...(assignment ? { providerId: assignment.providerId, label: assignment.label } : {}) };
   }
 
-  async createBoard(input: { title: string; template?: string; tab?: CooperationHostTab }, caller = userCaller): Promise<CooperationBoard> {
+  async createBoard(input: { title: string; tab?: CooperationHostTab }, caller = userCaller): Promise<CooperationBoard> {
     this.requireUser(caller);
     this.requireTitle(input.title);
     return this.repository.serialize(async () => {
@@ -115,22 +111,6 @@ export class BlackboardService {
       const board: StoredBoard = { schemaVersion: 1, boardId, title: input.title.trim(), revision: 0, status: "draft", eventCursor: 0,
         items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] };
       try {
-        const templates: Record<string, unknown> = { "system-design": systemDesign, "decision-review": decisionReview, "sketch-wip": sketchWip };
-        if (input.template && input.template !== "blank") {
-          requireCooperation(Object.hasOwn(templates, input.template), "INVALID_REQUEST", "Unknown board template.");
-          const fixture = JSON.parse(JSON.stringify(templates[input.template]), (key, value) => {
-            if (["createdBy", "updatedBy", "author", "ownerActor"].includes(key)) return cooperationActor(caller);
-            if (key === "removedAtBoardRevision") return 0;
-            return value;
-          }) as CooperationBoard;
-          for (const collection of collections) (board[collection] as unknown[]) = fixture[collection];
-          for (const asset of board.assets) {
-            const bytes = await fs.readFile(new URL("../../assets/cooperation/payment-pipeline-sketch.png", import.meta.url));
-            const validated = await this.decodeImage(bytes, asset.mime, asset.id);
-            Object.assign(asset, validated);
-            await this.repository.writeBytes(`boards/${boardId}/${asset.relativePath}`, bytes);
-          }
-        }
         next.boards[boardId] = board;
         next.recentEvents[boardId] = [];
         const touched = new Set([boardId]);

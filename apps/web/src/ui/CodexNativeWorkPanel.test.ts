@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CodexNativeWork, WorkspaceTab } from "@cloudx/shared";
 
 import { CodexNativeWorkPanel } from "./CodexNativeWorkPanel.js";
+import { openNativeWorkDetails } from "./nativeWorkDetails.js";
 
 const { CodexNativeWorkObservation } = await import(pathToFileURL(`${process.cwd()}/apps/server/helpers/codex-native-work.mjs`).href);
 
@@ -21,6 +22,7 @@ const tab: WorkspaceTab = {
 };
 let root: Root;
 let host: HTMLDivElement;
+let currentTab: WorkspaceTab;
 const recover = vi.fn();
 
 beforeEach(() => {
@@ -38,6 +40,43 @@ afterEach(async () => {
 });
 
 describe("Codex native work recovery", () => {
+  it.each(["running", "completed", "interrupted", undefined] as const)("has no whole native-work block for healthy %s work, including remounts and routine updates", async turnStatus => {
+    const current = withWork({ turnStatus, goalStatus: "active", lastError: undefined });
+    await show(current);
+    expect(panel()).toBeNull();
+    await show({ ...current, nativeWork: { ...current.nativeWork!, updatedAt: "2026-10-16T01:00:00Z", goalStatus: "complete" } });
+    expect(panel()).toBeNull();
+    await act(async () => root.render(createElement("div")));
+    await show(current);
+    expect(panel()).toBeNull();
+    expect(host.querySelector("h2")).toBeNull();
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("keeps explicit inspection open after resolution while automatic presentation disappears", async () => {
+    await show(tab);
+    await act(async () => openNativeWorkDetails(tab));
+    const resolved = withWork({ turnStatus: "completed", goalStatus: "active", incidentResolvedByTurnId: "successful-turn" });
+    await show(resolved);
+    expect(panel()).not.toBeNull();
+    expect(host.textContent).toContain("Resolved provider incident diagnostics");
+    await toggleDetails();
+    expect(panel()).toBeNull();
+    await show({ ...resolved, nativeWork: { ...resolved.nativeWork!, updatedAt: "2026-10-16T00:30:00Z" } });
+    expect(panel()).toBeNull();
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it.each([{ executionId: "healthy-execution" }, { threadId: "healthy-conversation" }])("starts a new healthy binding hidden even if the previous binding was explicitly opened: %j", async binding => {
+    await show(tab);
+    await act(async () => openNativeWorkDetails(tab));
+    await show(withWork({ ...binding, turnStatus: "running", goalStatus: "active", lastError: undefined }));
+    expect(panel()).toBeNull();
+    await act(async () => openNativeWorkDetails(tab));
+    expect(panel()).toBeNull();
+  });
+
+
   it("shows a native stream failure and blocked goal separately from an HTTP 200 transport response", async () => {
     await show(tab);
     expect(host.textContent).toContain("Goal blocked");
@@ -50,6 +89,22 @@ describe("Codex native work recovery", () => {
     expect(host.textContent).toContain("does not establish native completion");
     expect(host.textContent).not.toContain("Recovery succeeded");
     expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("automatically exposes the provider explanation during a running native turn without permitting restart", async () => {
+    await show(withWork({ turnStatus: "running", goalStatus: "active" }));
+    expect(panel()).not.toBeNull();
+    expect(host.querySelector("details")?.open).toBe(true);
+    expect(host.textContent).toContain(nativeWork.lastError!.message);
+    expect(restartButton()).toBeUndefined();
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("shows a terminal failure explanation while its native receipt is healthy", async () => {
+    await show({ ...withWork({ turnStatus: "completed", goalStatus: "active", lastError: undefined }), status: "failed", statusMessage: "The terminal process exited unexpectedly." });
+    expect(panel()).not.toBeNull();
+    expect(host.textContent).toContain("The terminal process exited unexpectedly.");
+    expect(restartButton().disabled).toBe(true);
   });
 
   it("distinguishes a retry notice while a healthy native turn is still running", async () => {
@@ -68,13 +123,12 @@ describe("Codex native work recovery", () => {
     expect(host.textContent).toContain("After the running turn finishes, enter /goal resume");
     expect(restartButton().disabled).toBe(true);
     await toggleDetails();
-    expect(details().hidden).toBe(true);
-    expect(presentationButton().getAttribute("aria-expanded")).toBe("false");
-    expect(host.querySelector(".codex-native-status")?.textContent).toContain("Native turn: Running · Goal: Blocked");
+    expect(panel()).toBeNull();
+    expect(host.querySelector(".codex-native-status")).toBeNull();
     expect(JSON.stringify(current.nativeWork)).toBe(savedWork);
     expect(recover).not.toHaveBeenCalled();
     await toggleDetails();
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(restartButton().disabled).toBe(true);
   });
 
@@ -82,15 +136,15 @@ describe("Codex native work recovery", () => {
     await show(tab);
     await toggleDetails();
     await show(withWork({ updatedAt: "2026-10-15T23:00:00Z" }));
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     const sibling = { ...tab, id: "sibling", nativeWork: { ...nativeWork, tabId: "sibling" } };
     await show(sibling);
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     await show(tab);
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await act(async () => root.render(createElement("div")));
     await show(tab);
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     expect(recover).not.toHaveBeenCalled();
   });
 
@@ -104,7 +158,7 @@ describe("Codex native work recovery", () => {
     await show(tab);
     await toggleDetails();
     await show(withWork(change));
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(recover).not.toHaveBeenCalled();
   });
 
@@ -112,11 +166,11 @@ describe("Codex native work recovery", () => {
     await show(tab);
     await toggleDetails();
     await show(withWork({ turnStatus: "running", turnId: "ordinary-turn" }));
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await show(withWork({ turnStatus: "completed", turnId: "ordinary-turn" }));
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await show(withWork({ turnStatus: "failed", turnId: "next-failed-turn" }));
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(recover).not.toHaveBeenCalled();
   });
 
@@ -126,9 +180,9 @@ describe("Codex native work recovery", () => {
     vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => { throw new Error("Storage disabled"); });
     await show(tab);
     await toggleDetails();
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await toggleDetails();
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(recover).not.toHaveBeenCalled();
     vi.restoreAllMocks();
   });
@@ -137,8 +191,7 @@ describe("Codex native work recovery", () => {
     await show(tab);
     await toggleDetails();
     await show(withWork({ turnStatus: "completed", goalStatus: "active", recoveryStatus: "succeeded" }));
-    expect(host.querySelector("h2")?.textContent).toBe("Codex native work");
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await toggleDetails();
     expect(host.textContent).toContain("Recovery succeeded: a subsequent native turn completed");
     expect(restartButton()).toBeUndefined();
@@ -232,7 +285,7 @@ describe("Codex native work recovery", () => {
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "restart-native", executionId: "affected-execution", sessionId: "exact-conversation" });
     expect(siblingRecover).not.toHaveBeenCalled();
     expect(host.textContent).not.toContain("Original conversation binding changed.");
-    expect(host.textContent).toContain("Native turn: Running");
+    expect(panel()).toBeNull();
   });
 
   it("shows a restart rejection that arrives after the user collapses its pending details", async () => {
@@ -244,10 +297,10 @@ describe("Codex native work recovery", () => {
     expect(liveAlert.getAttribute("aria-atomic")).toBe("true");
     await act(async () => restartButton().click());
     await toggleDetails();
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await act(async () => reject(new Error("The exact conversation binding became stale.")));
     const alert = host.querySelector('[role="alert"]')!;
-    expect(alert).toBe(liveAlert);
+    expect(alert).not.toBeNull();
     expect(alert.textContent).toContain("exact conversation binding became stale");
     expect(alert.closest("[hidden]")).toBeNull();
     expect(recover).toHaveBeenCalledExactlyOnceWith({ action: "restart-native", executionId: nativeWork.executionId, sessionId: nativeWork.threadId });
@@ -267,17 +320,17 @@ describe("Codex native work recovery", () => {
     await rejectStart(1);
     const firstError = observed.at(-1)!.lastError!;
     expect(firstError.incidentId).toEqual(expect.any(String));
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     await toggleDetails();
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     observer.fromServer({ method: "thread/goal/updated", params: { threadId, goal: { threadId, status: "active" } } });
     await show({ ...tab, nativeWork: observed.at(-1)! });
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     await rejectStart(2);
     const nextError = observed.at(-1)!.lastError!;
     expect(nextError.incidentId).not.toBe(firstError.incidentId);
     expect({ ...nextError, incidentId: undefined }).toEqual({ ...firstError, incidentId: undefined });
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(recover).not.toHaveBeenCalled();
   });
 
@@ -320,9 +373,7 @@ describe("Codex native work recovery", () => {
     expect(restartButton().disabled).toBe(true);
     complete("later-turn");
     await refresh();
-    expect(host.querySelector("h2")?.textContent).toBe("Codex native work");
-    expect(host.querySelector("h2 svg")).toBeNull();
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     expect(host.textContent).not.toContain("Recovery failed:");
     expect(host.textContent).not.toContain("Restart only this client");
     expect(restartButton()).toBeUndefined();
@@ -335,12 +386,12 @@ describe("Codex native work recovery", () => {
     await act(async () => root.render(createElement("div")));
     sessionStorage.clear();
     await refresh();
-    expect(details().hidden).toBe(true);
+    expect(panel()).toBeNull();
     expect(restartButton()).toBeUndefined();
     start("new-failure");
     complete("new-failure", { message: "server overloaded", codexErrorInfo: "serverOverloaded", requestId: "req_failed" });
     await refresh();
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(host.textContent).toContain("Recovery failed:");
     expect(restartButton().disabled).toBe(false);
     expect(recover).not.toHaveBeenCalled();
@@ -348,7 +399,7 @@ describe("Codex native work recovery", () => {
 
   it("keeps blocked-goal guidance after the provider incident is resolved", async () => {
     await show(withWork({ recoveryStatus: "failed", turnStatus: "completed", incidentResolvedByTurnId: "later-turn" }));
-    expect(details().hidden).toBe(false);
+    expect(panel()).not.toBeNull();
     expect(host.querySelector("h2")?.textContent).toBe("Codex native work · Goal blocked");
     expect(host.textContent).toContain("/goal resume");
     expect(host.textContent).not.toContain("Recovery failed:");
@@ -363,6 +414,7 @@ function withWork(overrides: Partial<CodexNativeWork>): WorkspaceTab {
 }
 
 async function show(current: WorkspaceTab) {
+  currentTab = current;
   await act(async () => root.render(createElement(CodexNativeWorkPanel, { tab: current, onRecover: recover })));
 }
 
@@ -370,14 +422,14 @@ function restartButton() {
   return [...host.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "Restart this Codex client")!;
 }
 
-function presentationButton() {
-  return host.querySelector<HTMLButtonElement>("button[aria-expanded]")!;
-}
-
-function details() {
-  return document.getElementById(presentationButton().getAttribute("aria-controls")!)!;
+function panel() {
+  return host.querySelector(".codex-native-work");
 }
 
 async function toggleDetails() {
-  await act(async () => presentationButton().click());
+  await act(async () => {
+    const close = [...host.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "Close native work details");
+    if (close) close.click();
+    else openNativeWorkDetails(currentTab);
+  });
 }

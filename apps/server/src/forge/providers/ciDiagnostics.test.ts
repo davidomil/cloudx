@@ -758,6 +758,58 @@ describe("GitHub shared failed producers in the pinned CloudX workflow", () => {
     expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/522/logs"))).toHaveLength(1);
   });
 
+  it("replaces an older browser failure with the third head's coverage producer while downstream gates fail", async () => {
+    const historical = await productionAggregateFixture().provider.getCiFailure(change);
+    expect(historical.jobs.map(job => job.name)).toEqual(["Isolated verifier (browser-2)"]);
+    const thirdHead = "f".repeat(40);
+    const jobs = productionJobs.map(job => ({ ...job,
+      conclusion: job.name === "Isolated verifier (browser-2)" ? "success" :
+        job.name === "Isolated verifier (coverage-4)" ? "failure" : job.conclusion,
+    }));
+    const original = productionAggregateFixture({ jobs,
+      logs: Object.fromEntries(jobs.map(job => [job.id, job.name === "Isolated verifier (coverage-4)"
+        ? `${checkout}AssertionError: WorkspaceCleanupService.test.ts:443 surviving-thread cleanup eligibility\n`
+        : "Process completed with exit code 1.\n"])),
+    });
+    const fixture = harness(github, async (url, init) => {
+      const response = await original.fetcher(url, init);
+      return new Response((await response.text()).replaceAll(source, thirdHead), { status: response.status, headers: response.headers });
+    });
+    const diagnostic = await fixture.provider.getCiFailure({ ...change, headSha: thirdHead });
+    expect(diagnostic).toMatchObject({ state: "actionable", sourceHeadSha: thirdHead, targetHeadSha: target, testedSha: tested,
+      jobs: [{ name: "Isolated verifier (coverage-4)", jobId: "517", runId: "100", runAttempt: 2,
+        classification: "code", log: expect.stringContaining("WorkspaceCleanupService.test.ts:443"),
+        requiredGate: { name: "CI aggregate" } }] });
+    expect(diagnostic.jobs).toHaveLength(1);
+    expect(diagnostic.failureKey).not.toBe(historical.failureKey);
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/522/logs"))).toBe(false);
+  });
+
+  it.each(["aggregate", "direct"] as const)("keeps a runner setup timeout blocked at its producer through the %s check", async scope => {
+    const producerName = "Isolated verifier (browser-1)";
+    const jobs = productionJobs.map(job => ({ ...job,
+      conclusion: job.name === "Isolated verifier (browser-2)" ? "success" :
+        job.name === producerName ? "failure" : job.conclusion,
+    }));
+    const producer = jobs.find(job => job.name === producerName)!;
+    const timeout = "##[error]The action 'Free unused runner SDKs before building the verifier' has timed out after 5 minutes.";
+    const fixture = productionAggregateFixture({ jobs,
+      ...(scope === "direct" ? { checks: [{ ...check, databaseId: Number(producer.check_run_url.split("/").at(-1)), name: producer.name }] } : {}),
+      logs: Object.fromEntries(jobs.map(job => [job.id, job.name === producerName
+        ? `${checkout}${timeout}\n##[error]No files were found with the provided path: container-results/results.json. No artifacts will be uploaded.\n`
+        : "Process completed with exit code 1.\n"])),
+    });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "blocked", sourceHeadSha: source, targetHeadSha: target,
+      reason: expect.stringContaining("infrastructure failure evidence"),
+      jobs: [{ name: producerName, jobId: String(producer.id), runId: "100", runAttempt: 2,
+        classification: "infrastructure", log: expect.stringContaining(timeout),
+        ...(scope === "aggregate" ? { requiredGate: { name: "CI aggregate" } } : {}) }] });
+    expect(diagnostic.jobs).toHaveLength(1);
+    expect(diagnostic.reason).not.toContain("unambiguous");
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/522/logs"))).toBe(false);
+  });
+
   it("rejects actual cycles between failed gates", async () => {
     const workflow = pinnedWorkflow.replace("needs:\n      - isolated-lanes", "needs:\n      - aggregate");
     expect(await productionAggregateFixture({ workflow }).provider.getCiFailure(change))
