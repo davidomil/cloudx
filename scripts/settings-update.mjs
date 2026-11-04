@@ -12,7 +12,7 @@ import {
   updateCommit,
 } from "./install-update.mjs";
 import { bundleCoordinator, syncDirectory, verifySnapshot, writeUpdateJson, publicUpdateCapacity } from "./managed-update-store.mjs";
-import { inspectRuntimeUpdate } from "./install-runtime.mjs";
+import { inspectRuntimeServices } from "./install-runtime.mjs";
 import { COORDINATOR_FILES } from "./update-coordinator.mjs";
 import { CURRENT_TERMINAL_CONTRACT, UpdateHost } from "./managed-update.mjs";
 import { parseEnvironmentFile } from "./installer-environment.mjs";
@@ -87,7 +87,7 @@ export class SettingsUpdater {
     commands,
     readCgroup = (pid) => fs.readFileSync(`/proc/${pid}/cgroup`, "utf8"),
     now = () => new Date(),
-    runtimeInspector = inspectRuntimeUpdate,
+    runtimeInspector = inspectRuntimeServices,
     stageCoordinator,
     capacityHost = options => new UpdateHost(options),
     cli = false,
@@ -444,7 +444,7 @@ export class SettingsUpdater {
       if (!noStart && runtimePlan.requiresInterruption && !confirmInterruption && !saved?.confirmInterruption) {
         const restoration = status.confirmation?.targetCommit === targetCommit && status.confirmation.restoreSnapshotRunId ? status.confirmation : undefined;
         const confirmation = restoration ? { ...restoration, requiresInterruption: true } : {
-          targetCommit, message: "This update must interrupt terminal processes. Saved tabs, layouts and exact saved conversations will be preserved for explicit recovery. Commands and prompts will not be replayed. " + (runtimePlan.recovery?.warnings ?? []).join(" "),
+          targetCommit, message: "This update must interrupt terminal processes. CloudX will validate saved recovery data and available storage before services stop. Saved tabs, layouts and exact saved conversations will be preserved for explicit recovery. Unsaved legacy tab identities cannot be restored. Commands and prompts will not be replayed. " + (runtimePlan.recovery?.warnings ?? []).join(" "),
         };
         this.write(path.join(this.stateDir, "confirmation.json"), { ...confirmation, repoRoot: this.repoRoot });
         return { ...status, confirmation };

@@ -1,4 +1,4 @@
-"""Bounded, read-only snapshots for native Codex schema compatibility checks."""
+"""Streaming, read-only snapshots for native Codex schema compatibility checks."""
 from contextlib import closing
 import errno
 import hashlib
@@ -10,9 +10,6 @@ import stat
 import sys
 import time
 
-DEADLINE = time.monotonic() + 60
-MAX_BYTES = 8 * 1024 * 1024 * 1024
-MAX_DIRECTORY_BYTES = 16 * 1024 * 1024
 COPY_CHUNK_BYTES = 1024 * 1024
 
 
@@ -26,13 +23,11 @@ class SnapshotPreparationError(ValueError):
     def diagnostic(self):
         result = {"stage": "snapshot", "code": self.code}
         if self.observed_bytes is not None:
-            result.update(observedBytes=self.observed_bytes, limitBytes=self.limit_bytes)
+            if self.code == "disk-inodes":
+                result.update(requiredInodes=self.observed_bytes, availableInodes=self.limit_bytes)
+            else:
+                result.update(observedBytes=self.observed_bytes, limitBytes=self.limit_bytes)
         return result
-
-
-def check_budget(observed_bytes, code="snapshot-budget"):
-    if observed_bytes > MAX_BYTES:
-        raise SnapshotPreparationError(code, observed_bytes, MAX_BYTES)
 
 
 def check_disk_space(required_bytes, destination):
@@ -46,7 +41,6 @@ def transcript_hash(file):
     digest = hashlib.sha256()
     with open(file, "rb") as stream:
         while chunk := stream.read(COPY_CHUNK_BYTES):
-            check_progress()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -55,9 +49,9 @@ def copy_transcript(original, isolated, total_bytes):
     digest = hashlib.sha256()
     with open(original, "rb") as source, open(isolated, "xb") as target:
         while chunk := source.read(COPY_CHUNK_BYTES):
-            check_progress()
+            check_disk_space(len(chunk), isolated.parent)
             total_bytes += len(chunk)
-            check_budget(total_bytes, "transcript-budget")
+            report_progress(total_bytes)
             target.write(chunk)
             digest.update(chunk)
     isolated.chmod(0o600)
@@ -66,27 +60,33 @@ def copy_transcript(original, isolated, total_bytes):
 
 def read_directories(file):
     with open(file, "rb") as stream:
-        data = stream.read(MAX_DIRECTORY_BYTES + 1)
-    if len(data) > MAX_DIRECTORY_BYTES:
-        raise SnapshotPreparationError("directory-list")
-    directories = json.loads(data)
-    if not isinstance(directories, list) or len(directories) > 10003 or any(not isinstance(directory, str) for directory in directories):
+        directories = json.load(stream)
+    if not isinstance(directories, list) or any(not isinstance(directory, str) for directory in directories):
         raise SnapshotPreparationError("directory-list")
     return directories
 
 
-def check_progress(_status=0, _remaining=0, total=0):
-    if time.monotonic() > DEADLINE:
-        raise SnapshotPreparationError("time-limit")
+PROGRESS_FILE = None
+LAST_PROGRESS = 0
+
+
+def report_progress(copied_bytes, force=False):
+    global LAST_PROGRESS
+    now = time.monotonic()
+    if PROGRESS_FILE is not None and (force or now - LAST_PROGRESS >= 1):
+        temporary = PROGRESS_FILE.with_suffix(".tmp")
+        with open(temporary, "w") as stream:
+            json.dump({"copiedBytes": copied_bytes}, stream)
+        temporary.chmod(0o600)
+        temporary.replace(PROGRESS_FILE)
+        LAST_PROGRESS = now
 
 
 def open_state(file):
     info = file.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         raise SnapshotPreparationError("database-file")
-    check_budget(info.st_size, "database-size")
     connection = sqlite3.connect(file.as_uri() + "?mode=ro", uri=True, timeout=1)
-    connection.set_progress_handler(lambda: int(time.monotonic() > DEADLINE), 1000)
     return connection
 
 
@@ -94,20 +94,16 @@ def schema(connection):
     return connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").fetchall()
 
 
-def snapshot(directories, destination):
+def plan_snapshots(directories):
     seen = set()
     results = []
-    total_bytes = 0
     for directory in directories:
-        check_progress()
         source = Path(directory)
         if not source.exists():
             continue
         if source.is_symlink() or not source.is_dir() or source.stat().st_uid != os.getuid():
             raise SnapshotPreparationError("database-home")
         files = sorted(source.glob("*.sqlite"))
-        if len(files) > 32:
-            raise SnapshotPreparationError("database-count")
         if not files:
             continue
         signature = []
@@ -121,43 +117,72 @@ def snapshot(directories, destination):
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
-        if len(seen) > 16:
-            raise SnapshotPreparationError("database-count")
+        results.append(files)
+    return results
+
+
+def snapshot(directories, destination, available_bytes=None, available_inodes=None):
+    plans = plan_snapshots(directories)
+    required_bytes = 0
+    largest_database = 0
+    required_inodes = 5  # Input, result, progress, temporary progress, and SQLite journal.
+    allowed = [(Path(directory) / name).resolve() for directory in directories for name in ["sessions", "archived_sessions"]]
+    block_size = os.statvfs(destination).f_frsize
+    for files in plans:
+        required_inodes += 2  # Schema directory and retained-identity receipt.
+        required_bytes += block_size * 2  # Schema directory and retained-identity receipt.
+        for file in files:
+            required_inodes += 1
+            with closing(open_state(file)) as connection:
+                database_bytes = connection.execute("PRAGMA page_count").fetchone()[0] * connection.execute("PRAGMA page_size").fetchone()[0]
+                required_bytes += database_bytes
+                largest_database = max(largest_database, database_bytes)
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+                if "rollout_path" in columns:
+                    required_inodes += 2
+                    required_bytes += block_size * 2
+                    for identity, rollout in connection.execute("SELECT id, rollout_path FROM threads"):
+                        original = retained_transcript(rollout, allowed)
+                        # Include path rewrites and receipt JSON, in addition to copied history.
+                        required_bytes += block_size + 6 * (len(str(identity).encode()) + len(str(original).encode()) + len(str(destination).encode()) + 128)
+                        if original.exists():
+                            required_inodes += 1
+                            required_bytes += ((original.stat().st_size + block_size - 1) // block_size) * block_size
+    # Rewriting rollout paths can require a rollback journal for an entire database.
+    required_bytes += largest_database
+    check_disk_space(required_bytes, destination)
+    if available_bytes is not None and required_bytes > available_bytes:
+        raise SnapshotPreparationError("disk-space", required_bytes, available_bytes)
+    if available_inodes is not None and required_inodes > available_inodes:
+        raise SnapshotPreparationError("disk-inodes", required_inodes, int(available_inodes))
+    results = []
+    total_bytes = 0
+    for files in plans:
         target = Path(destination) / str(len(results))
         target.mkdir(mode=0o700)
         retained = {"threads": {}, "transcripts": {}}
         for file in files:
             with closing(open_state(file)) as connection, closing(sqlite3.connect(target / file.name)) as copied:
                 page_size = connection.execute("PRAGMA page_size").fetchone()[0]
-                budget_before = total_bytes
 
                 def reserve_pages(status, remaining, total):
-                    check_progress()
-                    check_budget(budget_before + total * page_size)
+                    check_disk_space(remaining * page_size, target)
+                    report_progress(total_bytes + (total - remaining) * page_size)
 
-                reserve_pages(0, 0, connection.execute("PRAGMA page_count").fetchone()[0])
                 check_disk_space(connection.execute("PRAGMA page_count").fetchone()[0] * page_size, target)
                 connection.backup(copied, pages=256, progress=reserve_pages, sleep=0.01)
                 database_bytes = (target / file.name).stat().st_size
                 total_bytes += database_bytes
-                check_budget(total_bytes)
                 columns = {row[1] for row in copied.execute("PRAGMA table_info(threads)")}
                 if "rollout_path" in columns:
                     # The native process must never follow a copied row back into production history.
                     transcripts = target / "retained-transcripts" / file.name
                     transcripts.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    allowed = [(Path(directory) / name).resolve() for directory in directories for name in ["sessions", "archived_sessions"]]
-                    for index, (identity, rollout) in enumerate(copied.execute("SELECT id, rollout_path FROM threads").fetchall()):
-                        check_progress()
+                    for index, (identity, rollout) in enumerate(retained_thread_paths(copied)):
                         isolated = transcripts / (str(index) + ".jsonl")
-                        original = Path(rollout).resolve()
-                        if not any(parent in original.parents for parent in allowed) or original.suffix != ".jsonl":
-                            raise SnapshotPreparationError("transcript-path")
+                        original = retained_transcript(rollout, allowed)
                         if original.exists():
                             info = original.lstat()
-                            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                                raise SnapshotPreparationError("transcript-file")
-                            check_budget(total_bytes + info.st_size, "transcript-budget")
                             check_disk_space(info.st_size, target)
                             total_bytes, retained["transcripts"][str(isolated)] = copy_transcript(original, isolated, total_bytes)
                         copied.execute("UPDATE threads SET rollout_path = ? WHERE id = ?", (str(isolated), identity))
@@ -167,13 +192,42 @@ def snapshot(directories, destination):
                     for identity, in copied.execute("SELECT id FROM threads"):
                         retained["threads"][file.name][identity] = copied.execute("SELECT rollout_path FROM threads WHERE id = ?", (identity,)).fetchone()[0] if "rollout_path" in columns else None
             total_bytes += (target / file.name).stat().st_size - database_bytes
-            check_budget(total_bytes)
             os.chmod(target / file.name, 0o600)
         receipt = target / "retained-identities.json"
         receipt.write_text(json.dumps(retained))
         receipt.chmod(0o600)
         results.append(str(target))
+    report_progress(total_bytes, force=True)
     return results
+
+
+def retained_thread_paths(connection):
+    previous = None
+    while True:
+        # Exhaust each bounded cursor before updating indexed paths. A second read
+        # connection would block rollback-journal cache spills during a large rewrite.
+        if previous is None:
+            rows = connection.execute("SELECT id, rollout_path FROM threads ORDER BY id LIMIT 256").fetchall()
+        else:
+            rows = connection.execute("SELECT id, rollout_path FROM threads WHERE id > ? ORDER BY id LIMIT 256", (previous,)).fetchall()
+        if not rows:
+            return
+        for identity, rollout in rows:
+            if not isinstance(identity, str):
+                raise SnapshotPreparationError("database-identity")
+            yield identity, rollout
+        previous = rows[-1][0]
+
+
+def retained_transcript(rollout, allowed):
+    original = Path(rollout).resolve()
+    if not any(parent in original.parents for parent in allowed) or original.suffix != ".jsonl":
+        raise SnapshotPreparationError("transcript-path")
+    if original.exists():
+        info = original.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise SnapshotPreparationError("transcript-file")
+    return original
 
 
 def verify(directory, session_id):
@@ -207,7 +261,13 @@ def verify(directory, session_id):
 if __name__ == "__main__":
     try:
         if sys.argv[1] == "snapshot":
-            print(json.dumps(snapshot(read_directories(sys.argv[2]), sys.argv[3])))
+            PROGRESS_FILE = Path(sys.argv[3]) / "progress.json"
+            results = snapshot(read_directories(sys.argv[2]), sys.argv[3], int(sys.argv[4]), float(sys.argv[5]))
+            result_file = Path(sys.argv[3]) / "snapshots.json"
+            with open(result_file, "x") as stream:
+                json.dump(results, stream)
+            result_file.chmod(0o600)
+            print("true")
         elif sys.argv[1] == "verify":
             print(json.dumps(verify(sys.argv[2], sys.argv[3])))
         else:
@@ -219,9 +279,7 @@ if __name__ == "__main__":
             "code": "unavailable" if sys.argv[1] == "snapshot" else "candidate-state",
         }
         if diagnostic["stage"] == "snapshot" and not isinstance(error, SnapshotPreparationError):
-            if time.monotonic() > DEADLINE:
-                diagnostic["code"] = "time-limit"
-            elif getattr(error, "errno", None) in (errno.ENOSPC, errno.EDQUOT) or getattr(error, "sqlite_errorname", None) == "SQLITE_FULL":
+            if getattr(error, "errno", None) in (errno.ENOSPC, errno.EDQUOT) or getattr(error, "sqlite_errorname", None) == "SQLITE_FULL":
                 diagnostic["code"] = "disk-full"
             elif getattr(error, "errno", None) in (errno.EACCES, errno.EPERM):
                 diagnostic["code"] = "permission"

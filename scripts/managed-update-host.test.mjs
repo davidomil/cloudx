@@ -516,14 +516,33 @@ describe('managed update host with real Git and recovery files', () => {
     const f = fixture();
     f.record.transition.release = path.join(f.home, 'prepared');
     f.record.transition.preservedSessionIds = ['exact-shell', 'exact-codex'];
-    const inspect = vi.spyOn(f.commands, 'inspect').mockReturnValue(JSON.stringify({ sessionIds: f.record.transition.preservedSessionIds }));
+    const inspect = vi.spyOn(f.commands, 'inspect').mockImplementation((_command, args) => {
+      fs.writeFileSync(args[4], JSON.stringify({ sessionIds: f.record.transition.preservedSessionIds }));
+      return 'true';
+    });
     expect(f.host.probeTerminals(f.record, 'verify')).toEqual(['exact-shell', 'exact-codex']);
     const [node, args, options] = inspect.mock.calls[0];
     expect(node).toBe(process.execPath);
     expect(args.slice(0, 4)).toEqual([path.join(f.record.coordinator, 'scripts/managed-update-terminals.mjs'), 'verify', f.record.transition.release, f.dataDir]);
-    expect(JSON.parse(fs.readFileSync(args[4], 'utf8'))).toEqual({ sessionIds: ['exact-shell', 'exact-codex'] });
-    expect(options.timeout).toBe(60000);
-    inspect.mockReturnValue('{"sessionIds":["different-session"]}');
+    expect(JSON.parse(fs.readFileSync(args[5], 'utf8'))).toEqual({ sessionIds: ['exact-shell', 'exact-codex'] });
+    expect(options.timeout).toBe(0);
+    inspect.mockImplementation((_command, args) => {
+      fs.writeFileSync(args[4], '{"sessionIds":["different-session"]}');
+      return 'true';
+    });
     expect(() => f.host.probeTerminals(f.record, 'verify')).toThrow('preserved terminal sessions could not be attached');
+  });
+
+  it('reads captured terminal lists above the subprocess stdout budget from a private result file', () => {
+    const f = fixture();
+    f.record.transition.release = path.join(f.home, 'prepared');
+    const sessionIds = Array.from({ length: 9000 }, (_, index) => `${index}-${'a'.repeat(120)}`);
+    const result = JSON.stringify({ sessionIds });
+    expect(Buffer.byteLength(result)).toBeGreaterThan(1024 * 1024);
+    vi.spyOn(f.commands, 'inspect').mockImplementation((_command, args) => {
+      fs.writeFileSync(args[4], result, { mode: 0o600 });
+      return 'true';
+    });
+    expect(f.host.probeTerminals(f.record, 'capture')).toEqual(sessionIds);
   });
 });

@@ -11,7 +11,7 @@ import { stageInstalledUpdater } from './update-coordinator.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { InstallerRunner, prepareManagedRelease, activateManagedServices, waitForHealth } from './install-cloudx.mjs';
 import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePort, SERVICE_NAMES } from './install-update.mjs';
-import { inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
+import { inspectRuntimeServices, inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
 import { assertTerminalMigrationSafe } from './terminal-upgrade-recovery.mjs';
 import { parseEnvironmentFile, updateEnvironmentFile } from './installer-environment.mjs';
 import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile, estimateSnapshot, manifestTree, filesystemCapacity, capacityMessage, publicUpdateCapacity } from './managed-update-store.mjs';
@@ -181,8 +181,7 @@ export class UpdateHost {
       this.git(['apply', '--binary', '--whitespace=nowarn', patchFile], release);
     }
     transition.targetRuntime = inspectTargetRuntime(release);
-    transition.runtimePlan = inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: transition.targetRuntime });
-    if (transition.runtimePlan.blockers.length) throw publicFailure('terminals', transition.runtimePlan.blockers.map(blocker => blocker.message ?? blocker).join(' '));
+    transition.runtimePlan = this.inspectRuntimeRecovery(record);
     if (!record.noStart && transition.runtimePlan.requiresInterruption && !record.confirmInterruption) this.requireInterruption(record, transition.runtimePlan);
     transition.release = release;
     transition.environment = this.envConfig;
@@ -302,6 +301,21 @@ export class UpdateHost {
     }
   }
 
+  reportRecoveryProgress(record, message) {
+    record.run.component = 'terminals';
+    record.run.message = message;
+    this.save(record);
+  }
+
+  inspectRuntimeRecovery(record) {
+    this.reportRecoveryProgress(record, 'Inspecting retained terminal recovery data. Services remain running.');
+    const plan = inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target,
+      targetRuntime: record.transition.targetRuntime, inspectCapacity: this.inspectCapacity,
+      log: message => this.reportRecoveryProgress(record, message) });
+    if (plan.blockers.length) throw publicFailure('terminals', plan.blockers.map(blocker => blocker.message ?? blocker).join(' '));
+    return plan;
+  }
+
   requireInterruption(record, plan) {
     writeUpdateJson(path.join(path.dirname(this.runDir), 'confirmation.json'), { repoRoot: record.repoRoot, targetCommit: record.targetCommit,
       message: 'This update needs to interrupt terminal processes. Saved tabs, layouts and known conversations remain recoverable. Commands and prompts will not be replayed. ' + (plan.recovery?.warnings ?? []).join(' ') });
@@ -405,19 +419,21 @@ export class UpdateHost {
     this.assertDirectBrokerUnchanged(t);
     if (this.git(['rev-parse', 'HEAD']) !== t.sourceCommit || this.localChanges() !== t.localPatch || this.git(['write-tree']) !== t.sourceIndex)
       throw Object.assign(publicFailure('checkout', 'Local work changed while the release was building. Resume to prepare a fresh release with the current local work.'), { reprepare: true });
-    assertUpdaterOutsideServices(inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: t.targetRuntime }).services.map(({ service, state }) => [service, state]), fs.readFileSync);
+    assertUpdaterOutsideServices(inspectRuntimeServices({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: t.targetRuntime }).services.map(({ service, state }) => [service, state]), fs.readFileSync);
     assertTerminalMigrationSafe({ dataDir: this.paths.dataDir });
-    const currentPlan = inspectRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target, targetRuntime: t.targetRuntime });
+    // Check aggregate recovery capacity before the full terminal inspection.
+    this.preflightCapacity(record, 'before-stop');
+    const currentPlan = this.inspectRuntimeRecovery(record);
     if (currentPlan.requiresInterruption && !record.confirmInterruption) this.requireInterruption(record, currentPlan);
     t.serviceStates = Object.fromEntries(this.target.serviceNames.map(service => [service, this.runner.inspect('systemctl', ['--user', 'show', service, '--property=ActiveState,MainPID,InvocationID'])]));
     if (t.directBroker) t.directBroker.state = this.inspectOwnedBrokerConfiguration(t.directBroker.file).state;
-    // This is the final safe boundary before terminal migration or service stop.
-    this.preflightCapacity(record, 'before-stop');
+    // Both recovery checks complete before terminal migration or service stop.
     t.restored = false;
     t.mutating = true;
     this.save(record);
     const migration = prepareRuntimeUpdate({ paths: this.paths, commands: this.runner, target: this.target,
-      targetRuntime: t.targetRuntime, interruptionConfirmed: record.confirmInterruption });
+      targetRuntime: t.targetRuntime, interruptionConfirmed: record.confirmInterruption,
+      inspectCapacity: this.inspectCapacity, log: message => this.reportRecoveryProgress(record, message) });
     t.runtimePlan = migration.plan;
     t.terminalRecovery = migration?.recoverySnapshot;
     this.save(record);
@@ -588,14 +604,16 @@ export class UpdateHost {
   }
 
   probeTerminals(record, mode) {
-    const args = [path.join(record.coordinator, 'scripts/managed-update-terminals.mjs'), mode, record.transition.release, this.paths.dataDir];
+    const resultFile = path.join(this.runDir, `terminal-attachments-${randomUUID()}.json`);
+    const args = [path.join(record.coordinator, 'scripts/managed-update-terminals.mjs'), mode, record.transition.release, this.paths.dataDir, resultFile];
     if (mode === 'verify') {
       const input = path.join(this.runDir, 'preserved-terminals.json');
       writeUpdateJson(input, { sessionIds: record.transition.preservedSessionIds });
       args.push(input);
     }
     try {
-      const result = JSON.parse(this.runner.inspect(process.execPath, args, { timeout: 60000 }));
+      if (this.runner.inspect(process.execPath, args, { timeout: 0 }) !== 'true') throw new Error('Terminal attachment probe did not complete.');
+      const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
       if (!validSessionIds(result.sessionIds)) throw new Error('Invalid terminal attachment result.');
       if (mode === 'verify' && JSON.stringify(result.sessionIds) !== JSON.stringify(record.transition.preservedSessionIds)) throw new Error('The terminal attachment result changed its requested identities.');
       return result.sessionIds;

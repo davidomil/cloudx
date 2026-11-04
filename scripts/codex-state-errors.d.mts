@@ -3,6 +3,8 @@ export interface CodexStateDiagnostic {
   code: string;
   observedBytes?: number;
   limitBytes?: number;
+  requiredInodes?: number;
+  availableInodes?: number;
 }
 export function parseCodexStateDiagnostic(value: unknown): CodexStateDiagnostic | undefined;
 export class CodexStateVerificationError extends Error {
