@@ -5432,7 +5432,7 @@ describe("Forge completed retained checkout reconciliation", () => {
     await fs.mkdir(dependencyPath);
     await fs.writeFile(path.join(dependencyPath, "generated.bin"), "Disposable installed dependencies");
     await fs.symlink(dependencyPath, path.join(workspace.worktreePath, sourceOnly.path, "node_modules"));
-    const repositoryCopies: { path: string; object: string; bytes: Buffer; ref: string }[] = [];
+    const repositoryCopies: { path: string; object: string; bytes: Buffer; ref: string; refreshedIndex?: Buffer }[] = [];
     for (let index = 0; index < 3; index++) {
       const objectFile = path.join(root, `diagnostic-object-${index}`);
       await fs.writeFile(objectFile, `Unpublished object unique to diagnostic copy ${index}\n`);
@@ -5441,7 +5441,15 @@ describe("Forge completed retained checkout reconciliation", () => {
       await git(workspace.worktreePath, "update-ref", ref, object);
       const snapshot = await runtime.createDiagnosticSnapshot(workspace, attempts[index % 2]!, { kind: "repository", commitSha: headSha });
       const relativeObject = path.join(".git", "objects", object.slice(0, 2), object.slice(2));
-      repositoryCopies.push({ path: snapshot.path, object, bytes: await fs.readFile(path.join(workspace.worktreePath, snapshot.path, relativeObject)), ref });
+      const source = path.join(workspace.worktreePath, snapshot.path);
+      let refreshedIndex: Buffer | undefined;
+      if (index < 2) {
+        const originalIndex = await fs.readFile(path.join(source, ".git/index"));
+        expect(await gitWithEnvironment(source, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], { GIT_OPTIONAL_LOCKS: "1" })).toBe("");
+        refreshedIndex = await fs.readFile(path.join(source, ".git/index"));
+        expect(refreshedIndex).not.toEqual(originalIndex);
+      }
+      repositoryCopies.push({ path: snapshot.path, object, bytes: await fs.readFile(path.join(source, relativeObject)), ref, refreshedIndex });
       await git(workspace.worktreePath, "update-ref", "-d", ref);
     }
     const reportPath = ".cloudx/validation/snapshot-completion.log";
@@ -5469,6 +5477,7 @@ describe("Forge completed retained checkout reconciliation", () => {
         const relativeObject = path.join(".git", "objects", copy.object.slice(0, 2), copy.object.slice(2));
         expect(await fs.readFile(path.join(restored, relativeObject))).toEqual(copy.bytes);
         expect(await fs.readFile(path.join(restored, ".git", copy.ref), "utf8")).toBe(`${copy.object}\n`);
+        if (copy.refreshedIndex) expect(await fs.readFile(path.join(restored, ".git/index"))).toEqual(copy.refreshedIndex);
         expect(await git(restored, `--git-dir=${restored}/.git`, "rev-parse", "HEAD")).toBe(headSha);
       }
       const evidence = new ForgeCheckoutEvidence(path.join(root, "data"));

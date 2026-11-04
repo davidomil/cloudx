@@ -330,6 +330,8 @@ describe("Worker diagnostic snapshot ownership", () => {
     const prompt = f.runtime.launch.mock.calls[0]![0].prompt;
     expect(prompt).toContain(`forge-snapshot.mjs' ${worker.id} ${worker.attemptId}`);
     expect(prompt).toContain("Do not create undeclared diagnostic copies");
+    expect(prompt).toContain("Inventory files with git --no-optional-locks status");
+    expect(prompt).toContain("Inspect copies with git --no-optional-locks -C <source> status");
   });
 
   it("creates snapshots through the active reviewer's detached checkout", async () => {
@@ -5289,6 +5291,125 @@ describe("Forge issue auto review", () => {
     f.reports.read.mockResolvedValue(undefined);
     return diagnostic;
   }
+
+  async function pendingCiAfterUnchangedUpdate() {
+    const f = await automaticIssue();
+    f.codingReport(); await f.poll();
+    f.change.requiresBaseUpdate = true;
+    f.change.mergeable = false;
+    let evidence!: ReturnType<typeof realCiDiagnostics>;
+    let aggregate!: ReturnType<typeof realCiDiagnostics>["checks"][number];
+    f.runtime.updateIssueBranch.mockImplementation(async () => {
+      evidence = realCiDiagnostics(f, "github", "AssertionError: browser fixture did not restart\n", "Isolated verifier (browser-2)", true);
+      aggregate = evidence.checks[0];
+      evidence.checks.splice(0, 1, { ...aggregate, databaseId: 9, name: "Isolated verifier (browser-2)", isRequired: false });
+      evidence.run.status = "in_progress";
+      f.change.requiresBaseUpdate = false;
+      return f.change.headSha;
+    });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    await f.poll();
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledOnce();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { phase: "merging" },
+      ciRepair: { phase: "diagnosing", attempts: 0, attemptedHeads: [], diagnostic: { state: "pending", jobs: [] } } });
+    expect(f.currentIssue().pendingPublication).toBeUndefined();
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    return { ...f, evidence, aggregate };
+  }
+
+  it.each([false, true])("polls pending CI after an unchanged branch update and launches one matching repair (restart: %s)", async restart => {
+    const f = await pendingCiAfterUnchangedUpdate();
+    const owned = structuredClone(f.currentIssue());
+    const ciWait = owned.autoReview!.ciWait;
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    f.advanceTime(10 * 60_000);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, ciRepair: { attempts: 0 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    f.evidence.run.status = "completed";
+    f.evidence.checks.push(f.aggregate);
+    f.advanceTime(5_000);
+    await Promise.all([service.poll(), service.poll()]);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ id: owned.id, branch: owned.branch, worktreePath: owned.worktreePath,
+      headSha: owned.headSha, changeNumber: owned.changeNumber, status: "running", ciRepair: { phase: "repairing", attempts: 1,
+        attemptedHeads: [f.evidence.sourceHead], diagnostic: { state: "actionable", jobs: [{ jobId: "9", requiredGate: { jobId: "10" } }] } } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: owned.id, worktreePath: owned.worktreePath, preserveConversation: true });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("enforces the original pending CI deadline after an unchanged branch update (restart: %s)", async restart => {
+    const f = await pendingCiAfterUnchangedUpdate();
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    f.advanceTime(60 * 60_000);
+    await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait } });
+    f.advanceTime(60 * 60_000);
+    await service.poll(); await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/two hours.*Resume/),
+      ciRepair: { attempts: 0, attemptedHeads: [] } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop"] as const)("keeps %s authoritative after an unchanged branch update waits for CI", async action => {
+    const f = await pendingCiAfterUnchangedUpdate();
+    await f.service[action](f.issue.id);
+    f.evidence.run.status = "completed";
+    f.evidence.checks.push(f.aggregate);
+    f.advanceTime(2 * 60 * 60_000);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll(); await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ status: action === "pause" ? "paused" : "stopped", ciRepair: { attempts: 0 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("retains all approved batch members through pending CI after an unchanged update and restart", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    onTestFinished(() => { vi.useRealTimers(); });
+    const f = batchFixture();
+    const draft = await f.service.saveBatch(f.deps.settings().repository, "Pending aggregate", [1, 2]);
+    const worker = await f.service.startBatch(draft.id, placement, true);
+    f.provider.postReview.mockImplementation(async () => {
+      f.change.approved = true;
+      return { commentIds: [] };
+    });
+    f.reports.read.mockResolvedValue(f.report);
+    await f.service.poll();
+    f.change.requiresBaseUpdate = true;
+    f.change.mergeable = false;
+    f.runtime.updateIssueBranch.mockImplementation(async () => {
+      failedCi(f, { state: "pending", reason: "Required aggregate has not arrived.", jobs: [] });
+      f.change.requiresBaseUpdate = false;
+      return f.change.headSha;
+    });
+    f.reports.read.mockResolvedValue({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Ready", comments: [] });
+    vi.setSystemTime(Date.now() + 5_000);
+    await f.service.poll();
+    const owned = structuredClone(f.stored().find(saved => saved.id === worker.id)!);
+    expect(f.runtime.updateIssueBranch).toHaveBeenCalledOnce();
+    expect(owned).toMatchObject({ status: "awaiting_merge", batch: { issues: [{ number: 1 }, { number: 2 }],
+      results: f.report.issueResults }, ciRepair: { phase: "diagnosing", attempts: 0 } });
+    const restarted = new ForgeWorkflowService(f.deps);
+    vi.setSystemTime(Date.now() + 5_000);
+    failedCi(f);
+    await Promise.all([restarted.poll(), restarted.poll()]);
+    const current = f.stored().find(saved => saved.id === worker.id)!;
+    expect(current).toMatchObject({ id: worker.id, branch: owned.branch, worktreePath: owned.worktreePath, batch: owned.batch,
+      status: "running", autoReview: { reviewWorkerId: owned.autoReview!.reviewWorkerId }, ciRepair: { attempts: 1 } });
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ issues: [f.issues[0], f.issues[1]], batch: { name: "Pending aggregate" } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: worker.id, worktreePath: owned.worktreePath, preserveConversation: true });
+    expect(f.runtime.publishBranch).toHaveBeenCalledOnce();
+    expect(f.provider.postReview).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
 
   async function repairingCiIssue() {
     const f = await approvedIssue();

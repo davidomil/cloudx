@@ -5280,8 +5280,15 @@ a:hover svg {
   font-size: var(--font-size-md);
 }
 
-.web-viewer-panel .inline-error {
+.web-viewer-notices {
   grid-row: 2;
+}
+
+.web-viewer-restriction {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-foreground);
+  font-size: var(--font-size-sm);
 }
 
 .web-viewer-content {

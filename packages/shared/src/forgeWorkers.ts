@@ -110,6 +110,15 @@ export interface ForgeTurnCompletion {
   turnId: string;
   status: "running" | "completed" | "interrupted" | "failed";
   error?: string;
+  executionId?: string;
+  nativeError?: { code: string };
+}
+export const MAX_FORGE_MODEL_CAPACITY_RETRIES = 5;
+export interface ForgeExecutionSettings {
+  model: string;
+  reasoningEffort: import("./index.js").CodexReasoningEffort;
+  accountId?: string;
+  claudeLaunchMode?: import("./claudeLaunchPolicy.js").ClaudeLaunchMode;
 }
 export interface ForgeWorkerCompletion {
   attemptId: string;
@@ -127,7 +136,14 @@ export function isForgeTurnCompletion(value: unknown): value is ForgeTurnComplet
   return ["workerId", "attemptId", "threadId", "turnId"].every(key =>
     typeof turn[key] === "string" && turn[key].trim().length > 0 && turn[key].length <= 256) &&
     typeof turn.status === "string" && ["running", "completed", "interrupted", "failed"].includes(turn.status) &&
-    (turn.error === undefined || typeof turn.error === "string" && turn.error.length <= 100_000);
+    (turn.error === undefined || typeof turn.error === "string" && turn.error.length <= 100_000) &&
+    (turn.executionId === undefined || typeof turn.executionId === "string" && turn.executionId.trim().length > 0 && turn.executionId.length <= 256) &&
+    (turn.nativeError === undefined || isForgeNativeError(turn.nativeError));
+}
+function isForgeNativeError(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const error = value as Record<string, unknown>;
+  return typeof error.code === "string" && error.code.trim().length > 0 && error.code.length <= 256;
 }
 export const FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS = 30 * 60_000;
 
@@ -157,6 +173,15 @@ export interface ForgeWorker {
   tabId?: string;
   attemptId?: string;
   completion?: ForgeWorkerCompletion;
+  executionSettings?: ForgeExecutionSettings;
+  modelCapacityRecovery?: {
+    retries: number;
+    retryAt?: string;
+    failedAttemptId: string;
+    threadId: string;
+    turnId: string;
+    executionId?: string;
+  };
   retainedWorkspace?: ForgeRetainedWorkspace;
   publicationState?: "creating" | "uncertain" | "created";
   mergeConflict?: {
