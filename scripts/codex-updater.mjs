@@ -7,7 +7,6 @@ import { isExactCodexVersion as isVersion, readCodexSelection } from "./codex-se
 import { CODEX_STATE_ERROR_PREFIX, CodexStateVerificationError, parseCodexStateDiagnostic } from "./codex-state-errors.mjs";
 import { CODEX_RUNTIME_ERROR_PREFIX, CodexRuntimeVerificationError, parseCodexRuntimeDiagnostic } from "./codex-runtime-errors.mjs";
 
-const UPDATE_TIMEOUT_MS = 180_000;
 const OUTPUT_LIMIT = 512 * 1024;
 
 export class CodexUpdateError extends Error {
@@ -235,6 +234,7 @@ function runCommand(
     timeoutMs = 10_000,
     onOutput,
     outputBudget = { remaining: OUTPUT_LIMIT },
+    captureOutput = true,
   },
 ) {
   return new Promise((resolve, reject) => {
@@ -364,7 +364,7 @@ function runCommand(
       return;
     }
     acknowledgeCompletion();
-    timer = setTimeout(
+    if (timeoutMs !== null) timer = setTimeout(
       () =>
         stop(
           new CodexUpdateError(
@@ -377,11 +377,11 @@ function runCommand(
     signal?.addEventListener("abort", cancel, { once: true });
     if (signal?.aborted) cancel();
     const collect = (chunk, isError) => {
-      const allowed = chunk.subarray(0, Math.max(0, outputBudget.remaining));
-      outputBudget.remaining -= chunk.length;
+      const allowed = captureOutput ? chunk.subarray(0, Math.max(0, outputBudget.remaining)) : chunk;
+      if (captureOutput) outputBudget.remaining -= chunk.length;
       const text = allowed.toString("utf8");
-      if (isError) stderr += text;
-      else stdout += text;
+      if (isError) stderr = captureOutput ? stderr + text : (stderr + text).slice(-8192);
+      else if (captureOutput) stdout += text;
       if (text) {
         try {
           onOutput?.(text);
@@ -394,7 +394,7 @@ function runCommand(
           );
         }
       }
-      if (outputBudget.remaining < 0)
+      if (captureOutput && outputBudget.remaining < 0)
         stop(
           new CodexUpdateError(
             "output-limit",
@@ -503,7 +503,8 @@ async function verifyCodexLaunch(assistantBin, options, previousAssistantBin, al
   try {
     await runCommand(process.execPath, args, {
       ...options,
-      timeoutMs: 120_000,
+      timeoutMs: null,
+      captureOutput: false,
       onOutput: text => {
         diagnosticTail = (diagnosticTail + text).slice(-8192);
         options.onOutput?.(text);
@@ -602,15 +603,15 @@ export async function updateCodexInstallation({
   onOutput,
   onTarget,
   onInstalled,
-  timeoutMs = UPDATE_TIMEOUT_MS,
+  timeoutMs,
 }) {
   if (targetVersion !== "latest" && !isVersion(targetVersion)) {
     throw new CodexUpdateError("invalid-version", "Select an exact published Codex version, such as 0.155.1, or explicitly select latest stable.");
   }
   const installation = resolveCodexInstallation({ assistantBin, prefix });
   const release = acquireCodexInstallationLock(installation.prefix);
-  const deadline = AbortSignal.timeout(Math.max(1, Math.min(timeoutMs, UPDATE_TIMEOUT_MS)));
-  const operationSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const deadline = timeoutMs === undefined ? undefined : AbortSignal.timeout(Math.max(1, timeoutMs));
+  const operationSignal = deadline ? (signal ? AbortSignal.any([signal, deadline]) : deadline) : signal ?? new AbortController().signal;
   const npmEnv = npmEnvironment(installation.prefix, env);
   const commandOptions = { env: npmEnv, signal: operationSignal, onOutput, outputBudget: { remaining: OUTPUT_LIMIT } };
   let activeVersion = null;
@@ -687,7 +688,7 @@ export async function updateCodexInstallation({
     }
     const failure = error instanceof CodexUpdateError ? error :
       error.code === "selection" ? new CodexUpdateError("selection", error.message) : commandFailure(error, "", "npm");
-    if (deadline.aborted && !signal?.aborted) throw new CodexUpdateError("timeout", "The Codex update exceeded its time limit. Check network access and the private update log before trying again.", activeVersion);
+    if (deadline?.aborted && !signal?.aborted) throw new CodexUpdateError("timeout", "The Codex update exceeded its time limit. Check network access and the private update log before trying again.", activeVersion);
     failure.usableVersion = activeVersion;
     throw failure;
   } finally {

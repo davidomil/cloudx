@@ -588,14 +588,16 @@ export class UpdateHost {
   }
 
   probeTerminals(record, mode) {
-    const args = [path.join(record.coordinator, 'scripts/managed-update-terminals.mjs'), mode, record.transition.release, this.paths.dataDir];
+    const resultFile = path.join(this.runDir, `terminal-attachments-${randomUUID()}.json`);
+    const args = [path.join(record.coordinator, 'scripts/managed-update-terminals.mjs'), mode, record.transition.release, this.paths.dataDir, resultFile];
     if (mode === 'verify') {
       const input = path.join(this.runDir, 'preserved-terminals.json');
       writeUpdateJson(input, { sessionIds: record.transition.preservedSessionIds });
       args.push(input);
     }
     try {
-      const result = JSON.parse(this.runner.inspect(process.execPath, args, { timeout: 60000 }));
+      if (this.runner.inspect(process.execPath, args, { timeout: 0 }) !== 'true') throw new Error('Terminal attachment probe did not complete.');
+      const result = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
       if (!validSessionIds(result.sessionIds)) throw new Error('Invalid terminal attachment result.');
       if (mode === 'verify' && JSON.stringify(result.sessionIds) !== JSON.stringify(record.transition.preservedSessionIds)) throw new Error('The terminal attachment result changed its requested identities.');
       return result.sessionIds;

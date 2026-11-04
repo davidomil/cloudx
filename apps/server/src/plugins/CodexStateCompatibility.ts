@@ -6,13 +6,14 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { parse } from "smol-toml";
 import { CodexStateVerificationError, parseCodexStateDiagnostic } from "../../../../scripts/codex-state-errors.mjs";
+import { filesystemCapacity } from "../../../../scripts/managed-update-store.mjs";
 
 const execute = promisify(execFile);
 const helper = fileURLToPath(new URL("../../helpers/codex-state-snapshot.py", import.meta.url));
 
 /** Native verification owns the copies; production databases are opened read-only. */
 export class CodexStateCompatibility {
-  constructor(private readonly env: NodeJS.ProcessEnv, private readonly signal?: AbortSignal) {}
+  constructor(private readonly env: NodeJS.ProcessEnv, private readonly signal?: AbortSignal, private readonly onOutput?: (text: string) => void) {}
 
   async snapshots(sourceHome: string, dataDir: string | undefined, destination: string): Promise<string[]> {
     try {
@@ -48,20 +49,35 @@ export class CodexStateCompatibility {
       let entries;
       try { entries = await fs.readdir(launches, { withFileTypes: true }); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-      if (entries && entries.length > 10_000) throw new CodexStateVerificationError({ stage: "snapshot", code: "launch-count" });
       for (const entry of entries ?? []) if (entry.isDirectory()) directories.add(path.join(launches, entry.name));
     }
     const input = JSON.stringify([...directories]);
-    if (Buffer.byteLength(input) > 16_777_216) throw new CodexStateVerificationError({ stage: "snapshot", code: "directory-list" });
     await fs.mkdir(destination, { mode: 0o700 });
     const inputFile = path.join(destination, "directories.json");
+    const resultFile = path.join(destination, "snapshots.json");
+    const progressFile = path.join(destination, "progress.json");
+    let lastProgress = "";
+    const progress = setInterval(() => {
+      void fs.readFile(progressFile, "utf8").then(text => {
+        if (text === lastProgress) return;
+        lastProgress = text;
+        const value: unknown = JSON.parse(text);
+        if (value && typeof value === "object" && "copiedBytes" in value && Number.isSafeInteger(value.copiedBytes) && (value.copiedBytes as number) >= 0)
+          this.onOutput?.(`Codex retained-state snapshot: ${value.copiedBytes} bytes copied.\n`);
+      }).catch(() => { /* The helper creates progress after preflight. */ });
+    }, 1000);
     try {
       await fs.writeFile(inputFile, input, { mode: 0o600, flag: "wx", signal: this.signal });
-      const result: unknown = await this.run(["snapshot", inputFile, destination]);
+      const capacity = filesystemCapacity(destination);
+      this.onOutput?.(`Preparing retained Codex state; ${capacity.availableBytes} destination bytes available (${capacity.quotaStatus}).\n`);
+      if (await this.run(["snapshot", inputFile, destination, String(capacity.availableBytes), String(capacity.availableInodes)]) !== true) throw new Error("Invalid Codex state snapshot completion.");
+      const result: unknown = JSON.parse(await fs.readFile(resultFile, "utf8"));
       if (!Array.isArray(result) || result.some(value => typeof value !== "string" || path.dirname(value) !== destination)) throw new Error("Invalid Codex state snapshot result.");
+      this.onOutput?.(`Prepared ${result.length} retained Codex schema snapshots.\n`);
       return result;
     } finally {
-      await fs.rm(inputFile, { force: true });
+      clearInterval(progress);
+      await Promise.all([inputFile, resultFile, progressFile, path.join(destination, "progress.tmp")].map(file => fs.rm(file, { force: true })));
     }
   }
 
@@ -72,25 +88,63 @@ export class CodexStateCompatibility {
   async preserveSnapshot(sqliteHome: string, pristine: string): Promise<void> {
     try {
       this.signal?.throwIfAborted();
-      const requiredBytes = await this.snapshotBytes(sqliteHome);
-      const space = await fs.statfs(path.dirname(pristine));
-      const availableBytes = space.bavail * space.bsize;
+      const { availableBytes, availableInodes, blockSize } = filesystemCapacity(path.dirname(pristine));
+      const { bytes: requiredBytes, inodes: requiredInodes } = await this.snapshotStorage(sqliteHome, blockSize);
       if (requiredBytes > availableBytes) throw new CodexStateVerificationError({ stage: "snapshot", code: "disk-space", observedBytes: requiredBytes, limitBytes: availableBytes });
-      await fs.cp(sqliteHome, pristine, { recursive: true, force: false, errorOnExist: true });
+      if (requiredInodes > availableInodes) throw new CodexStateVerificationError({ stage: "snapshot", code: "disk-inodes", requiredInodes, availableInodes });
+      await this.copySnapshot(sqliteHome, pristine);
     } catch (error) {
       this.rejectPreparation(error);
     }
   }
 
-  private async snapshotBytes(directory: string): Promise<number> {
-    let bytes = 0;
+  private async copySnapshot(source: string, destination: string, progress = { bytes: 0, reportedAt: 0 }): Promise<void> {
+    this.signal?.throwIfAborted();
+    await fs.mkdir(destination, { mode: 0o700 });
+    for (const name of await fs.readdir(source)) {
+      this.signal?.throwIfAborted();
+      const from = path.join(source, name), to = path.join(destination, name);
+      const info = await fs.lstat(from);
+      if (info.isDirectory()) await this.copySnapshot(from, to, progress);
+      else if (info.isFile()) {
+        const input = await fs.open(from, "r");
+        try {
+          const output = await fs.open(to, "wx", 0o600);
+          try {
+            const buffer = Buffer.alloc(1024 * 1024);
+            let read;
+            while ((read = (await input.read(buffer)).bytesRead)) {
+              this.signal?.throwIfAborted();
+              let written = 0;
+              while (written < read) {
+                const count = (await output.write(buffer, written, read - written)).bytesWritten;
+                if (!count) throw new Error("Codex snapshot destination stopped accepting data.");
+                written += count;
+              }
+              progress.bytes += read;
+              if (Date.now() - progress.reportedAt >= 1000) {
+                this.onOutput?.(`Preserving pristine Codex state: ${progress.bytes} bytes copied.\n`);
+                progress.reportedAt = Date.now();
+              }
+            }
+          } finally { await output.close(); }
+        } finally { await input.close(); }
+      } else throw new CodexStateVerificationError({ stage: "snapshot", code: "unavailable" });
+    }
+  }
+
+  private async snapshotStorage(directory: string, blockSize: number): Promise<{ bytes: number; inodes: number }> {
+    let bytes = blockSize, inodes = 1;
     for (const name of await fs.readdir(directory)) {
+      this.signal?.throwIfAborted();
       const file = path.join(directory, name);
       const info = await fs.lstat(file);
       if (info.isSymbolicLink()) throw new CodexStateVerificationError({ stage: "snapshot", code: "unavailable" });
-      bytes += info.isDirectory() ? await this.snapshotBytes(file) : info.size;
+      const entry = info.isDirectory() ? await this.snapshotStorage(file, blockSize) : { bytes: Math.ceil(info.size / blockSize) * blockSize, inodes: 1 };
+      bytes += entry.bytes;
+      inodes += entry.inodes;
     }
-    return bytes;
+    return { bytes, inodes };
   }
 
   private rejectPreparation(error: unknown): never {
@@ -104,7 +158,7 @@ export class CodexStateCompatibility {
   private async run(args: string[]): Promise<unknown> {
     try {
       const result = await execute("python3", ["-I", "-S", helper, ...args], {
-        env: { PATH: this.env.PATH }, signal: this.signal, timeout: 65_000, maxBuffer: 16_384,
+        env: { PATH: this.env.PATH }, signal: this.signal, maxBuffer: 16_384,
       });
       return JSON.parse(result.stdout);
     } catch (error) {
@@ -114,7 +168,7 @@ export class CodexStateCompatibility {
       catch { /* Subprocess diagnostics contain only the validated protocol, never raw errors. */ }
       const stage = args[0] === "snapshot" ? "snapshot" : "verify";
       if (diagnostic?.stage !== stage) diagnostic = undefined;
-      const code = stage === "verify" ? "candidate-state" : (error as { killed?: boolean }).killed ? "time-limit" : "unavailable";
+      const code = stage === "verify" ? "candidate-state" : "unavailable";
       throw new CodexStateVerificationError(diagnostic ?? { stage, code });
     }
   }

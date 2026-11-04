@@ -114,6 +114,83 @@ async function launchViewFixture(selected = false) {
 }
 
 describe("controlled terminal replacement snapshots", () => {
+  it("streams transcripts above 256 MiB and aggregate history above 512 MiB without buffering them", () => {
+    const f = fixture();
+    const hash = createHash("sha256").update(fs.readFileSync(f.transcriptPath));
+    const event = '{"type":"event_msg","payload":{"message":"retained history"}}\n';
+    const chunk = Buffer.from(event.repeat(Math.floor(1024 * 1024 / Buffer.byteLength(event))));
+    const fd = fs.openSync(f.transcriptPath, "a");
+    try {
+      for (let index = 0; index < 258; index++) { fs.writeSync(fd, chunk); hash.update(chunk); }
+    } finally { fs.closeSync(fd); }
+    const saved = f.read("sessions.json");
+    saved.sessions.push({ ...saved.sessions[0], tab: { ...f.tab, id: "codex-2" } });
+    f.write("sessions.json", saved);
+    for (const name of [".cloudx-source.json", ".cloudx-conversation.json"])
+      f.write(`codex-launches/codex-2/${name}`, f.read(`codex-launches/codex-1/${name}`));
+    const size = fs.statSync(f.transcriptPath).size;
+    expect(size).toBeGreaterThan(256 * 1024 ** 2);
+    expect(size * 2).toBeGreaterThan(512 * 1024 ** 2);
+    const allocate = vi.spyOn(Buffer, "alloc");
+    const backup = snapshotTerminalRecovery(f);
+    const manifest = JSON.parse(fs.readFileSync(path.join(backup, "manifest.json"), "utf8"));
+    const expectedHash = hash.digest("hex");
+    for (const id of ["codex-1", "codex-2"]) {
+      expect(fs.statSync(path.join(backup, `transcripts/${id}.jsonl`)).size).toBe(size);
+      expect(manifest.files.find(file => file.snapshot === `transcripts/${id}.jsonl`).sha256).toBe(expectedHash);
+    }
+    expect(allocate.mock.calls.every(([bytes]) => bytes <= 1024 * 1024 + 1)).toBe(true);
+    expect(f.log.mock.calls.filter(([message]) => message.includes("bytes copied (transcripts/")).length).toBeGreaterThan(8);
+  }, 30_000);
+
+  it.each(["bytes", "inodes"])("rejects a real destination %s shortage before creating a backup", resource => {
+    const f = fixture();
+    const inspectCapacity = () => ({ blockSize: 4096, availableBytes: resource === "bytes" ? 1 : 10 ** 12,
+      availableInodes: resource === "inodes" ? 1 : 10 ** 9, quotaStatus: "user checked; destination group checked" });
+    const original = fs.readFileSync(f.transcriptPath);
+    for (const operation of [inspectTerminalRecovery, snapshotTerminalRecovery])
+      expect(() => operation({ ...f, inspectCapacity })).toThrow(/requires \d+ bytes and \d+ inodes; .* available .*before interrupting services/);
+    expect(fs.readFileSync(f.transcriptPath)).toEqual(original);
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
+  it("preserves opaque Forge history above the control-record parsing limit", () => {
+    const f = fixture();
+    const relative = "forge-workers/history/worker-1/retained.json";
+    const source = f.write(relative, "{}");
+    fs.appendFileSync(source, " ".repeat(16 * 1024 ** 2));
+    const backup = snapshotTerminalRecovery(f);
+    expect(fs.statSync(path.join(backup, relative)).size).toBe(fs.statSync(source).size);
+  });
+
+  it("retains the per-control-record JSON parsing budget without applying it to retained history", () => {
+    const f = fixture();
+    fs.appendFileSync(path.join(f.dataDir, "sessions.json"), " ".repeat(16 * 1024 ** 2));
+    expect(() => inspectTerminalRecovery(f)).toThrow("within its size limit");
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+    expect(() => assertTerminalMigrationSafe(f)).not.toThrow();
+  });
+
+  it("preserves more than 10,000 recovery records and directories deeper than 32", () => {
+    const f = fixture();
+    for (let index = 0; index < 10_001; index++) f.write(`forge-workers/history/record-${index}.json`, "{}");
+    const nested = `forge-workers/history/${"nested/".repeat(33)}record.json`;
+    f.write(nested, "{\"retained\":true}");
+    const backup = snapshotTerminalRecovery(f);
+    expect(fs.readdirSync(path.join(backup, "forge-workers/history")).length).toBe(10_002);
+    expect(fs.readFileSync(path.join(backup, nested), "utf8")).toBe('{"retained":true}');
+  }, 30_000);
+
+  it("cancels an in-progress copy without preserving an incomplete backup or changing source history", () => {
+    const f = fixture();
+    const controller = new AbortController();
+    const original = fs.readFileSync(f.transcriptPath);
+    f.log.mockImplementationOnce(() => controller.abort(new Error("cancelled by caller")));
+    expect(() => snapshotTerminalRecovery({ ...f, signal: controller.signal })).toThrow("cancelled by caller");
+    expect(fs.readFileSync(f.transcriptPath)).toEqual(original);
+    expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
+  });
+
   it.each([false, true])("preserves a launch-view receipt and snapshots its canonical transcript (selected=%s)", async selected => {
     const f = await launchViewFixture(selected);
     const receipt = fs.readFileSync(f.receiptPath);
@@ -158,21 +235,16 @@ describe("controlled terminal replacement snapshots", () => {
 
   it.each(["link", "store"])("rejects a %s replaced with identical transcript bytes during snapshot", async kind => {
     const f = await launchViewFixture(true);
-    const write = fs.writeFileSync;
-    let replaced = false;
-    vi.spyOn(fs, "writeFileSync").mockImplementation((file, bytes, options) => {
-      if (!replaced && String(file).includes("terminal-recovery-")) {
-        replaced = true;
-        if (kind === "link") {
-          fs.cpSync(f.store, `${f.store}.copy`, { recursive: true });
-          fs.unlinkSync(path.join(f.view, "sessions"));
-          fs.symlinkSync(`${f.store}.copy`, path.join(f.view, "sessions"));
-        } else {
-          fs.renameSync(f.store, `${f.store}.original`);
-          fs.cpSync(`${f.store}.original`, f.store, { recursive: true });
-        }
+    f.log.mockImplementation(message => {
+      if (!message.endsWith("(transcripts/codex-1.jsonl).")) return;
+      if (kind === "link") {
+        fs.cpSync(f.store, `${f.store}.copy`, { recursive: true });
+        fs.unlinkSync(path.join(f.view, "sessions"));
+        fs.symlinkSync(`${f.store}.copy`, path.join(f.view, "sessions"));
+      } else {
+        fs.renameSync(f.store, `${f.store}.original`);
+        fs.cpSync(`${f.store}.original`, f.store, { recursive: true });
       }
-      return write(file, bytes, options);
     });
     expect(() => snapshotTerminalRecovery(f)).toThrow(/session store/);
     expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
@@ -274,11 +346,8 @@ describe("controlled terminal replacement snapshots", () => {
       replace();
       expect(f.plan().blockers).toEqual([{ service: "recovery", message: expect.stringContaining("source ownership changed") }]);
     } else {
-      const write = fs.writeFileSync;
-      let replaced = false;
-      vi.spyOn(fs, "writeFileSync").mockImplementation((file, bytes, options) => {
-        if (!replaced && String(file).includes("terminal-recovery-")) { replaced = true; replace(); }
-        return write(file, bytes, options);
+      f.log.mockImplementation(message => {
+        if (message.endsWith("(transcripts/codex-1.jsonl).")) replace();
       });
     }
     expect(() => snapshotTerminalRecovery(f)).toThrow("source ownership changed");
@@ -524,11 +593,7 @@ describe("controlled terminal replacement snapshots", () => {
     saved.sessions[0].tab.status = "failed";
     saved.sessions[0].tab.recovery = { state: "missing", canResume: false, message: "Unavailable." };
     f.write("sessions.json", saved);
-    const write = fs.writeFileSync;
-    vi.spyOn(fs, "writeFileSync").mockImplementation((file, bytes, options) => {
-      if (String(file).includes("terminal-recovery-")) write(receiptPath, receipt);
-      return write(file, bytes, options);
-    });
+    f.log.mockImplementationOnce(() => fs.writeFileSync(receiptPath, receipt));
     expect(() => snapshotTerminalRecovery(f)).toThrow("Recovery source changed during snapshot");
     expect(fs.readFileSync(receiptPath)).toEqual(receipt);
     expect(fs.readdirSync(f.dataDir).some(name => name.startsWith("terminal-recovery-"))).toBe(false);
@@ -653,15 +718,13 @@ describe("controlled terminal replacement snapshots", () => {
   it.each(["write", "verification", "flush", "source change"])("refuses replacement after backup %s failure", failure => {
     const f = fixture();
     const workspace = fs.readFileSync(path.join(f.dataDir, "workspace.json"));
-    const realWrite = fs.writeFileSync;
+    const realWrite = fs.writeSync;
     if (failure === "flush") vi.spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("disk flush failed"); });
-    else vi.spyOn(fs, "writeFileSync").mockImplementation((target, bytes, options) => {
-      if (String(target).includes("terminal-recovery-")) {
-        if (failure === "write") throw new Error("disk full");
-        if (failure === "verification") return realWrite(target, "corrupt", options);
-        realWrite(f.transcriptPath, "changed during snapshot");
-      }
-      return realWrite(target, bytes, options);
+    else vi.spyOn(fs, "writeSync").mockImplementation((fd, bytes, offset, length) => {
+      if (failure === "write") throw new Error("disk full");
+      if (failure === "verification") return realWrite(fd, Buffer.alloc(length, 0), 0, length);
+      fs.writeFileSync(f.transcriptPath, "changed during snapshot");
+      return realWrite(fd, bytes, offset, length);
     });
     expect(() => snapshotTerminalRecovery(f)).toThrow(/backup failed; do not stop the broker/);
     expect(fs.readFileSync(path.join(f.dataDir, "workspace.json"))).toEqual(workspace);

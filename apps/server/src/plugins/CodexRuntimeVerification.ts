@@ -49,7 +49,7 @@ export async function verifyCodexRuntime(options: CodexRuntimeVerificationOption
   if (!options.sharedStateHome) return;
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-state-verification-"));
   try {
-    const compatibility = new CodexStateCompatibility(options.env ?? process.env, options.signal);
+    const compatibility = new CodexStateCompatibility(options.env ?? process.env, options.signal, options.onOutput);
     const snapshots = await compatibility.snapshots(options.sharedStateHome, options.dataDir, path.join(directory, "snapshots"));
     let recoveredOriginal = false;
     for (const sqliteHome of snapshots) {

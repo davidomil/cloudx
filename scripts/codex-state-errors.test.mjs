@@ -10,18 +10,20 @@ afterEach(async () => { await Promise.all(roots.splice(0).map(root => fs.rm(root
 
 it.each([
   undefined, null, [], {}, { stage: "snapshot", code: "private-secret" },
-  { stage: "snapshot", code: {} }, { stage: "verify", code: "snapshot-budget" },
-  { stage: "snapshot", code: "database-size", observedBytes: "secret", limitBytes: 8 },
-  { stage: "snapshot", code: "database-size", observedBytes: 9, limitBytes: 0 },
-  { stage: "snapshot", code: "database-size", observedBytes: 8, limitBytes: 8 },
-  { stage: "snapshot", code: "database-size", observedBytes: Number.MAX_SAFE_INTEGER + 1, limitBytes: 8 },
+  { stage: "snapshot", code: {} }, { stage: "verify", code: "disk-space" },
+  { stage: "snapshot", code: "disk-space", observedBytes: "secret", limitBytes: 8 },
+  { stage: "snapshot", code: "disk-space", observedBytes: 9, limitBytes: -1 },
+  { stage: "snapshot", code: "disk-space", observedBytes: 8, limitBytes: 8 },
+  { stage: "snapshot", code: "disk-space", observedBytes: Number.MAX_SAFE_INTEGER + 1, limitBytes: 8 },
+  { stage: "snapshot", code: "disk-inodes", requiredInodes: 1, availableInodes: -1 },
+  { stage: "snapshot", code: "disk-inodes", requiredInodes: 1, availableInodes: 1 },
 ])("rejects untrusted or invalid diagnostics %#", value => {
   expect(parseCodexStateDiagnostic(value)).toBeUndefined();
 });
 
 it("keeps only safe diagnostic fields and separates preparation from candidate compatibility", () => {
-  const diagnostic = parseCodexStateDiagnostic({ stage: "snapshot", code: "database-size", observedBytes: 9, limitBytes: 8, message: "private-secret", path: "/private" });
-  expect(diagnostic).toEqual({ stage: "snapshot", code: "database-size", observedBytes: 9, limitBytes: 8 });
+  const diagnostic = parseCodexStateDiagnostic({ stage: "snapshot", code: "disk-space", observedBytes: 9, limitBytes: 8, message: "private-secret", path: "/private" });
+  expect(diagnostic).toEqual({ stage: "snapshot", code: "disk-space", observedBytes: 9, limitBytes: 8 });
   expect(new CodexStateVerificationError(diagnostic).message).toContain("snapshot preparation failed");
   expect(new CodexStateVerificationError(diagnostic).message).not.toContain("private");
   expect(new CodexStateVerificationError({ stage: "verify", code: "candidate-state" }).message).toContain("compatibility verification failed");
@@ -33,8 +35,14 @@ it("reports a disk-space shortage with the required and available byte counts", 
   expect(new CodexStateVerificationError(diagnostic).message).toContain("16384 bytes; available disk space is 0 bytes");
 });
 
+it("reports the required and available destination inode counts", () => {
+  const diagnostic = { stage: "snapshot", code: "disk-inodes", requiredInodes: 100, availableInodes: 0 };
+  expect(parseCodexStateDiagnostic(diagnostic)).toEqual(diagnostic);
+  expect(new CodexStateVerificationError(diagnostic).message).toContain("requires 100 destination inodes; 0 inodes are available");
+});
+
 it.each([
-  { stage: "snapshot", code: "snapshot-budget", observedBytes: 65536, limitBytes: 50000 },
+  { stage: "snapshot", code: "disk-space", observedBytes: 65536, limitBytes: 50000 },
   { stage: "verify", code: "candidate-state" },
 ])("serializes the safe diagnostic through the actual verifier CLI ($stage)", async diagnostic => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-state-verifier-cli-"));

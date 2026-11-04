@@ -2,7 +2,6 @@ import { execFile } from "node:child_process";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import readline from "node:readline";
 
 import { agentProviderLabel, isRecord, type AgentProviderId } from "@cloudx/shared";
 
@@ -11,7 +10,6 @@ export interface AgentTranscriptEntry {
   text: string;
 }
 
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 const MAX_LINE_CHARS = 4 * 1024 * 1024;
 const MAX_ENTRY_CHARS = 6_000;
 const MAX_TOOL_CHARS = 240;
@@ -24,19 +22,34 @@ const CODEX_CONTEXT_PREFIXES = ["<environment_context>", "<user_instructions>", 
 // Reads a provider transcript into plain conversation entries. Reasoning,
 // token accounting and tool output are left out; tool calls are kept as one
 // line each so the next runner sees what was done.
-export async function readAgentTranscript(providerId: AgentProviderId, transcriptPath: string): Promise<AgentTranscriptEntry[]> {
+export async function* readAgentTranscript(providerId: AgentProviderId, transcriptPath: string): AsyncGenerator<AgentTranscriptEntry> {
   const stat = await fs.lstat(transcriptPath);
   if (!stat.isFile()) throw new Error("The conversation transcript is not a regular file.");
-  if (stat.size > MAX_TRANSCRIPT_BYTES) throw new Error("The conversation transcript is too large to hand off.");
-  const entries: AgentTranscriptEntry[] = [];
-  const lines = readline.createInterface({ input: createReadStream(transcriptPath, { encoding: "utf8" }), crlfDelay: Infinity });
-  for await (const line of lines) {
-    if (!line.trim() || line.length > MAX_LINE_CHARS) continue;
+  for await (const line of transcriptLines(transcriptPath)) {
+    if (!line.trim()) continue;
     let record: unknown;
     try { record = JSON.parse(line); } catch { continue; }
-    entries.push(...(providerId === "claude" ? claudeEntries(record) : codexEntries(record)));
+    yield* providerId === "claude" ? claudeEntries(record) : codexEntries(record);
   }
-  return entries;
+}
+
+async function* transcriptLines(transcriptPath: string): AsyncGenerator<string> {
+  let line = "", oversized = false;
+  for await (const chunk of createReadStream(transcriptPath, { encoding: "utf8" })) {
+    let start = 0;
+    while (start < chunk.length) {
+      const end = chunk.indexOf("\n", start);
+      const part = chunk.slice(start, end < 0 ? undefined : end);
+      if (!oversized && line.length + part.length <= MAX_LINE_CHARS) line += part;
+      else { line = ""; oversized = true; }
+      if (end < 0) break;
+      if (!oversized) yield line;
+      line = "";
+      oversized = false;
+      start = end + 1;
+    }
+  }
+  if (line && !oversized) yield line;
 }
 
 function claudeEntries(record: unknown): AgentTranscriptEntry[] {
@@ -95,7 +108,7 @@ export interface AgentHandoffInput {
   cwd: string;
   from: { providerId: AgentProviderId; accountLabel?: string; sessionId?: string };
   to: { providerId: AgentProviderId; accountLabel: string };
-  entries: AgentTranscriptEntry[];
+  entries: Iterable<AgentTranscriptEntry> | AsyncIterable<AgentTranscriptEntry>;
   now?: Date;
 }
 
@@ -139,7 +152,7 @@ export async function writeAgentHandoff(input: AgentHandoffInput): Promise<Agent
     "",
     "Earlier entries are omitted when the conversation exceeds the handoff size. Tool lines summarize calls; their output is not included.",
     "",
-    ...formatConversation(input.entries)
+    ...await formatConversation(input.entries)
   ];
   await fs.writeFile(filePath, `${lines.join("\n").trimEnd()}\n`, { mode: 0o600, flag: "wx" });
   const prompt = [
@@ -150,21 +163,21 @@ export async function writeAgentHandoff(input: AgentHandoffInput): Promise<Agent
   return { path: filePath, prompt };
 }
 
-function formatConversation(entries: AgentTranscriptEntry[]): string[] {
+async function formatConversation(entries: AgentHandoffInput["entries"]): Promise<string[]> {
   const blocks: string[] = [];
-  let used = 0;
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index]!;
+  let used = 0, omitted = 0;
+  for await (const entry of entries) {
     const block = entry.role === "tool" ? `- ${entry.text}` : `### ${entry.role === "user" ? "User" : "Assistant"}\n\n${entry.text}\n`;
-    if (used + block.length > HANDOFF_CONVERSATION_BUDGET) {
-      blocks.push(`_${index + 1} earlier entries omitted._\n`);
-      break;
-    }
     used += block.length;
     blocks.push(block);
+    while (used > HANDOFF_CONVERSATION_BUDGET) {
+      used -= blocks.shift()!.length;
+      omitted++;
+    }
   }
-  if (!entries.length) blocks.push("_No conversation entries were recorded._");
-  return blocks.reverse();
+  if (omitted) blocks.unshift(`_${omitted} earlier entries omitted._\n`);
+  else if (!blocks.length) blocks.push("_No conversation entries were recorded._");
+  return blocks;
 }
 
 function gitOutput(cwd: string, args: string[]): Promise<string | undefined> {

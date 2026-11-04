@@ -4,12 +4,11 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const MAX_SESSIONS = 256;
 const SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/u;
 
 function sessionIds(value) {
-  if (!Array.isArray(value) || value.length > MAX_SESSIONS || value.some(id => typeof id !== "string" || !SESSION_ID.test(id))
-    || new Set(value).size !== value.length) throw new Error("Terminal attachment probe requires at most 256 unique saved session IDs.");
+  if (!Array.isArray(value) || value.some(id => typeof id !== "string" || !SESSION_ID.test(id))
+    || new Set(value).size !== value.length) throw new Error("Terminal attachment probe requires unique saved session IDs.");
   return value;
 }
 
@@ -68,8 +67,8 @@ function readExpectedSessions(file) {
   const fd = fs.openSync(path.join(parent, path.basename(file)), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.uid !== process.getuid() || stat.mode & 0o077 || stat.size > 64 * 1024)
-      throw new Error("The saved attachment list must be an owned private regular file of at most 64 KiB.");
+    if (!stat.isFile() || stat.uid !== process.getuid() || stat.mode & 0o077)
+      throw new Error("The saved attachment list must be an owned private regular file.");
     let value;
     try { value = JSON.parse(fs.readFileSync(fd, "utf8")); } catch (error) {
       throw new Error("The saved attachment list must contain valid JSON.", { cause: error });
@@ -80,10 +79,14 @@ function readExpectedSessions(file) {
 }
 
 export function parseTerminalProbeArguments(argv) {
-  const [mode, release, data, file, ...extra] = argv;
-  if (!["capture", "verify"].includes(mode) || extra.length || mode === "capture" && file !== undefined || mode === "verify" && !file)
-    throw new Error("Usage: managed-update-terminals.mjs capture <release> <data> | verify <release> <data> <private-session-list>");
+  const [mode, release, data, resultPath, file, ...extra] = argv;
+  if (!["capture", "verify"].includes(mode) || extra.length || !path.isAbsolute(resultPath ?? "") || resultPath !== path.resolve(resultPath) ||
+      mode === "capture" && file !== undefined || mode === "verify" && !file)
+    throw new Error("Usage: managed-update-terminals.mjs capture <release> <data> <private-result-file> | verify <release> <data> <private-result-file> <private-session-list>");
+  ownedDirectory(path.dirname(resultPath));
+  if (fs.lstatSync(resultPath, { throwIfNoEntry: false })) throw new Error("The terminal attachment result file must not already exist.");
   return { mode, releaseRoot: ownedDirectory(release), dataDir: ownedDirectory(data),
+    resultPath,
     ...(mode === "verify" ? { sessionIds: readExpectedSessions(file) } : {}) };
 }
 
@@ -104,7 +107,10 @@ export async function inspectTerminalAttachments({ releaseRoot, dataDir, mode, s
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
-    console.log(JSON.stringify(await inspectTerminalAttachments(parseTerminalProbeArguments(process.argv.slice(2)))));
+    const options = parseTerminalProbeArguments(process.argv.slice(2));
+    const result = await inspectTerminalAttachments(options);
+    fs.writeFileSync(options.resultPath, `${JSON.stringify(result)}\n`, { flag: "wx", mode: 0o600, flush: true });
+    console.log("true");
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

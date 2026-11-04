@@ -82,6 +82,16 @@ it("keeps the broker alive if recovery state cannot be backed up", () => {
   expect(() => prepareRuntimeUpdate({ paths: { dataDir: root, repoRoot: "/repo" }, commands, target: { kind: "standard" }, migrateTerminals: true, log: () => {} })).toThrow("Invalid recovery state");
   expect(actions).toEqual([]);
 });
+it.each(["space", "quota", "inodes"])("leaves both services running when terminal recovery lacks destination %s", constraint => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-migrate-capacity-")); roots.push(root);
+  fs.writeFileSync(path.join(root, "workspace.json"), JSON.stringify({ windows: [{ id: "window-1", name: "Saved", defaultCwd: "/repo",
+    layout: { activePaneId: "pane-1", root: { type: "pane", pane: { id: "pane-1", tabIds: [] } } } }] }));
+  const commands = { inspect: () => Object.entries(state).map(([key, value]) => `${key}=${value}`).join("\n"), run: vi.fn() };
+  expect(() => prepareRuntimeUpdate({ paths: { dataDir: root, repoRoot: "/repo" }, commands, target: { kind: "standard" }, migrateTerminals: true,
+    inspectCapacity: () => ({ blockSize: 4096, availableBytes: constraint === "inodes" ? 10 ** 12 : 0,
+      availableInodes: constraint === "inodes" ? 0 : 10 ** 9, quotaStatus: constraint }) })).toThrow(/requires .* available/);
+  expect(commands.run).not.toHaveBeenCalled();
+});
 it("rejects a stopped main PID with surviving service descendants", () => {
   expect(() => assertPinnedTerminalRuntime({ state: { ...state, ActiveState: "inactive", MainPID: "0" }, service: "custom.service", readFile: () => "populated 1\n" })).toThrow("still owns processes");
 });

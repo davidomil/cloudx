@@ -2,11 +2,11 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { filesystemCapacity } from "./managed-update-store.mjs";
 
+// Only parsed control records are buffered. Retained histories are streamed.
 const STATE_LIMIT = 16 * 1024 * 1024;
-const TRANSCRIPT_LIMIT = 256 * 1024 * 1024;
-const TOTAL_LIMIT = 512 * 1024 * 1024;
-const FILE_LIMIT = 10_000;
+const COPY_CHUNK_BYTES = 1024 * 1024;
 const SAFE_ID = /^[A-Za-z0-9_-]+$/u;
 const CONVERSATION_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/iu;
 const FORGE_STATE = `plugin-data/forge-${createHash("sha256").update("forge").digest("hex")}.json`;
@@ -27,26 +27,28 @@ export class ForgeUpdateBlockedError extends Error {
   }
 }
 
-/** Run before stopping the web service; snapshotTerminalRecovery checks again after it stops. */
-export function assertTerminalMigrationSafe({ dataDir }) {
-  const snapshot = new RecoverySnapshot(dataDir);
+/** Forge ownership also blocks hot updates that preserve the terminal broker. */
+export function assertTerminalMigrationSafe(options) {
+  const snapshot = new RecoverySnapshot(options);
   snapshot.readForgeState();
 }
 
-export function inspectTerminalRecovery({ dataDir, allowLegacyState = false }) {
-  const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
+/** Inspect all recovery data and destination capacity before interrupting services. */
+export function inspectTerminalRecovery(options) {
+  const snapshot = new RecoverySnapshot(options);
   snapshot.readForgeState();
   snapshot.readSessions();
+  snapshot.assertCapacity();
   return { legacySessionIdentitiesUnavailable: snapshot.legacySessions, warnings: snapshot.warnings() };
 }
 
 /** The caller must stop the web service before this runs, and stop the broker only after it returns. */
-export function snapshotTerminalRecovery({ dataDir, log = console.warn, allowLegacyState = false }) {
-  const snapshot = new RecoverySnapshot(dataDir, allowLegacyState);
+export function snapshotTerminalRecovery({ log = console.warn, ...options }) {
+  const snapshot = new RecoverySnapshot({ ...options, log });
   snapshot.readForgeState();
   snapshot.readSessions();
   if (!snapshot.files.size) return undefined;
-  const backup = snapshot.save();
+  const backup = snapshot.save(log);
   for (const warning of snapshot.warnings()) log(warning);
   log(`Verified terminal recovery snapshot: ${backup}. Broker replacement interrupts processes. Reopen shells explicitly and select an exact saved Codex conversation in each existing tab; no commands or prompts are replayed.`);
   return backup;
@@ -58,30 +60,38 @@ class RecoverySnapshot {
   transcriptBindings = [];
   unavailableConversations = [];
   sources = [];
-  bytes = 0;
-  entries = 0;
   legacySessions = false;
 
-  constructor(dataDir, allowLegacyState = false) {
+  constructor({ dataDir, allowLegacyState = false, inspectCapacity = filesystemCapacity, signal, log = () => {} }) {
     this.dataDir = path.resolve(dataDir);
     this.present = safeDirectory(this.dataDir, true);
     this.allowLegacyState = allowLegacyState;
+    this.inspectCapacity = inspectCapacity;
+    this.signal = signal;
+    this.log = log;
   }
 
-  capture(relative, optional = false, source = path.join(this.dataDir, relative), limit = STATE_LIMIT) {
-    if (this.files.has(relative)) return this.files.get(relative).bytes;
-    const bytes = readFile(source, limit, optional);
-    if (bytes === undefined) return undefined;
-    this.bytes += bytes.length;
-    if (this.files.size >= FILE_LIMIT || this.bytes > TOTAL_LIMIT)
-      throw new Error("Terminal recovery snapshot exceeds its file or size limit; preserve sessions manually before replacement.");
-    this.files.set(relative, { source, bytes });
-    return bytes;
+  capture(relative, optional = false, source = path.join(this.dataDir, relative)) {
+    if (this.files.has(relative)) return this.files.get(relative);
+    let reported = 0;
+    const captured = scanFile(source, { optional, signal: this.signal, chunk: (_bytes, position) => {
+      if (position - reported >= 64 * COPY_CHUNK_BYTES) {
+        this.log(`Terminal recovery: ${position} bytes inspected (${relative}).`);
+        reported = position;
+      }
+    } });
+    if (captured === undefined) return undefined;
+    const file = { source, ...captured };
+    this.files.set(relative, file);
+    return file;
   }
 
   json(relative, optional = false) {
-    const bytes = this.capture(relative, optional);
-    if (bytes === undefined) return undefined;
+    const captured = this.capture(relative, optional);
+    if (captured === undefined) return undefined;
+    const bytes = readFile(captured.source, STATE_LIMIT);
+    if (createHash("sha256").update(bytes).digest("hex") !== captured.sha256)
+      throw new Error(`Recovery source changed during snapshot: ${relative}`);
     try { return JSON.parse(bytes.toString("utf8")); }
     catch { throw new Error(`Invalid recovery state: ${relative}. Repair the original state before replacing the broker.`); }
   }
@@ -97,7 +107,7 @@ class RecoverySnapshot {
   readForgeRecords() {
     if (!this.present) return;
     const workers = this.json(FORGE_STATE, true) ?? [];
-    if (!Array.isArray(workers) || workers.length > FILE_LIMIT || new Set(workers.map(worker => worker?.id)).size !== workers.length)
+    if (!Array.isArray(workers) || new Set(workers.map(worker => worker?.id)).size !== workers.length)
       throw new Error(`Invalid Forge worker state. ${WORKER_GUIDANCE}`);
     const ownership = new Map();
     for (const relative of this.stateFiles("forge-workers/workspaces")) {
@@ -158,18 +168,20 @@ class RecoverySnapshot {
     } catch { return false; }
   }
 
-  stateFiles(relative, depth = 0) {
-    if (depth > 32) throw new Error("Forge recovery state exceeds its directory depth limit.");
-    const directory = path.join(this.dataDir, relative);
-    if (!safeDirectory(directory, true)) return [];
+  stateFiles(relative) {
     const files = [];
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (++this.entries > FILE_LIMIT) throw new Error("Forge recovery state exceeds its entry limit.");
-      const candidate = path.join(relative, entry.name);
-      if (entry.isDirectory()) files.push(...this.stateFiles(candidate, depth + 1));
-      else if (entry.isFile() && entry.name.endsWith(".json")) files.push(candidate);
-      else throw new Error(`Unsafe or unexpected recovery state: ${candidate}`);
-      if (files.length > FILE_LIMIT) throw new Error("Forge recovery state exceeds its file limit.");
+    const pending = [relative];
+    while (pending.length) {
+      this.signal?.throwIfAborted();
+      const current = pending.pop();
+      const directory = path.join(this.dataDir, current);
+      if (!safeDirectory(directory, current === relative)) continue;
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const candidate = path.join(current, entry.name);
+        if (entry.isDirectory()) pending.push(candidate);
+        else if (entry.isFile() && entry.name.endsWith(".json")) files.push(candidate);
+        else throw new Error(`Unsafe or unexpected recovery state: ${candidate}`);
+      }
     }
     return files;
   }
@@ -183,7 +195,7 @@ class RecoverySnapshot {
       this.legacySessions = true;
     }
     if (saved === undefined) return;
-    if (!saved || saved.version !== 1 || !Array.isArray(saved.sessions) || saved.sessions.length > FILE_LIMIT ||
+    if (!saved || saved.version !== 1 || !Array.isArray(saved.sessions) ||
         saved.sessions.some(session => !session || !validSession(session)))
       throw new Error("Invalid saved tab identities; broker replacement stopped.");
     const ids = saved.sessions.map(({ tab }) => tab.id);
@@ -238,9 +250,8 @@ class RecoverySnapshot {
     const { transcriptPath, storeIdentity } = resolveBoundTranscript(transcriptBinding);
     this.transcriptBindings.push({ ...transcriptBinding, transcriptPath, storeIdentity });
     const destination = `transcripts/${tab.id}.jsonl`;
-    const transcript = this.capture(destination, false, transcriptPath, TRANSCRIPT_LIMIT);
-    const end = transcript.indexOf(10);
-    const header = transcript.subarray(0, end === -1 ? transcript.length : end);
+    this.capture(destination, false, transcriptPath);
+    const header = transcriptHeader(transcriptPath);
     let metadata;
     try { if (header.length <= 1024 * 1024) metadata = JSON.parse(header.toString("utf8")); } catch {}
     if (metadata?.type !== "session_meta" || metadata.payload?.id !== receipt.sessionId || metadata.payload?.cwd !== receipt.cwd)
@@ -252,27 +263,78 @@ class RecoverySnapshot {
     return [...(this.legacySessions ? [LEGACY_RECOVERY] : []), ...this.unavailableConversations.map(({ message }) => message)];
   }
 
-  save() {
+  assertCapacity() {
+    if (!this.files.size) return;
+    const capacity = this.inspectCapacity(this.dataDir);
+    const block = capacity.blockSize;
+    const rounded = bytes => Math.ceil(bytes / block) * block;
+    const directories = new Set(["."]);
+    let requiredBytes = 0;
+    let manifestBytes = 4096 + Buffer.byteLength(JSON.stringify({ conversations: this.conversations,
+      unavailableConversations: this.unavailableConversations, warnings: this.warnings() }));
+    for (const [relative, file] of this.files) {
+      requiredBytes += rounded(file.size);
+      // JSON escapes can expand each path character to six bytes.
+      manifestBytes += 512 + 6 * Buffer.byteLength(file.source + relative);
+      for (let parent = path.dirname(relative); parent !== "."; parent = path.dirname(parent)) directories.add(parent);
+    }
+    const requiredInodes = this.files.size + directories.size + 1;
+    requiredBytes += directories.size * block + rounded(manifestBytes);
+    if (!Number.isSafeInteger(requiredBytes)) throw new Error("Terminal recovery capacity exceeds the supported integer range.");
+    if (requiredBytes > capacity.availableBytes || requiredInodes > capacity.availableInodes)
+      throw new Error(`Terminal recovery destination ${this.dataDir} requires ${requiredBytes} bytes and ${requiredInodes} inodes; ` +
+        `${capacity.availableBytes} bytes and ${capacity.availableInodes} inodes available (${capacity.quotaStatus}). ` +
+        "Free destination space or quota before interrupting services. Original recovery data was preserved.");
+  }
+
+  assertSources() {
+    for (const source of this.sources) assertSourceIdentity(source);
+    for (const transcript of this.transcriptBindings) {
+      const current = resolveBoundTranscript(transcript);
+      if (current.transcriptPath !== transcript.transcriptPath ||
+          ["dev", "ino", "uid", "birthtimeNs"].some(key => current.storeIdentity[key] !== transcript.storeIdentity[key]))
+        throw new Error(`Codex tab ${transcript.tabId} session store changed during snapshot.`);
+    }
+  }
+
+  save(log) {
+    this.assertCapacity();
     const backup = fs.mkdtempSync(path.join(this.dataDir, "terminal-recovery-"));
     try {
       const files = [];
-      for (const [relative, { source, bytes }] of this.files) {
+      let copied = 0;
+      const total = [...this.files.values()].reduce((bytes, file) => bytes + file.size, 0);
+      for (const [relative, file] of this.files) {
+        const { source, sha256 } = file;
         const target = path.join(backup, relative);
         fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-        fs.writeFileSync(target, bytes, { flag: "wx", mode: 0o600, flush: true });
-        if (!readFile(target, TRANSCRIPT_LIMIT).equals(bytes)) throw new Error(`Backup verification failed: ${relative}`);
-        files.push({ source, snapshot: relative, sha256: createHash("sha256").update(bytes).digest("hex") });
+        const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+        let reported = 0;
+        try {
+          const saved = scanFile(source, { signal: this.signal, chunk: (bytes, position) => {
+            let offset = 0;
+            while (offset < bytes.length) {
+              const written = fs.writeSync(fd, bytes, offset, bytes.length - offset);
+              if (!written) throw new Error(`Recovery destination stopped accepting data: ${relative}`);
+              offset += written;
+            }
+            if (position - reported >= 64 * COPY_CHUNK_BYTES) {
+              log(`Terminal recovery: ${copied + position}/${total} bytes copied (${relative}).`);
+              reported = position;
+            }
+          } });
+          if (!sameFile(file, saved)) throw new Error(`Recovery source changed during snapshot: ${source}`);
+          fs.fsyncSync(fd);
+        } finally { fs.closeSync(fd); }
+        if (scanFile(target, { signal: this.signal }).sha256 !== sha256) throw new Error(`Backup verification failed: ${relative}`);
+        copied += file.size;
+        log(`Terminal recovery: ${copied}/${total} bytes copied (${relative}).`);
+        files.push({ source, snapshot: relative, sha256 });
       }
       // Detect state or transcript changes across the whole snapshot, including ongoing Codex writes.
-      for (const { source, bytes } of this.files.values())
-        if (!readFile(source, TRANSCRIPT_LIMIT).equals(bytes)) throw new Error(`Recovery source changed during snapshot: ${source}`);
-      for (const source of this.sources) assertSourceIdentity(source);
-      for (const transcript of this.transcriptBindings) {
-        const current = resolveBoundTranscript(transcript);
-        if (current.transcriptPath !== transcript.transcriptPath ||
-            ["dev", "ino", "uid", "birthtimeNs"].some(key => current.storeIdentity[key] !== transcript.storeIdentity[key]))
-          throw new Error(`Codex tab ${transcript.tabId} session store changed during snapshot.`);
-      }
+      this.assertSources();
+      for (const file of this.files.values())
+        if (!sameFile(file, scanFile(file.source, { signal: this.signal }))) throw new Error(`Recovery source changed during snapshot: ${file.source}`);
       for (const { receiptPath } of this.unavailableConversations)
         if (readFile(path.join(this.dataDir, receiptPath), STATE_LIMIT, true) !== undefined)
           throw new Error(`Recovery source changed during snapshot: ${receiptPath}`);
@@ -310,7 +372,7 @@ function validSession({ tab, initialInput }) {
 // This updater is staged without node_modules or built packages; keep these checks aligned
 // with SessionStateStore, readWindow, and isUsableTabLayoutState (covered by production-validator tests).
 function validWorkspace(workspace) {
-  return isRecord(workspace) && Array.isArray(workspace.windows) && workspace.windows.length > 0 && workspace.windows.length <= FILE_LIMIT &&
+  return isRecord(workspace) && Array.isArray(workspace.windows) && workspace.windows.length > 0 &&
     uniqueIds(workspace.windows.map(window => window?.id)) &&
     (workspace.activeWindowId === undefined || workspace.windows.some(window => window.id === workspace.activeWindowId)) &&
     workspace.windows.every(window => isRecord(window) && ["id", "name", "defaultCwd"].every(key => typeof window[key] === "string") &&
@@ -321,10 +383,9 @@ function validLayout(layout) {
   if (!isRecord(layout) || typeof layout.activePaneId !== "string") return false;
   const pending = [layout.root];
   const panes = [], splits = [], tabs = [];
-  let nodes = 0;
   while (pending.length) {
     const node = pending.pop();
-    if (++nodes > FILE_LIMIT || !isRecord(node)) return false;
+    if (!isRecord(node)) return false;
     if (node.type === "pane") {
       const pane = node.pane;
       if (!isRecord(pane) || !Array.isArray(pane.tabIds) || !uniqueIds(pane.tabIds) ||
@@ -435,6 +496,65 @@ function safeDirectory(directory, optional = false) {
   return true;
 }
 
+function fileIdentity(stat) {
+  return ["dev", "ino", "uid", "birthtimeNs", "size", "mtimeNs", "ctimeNs"].map(key => stat[key].toString()).join(":");
+}
+
+function sameFile(expected, current) {
+  return expected.identity === current.identity && expected.sha256 === current.sha256;
+}
+
+function scanFile(filePath, { optional = false, signal, chunk = () => {} } = {}) {
+  signal?.throwIfAborted();
+  if (!safeDirectory(path.dirname(filePath), optional)) return undefined;
+  const named = fs.lstatSync(filePath, { bigint: true, throwIfNoEntry: false });
+  if (!named && optional) return undefined;
+  if (!named?.isFile() || named.uid !== BigInt(process.getuid()))
+    throw new Error(`Recovery file must be an owned regular file: ${filePath}`);
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const before = fs.fstatSync(fd, { bigint: true });
+    if (!before.isFile() || fileIdentity(before) !== fileIdentity(named))
+      throw new Error(`Recovery file changed before reading: ${filePath}`);
+    const size = Number(before.size);
+    if (!Number.isSafeInteger(size)) throw new Error(`Recovery file exceeds the supported integer range: ${filePath}`);
+    const bytes = Buffer.alloc(Math.min(COPY_CHUNK_BYTES, size));
+    const hash = createHash("sha256");
+    let position = 0;
+    while (position < size) {
+      signal?.throwIfAborted();
+      const count = fs.readSync(fd, bytes, 0, Math.min(bytes.length, size - position), position);
+      if (!count) break;
+      const part = bytes.subarray(0, count);
+      hash.update(part);
+      position += count;
+      chunk(part, position);
+    }
+    const after = fs.fstatSync(fd, { bigint: true });
+    const current = fs.lstatSync(filePath, { bigint: true });
+    if (position !== size || !current.isFile() || fileIdentity(before) !== fileIdentity(after) || fileIdentity(before) !== fileIdentity(current))
+      throw new Error(`Recovery file changed during reading: ${filePath}`);
+    return { size, identity: fileIdentity(before), sha256: hash.digest("hex") };
+  } finally { fs.closeSync(fd); }
+}
+
+function transcriptHeader(filePath) {
+  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    // Metadata is a single protocol record. History after it has no size limit.
+    const bytes = Buffer.alloc(COPY_CHUNK_BYTES + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = fs.readSync(fd, bytes, length, bytes.length - length, length);
+      if (!count) break;
+      length += count;
+      const end = bytes.subarray(0, length).indexOf(10);
+      if (end !== -1) return bytes.subarray(0, end);
+    }
+    return bytes.subarray(0, length);
+  } finally { fs.closeSync(fd); }
+}
+
 function readFile(filePath, limit, optional = false) {
   if (!safeDirectory(path.dirname(filePath), optional)) return undefined;
   const named = fs.lstatSync(filePath, { throwIfNoEntry: false });
@@ -463,9 +583,14 @@ function readFile(filePath, limit, optional = false) {
 }
 
 function syncDirectories(directory) {
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true }))
-    if (entry.isDirectory()) syncDirectories(path.join(directory, entry.name));
-  syncDirectory(directory);
+  const pending = [directory], directories = [];
+  while (pending.length) {
+    const current = pending.pop();
+    directories.push(current);
+    for (const entry of fs.readdirSync(current, { withFileTypes: true }))
+      if (entry.isDirectory()) pending.push(path.join(current, entry.name));
+  }
+  for (const current of directories.reverse()) syncDirectory(current);
 }
 
 function syncDirectory(directory) {
