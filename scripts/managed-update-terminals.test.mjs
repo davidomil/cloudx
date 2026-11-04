@@ -83,31 +83,50 @@ it("does not disclose unreadable saved state and validates capture before attach
   expect(factory.attach).not.toHaveBeenCalled();
 });
 
-it.each([undefined, ["../shell"], ["shell", "shell"], ["x".repeat(129)], Array.from({ length: 257 }, (_, i) => String(i))])(
-  "rejects invalid or unbounded expected IDs before touching the broker: %j", async sessionIds => {
+it.each([undefined, ["../shell"], ["shell", "shell"], ["x".repeat(129)]])(
+  "rejects invalid expected IDs before touching the broker: %j", async sessionIds => {
     const factory = { attach: vi.fn() };
     await expect(probeTerminalAttachments({ mode: "verify", sessionIds }, { factory })).rejects.toThrow("unique saved session IDs");
     expect(factory.attach).not.toHaveBeenCalled();
   });
 
-it("accepts a bounded private expected list and rejects unsafe paths, modes, and file contents", () => {
+it("captures and verifies more than 256 terminal identities from a private list above 64 KiB", async () => {
   const root = directory();
   const list = path.join(root, "ids.json");
+  const resultPath = path.join(root, "result.json");
+  const sessionIds = Array.from({ length: 600 }, (_, index) => `${index}-${"a".repeat(120)}`);
+  fs.writeFileSync(list, JSON.stringify({ sessionIds }), { mode: 0o600 });
+  expect(fs.statSync(list).size).toBeGreaterThan(64 * 1024);
+  expect(parseTerminalProbeArguments(["verify", root, root, resultPath, list]).sessionIds).toEqual(sessionIds);
+  const detach = vi.fn();
+  const dependencies = { factory: { attach: vi.fn(async () => ({ detach, onExit: () => () => {} })) },
+    readSessions: async () => ({ version: 1, sessions: sessionIds.map(id => saved(id)) }) };
+  expect(await probeTerminalAttachments({ mode: "capture" }, dependencies)).toEqual({ sessionIds });
+  expect(await probeTerminalAttachments({ mode: "verify", sessionIds }, dependencies)).toEqual({ sessionIds });
+  expect(detach).toHaveBeenCalledTimes(sessionIds.length * 2);
+});
+
+it("accepts a private expected list and rejects unsafe paths, modes, and file contents", () => {
+  const root = directory();
+  const list = path.join(root, "ids.json");
+  const resultPath = path.join(root, "result.json");
   fs.writeFileSync(list, JSON.stringify({ sessionIds: ["shell"] }), { mode: 0o600 });
-  expect(parseTerminalProbeArguments(["verify", root, root, list])).toEqual({ mode: "verify", releaseRoot: root, dataDir: root, sessionIds: ["shell"] });
-  for (const args of [["other", root, root], ["capture", root, root, list], ["verify", root, root], ["capture", ".", root]])
+  expect(parseTerminalProbeArguments(["verify", root, root, resultPath, list])).toEqual({ mode: "verify", releaseRoot: root, dataDir: root, resultPath, sessionIds: ["shell"] });
+  for (const args of [["other", root, root, resultPath], ["capture", root, root, resultPath, list], ["verify", root, root, resultPath], ["capture", ".", root, resultPath], ["capture", root, root, "relative-result"]])
     expect(() => parseTerminalProbeArguments(args)).toThrow();
   fs.symlinkSync(root, path.join(root, "linked"));
-  expect(() => parseTerminalProbeArguments(["capture", path.join(root, "linked"), root])).toThrow("without symbolic links");
+  expect(() => parseTerminalProbeArguments(["capture", path.join(root, "linked"), root, resultPath])).toThrow("without symbolic links");
   fs.symlinkSync(list, path.join(root, "linked.json"));
-  expect(() => parseTerminalProbeArguments(["verify", root, root, path.join(root, "linked.json")])).toThrow();
+  expect(() => parseTerminalProbeArguments(["verify", root, root, resultPath, path.join(root, "linked.json")])).toThrow();
   fs.chmodSync(list, 0o644);
-  expect(() => parseTerminalProbeArguments(["verify", root, root, list])).toThrow("private regular file");
+  expect(() => parseTerminalProbeArguments(["verify", root, root, resultPath, list])).toThrow("private regular file");
   fs.chmodSync(list, 0o600);
   for (const value of [{ sessionIds: ["shell"], extra: true }, { sessionIds: ["../shell"] }, "x".repeat(65536)]) {
     fs.writeFileSync(list, JSON.stringify(value));
-    expect(() => parseTerminalProbeArguments(["verify", root, root, list])).toThrow();
+    expect(() => parseTerminalProbeArguments(["verify", root, root, resultPath, list])).toThrow();
   }
+  fs.symlinkSync(list, resultPath);
+  expect(() => parseTerminalProbeArguments(["capture", root, root, resultPath])).toThrow("must not already exist");
 });
 
 it.skipIf(process.platform !== "linux")("reattaches through a real broker without input, new processes, resizing, or termination", async () => {
@@ -212,18 +231,21 @@ it.skipIf(process.platform !== "linux")("excludes an exited shell when every bro
 }, 15_000);
 
 it.skipIf(process.platform !== "linux" || !fs.existsSync(path.join(releaseRoot, "apps/server/dist/terminal/DurableTerminalProcess.js")))(
-  "runs the production probe child against the built release and a live terminal, returning JSON without terminal output", async () => {
+  "runs the production probe child against the built release and a live terminal, writing its private result without terminal output", async () => {
     const f = await liveTerminal();
     const run = (...args) => promisify(execFile)(process.execPath, [probeFile, ...args], { timeout: 15_000, maxBuffer: 64 * 1024 });
-    const captured = await run("capture", releaseRoot, f.root);
-    expect(captured).toEqual({ stdout: '{"sessionIds":["preserved-shell"]}\n', stderr: "" });
-    const list = path.join(f.root, "expected.json");
-    fs.writeFileSync(list, captured.stdout, { mode: 0o600 });
-    expect(await run("verify", releaseRoot, f.root, list)).toEqual(captured);
+    const list = path.join(f.root, "captured.json");
+    const resultPath = path.join(f.root, "verified.json");
+    const captured = await run("capture", releaseRoot, f.root, list);
+    expect(captured).toEqual({ stdout: "true\n", stderr: "" });
+    expect(JSON.parse(fs.readFileSync(list, "utf8"))).toEqual({ sessionIds: ["preserved-shell"] });
+    expect(fs.statSync(list).mode & 0o777).toBe(0o600);
+    expect(await run("verify", releaseRoot, f.root, resultPath, list)).toEqual(captured);
+    expect(fs.readFileSync(resultPath)).toEqual(fs.readFileSync(list));
     f.assertUntouched();
     const attached = await f.factory.attach("preserved-shell");
     await attached.terminate();
-    await expect(run("verify", releaseRoot, f.root, list)).rejects.toMatchObject({ code: 1, stdout: "",
+    await expect(run("verify", releaseRoot, f.root, path.join(f.root, "missing.json"), list)).rejects.toMatchObject({ code: 1, stdout: "",
       stderr: "Terminal attachment could not be verified for saved session preserved-shell.\n" });
   }, 20_000);
 

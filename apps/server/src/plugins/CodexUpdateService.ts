@@ -136,8 +136,8 @@ export class CodexUpdateService {
 
   private async run(version: string): Promise<void> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.options.maxDurationMs ?? 3 * 60_000);
-    timer.unref();
+    const timer = this.options.maxDurationMs === undefined ? undefined : setTimeout(() => controller.abort(), this.options.maxDurationMs);
+    timer?.unref();
     const signal = AbortSignal.any([controller.signal, this.shutdown.signal]);
     let log: number | undefined;
     let logBytes = 0;

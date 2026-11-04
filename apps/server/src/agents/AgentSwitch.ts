@@ -73,7 +73,7 @@ export async function prepareAgentSwitch(context: AgentSwitchContext, request: A
     cwd: context.cwd,
     from: { providerId: current.providerId, accountLabel: fromAccount?.label, sessionId },
     to: { providerId: target.providerId, accountLabel: target.label },
-    entries: await readAgentTranscript(current.providerId, transcript!)
+    entries: readAgentTranscript(current.providerId, transcript!)
   });
   return { ...next, prompt: handoff.prompt, agentHandoff: handoff.path };
 }

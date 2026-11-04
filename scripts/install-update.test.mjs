@@ -94,6 +94,7 @@ function checkout({ includeInstaller = false } = {}) {
       "install-terminal-upgrade.mjs",
       "install-runtime.mjs",
       "terminal-upgrade-recovery.mjs",
+      "managed-update-store.mjs",
       "installer-environment.mjs",
     ])
       fs.copyFileSync(

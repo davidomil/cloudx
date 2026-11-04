@@ -37,9 +37,9 @@ beforeEach(() => {
         if (mode === 'conflict') console.error('CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify({ stage: 'verify', code: 'candidate-state' }));
         process.exit(1);
       }
-      if (['snapshot-size', 'snapshot-budget', 'candidate-state', 'invalid-state-diagnostic'].includes(process.env.TEST_MODE)) {
+      if (['snapshot-capacity', 'candidate-state', 'invalid-state-diagnostic'].includes(process.env.TEST_MODE)) {
         const diagnostic = process.env.TEST_MODE === 'candidate-state' ? { stage: 'verify', code: 'candidate-state' }
-          : { stage: 'snapshot', code: process.env.TEST_MODE === 'snapshot-size' ? 'database-size' : 'snapshot-budget', observedBytes: 8589934593, limitBytes: 8589934592 };
+          : { stage: 'snapshot', code: 'disk-space', observedBytes: 8589934593, limitBytes: 8589934592 };
         if (process.env.TEST_MODE === 'invalid-state-diagnostic') diagnostic.limitBytes = 'SECRET-TOKEN';
         diagnostic.message = 'SECRET-TOKEN';
         console.error('CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify(diagnostic));
@@ -52,6 +52,20 @@ beforeEach(() => {
         const child = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
         fs.writeFileSync(process.env.TEST_CHILD, String(child.pid));
         setInterval(() => {}, 1000);
+      }
+      if (process.env.TEST_MODE === 'runtime-progress') {
+        const child = require('node:child_process').spawn(process.execPath, ['-e', "setInterval(() => require('node:fs').appendFileSync(process.env.TEST_WRITES, 'x'), 10)"], { detached: true, stdio: 'ignore' });
+        child.unref();
+        fs.writeFileSync(process.env.TEST_CHILD, String(child.pid));
+        const copying = setInterval(() => {
+          console.log('Retained-state snapshot is progressing.');
+          if (fs.existsSync(process.env.TEST_RUNTIME_LOG + '.release')) clearInterval(copying);
+        }, 25);
+      }
+      if (process.env.TEST_MODE === 'runtime-verbose-diagnostic') {
+        fs.writeSync(1, 'Retained-state snapshot is progressing.\\n'.repeat(20_000));
+        fs.writeSync(1, 'CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify({ stage: 'snapshot', code: 'disk-space', observedBytes: 8589934593, limitBytes: 8589934592 }) + '\\n');
+        process.exit(1);
       }
     `;
     return spawn(command, [...args.slice(0, verifier), "-e", source, "--", ...args.slice(verifier + 1)], options);
@@ -603,17 +617,17 @@ describe("shared Codex update", () => {
     expect(error.message).not.toMatch(/Forge|shared-state|SECRET-TOKEN|\/private/);
   });
 
-  it.each(["snapshot-size", "snapshot-budget"])("preserves the verified selection and reports the precise %s preparation cause", async mode => {
+  it("preserves the verified selection and reports an actual snapshot capacity shortage", async () => {
     const fixture = installation();
     await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
     const selectionBefore = fs.readFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"));
-    fixture.env.TEST_MODE = mode;
+    fixture.env.TEST_MODE = "snapshot-capacity";
     const output = [];
 
     const error = await updateCodexInstallation({ ...fixture, onOutput: text => output.push(text) }).catch(error => error);
 
     expect(error).toMatchObject({ code: "snapshot-preparation", usableVersion: "1.0.0", message: expect.stringContaining("snapshot preparation failed") });
-    expect(error.message).toContain("8589934593 bytes; the limit is 8589934592 bytes");
+    expect(error.message).toContain("8589934593 bytes; available disk space is 8589934592 bytes");
     expect(error.message).not.toContain("SECRET-TOKEN");
     expect(output.join("")).toContain('"observedBytes":8589934593');
     expect(fs.readFileSync(path.join(fixture.prefix, ".cloudx-codex-selection.json"))).toEqual(selectionBefore);
@@ -634,6 +648,71 @@ describe("shared Codex update", () => {
     await expect(updateCodexInstallation({ ...fixture, timeoutMs: 800 })).rejects.toMatchObject({ code: "timeout", usableVersion: "1.0.0" });
     const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
     expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+    expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
+  });
+
+  it("lets progressing retained-state verification finish beyond the former default deadlines", async () => {
+    const fixture = installation({ mode: "runtime-progress", version: "1.1.0" });
+    const setTimer = globalThis.setTimeout;
+    const abortAfter = AbortSignal.timeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, delay, ...args) => setTimer(callback, delay === 120_000 ? 500 : delay, ...args));
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(delay => abortAfter(delay === 180_000 ? 500 : delay));
+    const output = [], stages = [];
+    const result = updateCodexInstallation({ ...fixture, onOutput: text => output.push(text), onProgress: stage => stages.push(stage) }).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(output.join("")).toContain("Retained-state snapshot is progressing."));
+      await new Promise(resolve => setTimer(resolve, 650));
+      expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(/Another CloudX installer/);
+      expect(readCodexSelection(fixture.prefix)).toBeNull();
+      fs.writeFileSync(fixture.env.TEST_RUNTIME_LOG + ".release", "continue");
+      expect(await result).toMatchObject({ outcome: "current", activeVersion: "1.1.0" });
+      expect(stages).toEqual(["checking", "verifying"]);
+      const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+      expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+      expect(readCodexSelection(fixture.prefix).active.version).toBe("1.1.0");
+    } finally {
+      fs.writeFileSync(fixture.env.TEST_RUNTIME_LOG + ".release", "continue");
+      await result;
+      stopEscapedFixture(fixture);
+    }
+  });
+
+  it("cancels a progressing retained-state verifier and reaps its writers before unlocking", async () => {
+    const fixture = installation();
+    await updateCodexInstallation({ ...fixture, targetVersion: "1.0.0" });
+    const previous = readCodexSelection(fixture.prefix);
+    fixture.env.TEST_MODE = "runtime-progress";
+    const controller = new AbortController();
+    const output = [];
+    const result = updateCodexInstallation({ ...fixture, signal: controller.signal, onOutput: text => output.push(text) }).catch(error => error);
+    try {
+      await vi.waitFor(() => expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(0));
+      expect(output.join("")).toContain("Retained-state snapshot is progressing.");
+      expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(/Another CloudX installer/);
+      controller.abort();
+      expect(await result).toMatchObject({ code: "cancelled", usableVersion: "1.0.0" });
+      expect(readCodexSelection(fixture.prefix)).toEqual(previous);
+      const pid = Number(fs.readFileSync(fixture.env.TEST_CHILD, "utf8"));
+      expect(fs.existsSync(`/proc/${pid}`)).toBe(false);
+      const bytes = fs.statSync(fixture.env.TEST_WRITES).size;
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(fs.statSync(fixture.env.TEST_WRITES).size).toBe(bytes);
+      const release = acquireCodexInstallationLock(fixture.prefix);
+      release();
+    } finally {
+      controller.abort();
+      await result;
+      stopEscapedFixture(fixture);
+    }
+  });
+
+  it("drains verbose verification progress and preserves the final diagnostic without the npm output cap", async () => {
+    const fixture = installation({ mode: "runtime-verbose-diagnostic" });
+    let forwardedBytes = 0;
+    const error = await updateCodexInstallation({ ...fixture, onOutput: text => { forwardedBytes += Buffer.byteLength(text); } }).catch(error => error);
+    expect(forwardedBytes).toBeGreaterThan(512 * 1024);
+    expect(error).toMatchObject({ code: "snapshot-preparation", usableVersion: "1.0.0", message: expect.stringContaining("8589934593 bytes; available disk space is 8589934592 bytes") });
+    expect(readCodexSelection(fixture.prefix)).toBeNull();
     expect(fs.existsSync(path.join(fixture.prefix, ".cloudx-codex-update.lock"))).toBe(false);
   });
 

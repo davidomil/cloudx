@@ -39,14 +39,21 @@ beforeEach(() => {
         console.error('CLOUDX_CODEX_RUNTIME_ERROR=' + JSON.stringify({ stage: 'interactive-evidence', code: process.env.CLOUDX_TEST_FAILURE === 'runtime-evidence-roots' ? 'workspace-roots' : 'transcript', message: 'synthetic-private-runtime-detail' }));
         process.exit(1);
       }
-      if (process.env.CLOUDX_TEST_FAILURE?.startsWith('snapshot-')) {
+      if (process.env.CLOUDX_TEST_FAILURE === 'snapshot-capacity') {
         console.log('Selected conversation saved before any model prompt.');
         console.log('Synthetic local-provider turn preserved selection, launch permissions and workspace/skills roots.');
         console.log('Resumed Forge turn matched the selected thread, native completion and final shutdown.');
-        const diagnostic = { stage: 'snapshot', code: process.env.CLOUDX_TEST_FAILURE === 'snapshot-size' ? 'database-size' : 'snapshot-budget', observedBytes: 8589934593, limitBytes: 8589934592 };
+        const diagnostic = { stage: 'snapshot', code: 'disk-space', observedBytes: 8589934593, limitBytes: 8589934592 };
         console.error('CLOUDX_CODEX_STATE_ERROR=' + JSON.stringify(diagnostic));
-        console.error('Codex native runtime verification failed: shared-state snapshot preparation failed: 8589934593 bytes; the limit is 8589934592 bytes.');
+        console.error('Codex native runtime verification failed: shared-state snapshot preparation failed: 8589934593 bytes; available disk space is 8589934592 bytes.');
         process.exit(1);
+      }
+      if (process.env.CLOUDX_TEST_FAILURE === 'runtime-progress') {
+        const fs = require('node:fs');
+        const copying = setInterval(() => {
+          console.log('Retained-state snapshot is progressing.');
+          if (fs.existsSync(process.env.CLOUDX_TEST_RELEASE)) clearInterval(copying);
+        }, 25);
       }
     `;
     return spawn(command, [...args.slice(0, verifier), "-e", source, "--", ...args.slice(verifier + 1)], options);
@@ -235,6 +242,36 @@ describe("server-owned Codex updates", () => {
     expect(await f.commands()).toEqual([["view", "@openai/codex", "versions", "dist-tags", "--json"]]);
   });
 
+  it("keeps progressing verification running until it finishes without a default job deadline", async () => {
+    const f = await installation({ current: true, failure: "runtime-progress" });
+    const setTimer = globalThis.setTimeout;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((...[callback, delay, ...args]: Parameters<typeof setTimeout>) => setTimer(callback, delay === 180_000 ? 500 : delay, ...args)) as typeof setTimeout);
+    const updates = f.service();
+    await updates.start("1.0.0");
+    const log = path.join(f.dataDir, "codex-update/update.log");
+    await vi.waitFor(async () => expect(await fs.readFile(log, "utf8")).toContain("Retained-state snapshot is progressing."));
+    await new Promise(resolve => setTimer(resolve, 650));
+    expect(await updates.read()).toMatchObject({ phase: "verifying", activeVersion: "1.0.0", finishedAt: null });
+    await f.release();
+    expect(await finished(updates)).toMatchObject({ phase: "succeeded", outcome: "current", activeVersion: "1.0.0" });
+  });
+
+  it("stops progressing retained-state verification on service shutdown before releasing its lock", async () => {
+    const f = await installation({ current: true, failure: "runtime-progress" });
+    const updates = f.service();
+    await updates.start("1.0.0");
+    await vi.waitFor(async () => expect(await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8")).toContain("Retained-state snapshot is progressing."));
+    const launches = vi.mocked(childProcess.spawn);
+    const verifier = launches.mock.calls.findIndex(([, args]) => Array.isArray(args) && args.some(argument => argument.endsWith("/codex-runtime-verification.mjs")));
+    const supervisor = launches.mock.results[verifier]!.value;
+    expect(fsSync.existsSync(`/proc/${supervisor.pid}`)).toBe(true);
+    await updates.dispose();
+    expect(JSON.parse(await fs.readFile(path.join(f.dataDir, "codex-update/selection-status.json"), "utf8")).update).toMatchObject({ phase: "failed", activeVersion: "1.0.0", message: expect.stringContaining("stopped") });
+    expect(fsSync.existsSync(`/proc/${supervisor.pid}`)).toBe(false);
+    expect(fsSync.existsSync(path.join(f.prefix, ".cloudx-codex-update.lock"))).toBe(false);
+    expect(fsSync.existsSync(path.join(f.prefix, ".cloudx-codex-selection.json"))).toBe(false);
+  });
+
   it.each([false, true])("retains a failed runtime verification across reads and restart until an explicit successful retry (current: %s)", async current => {
     const f = await installation({ failure: "runtime", current });
     const updates = f.service();
@@ -277,21 +314,21 @@ describe("server-owned Codex updates", () => {
     expect(await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8")).toContain("synthetic-private-runtime-detail: native transcript assertion at /private/path");
   });
 
-  it.each(["snapshot-size", "snapshot-budget"])("persists the specific %s cause in status and the private log without changing the active selection", async failure => {
+  it("persists actual snapshot capacity shortages in status and the private log without changing the active selection", async () => {
     const f = await installation();
     const initial = f.service();
     await initial.start("1.0.0");
     expect(await finished(initial)).toMatchObject({ phase: "succeeded", activeVersion: "1.0.0" });
     const selectionPath = path.join(f.env.CLOUDX_NPM_GLOBAL_DIR!, ".cloudx-codex-selection.json");
     const before = await fs.readFile(selectionPath);
-    f.env.CLOUDX_TEST_FAILURE = failure;
+    f.env.CLOUDX_TEST_FAILURE = "snapshot-capacity";
     const updates = f.service();
 
     await updates.start("1.1.0");
     const failed = await finished(updates);
 
     expect(failed).toMatchObject({ phase: "failed", installedVersion: "1.1.0", activeVersion: "1.0.0", outcome: null, message: expect.stringContaining("snapshot preparation failed") });
-    expect(failed.message).toContain("8589934593 bytes; the limit is 8589934592 bytes");
+    expect(failed.message).toContain("8589934593 bytes; available disk space is 8589934592 bytes");
     expect(failed.message).not.toContain("failed CloudX tab launch");
     expect(await fs.readFile(selectionPath)).toEqual(before);
     expect(await updates.read()).toEqual(failed);
@@ -299,7 +336,7 @@ describe("server-owned Codex updates", () => {
     const log = await fs.readFile(path.join(f.dataDir, "codex-update/update.log"), "utf8");
     expect(log).toContain("Resumed Forge turn matched the selected thread");
     expect(log).toContain('"observedBytes":8589934593');
-    expect(log).toContain("8589934593 bytes; the limit is 8589934592 bytes");
+    expect(log).toContain("8589934593 bytes; available disk space is 8589934592 bytes");
   });
 
   it("marks a retained unfinished job interrupted after restart and checks the executable before displaying its version", async () => {

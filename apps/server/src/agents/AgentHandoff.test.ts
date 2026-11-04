@@ -6,6 +6,12 @@ import { describe, expect, it } from "vitest";
 
 import { readAgentTranscript, writeAgentHandoff } from "./AgentHandoff.js";
 
+async function entries(provider: "codex" | "claude", file: string) {
+  const result = [];
+  for await (const entry of readAgentTranscript(provider, file)) result.push(entry);
+  return result;
+}
+
 async function transcript(lines: unknown[]): Promise<string> {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-transcript-"));
   const file = path.join(directory, "session.jsonl");
@@ -23,7 +29,7 @@ describe("readAgentTranscript", () => {
       { type: "response_item", payload: { type: "function_call", name: "shell", arguments: "{\"cmd\":\"npm test\"}" } },
       { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Fixed." }] } }
     ]);
-    expect(await readAgentTranscript("codex", file)).toEqual([
+    expect(await entries("codex", file)).toEqual([
       { role: "user", text: "Fix the parser" },
       { role: "tool", text: "shell: {\"cmd\":\"npm test\"}" },
       { role: "assistant", text: "Fixed." }
@@ -38,11 +44,35 @@ describe("readAgentTranscript", () => {
       { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Adding it." }, { type: "tool_use", name: "Bash", input: { command: "npm test" } }] } },
       { type: "user", message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } }
     ]);
-    expect(await readAgentTranscript("claude", file)).toEqual([
+    expect(await entries("claude", file)).toEqual([
       { role: "user", text: "Add a test" },
       { role: "assistant", text: "Adding it." },
       { role: "tool", text: "Bash: npm test" }
     ]);
+  });
+
+  it("hands off a transcript above the former 64 MiB cap without loading its old records", async () => {
+    const file = await transcript([]);
+    const handle = await fs.open(file, "w");
+    const padding = `${JSON.stringify({ type: "reasoning", text: "x".repeat(1024 * 1024) })}\n`;
+    try {
+      for (let index = 0; index < 65; index++) await handle.write(padding);
+      await handle.write(JSON.stringify({ type: "user", message: { content: "Continue the retained conversation" } }));
+    } finally { await handle.close(); }
+    try {
+      expect((await fs.stat(file)).size).toBeGreaterThan(64 * 1024 * 1024);
+      const handoff = await writeAgentHandoff({ cwd: path.dirname(file), from: { providerId: "claude" }, to: { providerId: "codex", accountLabel: "A" }, entries: readAgentTranscript("claude", file) });
+      expect(await fs.readFile(handoff.path, "utf8")).toContain("Continue the retained conversation");
+      expect((await fs.stat(file)).size).toBeGreaterThan(64 * 1024 * 1024);
+    } finally { await fs.rm(path.dirname(file), { recursive: true, force: true }); }
+  });
+
+  it("discards oversized records incrementally and resumes at the next record", async () => {
+    const file = await transcript([]);
+    try {
+      await fs.writeFile(file, `${"x".repeat(5 * 1024 * 1024)}\n${JSON.stringify({ type: "user", message: { content: "After the oversized record" } })}`);
+      expect(await entries("claude", file)).toEqual([{ role: "user", text: "After the oversized record" }]);
+    } finally { await fs.rm(path.dirname(file), { recursive: true, force: true }); }
   });
 });
 
@@ -73,5 +103,26 @@ describe("writeAgentHandoff", () => {
     expect(content).toContain("earlier entries omitted");
     expect(content).toContain("39 xxx");
     expect(content).not.toContain("\n0 xxx");
+  });
+
+  it("bounds the handoff while consuming every streamed entry and reports the exact omitted count", async () => {
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-handoff-stream-"));
+    let consumed = 0;
+    async function* conversation() {
+      for (let index = 0; index < 5000; index++) {
+        consumed++;
+        yield { role: "user" as const, text: `message-${String(index).padStart(4, "0")} ${"x".repeat(990)}` };
+      }
+    }
+    try {
+      const handoff = await writeAgentHandoff({ cwd, from: { providerId: "claude" }, to: { providerId: "codex", accountLabel: "A" }, entries: conversation() });
+      const content = await fs.readFile(handoff.path, "utf8");
+      const retained = content.match(/### User\n/gu)?.length ?? 0;
+      expect(consumed).toBe(5000);
+      expect(content).toContain(`_${5000 - retained} earlier entries omitted._`);
+      expect(content).toContain("message-4999");
+      expect(content).not.toContain("message-0000");
+      expect(content.length).toBeLessThan(82_000);
+    } finally { await fs.rm(cwd, { recursive: true, force: true }); }
   });
 });
