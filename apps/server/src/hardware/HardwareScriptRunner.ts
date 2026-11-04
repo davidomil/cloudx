@@ -21,11 +21,11 @@ export class HardwareScriptRunner {
 
   async validateWorkingDirectory(candidate: string): Promise<string> {
     try {
-      const cwd = this.options.pathPolicy ? await this.options.pathPolicy.ensureDirectory(candidate, false) : await fs.realpath(candidate);
+      const cwd = candidate === "/" ? "/" : this.options.pathPolicy ? await this.options.pathPolicy.ensureDirectory(candidate, false) : await fs.realpath(candidate);
       if (!(await fs.stat(cwd)).isDirectory()) throw new Error("Not a directory");
       return cwd;
     } catch {
-      throw new HardwareError("INVALID_INPUT", "Script working directory must exist, be a directory, and be inside the configured CloudX allowed roots.");
+      throw new HardwareError("INVALID_INPUT", "Script working directory must be / or an existing directory inside the configured CloudX allowed roots.");
     }
   }
 

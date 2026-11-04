@@ -52,6 +52,8 @@ The panel additionally manages item, tag, status-definition, and physical-group 
 
 For command statuses, the definition's value type selects the result contract. A normal boolean command exit produces a known value: zero is `true`, and any nonzero code is `false`. Either value completes the refresh successfully; stdout and stderr remain diagnostics. Text and enum commands require exit zero and one JSON value of their declared type. Runner failures and uncertain outcomes retain their existing error and recovery behavior.
 
+The panel defaults new status commands and reservation hooks to `cwd: "/"`. Script input requires an explicit absolute `cwd`. Hardware scripts admit the literal `/`; custom directories must exist inside the server's allowed roots. Configuration saves and script execution both validate the directory.
+
 Reject item connection/type/group/hook/status-binding edits while affected keys are held. Allow notes, tag membership, descriptive metadata, enabled state, and manual status values to change with revisions; these changes never evict the owner. A manual value update preserves the binding revision and updates the observation. Disabling a type contribution does not delete its saved items; they become unavailable until its exact supported code returns.
 
 ## Filtering and pagination

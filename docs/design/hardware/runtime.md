@@ -6,7 +6,7 @@ Open **Hardware** from Add tab. All panels on one CloudX host share the inventor
 
 ## Configure host access
 
-Hardware storage, script process ownership, and UART control-line handling require Linux. Install OpenSSH client tools for SSH/SFTP and `ssh-copy-id`, and Python 3 for Linux UART modem-control operations. Admit explicit local key files, optional known-hosts overrides, UART paths, transfer paths, and script directories through `CLOUDX_ALLOWED_ROOTS`. Inventory inspection does not open the endpoint.
+Hardware storage, script process ownership, and UART control-line handling require Linux. Install OpenSSH client tools for SSH/SFTP and `ssh-copy-id`, and Python 3 for Linux UART modem-control operations. Admit explicit local key files, optional known-hosts overrides, UART paths, transfer paths, and custom script directories through `CLOUDX_ALLOWED_ROOTS`. Inventory inspection does not open the endpoint.
 
 SSH defaults to **Current SSH agent**. It uses the agent available to the CloudX server through `SSH_AUTH_SOCK`; no socket path is required. This is the server's agent, including when the browser runs on another machine. Choose **Identity file** to use an admitted private key, or **Password** to enter a login password. Passwords are saved in CloudX's private secret store. Inventory contains an opaque reference, and editing an existing item never displays its saved password.
 
@@ -18,7 +18,7 @@ To install keys on a machine, save the item, reserve it, and choose **Register S
 
 In **Statuses & hooks**, bind a boolean, text, or enum definition to a manual value or host Bash command. Boolean commands use exit codes: zero means `true`, and any normal nonzero exit means `false`. Output is retained for diagnostics and does not set the boolean value. Text and enum commands must exit zero and print one JSON value of their declared type. Set freshness, scheduling, and an exact required value when it gates reservation; `false` is a valid requirement. Before reserve and On release run in their configured host directory with bounded output and a deadline. They receive JSON context on stdin.
 
-Choose an existing working directory inside the server's allowed roots. CloudX validates it when saving and again before running. A rejected directory leaves the configuration editable. While a reservation or check holds the resource, **Inspect hold** opens its exact entry in Reservations, including its state and recovery reason.
+New status commands and hooks default to `/` on the CloudX host. Keep this value, or choose an existing directory inside the server's allowed roots. CloudX validates it when saving and again before running. A rejected directory leaves the configuration editable. While a reservation or check holds the resource, **Inspect hold** opens its exact entry in Reservations, including its state and recovery reason.
 
 For a boolean online check, use a bounded ping directly. For example, set a three-second script deadline and use:
 

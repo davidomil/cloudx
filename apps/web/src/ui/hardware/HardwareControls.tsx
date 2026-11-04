@@ -144,7 +144,7 @@ export function StatusInput({
 
 export const emptyScript = (): BashScript => ({
   source: "",
-  cwd: "",
+  cwd: "/",
   timeoutMs: 30000,
   maxOutputBytes: 65536,
   credentialRefIds: [],

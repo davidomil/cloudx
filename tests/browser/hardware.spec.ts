@@ -1332,20 +1332,97 @@ test("status editor explains check recovery and restores editing after explicit 
   await expect(button(page, "Inspect hold")).toHaveCount(0);
 });
 
+test("new status and reservation hooks save and run from the default root directory", async ({
+  page,
+}, info) => {
+  const latestResult = async () => {
+    const receipt = page.getByRole("article", {
+      name: "Operation receipt",
+      exact: true,
+    });
+    await expect(receipt.locator("header > strong")).toHaveText("succeeded");
+    return JSON.parse(await receipt.locator("pre").innerText());
+  };
+  await button(page, "Statuses & hooks").click();
+  await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
+  await label(page, "Up source").selectOption("command");
+  await expect(label(page, "Up status command working directory")).toHaveValue(
+    "/",
+  );
+  await label(page, "Up status command").fill("pwd");
+  await label(page, "Require Up for reservation").check();
+  for (const hook of ["Before reserve", "On release"]) {
+    await label(page, `Enable ${hook}`).check();
+    await expect(
+      label(page, `${hook} Bash script working directory`),
+    ).toHaveValue("/");
+    await label(page, `${hook} Bash script`).fill("pwd");
+  }
+  await screenshot(
+    page,
+    info,
+    "default-root-fields",
+    "Up status command working directory",
+  );
+  await button(page, "Save configuration").click();
+  await latestResult();
+  const saved = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.id === lab.ssh.id,
+  )!.item;
+  expect(saved.statuses[0]).toMatchObject({
+    source: "command",
+    script: { source: "pwd", cwd: "/" },
+  });
+  expect(saved.hooks).toMatchObject({
+    beforeReserve: { source: "pwd", cwd: "/" },
+    onRelease: { source: "pwd", cwd: "/" },
+  });
+  await button(page, "Refresh Up").click();
+  await expect(
+    page
+      .locator(".hardware-observation-row")
+      .filter({ hasText: "Up" })
+      .locator(".hardware-observation"),
+  ).toHaveText("true · fresh");
+  expect(await latestResult()).toMatchObject({
+    diagnostics: [expect.objectContaining({ exitCode: 0, stdout: "/\n" })],
+  });
+  await button(page, "Inventory").click();
+  await reserve(page, "Atlas SSH");
+  expect(await latestResult()).toMatchObject({
+    diagnostics: { exitCode: 0, stdout: "/\n" },
+  });
+  await button(page, "Reservations").click();
+  await button(page, "Details").click();
+  await button(page, "Release own reservation").click();
+  await expect
+    .poll(
+      async () => (await lab.service.snapshot(operator)).reservations.length,
+    )
+    .toBe(0);
+  expect(await latestResult()).toMatchObject({
+    diagnostics: { exitCode: 0, stdout: "/\n" },
+  });
+  expect((await lab.service.snapshot(operator)).checkHolds).toEqual([]);
+});
+
 test("status configuration rejects a disallowed directory without holding hardware or losing the draft", async ({
   page,
 }) => {
+  const outsideDirectory = path.dirname(lab.root);
   await button(page, "Statuses & hooks").click();
   await label(page, "Configure hardware statuses").selectOption(lab.ssh.id);
   await label(page, "Up source").selectOption("command");
   await label(page, "Up status command").fill("true");
-  await label(page, "Up status command working directory").fill("/");
+  await label(page, "Up status command working directory").fill(
+    outsideDirectory,
+  );
   await button(page, "Save configuration").click();
   await expect(page.getByRole("alert")).toContainText("CloudX allowed roots");
   await expect(label(page, "Up source")).toBeEnabled();
   await expect(label(page, "Up status command")).toHaveValue("true");
   await expect(label(page, "Up status command working directory")).toHaveValue(
-    "/",
+    outsideDirectory,
   );
   const rejected = await lab.service.snapshot(operator);
   expect(rejected.checkHolds).toEqual([]);
@@ -1395,7 +1472,7 @@ test("status bindings, exact manual values and real Bash reservation hooks work"
     "Exit 0 means true; a normal nonzero exit means false.",
   );
   await expect(page.locator(".hardware-status-editor").first()).toContainText(
-    "existing directory within a CloudX allowed root",
+    "The working directory defaults to /. Other directories must exist inside a CloudX allowed root.",
   );
   await label(page, "Up status command").fill("true");
   await label(page, "Up status command working directory").fill(lab.root);

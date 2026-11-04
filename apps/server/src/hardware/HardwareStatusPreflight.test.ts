@@ -47,13 +47,50 @@ async function settled(service: HardwareService, receipt: OperationReceipt): Pro
 }
 
 describe("Hardware script directory preflight", () => {
+  it.each(["create", "update"])("saves root-cwd scripts on %s and runs the status and both hooks in root", async mode => {
+    const f = await fixture();
+    const script = (name: string) => ({ ...f.script("/"), source: `pwd -P > '${path.join(f.root, name)}'` });
+    const patch = { statuses: [{ ...f.status("/"), script: script("status-cwd") }], hooks: { beforeReserve: script("before-reserve-cwd"), onRelease: script("on-release-cwd") } };
+    let item: HardwareItem;
+    if (mode === "create") item = await f.create(patch);
+    else { item = await f.create(); await f.update(item, patch); item = (await f.service.snapshot(owner)).items[0].item; }
+    for (const name of ["status-cwd", "before-reserve-cwd", "on-release-cwd"]) await expect(fs.stat(path.join(f.root, name))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await f.refresh(item)).state).toBe("succeeded");
+    expect((await f.service.snapshot(owner)).items[0].observations).toMatchObject([{ state: "known", value: true }]);
+    const reserved = await f.mutate("hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Run root-cwd hooks" });
+    expect((await settled(f.service, reserved.receipt)).state).toBe("succeeded");
+    const claim = (await f.service.snapshot(owner)).reservations[0]; expect(claim.state).toBe("active");
+    const released = await f.mutate("hardware.release", { reservationId: claim.reservationId, generation: claim.generation });
+    expect((await settled(f.service, released.receipt)).state).toBe("succeeded");
+    for (const name of ["status-cwd", "before-reserve-cwd", "on-release-cwd"]) expect(await fs.readFile(path.join(f.root, name), "utf8")).toBe("/\n");
+    expect((await f.service.snapshot(owner)).reservations).toEqual([]);
+  });
+
   it.each(["status", "beforeReserve", "onRelease"] as const)("rejects a forbidden %s directory on create and update without executing", async kind => {
     const f = await fixture();
-    const patch = kind === "status" ? { statuses: [f.status("/")] } : { hooks: { [kind]: f.script("/") } };
+    const patch = kind === "status" ? { statuses: [f.status("/etc")] } : { hooks: { [kind]: f.script("/etc") } };
     await expect(f.create(patch)).rejects.toMatchObject({ code: "INVALID_INPUT", message: expect.stringContaining("working directory") });
     expect((await f.service.snapshot(owner)).items).toEqual([]);
     const item = await f.create();
     await expect(f.update(item, patch)).rejects.toMatchObject({ code: "INVALID_INPUT", message: expect.stringContaining("working directory") });
+    expect((await f.service.snapshot(owner)).items[0].item).toEqual(item);
+    await expect(fs.stat(path.join(f.root, "dispatched"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["/./", "//", "/..", "/ ", " /", ".", "../", ""])("does not admit the root alias or relative cwd %j on create or update", async cwd => {
+    const f = await fixture(), patch = { statuses: [f.status(cwd)] };
+    await expect(f.create(patch)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const item = await f.create();
+    await expect(f.update(item, patch)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect((await f.service.snapshot(owner)).items[0].item).toEqual(item);
+    await expect(fs.stat(path.join(f.root, "dispatched"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps a workspace symlink to root subject to the custom path policy", async () => {
+    const f = await fixture(), cwd = path.join(f.root, "root-link"); await fs.symlink("/", cwd);
+    await expect(f.create({ statuses: [f.status(cwd)] })).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    const item = await f.create();
+    await expect(f.update(item, { statuses: [f.status(cwd)] })).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect((await f.service.snapshot(owner)).items[0].item).toEqual(item);
     await expect(fs.stat(path.join(f.root, "dispatched"))).rejects.toMatchObject({ code: "ENOENT" });
   });

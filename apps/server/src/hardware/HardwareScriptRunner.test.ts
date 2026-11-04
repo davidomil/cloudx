@@ -16,6 +16,16 @@ async function fixture() {
 }
 
 describe("bounded Hardware Bash execution", () => {
+  it("runs in the literal root directory without admitting root to the general path policy", async () => {
+    const { root, script } = await fixture();
+    const pathPolicy = new PathPolicy([root]);
+    const runner = new HardwareScriptRunner({ pathPolicy });
+    await expect(pathPolicy.ensureDirectory("/", false)).rejects.toThrow();
+    expect(await runner.run({ ...script, cwd: "/", source: "pwd -P" }, {}, new AbortController().signal)).toMatchObject({ state: "completed", exitCode: 0, stdout: "/\n", cleanupConfirmed: true });
+    await expect(pathPolicy.ensureDirectory("/", false)).rejects.toThrow();
+    await expect(pathPolicy.ensureDirectory("/etc", false)).rejects.toThrow();
+  });
+
   it("passes structured context on stdin, isolates inherited environment, and uses pipefail", async () => {
     const { runner, script } = await fixture();
     process.env.HARDWARE_TEST_PRIVATE = "private-parent-value";
