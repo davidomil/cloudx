@@ -547,7 +547,7 @@ async function startServer() {
           () => 0,
         );
       },
-      { timeout: 10_000, intervals: [100] },
+      { timeout: test.info().timeout, intervals: [100] },
     )
     .toBe(200);
 }
