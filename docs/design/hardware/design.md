@@ -38,7 +38,9 @@ Status commands run on the CloudX host under its configured execution policy. Th
 
 ## Discover, reserve, inspect, use, release
 
-The default agent workflow has seven steps.
+The default agent workflow for registered hardware has seven steps. If the user requests hardware that is not managed by the plugin, ordinary SSH, UART, or host tools can be used without registration, a Hardware reservation, or the helper. Existing host controls and higher-priority instructions still apply.
+
+Use the complete inventory and known physical aliases when checking whether a target is managed. Disabled, held, ineligible, or unavailable entries remain managed. A failed lookup, missing helper, denied reservation, or unknown outcome does not prove that a target is unmanaged or permit bypassing a managed hold.
 
 1.  Read the hardware helper’s current execution context.
 2.  List tags, types, and status definitions. Search the inventory with explicit filters.

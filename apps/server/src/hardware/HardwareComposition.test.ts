@@ -98,6 +98,33 @@ describe("Hardware production composition", () => {
     expect(state.json().readiness.state).toBe("ready");
   });
 
+  it("allows requested unmanaged hardware in the installed guidance while retaining managed access controls", async () => {
+    const { services } = await fixture();
+    const catalog = await services.pluginContributionsReady!;
+    const rule = catalog.systemRules.find(rule => rule.id === "hardware-access-policy")!;
+    const skills = catalog.systemSkills.filter(skill => skill.id.startsWith("hardware-"));
+    expect(skills).toHaveLength(4);
+    const instructions = await Promise.all(skills.map(skill => fs.readFile(path.join(services.rulesSkills!.catalogRoot(), "system-skills", skill.id, "SKILL.md"), "utf8")));
+    for (const text of [rule.text, ...instructions]) {
+      expect(text).toContain("For hardware not managed by the plugin, use ordinary SSH, UART, or host tools when the user requests it.");
+      expect(text).toContain("No Hardware registration, reservation, or helper is required for that unmanaged hardware.");
+      expect(text).toContain("complete inventory");
+      expect(text).toContain("known physical aliases");
+      expect(text).toContain("Registered items remain managed when disabled, held, ineligible, or unavailable.");
+      expect(text).toContain("A missing helper or failed lookup does not prove that a target is unmanaged.");
+      expect(text).toContain("Do not treat a denied reservation or an unknown outcome as permission for raw access to managed hardware.");
+    }
+    expect(rule.text).toContain("reserve a suitable item exclusively");
+    expect(rule.text).toContain("Use the exact reservation generation for managed access");
+    expect(rule.text).toContain("reread all notes");
+    for (const text of instructions) {
+      expect(text).toContain("If managed access is needed and the helper is unavailable, deliberately relaunch the AI tab");
+      expect(text).not.toContain("If unavailable, deliberately relaunch the AI tab");
+      expect(text).toContain("Unknown effects retain the claim");
+      expect(text).toContain("A changed execution or attempt cannot inherit a claim");
+    }
+  });
+
   it("persists management edits through actual routes and returns field errors without resetting state", async () => {
     const { app, root } = await fixture();
     const item = await createReadySsh(app, root);

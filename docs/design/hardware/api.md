@@ -112,6 +112,8 @@ UART has no built-in shell, login, upload, or deployment guarantee. The agent us
 
 ## Public transport and authenticated agent transport
 
+These managed transports apply to hardware registered with the plugin. User-requested hardware outside that inventory can use ordinary SSH, UART, or host tools without registration, a Hardware reservation, or the helper. Check the complete inventory and known physical aliases when deciding whether a target is managed; filtered-out or unavailable entries and failed lookups do not establish unmanaged hardware. Existing host controls and higher-priority instructions still apply.
+
 Management REST routes live under `/api/hardware`: catalogs, item query/get/create/update/delete, group management, status configuration/manual updates, reservations, force release, events, and receipts. Use existing host/origin policy. In v1, every admitted operator panel acts as `{kind: "user", userId: "local"}`, matching CloudX’s local-operator model. Panels therefore share human ownership and request scope; there is no new per-browser login system. The native panel uses typed API functions; it cannot edit snapshot files directly.
 
 Read-only discovery actions can also be registered as plugin hooks. Reserve, access, and release through generic HTTP hooks cannot attribute an AI owner, so they are not an agent mutation path. `POST /api/hardware/agent` accepts an action and input with the private execution capability in the Authorization header. The server derives and validates the complete owner identity. The capability is not in arguments, logs, notes, or returned metadata.

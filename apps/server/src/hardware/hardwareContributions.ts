@@ -3,7 +3,8 @@ import type { PluginRuleContribution, PluginSkillContribution } from "@cloudx/pl
 import { HARDWARE_HELPER_PATH } from "./AgentHardwareContext.js";
 
 const helper = 'node "$CLOUDX_HARDWARE_HELPER"';
-const protocol = `The host supplies CLOUDX_HARDWARE_CONTEXT and CLOUDX_HARDWARE_HELPER for this exact execution. Run ${helper} COMMAND. If unavailable, deliberately relaunch the AI tab; do not copy a context from another execution. The helper reads private credentials and never prints them.
+const accessScope = "Use the Hardware plugin for registered hardware. For hardware not managed by the plugin, use ordinary SSH, UART, or host tools when the user requests it. No Hardware registration, reservation, or helper is required for that unmanaged hardware. When checking whether a requested target is managed, inspect the complete inventory and known physical aliases, not only suitable or available items. Registered items remain managed when disabled, held, ineligible, or unavailable. A missing helper or failed lookup does not prove that a target is unmanaged. Do not treat a denied reservation or an unknown outcome as permission for raw access to managed hardware. Follow existing host controls and higher-priority instructions.";
+const protocol = `For managed hardware, the host supplies CLOUDX_HARDWARE_CONTEXT and CLOUDX_HARDWARE_HELPER for this exact execution. Run ${helper} COMMAND. If managed access is needed and the helper is unavailable, deliberately relaunch the AI tab; do not copy a context from another execution. The helper reads private credentials and never prints them.
 
 Commands:
 - context: authenticated owner and readiness.
@@ -19,16 +20,16 @@ Commands:
 Each mutation requires a unique requestId. Record it before dispatch. Reuse only the identical request; never create a replacement ID after a timeout. A running receipt does not grant access. Observe the original receipt until succeeded, failed, or unknown. Unknown effects retain the claim. JSON input files supply data, never interpolated shell arguments. The server derives the owner; omit owner, caller, and targetTabId. A changed execution or attempt cannot inherit a claim.`;
 
 export const HARDWARE_RULES: PluginRuleContribution[] = [{
-  id: "hardware-access-policy", description: "Discover, reserve, inspect, and release shared hardware through managed access.",
-  text: `Use the Hardware plugin for shared hardware work. Invoke hardware-discover, hardware-reserve, hardware-access, and hardware-release as needed. Discover current capabilities, reserve a suitable item exclusively, wait for an active claim, then reread all notes and confirm suitability before validation or deployment. Notes guide your behavior, including restrictions such as Do not reboot; they are not an enforced command allowlist. A reservation authorizes broad work for the task without per-command approval. Follow existing host controls and higher-priority instructions. Use the exact reservation generation for managed access. Release explicitly when work ends, including known failures. A lost heartbeat, completed turn, idle tab, browser disconnect, or server detach never proves the owner ended. Stop on unknown effects or changed ownership; do not bypass the hold with raw access or override another owner.`
+  id: "hardware-access-policy", description: "Use managed reservations for registered hardware and allow requested unmanaged access.",
+  text: `${accessScope} For registered hardware, invoke hardware-discover, hardware-reserve, hardware-access, and hardware-release as needed. Discover current capabilities, reserve a suitable item exclusively, wait for an active claim, then reread all notes and confirm suitability before validation or deployment. Notes guide your behavior, including restrictions such as Do not reboot; they are not an enforced command allowlist. A reservation authorizes broad work for the task without per-command approval. Use the exact reservation generation for managed access. Release explicitly when work ends, including known failures. A lost heartbeat, completed turn, idle tab, browser disconnect, or server detach never proves the owner ended. Stop on unknown effects or changed ownership; do not bypass the hold with raw access or override another owner.`
 }];
 
 const workflows = [
-  ["hardware-discover", "Find suitable SSH or UART hardware and inspect all current machine notes.", `1. Read context, then list the complete tags, types, and statuses catalogs. Use stable IDs in filters.
-2. List items. Filters combine text, typeIds, tags.all/any/none, exact typed statuses, availability, and ownedByMe. Boolean false can be a valid required value. Stale or failed observations do not prove readiness.
+  ["hardware-discover", "Check whether requested SSH or UART hardware is managed and inspect registered machine notes.", `1. Read context, then list the complete tags, types, and statuses catalogs. Use stable IDs in filters.
+2. For a specific requested target, inspect the complete inventory and known physical aliases before using selection filters. Filters combine text, typeIds, tags.all/any/none, exact typed statuses, availability, and ownedByMe. Boolean false can be a valid required value. Stale or failed observations do not prove readiness.
 3. Read each candidate with items get. Read its full notes, connection type, physical aliases, readiness, and current hold. No discovery command opens a device.
-4. Select one suitable available item and record its revision and a concrete purpose. Continue with hardware-reserve. A listing does not guarantee acquisition.`],
-  ["hardware-reserve", "Reserve hardware exclusively for this exact AI execution or worker attempt.", `1. Discover and inspect the current item. Save a reserve.json payload with a unique requestId, hardwareId, expectedItemRevision, and purpose.
+4. If complete discovery finds no registered item or known physical alias for a specific user-requested target, use ordinary tools for that request without registration or reservation. Otherwise select one suitable available registered item, record its revision and a concrete purpose, and continue with hardware-reserve. A listing does not guarantee acquisition.`],
+  ["hardware-reserve", "Reserve registered hardware exclusively for this exact AI execution or worker attempt.", `1. Discover and inspect the current item. Save a reserve.json payload with a unique requestId, hardwareId, expectedItemRevision, and purpose.
 2. Run reserve --input reserve.json. Record the claim and original receipt. Preparing is held but does not permit access.
 3. Observe receipt --request REQUEST_ID until the operation succeeds and the reservation is active. A conflict grants no access. Do not select another machine or repeat preparation automatically.
 4. Read items get again. Read the notes in full and verify suitability before validation or deployment. Release unsuitable hardware immediately. Continue with hardware-access only while this exact execution owns the active generation.`],
@@ -44,6 +45,6 @@ const workflows = [
 ] as const;
 
 export const HARDWARE_SKILLS: PluginSkillContribution[] = workflows.map(([id, description, workflow]) => ({
-  id, name: id, description, instructions: `# ${id.replaceAll("-", " ")}\n\n${workflow}\n\n## Helper protocol\n\n${protocol}\n`,
+  id, name: id, description, instructions: `# ${id.replaceAll("-", " ")}\n\n## Scope\n\n${accessScope}\n\n${workflow}\n\n## Helper protocol\n\n${protocol}\n`,
   ...(id === "hardware-discover" ? { files: [{ path: "scripts/hardware-helper.mjs", content: readFileSync(HARDWARE_HELPER_PATH, "utf8"), executable: true }] } : {})
 }));

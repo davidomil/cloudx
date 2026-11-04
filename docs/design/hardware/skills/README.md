@@ -11,7 +11,11 @@ These four SKILL.md files preserve the original design drafts. The built-in Hard
 
 ## Default rule: hardware-access-policy
 
-For hardware validation, deployment, or machine access, use the Hardware plugin workflow. Read this execution's context. Discover suitable hardware, reserve it, read its current notes, confirm suitability, perform the authorized work, and release it. Do not use hardware held by another owner. Do not bypass a denied or unknown claim through raw host tools.
+Use the Hardware plugin workflow for registered hardware. If the user requests hardware that is not managed by the plugin, use ordinary SSH, UART, or host tools without registration, a Hardware reservation, or the helper. Existing host controls and higher-priority instructions still apply.
+
+Check the complete inventory and known physical aliases when deciding whether a requested target is managed. Disabled, held, ineligible, or unavailable entries remain managed. A missing helper, failed lookup, denied reservation, or unknown outcome does not prove that a target is unmanaged.
+
+For registered hardware, read this execution's context. Discover suitable hardware, reserve it, read its current notes, confirm suitability, perform the authorized work, and release it. Do not use hardware held by another owner. Do not bypass a denied or unknown claim through raw host tools.
 
 A reservation permits broad work for the task without a new per-command approval from the plugin. Follow machine-specific notes, including restrictions such as Do not reboot. Those restrictions are agent guidance and are not enforced by a server policy parser. Existing higher-level instructions and host controls still apply.
 
