@@ -1,17 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
 import {
-  COOPERATION_LIMITS, boundsIntersect, connectionIntersectsRegion, cooperationActor, isCooperationId, itemBounds,
+  COOPERATION_LIMITS, boundsIntersect, connectionIntersectsRegion, cooperationActor, isCooperationFileName, isCooperationId, itemBounds,
   type CooperationAssignment, type CooperationAsset, type CooperationBoard, type CooperationBoardSummary,
-  type CooperationCaller, type CooperationEvent, type CooperationHostTab, type CooperationInboxEvent, type CooperationItem,
-  type CooperationOperation, type CooperationPrecondition, type CooperationReceipt, type CooperationRecordKind,
+  type CooperationCaller, type CooperationEvent, type CooperationHostTab, type CooperationImageAsset, type CooperationInboxEvent, type CooperationItem,
+  type CooperationOperation, type CooperationPrecondition, type CooperationReceipt, type CooperationRecordKind, type CooperationRegion,
   type CooperationTarget, type CooperationTransaction, type CooperationTurnCompletion
 } from "@cloudx/shared";
-import systemDesign from "./templates/system-design.json" with { type: "json" };
-import decisionReview from "./templates/decision-review.json" with { type: "json" };
-import sketchWip from "./templates/sketch-wip.json" with { type: "json" };
 import { BoardFileProjection, boardMarkdown } from "./BoardFileProjection.js";
 import { BoardUndoHistory } from "./BoardUndoHistory.js";
 import { validateBlackboardAudit } from "./BlackboardAuditValidation.js";
@@ -105,7 +101,7 @@ export class BlackboardService {
       ...(assignment ? { providerId: assignment.providerId, label: assignment.label } : {}) };
   }
 
-  async createBoard(input: { title: string; template?: string; tab?: CooperationHostTab }, caller = userCaller): Promise<CooperationBoard> {
+  async createBoard(input: { title: string; tab?: CooperationHostTab }, caller = userCaller): Promise<CooperationBoard> {
     this.requireUser(caller);
     this.requireTitle(input.title);
     return this.repository.serialize(async () => {
@@ -115,22 +111,6 @@ export class BlackboardService {
       const board: StoredBoard = { schemaVersion: 1, boardId, title: input.title.trim(), revision: 0, status: "draft", eventCursor: 0,
         items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] };
       try {
-        const templates: Record<string, unknown> = { "system-design": systemDesign, "decision-review": decisionReview, "sketch-wip": sketchWip };
-        if (input.template && input.template !== "blank") {
-          requireCooperation(Object.hasOwn(templates, input.template), "INVALID_REQUEST", "Unknown board template.");
-          const fixture = JSON.parse(JSON.stringify(templates[input.template]), (key, value) => {
-            if (["createdBy", "updatedBy", "author", "ownerActor"].includes(key)) return cooperationActor(caller);
-            if (key === "removedAtBoardRevision") return 0;
-            return value;
-          }) as CooperationBoard;
-          for (const collection of collections) (board[collection] as unknown[]) = fixture[collection];
-          for (const asset of board.assets) {
-            const bytes = await fs.readFile(new URL("../../assets/cooperation/payment-pipeline-sketch.png", import.meta.url));
-            const validated = await this.decodeImage(bytes, asset.mime, asset.id);
-            Object.assign(asset, validated);
-            await this.repository.writeBytes(`boards/${boardId}/${asset.relativePath}`, bytes);
-          }
-        }
         next.boards[boardId] = board;
         next.recentEvents[boardId] = [];
         const touched = new Set([boardId]);
@@ -507,16 +487,16 @@ export class BlackboardService {
 
   completionsForTab(tabId: string): CooperationTurnCompletion[] { this.assertReady(); return structuredClone(this.state.completions.filter(completion => completion.tabId === tabId)); }
 
-  async stageAsset(boardId: string, input: { mime: string; bytes: Buffer }, caller = userCaller) {
+  async stageAsset(boardId: string, input: { mime: string; bytes: Buffer; name?: string }, caller = userCaller) {
     this.validateCaller(caller);
     return this.repository.serialize(async () => {
       this.authorize(this.state, boardId, caller, true);
-      const asset = await this.decodeImage(input.bytes, input.mime, `image-${randomUUID()}`);
+      const asset = await this.describeOriginal(input);
       const current = this.requireBoard(this.state, boardId);
       const staged = Object.values(this.state.stagedAssets).filter(staged => staged.boardId === boardId);
       requireCooperation(current.assets.length + staged.length < COOPERATION_LIMITS.assets &&
-        current.assets.reduce((sum, asset) => sum + asset.byteLength, 0) + staged.reduce((sum, staged) => sum + staged.asset.byteLength, 0) + asset.byteLength <= COOPERATION_LIMITS.boardImageBytes,
-      "LIMIT_EXCEEDED", "The board cannot accept more original images.");
+        current.assets.reduce((sum, asset) => sum + asset.byteLength, 0) + staged.reduce((sum, staged) => sum + staged.asset.byteLength, 0) + asset.byteLength <= COOPERATION_LIMITS.boardAssetBytes,
+      "LIMIT_EXCEEDED", "The board cannot accept more original assets.");
       const token = `stage-${randomUUID()}`;
       await this.repository.writeBytes(`staging/${token}`, input.bytes);
       const next = structuredClone(this.state);
@@ -534,7 +514,7 @@ export class BlackboardService {
     await this.repository.serialize(async () => {
       this.authorize(this.state, boardId, caller, false);
       const staged = own(this.state.stagedAssets, token);
-      requireCooperation(staged && staged.boardId === boardId && staged.actor === callerKey(caller), "ASSET_INVALID", "The staged image does not belong to this caller.");
+      requireCooperation(staged && staged.boardId === boardId && staged.actor === callerKey(caller), "ASSET_INVALID", "The staged original does not belong to this caller.");
       const next = structuredClone(this.state); delete next.stagedAssets[token];
       await this.commit(next, new Set(), "staged");
     });
@@ -544,10 +524,10 @@ export class BlackboardService {
     return this.repository.serialize(async () => {
       const board = this.getBoard(boardId, caller);
       const asset = board.assets.find(asset => asset.id === assetId);
-      requireCooperation(asset, "ASSET_INVALID", "The original image is not on this board.");
+      requireCooperation(asset, "ASSET_INVALID", "The original asset is not on this board.");
       const relative = `boards/${boardId}/${asset.relativePath}`;
       const bytes = await this.repository.readBytes(relative);
-      requireCooperation(bytes.length === asset.byteLength && digestBytes(bytes) === asset.sha256, "INTEGRITY_ERROR", "The original image differs from its committed manifest.");
+      requireCooperation(bytes.length === asset.byteLength && digestBytes(bytes) === asset.sha256, "INTEGRITY_ERROR", "The original differs from its committed manifest.");
       return { asset, localPath: this.repository.resolve(relative), bytes };
     });
   }
@@ -575,7 +555,7 @@ export class BlackboardService {
     switch (operation.kind) {
       case "createItem": {
         this.requireFreshRecord(state, board, operation.item.id);
-        requireCooperation(operation.item.kind !== "image", "ASSET_INVALID", "Use attachAsset to add an original image and its item atomically.");
+        requireCooperation(operation.item.kind !== "image" && operation.item.kind !== "file", "ASSET_INVALID", "Use attachAsset to add an original asset and its item atomically.");
         board.items.push({ ...structuredClone(operation.item), revision: 1, createdBy: actor, updatedBy: actor } as CooperationItem);
         break;
       }
@@ -626,24 +606,27 @@ export class BlackboardService {
         board.connections = board.connections.filter(record => record.id !== edge.id); break;
       }
       case "createRegion":
-        this.requireUser(caller);
         this.requireFreshRecord(state, board, operation.region.id);
+        for (const id of operation.region.protectedItemIds) requireRecord("item", board.items, id);
         board.regions.push({ ...structuredClone(operation.region), revision: 1, ownerActor: actor }); break;
       case "updateRegion": {
-        this.requireUser(caller);
         const region = requireRecord("region", board.regions, operation.regionId);
+        this.requireRegionOwner(region, caller);
+        if (operation.patch.protectedItemIds) for (const id of new Set([...region.protectedItemIds, ...operation.patch.protectedItemIds])) requireRecord("item", board.items, id);
         Object.assign(region, structuredClone(operation.patch), { revision: region.revision + 1 }); break;
       }
       case "markRegionReady": {
-        this.requireUser(caller);
         const region = requireRecord("region", board.regions, operation.regionId);
+        this.requireRegionOwner(region, caller);
+        requireCooperation(caller.kind === "user" || operation.recipientTabId === undefined, "FORBIDDEN", "Only the user can address a Ready event to an AI tab.");
         requireCooperation(region.mode === "wip", "INVALID_REQUEST", "Only a work-in-progress region can become ready.");
         region.mode = "ready"; region.revision++;
-        this.enqueueFeedback(state, board, "ready", { kind: "region", id: region.id }, caller, operation.recipientTabId); break;
+        if (caller.kind === "user") this.enqueueFeedback(state, board, "ready", { kind: "region", id: region.id }, caller, operation.recipientTabId);
+        break;
       }
       case "deleteRegion": {
-        this.requireUser(caller);
         const region = requireRecord("region", board.regions, operation.regionId);
+        this.requireRegionOwner(region, caller);
         this.preserveTarget(board, { kind: "region", id: region.id }, region);
         board.regions = board.regions.filter(record => record.id !== region.id); break;
       }
@@ -712,8 +695,9 @@ export class BlackboardService {
       case "attachAsset": {
         this.requireFreshRecord(state, board, operation.item.id);
         const staged = own(state.stagedAssets, operation.stagedToken);
-        requireCooperation(staged && staged.boardId === board.boardId && staged.actor === callerKey(caller) && operation.item.kind === "image" && operation.item.content.assetId === staged.asset.id,
-          "ASSET_INVALID", "Attach the original staged image owned by this caller.");
+        requireCooperation(staged && staged.boardId === board.boardId && staged.actor === callerKey(caller) &&
+          operation.item.kind === (staged.asset.kind === "file" ? "file" : "image") && operation.item.content.assetId === staged.asset.id,
+          "ASSET_INVALID", "Attach a matching original staged asset owned by this caller.");
         board.assets.push(structuredClone(staged.asset));
         board.items.push({ ...structuredClone(operation.item), revision: 1, createdBy: actor, updatedBy: actor });
         delete state.stagedAssets[operation.stagedToken];
@@ -801,19 +785,46 @@ export class BlackboardService {
 
   private enforceWip(before: CooperationBoard, after: CooperationBoard, caller: CooperationCaller): void {
     if (caller.kind === "user") return;
-    const regions = before.regions.filter(region => region.mode === "wip");
-    const changedItems = new Set(this.recordChanges(before, after).filter(change => change.collection === "items").map(change => change.id));
-    const affectedEdges = new Set(this.recordChanges(before, after).filter(change => change.collection === "connections").map(change => change.id));
-    for (const edge of [...before.connections, ...after.connections]) if (changedItems.has(edge.from.itemId) || changedItems.has(edge.to.itemId)) affectedEdges.add(edge.id);
-    for (const region of regions) {
-      for (const item of [...before.items, ...after.items].filter(item => changedItems.has(item.id))) {
-        requireCooperation(!region.protectedItemIds.includes(item.id) && !boundsIntersect(itemBounds(item), region.geometry), "REGION_PROTECTED", "This scene edit intersects a user work-in-progress region.", { regionId: region.id, targetId: item.id });
-      }
-      for (const snapshot of [before, after]) for (const edge of snapshot.connections.filter(edge => affectedEdges.has(edge.id))) {
-        requireCooperation(!region.protectedItemIds.includes(edge.from.itemId) && !region.protectedItemIds.includes(edge.to.itemId) &&
-          !connectionIntersectsRegion(edge, snapshot.items, region.geometry), "REGION_PROTECTED", "The connector route or label intersects a user work-in-progress region.", { regionId: region.id, targetId: edge.id });
+    const actor = cooperationActor(caller);
+    const regions = before.regions.filter(region => region.mode === "wip" && region.ownerActor !== actor);
+    if (!regions.length) return;
+    const changes = this.recordChanges(before, after);
+    const changedItems = new Set(changes.filter(change => change.collection === "items").map(change => change.id));
+    const changedConnections = new Set(changes.filter(change => change.collection === "connections").map(change => change.id));
+    const placedRegions: CooperationRegion[] = [];
+    for (const change of changes.filter(change => change.collection === "regions")) {
+      const previous = change.before as CooperationRegion | undefined;
+      const proposed = change.after as CooperationRegion | undefined;
+      if (!proposed || proposed.ownerActor !== actor) continue;
+      if (previous) this.requireRegionOwner(previous, caller);
+      const geometryChanged = !previous || (Object.keys(proposed.geometry) as (keyof CooperationRegion["geometry"])[]).some(key => proposed.geometry[key] !== previous.geometry[key]);
+      const oldMembers = new Set(previous?.protectedItemIds);
+      const membershipChanged = oldMembers.size !== proposed.protectedItemIds.length || proposed.protectedItemIds.some(id => !oldMembers.has(id));
+      if (geometryChanged || membershipChanged || previous?.mode !== "wip" && proposed.mode === "wip") placedRegions.push(proposed);
+    }
+    if (!changedItems.size && !changedConnections.size && !placedRegions.length) return;
+    for (const region of regions) for (const snapshot of [before, after]) {
+      const protectedScene = this.protectedScene(snapshot, region);
+      for (const item of protectedScene.items) requireCooperation(!changedItems.has(item.id), "REGION_PROTECTED", "This scene edit changes another participant's work in progress.", { regionId: region.id, targetId: item.id });
+      for (const edge of protectedScene.connections) requireCooperation(!changedConnections.has(edge.id), "REGION_PROTECTED", "This connector belongs to another participant's work in progress.", { regionId: region.id, targetId: edge.id });
+      for (const proposed of placedRegions) {
+        requireCooperation(!boundsIntersect(proposed.geometry, region.geometry) &&
+          protectedScene.items.every(item => !proposed.protectedItemIds.includes(item.id) && !boundsIntersect(itemBounds(item), proposed.geometry)) &&
+          protectedScene.connections.every(edge => !connectionIntersectsRegion(edge, snapshot.items, proposed.geometry)),
+        "REGION_PROTECTED", "This zone would capture another participant's work in progress.", { regionId: region.id, targetId: proposed.id });
       }
     }
+  }
+
+  private protectedScene(board: CooperationBoard, region: CooperationRegion) {
+    const protectedIds = new Set(board.items.filter(item => region.protectedItemIds.includes(item.id) || boundsIntersect(itemBounds(item), region.geometry)).map(item => item.id));
+    const connections = board.connections.filter(edge => protectedIds.has(edge.from.itemId) || protectedIds.has(edge.to.itemId) || connectionIntersectsRegion(edge, board.items, region.geometry));
+    for (const edge of connections) { protectedIds.add(edge.from.itemId); protectedIds.add(edge.to.itemId); }
+    return { items: board.items.filter(item => protectedIds.has(item.id)), connections };
+  }
+
+  private requireRegionOwner(region: CooperationRegion, caller: CooperationCaller): void {
+    requireCooperation(caller.kind === "user" || region.ownerActor === cooperationActor(caller), "FORBIDDEN", "Agents can manage only their own zones.");
   }
 
   private preserveTarget(board: StoredBoard, target: CooperationTarget, record: CooperationItem | CooperationBoard["connections"][number] | CooperationBoard["regions"][number] | CooperationBoard["threads"][number]["messages"][number]): void {
@@ -835,13 +846,13 @@ export class BlackboardService {
   }
 
   private enqueueFeedback(state: BlackboardState, board: StoredBoard, kind: CooperationInboxEvent["kind"], target: CooperationTarget, caller: CooperationCaller, recipientTabId?: string | null, reactionId?: string, threadId?: string): void {
-    const authorRecord = targetRecord(boardSnapshot(state, board.boardId), target);
+    const authorRecord = targetRecord(boardSnapshot(state, board.boardId), target) ?? target.snapshot?.record;
     const targetRevision = authorRecord && "revision" in authorRecord ? authorRecord.revision : 1;
     const event: CooperationInboxEvent = { eventId: `feedback-${randomUUID()}`, sequence: board.eventCursor + 1, boardId: board.boardId,
       boardRevision: board.revision + 1, kind, author: cooperationActor(caller), target: structuredClone(target), state: "needsResponder", createdAt: this.now(),
       targetRevision,
       ...(reactionId ? { reactionId } : {}), ...(threadId ? { threadId } : {}) };
-    const author = authorRecord && ("createdBy" in authorRecord ? authorRecord.createdBy : "author" in authorRecord ? authorRecord.author : undefined);
+    const author = authorRecord && ("createdBy" in authorRecord ? authorRecord.createdBy : "ownerActor" in authorRecord ? authorRecord.ownerActor : "author" in authorRecord ? authorRecord.author : undefined);
     const authorTabId = author?.startsWith("agent:") ? author.slice(6) : undefined;
     const authorMember = authorTabId ? own(state.assignments, authorTabId) : undefined;
     const responder = Object.values(state.assignments).find(assignment => assignment.boardId === board.boardId && assignment.role === "responder");
@@ -864,7 +875,7 @@ export class BlackboardService {
       requireCooperation(event && event.state === "claimed" && event.recipientTabId === caller.tabId && event.assignmentGeneration === caller.assignmentGeneration && event.claim?.attemptId === caller.attemptId,
         "ASSIGNMENT_CHANGED", "Claim the addressed feedback in this attempt before answering.");
       const answersThread = event.threadId && transaction.operations.some(operation => operation.kind === "appendThreadMessage" && operation.threadId === event.threadId);
-      const answersReady = event.kind === "ready" && transaction.operations.some(operation => ["createItem", "updateItem", "createConnection", "updateConnection"].includes(operation.kind));
+      const answersReady = event.kind === "ready" && transaction.operations.some(operation => ["createItem", "updateItem", "attachAsset", "createConnection", "updateConnection"].includes(operation.kind));
       requireCooperation(answersThread || answersReady, "INVALID_REQUEST", "The transaction must answer at the feedback target.");
       if (event.kind === "ready") {
         const region = this.requireBoard(state, event.boardId).regions.find(region => region.id === event.target.id);
@@ -957,7 +968,7 @@ export class BlackboardService {
     try {
       for (const staged of attached) {
         const bytes = await this.repository.readBytes(`staging/${staged.token}`);
-        requireCooperation(digestBytes(bytes) === staged.asset.sha256, "ASSET_INVALID", "The staged original changed before attachment.");
+        requireCooperation(bytes.length === staged.asset.byteLength && digestBytes(bytes) === staged.asset.sha256, "ASSET_INVALID", "The staged original changed before attachment.");
         const relative = `boards/${staged.boardId}/${staged.asset.relativePath}`;
         await this.repository.writeBytes(relative, bytes); written.push(relative);
       }
@@ -991,7 +1002,7 @@ export class BlackboardService {
       this.notify({ boardId, reason, event: own(next.recentEvents, boardId)?.at(-1) });
     }
     if (failedBoards.length) throw new CooperationError("COMMITTED_PROJECTION_UNAVAILABLE", "The state committed, but board files could not be published. Read the receipt and repair publication before writing.", { ...(receipt ? { receipt } : {}), boardId: failedBoards[0], boardIds: failedBoards });
-    if (cleanupFailures.length) throw new CooperationError("INTEGRITY_ERROR", "The state committed, but cancelled image staging files could not be removed.", { committed: true, cleanupRequired: cleanupFailures });
+    if (cleanupFailures.length) throw new CooperationError("INTEGRITY_ERROR", "The state committed, but cancelled asset staging files could not be removed.", { committed: true, cleanupRequired: cleanupFailures });
   }
 
   private validateState(state: BlackboardState): void {
@@ -1042,7 +1053,18 @@ export class BlackboardService {
     }
   }
 
-  private async decodeImage(bytes: Buffer, mime: string, assetId: string): Promise<CooperationAsset> {
+  private async describeOriginal(input: { mime: string; bytes: Buffer; name?: string }): Promise<CooperationAsset> {
+    requireCooperation(typeof input.mime === "string" && input.mime.length <= 127, "ASSET_INVALID", "Use a bounded MIME type without parameters.");
+    const mime = input.mime.toLowerCase();
+    requireCooperation(/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mime), "ASSET_INVALID", "Use a bounded MIME type without parameters.");
+    if (["image/png", "image/jpeg", "image/webp"].includes(mime)) return this.decodeImage(input.bytes, mime, `image-${randomUUID()}`);
+    requireCooperation(Buffer.isBuffer(input.bytes) && input.bytes.length <= COOPERATION_LIMITS.fileBytes, "ASSET_INVALID", "The original file exceeds its byte budget.");
+    requireCooperation(isCooperationFileName(input.name), "ASSET_INVALID", "Use a bounded original file name without directories or control characters.");
+    const id = `file-${randomUUID()}`;
+    return { kind: "file", id, name: input.name, mime, sha256: digestBytes(input.bytes), byteLength: input.bytes.length, relativePath: `assets/${id}.bin` };
+  }
+
+  private async decodeImage(bytes: Buffer, mime: string, assetId: string): Promise<CooperationImageAsset> {
     requireCooperation(Buffer.isBuffer(bytes) && bytes.length > 0 && bytes.length <= COOPERATION_LIMITS.imageBytes && ["image/png", "image/jpeg", "image/webp"].includes(mime), "ASSET_INVALID", "Use a bounded PNG, JPEG or WebP original.");
     try {
       const image = sharp(bytes, { limitInputPixels: COOPERATION_LIMITS.imagePixels, failOn: "warning", animated: false });
@@ -1050,7 +1072,7 @@ export class BlackboardService {
       requireCooperation(`image/${metadata.format}` === mime || metadata.format === "jpeg" && mime === "image/jpeg", "ASSET_INVALID", "Declared MIME does not match the decoded original.");
       requireCooperation((metadata.pages ?? 1) === 1 && metadata.width && metadata.height && metadata.width * metadata.height <= COOPERATION_LIMITS.imagePixels, "ASSET_INVALID", "The original must be one bounded image.");
       await image.raw().toBuffer();
-      return { id: assetId, mime: mime as CooperationAsset["mime"], sha256: digestBytes(bytes), byteLength: bytes.length,
+      return { id: assetId, mime: mime as CooperationImageAsset["mime"], sha256: digestBytes(bytes), byteLength: bytes.length,
         width: metadata.width, height: metadata.height, relativePath: `assets/${assetId}.${mime === "image/jpeg" ? "jpg" : mime.slice(6)}` };
     } catch (error) {
       if (error instanceof CooperationError) throw error;
@@ -1079,7 +1101,7 @@ export class BlackboardService {
   private assertReady() { requireCooperation(this.ready, "INTEGRITY_ERROR", "The cooperation service has not finished validating saved state."); }
   private requireId(id: unknown): asserts id is string { requireCooperation(isCooperationId(id), "INVALID_REQUEST", "Use a valid stable record ID."); }
   private requireTitle(title: unknown): asserts title is string { requireCooperation(typeof title === "string" && title.trim().length > 0 && title.length <= 200, "INVALID_REQUEST", "A title must contain 1 to 200 characters."); }
-  private requireUser(caller: CooperationCaller) { this.validateCaller(caller); requireCooperation(caller.kind === "user", "FORBIDDEN", "Blackboard management and draft protection belong to the user."); }
+  private requireUser(caller: CooperationCaller) { this.validateCaller(caller); requireCooperation(caller.kind === "user", "FORBIDDEN", "This blackboard management action requires the user."); }
   private validateCaller(caller: CooperationCaller) {
     requireCooperation(caller && (caller.kind === "user" || caller.kind === "agent"), "FORBIDDEN", "A verified caller is required.");
     this.requireId(caller.kind === "user" ? caller.userId : caller.tabId);

@@ -6,6 +6,9 @@ import { CooperationError, requireCooperation } from "../cooperation/Cooperation
 import type { AgentCooperationContext } from "../cooperationAgent/AgentCooperationContext.js";
 import type { CooperationFeedbackDelivery } from "../cooperationAgent/CooperationFeedbackDelivery.js";
 import type { SessionStore } from "../sessionStore.js";
+import { sendCooperationAsset } from "./CooperationAssetResponse.js";
+
+const assetUploadBytes = Math.ceil(COOPERATION_LIMITS.fileBytes / 3) * 4 + 2048;
 
 export interface CooperationRouteServices {
   boards: BlackboardService;
@@ -46,9 +49,9 @@ export async function registerCooperationRoutes(app: FastifyInstance, services: 
 
     scope.get("/api/cooperation/boards", () => boards.listBoards());
     scope.post("/api/cooperation/boards", async request => {
-      const body = fields(request.body, ["title", "template", "tabId"]);
+      const body = fields(request.body, ["title", "tabId"]);
       const tab = body.tabId === undefined ? undefined : cooperationHostTab(sessions, text(body.tabId));
-      const board = await boards.createBoard({ title: text(body.title), ...(body.template === undefined ? {} : { template: text(body.template) }), ...(tab ? { tab } : {}) });
+      const board = await boards.createBoard({ title: text(body.title), ...(tab ? { tab } : {}) });
       if (tab) await contexts.prepare(tab.tabId);
       return board;
     });
@@ -82,17 +85,16 @@ export async function registerCooperationRoutes(app: FastifyInstance, services: 
       requireCooperation(isRecord(request.body) && request.body.boardId === request.params.boardId, "INVALID_REQUEST", "The transaction must target this board.");
       return boards.apply(request.body as unknown as CooperationTransaction, { kind: "user", userId: "local" });
     });
-    scope.post<{ Params: { boardId: string } }>("/api/cooperation/boards/:boardId/assets", { bodyLimit: 14 * 1024 * 1024 }, async request => {
-      const body = fields(request.body, ["mime", "base64"]);
-      const base64 = text(body.base64);
-      requireCooperation(base64.length <= Math.ceil(COOPERATION_LIMITS.imageBytes / 3) * 4 && base64.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(base64), "ASSET_INVALID", "The image must contain bounded canonical base64 bytes.");
-      const bytes = Buffer.from(base64, "base64");
-      requireCooperation(bytes.toString("base64") === base64, "ASSET_INVALID", "The image encoding is not canonical base64.");
-      return boards.stageAsset(request.params.boardId, { mime: text(body.mime), bytes });
+    scope.post<{ Params: { boardId: string } }>("/api/cooperation/boards/:boardId/assets", { bodyLimit: assetUploadBytes }, async request => {
+      return boards.stageAsset(request.params.boardId, assetInput(fields(request.body, ["mime", "base64", "name"])));
     });
-    scope.get<{ Params: { boardId: string; assetId: string } }>("/api/cooperation/boards/:boardId/assets/:assetId", async (request, reply) => {
-      const { asset, bytes } = await boards.resolveAsset(request.params.boardId, request.params.assetId);
-      return reply.header("x-content-type-options", "nosniff").type(asset.mime).send(bytes);
+    scope.get<{ Params: { boardId: string; assetId: string }; Querystring: { download?: string } }>("/api/cooperation/boards/:boardId/assets/:assetId", async (request, reply) => {
+      requireCooperation(request.query.download === undefined || request.query.download === "1", "INVALID_REQUEST", "Use download=1 to save an original file.");
+      const ifRange = request.headers["if-range"];
+      requireCooperation(ifRange === undefined || typeof ifRange === "string", "INVALID_REQUEST", "Use one If-Range validator.");
+      return sendCooperationAsset(reply, await boards.resolveAsset(request.params.boardId, request.params.assetId), {
+        method: request.method, range: request.headers.range, ifRange, download: request.query.download === "1"
+      });
     });
     scope.delete<{ Params: { boardId: string; stagedToken: string } }>("/api/cooperation/boards/:boardId/staged-assets/:stagedToken", async request => {
       await boards.discardStagedAsset(request.params.boardId, request.params.stagedToken);
@@ -127,16 +129,24 @@ export async function registerCooperationRoutes(app: FastifyInstance, services: 
       return { events: boards.inbox(request.params.boardId) };
     });
 
+    scope.post("/api/cooperation/agent/assets", { bodyLimit: assetUploadBytes }, async request => {
+      const body = fields(request.body, ["tabId", "boardId", "assignmentGeneration", "mime", "base64", "name"]);
+      const caller = await contexts.authenticate(agentRequest(body, request.headers.authorization));
+      requireCooperation(typeof body.boardId === "string", "UNASSIGNED", "This AI tab is not assigned to a blackboard.");
+      const nativeCaller = currentNativeCaller(caller, body.boardId, services.feedback);
+      return boards.stageAsset(body.boardId, assetInput(body), nativeCaller);
+    });
+
     scope.post("/api/cooperation/agent", { bodyLimit: 272 * 1024 }, async request => {
-      const body = fields(request.body, ["action", "tabId", "boardId", "assignmentGeneration", "format", "itemId", "assetId", "eventId", "transaction", "operationId", "completion"]);
-      requireCooperation(isCooperationId(body.tabId) && (body.boardId === null || isCooperationId(body.boardId)) && Number.isSafeInteger(body.assignmentGeneration), "INVALID_REQUEST", "Read the current per-tab cooperation context.");
-      const caller = await contexts.authenticate({ tabId: body.tabId, boardId: body.boardId, assignmentGeneration: Number(body.assignmentGeneration), capability: request.headers.authorization?.replace(/^Bearer /, "") ?? "" });
+      const body = fields(request.body, ["action", "tabId", "boardId", "assignmentGeneration", "format", "itemId", "assetId", "stagedToken", "eventId", "transaction", "operationId", "completion"]);
+      const identity = agentRequest(body, request.headers.authorization);
+      const caller = await contexts.authenticate(identity);
       if (body.action === "context") {
         const metadata = boards.metadataForTab(caller.tabId);
         return { ...metadata, ...(metadata.boardId ? await boards.readBoard(metadata.boardId, caller).then(({ board, jsonPath, markdownPath, projectionHash }) => ({ status: board.status, boardRevision: board.revision, eventCursor: board.eventCursor, jsonPath, markdownPath, projectionHash })) : {}), providerId: caller.providerId,
           currentTurn: services.feedback?.currentTurn(caller.tabId), turnStatus: services.feedback?.turnStatus(caller.tabId) };
       }
-      requireCooperation(body.boardId, "UNASSIGNED", "This AI tab is not assigned to a blackboard.");
+      requireCooperation(isCooperationId(body.boardId), "UNASSIGNED", "This AI tab is not assigned to a blackboard.");
       const boardId = body.boardId;
       switch (body.action) {
         case "read": {
@@ -151,8 +161,12 @@ export async function registerCooperationRoutes(app: FastifyInstance, services: 
         }
         case "asset": {
           const original = await boards.resolveAsset(boardId, text(body.assetId), caller);
-          const { asset, localPath } = await contexts.materializeAsset(caller.tabId, caller.assignmentGeneration, original);
+          const { asset, localPath } = await contexts.materializeAsset(identity, original);
           return { ...asset, localPath };
+        }
+        case "discardAsset": {
+          await boards.discardStagedAsset(boardId, text(body.stagedToken), currentNativeCaller(caller, boardId, services.feedback));
+          return { discarded: true };
         }
         case "inbox": return { events: boards.inbox(boardId, caller) };
         case "claim": return { event: await boards.claimEvent(boardId, text(body.eventId), currentNativeCaller(caller, boardId, services.feedback)) };
@@ -221,6 +235,17 @@ function currentNativeCaller(caller: Extract<CooperationCaller, { kind: "agent" 
 function fields(value: unknown, allowed: string[]): Record<string, unknown> {
   requireCooperation(isRecord(value) && Object.keys(value).every(key => allowed.includes(key)), "INVALID_REQUEST", "The request contains invalid or unknown fields.");
   return value;
+}
+function agentRequest(body: Record<string, unknown>, authorization?: string) {
+  requireCooperation(isCooperationId(body.tabId) && (body.boardId === null || isCooperationId(body.boardId)) && Number.isSafeInteger(body.assignmentGeneration), "INVALID_REQUEST", "Read the current per-tab cooperation context.");
+  return { tabId: body.tabId, boardId: body.boardId, assignmentGeneration: Number(body.assignmentGeneration), capability: authorization?.replace(/^Bearer /, "") ?? "" };
+}
+function assetInput(body: Record<string, unknown>): { mime: string; bytes: Buffer; name?: string } {
+  const base64 = body.base64;
+  requireCooperation(typeof base64 === "string" && base64.length <= Math.ceil(COOPERATION_LIMITS.fileBytes / 3) * 4 && base64.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(base64), "ASSET_INVALID", "The original must contain bounded canonical base64 bytes.");
+  const bytes = Buffer.from(base64, "base64");
+  requireCooperation(bytes.toString("base64") === base64, "ASSET_INVALID", "The original encoding is not canonical base64.");
+  return { mime: text(body.mime), bytes, ...(body.name === undefined ? {} : { name: text(body.name) }) };
 }
 function text(value: unknown): string {
   requireCooperation(typeof value === "string" && value.length > 0, "INVALID_REQUEST", "A nonempty string is required.");

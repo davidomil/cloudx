@@ -45,7 +45,7 @@ test.afterAll(async () => {
   );
 });
 
-async function openFixture(page: Page) {
+async function openFixture(page: Page, healthy = false) {
   const sockets: Record<string, WebSocketRoute[]> = {
     affected: [],
     sibling: [],
@@ -78,10 +78,12 @@ async function openFixture(page: Page) {
       }
     });
   });
-  await page.goto(baseUrl);
-  await expect(
-    page.getByRole("heading", { name: "Native turn failed · Goal blocked" }),
-  ).toBeVisible();
+  await page.goto(`${baseUrl}${healthy ? "?healthy" : ""}`);
+  if (healthy) await expect(page.locator(".codex-native-work")).toHaveCount(0);
+  else
+    await expect(
+      page.getByRole("heading", { name: "Native turn failed · Goal blocked" }),
+    ).toBeVisible();
   return { sockets, input };
 }
 
@@ -218,9 +220,24 @@ test("keeps failure diagnostics and input live, binds restart through tab switch
     goalStatus: "active",
     recoveryStatus: "running",
   });
+  await expect(panel).toHaveCount(0);
+  await page
+    .getByRole("button", {
+      name: "Open native work details for Affected Codex",
+    })
+    .click();
   await expect(panel).toContainText("Waiting for native completion");
   await expect(panel).not.toContainText("Recovery succeeded");
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
   await observe(page, { turnStatus: "completed", recoveryStatus: "succeeded" });
+  await expect(panel).toHaveCount(0);
+  await page
+    .getByRole("button", {
+      name: "Open native work details for Affected Codex",
+    })
+    .click();
   await expect(panel).toContainText(
     "Recovery succeeded: a subsequent native turn completed",
   );
@@ -274,129 +291,96 @@ test("leaves repeated native failure blocked with diagnostics and a deliberate r
   expect(requests).toHaveLength(1);
 });
 
-test("collapses blocked-goal details across refresh, reconnect and tabs while input stays live; new failures reopen", async ({
+test("removes the whole dismissed block across refresh, reconnect and tabs; distinct failures surface again", async ({
   page,
 }) => {
-  const requests: unknown[] = [];
-  await page.route("**/api/tabs/*/recover", (route) => {
-    requests.push(route.request().postDataJSON());
-    return route.fulfill({ json: restoredTab() });
-  });
   const { sockets, input } = await openFixture(page);
-  await observe(page, { turnStatus: "running" });
   const panel = page.getByRole("region", {
     name: "Native work for Affected Codex",
   });
+  await observe(page, { turnStatus: "running" });
   await expect(panel.getByRole("heading")).toHaveText(
     "Native turn running · Goal blocked",
   );
-  await expect(panel).not.toContainText("native work stopped");
   await expect(
     panel.getByRole("button", { name: "Restart this Codex client" }),
   ).toBeDisabled();
-  await expect(panel).toContainText(
-    "After the running turn finishes, enter /goal resume",
-  );
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toHaveAttribute("aria-expanded", "false");
-  await expect(
-    panel.getByText("request-after-http-200", { exact: false }),
-  ).toBeHidden();
+  const terminal = page.locator('[data-tab="affected"] .terminal-panel');
+  const visibleHeight = (await terminal.boundingBox())!.height;
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
+  await expect(panel).toHaveCount(0);
+  expect((await terminal.boundingBox())!.height).toBeGreaterThan(visibleHeight);
   await observe(page, { updatedAt: "2026-10-15T23:00:00Z" });
   await sockets.affected[0].close({ code: 1001 });
   await expect.poll(() => sockets.affected.length).toBe(2);
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toBeVisible();
+  await expect(panel).toHaveCount(0);
   await page
     .getByRole("button", { name: "Working Codex", exact: true })
     .click();
-  const sibling = page.getByRole("region", {
-    name: "Native work for Working Codex",
-  });
-  await expect(
-    sibling.getByRole("button", { name: "Hide native work details" }),
-  ).toBeVisible();
+  await expect(page.locator(".codex-native-work")).toHaveCount(0);
   await page
     .getByRole("button", { name: "Affected Codex", exact: true })
     .click();
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toBeVisible();
-  await page.locator('[data-tab="affected"] .xterm-helper-textarea').focus();
+  await expect(panel).toHaveCount(0);
+  await terminal.locator(".xterm-helper-textarea").focus();
   await page.keyboard.type("continue ordinary work");
   await expect
     .poll(() => input.affected.join(""))
     .toBe("continue ordinary work");
-  expect(requests).toHaveLength(0);
-
-  // Starting an ordinary turn keeps the dismissed failure compact.
+  await page
+    .getByRole("button", {
+      name: "Open native work details for Affected Codex",
+    })
+    .click();
+  await expect(panel).toContainText("request-after-http-200");
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
   await observe(page, { turnStatus: "failed" });
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
-  await observe(page, { turnStatus: "running" });
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toBeVisible();
-  await expect(panel.getByRole("heading")).toHaveText(
-    "Native turn running · Goal blocked",
-  );
-  // The fixture starts failed on reload; dismiss that exact failure first.
-  await observe(page, { turnStatus: "failed" });
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await expect(panel).toBeVisible();
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
   await page.reload();
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toBeVisible();
-  await panel.getByRole("button", { name: "Show native work details" }).click();
-  await expect(
-    panel.getByText("request-after-http-200", { exact: false }),
-  ).toBeVisible();
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await expect(panel).toHaveCount(0);
   await observe(page, {
     turnId: "new-failed-turn",
     lastError: {
       kind: "terminal",
       message: "A new failure after dismissal.",
       requestId: "new-failure",
+      incidentId: "new-incident",
     },
   });
-  await expect(
-    panel.getByRole("button", { name: "Hide native work details" }),
-  ).toBeVisible();
   await expect(panel).toContainText("A new failure after dismissal");
   await expect(
     panel.getByRole("button", { name: "Restart this Codex client" }),
   ).toBeEnabled();
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
   await observe(page, {
-    executionId: "new-execution",
-    turnStatus: "completed",
+    executionId: "healthy-execution",
+    threadId: "healthy-conversation",
+    turnStatus: "running",
     goalStatus: "active",
-    recoveryStatus: "succeeded",
+    lastError: undefined,
   });
-  await expect(panel).toContainText(
-    "Recovery succeeded: a subsequent native turn completed",
-  );
-  await expect(
-    panel.getByRole("button", { name: "Restart this Codex client" }),
-  ).toHaveCount(0);
-  expect(requests).toHaveLength(0);
+  await expect(panel).toHaveCount(0);
 });
 
-test("shows rejected recovery outside collapsed details and distinguishes identical rejected-start incidents", async ({
+test("reopens rejected recovery after dismissal and distinguishes identical rejected-start incidents", async ({
   page,
 }) => {
-  const requests: Array<{ path: string; body: unknown }> = [];
+  const requests: unknown[] = [];
   let release!: () => void;
   const released = new Promise<void>((resolve) => {
     release = resolve;
   });
   await page.route("**/api/tabs/*/recover", async (route) => {
-    requests.push({
-      path: new URL(route.request().url()).pathname,
-      body: route.request().postDataJSON(),
-    });
+    requests.push(route.request().postDataJSON());
     await released;
     await route.fulfill({
       status: 409,
@@ -411,31 +395,19 @@ test("shows rejected recovery outside collapsed details and distinguishes identi
     .getByRole("button", { name: "Restart this Codex client" })
     .click();
   await expect.poll(() => requests.length).toBe(1);
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
+  await expect(panel).toHaveCount(0);
   release();
   await expect(panel.getByRole("alert")).toHaveText(
     "The exact conversation binding became stale.",
   );
-  await expect(panel.getByRole("alert")).toBeVisible();
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toBeVisible();
-  expect(requests).toEqual([
-    {
-      path: "/api/tabs/affected/recover",
-      body: {
-        action: "restart-native",
-        executionId: "affected-execution",
-        sessionId: "exact-conversation",
-      },
-    },
-  ]);
   await page.locator('[data-tab="affected"] .xterm-helper-textarea').focus();
   await page.keyboard.type("inspect rejected recovery");
   await expect
     .poll(() => input.affected.join(""))
     .toBe("inspect rejected recovery");
-
   const sameError = {
     kind: "terminal" as const,
     code: "badRequest",
@@ -444,27 +416,20 @@ test("shows rejected recovery outside collapsed details and distinguishes identi
   await observe(page, {
     lastError: { ...sameError, incidentId: "first-rejected-start" },
   });
-  await expect(
-    panel.getByText(sameError.message, { exact: true }),
-  ).toBeVisible();
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await expect(panel).toContainText(sameError.message);
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
   await observe(page, { updatedAt: "2026-10-16T00:20:00Z" });
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toBeVisible();
+  await expect(panel).toHaveCount(0);
   await observe(page, {
     lastError: { ...sameError, incidentId: "second-rejected-start" },
   });
-  await expect(
-    panel.getByRole("button", { name: "Hide native work details" }),
-  ).toBeVisible();
-  await expect(
-    panel.getByText(sameError.message, { exact: true }),
-  ).toBeVisible();
+  await expect(panel).toContainText(sameError.message);
   expect(requests).toHaveLength(1);
 });
 
-test("clears resolved recovery guidance automatically while preserving history and new-failure attention", async ({
+test("clears resolved automatic presentation while retaining inspectable diagnostics and new-failure attention", async ({
   page,
 }, testInfo) => {
   const { sockets, input } = await openFixture(page);
@@ -476,9 +441,7 @@ test("clears resolved recovery guidance automatically while preserving history a
     goalStatus: "active",
     turnId: "failed-recovery",
   });
-  await expect(
-    panel.getByText("Recovery failed:", { exact: false }),
-  ).toBeVisible();
+  await expect(panel).toContainText("Recovery failed:");
   await observe(page, { turnId: "later-turn", turnStatus: "running" });
   await expect(
     panel.getByRole("button", { name: "Restart this Codex client" }),
@@ -487,34 +450,19 @@ test("clears resolved recovery guidance automatically while preserving history a
     turnStatus: "completed",
     incidentResolvedByTurnId: "later-turn",
   });
-  await expect(panel.getByRole("heading")).toHaveText("Codex native work");
-  await expect(
-    panel.getByRole("button", { name: "Show native work details" }),
-  ).toHaveAttribute("aria-expanded", "false");
-  await expect(
-    panel.getByRole("button", { name: "Restart this Codex client" }),
-  ).toHaveCount(0);
-  await expect(
-    panel.getByText("Restart only this client", { exact: false }),
-  ).toHaveCount(0);
+  await expect(panel).toHaveCount(0);
   await sockets.affected[0].close({ code: 1001 });
   await expect.poll(() => sockets.affected.length).toBe(2);
-  await expect(panel.getByRole("heading")).toHaveText("Codex native work");
-  const evidenceDirectory = path.join(repoRoot, "test-results/issue230");
-  await mkdir(evidenceDirectory, { recursive: true });
-  const screenshot = path.join(
-    evidenceDirectory,
-    `${testInfo.project.name}-resolved.png`,
-  );
-  await page.screenshot({ path: screenshot });
-  await testInfo.attach("resolved-native-incident", {
-    path: screenshot,
-    contentType: "image/png",
+  await expect(panel).toHaveCount(0);
+  await page.screenshot({
+    path: testInfo.outputPath("resolved-native-incident.png"),
   });
-  await panel.getByRole("button", { name: "Show native work details" }).click();
-  await expect(
-    panel.getByText("Previous recovery attempt failed.", { exact: false }),
-  ).toBeVisible();
+  await page
+    .getByRole("button", {
+      name: "Open native work details for Affected Codex",
+    })
+    .click();
+  await expect(panel).toContainText("Previous recovery attempt failed.");
   await panel
     .getByText("Resolved provider incident diagnostics", { exact: true })
     .click();
@@ -526,7 +474,16 @@ test("clears resolved recovery guidance automatically while preserving history a
   await expect
     .poll(() => input.affected.join(""))
     .toBe("continue after successful turn");
-  await panel.getByRole("button", { name: "Hide native work details" }).click();
+  await observe(page, {
+    turnId: "another-success",
+    turnStatus: "completed",
+    incidentResolvedByTurnId: "another-success",
+  });
+  await expect(panel).toBeVisible();
+  await panel
+    .getByRole("button", { name: "Close native work details" })
+    .click();
+  await expect(panel).toHaveCount(0);
   await observe(page, {
     turnId: "new-failure",
     turnStatus: "failed",
@@ -534,9 +491,100 @@ test("clears resolved recovery guidance automatically while preserving history a
   });
   await expect(panel.getByRole("heading")).toHaveText("Native turn failed");
   await expect(
-    panel.getByRole("button", { name: "Hide native work details" }),
-  ).toBeVisible();
-  await expect(
     panel.getByRole("button", { name: "Restart this Codex client" }),
   ).toBeEnabled();
+});
+
+test("healthy fresh and restored tabs have no native header; button and keyboard or touch menu inspect only their exact tab", async ({
+  page,
+}, testInfo) => {
+  const requests: unknown[] = [];
+  await page.route("**/api/tabs/*/recover", (route) => {
+    requests.push(route.request().postDataJSON());
+    return route.abort();
+  });
+  const { input } = await openFixture(page, true);
+  const terminal = page.locator('[data-tab="affected"] .terminal-panel');
+  await expect(terminal).toBeVisible();
+  await expect(
+    page.locator(".codex-native-heading, .codex-native-status"),
+  ).toHaveCount(0);
+  expect((await terminal.boundingBox())!.height).toBeGreaterThan(500);
+  await page.reload();
+  await expect(page.locator(".codex-native-work")).toHaveCount(0);
+  await observe(page, {
+    updatedAt: "2026-10-16T00:30:00Z",
+    goalStatus: "complete",
+  });
+  await expect(page.locator(".codex-native-work")).toHaveCount(0);
+  await page
+    .getByRole("button", {
+      name: "Open native work details for Affected Codex",
+    })
+    .click();
+  const affected = page.getByRole("region", {
+    name: "Native work for Affected Codex",
+  });
+  await expect(affected).toContainText("Native turn: Completed");
+  await page
+    .getByRole("button", { name: "Working Codex", exact: true })
+    .click();
+  await expect(
+    page.locator('[data-tab="sibling"] .xterm-helper-textarea'),
+  ).toBeFocused();
+  await expect(
+    page.getByRole("region", { name: "Native work for Working Codex" }),
+  ).toHaveCount(0);
+  const affectedTab = page.getByRole("button", {
+    name: "Affected Codex",
+    exact: true,
+  });
+  if (testInfo.project.name.startsWith("mobile")) {
+    await affectedTab.dispatchEvent("pointerdown", {
+      pointerType: "touch",
+      clientX: 50,
+      clientY: 20,
+    });
+    await expect(
+      page.getByRole("menuitem", { name: "Open native work details" }),
+    ).toBeVisible();
+    await affectedTab.dispatchEvent("pointerup", { pointerType: "touch" });
+  } else {
+    await affectedTab.focus();
+    await expect(affectedTab).toBeFocused();
+    await page.keyboard.press("Shift+F10");
+  }
+  await page
+    .getByRole("menuitem", { name: "Open native work details" })
+    .click();
+  await expect(affected).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "Native work for Working Codex" }),
+  ).toHaveCount(0);
+  await affected
+    .getByRole("button", { name: "Close native work details" })
+    .click();
+  await expect(page.locator(".codex-native-work")).toHaveCount(0);
+  await expect(terminal.locator(".xterm-helper-textarea")).toBeFocused();
+  await page.keyboard.type("healthy terminal remains usable");
+  await expect
+    .poll(() => input.affected.join(""))
+    .toBe("healthy terminal remains usable");
+  await page.screenshot({
+    path: testInfo.outputPath("healthy-terminal-no-native-header.png"),
+  });
+  if (!testInfo.project.name.startsWith("mobile")) {
+    await page
+      .getByRole("button", { name: "Working Codex", exact: true })
+      .click({ button: "right" });
+    await page
+      .getByRole("menuitem", { name: "Open native work details" })
+      .click();
+    await expect(
+      page.getByRole("region", { name: "Native work for Working Codex" }),
+    ).toBeVisible();
+    await expect(affected).toHaveCount(0);
+  }
+
+  expect(requests).toHaveLength(0);
 });

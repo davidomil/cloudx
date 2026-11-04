@@ -1,3 +1,4 @@
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -5,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BlackboardRepository } from "./BlackboardRepository.js";
 import { BlackboardService } from "./BlackboardService.js";
+import { COOPERATION_LIMITS } from "@cloudx/shared";
 
 let root: string;
 let repository: BlackboardRepository;
@@ -113,6 +115,28 @@ describe("BlackboardRepository original durability", () => {
     await repository.writeBytes(imagePath, bytes);
     await expect(repository.writeBytes(imagePath, Buffer.from("Replacement"))).rejects.toMatchObject({ code: "EEXIST" });
     expect(await fs.readFile(path.join(root, imagePath))).toEqual(bytes);
+  });
+
+  it("bounds an original read when its file grows after the descriptor size check", async () => {
+    await repository.writeBytes(imagePath, bytes);
+    const open = fs.open;
+    const allocation = vi.spyOn(Buffer, "alloc");
+    vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      const file = await open(...args);
+      if (args[1] === (constants.O_RDONLY | constants.O_NOFOLLOW)) {
+        const stat = file.stat.bind(file);
+        vi.spyOn(file, "stat").mockImplementationOnce(async () => {
+          const beforeGrowth = await stat();
+          await fs.truncate(path.join(root, imagePath), COOPERATION_LIMITS.fileBytes + 1);
+          return beforeGrowth;
+        });
+      }
+      return file;
+    });
+    const result = await repository.readBytes(imagePath).then(() => "returned original", error => error.code);
+    expect(result).toBe("ASSET_INVALID");
+    expect(allocation).toHaveBeenCalledWith(bytes.length + 1);
+    expect(allocation.mock.calls.every(([size]) => size <= bytes.length + 1)).toBe(true);
   });
 
   it("stops before creating an original when a parent directory cannot be made durable", async () => {

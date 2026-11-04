@@ -53,8 +53,8 @@ export function validateBlackboardAudit(state: BlackboardState): void {
   }
 
   for (const [token, staged] of Object.entries(state.stagedAssets)) {
-    exactRecord(staged, ["token", "boardId", "actor", "asset"], [], "Staged image");
-    requireCooperation(isCooperationId(token) && staged.token === token && Object.hasOwn(state.boards, staged.boardId) && /^(user:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|agent:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}@[1-9][0-9]*)$/.test(staged.actor), "INTEGRITY_ERROR", "Staged image ownership is invalid.");
+    exactRecord(staged, ["token", "boardId", "actor", "asset"], [], "Staged asset");
+    requireCooperation(isCooperationId(token) && staged.token === token && Object.hasOwn(state.boards, staged.boardId) && /^(user:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}|agent:[A-Za-z0-9][A-Za-z0-9._:-]{0,127}@[1-9][0-9]*)$/.test(staged.actor), "INTEGRITY_ERROR", "Staged asset ownership is invalid.");
     validateRecordChange({ collection: "assets", id: staged.asset.id, after: staged.asset });
   }
 

@@ -13,11 +13,12 @@ These documents record the design reviewed against CloudX commit `fe78a9353c1f41
 | [AI cooperation policy](cooperation.md) | Mandatory board-first behavior, coworker language, skill packaging, and feedback flow. |
 | [Implementation and validation plan](implementation-plan.md) | Ordered milestones, native integration gates, future tests, and requirement trace. |
 | [Research and decisions](research.md) | Current-source findings, rated primary sources, choices, tradeoffs, and engineering gates. |
-| [Visual templates](visual-templates.md) | Four imagegen concepts with exact prompts and review notes. |
-| [Semantic templates](examples/README.md) | Three scenario snapshots, a strict JSON Schema, and a real image asset. |
+| [Serialization and image fixtures](examples/README.md) | Snapshot schema and original image used by regression tests. |
 | [Validation record](validation.md) | Checks actually performed on this documentation package and their limits. |
 
 The main decisions are:
+
+- Create each board as an empty canvas with a name and optional initial AI tab assignment.
 
 - One board per assigned AI tab; many Codex/Claude tabs can share it. Every AI tab type, including managed tabs, remains in scope.
 - Right-click, keyboard, or long-press assignment. Open each board in its own workspace tab.

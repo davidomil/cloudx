@@ -66,6 +66,20 @@
 .cooperation-image-content { min-height: 0; flex: 1; position: relative; padding: 0 8px 8px; }
 .cooperation-image-content > img { object-fit: contain; height: 100%; width: 100%; display: block; }
 .cooperation-image-content > p { margin: 0; padding: 10px; color: var(--color-warning); font-size: 12px; }
+.cooperation-link-content, .cooperation-file-content { min-height: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 12px; overflow: auto; font-size: 12px; }
+.cooperation-link-host { display: flex; align-items: center; gap: 6px; color: var(--color-accent-tertiary); overflow-wrap: anywhere; }
+.cooperation-link-content p, .cooperation-file-content p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cooperation-link-content > a, .cooperation-file-download { display: flex; align-items: center; gap: 6px; max-width: 100%; margin-top: auto; color: var(--color-accent-tertiary); overflow-wrap: anywhere; }
+.cooperation-link-content > a > span { min-width: 0; }
+.cooperation-file-content audio, .cooperation-file-content video { width: 100%; min-height: 48px; flex-shrink: 0; }
+.cooperation-file-content video { max-height: 190px; object-fit: contain; background: #000; }
+.cooperation-file-content small { color: var(--color-muted-foreground); overflow-wrap: anywhere; }
+.cooperation-file-content [role="status"] { color: var(--color-warning); }
+.cooperation-note-block a { color: var(--color-accent-tertiary); text-decoration: underline; }
+.cooperation-link-editor { display: grid; gap: 12px; }
+.cooperation-link-editor fieldset { display: grid; gap: 12px; padding: 0; margin: 0; border: 0; }
+.cooperation-link-editor label { display: grid; gap: 5px; font-size: 12px; }
+.cooperation-link-editor input, .cooperation-link-editor textarea { width: 100%; box-sizing: border-box; }
 .cooperation-open-original { position: absolute; display: flex; gap: 5px; align-items: center; left: 12px; bottom: 12px; color: var(--color-foreground); background: var(--color-background); border: 1px solid var(--color-border); padding: 4px 6px; border-radius: 3px; font: inherit; font-size: 10px; cursor: pointer; }
 .cooperation-item.item-drawing { background: transparent; border-color: transparent; box-shadow: none; }
 .cooperation-item.item-drawing .cooperation-item-heading { opacity: 0; height: 0; min-height: 0; padding: 0; position: absolute; top: -25px; }
@@ -78,6 +92,9 @@
 .cooperation-edge-label > button { display: flex; gap: 4px; align-items: center; flex-shrink: 0; border: 0; background: none; padding: 0; color: var(--color-warning); font: inherit; cursor: pointer; }
 .cooperation-region { position: absolute; border: 1px dashed var(--color-muted-foreground); border-radius: 7px; background: transparent; pointer-events: none; z-index: -1; }
 .cooperation-region.mode-wip { border: 2px dashed var(--color-warning); background: color-mix(in srgb, var(--color-warning) 4%, transparent); }
+.cooperation-region.is-selected { outline: 1px solid var(--color-accent); outline-offset: 2px; }
+.cooperation-board .cooperation-region-resize { position: absolute; z-index: 2; display: grid; place-items: center; min-width: 0; min-height: 0; padding: 0; border: 0; border-radius: 0; background: transparent; transform: translate(-50%, -50%); pointer-events: all; touch-action: none; }
+.cooperation-region-resize > span { border-style: solid; border-color: var(--color-accent); background: var(--color-background); pointer-events: none; }
 .cooperation-region-label { position: absolute; left: 8px; top: 8px; display: flex; align-items: center; gap: 6px; max-width: calc(100% - 16px); padding: 5px 9px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border: 0; border-radius: 4px; color: var(--color-muted-foreground); background: var(--color-background); font: inherit; font-size: 11px; cursor: pointer; pointer-events: all; }
 .cooperation-region.mode-wip .cooperation-region-label { color: var(--color-warning); }
 .cooperation-region.mode-ready .cooperation-region-label { top: -20px; left: auto; right: 8px; }
@@ -87,7 +104,7 @@
 button.cooperation-reaction { cursor: pointer; }
 .cooperation-reaction.reaction-question, .cooperation-reaction.reaction-concern { color: var(--color-warning); border-color: var(--color-warning); }
 .cooperation-reaction.reaction-agree { color: var(--color-accent); border-color: var(--color-accent); }
-.cooperation-tool-rail { position: absolute; left: 9px; top: 12px; z-index: 8; display: grid; gap: 5px; padding: 5px; border: 1px solid var(--color-border); border-radius: 6px; background: color-mix(in srgb, var(--color-card) 94%, transparent); box-shadow: 0 6px 18px color-mix(in srgb, var(--color-background) 60%, transparent); }
+.cooperation-tool-rail { position: absolute; left: 9px; top: 12px; z-index: 8; display: grid; gap: 5px; max-height: calc(100% - 24px); overflow-y: auto; padding: 5px; border: 1px solid var(--color-border); border-radius: 6px; background: color-mix(in srgb, var(--color-card) 94%, transparent); box-shadow: 0 6px 18px color-mix(in srgb, var(--color-background) 60%, transparent); }
 .cooperation-tool-rail .cx-button { background: transparent; border-color: transparent; }
 .cooperation-shape-palette, .cooperation-pen-palette { position: absolute; top: 12px; left: 63px; z-index: 9; display: flex; gap: 5px; align-items: center; padding: 6px; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-card); }
 .cooperation-pen-palette label { margin: 0; display: flex; align-items: center; gap: 5px; }

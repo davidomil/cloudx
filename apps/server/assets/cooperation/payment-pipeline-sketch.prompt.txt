@@ -1,5 +1,0 @@
-Use case: photorealistic-natural.
-Asset type: original reference photo shown inside an editable software-design blackboard.
-Primary request: a clean top-down photograph of a hand-drawn payment-processing architecture sketch on white fine-square graph paper, matching a careful engineer's quick ink sketch.
-Composition: wide landscape paper fills the entire image, level and evenly lit, generous margins. No application UI, screens, panels, toolbar, cursor, borders or watermark.
-Diagram: a single left-to-right row of four black ink shapes: rectangle "Client", rectangle "Checkout API", horizontal cylinder "Event queue", rectangle "Ledger worker". Hand-drawn arrows connect each neighboring shape pointing right. A downward arrow from "Ledger worker" points to a small vertical database cylinder labeled "Ledger DB" beneath the rightmost node. Write "POST /payments" above the first arrow and "PaymentAccepted" above the second arrow. Make the exact lettering legible. Thin gray graph-paper grid, natural slight pen irregularity, all drawing in dark charcoal ink. This is an illustrative reference for a proposed design, with no factual performance claims.

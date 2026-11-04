@@ -81,6 +81,7 @@ import { noSystemTextAssistProps } from "./inputAssist.js";
 import { attemptPortraitOrientationLock } from "./orientationLock.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
+import { openNativeWorkDetails } from "./nativeWorkDetails.js";
 import { useCooperationBoards } from "./cooperation/cooperationBoards.js";
 import { agentSelection, agentTabChoices } from "./agentTabChoice.js";
 import { ClaudeLaunchModeControl, claudeLaunchModeLabel } from "./ClaudeLaunchModeControl.js";
@@ -1592,6 +1593,11 @@ export function App() {
           callHook={callUiHook}
           onSwitched={tab => setTabs(current => current.map(currentTab => currentTab.id === tab.id ? tab : currentTab))}
           onOpenAccounts={() => { setSettingsCategory("agents"); setSettingsOpen(true); }}
+          onOpenNativeWork={tab => {
+            const pane = panes.find(pane => pane.tabIds.includes(tab.id));
+            if (pane) void activateTab(tab.id, pane.id);
+            openNativeWorkDetails(tab);
+          }}
           accountsEnabled={pluginById.has(AGENT_ACCOUNTS_PLUGIN_ID)}
           cooperationEnabled={cooperationEnabled}
           onOpenBoard={(boardId, title) => { void openBlackboard(boardId, title); }}

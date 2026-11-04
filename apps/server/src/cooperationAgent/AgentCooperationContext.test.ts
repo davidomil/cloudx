@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -9,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, expect, it, vi } from "vitest";
-import type { CooperationAsset, WorkspaceTab } from "@cloudx/shared";
+import { COOPERATION_LIMITS, type CooperationAsset, type WorkspaceTab } from "@cloudx/shared";
 
 import { AgentCooperationContext, COOPERATION_HELPER_PATH, cooperationLaunchEnv, type CooperationAgentBinding } from "./AgentCooperationContext.js";
 import { COOPERATION_RULES, COOPERATION_SKILLS } from "./cooperationContributions.js";
@@ -138,18 +139,18 @@ it("exposes only byte-identical originals in this tab's image directory and clea
   const bytes = await fs.readFile("docs/design/cooperation/examples/assets/reference.png");
   await fs.writeFile(originalPath, bytes);
   const asset: CooperationAsset = { id: "asset-1", mime: "image/png", sha256: createHash("sha256").update(bytes).digest("hex"), byteLength: bytes.length, width: 1200, height: 800, relativePath: "assets/reference.png" };
-  const original = await f.contexts.materializeAsset("tab-1", 3, { asset, localPath: originalPath });
+  const original = await f.contexts.materializeAsset(f.locator, { asset, localPath: originalPath });
   expect(path.dirname(original.localPath)).toBe(f.locator.assetRoot);
   expect((await fs.readFile(original.localPath)).equals(bytes)).toBe(true);
   expect((await fs.stat(original.localPath)).mode & 0o777).toBe(0o400);
-  await expect(f.contexts.materializeAsset("tab-1", 3, { asset: { ...asset, sha256: "0".repeat(64) }, localPath: originalPath })).rejects.toThrow("hash changed");
+  await expect(f.contexts.materializeAsset(f.locator, { asset: { ...asset, sha256: "0".repeat(64) }, localPath: originalPath })).rejects.toThrow("hash changed");
   await fs.chmod(original.localPath, 0o600);
   await fs.writeFile(original.localPath, "modified");
-  await expect(f.contexts.materializeAsset("tab-1", 3, { asset, localPath: originalPath })).rejects.toThrow("copy was modified");
+  await expect(f.contexts.materializeAsset(f.locator, { asset, localPath: originalPath })).rejects.toThrow("copy was modified");
   f.change({ ...f.locator, boardId: "board-2", assignmentGeneration: 4 });
   await f.contexts.prepare("tab-1");
   expect(await fs.readdir(f.locator.assetRoot)).toEqual([]);
-  await expect(f.contexts.materializeAsset("tab-1", 3, { asset, localPath: originalPath })).rejects.toMatchObject({ code: "ASSIGNMENT_CHANGED" });
+  await expect(f.contexts.materializeAsset(f.locator, { asset, localPath: originalPath })).rejects.toMatchObject({ code: "FORBIDDEN" });
 });
 
 it("executes the shipped helper with the current capability for reads, original images and bounded writes", async () => {
@@ -179,6 +180,21 @@ it("executes the shipped helper with the current capability for reads, original 
   await fs.writeFile(transaction, "x".repeat(256 * 1024 + 1));
   await expect(run(process.execPath, [COOPERATION_HELPER_PATH, "apply", "--file", transaction], { env })).rejects.toThrow("bounded regular file");
   expect(requests).toHaveLength(3);
+});
+
+it("rejects oversized, symlink and directory upload sources before contacting the host", async () => {
+  const f = await fixture();
+  const file = path.join(f.root, "original.bin");
+  await fs.writeFile(file, "Original");
+  const link = path.join(f.root, "link.bin");
+  await fs.symlink(file, link);
+  const env = { PATH: process.env.PATH, CLOUDX_COOPERATION_CONTEXT: f.contexts.contextPath("tab-1") };
+  const upload = (source: string) => run(process.execPath, [COOPERATION_HELPER_PATH, "upload", "--file", source, "--mime", "application/octet-stream"], { env });
+  await expect(upload(link)).rejects.toMatchObject({ stderr: expect.stringContaining("ELOOP") });
+  await expect(upload(f.root)).rejects.toMatchObject({ stderr: expect.stringContaining("bounded regular file") });
+  await fs.truncate(file, COOPERATION_LIMITS.fileBytes + 1);
+  await expect(upload(file)).rejects.toMatchObject({ stderr: expect.stringContaining("bounded regular file") });
+  await expect(run(process.execPath, [COOPERATION_HELPER_PATH, "upload", "--file", file], { env })).rejects.toMatchObject({ stderr: expect.stringContaining("--mime requires a value") });
 });
 
 it("addresses the existing native owner and retains one native acceptance per event", async () => {
@@ -467,4 +483,162 @@ it("reconciles a persisted Claude completion when its native prompt arrives afte
   await vi.waitFor(() => expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "newer-user-prompt", status: "running" }));
   await broker.readTurn();
   expect(broker.control.currentTurn).toMatchObject({ providerTurnId: "newer-user-prompt", status: "running" });
+});
+
+it("publishes one complete original when two helpers request the same file together", async () => {
+  const f = await fixture();
+  const bytes = Buffer.alloc(16 * 1024 * 1024, 0x61);
+  const original = await originalFile(f.root, bytes);
+  const copies = await Promise.all([
+    f.contexts.materializeAsset(f.locator, original),
+    f.contexts.materializeAsset(f.locator, original)
+  ]);
+  expect(copies[0].localPath).toBe(copies[1].localPath);
+  expect((await fs.readFile(copies[0].localPath)).equals(bytes)).toBe(true);
+  expect((await fs.stat(copies[0].localPath)).mode & 0o777).toBe(0o400);
+});
+
+it.each([
+  ["execution", { executionId: "execution-replacement" }],
+  ["provider", { providerId: "claude" }]
+] as const)("rejects original access when the authenticated %s changes", async (_kind, change) => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  await f.contexts.authenticate(f.locator);
+  f.change({ ...f.locator, ...change });
+  await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toMatchObject({ code: "FORBIDDEN" });
+  expect(await fs.readdir(f.locator.assetRoot)).toEqual([]);
+});
+
+it("stops a growing original before an unbounded file read", async () => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  const open = fs.open;
+  const unboundedReads: { mock: { calls: unknown[] } }[] = [];
+  let grew = false;
+  const openSpy = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+    const handle = await open(file, flags, mode);
+    if (String(file) !== original.localPath) return handle;
+    const stat = handle.stat.bind(handle);
+    vi.spyOn(handle, "stat").mockImplementation(async () => {
+      const observed = await stat();
+      if (!grew) {
+        grew = true;
+        await fs.truncate(original.localPath, COOPERATION_LIMITS.fileBytes + 1);
+      }
+      return observed;
+    });
+    unboundedReads.push(vi.spyOn(handle, "readFile"));
+    return handle;
+  });
+  try {
+    await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toThrow();
+    expect(grew).toBe(true);
+    expect(unboundedReads).toHaveLength(1);
+    expect(unboundedReads.flatMap(read => read.mock.calls)).toEqual([]);
+    expect(await fs.readdir(f.locator.assetRoot)).toEqual([]);
+  } finally { openSpy.mockRestore(); }
+});
+
+async function originalFile(root: string, bytes = Buffer.from("Original")) {
+  const localPath = path.join(root, "original.bin");
+  await fs.writeFile(localPath, bytes);
+  const asset: CooperationAsset = { kind: "file", id: "file-original", name: "original.bin", mime: "application/octet-stream",
+    sha256: createHash("sha256").update(bytes).digest("hex"), byteLength: bytes.length, relativePath: "assets/file-original.bin" };
+  return { asset, localPath };
+}
+
+it("removes a new original copy when its execution ends during publication", async () => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  const open = fs.open;
+  let changed = false;
+  const openSpy = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+    const handle = await open(file, flags, mode);
+    if (path.basename(String(file)) !== `${original.asset.sha256}.bin` || typeof flags !== "number" || !(flags & constants.O_WRONLY)) return handle;
+    const sync = handle.sync.bind(handle);
+    vi.spyOn(handle, "sync").mockImplementation(async () => {
+      await sync();
+      changed = true;
+      f.change({ ...f.locator, executionId: "execution-replacement" });
+    });
+    return handle;
+  });
+  try {
+    await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(changed).toBe(true);
+    expect(await fs.readdir(f.locator.assetRoot)).toEqual([]);
+    expect(await fs.readFile(original.localPath)).toEqual(Buffer.from("Original"));
+  } finally { openSpy.mockRestore(); }
+});
+
+it("removes an unconfirmed original copy after a storage failure", async () => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  const failure = new Error("The original copy could not be flushed.");
+  const open = fs.open;
+  const openSpy = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+    const handle = await open(file, flags, mode);
+    if (path.basename(String(file)) === `${original.asset.sha256}.bin` && typeof flags === "number" && flags & constants.O_WRONLY)
+      vi.spyOn(handle, "sync").mockRejectedValue(failure);
+    return handle;
+  });
+  try {
+    await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toBe(failure);
+    expect(await fs.readdir(f.locator.assetRoot)).toEqual([]);
+  } finally { openSpy.mockRestore(); }
+  const confirmed = await f.contexts.materializeAsset(f.locator, original);
+  expect(await fs.readFile(confirmed.localPath)).toEqual(Buffer.from("Original"));
+});
+
+it("rejects a locator that redirects original copies outside the managed cache", async () => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  const outside = path.join(f.root, "outside-cache");
+  await fs.mkdir(outside, { mode: 0o700 });
+  await fs.writeFile(f.contexts.contextPath(f.locator.tabId), JSON.stringify({ ...f.locator, assetRoot: outside }));
+  await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toThrow();
+  expect(await fs.readdir(outside)).toEqual([]);
+});
+
+it("rejects a symbolic link in place of the original cache directory", async () => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  const outside = path.join(f.root, "outside-cache");
+  await fs.mkdir(outside, { mode: 0o700 });
+  await fs.rm(f.locator.assetRoot, { recursive: true });
+  await fs.symlink(outside, f.locator.assetRoot);
+  await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toThrow();
+  expect(await fs.readdir(outside)).toEqual([]);
+});
+
+it("rejects a replaced cache directory without writing outside it", async () => {
+  const f = await fixture();
+  const original = await originalFile(f.root);
+  const outside = path.join(f.root, "outside-cache");
+  const retired = path.join(f.root, "retired-cache");
+  await fs.mkdir(outside, { mode: 0o700 });
+  const open = fs.open;
+  let replaced = false;
+  const openSpy = vi.spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+    const handle = await open(file, flags, mode);
+    if (String(file) !== f.locator.assetRoot) return handle;
+    const stat = handle.stat.bind(handle);
+    vi.spyOn(handle, "stat").mockImplementation(async () => {
+      const observed = await stat();
+      if (!replaced) {
+        replaced = true;
+        await fs.rename(f.locator.assetRoot, retired);
+        await fs.symlink(outside, f.locator.assetRoot);
+      }
+      return observed;
+    });
+    return handle;
+  });
+  try {
+    await expect(f.contexts.materializeAsset(f.locator, original)).rejects.toThrow();
+    expect(replaced).toBe(true);
+    expect(await fs.readdir(outside)).toEqual([]);
+    expect(await fs.readdir(retired)).toEqual([]);
+  } finally { openSpy.mockRestore(); }
 });

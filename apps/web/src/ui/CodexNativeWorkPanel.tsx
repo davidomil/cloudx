@@ -1,45 +1,40 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import { isCodexNativeWork, type CodexNativeWork, type RecoverTabRequest, type WorkspaceTab } from "@cloudx/shared";
+import { type CodexNativeWork, type RecoverTabRequest, type WorkspaceTab } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
+import { nativeWorkPresentationKey, onOpenNativeWorkDetails, readNativeWorkPresentation, saveNativeWorkPresentation } from "./nativeWorkDetails.js";
 
-export function CodexNativeWorkPanel({ tab, onRecover }: {
+export function CodexNativeWorkPanel({ tab, onRecover, onDismiss }: {
   tab: WorkspaceTab;
   onRecover?: (input: RecoverTabRequest) => Promise<void>;
+  onDismiss?: () => void;
 }) {
   const work = tab.nativeWork;
-  return work ? <NativeWork key={JSON.stringify([tab.id, work.executionId, work.threadId])} tab={tab} work={work} onRecover={onRecover} /> : null;
+  return work ? <NativeWork key={JSON.stringify([tab.id, work.executionId, work.threadId])} tab={tab} work={work} onRecover={onRecover} onDismiss={onDismiss} /> : null;
 }
 
-function NativeWork({ tab, work, onRecover }: {
+function NativeWork({ tab, work, onRecover, onDismiss }: {
   tab: WorkspaceTab;
   work: CodexNativeWork;
   onRecover?: (input: RecoverTabRequest) => Promise<void>;
+  onDismiss?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [error, setError] = useState<string>();
   const incidentResolved = Boolean(work.incidentResolvedByTurnId);
   const recoveryFailed = work.recoveryStatus === "failed" && !incidentResolved;
-  const needsAttention = work.goalStatus === "blocked" || work.turnStatus === "failed" || recoveryFailed;
+  const needsAttention = tab.status === "failed" || work.goalStatus === "blocked" || work.turnStatus === "failed" || recoveryFailed;
   const recoveryPending = work.recoveryStatus === "awaiting_goal_resume" || work.recoveryStatus === "awaiting_turn" || work.recoveryStatus === "running";
-  const resolutionNeedsNoAction = incidentResolved && !needsAttention && !recoveryPending;
-  const detailsId = useId();
-  const presentationKey = `cloudx.nativeWork.presentation:${JSON.stringify([tab.id, work.executionId, work.threadId])}`;
-  const [presentation, setPresentation] = useState(() => {
-    const previous = readCollapsedWork(presentationKey);
-    return { work, expanded: !resolutionNeedsNoAction && (!previous || hasNewFailure(previous, work)) };
-  });
-  if (presentation.work !== work) setPresentation({ work, expanded: hasNewFailure(presentation.work, work) ||
-    presentation.expanded && !(resolutionNeedsNoAction && !presentation.work.incidentResolvedByTurnId) });
-  const { expanded } = presentation;
-  useEffect(() => {
-    try {
-      if (presentation.expanded) sessionStorage.removeItem(presentationKey);
-      else sessionStorage.setItem(presentationKey, JSON.stringify(presentation.work));
-    } catch { /* Browser storage is optional; the presentation still works in memory. */ }
-  }, [presentationKey, presentation]);
+  const presentationKey = nativeWorkPresentationKey(tab);
+  const incidents = currentIncidents(tab, work);
+  const [presentation, setPresentation] = useState(() => readNativeWorkPresentation(presentationKey));
+  const dismissedIncidents = presentation.dismissedIncidents.filter(incident => incidents.includes(incident));
+  if (dismissedIncidents.length !== presentation.dismissedIncidents.length) setPresentation({ ...presentation, dismissedIncidents });
+  const visible = presentation.explicitOpen || Boolean(error) || incidents.some(incident => !dismissedIncidents.includes(incident));
+  useEffect(() => saveNativeWorkPresentation(presentationKey, presentation), [presentationKey, presentation]);
+  useEffect(() => onOpenNativeWorkDetails(presentationKey, () => setPresentation(current => ({ ...current, explicitOpen: true }))), [presentationKey]);
   const pending = useRef(false);
   const disposed = useRef(false);
   useEffect(() => {
@@ -74,19 +69,27 @@ function NativeWork({ tab, work, onRecover }: {
     }
   }
 
+  function closeDetails() {
+    setPresentation({ explicitOpen: false, dismissedIncidents: incidents });
+    setError(undefined);
+    onDismiss?.();
+  }
+
+  if (!visible) return null;
   const heading = work.turnStatus === "running" ? "Native turn running"
     : work.turnStatus === "failed" ? "Native turn failed"
     : recoveryFailed ? "Native recovery failed" : "Codex native work";
   return <section className="codex-native-work" aria-label={`Native work for ${tab.title}`} aria-busy={busy}>
     <div className="codex-native-heading">
-      <h2>{needsAttention ? <AlertTriangle size={16} aria-hidden="true" /> : null}{heading}{work.goalStatus === "blocked" ? " · Goal blocked" : ""}</h2>
-      <ControlButton size="compact" aria-expanded={expanded} aria-controls={detailsId} onClick={() => setPresentation({ work, expanded: !expanded })}>{expanded ? "Hide native work details" : "Show native work details"}</ControlButton>
+      <h2>{needsAttention || work.lastError && !incidentResolved ? <AlertTriangle size={16} aria-hidden="true" /> : null}{heading}{work.goalStatus === "blocked" ? " · Goal blocked" : ""}</h2>
+      <ControlButton size="compact" onClick={closeDetails}>Close native work details</ControlButton>
     </div>
     <p className="codex-native-status">Terminal process: {statusLabel(tab.status)} · Native turn: {work.turnStatus ? statusLabel(work.turnStatus) : "Not observed"} · Goal: {work.goalStatus ? statusLabel(work.goalStatus) : "Not observed"}</p>
-    <div id={detailsId} hidden={!expanded}>
+    <div>
+      {tab.status === "failed" ? <p role="alert">{tab.recovery?.message ?? tab.statusMessage ?? "The terminal process failed."}</p> : null}
       {work.recoveryStatus === "failed" && incidentResolved ? <p>Previous recovery attempt failed. A later native turn completed and resolved the provider incident.</p>
         : work.recoveryStatus ? <p role="status">{recoveryMessage(work.recoveryStatus)}</p> : null}
-      {work.lastError ? <details open={!incidentResolved && (needsAttention || work.lastError.kind === "retry")}>
+      {work.lastError ? <details open={!incidentResolved}>
         <summary>{incidentResolved ? "Resolved provider incident diagnostics" : work.lastError.kind === "retry" ? "Provider retry notice" : "Last terminal provider error"}</summary>
         <p>{work.lastError.message}</p>
         <p className="codex-native-diagnostics">
@@ -109,18 +112,16 @@ function NativeWork({ tab, work, onRecover }: {
   </section>;
 }
 
-function readCollapsedWork(key: string): CodexNativeWork | undefined {
-  try {
-    const value: unknown = JSON.parse(sessionStorage.getItem(key) ?? "null");
-    return isCodexNativeWork(value) ? value : undefined;
-  } catch { return undefined; }
-}
-
-function hasNewFailure(previous: CodexNativeWork, current: CodexNativeWork): boolean {
-  return current.turnStatus === "failed" && (previous.turnStatus !== "failed" || previous.turnId !== current.turnId) ||
-    current.goalStatus === "blocked" && previous.goalStatus !== "blocked" ||
-    current.recoveryStatus === "failed" && !current.incidentResolvedByTurnId && previous.recoveryStatus !== "failed" ||
-    current.lastError !== undefined && (Boolean(previous.incidentResolvedByTurnId) && !current.incidentResolvedByTurnId || JSON.stringify(current.lastError) !== JSON.stringify(previous.lastError));
+function currentIncidents(tab: WorkspaceTab, work: CodexNativeWork): string[] {
+  const incidents: string[] = [];
+  if (!work.incidentResolvedByTurnId) {
+    if (work.lastError) incidents.push(`provider:${work.lastError.incidentId ?? JSON.stringify(work.lastError)}`);
+    if (work.recoveryStatus === "failed") incidents.push("recovery:failed");
+  }
+  if (work.turnStatus === "failed") incidents.push(`turn:${work.turnId ?? "unobserved"}`);
+  if (work.goalStatus === "blocked") incidents.push("goal:blocked");
+  if (tab.status === "failed") incidents.push(`terminal:${tab.recovery?.message ?? "failed"}`);
+  return incidents;
 }
 
 function statusLabel(status: string): string {

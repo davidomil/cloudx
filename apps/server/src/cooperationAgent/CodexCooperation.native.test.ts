@@ -111,7 +111,7 @@ it.skipIf(!codex)("native Codex receives addressed idle feedback without replaci
     const originalImage = await fs.readFile("docs/design/cooperation/examples/assets/reference.png");
     const originalImagePath = path.join(root, "original.png");
     await fs.writeFile(originalImagePath, originalImage);
-    imagePath = (await contexts.materializeAsset(tab.id, 1, { asset: { id: "asset-codex", mime: "image/png", sha256: createHash("sha256").update(originalImage).digest("hex"), byteLength: originalImage.length, width: 1200, height: 800, relativePath: "assets/reference.png" }, localPath: originalImagePath })).localPath;
+    imagePath = (await contexts.materializeAsset(await contexts.prepare(tab.id), { asset: { id: "asset-codex", mime: "image/png", sha256: createHash("sha256").update(originalImage).digest("hex"), byteLength: originalImage.length, width: 1200, height: 800, relativePath: "assets/reference.png" }, localPath: originalImagePath })).localPath;
     expect(await fs.readFile(imagePath)).toEqual(originalImage);
     const imageDelivery = await native.deliver({ recipientTabId: tab.id, assignmentGeneration: 1, boardId: "board-native", boardRevision: 2, eventIds: ["event-image"], text: `For event-image, open the original board image at ${imagePath} with view_image.` });
     expect(imageDelivery, JSON.stringify({ imageDelivery, screen: visible(terminal.snapshot().recentOutput).slice(-1800) })).toMatchObject({ state: "nativeAccepted" });

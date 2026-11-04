@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CooperationBoard, CooperationTransaction } from "@cloudx/shared";
-import { CooperationSaveError, createCooperationBoard, discardRetiredCooperationImageStage, getCooperationReceipt, listCooperationBoards, stageCooperationImage, subscribeCooperationBoard, subscribeCooperationBoards, transactCooperationBoard } from "./cooperationApi.js";
+import { CooperationSaveError, cooperationTextExportUrl, createCooperationBoard, discardRetiredCooperationAssetStage, getCooperationReceipt, listCooperationBoards, stageCooperationAsset, subscribeCooperationBoard, subscribeCooperationBoards, transactCooperationBoard } from "./cooperationApi.js";
 
 const board: CooperationBoard = { schemaVersion: 1, boardId: "board", title: "Review", revision: 0, status: "draft", eventCursor: 0, members: [], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] };
 const transaction: CooperationTransaction = { schemaVersion: 1, operationId: "original-save", boardId: "board", expectedBoardRevision: 0, preconditions: [], operations: [], respondsToEventIds: [] };
@@ -16,11 +16,14 @@ class Socket extends EventTarget {
 afterEach(() => { vi.unstubAllGlobals(); Socket.instances = []; });
 
 describe("cooperation transport boundaries", () => {
+  it("links the text export of the exact board", () => {
+    expect(cooperationTextExportUrl("board/one")).toBe("/api/cooperation/boards/board%2Fone/export?format=markdown");
+  });
   it("creates and assigns in the same durable request and validates returned documents", async () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify(board)));
     vi.stubGlobal("fetch", fetch);
-    await expect(createCooperationBoard("Review", "decision-review", "agent")).resolves.toEqual(board);
-    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards", expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "Review", template: "decision-review", tabId: "agent" }) }));
+    await expect(createCooperationBoard("Review", "agent")).resolves.toEqual(board);
+    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards", expect.objectContaining({ method: "POST", body: JSON.stringify({ title: "Review", tabId: "agent" }) }));
     fetch.mockResolvedValueOnce(new Response(JSON.stringify({ ...board, schemaVersion: 7 })));
     await expect(createCooperationBoard("Review")).rejects.toThrow();
   });
@@ -41,18 +44,24 @@ describe("cooperation transport boundaries", () => {
   it("keeps original image bytes in a bounded JSON stage request", async () => {
     const fetch = vi.fn(async () => new Response(JSON.stringify({ stagedToken: "staged", asset: { id: "asset" } })));
     vi.stubGlobal("fetch", fetch);
-    await stageCooperationImage("board", new File([new Uint8Array([0, 1, 2, 255])], "reference.png", { type: "image/png" }));
-    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards/board/assets", expect.objectContaining({ method: "POST", body: JSON.stringify({ mime: "image/png", base64: "AAEC/w==" }) }));
+    await stageCooperationAsset("board", new File([new Uint8Array([0, 1, 2, 255])], "reference.png", { type: "image/png" }));
+    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards/board/assets", expect.objectContaining({ method: "POST", body: JSON.stringify({ mime: "image/png", base64: "AAEC/w==", name: "reference.png" }) }));
+  });
+  it("uploads named files without MIME metadata as original binary attachments", async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ stagedToken: "staged", asset: { id: "asset" } })));
+    vi.stubGlobal("fetch", fetch);
+    await stageCooperationAsset("board", new File([new Uint8Array([0, 255, 128])], "evidence.bin"));
+    expect(fetch).toHaveBeenCalledWith("/api/cooperation/boards/board/assets", expect.objectContaining({ method: "POST", body: JSON.stringify({ mime: "application/octet-stream", base64: "AP+A", name: "evidence.bin" }) }));
   });
   it("recognizes a concurrently consumed retired stage only through its exact committed receipt", async () => {
     const consumed = () => new Response(JSON.stringify({ code: "ASSET_INVALID", message: "Stage consumed" }), { status: 400 });
     const receipt = { operationId: "original-save", boardId: "board", boardRevision: 1, eventCursor: 1, actor: "user:local", changedIds: ["image"], answeredEventIds: [], committedAt: "2026-11-02T00:00:00Z", projectionStatus: "published" };
     const fetch = vi.fn().mockResolvedValueOnce(consumed()).mockResolvedValueOnce(new Response(JSON.stringify(receipt)));
     vi.stubGlobal("fetch", fetch);
-    await expect(discardRetiredCooperationImageStage("board", "stage", "original-save")).resolves.toBeUndefined();
+    await expect(discardRetiredCooperationAssetStage("board", "stage", "original-save")).resolves.toBeUndefined();
     expect(fetch.mock.calls.map(([url]) => url)).toEqual(["/api/cooperation/boards/board/staged-assets/stage", "/api/cooperation/boards/board/receipts/original-save"]);
     fetch.mockResolvedValueOnce(consumed()).mockResolvedValueOnce(new Response("null"));
-    await expect(discardRetiredCooperationImageStage("board", "stage", "original-save")).rejects.toThrow("Stage consumed");
+    await expect(discardRetiredCooperationAssetStage("board", "stage", "original-save")).rejects.toThrow("Stage consumed");
     expect(fetch).toHaveBeenCalledTimes(4);
   });
   it("rejects incomplete receipt evidence before clearing a draft or considering it editable", async () => {

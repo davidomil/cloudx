@@ -1,12 +1,12 @@
 # Design package validation
 
-This record covers the original design-only stage inspected on 2026-11-02. No production code changed during that stage. Current runtime behavior and verification scope are documented in [Use the cooperation blackboard](runtime.md); the historical checks below establish the design package's evidence and examples.
+This record covers the original design-only stage inspected on 2026-11-02. The scenario templates, generated concept images and seed prompts were later removed when board creation changed to always use an empty canvas. The schema and test reference image remain. No production code changed during that stage. Current runtime behavior and verification scope are documented in [Use the cooperation blackboard](runtime.md); the historical checks below establish the design package's evidence and examples.
 
 The six main documents passed the source-grounded-writing evidence and presentation validators, compilation to GFM, and checks against the exact compiled Markdown. The local compiler checked source-file identities and artifact content/assets. Semantic support was reviewed against the current repository and opened primary sources; structural checks alone do not prove it.
 
 All three scenario snapshots passed the strict JSON Schema, ID/reference, Unicode anchor, serialized-size, image hash/bytes/dimensions, asset-pinning, and geometry checks. Eighteen invalid-input cases were rejected. Twelve geometry probes passed for rotated bounds, fixed ports, arc midpoint, zero-length paths, stroke/label/boundary contact, and fixture WIP coverage. These checks exercise the proposed contract and examples, not a production mutation service.
 
-Four imagegen concepts and three static architecture/lifecycle/feedback figures were opened for visual review. The review corrected diagram escaping and an undersized SVG raster export. Final figures have readable labels and complete content. The visual-template guide identifies generated wording, mixed feedback states, and out-of-scope decorative controls. Image prompts and original PNGs are retained.
+Four imagegen concepts and three static architecture/lifecycle/feedback figures were opened for visual review. The review corrected diagram escaping and an undersized SVG raster export. Final figures have readable labels and complete content. The former visual-template guide identified generated wording, mixed feedback states, and out-of-scope decorative controls. These concept images and prompts are no longer part of the package.
 
 An independent design review found gaps in shared geometry, deleted-target preservation, actor routing, and lifecycle wording. The documents and examples now specify fixed routes and ink containment, strict target snapshots, stable tab actor IDs, authoritative automatic close, and an explicit same-run managed transfer exception.
 

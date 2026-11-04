@@ -2,14 +2,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import WebSocket from "ws";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { CooperationBoard, CooperationTransaction, WorkspaceTab } from "@cloudx/shared";
+import type { CooperationBoard, CooperationProvider, CooperationTransaction, WorkspaceTab } from "@cloudx/shared";
 
 import { BlackboardService } from "../cooperation/BlackboardService.js";
-import { AgentCooperationContext } from "../cooperationAgent/AgentCooperationContext.js";
+import { AgentCooperationContext, COOPERATION_HELPER_PATH } from "../cooperationAgent/AgentCooperationContext.js";
 import type { SessionStore } from "../sessionStore.js";
 import { registerCooperationRoutes } from "./CooperationRoutes.js";
 import type { CooperationFeedbackDelivery, CooperationTurnStatus } from "../cooperationAgent/CooperationFeedbackDelivery.js";
@@ -19,6 +22,9 @@ let app: FastifyInstance;
 let boards: BlackboardService;
 let contexts: AgentCooperationContext;
 let nativeTurnId: string | undefined;
+let providerId: CooperationProvider;
+let endpoint: string;
+const run = promisify(execFile);
 const runtimeListeners = new Set<(tabId: string, status: CooperationTurnStatus) => void>();
 const tab = { id: "agent", pluginId: "codex-terminal", title: "API reviewer", cwd: "/tmp", status: "running" } as WorkspaceTab;
 
@@ -27,17 +33,19 @@ beforeEach(async () => {
   boards = new BlackboardService({ rootDir: path.join(root, "boards") });
   await boards.init();
   nativeTurnId = "turn-route";
+  providerId = "codex";
+  endpoint = "http://127.0.0.1:4317/api/cooperation/agent";
   runtimeListeners.clear();
-  contexts = new AgentCooperationContext({ dataDir: root, endpoint: () => "http://127.0.0.1:4317/api/cooperation/agent",
-    binding: tabId => tabId === tab.id ? { ...boards.metadataForTab(tabId), providerId: "codex" } : undefined });
+  contexts = new AgentCooperationContext({ dataDir: root, endpoint: () => endpoint,
+    binding: tabId => tabId === tab.id ? { ...boards.metadataForTab(tabId), providerId } : undefined });
   const sessions = { getTab: (id: string) => {
     if (id !== tab.id) throw new Error("Unknown tab");
     return tab;
-  }, agentProvider: () => "codex" } as unknown as SessionStore;
+  }, agentProvider: () => providerId } as unknown as SessionStore;
   app = Fastify();
   await app.register(websocket);
   const feedback = { currentTurn: () => nativeTurnId ? {
-    tabId: tab.id, providerId: "codex", executionId: "execution-route", providerTurnId: nativeTurnId,
+    tabId: tab.id, providerId, executionId: "execution-route", providerTurnId: nativeTurnId,
     boardId: boards.metadataForTab(tab.id).boardId, assignmentGeneration: boards.metadataForTab(tab.id).assignmentGeneration,
     status: "running", startedAt: new Date().toISOString()
   } : undefined, turnStatus: () => undefined, onStatus: (listener: (tabId: string, status: CooperationTurnStatus) => void) => {
@@ -65,7 +73,57 @@ function transaction(board: CooperationBoard): CooperationTransaction {
       geometry: { x: 40, y: 50, width: 200, height: 120, rotation: 0 }, content: { title: "Evidence", blocks: [{ id: "body", revision: 1, text: "Observed response" }] } } }] };
 }
 
+async function connectHelper(provider: CooperationProvider) {
+  providerId = provider;
+  endpoint = `${await app.listen({ port: 0, host: "127.0.0.1" })}/api/cooperation/agent`;
+  const board = await create();
+  const locator = await contexts.prepare(tab.id);
+  const invoke = async (...args: string[]) => (await run(process.execPath, [COOPERATION_HELPER_PATH, ...args], {
+    env: { PATH: process.env.PATH, CLOUDX_COOPERATION_CONTEXT: contexts.contextPath(tab.id) }
+  })).stdout;
+  const helper = async (...args: string[]) => JSON.parse(await invoke(...args));
+  return { board, locator, invoke, helper };
+}
+
+async function originalFiles() {
+  const image = await fs.readFile(new URL("../../../../docs/design/cooperation/examples/assets/reference.png", import.meta.url));
+  return [
+    { name: "reference.png", mime: "image/png", bytes: image },
+    { name: "design.pdf", mime: "application/pdf", bytes: Buffer.from("%PDF-1.4\noriginal document\n%%EOF") },
+    { name: "meeting.wav", mime: "audio/wav", bytes: Buffer.from("RIFF-original-audio") },
+    { name: "demo.webm", mime: "video/webm", bytes: Buffer.from("original-video-bytes") },
+    { name: "source.bin", mime: "application/octet-stream", bytes: Buffer.from([0, 1, 255]) },
+    { name: "empty.txt", mime: "text/plain", bytes: Buffer.alloc(0) }
+  ];
+}
+
+async function expectOriginalPaths(boardId: string, invoke: (...args: string[]) => Promise<string>) {
+  const text = await invoke("read", "--format", "markdown");
+  const context = JSON.parse(await invoke("context"));
+  for (const asset of boards.getBoard(boardId).assets) {
+    expect(text).toContain(`Path: ${asset.relativePath}`);
+    const original = await fs.readFile(path.resolve(path.dirname(context.markdownPath), asset.relativePath));
+    expect(createHash("sha256").update(original).digest("hex")).toBe(asset.sha256);
+  }
+}
+
 describe("cooperation HTTP and live boundary", () => {
+  it("creates empty drafts and rejects the removed template field before creating or assigning a board", async () => {
+    const response = await app.inject({ method: "POST", url: "/api/cooperation/boards", payload: { title: "Empty draft" } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ title: "Empty draft", status: "draft", members: [], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] });
+    const assigned = await create();
+    expect(assigned).toMatchObject({ status: "active", members: [expect.objectContaining({ tabId: tab.id })], items: [], connections: [], regions: [], reactions: [], threads: [], assets: [] });
+    const assignment = boards.assignmentForTab(tab.id);
+    for (const template of ["blank", "system-design", "decision-review", "sketch-wip"]) {
+      const rejected = await app.inject({ method: "POST", url: "/api/cooperation/boards", payload: { title: "Removed option", template, tabId: tab.id } });
+      expect(rejected.statusCode).toBe(400);
+      expect(rejected.json()).toMatchObject({ code: "INVALID_REQUEST" });
+    }
+    expect(boards.listBoards()).toHaveLength(2);
+    expect(boards.assignmentForTab(tab.id)).toEqual(assignment);
+  });
+
   it("creates and assigns atomically, rejects invalid management, and keeps closed-board exports", async () => {
     const board = await create();
     expect(board.members).toEqual([expect.objectContaining({ tabId: tab.id, providerId: "codex" })]);
@@ -216,5 +274,176 @@ describe("cooperation HTTP and live boundary", () => {
     expect(missingAsset.statusCode).toBe(400);
     expect(missingAsset.json().code).toBe("ASSET_INVALID");
     expect(boards.getBoard(board.boardId)).toEqual(board);
+  });
+
+  it.each(["codex", "claude"] as const)("shares agent originals with the user through the real %s helper", async provider => {
+    const { board, locator, invoke, helper } = await connectHelper(provider);
+    let serial = 0;
+    for (const original of await originalFiles()) {
+      const file = path.join(root, original.name);
+      await fs.writeFile(file, original.bytes);
+      const uploaded = await helper("upload", "--file", file, "--mime", original.mime);
+      const item = { id: `agent-file-${++serial}`, kind: original.mime === "image/png" ? "image" : "file",
+        geometry: { x: serial * 240, y: 0, width: 220, height: 160, rotation: 0 }, content: original.mime === "image/png"
+          ? { title: original.name, assetId: uploaded.asset.id, alt: "Original image" }
+          : { title: original.name, assetId: uploaded.asset.id, description: "Shared original" } };
+      const tx = { ...transaction(boards.getBoard(board.boardId)), operationId: `agent-attach-${serial}`, assignmentGeneration: locator.assignmentGeneration,
+        operations: [{ kind: "attachAsset", stagedToken: uploaded.stagedToken, item }] };
+      const txFile = path.join(root, "attach.json");
+      await fs.writeFile(txFile, JSON.stringify(tx));
+      const accepted = await helper("apply", "--file", txFile);
+      expect(accepted.receipt).toMatchObject({ actor: `agent:${tab.id}`, providerId: provider, providerTurnId: nativeTurnId });
+      const download = await app.inject({ url: `/api/cooperation/boards/${board.boardId}/assets/${uploaded.asset.id}?download=1` });
+      expect(download.statusCode).toBe(200);
+      expect(download.headers["content-disposition"]).toContain("attachment");
+      expect(download.rawPayload).toEqual(original.bytes);
+      if (!original.bytes.length) {
+        const emptyRange = await app.inject({ url: `/api/cooperation/boards/${board.boardId}/assets/${uploaded.asset.id}`, headers: { range: "bytes=0-" } });
+        expect(emptyRange.statusCode).toBe(416);
+        expect(emptyRange.headers["content-range"]).toBe("bytes */0");
+      }
+    }
+    await expectOriginalPaths(board.boardId, invoke);
+  }, 20000);
+
+  it.each(["codex", "claude"] as const)("shares user originals with the agent through the real %s helper", async provider => {
+    const { board, invoke, helper } = await connectHelper(provider);
+    let serial = 0;
+    for (const original of await originalFiles()) {
+      const userStage = await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/assets`,
+        payload: { mime: original.mime, name: original.name, base64: original.bytes.toString("base64") } });
+      expect(userStage.statusCode).toBe(200);
+      const staged = userStage.json();
+      const item = { id: `user-file-${++serial}`, kind: original.mime === "image/png" ? "image" : "file",
+        geometry: { x: serial * 240, y: 0, width: 220, height: 160, rotation: 0 }, content: original.mime === "image/png"
+          ? { title: original.name, assetId: staged.asset.id, alt: "Original image" }
+          : { title: original.name, assetId: staged.asset.id, description: "Shared original" } };
+      const userTx = { ...transaction(boards.getBoard(board.boardId)), operationId: `user-attach-${serial}`,
+        operations: [{ kind: "attachAsset", stagedToken: staged.stagedToken, item }] };
+      expect((await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/transactions`, payload: userTx })).statusCode).toBe(200);
+      const resolved = await helper("asset", "--id", staged.asset.id);
+      expect(await fs.readFile(resolved.localPath)).toEqual(original.bytes);
+      expect(resolved.sha256).toBe(staged.asset.sha256);
+      expect((await fs.stat(resolved.localPath)).mode & 0o777).toBe(0o400);
+      if (original.mime !== "image/png") expect(path.extname(resolved.localPath)).toBe(path.extname(original.name));
+    }
+    await expectOriginalPaths(board.boardId, invoke);
+  }, 20000);
+
+  it.each(["codex", "claude"] as const)("shares links, owned zones and staged originals through the real %s helper", async provider => {
+    const { board, locator, invoke, helper } = await connectHelper(provider);
+    const linkTx = { ...transaction(boards.getBoard(board.boardId)), operationId: "agent-link", assignmentGeneration: locator.assignmentGeneration,
+      operations: [{ kind: "createItem", item: { id: "shared-link", kind: "link", geometry: { x: 0, y: 300, width: 300, height: 180, rotation: 0 },
+        content: { title: "Design source", url: "https://example.com/design", description: "Read the design." } } }] };
+    const linkFile = path.join(root, "link.json");
+    await fs.writeFile(linkFile, JSON.stringify(linkTx));
+    expect((await helper("apply", "--file", linkFile)).receipt.actor).toBe(`agent:${tab.id}`);
+    const current = boards.getBoard(board.boardId);
+    const link = current.items.find(item => item.id === "shared-link")!;
+    expect(link).toMatchObject({ kind: "link", createdBy: `agent:${tab.id}`, content: { url: "https://example.com/design" } });
+    const userEdit = { ...transaction(current), operationId: "user-link-edit", preconditions: [{ targetKind: "item", targetId: link.id, expectedRevision: link.revision }],
+      operations: [{ kind: "updateItem", itemId: link.id, patch: { content: { title: "Revised source", url: "https://example.com/revised", description: "Use the revised design." } } }] };
+    expect((await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/transactions`, payload: userEdit })).statusCode).toBe(200);
+    expect((await helper("read", "--item", link.id)).item).toMatchObject({ updatedBy: "user:local", content: { url: "https://example.com/revised" } });
+    const zoneTx = { ...transaction(boards.getBoard(board.boardId)), operationId: "agent-zone", assignmentGeneration: locator.assignmentGeneration,
+      operations: [{ kind: "createRegion", region: { id: "agent-zone", title: "Agent workspace", mode: "wip", protectedItemIds: [],
+        geometry: { x: 3000, y: 0, width: 500, height: 400, rotation: 0 } } }, { kind: "createItem", item: { id: "zone-note", kind: "note",
+        geometry: { x: 3020, y: 20, width: 220, height: 160, rotation: 0 }, content: { title: "Zone plan", blocks: [{ id: "zone-body", revision: 1, text: "- Inspect the shared originals." }] } } }] };
+    const zoneFile = path.join(root, "zone.json");
+    await fs.writeFile(zoneFile, JSON.stringify(zoneTx));
+    expect((await helper("apply", "--file", zoneFile)).receipt.actor).toBe(`agent:${tab.id}`);
+    const zone = boards.getBoard(board.boardId).regions.find(region => region.id === "agent-zone")!;
+    expect(zone).toMatchObject({ ownerActor: `agent:${tab.id}`, mode: "wip" });
+    const text = await invoke("read", "--format", "markdown");
+    expect(text).toContain("Agent workspace: wip");
+    expect(text).toContain(`owner agent:${tab.id}`);
+    expect(text).toContain("- Inspect the shared originals.");
+    expect(text).toContain("https://example.com/revised");
+    const release = { ...transaction(boards.getBoard(board.boardId)), operationId: "agent-zone-ready", assignmentGeneration: locator.assignmentGeneration,
+      preconditions: [{ targetKind: "region", targetId: zone.id, expectedRevision: zone.revision }], operations: [{ kind: "markRegionReady", regionId: zone.id }] };
+    await fs.writeFile(zoneFile, JSON.stringify(release));
+    expect((await helper("apply", "--file", zoneFile)).receipt.changedIds).toContain(zone.id);
+    expect(boards.getBoard(board.boardId).regions.find(region => region.id === zone.id)?.mode).toBe("ready");
+    expect(boards.inbox(board.boardId)).toEqual([]);
+    const file = path.join(root, "source.bin");
+    await fs.writeFile(file, Buffer.from([0, 1, 255]));
+    const pending = await helper("upload", "--file", file, "--mime", "application/octet-stream");
+    expect(await helper("discard", "--token", pending.stagedToken)).toEqual({ discarded: true });
+    await expect(helper("discard", "--token", pending.stagedToken)).rejects.toMatchObject({ stderr: expect.stringContaining("ASSET_INVALID") });
+  }, 20000);
+
+  it("requires the current native caller for staging and preserves stage ownership", async () => {
+    const board = await create();
+    const locator = await contexts.prepare(tab.id);
+    const payload = { tabId: tab.id, boardId: board.boardId, assignmentGeneration: locator.assignmentGeneration,
+      mime: "text/plain", name: "evidence.txt", base64: Buffer.from("Evidence").toString("base64") };
+    const upload = (value = payload, capability = locator.capability) => app.inject({ method: "POST", url: "/api/cooperation/agent/assets", headers: { authorization: `Bearer ${capability}` }, payload: value });
+    expect((await upload(payload, "wrong")).statusCode).toBe(403);
+    nativeTurnId = undefined;
+    expect((await upload()).json()).toMatchObject({ code: "DELIVERY_UNAVAILABLE" });
+    nativeTurnId = "turn-route";
+    const staged = await upload();
+    expect(staged.statusCode).toBe(200);
+    const { stagedToken } = staged.json();
+    expect((await app.inject({ method: "DELETE", url: `/api/cooperation/boards/${board.boardId}/staged-assets/${stagedToken}` })).json()).toMatchObject({ code: "ASSET_INVALID" });
+    expect((await upload({ ...payload, base64: "ZQ==\n" })).statusCode).toBe(400);
+    expect((await upload({ ...payload, name: "../../outside.txt" })).statusCode).toBe(400);
+    await boards.assign({ tabId: tab.id, providerId, label: tab.title }, null);
+    expect((await upload()).json()).toMatchObject({ code: "ASSIGNMENT_CHANGED" });
+  });
+
+  it("accepts file uploads above the image transport ceiling for both participants", async () => {
+    const board = await create();
+    const locator = await contexts.prepare(tab.id);
+    const bytes = Buffer.alloc(12 * 1024 * 1024, 0x61);
+    const payload = { mime: "application/octet-stream", name: "large-original.bin", base64: bytes.toString("base64") };
+    const userUpload = await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/assets`, payload });
+    expect(userUpload.statusCode).toBe(200);
+    expect(userUpload.json().asset.byteLength).toBe(bytes.length);
+    const agentUpload = await app.inject({ method: "POST", url: "/api/cooperation/agent/assets", headers: { authorization: `Bearer ${locator.capability}` },
+      payload: { ...payload, tabId: tab.id, boardId: board.boardId, assignmentGeneration: locator.assignmentGeneration } });
+    expect(agentUpload.statusCode).toBe(200);
+    expect(agentUpload.json().asset).toMatchObject({ byteLength: bytes.length, sha256: userUpload.json().asset.sha256 });
+    expect((await app.inject({ method: "DELETE", url: `/api/cooperation/boards/${board.boardId}/staged-assets/${userUpload.json().stagedToken}` })).statusCode).toBe(200);
+    expect((await agent("discardAsset", { stagedToken: agentUpload.json().stagedToken })).statusCode).toBe(200);
+  });
+
+  it("serves media ranges and forces active content into original downloads", async () => {
+    const board = await create();
+    const bytes = Buffer.from("0123456789");
+    for (const [index, mime] of ["video/webm", "audio/wav", "text/html", "image/svg+xml", "application/pdf"].entries()) {
+      const staged = await boards.stageAsset(board.boardId, { mime, bytes, name: "café's evidence.dat" });
+      const request = { ...transaction(boards.getBoard(board.boardId)), operationId: `media-${index}`,
+        operations: [{ kind: "attachAsset", stagedToken: staged.stagedToken, item: { id: `media-${index}`, kind: "file", geometry: { x: 0, y: 0, width: 320, height: 240, rotation: 0 }, content: { title: "Evidence", assetId: staged.asset.id, description: "Original" } } }] };
+      expect((await app.inject({ method: "POST", url: `/api/cooperation/boards/${board.boardId}/transactions`, payload: request })).statusCode).toBe(200);
+      const url = `/api/cooperation/boards/${board.boardId}/assets/${staged.asset.id}`;
+      const full = await app.inject({ url });
+      expect(full.headers["x-content-type-options"]).toBe("nosniff");
+      expect(full.rawPayload).toEqual(bytes);
+      const media = mime.startsWith("video/") || mime.startsWith("audio/");
+      expect(full.headers["content-type"]).toBe(media ? mime : "application/octet-stream");
+      expect(full.headers["content-disposition"]).toBe(media ? undefined : "attachment; filename*=UTF-8''caf%C3%A9%27s%20evidence.dat");
+      const head = await app.inject({ method: "HEAD", url });
+      expect(head.headers["content-length"]).toBe("10");
+      expect(head.body).toBe("");
+      for (const [range, expected] of [["bytes=0-0", "0"], ["bytes=3-", "3456789"], ["bytes=-3", "789"], ["bytes=8-99", "89"], ["bytes=-99", "0123456789"], ["bytes=0-99999999999999999999999", "0123456789"]]) {
+        const part = await app.inject({ url, headers: { range } });
+        expect(part.statusCode).toBe(206);
+        expect(part.body).toBe(expected);
+        expect(part.headers["accept-ranges"]).toBe("bytes");
+        expect(part.headers["content-range"]).toMatch(/^bytes \d+-\d+\/10$/);
+      }
+      for (const range of ["bytes=10-", "bytes=-0", "bytes=3-1", "bytes=0-1,3-4", "bytes=99999999999999999999999-"]) {
+        const invalid = await app.inject({ url, headers: { range } });
+        expect(invalid.statusCode).toBe(416);
+        expect(invalid.headers["content-range"]).toBe("bytes */10");
+      }
+      expect((await app.inject({ url, headers: { range: "items=1-2" } })).statusCode).toBe(200);
+      const changed = await app.inject({ url, headers: { range: "bytes=0-0", "if-range": '"different-original"' } });
+      expect(changed.statusCode).toBe(200);
+      expect(changed.rawPayload).toEqual(bytes);
+      expect((await app.inject({ url, headers: { range: "bytes=0-0", "if-range": String(full.headers.etag) } })).statusCode).toBe(206);
+      expect((await app.inject({ method: "HEAD", url, headers: { range: "bytes=0-0" } })).headers["content-length"]).toBe("10");
+    }
   });
 });

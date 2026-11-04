@@ -85,14 +85,13 @@ All requested behavior remains in the design and full-release acceptance scope.
 | R05 | Auto-close with final assigned AI tab | design.md lifetime; architecture.md state diagram; M0/M1. |
 | R06 | Each board opens in its own workspace tab | design.md; native panel contribution; M2. |
 | R07 | Paste images; AI opens their original bytes | file-protocol.md assets; image fixtures; M0/M3. |
-| R08 | Notes and code blocks | design.md vocabulary; strict schema/templates; M3. |
-| R09 | Manual drawing and flowchart editor | design.md canvas; sketch-wip.json; cooperation-diagram skill; M3. |
+| R08 | Notes and code blocks | design.md vocabulary; strict snapshot schema; M3. |
+| R09 | Manual drawing and flowchart editor | design.md canvas; normal drawing and WIP operations; cooperation-diagram skill; M3. |
 | R10 | Universal custom-described connections first; extensible later | file-protocol.md connection model; M3. |
-| R11 | Emotes/descriptions on all scene types and connections | design.md feedback; schema/examples; M4. |
+| R11 | Emotes/descriptions on all scene types and connections | design.md feedback; snapshot schema and feedback operations; M4. |
 | R12 | Question a specific note section; notify AI; explain | cooperation.md sequence; code-point anchors; M0/M4. |
 | R13 | Everything represented in text; images remain viewable | file-protocol.md complete JSON/readable Markdown; outline; M0/M3. |
 | R14 | Mandatory board-first AI graphs, decisions and coworker language | cooperation.md; system rule and skill drafts; M2/M4. |
 | R15 | Expanding canvas; WIP tells AI to wait, permits comments | design.md WIP; server guard; sketch fixture; M3/M4. |
-| R16 | Non-obstructive regions, comments and AI-change highlights | design.md; visual 03; browser acceptance in M4/M5. |
-| R17 | Collapsible tools use little screen area | design.md compact tools; visuals; M5. |
-| R18 | Series of imagegen templates in CloudX styling | visual-templates.md, four PNGs, exact prompts.json, three semantic templates. |
+| R16 | Non-obstructive regions, comments and AI-change highlights | design.md; browser acceptance in M4/M5. |
+| R17 | Collapsible tools use little screen area | design.md compact tools; browser controls; M5. |

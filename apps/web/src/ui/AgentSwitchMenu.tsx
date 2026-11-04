@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type PointerEvent } from "react";
-import { ArrowRightLeft, Settings } from "lucide-react";
+import { ArrowRightLeft, Info, Settings } from "lucide-react";
 import { AGENT_ACCOUNT_HOOKS, AGENT_PROVIDER_IDS, agentProviderLabel, isAgentTab, type AgentAccountsState, type WorkspaceTab } from "@cloudx/shared";
 
 import { switchAgent } from "../api.js";
+import { openNativeWorkDetails } from "./nativeWorkDetails.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
 import { BlackboardAssignment } from "./cooperation/BlackboardAssignment.js";
 import "./cooperation/cooperation.css";
@@ -37,7 +38,7 @@ export function useAgentSwitchMenu(enabled: boolean) {
   useEffect(() => cancelPress, []);
 
   function tabHandlers(tab: WorkspaceTab) {
-    if (!enabled || !isAgentTab(tab)) return {};
+    if (!isAgentTab(tab) || !enabled && !tab.nativeWork) return {};
     return {
       onKeyDown: (event: KeyboardEvent<HTMLElement>) => {
         if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey)) return;
@@ -74,6 +75,7 @@ interface AgentSwitchMenuProps {
   callHook?: CallHook;
   onSwitched: (tab: WorkspaceTab) => void;
   onOpenAccounts: () => void;
+  onOpenNativeWork?: (tab: WorkspaceTab) => void;
   onClose: () => void;
   cooperationEnabled?: boolean;
   accountsEnabled?: boolean;
@@ -82,7 +84,7 @@ interface AgentSwitchMenuProps {
 
 // Right-click menu on an agent tab. The server checks that the current turn is
 // idle or ended; the menu shows its reason when it refuses.
-export function AgentSwitchMenu({ tab, x, y, callHook, onSwitched, onOpenAccounts, onClose, cooperationEnabled = false, accountsEnabled = true, onOpenBoard }: AgentSwitchMenuProps) {
+export function AgentSwitchMenu({ tab, x, y, callHook, onSwitched, onOpenAccounts, onOpenNativeWork = openNativeWorkDetails, onClose, cooperationEnabled = false, accountsEnabled = true, onOpenBoard }: AgentSwitchMenuProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [state, setState] = useState<AgentAccountsState>();
   const [busy, setBusy] = useState(false);
@@ -126,13 +128,14 @@ export function AgentSwitchMenu({ tab, x, y, callHook, onSwitched, onOpenAccount
 
   const installed = new Set(state?.providers.filter(provider => provider.installed).map(provider => provider.providerId));
   const accounts = state?.accounts.filter(account => installed.has(account.providerId)) ?? [];
-  return <div ref={ref} className="file-context-menu agent-switch-menu" style={{ left: x, top: y }} role="menu" aria-label={`${cooperationEnabled ? "Agent actions" : "Switch agent"} for ${tab.title}`} aria-busy={busy} onKeyDown={event => {
+  return <div ref={ref} className="file-context-menu agent-switch-menu" style={{ left: x, top: y }} role="menu" aria-label={`Agent actions for ${tab.title}`} aria-busy={busy} onKeyDown={event => {
     if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement) return;
     const items = [...(ref.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
     const index = items.indexOf(document.activeElement as HTMLButtonElement);
     const next = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1 : (index + (event.key === "ArrowUp" ? -1 : 1) + items.length) % items.length;
     event.preventDefault(); items[next]?.focus();
   }}>
+    {tab.nativeWork ? <button type="button" role="menuitem" onClick={() => { onOpenNativeWork(tab); onClose(); }}><Info size={14} aria-hidden="true" /><span>Open native work details</span></button> : null}
     {cooperationEnabled && onOpenBoard ? <BlackboardAssignment tab={tab} onOpenBoard={onOpenBoard} onClose={onClose} /> : null}
     {canSwitch ? <><p className="agent-switch-hint">
       {tab.status === "running" ? "Switch after the current turn finishes. The run restarts on the chosen account." : "Restart this run on another account or provider."}

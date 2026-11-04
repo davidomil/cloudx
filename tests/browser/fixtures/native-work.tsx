@@ -2,6 +2,8 @@ import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { CodexNativeWork, WorkspaceTab } from "@cloudx/shared";
 import { recoverTab } from "../../../apps/web/src/api.js";
+import { AgentSwitchMenu, useAgentSwitchMenu } from "../../../apps/web/src/ui/AgentSwitchMenu.js";
+import { openNativeWorkDetails } from "../../../apps/web/src/ui/nativeWorkDetails.js";
 import { TerminalPanel } from "../../../apps/web/src/ui/TerminalPanel.js";
 import "@xterm/xterm/css/xterm.css";
 import "../../../apps/web/src/styles.css";
@@ -36,7 +38,7 @@ const affected: WorkspaceTab = {
 
 function NativeWorkFixture() {
   const [tabs, setTabs] = useState<WorkspaceTab[]>([
-    affected,
+    location.search.includes("healthy") ? { ...affected, nativeWork: { ...affected.nativeWork!, turnStatus: "completed", goalStatus: "active", lastError: undefined } } : affected,
     {
       ...affected,
       id: "sibling",
@@ -54,6 +56,8 @@ function NativeWorkFixture() {
     },
   ]);
   const [activeTab, setActiveTab] = useState("affected");
+  const menu = useAgentSwitchMenu(true);
+  const menuTab = tabs.find(tab => tab.id === menu.position?.tabId);
   Object.assign(window, {
     observeNativeWork: (work: Partial<CodexNativeWork>) =>
       setTabs((current) =>
@@ -68,11 +72,12 @@ function NativeWorkFixture() {
     <main style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <nav aria-label="Fixture tabs">
         {tabs.map((tab) => (
-          <button key={tab.id} onClick={() => setActiveTab(tab.id)}>
+          <button key={tab.id} {...menu.tabHandlers(tab)} onClick={() => setActiveTab(tab.id)}>
             {tab.title}
           </button>
         ))}
       </nav>
+      {menu.position && menuTab ? <AgentSwitchMenu tab={menuTab} x={menu.position.x} y={menu.position.y} accountsEnabled={false} onSwitched={() => {}} onOpenAccounts={() => {}} onClose={menu.close} onOpenNativeWork={tab => { setActiveTab(tab.id); openNativeWorkDetails(tab); }} /> : null}
       {tabs.map((tab) => (
         <div
           key={tab.id}

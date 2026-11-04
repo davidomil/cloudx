@@ -57,6 +57,22 @@ describe("Persisted CI repair evidence", () => {
     expect(parseWorkers([{ ...owned, attemptId: worker.id, ciRepair: reviewing }])[0].ciRepair).toEqual(reviewing);
   });
 
+  it("retains a manual repair beyond the automatic budget without inventing an automatic attempted head", () => {
+    const ciRepair = { ...active, manual: true, attempts: 2, attemptedHeads: ["d".repeat(40), "e".repeat(40)],
+      diagnosticStatus: "current", diagnosticReason: "Current producer evidence is pinned." };
+    expect(parse(ciRepair)).toEqual(ciRepair);
+    expect(() => parse({ ...ciRepair, manual: false })).toThrow();
+    expect(() => parse({ ...ciRepair, attempts: 3 })).toThrow();
+  });
+
+  it("retains the historical snapshot while refreshing and rejects invalid freshness", () => {
+    const refreshing = { ...active, phase: "diagnosing", diagnosticStatus: "stale", diagnosticReason: "Refreshing current evidence." };
+    expect(parse(refreshing)).toEqual(refreshing);
+    expect(() => parse({ ...refreshing, diagnosticStatus: "current" })).toThrow();
+    expect(() => parse({ ...refreshing, diagnosticStatus: "unknown" })).toThrow();
+    expect(() => parse({ phase: "blocked", attempts: 0, attemptedHeads: [], diagnosticStatus: "current" })).toThrow();
+  });
+
   it("retains the required aggregate gate alongside its proved producer", () => {
     const requiredGate = { jobId: "gate-1", name: "CI aggregate", url: "https://github.com/cloudx/example/actions/runs/1/job/2", log: "UPGRADE_RESULT: failure" };
     const repair = { ...ready, diagnostic: { ...diagnostic, jobs: [{ ...diagnostic.jobs[0], requiredGate }] } };

@@ -5625,6 +5625,348 @@ describe("Forge issue auto review", () => {
     expect(f.provider.merge).not.toHaveBeenCalled();
   });
 
+  async function exhaustedCiBudget(review: Partial<ForgeReviewSubmission> = {}) {
+    const f = await repairingCiIssue();
+    await publishCiRepair(f, "c".repeat(40));
+    failedCi(f);
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Source reviewed", comments: [] });
+    await f.poll();
+    await publishCiRepair(f, "d".repeat(40));
+    const diagnostic = failedCi(f, { failureKey: "third-head:run-99:attempt-2:coverage-4",
+      jobs: [{ runId: "99", runAttempt: 2, jobId: "44", name: "coverage-4", url: "https://ci.test/jobs/44",
+        conclusion: "failure", testedSha: "e".repeat(40), classification: "code", log: "AssertionError: surviving-thread cleanup eligibility" }] });
+    f.report({ kind: "review", headSha: f.change.headSha, event: "approve", body: "Source reviewed", comments: [], ...review });
+    await f.poll();
+    f.report(undefined);
+    return { ...f, currentDiagnostic: diagnostic };
+  }
+
+  it.each(["continue", "resume", "restart during preparation"] as const)("recovers a manual repair context-write failure with %s without spending automatic attempts", async action => {
+    const f = await exhaustedCiBudget();
+    const original = f.currentIssue();
+    const message = "Repair the current CI failure and preserve my diagnostics.";
+    let preparationCheckpoint: ForgeWorker[] = [];
+    f.reports.prepare.mockImplementationOnce(async () => {
+      preparationCheckpoint = f.stored();
+      throw new Error("Context write failed before native delivery.");
+    });
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    await expect(f.service.continueWorker(f.issue.id, message, placement, { ciRepair: true })).rejects.toThrow("Context write failed");
+    expect(f.currentIssue()).toMatchObject({ status: "failed", ciRepair: { phase: "blocked", attempts: 2,
+      attemptedHeads: original.ciRepair!.attemptedHeads }, pendingContinuation: { message, previousError: original.error, ciRepair: true } });
+    expect(f.currentIssue().pendingContinuation?.deliveryAttemptId).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    if (action === "restart during preparation") await f.deps.store.write(preparationCheckpoint);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    f.runtime.readTurnCompletion.mockImplementation(async (workerId, attemptId) =>
+      f.runtime.launch.mock.calls.some(([input]) => input.id === workerId && input.attemptId === attemptId)
+        ? { workerId, attemptId, threadId: "manual-thread", turnId: "manual-turn", status: "running" } : undefined);
+    f.runtime.launch.mockImplementationOnce(async input => {
+      expect(f.currentIssue()).toMatchObject({ ciRepair: { phase: "launching", attemptId: input.attemptId },
+        pendingContinuation: { message, deliveryAttemptId: input.attemptId, ciRepair: true } });
+      return "tab-1";
+    });
+    const continued = action === "continue"
+      ? await restarted.continueWorker(f.issue.id, message, placement, { ciRepair: true })
+      : await restarted.resume(f.issue.id, placement);
+    expect(continued).toMatchObject({ status: "running", branch: original.branch, worktreePath: original.worktreePath,
+      changeNumber: original.changeNumber, ciRepair: { manual: true, phase: "repairing", attempts: 2,
+        attemptedHeads: original.ciRepair!.attemptedHeads } });
+    expect(continued.pendingContinuation).toBeUndefined();
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({
+      manualContinuation: { message, previousError: original.error }, ciRepair: expect.objectContaining({ manual: true, diagnostic: f.currentDiagnostic }) }));
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("keeps manual repair recoverable when its delivery checkpoint cannot be persisted", async () => {
+    const f = await exhaustedCiBudget();
+    const write = f.deps.store.write;
+    let failedCheckpoint = false;
+    f.deps.store.write = async workers => {
+      if (!failedCheckpoint && workers.some(worker => worker.id === f.issue.id && worker.ciRepair?.manual && worker.ciRepair.phase === "launching")) {
+        failedCheckpoint = true;
+        throw new Error("Delivery checkpoint write failed.");
+      }
+      await write(workers);
+    };
+    await expect(f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow("Delivery checkpoint write failed");
+    expect(f.currentIssue()).toMatchObject({ status: "failed", ciRepair: { phase: "blocked", attempts: 2 },
+      pendingContinuation: { message: "Repair current CI.", ciRepair: true } });
+    expect(f.currentIssue().pendingContinuation?.deliveryAttemptId).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    const restarted = new ForgeWorkflowService(f.deps);
+    expect(await restarted.resume(f.issue.id, placement)).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 2 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+  });
+
+  it.each([
+    ["pause", "resume"], ["pause", "continue"], ["stop", "resume"], ["stop", "continue"],
+  ] as const)("recovers %s during the manual delivery checkpoint with %s after restart", async (control, recovery) => {
+    const f = await exhaustedCiBudget();
+    const original = f.currentIssue();
+    const message = "Repair CI and preserve the cancellation diagnostics.";
+    const saving = deferred<void>();
+    const release = deferred<void>();
+    const write = f.deps.store.write;
+    let held = false;
+    f.deps.store.write = async workers => {
+      await write(workers);
+      if (!held && workers.some(worker => worker.id === f.issue.id && worker.ciRepair?.manual && worker.ciRepair.phase === "launching")) {
+        held = true;
+        saving.resolve();
+        await release.promise;
+      }
+    };
+    const deliveredAttempts = new Set<string>();
+    f.runtime.launch.mockImplementation(async (input, signal) => {
+      signal?.throwIfAborted();
+      deliveredAttempts.add(input.attemptId);
+      return "tab-1";
+    });
+    f.runtime.readTurnCompletion.mockImplementation(async (workerId, attemptId) => deliveredAttempts.has(attemptId)
+      ? { workerId, attemptId, threadId: "manual-thread", turnId: "manual-turn", status: "running" } : undefined);
+    const continuing = expect(f.service.continueWorker(f.issue.id, message, placement, { ciRepair: true })).rejects.toThrow(/Worker (paused|stopped) by user/);
+    await saving.promise;
+    const stopping = f.service[control](f.issue.id);
+    release.resolve();
+    await Promise.all([continuing, stopping]);
+    expect(deliveredAttempts.size).toBe(0);
+    expect(f.currentIssue()).toMatchObject({ status: control === "pause" ? "paused" : "stopped",
+      ciRepair: { manual: true, phase: "blocked", attempts: 2, attemptedHeads: original.ciRepair!.attemptedHeads },
+      pendingContinuation: { message, previousError: original.error, ciRepair: true } });
+    expect(f.currentIssue().pendingContinuation?.deliveryAttemptId).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(deliveredAttempts.size).toBe(0);
+    const continued = recovery === "resume" ? await restarted.resume(f.issue.id, placement)
+      : await restarted.continueWorker(f.issue.id, message, placement, { ciRepair: true });
+    expect(continued).toMatchObject({ status: "running", branch: original.branch, worktreePath: original.worktreePath,
+      changeNumber: original.changeNumber, ciRepair: { manual: true, phase: "repairing", attempts: 2,
+        attemptedHeads: original.ciRepair!.attemptedHeads } });
+    expect(continued.pendingContinuation).toBeUndefined();
+    expect(deliveredAttempts.size).toBe(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({
+      manualContinuation: { message, previousError: original.error } }));
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("keeps a rejected native delivery uncertain after restart instead of repeating it", async () => {
+    const f = await exhaustedCiBudget();
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    f.runtime.launch.mockRejectedValueOnce(new Error("Native launch acknowledgement was lost."));
+    await expect(f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow("acknowledgement was lost");
+    const failed = f.currentIssue();
+    expect(failed).toMatchObject({ ciRepair: { phase: "launching", attempts: 2, attemptId: failed.attemptId },
+      pendingContinuation: { deliveryAttemptId: failed.attemptId, ciRepair: true } });
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.resume(f.issue.id, placement)).rejects.toThrow(/uncertain/);
+    await expect(restarted.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow(/uncertain/);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+  });
+
+  it.each([false, true])("includes the matching unpublished reviewer findings in manual repair across restart %s", async restart => {
+    const finding = { body: "Isolate process inspection from unrelated Node identity changes.", path: "apps/server/src/workspace/WorkspaceCleanupService.test.ts", line: 443, side: "RIGHT" as const };
+    const f = await exhaustedCiBudget({ event: "request_changes", body: "Keep process identity uncertainty and fix the fixture.", comments: [finding] });
+    const review = f.currentReview();
+    expect(review).toMatchObject({ status: "completed", draft: { status: "draft", event: "request_changes", comments: [finding] } });
+    f.change.comments = [];
+    expect(f.change.comments).toEqual([]);
+    const posted = f.provider.postReview.mock.calls.length;
+    const service = restart ? new ForgeWorkflowService(f.deps) : f.service;
+    const continued = await service.continueWorker(f.issue.id, "Repair CI and address the current reviewer findings.", placement, { ciRepair: true });
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({
+      localReview: { workerId: review.id, draft: review.draft, revision: review.reviewBaseline!.revision },
+      change: expect.objectContaining({ comments: [] }), ciRepair: expect.objectContaining({ attempts: 2 }) }));
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0].prompt).toContain("localReview");
+    expect(f.provider.postReview).toHaveBeenCalledTimes(posted);
+  });
+
+  it.each(["review head", "draft comparison", "baseline base", "missing baseline"] as const)("excludes local findings with a mismatched %s from manual repair", async mismatch => {
+    const f = await exhaustedCiBudget({ event: "request_changes", body: "A finding from another comparison", comments: [{ body: "Do not apply this stale finding." }] });
+    const saved = f.stored();
+    const review = saved.find(worker => worker.id === f.currentReview().id)!;
+    if (mismatch === "review head") review.headSha = "f".repeat(40);
+    if (mismatch === "draft comparison") review.draft!.headSha = review.reviewBaseline!.revision.headSha = "f".repeat(40);
+    if (mismatch === "baseline base") review.reviewBaseline!.revision.baseSha = "f".repeat(40);
+    if (mismatch === "missing baseline") review.reviewBaseline = undefined;
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true });
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).not.toHaveProperty("localReview");
+  });
+
+  it.each(["issue", "repository", "request"] as const)("rejects manual repair when its linked reviewer belongs to another %s", async mismatch => {
+    const f = await exhaustedCiBudget({ event: "request_changes", body: "Local finding", comments: [{ body: "Fix the fixture." }] });
+    const saved = f.stored();
+    const review = saved.find(worker => worker.id === f.currentReview().id)!;
+    if (mismatch === "issue") review.issueWorkerId = randomUUID();
+    if (mismatch === "repository") review.repository.projectPath = "a/other";
+    if (mismatch === "request") review.number = review.changeNumber = f.change.number + 1;
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow("linked reviewer does not belong");
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    expect(f.provider.postReview.mock.calls.at(-1)?.[1].body).not.toContain("Local finding");
+  });
+
+  it("refreshes the different third-head producer at the cap and Resume never replenishes automatic attempts", async () => {
+    const f = await exhaustedCiBudget();
+    const history = f.currentIssue().ciRepair!.attemptedHeads;
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { phase: "blocked", attempts: 2,
+      diagnosticStatus: "current", diagnostic: f.currentDiagnostic }, error: expect.stringMatching(/Resume only rechecks.*Continue CI repair/) });
+    expect(f.provider.getCiFailure).toHaveBeenLastCalledWith(expect.objectContaining({ headSha: "d".repeat(40) }));
+    const refreshed = failedCi(f, { ...f.currentDiagnostic, failureKey: "third-head:run-100:attempt-3:coverage-4",
+      jobs: [{ ...f.currentDiagnostic.jobs[0], runId: "100", runAttempt: 3 }] });
+    await f.service.resume(f.issue.id, placement);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { attempts: 2, attemptedHeads: history,
+      diagnosticStatus: "current", diagnostic: refreshed } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("marks the retained snapshot historical when the capped refresh cannot obtain current logs", async () => {
+    const f = await exhaustedCiBudget();
+    f.provider.getCiFailure.mockRejectedValue(new ForgeProviderUnavailableError("connection"));
+    await f.service.resume(f.issue.id, placement);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { attempts: 2, diagnosticStatus: "stale",
+      diagnostic: f.currentDiagnostic, diagnosticReason: expect.stringMatching(/could not be collected/) } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+  });
+
+  it("marks newly read capped evidence historical when the provider cannot confirm its current request", async () => {
+    const f = await exhaustedCiBudget();
+    f.provider.getCiFailure.mockImplementationOnce(async () => {
+      f.provider.getChangeRequest.mockRejectedValueOnce(new ForgeProviderUnavailableError("connection"));
+      return f.currentDiagnostic;
+    });
+    await f.service.resume(f.issue.id, placement);
+    await f.poll();
+    expect(f.currentIssue().ciRepair).toMatchObject({ attempts: 2, diagnosticStatus: "stale",
+      diagnosticReason: expect.stringMatching(/Confirming the current request/) });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+  });
+
+  it("continues a capped repair once with current pinned evidence and actionable findings without resetting history", async () => {
+    const f = await exhaustedCiBudget();
+    const original = f.currentIssue();
+    f.change.comments.push({ id: "current-finding", discussionId: "cleanup-thread", author: "reviewer", resolved: false,
+      body: "Isolate process inspection from unrelated Node identity changes." });
+    const continued = await f.service.continueWorker(f.issue.id, "Repair the current CI failure.", placement, { ciRepair: true });
+    expect(continued).toMatchObject({ status: "running", id: original.id, branch: original.branch, worktreePath: original.worktreePath,
+      changeNumber: original.changeNumber, headSha: original.headSha, ciRepair: { manual: true, phase: "repairing", attempts: 2,
+        attemptedHeads: original.ciRepair!.attemptedHeads, diagnosticStatus: "current", diagnostic: f.currentDiagnostic,
+        attemptId: continued.attemptId }, completion: { turn: { status: "running" } } });
+    expect(continued.pendingContinuation).toBeUndefined();
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId, expect.objectContaining({
+      change: expect.objectContaining({ comments: expect.arrayContaining([expect.objectContaining({ id: "current-finding" })]) }),
+      ciRepair: expect.objectContaining({ manual: true, diagnostic: f.currentDiagnostic }),
+    }));
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ preserveConversation: true,
+      prompt: expect.stringContaining("explicitly requested manual CI repair") });
+    await expect(f.service.continueWorker(f.issue.id, "Repair the current CI failure.", placement, { ciRepair: true })).rejects.toThrow(/Pause/);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", ciRepair: { manual: true, attempts: 2, phase: "repairing" } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("requires publication, a fresh review and passing CI after an explicit capped repair", async () => {
+    const f = await exhaustedCiBudget();
+    await f.service.continueWorker(f.issue.id, "Repair the current failure.", placement, { ciRepair: true });
+    const repairedHead = "f".repeat(40);
+    await publishCiRepair(f, repairedHead);
+    expect(f.runtime.publishBranch).toHaveBeenLastCalledWith(expect.objectContaining({ id: f.issue.id }), expect.any(AbortSignal), repairedHead,
+      { purpose: "ci_repair", expectedRemoteHeadSha: f.currentDiagnostic.sourceHeadSha });
+    expect(f.currentIssue().ciRepair).toMatchObject({ manual: true, phase: "reviewing", attempts: 2, repairedHeadSha: repairedHead });
+    expect(f.currentReview()).toMatchObject({ status: "running", headSha: repairedHead });
+    f.report({ kind: "review", headSha: repairedHead, event: "approve", body: "Manual repair reviewed", comments: [] });
+    await f.poll();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.checks!.state = "passed";
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", error: expect.stringContaining("provider's merge requirements") });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.mergeable = true;
+    await f.poll();
+    expect(f.provider.merge).toHaveBeenCalledExactlyOnceWith(f.change.number, repairedHead, f.change.targetHeadSha);
+    expect(f.stored()).toEqual([]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(8);
+  });
+
+  it("rejects a repeated CI-repair click while pinned evidence is being collected", async () => {
+    const f = await exhaustedCiBudget();
+    let release!: (diagnostic: ForgeCiDiagnostic) => void;
+    f.provider.getCiFailure.mockReturnValueOnce(new Promise(resolve => { release = resolve; }));
+    const first = f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true });
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    await expect(f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow(/progress|pending/);
+    release(f.currentDiagnostic);
+    expect(await first).toMatchObject({ status: "running", ciRepair: { manual: true, attempts: 2 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+  });
+
+  it.each(["reviewer", "publication", "merge"] as const)("rejects explicit CI continuation while %s is pending", async pending => {
+    const f = await exhaustedCiBudget();
+    const saved = f.stored();
+    const issue = saved.find(worker => worker.id === f.issue.id)!;
+    if (pending === "reviewer") saved.find(worker => worker.id === issue.autoReview!.reviewWorkerId)!.status = "running";
+    if (pending === "publication") issue.pendingPublication = { report: { kind: "issue", title: "Pending", body: "Pending", discussionReplies: [], resolvedDiscussionIds: [] }, repliedDiscussionIds: [] };
+    if (pending === "merge") issue.mergeAttempted = true;
+    await f.deps.store.write(saved);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.continueWorker(issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow(/review|publication|merge/i);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+  });
+
+  it.each(["source", "target", "unavailable", "obsolete"] as const)("rejects manual repair with %s evidence and preserves the cap", async mismatch => {
+    const f = await exhaustedCiBudget();
+    if (mismatch === "unavailable") f.provider.getCiFailure.mockRejectedValue(new Error("Failure logs unavailable"));
+    else f.provider.getCiFailure.mockResolvedValue({ ...f.currentDiagnostic,
+      ...(mismatch === "source" ? { sourceHeadSha: "f".repeat(40) } : mismatch === "target" ? { targetHeadSha: "f".repeat(40) } : { state: "obsolete", reason: "The CI run was superseded." }) });
+    await expect(f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true })).rejects.toThrow(/match|historical|superseded/);
+    expect(f.currentIssue().ciRepair).toMatchObject({ attempts: 2, diagnosticStatus: "stale" });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(6);
+  });
+
+  it("retains an unknown manual launch identity across repeated delivery and restart until its receipt arrives", async () => {
+    const f = await exhaustedCiBudget();
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    const continued = await f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true });
+    expect(continued).toMatchObject({ status: "running", ciRepair: { manual: true, phase: "launching", attempts: 2, attemptId: continued.attemptId },
+      pendingContinuation: { ciRepair: true, deliveryAttemptId: continued.attemptId } });
+    await f.service.pause(f.issue.id);
+    const restarted = new ForgeWorkflowService(f.deps);
+    for (const action of [() => restarted.resume(f.issue.id, placement),
+      () => restarted.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true }),
+      () => restarted.continueWorker(f.issue.id, "Different repair request.", placement)])
+      await expect(action()).rejects.toThrow(/uncertain.*identity|identity.*uncertain/);
+    expect(f.currentIssue().ciRepair).toMatchObject({ phase: "launching", attempts: 2, attemptId: continued.attemptId });
+    f.runtime.readTurnCompletion.mockResolvedValue({ workerId: f.issue.id, attemptId: continued.attemptId!, threadId: "manual-thread", turnId: "manual-turn", status: "running" });
+    const recovered = await restarted.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true });
+    expect(recovered).toMatchObject({ status: "running", error: undefined, ciRepair: { phase: "repairing", attempts: 2, manual: true, attemptId: continued.attemptId } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+  });
+
+  it("acknowledges a delayed manual launch receipt during polling and clears the resolved launch warning", async () => {
+    const f = await exhaustedCiBudget();
+    f.runtime.readTurnCompletion.mockResolvedValue(undefined);
+    const continued = await f.service.continueWorker(f.issue.id, "Repair current CI.", placement, { ciRepair: true });
+    expect(continued).toMatchObject({ ciRepair: { phase: "launching", attempts: 2 }, error: expect.stringContaining("awaiting its matching native turn acknowledgement") });
+    f.runtime.readTurnCompletion.mockResolvedValue({ workerId: f.issue.id, attemptId: continued.attemptId!, threadId: "manual-thread", turnId: "manual-turn", status: "running" });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", error: undefined, pendingContinuation: undefined,
+      ciRepair: { manual: true, phase: "repairing", attempts: 2, attemptId: continued.attemptId } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+  });
+
   it.each(["diagnosing", "ready"] as const)("continues a persisted %s repair after restart with one durable launch intention", async phase => {
     const f = await approvedIssue();
     const diagnostic = failedCi(f);

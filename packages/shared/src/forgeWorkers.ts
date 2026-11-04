@@ -34,6 +34,9 @@ export interface ForgeCiRepair {
   attempts: number;
   attemptedHeads: string[];
   diagnostic?: ForgeCiDiagnostic;
+  diagnosticStatus?: "current" | "stale" | "unavailable";
+  diagnosticReason?: string;
+  manual?: true;
   attemptId?: string;
   repairedHeadSha?: string;
   reason?: string;
@@ -203,7 +206,7 @@ export interface ForgeWorker {
     candidate?: { headSha: string; targetHeadSha: string; prepared?: true; reviewId?: string; checksUrl?: string };
     outcome?: "uncertain" | "merged";
   };
-  pendingContinuation?: { message: string; previousError?: string; deliveryAttemptId?: string };
+  pendingContinuation?: { message: string; previousError?: string; deliveryAttemptId?: string; ciRepair?: true };
   recoveryContext?: {
     operation: "branch_update";
     reason: string;
