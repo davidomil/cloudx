@@ -1820,20 +1820,26 @@ export function validateCiWorkflow(workflowName, workflow, issues = []) {
     const job = jobs[name];
     const steps = Array.isArray(job?.steps) ? job.steps.filter(isRecord) : [];
     const space = steps.find((step) => step.id === "lifecycle-space");
+    const checkout = steps.find((step) =>
+      step.uses?.startsWith("actions/checkout@"),
+    );
     if (
       !space ||
       !boundedTimeout(space, 5) ||
-      !String(space.run).includes(
-        "sudo rm -rf -- /usr/local/lib/android/sdk /usr/share/dotnet",
-      ) ||
-      !["before", "after"].every((phase) =>
-        String(space.run).includes(
-          `lifecycle-${scenario}/disk-space-${phase}.txt`,
-        ),
-      )
+      checkout?.with?.ref !==
+        "${{ needs.lifecycle-revisions.outputs.target-sha }}" ||
+      checkout?.with?.["fetch-depth"] !== 0 ||
+      checkout?.with?.["persist-credentials"] !== false ||
+      steps.indexOf(checkout) >= steps.indexOf(space) ||
+      String(space.run).trim() !==
+        [
+          `df -B1 / > "$RUNNER_TEMP/lifecycle-${scenario}/disk-space-before.txt"`,
+          "bash scripts/ci/prepare-verifier-disk.sh",
+          `df -B1 / > "$RUNNER_TEMP/lifecycle-${scenario}/disk-space-after.txt"`,
+        ].join("\n")
     ) {
       issues.push(
-        `Workflow '${workflowName}' ${name} must reclaim only unused runner SDKs with a bounded step and retained disk-space evidence.`,
+        `Workflow '${workflowName}' ${name} must reclaim only unused runner SDKs through the shared guard after immutable checkout, with a bounded step and retained disk-space evidence.`,
       );
     }
     if (

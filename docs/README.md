@@ -26,6 +26,7 @@ Starting points.
 | Forge workers         | [User guide](plugins/forge.md), [implementation](implementation/forge-workers.md)                                                                                                                 |
 | Architecture          | [System context](architecture/system-context.md), [ownership](architecture/module-ownership.md), [state invariants](architecture/state-invariants.md)                                             |
 | Cooperation blackboards | [Use the blackboard](design/cooperation/runtime.md): assignment, drawing, feedback, WIP, native delivery, and recovery. [Design package](design/cooperation/README.md): architecture and visual concepts. |
+| Hardware access | [Operator guide](design/hardware/runtime.md), [design package](design/hardware/README.md), and [UI gallery](design/hardware/implementation/README.md): SSH/UART inventory, statuses, exclusive reservations, and AI skills. |
 | Contributing          | [Contribution guide](../CONTRIBUTING.md), [testing map](architecture/testing-map.md), [optional managed automation](AI_CHANGE_PROCESS.md)                                                         |
 
 Operational guides and engineering references.

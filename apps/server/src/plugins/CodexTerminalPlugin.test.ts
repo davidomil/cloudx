@@ -15,6 +15,7 @@ import type { TerminalProcess, TerminalProcessFactory } from "../terminal/Termin
 import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
 import type { TerminalScreenSnapshot } from "../terminal/TerminalScreen.js";
 import { CodexStateSources } from "./CodexStateSources.js";
+import { hardwareLaunchEnv } from "../hardware/AgentHardwareContext.js";
 import { CodexConversationRecovery } from "./CodexConversationRecovery.js";
 import { CodexConversationForks } from "./CodexConversationForks.js";
 import { codexNativeWorkPath } from "./CodexNativeWork.js";
@@ -100,6 +101,25 @@ const tab: WorkspaceTab = {
 };
 
 describe("CodexTerminalPlugin", () => {
+  it("launches each Codex execution with its own Hardware helper context and enforces it through the login shell", async () => {
+    await withProjectTrustFixture(async ({ root, factory, plugin }) => {
+      const runtimeContext = { pluginRuntime: { hardware: { directory: path.join(root, "hardware-agent"), helperPath: path.join(root, "hardware-helper.mjs") } } };
+      const controls = { setTabIndicator: vi.fn(), closeTab: vi.fn(), setRestoreInput: vi.fn() };
+      const first = await plugin.createSession({ tab, cwd: root, runtimeContext, controls });
+      const firstId = first.restoreInput?.()?.codexExecutionId as string;
+      const firstPath = hardwareLaunchEnv(runtimeContext, firstId).CLOUDX_HARDWARE_CONTEXT;
+      expect(factory.env).toMatchObject(hardwareLaunchEnv(runtimeContext, firstId));
+      expect(factory.env?.CLOUDX_ENFORCED_CLOUDX_HARDWARE_CONTEXT).toBe(firstPath);
+      first.stop?.();
+      const second = await plugin.createSession({ tab, cwd: root, runtimeContext, controls });
+      const secondId = second.restoreInput?.()?.codexExecutionId as string;
+      expect(secondId).not.toBe(firstId);
+      expect(factory.env).toMatchObject(hardwareLaunchEnv(runtimeContext, secondId));
+      expect(factory.env?.CLOUDX_HARDWARE_CONTEXT).not.toBe(firstPath);
+      second.stop?.();
+    });
+  });
+
   it("provides source-grounded writing and its resources without a personality template", async () => {
     await withProjectTrustFixture(async ({ root, factory, plugin }) => {
       vi.stubEnv("CLOUDX_PERSONALITY_TEMPLATE_ID", undefined);

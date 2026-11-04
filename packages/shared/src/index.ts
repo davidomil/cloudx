@@ -1369,3 +1369,4 @@ export * from "./forgeGitHistory.js";
 export * from "./forgeDiagnosticSnapshots.js";
 
 export * from "./terminalCapabilities.js";
+export * from "./hardware.js";

@@ -24,6 +24,7 @@ export interface SessionRuntimeContextResolver {
   runtimeContextFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<WorkspaceRuntimeContext> | WorkspaceRuntimeContext;
   tabIndicatorFor(tab: WorkspaceTab, window?: WorkspaceWindow): Promise<TabIndicatorUpdate | undefined> | TabIndicatorUpdate | undefined;
   prepareExecution?(tab: WorkspaceTab): Promise<void> | void;
+  executionEnded?(tab: WorkspaceTab, execution: { providerId: AgentProviderId; executionId: string; logicalRunId?: string; attemptId?: string }): Promise<void> | void;
 }
 
 export interface StartTabRequest {
@@ -288,6 +289,7 @@ export class SessionStore {
     try {
       await previous.terminate();
       if (previous.hasExited?.() !== true) throw new Error("The native client did not confirm process termination.");
+      await this.notifyExecutionEnded(tab);
       this.disposeSessionListeners(tab.id);
       previous.detach?.();
       this.sessions.delete(tab.id);
@@ -344,6 +346,7 @@ export class SessionStore {
     if (previous) {
       this.disposeSessionListeners(tabId);
       if (alive) await previous.terminate?.();
+      if (previous.hasExited?.() === true) await this.notifyExecutionEnded(tab);
       this.sessions.delete(tabId);
     }
     this.initialInputs.set(tabId, structuredClone(next));
@@ -840,6 +843,7 @@ export class SessionStore {
       const session = this.actionSession(tabId);
       this.plugins.validateInput(session.tab.pluginId, action, input);
       const result = this.plugins.validateOutput(session.tab.pluginId, action, await session.handleAction(action, input, { signal: admittedSignal, caller: { kind: "ui" } }));
+      if (["stop", "finish"].includes(action) && session.hasExited?.() === true) await this.notifyExecutionEnded(session.tab);
       await this.contextService.record(this.getTab(tabId), "plugin-action", JSON.stringify({ action, input, result }, null, 2));
       this.markTabInteractedIfActionUpdatesState(session.tab.pluginId, action, tabId);
       return result;
@@ -918,6 +922,7 @@ export class SessionStore {
       }
       if (session?.terminate) await session.terminate();
       else if (stopSession) session?.stop?.();
+      if (closingTab && session?.hasExited?.() === true) await this.notifyExecutionEnded(closingTab);
     } catch (error) {
       const message = `Could not close tab: ${error instanceof Error ? error.message : String(error)}`;
       this.updateTab(tabId, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });
@@ -1044,6 +1049,7 @@ export class SessionStore {
     this.sessions.delete(tabId);
     if (oldSession?.terminate) await oldSession.terminate();
     else oldSession?.stop?.();
+    if (oldSession?.hasExited?.() === true) await this.notifyExecutionEnded(current);
 
     const window = this.workspace?.findWindowForTab(tabId) ?? this.workspace?.getActiveWindow();
     const runtimeContext = await this.runtimeContextResolver?.runtimeContextFor(current, window);
@@ -1347,6 +1353,13 @@ export class SessionStore {
         this.reportBackgroundError(error, "notify tab listeners", this.activeTabId ?? "workspace");
       }
     }
+  }
+
+  private async notifyExecutionEnded(tab: WorkspaceTab): Promise<void> {
+    if (!isAgentTab(tab) || tab.ownerPluginId) return;
+    const lineage = this.agentLineage(tab.id);
+    const providerId = this.agentProvider(tab.id);
+    if (lineage.executionId && providerId) await this.runtimeContextResolver?.executionEnded?.(tab, { ...lineage, providerId, executionId: lineage.executionId });
   }
 
   private persistSessions(): void {

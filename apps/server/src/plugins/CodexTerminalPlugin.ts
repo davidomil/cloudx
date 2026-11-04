@@ -40,6 +40,7 @@ import { ClaudeTerminal } from "../agents/claude/ClaudeTerminal.js";
 import type { ClaudeSettingsService } from "../agents/claude/ClaudeSettingsService.js";
 import type { AgentUsageRecorder } from "../agents/usage/AgentUsageRecorder.js";
 import { cooperationLaunchEnv } from "../cooperationAgent/AgentCooperationContext.js";
+import { hardwareLaunchEnv } from "../hardware/AgentHardwareContext.js";
 import { AgentLaunchRecords } from "../agents/AgentLaunchRecords.js";
 import { readAgentProviderStatus } from "../agents/agentCli.js";
 
@@ -220,13 +221,16 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     const work = launchTemplate.overlay ? new CodexNativeWorkReceipt(launchTemplate.overlay.codexHome) : undefined;
     const targetedRecovery = input.initialInput?.codexNativeRecovery === true;
     delete restoredInput.codexNativeRecovery;
-    restoredInput = { ...restoredInput, codexExecutionId: selection?.executionId };
+    const hardwareExecutionId = selection?.executionId ?? (input.runtimeContext?.pluginRuntime?.hardware ? randomUUID() : undefined);
+    restoredInput = { ...restoredInput, codexExecutionId: hardwareExecutionId };
     await conversation?.reset();
     if (forks) await fs.rm(forks.receiptPath, { force: true });
     if (work) await fs.rm(work.receiptPath, { force: true });
     if (launchTemplate.overlay) await fs.rm(codexCommandDetailsPath(launchTemplate.overlay.codexHome), { force: true });
     if (launchTemplate.overlay) await fs.rm(agentTurnReceiptPath(launchTemplate.overlay.codexHome), { force: true });
     await input.controls.setRestoreInput?.(restoredInput);
+    const hardwareEnv = hardwareLaunchEnv(input.runtimeContext, hardwareExecutionId);
+    Object.assign(launchTemplate.env, hardwareEnv);
     const command = launchTemplate.command;
     const useBridge = Boolean(input.agentTurn || selection);
     const sessionArgs = ["--cd", input.cwd, ...initialArgs];
@@ -240,7 +244,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     }
     // The tab's CODEX_HOME overlay wins over one the user's profile exports.
     const codexHome = launchTemplate.env.CODEX_HOME;
-    const enforced: EnforcedEnv = { set: { ...(codexHome ? { CODEX_HOME: codexHome } : {}), ...cooperationEnv }, unset: [] };
+    const enforced: EnforcedEnv = { set: { ...(codexHome ? { CODEX_HOME: codexHome } : {}), ...cooperationEnv, ...hardwareEnv }, unset: [] };
     const launch = useBridge
       ? buildEnforcedLoginShellLaunch(process.execPath, [
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
