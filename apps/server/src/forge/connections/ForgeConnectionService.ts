@@ -39,14 +39,14 @@ export class ForgeConnectionService {
 
   credential(repository: ForgeRepository, role: ForgeCredentialRole): ForgeCredential {
     const connection = this.deps.store.read()[connectionKey(repository, role)];
-    if (connection?.phase !== "connected") throw new Error(`Connect the ${role} application in Forge settings.`);
+    if (connection?.phase !== "connected") throw new ForgeProviderError(`Connect the ${role} application in Forge settings.`);
     if (repository.provider === "github" && connection.app && connection.installationId)
       return { kind: "github-app", appId: connection.app.appId, privateKey: connection.app.privateKey, installationId: connection.installationId };
     if (repository.provider === "gitlab" && connection.token) {
-      if (this.tokenExpired(connection)) throw new Error(`The ${role} GitLab bot token has expired. Renew its access in Forge settings before starting work.`);
+      if (this.tokenExpired(connection)) throw new ForgeProviderError(`The ${role} GitLab bot token has expired. Renew its access in Forge settings before starting work.`);
       return { kind: "token", token: connection.token };
     }
-    throw new Error("Forge application credentials are incomplete.");
+    throw new ForgeProviderError("Forge application credentials are incomplete.");
   }
 
   workerAuthors(repository: ForgeRepository): string[] {

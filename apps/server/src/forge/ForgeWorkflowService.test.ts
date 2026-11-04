@@ -7656,11 +7656,17 @@ describe("Forge issue auto review", () => {
     ])("persists $publication observed by $endpoint through restart and issue closure", async ({ publication, endpoint }) => {
       const f = await resolvingIssue();
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-merged-publication-"));
-      onTestFinished(() => fs.rm(directory, { recursive: true, force: true }));
       const store = new ForgeWorkflowStore(new PluginDataStore(directory));
+      onTestFinished(async () => {
+        await store.releaseWriter();
+        await fs.rm(directory, { recursive: true, force: true });
+      });
       await store.write(f.stored());
+      const releaseWriter = vi.spyOn(store, "releaseWriter");
       const save = f.deps.store.write;
       f.deps.store = {
+        claimWriter: () => store.claimWriter(),
+        releaseWriter: () => store.releaseWriter(),
         read: () => store.read(),
         write: async workers => { await store.write(workers); await save(workers); },
       };
@@ -7683,12 +7689,14 @@ describe("Forge issue auto review", () => {
       await f.poll();
       expect(f.currentIssue()).toMatchObject({ status: "awaiting_publication", headSha: previousHead,
         pendingPublication: { headSha: publishedHead, previousHeadSha: previousHead } });
+      expect(releaseWriter).not.toHaveBeenCalled();
       const report = f.currentIssue().pendingPublication!.report;
       const launches = f.runtime.launch.mock.calls.length;
       const pushes = f.runtime.publishBranch.mock.calls.length;
       const reviews = f.provider.postReview.mock.calls.length;
 
       await f.service.dispose();
+      expect(releaseWriter).toHaveBeenCalledTimes(1);
       let service = new ForgeWorkflowService(f.deps);
       await service.poll();
       expect(f.currentIssue().status).toBe("awaiting_publication");
@@ -7707,6 +7715,7 @@ describe("Forge issue auto review", () => {
       expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.oldReview.id }));
 
       await service.dispose();
+      expect(releaseWriter).toHaveBeenCalledTimes(2);
       service = new ForgeWorkflowService(f.deps);
       await service.poll();
       expect(f.currentIssue().status).toBe("paused");
@@ -7727,6 +7736,7 @@ describe("Forge issue auto review", () => {
       expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
       expect(f.provider.merge).not.toHaveBeenCalled();
       await service.dispose();
+      expect(releaseWriter).toHaveBeenCalledTimes(3);
     });
   });
 
