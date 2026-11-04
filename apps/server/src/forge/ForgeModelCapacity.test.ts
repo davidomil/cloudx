@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_FORGE_MODEL_CAPACITY_RETRIES, isForgeTurnCompletion } from "@cloudx/shared";
 import type { ForgeChangeRequest, ForgeTurnCompletion, ForgeWorker } from "@cloudx/shared";
@@ -52,6 +53,7 @@ function fixture() {
     close: vi.fn(async (tabId: string) => { activeTabs.delete(tabId); }), pause: vi.fn(async () => {}),
     finish: vi.fn(async () => {}), verifyPublishedWorkspace: vi.fn(async () => {}),
     syncPublishedBranch: vi.fn(async () => {}), cleanup: vi.fn(async () => {}),
+    prepareIssueRebase: vi.fn(async () => ({ targetHeadSha: change.targetHeadSha!, originalHeadSha: change.headSha })),
   };
   const reports = { prepare: vi.fn(async (_attemptId: string, _context: unknown) => ({ reportPath: "/report.json", contextPath: "/context.json" })), read: vi.fn(async (): Promise<unknown> => undefined), remove: vi.fn(async () => {}) };
   const deps = {
@@ -95,7 +97,127 @@ async function linkedReviewWait(f: ReturnType<typeof fixture>) {
   return { service, issue, review };
 }
 
+async function capacityRebaseWait(f: ReturnType<typeof fixture>, existingRebase: boolean) {
+  const worker = await capacityWait(f);
+  await f.service.dispose();
+  const saved = structuredClone(f.current());
+  saved.changeNumber = 7;
+  saved.headSha = "a".repeat(40);
+  if (existingRebase) saved.rebaseRecovery = {
+    branch: saved.branch!, baseBranch: saved.baseBranch, expectedHeadSha: saved.headSha,
+    originalHeadSha: saved.headSha, targetHeadSha: "b".repeat(40), phase: "resolving",
+  };
+  f.seed([saved]);
+  const change = await f.provider.getChangeRequest();
+  f.provider.getChangeRequest.mockResolvedValue({ ...change, hasConflicts: !existingRebase });
+  const service = f.createService();
+  await service.dashboard();
+  return { worker, service };
+}
+
 describe("Forge native model capacity recovery", () => {
+  it.each(["automatic", "manual"] as const)("keeps %s capacity rebase recovery valid until its merge queue turn is available", async mode => {
+    const f = fixture();
+    const { service, worker } = await capacityRebaseWait(f, false);
+    const blocker = await service.startIssue(repository, 2, placement);
+    await service.pause(blocker.id);
+    await service.dispose();
+    const saved = structuredClone(f.stored());
+    const capacityWorker = saved.find(candidate => candidate.id === worker.id)!;
+    if (mode === "manual") {
+      capacityWorker.modelCapacityRecovery!.retries = MAX_FORGE_MODEL_CAPACITY_RETRIES;
+      capacityWorker.modelCapacityRecovery!.retryAt = undefined;
+    }
+    const queued = saved.find(candidate => candidate.id === blocker.id)!;
+    Object.assign(queued, { status: "awaiting_review", changeNumber: 8, headSha: "c".repeat(40), mergeQueue: {
+      sequence: 1, enteredAt: new Date().toISOString(), phase: "updating", active: true, position: 1,
+    } });
+    f.seed(saved);
+    const restarted = f.createService();
+    await restarted.dashboard();
+    const originalSettings = structuredClone(f.current(worker.id).executionSettings);
+    f.settings.workerModel = "different-model";
+    await vi.advanceTimersByTimeAsync(30_000);
+    if (mode === "manual") await restarted.resume(worker.id, placement);
+    else await restarted.poll();
+    expect(f.current(worker.id)).toMatchObject({ status: "paused", attemptId: worker.attemptId, modelCapacityRecovery: { retries: mode === "manual" ? MAX_FORGE_MODEL_CAPACITY_RETRIES : 0 } });
+    expect(f.current(worker.id).modelCapacityRecovery?.retryAt).toBe(mode === "manual" ? undefined : "2026-11-04T00:00:30.000Z");
+    if (mode === "manual") expect(f.current(worker.id).error).toContain("Resume after it finishes");
+    expect(f.runtime.prepareIssueRebase).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    await restarted.stop(blocker.id);
+    if (mode === "manual") await restarted.resume(worker.id, placement);
+    else await Promise.all([restarted.poll(), restarted.poll()]);
+    expect(f.current(worker.id)).toMatchObject({ status: "running", modelCapacityRecovery: { retries: mode === "manual" ? 0 : 1 } });
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject(originalSettings!);
+  });
+
+  it("keeps an uncertain capacity launch's settings and retry count when manual Resume enters rebase recovery", async () => {
+    const f = fixture();
+    const { service, worker } = await capacityRebaseWait(f, true);
+    await service.dispose();
+    const saved = structuredClone(f.current());
+    const originalSettings = structuredClone(saved.executionSettings);
+    saved.attemptId = randomUUID();
+    saved.completion = { attemptId: saved.attemptId, deadlineAt: new Date(Date.now() + 60_000).toISOString() };
+    saved.modelCapacityRecovery!.retryAt = undefined;
+    saved.modelCapacityRecovery!.retries = 3;
+    f.seed([saved]);
+    f.settings.workerModel = "different-model";
+    const restarted = f.createService();
+    await restarted.resume(worker.id, placement);
+    expect(f.current()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" }, modelCapacityRecovery: { retries: 3 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject(originalSettings!);
+    expect(f.reports.remove).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("keeps the capacity receipt valid while conflict preparation yields (existing rebase: %s)", async existingRebase => {
+    const f = fixture();
+    const { service, worker } = await capacityRebaseWait(f, existingRebase);
+    let release!: () => void;
+    const prepared = { targetHeadSha: "b".repeat(40), originalHeadSha: "a".repeat(40) };
+    f.runtime.prepareIssueRebase.mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return prepared;
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    const polling = service.poll();
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const unrelated = await service.startIssue(repository, 2, placement);
+    expect(f.current(worker.id)).toMatchObject({ status: "starting", attemptId: worker.attemptId, modelCapacityRecovery: { retries: 0, retryAt: "2026-11-04T00:00:30.000Z" } });
+    expect(parseWorkers(f.stored())).toEqual(f.stored());
+    expect(f.current(unrelated.id)).toBeDefined();
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    release();
+    await polling;
+    expect(f.current(worker.id)).toMatchObject({ status: "running", modelCapacityRecovery: { retries: 1 } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+  });
+
+  it.each([true, false])("resumes capacity recovery through conflict preparation (existing rebase: %s)", async existingRebase => {
+    const f = fixture();
+    const { worker, service } = await capacityRebaseWait(f, existingRebase);
+    const originalSettings = structuredClone(f.current().executionSettings);
+    f.settings.workerModel = "different-model";
+    f.settings.workerAccountId = "different-account";
+    await vi.advanceTimersByTimeAsync(30_000);
+    await Promise.all([service.poll(), service.poll(), service.poll()]);
+    expect(f.current()).toMatchObject({ status: "running", rebaseRecovery: { phase: "resolving" }, modelCapacityRecovery: { retries: 1 } });
+    expect(f.current().attemptId).not.toBe(worker.attemptId);
+    expect(f.runtime.prepareIssueRebase).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch.mock.calls.at(-1)?.[0]).toMatchObject({ id: worker.id, worktreePath: "/repo/work", preserveConversation: true, ...originalSettings });
+    expect(f.reports.remove).not.toHaveBeenCalled();
+    expect(f.reports.prepare.mock.calls.at(-1)?.[1]).toMatchObject({ rebaseRecovery: f.current().rebaseRecovery });
+    f.fail(f.current());
+    await service.poll();
+    expect(f.current()).toMatchObject({ status: "paused", modelCapacityRecovery: { retries: 1, retryAt: "2026-11-04T00:01:30.000Z" } });
+    expect(new Set([...f.receipts.values()].map(turn => turn.threadId)).size).toBe(1);
+  });
+
   it("resumes one new attempt after 30 seconds with the same work, conversation and selected settings", async () => {
     const f = fixture();
     const worker = await capacityWait(f);
@@ -253,6 +375,38 @@ describe("Forge native model capacity recovery", () => {
     await f.service.poll();
     expect(f.current().status).toBe("cleanup_failed");
     expect(f.current().modelCapacityRecovery).toBeUndefined();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["ownership", "report"] as const)("persists a startup %s hold from a saved capacity retry checkpoint across another restart", async hold => {
+    const f = fixture();
+    const worker = await capacityWait(f);
+    await f.service.dispose();
+    const checkpoint = structuredClone(f.current());
+    checkpoint.status = "starting";
+    f.seed([checkpoint]);
+    if (hold === "ownership") f.runtime.recover.mockRejectedValue(new Error("Owned execution identity changed"));
+    else f.reports.read.mockResolvedValue({ kind: "issue", title: "Invalid completion report" });
+    const expected = {
+      id: worker.id, attemptId: worker.attemptId, status: hold === "ownership" ? "cleanup_failed" : "paused",
+      worktreePath: checkpoint.worktreePath, executionSettings: checkpoint.executionSettings,
+      error: hold === "ownership" ? "Owned execution identity changed" : expect.stringContaining("Invalid completion report:"),
+      completion: { attemptId: worker.attemptId, turn: checkpoint.completion!.turn },
+    };
+    const restarted = f.createService();
+    await expect(restarted.dashboard()).resolves.toMatchObject({ workers: [expected] });
+    expect(f.current()).toMatchObject(expected);
+    expect(f.current().modelCapacityRecovery).toBeUndefined();
+    expect(parseWorkers(f.stored())).toEqual(f.stored());
+    if (hold === "report") expect(f.current().completion?.reportError).toBe(f.current().error);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await restarted.poll();
+    await restarted.dispose();
+    const secondRestart = f.createService();
+    await expect(secondRestart.dashboard()).resolves.toMatchObject({ workers: [expected] });
+    expect(f.current().modelCapacityRecovery).toBeUndefined();
+    expect(f.current().attemptId).toBe(checkpoint.attemptId);
+    expect(f.reports.remove).not.toHaveBeenCalled();
     expect(f.runtime.launch).toHaveBeenCalledTimes(1);
   });
 

@@ -1317,7 +1317,7 @@ export class ForgeWorkflowService {
       await this.quiesce(worker, { retainReport: Boolean(worker.completion && !worker.completion.readyAt) });
       if (!modelCapacityRecovery) worker.attemptId = undefined;
       if (worker.kind === "issue" && (worker.rebaseRecovery?.phase === "resolving" || change?.hasConflicts)) {
-        await this.startRebaseRecovery(worker, placement);
+        await this.startRebaseRecovery(worker, placement, false, modelCapacityRecovery);
         return structuredClone(worker);
       }
       if (worker.kind === "review" && change) {
@@ -1534,6 +1534,10 @@ export class ForgeWorkflowService {
         }
       } catch (error) {
         completion.reportError = `Invalid completion report: ${message(error)} Its original file was preserved.`;
+        if (worker.modelCapacityRecovery) {
+          worker.modelCapacityRecovery = undefined;
+          worker.error = completion.reportError;
+        }
       }
       await this.persist();
     }
@@ -2223,9 +2227,14 @@ export class ForgeWorkflowService {
       await this.waitForIssueClosure(worker, "Merge succeeded. Waiting for the provider to confirm completion.");
     this.deps.notify("Issue merged", `${worker.title} has merged. Review environments are cleaned up now; issue environments are cleaned up once their assigned issues close.`);
   }
-  private async reserveMergeTurn(worker: ForgeWorker, change: ForgeChangeRequest): Promise<boolean> {
+  private async reserveMergeTurn(worker: ForgeWorker, change: ForgeChangeRequest, retainCapacityWait = false): Promise<boolean> {
     const active = this.mergeQueue.reserve(worker, change);
-    if (!active || ["paused", "stopped", "failed", "cleanup_failed"].includes(worker.status)) {
+    if (!active && retainCapacityWait) {
+      worker.status = "paused";
+      worker.error = worker.modelCapacityRecovery?.retryAt
+        ? "Waiting for the earlier merge queue worker before resuming model-capacity recovery automatically."
+        : "The earlier merge queue worker still owns its turn. Resume after it finishes.";
+    } else if (!active || ["paused", "stopped", "failed", "cleanup_failed"].includes(worker.status)) {
       worker.status = worker.autoReview?.enabled && worker.autoReview.phase === "merging" ? "awaiting_merge" : "awaiting_review";
       worker.error = undefined;
     }
@@ -2551,7 +2560,7 @@ export class ForgeWorkflowService {
     await this.launch(worker, worker.autoReview.placement, { item: currentIssue, change: latest });
     return true;
   }
-  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false): Promise<void> {
+  private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false, modelCapacityRecovery?: "automatic" | "manual" | "continuation"): Promise<void> {
     this.requireRecoveryPublication(worker);
     this.requireIdleReviewers(worker);
     const signal = this.operations.get(worker.id)?.signal;
@@ -2564,7 +2573,7 @@ export class ForgeWorkflowService {
     requirePublicationRequest(worker, change);
     if (change.headSha !== worker.headSha)
       throw new Error("The published branch changed before conflict recovery. Inspect the retained checkout before resuming.");
-    if (!await this.reserveMergeTurn(worker, change)) return;
+    if (!await this.reserveMergeTurn(worker, change, Boolean(modelCapacityRecovery))) return;
     const saved = worker.rebaseRecovery;
     if (saved?.phase !== "resolving" && !change.hasConflicts && !localConflict)
       throw new Error("The provider no longer reports a merge conflict. Resume the issue loop to check its current requirements.");
@@ -2572,7 +2581,7 @@ export class ForgeWorkflowService {
     if (item.number !== worker.number || item.state !== "open")
       throw new Error("Conflict recovery requires the original issue to remain open.");
     signal?.throwIfAborted();
-    await this.quiesce(worker);
+    await this.quiesce(worker, { retainReport: Boolean(modelCapacityRecovery) });
     const prepared = await this.waitForWorkerIO(worker, "Preparing conflict recovery", () => this.deps.runtime.prepareIssueRebase(workerWorkspace(worker), worker.headSha!, worker.baseBranch, signal));
     signal?.throwIfAborted();
     if (saved?.phase === "reviewing" && saved.headSha === worker.headSha && saved.targetHeadSha === prepared.targetHeadSha)
@@ -2592,7 +2601,7 @@ export class ForgeWorkflowService {
     await this.persist();
     if (saved?.phase !== "resolving" && prepared.targetHeadSha !== change.targetHeadSha)
       throw new Error("The target branch changed during conflict detection. Resume to continue the preserved rebase on its saved target.");
-    await this.launch(worker, placement, { item, change });
+    await this.launch(worker, placement, { item, change }, modelCapacityRecovery);
   }
   private async acceptRebaseReport(worker: ForgeWorker): Promise<boolean> {
     const recovery = worker.rebaseRecovery!;
@@ -3830,6 +3839,7 @@ export class ForgeWorkflowService {
                 continue;
               }
             } catch (error) {
+              worker.modelCapacityRecovery = undefined;
               worker.error = message(error);
             }
           }
@@ -3845,6 +3855,7 @@ export class ForgeWorkflowService {
               await this.quiesce(worker);
               this.operations.set(worker.id, new AbortController());
             } catch (error) {
+              worker.modelCapacityRecovery = undefined;
               worker.status = "cleanup_failed";
               worker.error = message(error);
             }
@@ -3869,6 +3880,7 @@ export class ForgeWorkflowService {
                 this.operations.set(worker.id, new AbortController());
               }
             } catch (error) {
+              worker.modelCapacityRecovery = undefined;
               worker.status = "cleanup_failed";
               worker.error = message(error);
             }
