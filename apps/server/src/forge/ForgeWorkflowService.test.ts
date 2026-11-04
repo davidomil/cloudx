@@ -11,7 +11,7 @@ import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
 } from "./ForgeWorkflowService.js";
-import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { ForgeDisposableResources, ForgeEvidenceCompletenessError, type ContainerIdentity, type DisposableContainerHost } from "./ForgeDisposableResources.js";
@@ -57,9 +57,7 @@ function fixture(issueNumber = 1) {
   const provider = {
     listIssues: vi.fn(),
     listChangeRequests: vi.fn(),
-    findChangeRequestByBranch: vi.fn(
-      async () => undefined as typeof change | undefined,
-    ),
+    findChangeRequestByBranch: vi.fn<ForgeProvider["findChangeRequestByBranch"]>(async () => undefined),
     getIssue: vi.fn(async (_number?: number) => ({ ...issue })),
     getChangeRequestStatus: vi.fn(async () => ({ ...change })),
     getChangeRequest: vi.fn(async () => ({ ...change })),
@@ -9619,16 +9617,76 @@ describe("Independent Forge progress during checkout preparation", () => {
 
 
 describe("Explicit recovery of absent request creation", () => {
-  async function absentPublication() {
+  async function absentPublication(providerKind: "github" | "gitlab" = "github") {
     const f = fixture();
-    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
-    const failures = new ForgeRequestFailures(f.deps.settings().repository, "worker", "/repos/a/b/pulls", "POST", "request");
+    const settings = f.deps.settings();
+    const repository = { ...settings.repository, provider: providerKind, apiUrl: providerKind === "github" ? "https://api.github.com" : "https://gitlab.example/api/v4" };
+    f.deps.settings = () => ({ ...settings, repository });
+    const worker = await f.service.startIssue(repository, 1, placement);
+    const failures = new ForgeRequestFailures(repository, "worker", providerKind === "github" ? "/repos/a/b/pulls" : "/projects/a%2Fb/merge_requests", "POST", "request");
     const failure = failures.transport(new TypeError("fetch failed", { cause: Object.assign(new Error("private DNS detail"), { code: "EAI_AGAIN" }) }), new AbortController().signal, true);
     f.provider.createChangeRequest.mockRejectedValueOnce(failure);
     f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
     await f.service.poll();
     return { ...f, worker };
   }
+
+  function realRetargetedRequestLookup(f: Awaited<ReturnType<typeof absentPublication>>) {
+    const repository = f.worker.repository;
+    const github = repository.provider === "github";
+    const visibility = { visible: false };
+    const request = github ? {
+      number: 7, title: "Fix", body: "Ready", html_url: "https://github.com/a/b/pull/7", state: "open", labels: [],
+      user: { login: "bot" }, updated_at: "2026-11-04T20:43:55Z", draft: false,
+      head: { ref: f.worker.branch, sha: f.change.headSha, repo: { full_name: "a/b" } },
+      base: { ref: "release", sha: f.change.baseSha, repo: { full_name: "a/b" } },
+    } : {
+      iid: 7, title: "Fix", description: "Ready", web_url: "https://gitlab.example/a/b/-/merge_requests/7", state: "opened", labels: [],
+      author: { username: "bot" }, updated_at: "2026-11-04T20:43:55Z", draft: false,
+      source_branch: f.worker.branch, target_branch: "release", source_project_id: 1, target_project_id: 1,
+    };
+    const fetcher = vi.fn<typeof fetch>(async input => {
+      const url = new URL(String(input));
+      if (!github && decodeURIComponent(url.pathname) === "/api/v4/projects/a/b")
+        return Response.json({ id: 1, path_with_namespace: "a/b" });
+      if (!url.pathname.endsWith(github ? "/pulls" : "/merge_requests"))
+        throw new Error(`Unexpected publication lookup: ${url.pathname}`);
+      const head = url.searchParams.get(github ? "head" : "source_branch");
+      const base = url.searchParams.get(github ? "base" : "target_branch");
+      const matchesHead = head === null || head === (github ? `a:${f.worker.branch}` : f.worker.branch);
+      const matchesBase = base === null || base === "release";
+      return Response.json(visibility.visible && matchesHead && matchesBase ? [request] : []);
+    });
+    const credentials = { headers: async () => ({}), requestDelay: () => undefined, deferRequests: () => {} } as unknown as ConstructorParameters<typeof ForgeHttpClient>[1];
+    const http = new ForgeHttpClient(repository, credentials, fetcher);
+    const provider = github ? new GitHubProvider(http) : new GitLabProvider(http);
+    f.provider.findChangeRequestByBranch.mockImplementation((head, base) => provider.findChangeRequestByBranch(head, base));
+    return visibility;
+  }
+
+  describe.each(["github", "gitlab"] as const)("%s retargeted publication recovery", providerKind => {
+    it.each(["reconcile", "create"] as const)("blocks %s when the same-head request targets release", async action => {
+      const f = await absentPublication(providerKind);
+      const visibility = realRetargetedRequestLookup(f);
+      const original = f.stored()[0];
+      const checked = action === "create" ? await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement) : undefined;
+      if (checked) expect(checked.publicationRecovery?.phase).toBe("absent");
+      visibility.visible = true;
+      const blocked = await f.service.recoverPublication(f.worker.id, {
+        action, ...(checked ? { recoveryId: checked.publicationRecovery!.id } : {}),
+      }, placement);
+      expect(blocked).toMatchObject({ status: "failed", publicationState: "uncertain", error: expect.stringContaining("different repository or branch") });
+      expect(blocked.publicationRecovery).toEqual(checked?.publicationRecovery);
+      expect(blocked.publicationRecovery?.dispatchedAt).toBeUndefined();
+      expect(blocked.changeNumber).toBeUndefined();
+      expect(blocked.pendingPublication).toEqual(original.pendingPublication);
+      expect(blocked.completion).toEqual(original.completion);
+      expect(blocked.publicationFailure).toEqual(original.publicationFailure);
+      expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+      expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+      expect(f.runtime.publishBranch).toHaveBeenCalledTimes(1);
+    });
+  });
 
   it("retains the DNS cause across Resume and restart, then creates once through explicit recovery", async () => {
     const f = await absentPublication();

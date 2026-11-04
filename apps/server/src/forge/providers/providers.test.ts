@@ -2350,7 +2350,33 @@ describe("request creation and input boundaries", () => {
     expect(lookup.url.searchParams.get("state")).toBe("all");
     expect(lookup.url.searchParams.get(repository.provider === "github" ? "head" : "source_branch"))
       .toBe(repository.provider === "github" ? "owner:fix-race" : "fix-race");
-    expect(lookup.url.searchParams.get(repository.provider === "github" ? "base" : "target_branch")).toBe("main");
+    expect(lookup.url.searchParams.has(repository.provider === "github" ? "base" : "target_branch")).toBe(false);
+    expect(calls.every(call => call.options.method === "GET")).toBe(true);
+  });
+
+  it.each([github, gitlab].flatMap(repository => [
+    { repository, timing: "before reconciliation", priorAbsence: false },
+    { repository, timing: "after an earlier absence", priorAbsence: true },
+  ]))("blocks retargeted $repository.provider requests $timing", async ({ repository, priorAbsence }) => {
+    const retargeted = repository.provider === "github"
+      ? { ...lookupRequest(repository), base: { ...hubRequest.base, ref: "release", repo: { full_name: "owner/repo" } } }
+      : { ...lookupRequest(repository), target_branch: "release" };
+    let visible = !priorAbsence;
+    const { provider, calls } = lookupHarness(repository, url => {
+      const head = url.searchParams.get(repository.provider === "github" ? "head" : "source_branch");
+      const base = url.searchParams.get(repository.provider === "github" ? "base" : "target_branch");
+      const matchesHead = head === null || head === (repository.provider === "github" ? "owner:fix-race" : "fix-race");
+      const matchesBase = base === null || base === "release";
+      return response(visible && matchesHead && matchesBase ? [retargeted] : []);
+    });
+    if (priorAbsence) {
+      expect(await provider.findChangeRequestByBranch("fix-race", "main")).toBeUndefined();
+      visible = true;
+    }
+    await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining("different repository or branch"),
+    });
     expect(calls.every(call => call.options.method === "GET")).toBe(true);
   });
 

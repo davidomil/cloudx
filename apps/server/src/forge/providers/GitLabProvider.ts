@@ -318,7 +318,6 @@ export class GitLabProvider implements ForgeProvider {
       state: "all",
       scope: "all",
       source_branch: headBranch,
-      target_branch: baseBranch,
     });
     const project = record((await this.http.request(this.path)).body);
     const projectId = issueNumber(integer(project.id));

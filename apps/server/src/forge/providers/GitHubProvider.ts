@@ -365,7 +365,6 @@ export class GitHubProvider implements ForgeProvider {
     const params = new URLSearchParams({
       state: "all",
       head: `${this.http.repository.projectPath.split("/")[0]}:${headBranch}`,
-      base: baseBranch,
     });
     const requests = (await this.http.all(`${this.path}/pulls?${params}`, { requireCompletePages: true }))
       .map(record);
