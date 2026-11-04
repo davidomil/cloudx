@@ -307,11 +307,16 @@ describe("Forge connection HTTP routes", () => {
     expect(status.body).not.toMatch(/private-worker|cookieHash/);
   });
 
-  it("shows missing workflow access in browser status and connects the same app after the grant is approved", async () => {
+  it.each([
+    { permission: "workflows", label: "Workflows", granted: undefined },
+    { permission: "actions", label: "actions", granted: "read" },
+  ])("shows insufficient $permission access in browser status and connects the same app after the grant is approved", async ({ permission, label, granted }) => {
     const f = await server();
     const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     f.registration.githubConvert.mockResolvedValueOnce({ appId: "11", privateKey, slug: "cloudx-worker", name: "CloudX worker" });
-    const permissions: Record<string, string> = { contents: "write", issues: "write", pull_requests: "write", checks: "read", actions: "read" };
+    const permissions: Record<string, string> = { contents: "write", issues: "write", pull_requests: "write", checks: "read", workflows: "write", actions: "write" };
+    if (granted === undefined) delete permissions[permission];
+    else permissions[permission] = granted;
     const client = new ForgeRegistrationClient(async () => Response.json({ id: 41, app_id: 11, suspended_at: null, permissions }));
     f.registration.githubInstallation.mockImplementation(client.githubInstallation.bind(client));
     const start = await f.app.inject({ method: "POST", url: "/api/forge/connections/github/start", headers: { origin }, payload: { repository: github, role: "worker" } });
@@ -327,12 +332,12 @@ describe("Forge connection HTTP routes", () => {
     const status = await f.app.inject("/api/forge/connections");
     expect(status.json().roles[0]).toMatchObject({
       state: "installing",
-      message: "Grant the worker GitHub App Workflows: write permission, approve the updated permissions for its installation, then continue installation.",
+      message: `Grant the worker GitHub App ${label}: write permission, approve the updated permissions for its installation, then continue installation.`,
     });
     expect(status.body).not.toMatch(/PRIVATE KEY|cookieHash/);
     expect(f.service().status().roles[0]?.message).toBe(status.json().roles[0].message);
 
-    permissions.workflows = "write";
+    permissions[permission] = "write";
     expect((await f.app.inject(callback)).statusCode).toBe(200);
     const connected = await f.app.inject("/api/forge/connections");
     expect(connected.json().roles[0].state).toBe("connected");

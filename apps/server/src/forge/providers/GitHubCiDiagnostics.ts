@@ -61,8 +61,20 @@ export class GitHubCiDiagnostics {
         const identities = new Map<number, string>();
         const active = new Set<number>();
         const completed = new Set<number>();
+        const resolvedGates = new Set<number>();
+        const artifactSteps = new Map<number, string>();
         let workflow: GitHubWorkflowDependencies | undefined;
         let workflowSha: string | undefined;
+        const loadWorkflow = async (testedSha?: string): Promise<boolean> => {
+          if (!workflow) {
+            workflowSha = await this.workflowRevision(run, change, diagnostic);
+            if (!workflowSha) return false;
+            workflow = await this.pinnedWorkflow(run, workflowSha);
+          }
+          if (testedSha && testedSha !== workflowSha)
+            throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
+          return true;
+        };
         const inspect = async (producer: Record<string, unknown>, gate?: CiJob["requiredGate"]): Promise<boolean> => {
           const jobId = ciId(producer.id);
           if (active.has(jobId)) throw new ForgeProviderError("Aggregate dependencies form a cycle.");
@@ -82,7 +94,7 @@ export class GitHubCiDiagnostics {
             const existing = diagnostic.jobs.find(job => job.runId === String(failure.runId) && job.runAttempt === failure.runAttempt && job.jobId === String(jobId));
             if (existing) {
               if (workflowSha && existing.testedSha !== workflowSha) throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
-              const inspected = existing.classification === "code" && Boolean(existing.testedSha);
+              const inspected = Boolean(existing.testedSha);
               if (inspected) completed.add(jobId);
               return inspected;
             }
@@ -93,10 +105,13 @@ export class GitHubCiDiagnostics {
               name: ciJobName(producer.name), url: ciUrl(producer.html_url), conclusion: string(producer.conclusion),
               classification: "unknown", ...(gate ? { requiredGate: gate } : {}),
             };
+            const failedStep = this.failedStep(producer);
+            if (failedStep) evidence.failedStep = failedStep;
             diagnostic.jobs.push(evidence);
             const collected = await this.http.ciLogEvidence(`${this.path}/actions/jobs/${jobId}/logs`);
             Object.assign(evidence, { log: collected.log, classification: collected.classification });
-            if (["credentials", "policy", "infrastructure"].includes(evidence.classification)) {
+            if (["credentials", "policy"].includes(evidence.classification) ||
+                evidence.classification === "infrastructure" && !collected.artifactTransportFailure) {
               classifyDiagnostic(diagnostic);
               return false;
             }
@@ -107,19 +122,39 @@ export class GitHubCiDiagnostics {
               if (workflowSha && testedSha !== workflowSha) throw new ForgeProviderError("The dependency checkout differs from the pinned aggregate workflow revision.");
               if (!await this.testedCurrentCommit(testedSha, change, diagnostic)) return false;
               evidence.testedSha = testedSha;
-              // A checkout also appears in result-only verifier gates. Unknown
-              // output needs the pinned dependencies before it can offer repair.
-              if (evidence.classification === "code" || run.path === undefined) {
-                completed.add(jobId);
-                return true;
+            }
+            if (collected.artifactTransportFailure && failedStep && evidence.classification !== "code") {
+              if (!await loadWorkflow(testedSha)) return false;
+              if (workflow!.pinnedArtifactStep(producer, failedStep.name, jobs)) {
+                const step = await this.http.ciLogEvidence(`${this.path}/actions/jobs/${jobId}/steps/${failedStep.number}/logs`);
+                if (step.artifactTransportFailure && !["code", "credentials", "policy"].includes(step.classification)) {
+                  evidence.classification = "infrastructure";
+                  evidence.retryableFailure = "artifact_transport";
+                  evidence.testedSha ??= workflowSha;
+                  completed.add(jobId);
+                  artifactSteps.set(jobId, failedStep.name);
+                  return true;
+                }
               }
             }
-            if (!workflow) {
-              workflowSha = await this.workflowRevision(run, change, diagnostic);
-              if (!workflowSha) return false;
-              workflow = await this.pinnedWorkflow(run, workflowSha);
+            if (evidence.classification === "infrastructure") {
+              classifyDiagnostic(diagnostic);
+              return false;
             }
-            const dependencies = workflow.failedDependencies(producer, jobs);
+            // Result-only verifier gates can check out code too. Unknown output
+            // still needs the pinned dependency graph before it can offer repair.
+            if (testedSha && (evidence.classification === "code" || run.path === undefined)) {
+              completed.add(jobId);
+              return true;
+            }
+            if (!await loadWorkflow(testedSha)) return false;
+            const dependencies = workflow!.failedDependencies(producer, jobs);
+            resolvedGates.add(jobId);
+            if (!dependencies.length) {
+              evidence.testedSha ??= workflowSha;
+              completed.add(jobId);
+              return true;
+            }
             diagnostic.jobs.pop();
             const requiredGate = gate ?? { jobId: evidence.jobId, name: evidence.name, url: evidence.url, log: evidence.log! };
             for (const dependency of dependencies) if (!await inspect(dependency, requiredGate)) return false;
@@ -149,10 +184,16 @@ export class GitHubCiDiagnostics {
         // Re-resolve the pinned dependency graph too: a successful sibling becoming
         // a failed dependency must invalidate this evidence, even if selected IDs stayed fixed.
         if (workflow) {
-          for (const id of identities.keys()) {
+          for (const [id, stepName] of artifactSteps) {
+            const selected = currentJobs.find(job => ciId(job.id) === id)!;
+            if (!workflow.pinnedArtifactStep(selected, stepName, currentJobs)) {
+              diagnostic.state = "obsolete"; diagnostic.reason = "Artifact action dependencies changed while reading failure evidence.";
+              return finishCiDiagnostic(diagnostic);
+            }
+          }
+          for (const id of resolvedGates) {
             const previous = jobs.find(job => ciId(job.id) === id)!;
             const selected = currentJobs.find(job => ciId(job.id) === id)!;
-            if (diagnostic.jobs.some(job => job.jobId === String(id))) continue;
             const before = workflow.failedDependencies(previous, jobs).map(job => this.jobIdentity(job)).sort();
             const after = workflow.failedDependencies(selected, currentJobs).map(job => this.jobIdentity(job)).sort();
             if (JSON.stringify(before) !== JSON.stringify(after)) {
@@ -275,7 +316,17 @@ export class GitHubCiDiagnostics {
 
   private jobIdentity(job: Record<string, unknown>): string {
     return JSON.stringify([ciId(job.id), this.checkId(job), ciId(job.run_id), job.run_attempt,
-      ciSha(job.head_sha), ciJobName(job.name), ciUrl(job.html_url), job.status, job.conclusion]);
+      ciSha(job.head_sha), ciJobName(job.name), ciUrl(job.html_url), job.status, job.conclusion, job.steps]);
+  }
+
+  private failedStep(job: Record<string, unknown>): CiJob["failedStep"] {
+    if (job.steps === undefined) return;
+    const steps = list(job.steps).map(record);
+    if (new Set(steps.map(step => ciId(step.number))).size !== steps.length)
+      throw new ForgeProviderError("GitHub returned duplicate workflow step identities.");
+    const failed = steps.filter(step => step.status === "completed" && ["failure", "timed_out"].includes(String(step.conclusion)));
+    if (failed.length !== 1) return;
+    return { name: ciJobName(failed[0].name), number: ciId(failed[0].number) };
   }
 
   private async workflowRevision(run: Record<string, unknown>, change: ForgeChangeRequest, diagnostic: ForgeCiDiagnostic): Promise<string | undefined> {

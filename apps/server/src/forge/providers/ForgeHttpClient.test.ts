@@ -21,6 +21,46 @@ function expectPrivateFailure(error: unknown) {
   expect((error as Error).cause).toBeUndefined();
 }
 
+describe("CI log evidence paths", () => {
+  it.each(["123/logs", "123/steps/4/logs"])("reads %s through the bounded log download path", async suffix => {
+    const download = "https://results-receiver.actions.githubusercontent.com/logs/job.txt?sig=private-signature";
+    const fetcher = vi.fn<typeof fetch>(async value => String(value) === download
+      ? new Response("Error: private-token artifact download failed")
+      : new Response(null, { status: 302, headers: { location: download } }));
+    const evidence = await client(fetcher).ciLogEvidence(`/repos/owner/repo/actions/jobs/${suffix}`);
+    expect(evidence.log).toContain("artifact download failed");
+    expect(evidence.log).not.toContain("private-token");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1][1]).toMatchObject({ credentials: "omit", referrerPolicy: "no-referrer", headers: { Accept: "text/plain" } });
+    expect(new Headers(fetcher.mock.calls[1][1]?.headers).has("Authorization")).toBe(false);
+  });
+
+  it.each([
+    "/repos/other/repo/actions/jobs/123/steps/4/logs",
+    ...["0", "01", "-1", "1.5", "%31", "../4", "4?other=1", "4/logs/extra"].map(step =>
+      `/repos/owner/repo/actions/jobs/123/steps/${step}/logs`),
+    "/repos/owner/repo/actions/jobs/abc/steps/4/logs",
+    "/repos/owner/repo/actions/jobs/123/steps/4/trace",
+    "/repos/owner/repo/actions/jobs/123/steps/4/logs?redirect=other",
+  ])("rejects an unrelated or malformed CI log path %s before loading credentials", async path => {
+    const read = vi.fn();
+    const fetcher = vi.fn<typeof fetch>();
+    const http = new ForgeHttpClient(repository, new ForgeCredentials(repository, read), fetcher);
+    await expect(http.ciLogEvidence(path)).rejects.toThrow("configured repository");
+    expect(read).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("keeps GitLab traces scoped to the whole job", async () => {
+    const gitlab: ForgeRepository = { provider: "gitlab", apiUrl: "https://gitlab.com/api/v4", projectPath: "owner/repo" };
+    const fetcher = vi.fn<typeof fetch>(async () => new Response("script failed"));
+    const http = new ForgeHttpClient(gitlab, new ForgeCredentials(gitlab, async () => ({ kind: "token", token: "private-token" })), fetcher);
+    await expect(http.ciLogEvidence("/projects/owner%2Frepo/jobs/123/trace")).resolves.toMatchObject({ log: "script failed" });
+    await expect(http.ciLogEvidence("/projects/owner%2Frepo/jobs/123/steps/4/logs")).rejects.toThrow("configured repository");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+});
+
 describe("safe Forge request failures", () => {
   it("measures a timed-out fetch independently of the wall clock and reports the configured deadline", async () => {
     let elapsed = 100;

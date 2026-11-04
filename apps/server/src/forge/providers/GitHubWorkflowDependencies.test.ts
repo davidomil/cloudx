@@ -39,6 +39,11 @@ describe("Pinned workflow dependencies", () => {
     expect(workflow.failedDependencies(terminal("gate"), [failed, terminal("Test (mac)")])).toEqual([failed]);
   });
 
+  it("proves that an independently failed gate has only successful dependencies", () => {
+    const workflow = new GitHubWorkflowDependencies("jobs: {gate: {needs: [test, sibling]}, test: {}, sibling: {}}");
+    expect(workflow.failedDependencies(terminal("gate", "failure"), [terminal("test"), terminal("sibling")])).toEqual([]);
+  });
+
   it.each([
     "jobs: {gate: {needs: missing}}",
     "jobs: {gate: {needs: test}, test: {name: Duplicate}, other: {name: Duplicate}}",
@@ -46,10 +51,35 @@ describe("Pinned workflow dependencies", () => {
     "jobs: {gate: {needs: [test, test]}, test: {}}",
     "jobs: {gate: {needs: test}, test: {name: '${{ inputs.name }}'}}",
     "jobs: {gate: {needs: test}, test: {name: '${{ matrix.os }}', strategy: {matrix: '${{ fromJSON(needs.setup.outputs.matrix) }}'}}}",
+    "jobs: {gate: {needs: test}, test: {name: '${{ matrix.os }}', strategy: {matrix: {os: [test, test]}}}}",
     "jobs: {gate: {needs: test}, test: {}, test: {}}",
+    "jobs: {gate: {needs: '${{ inputs.job }}'}, test: {}}",
+    "jobs: {gate: {needs: test}, test: {needs: gate}}",
+    "jobs: {gate: {needs: test}, test: {needs: missing}}",
     "jobs: &jobs {gate: {needs: test}, test: *jobs}",
   ])("rejects unknown, ambiguous or dynamic dependency identities: %s", text => {
     expect(() => new GitHubWorkflowDependencies(text).failedDependencies(terminal("gate"), [terminal("test", "failure")])).toThrow();
+  });
+
+  it("rejects missing, duplicate and skipped successful dependency evidence", () => {
+    const workflow = new GitHubWorkflowDependencies("jobs: {gate: {needs: test}, test: {}}");
+    for (const jobs of [[], [terminal("test"), terminal("test")], [terminal("test", "skipped")]])
+      expect(() => workflow.failedDependencies(terminal("gate", "failure"), jobs)).toThrow();
+  });
+
+  it("rejects cycles even when every reported dependency succeeded", () => {
+    const workflow = new GitHubWorkflowDependencies("jobs: {gate: {needs: test}, test: {needs: gate}}");
+    expect(() => workflow.failedDependencies(terminal("gate", "failure"), [terminal("test")])).toThrow("cycle");
+  });
+
+  it.each([
+    { uses: "actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0", trusted: true },
+    { uses: "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", trusted: true },
+    { uses: "actions/download-artifact@v4", trusted: false },
+    { uses: "custom/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0", trusted: false },
+  ])("binds retry trust to the exact literal artifact action: $uses", ({ uses, trusted }) => {
+    const workflow = new GitHubWorkflowDependencies(`jobs: {gate: {steps: [{uses: '${uses}'}]}}`);
+    expect(workflow.pinnedArtifactStep(terminal("gate"), `Run ${uses}`, [])).toBe(trusted);
   });
 
   it("rejects policy, cancelled and running siblings even beside a code failure", () => {

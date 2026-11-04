@@ -19,6 +19,7 @@ export interface CiLogEvidence {
   log: string;
   classification: CiJob["classification"];
   checkout: { shas: string[]; invalid: boolean };
+  artifactTransportFailure?: boolean;
 }
 
 export function ciDiagnostic(repository: ForgeRepository, change: ForgeChangeRequest): ForgeCiDiagnostic {
@@ -338,6 +339,7 @@ class CiLogExcerpts {
   private prefix = "";
   private tail = "";
   private checkoutLog = "";
+  private artifactTransportLog = "";
   private readonly classifier = new CiLogClassifier();
   private repository = "";
   private awaitingSha = false;
@@ -352,6 +354,10 @@ class CiLogExcerpts {
     const clean = this.redact(raw);
     this.classifier.add(line, clean);
     this.checkout(line, clean);
+    if (/^(?:##\[error\]|Error:)?\s*(?:Unable to (?:download|upload) artifact\(s\):\s*)?Failed to (?:GetSignedArtifactURL|ListArtifacts|CreateArtifact|FinalizeArtifact): Unable to make request: (?:ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENETUNREACH)\b/.test(line)) {
+      this.evidence.artifactTransportFailure = true;
+      this.artifactTransportLog = (this.artifactTransportLog + clean).slice(0, 2_000);
+    }
     if (!this.shortened) {
       this.complete += clean;
       if (this.complete.length > maxCiLogCharacters) { this.complete = ""; this.shortened = true; }
@@ -368,6 +374,7 @@ class CiLogExcerpts {
     const context = [
       this.prefix, "[CI log truncated; full stream scanned]",
       this.checkoutLog && `[Checkout evidence]\n${this.checkoutLog}`,
+      this.artifactTransportLog && `[Artifact transport evidence]\n${this.artifactTransportLog}`,
       this.classifier.blockers.size && `[Operational blocker evidence]\n${[...this.classifier.blockers.values()].join("")}`,
       this.classifier.failureEvidence && `[Failed-test evidence]\n${this.classifier.failureEvidence}`,
     ].filter(Boolean).join("\n");

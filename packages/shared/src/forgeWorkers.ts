@@ -7,6 +7,7 @@ export const MAX_FORGE_REVIEW_HISTORY = 1000;
 export const MAX_FORGE_CONTINUATION_MESSAGE_LENGTH = 20_000;
 export const MAX_FORGE_BATCH_ISSUES = 50;
 export const MAX_FORGE_CI_REPAIR_ATTEMPTS = 2;
+export const MAX_FORGE_CI_RECOVERY_ATTEMPTS = 2;
 export interface ForgeCiDiagnostic {
   repository: ForgeRepository;
   changeNumber: number;
@@ -25,8 +26,21 @@ export interface ForgeCiDiagnostic {
     conclusion: string;
     testedSha?: string;
     classification: "code" | "infrastructure" | "credentials" | "policy" | "unknown";
+    retryableFailure?: "artifact_transport";
+    failedStep?: { name: string; number: number };
     log?: string;
     requiredGate?: { jobId: string; name: string; url: string; log: string };
+  }>;
+}
+export interface ForgeCiRecovery {
+  actions: Array<{
+    runId: string;
+    runAttempt: number;
+    phase: "requesting" | "waiting" | "observed";
+    requestedAt: string;
+    observedAttempt?: number;
+    diagnostic: ForgeCiDiagnostic;
+    reason?: string;
   }>;
 }
 export interface ForgeCiRepair {
@@ -189,6 +203,7 @@ export interface ForgeWorker {
     targetHeadSha: string;
   };
   ciRepair?: ForgeCiRepair;
+  ciRecovery?: ForgeCiRecovery;
   rebaseRecovery?: {
     branch: string;
     baseBranch: string;

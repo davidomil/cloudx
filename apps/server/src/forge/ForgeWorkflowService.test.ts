@@ -5292,6 +5292,271 @@ describe("Forge issue auto review", () => {
     return diagnostic;
   }
 
+  function transportFailure(f: Awaited<ReturnType<typeof approvedIssue>>, runAttempt = 1) {
+    const diagnostic = failedCi(f, { state: "blocked", reason: "Artifact download failed: ECONNRESET",
+      failureKey: `${f.change.headSha}:run-42:attempt-${runAttempt}:job-9`,
+      jobs: [{ runId: "42", runAttempt, jobId: "9", name: "Isolated full verifier", url: "https://ci.test/jobs/9",
+        conclusion: "failure", testedSha: "e".repeat(40), classification: "infrastructure", retryableFailure: "artifact_transport",
+        failedStep: { name: "Download verifier artifacts", number: 4 },
+        log: "Unable to download artifact(s): Failed to GetSignedArtifactURL: Unable to make request: ECONNRESET" }] });
+    return diagnostic;
+  }
+
+  function ciRecoveryProvider(f: Awaited<ReturnType<typeof approvedIssue>>) {
+    const getCiRun = vi.fn(async (_change: ForgeChangeRequest, _runId: string, _testedSha: string) =>
+      ({ runAttempt: 1, status: "completed", conclusion: "failure" }));
+    const rerunFailedCi = vi.fn(async (_change: ForgeChangeRequest, _runId: string, _runAttempt: number, _testedSha: string) => {});
+    Object.assign(f.provider, { getCiRun, rerunFailedCi });
+    return { getCiRun, rerunFailedCi };
+  }
+
+  it("checkpoints one failed-job rerun and preserves the completed review, checkout and source repair budget", async () => {
+    const f = await approvedIssue();
+    const oldRepair: NonNullable<ForgeWorker["ciRepair"]> = { phase: "blocked", attempts: 2, attemptedHeads: [f.change.headSha, "c".repeat(40)], reason: "Source repair history" };
+    await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? { ...worker, ciRepair: oldRepair } : worker));
+    const service = new ForgeWorkflowService(f.deps);
+    const diagnostic = transportFailure(f);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    const before = structuredClone(f.currentIssue());
+    rerunFailedCi.mockImplementation(async () => {
+      expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", ciRecovery: { actions: [{ runId: "42", runAttempt: 1, phase: "requesting", diagnostic }] } });
+    });
+    await service.poll();
+    expect(rerunFailedCi).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ headSha: f.change.headSha }), "42", 1, diagnostic.testedSha);
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", attemptId: before.attemptId, headSha: before.headSha,
+      worktreePath: before.worktreePath, ciRepair: oldRepair, autoReview: { reviewWorkerId: before.autoReview!.reviewWorkerId },
+      ciRecovery: { actions: [{ phase: "waiting", diagnostic }] } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.runtime.updateIssueBranch).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["requesting", "waiting"] as const)("observes a persisted %s request after restart without duplicate reruns or stale success", async phase => {
+    const f = await approvedIssue();
+    const diagnostic = transportFailure(f);
+    const { getCiRun, rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? {
+      ...worker, ciRecovery: { actions: [{ ...worker.ciRecovery!.actions[0], phase }] },
+    } : worker));
+    const service = new ForgeWorkflowService(f.deps);
+    f.change.mergeable = true;
+    f.change.checks = { state: "passed", url: `${f.change.url}/checks` };
+    for (let poll = 0; poll < 3; poll++) { f.advanceTime(5_000); await service.poll(); }
+    expect(getCiRun).toHaveBeenCalledWith(expect.objectContaining({ headSha: f.change.headSha }), "42", diagnostic.testedSha);
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    getCiRun.mockResolvedValue({ runAttempt: 2, status: "in_progress", conclusion: "" });
+    f.advanceTime(5_000); await service.poll();
+    expect(f.currentIssue().ciRecovery?.actions[0]).toMatchObject({ phase, observedAttempt: 2 });
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    getCiRun.mockResolvedValue({ runAttempt: 2, status: "completed", conclusion: "success" });
+    f.change.checks.state = "pending";
+    f.advanceTime(5_000); await service.poll();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    f.change.checks.state = "passed";
+    f.advanceTime(5_000); await service.poll();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an uncertain rerun paused across Resume without resending the request", async () => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    f.advanceTime(120_001); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/uncertain.*Inspect.*Resume/i), ciRecovery: { actions: [{ phase: "waiting" }] } });
+    const service = new ForgeWorkflowService(f.deps);
+    await service.resume(f.issue.id, placement);
+    f.advanceTime(5_000); await service.poll();
+    expect(f.currentIssue().status).toBe("paused");
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("retains a rejected rerun as uncertain and observes it on Resume instead of submitting again", async () => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { getCiRun, rerunFailedCi } = ciRecoveryProvider(f);
+    rerunFailedCi.mockRejectedValueOnce(new Error("Connection closed after POST"));
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRecovery: { actions: [{ phase: "requesting", reason: expect.stringContaining("Connection closed after POST") }] } });
+    getCiRun.mockResolvedValue({ runAttempt: 2, status: "completed", conclusion: "success" });
+    f.change.checks!.state = "passed"; f.change.mergeable = true;
+    await f.service.resume(f.issue.id, placement);
+    await f.poll();
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.provider.merge).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+  });
+
+  it("limits infrastructure reruns independently of the untouched source repair budget", async () => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { getCiRun, rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    transportFailure(f, 2);
+    getCiRun.mockResolvedValue({ runAttempt: 2, status: "completed", conclusion: "failure" });
+    await f.poll();
+    expect(rerunFailedCi).toHaveBeenCalledTimes(2);
+    expect(f.currentIssue().ciRecovery?.actions).toMatchObject([{ phase: "observed", observedAttempt: 2 }, { phase: "waiting", runAttempt: 2 }]);
+    transportFailure(f, 3);
+    getCiRun.mockResolvedValue({ runAttempt: 3, status: "completed", conclusion: "failure" });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/budget|bounded|exhausted/i), ciRepair: { attempts: 0, attemptedHeads: [] } });
+    expect(rerunFailedCi).toHaveBeenCalledTimes(2);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch a failed-job rerun when its persisted checkpoint fails", async () => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    const save = f.deps.store.write;
+    let rejected = false;
+    f.deps.store.write = async workers => {
+      if (!rejected && workers.some(worker => worker.ciRecovery?.actions.at(-1)?.phase === "requesting")) {
+        rejected = true; throw new Error("Recovery checkpoint unavailable");
+      }
+      await save(workers);
+    };
+    await f.poll();
+    expect(rejected).toBe(true);
+    expect(rerunFailedCi).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["pause", "stop", "disable"] as const)("honors %s before transport rerun dispatch", async action => {
+    const f = await approvedIssue();
+    const diagnostic = transportFailure(f);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    const diagnosing = deferred<void>();
+    const diagnosed = deferred<ForgeCiDiagnostic>();
+    f.provider.getCiFailure.mockImplementationOnce(() => { diagnosing.resolve(); return diagnosed.promise; });
+    const polling = f.poll();
+    await diagnosing.promise;
+    const stopping = action === "disable" ? f.service.setAutoReview(f.issue.id, false, placement) : f.service[action](f.issue.id);
+    diagnosed.resolve(diagnostic);
+    await Promise.all([polling, stopping]);
+    await f.poll();
+    expect(rerunFailedCi).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    if (action === "disable") expect(f.currentIssue().autoReview?.enabled).toBe(false);
+    else expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+  });
+
+  it.each(["pause", "stop", "disable"] as const)("honors %s while the transport recovery checkpoint is saving", async action => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    const checkpointing = deferred<void>();
+    const saveCheckpoint = deferred<void>();
+    const save = f.deps.store.write;
+    let held = false;
+    f.deps.store.write = async workers => {
+      if (!held && workers.some(worker => worker.ciRecovery?.actions.at(-1)?.phase === "requesting")) {
+        held = true; checkpointing.resolve(); await saveCheckpoint.promise;
+      }
+      await save(workers);
+    };
+    const polling = f.poll();
+    await checkpointing.promise;
+    const stopping = action === "disable" ? f.service.setAutoReview(f.issue.id, false, placement) : f.service[action](f.issue.id);
+    saveCheckpoint.resolve();
+    await Promise.all([polling, stopping]);
+    await f.poll();
+    expect(rerunFailedCi).not.toHaveBeenCalled();
+    expect(f.currentIssue().ciRecovery?.actions).toMatchObject([{ phase: "requesting" }]);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+    if (action === "disable") expect(f.currentIssue().autoReview?.enabled).toBe(false);
+    else expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
+  });
+
+  it.each(["failed", "passed", "unknown"] as const)("keeps a propagated rerun bounded by the original two-hour CI deadline with %s checks", async state => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { getCiRun, rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    const ciWait = f.currentIssue().autoReview!.ciWait;
+    f.change.checks!.state = state;
+    f.change.mergeable = true;
+    getCiRun.mockResolvedValue({ runAttempt: 2, status: "in_progress", conclusion: "" });
+    f.advanceTime(60 * 60_000); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "awaiting_merge", autoReview: { ciWait }, ciRecovery: { actions: [{ observedAttempt: 2 }] } });
+    const service = new ForgeWorkflowService(f.deps);
+    f.advanceTime(60 * 60_000); await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/two hours.*Inspect.*Resume/) });
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["headSha", "targetHeadSha"] as const)("blocks a changed %s during transport recovery without rerunning or repairing source", async field => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { getCiRun, rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    const recorded = structuredClone(f.currentIssue().ciRecovery);
+    f.change[field] = "f".repeat(40);
+    f.change.checks!.state = "passed"; f.change.mergeable = true;
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: field === "headSha" ? "failed" : "paused",
+      error: expect.stringMatching(/changed (outside this issue loop|during CI transport recovery)/i), ciRecovery: recorded });
+    expect(getCiRun).not.toHaveBeenCalled();
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("keeps transport recovery blocked when the provider cannot inspect its recorded rerun", async () => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    Object.assign(f.provider, { getCiRun: undefined });
+    const service = new ForgeWorkflowService(f.deps);
+    f.change.checks!.state = "passed"; f.change.mergeable = true;
+    f.advanceTime(5_000); await service.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/provider cannot confirm.*CI rerun/i), ciRecovery: { actions: [{ phase: "waiting" }] } });
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("retains transport evidence without recovery when failed jobs span different runs", async () => {
+    const f = await approvedIssue();
+    const diagnostic = transportFailure(f);
+    f.provider.getCiFailure.mockResolvedValue({ ...diagnostic, jobs: [diagnostic.jobs[0], { ...diagnostic.jobs[0], runId: "43", jobId: "10" }] });
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(/one verified.*run/i) });
+    expect(f.currentIssue().ciRecovery).toBeUndefined();
+    expect(rerunFailedCi).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancelled", "action_required", "startup_failure"])("blocks %s rerun conclusions without source repair or another rerun", async conclusion => {
+    const f = await approvedIssue();
+    transportFailure(f);
+    const { getCiRun, rerunFailedCi } = ciRecoveryProvider(f);
+    await f.poll();
+    getCiRun.mockResolvedValue({ runAttempt: 2, status: "completed", conclusion });
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringContaining(conclusion) });
+    expect(rerunFailedCi).toHaveBeenCalledOnce();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
   async function pendingCiAfterUnchangedUpdate() {
     const f = await automaticIssue();
     f.codingReport(); await f.poll();

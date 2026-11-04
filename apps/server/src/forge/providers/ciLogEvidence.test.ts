@@ -5,6 +5,15 @@ import { ForgeHttpClient } from "./ForgeHttpClient.js";
 import { classifyCiLog, classifyDiagnostic, maxCiLogBytes, maxCiLogScanBytes, readCiLog } from "./ciEvidence.js";
 import { playwrightAssertions, playwrightFailureReport } from "./playwrightFailure.fixture.js";
 
+it("retains artifact transport signatures without granting retry trust to arbitrary job output", async () => {
+  const failure = "Error: Failed to ListArtifacts: Unable to make request: ECONNRESET\n";
+  const noise = "progress\n".repeat(6_000);
+  const evidence = await readCiLog(new Response(noise + failure + noise), [], "owner/repo");
+  expect(evidence).toMatchObject({ artifactTransportFailure: true, classification: "unknown", log: expect.stringContaining(failure.trim()) });
+  expect(classifyCiLog(failure)).toBe("unknown");
+  expect(classifyCiLog("AssertionError: expected ECONNRESET to equal ETIMEDOUT")).toBe("code");
+});
+
 const source = "a".repeat(40);
 const moved = "b".repeat(40);
 const checkout = (sha = source, repository = "owner/repo") =>

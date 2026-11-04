@@ -26,6 +26,7 @@ import {
   requireDiscussion,
   requireMergeReady,
   validateDiscussionReply,
+  type ForgeCiRunState,
   type ForgeListIdentity,
   type ForgeProvider,
 } from "./ForgeProvider.js";
@@ -43,6 +44,7 @@ import {
 import { validateCreateRequest, validateRequestText, validateReview } from "./reviewValidation.js";
 import { assertGitHubScopedFilter, resolveListScope } from "./listScope.js";
 import { GitHubCiDiagnostics } from "./GitHubCiDiagnostics.js";
+import { ciId, ciSha } from "./ciEvidence.js";
 
 interface GitHubReadiness {
   headSha: string;
@@ -168,6 +170,79 @@ export class GitHubProvider implements ForgeProvider {
 
   async getCiFailure(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic> {
     return new GitHubCiDiagnostics(this.http).collect(change);
+  }
+
+  async getCiRun(change: ForgeChangeRequest, runId: string, testedSha: string): Promise<ForgeCiRunState> {
+    if (!/^[1-9]\d*$/.test(runId) || !Number.isSafeInteger(Number(runId)))
+      throw new ForgeProviderError("CI recovery requires a valid workflow run ID.");
+    const request = await this.requireCurrentCiRequest(change);
+    await this.requireCurrentCiCheckout(change, request, ciSha(testedSha));
+    await this.requireCurrentCiRequest(change);
+    const run = record((await this.http.request(`${this.path}/actions/runs/${runId}`)).body);
+    if (ciId(run.id) !== Number(runId) || ciSha(run.head_sha) !== change.headSha ||
+        record(run.repository).full_name !== this.http.repository.projectPath ||
+        !["push", "pull_request"].includes(string(run.event)))
+      throw new ForgeProviderError("The CI run does not match this request source and repository.", 409);
+    const requests = list(run.pull_requests);
+    const bound = requests.length ? requests.some(value => {
+      const linked = record(value);
+      return integer(linked.number) === change.number && ciSha(record(linked.head).sha) === change.headSha &&
+        ciSha(record(linked.base).sha) === change.targetHeadSha;
+    }) : run.event === "push" && run.head_branch === change.headBranch &&
+      record(record(request.head).repo).full_name === this.http.repository.projectPath;
+    if (!bound)
+      throw new ForgeProviderError("The CI run has no current request and target binding.", 409);
+    const state: ForgeCiRunState = {
+      runAttempt: ciId(run.run_attempt), status: string(run.status),
+      ...(run.conclusion === null ? {} : { conclusion: string(run.conclusion) }),
+    };
+    if (!["queued", "in_progress", "completed", "waiting", "requested", "pending"].includes(state.status))
+      return invalid();
+    return state;
+  }
+
+  async rerunFailedCi(change: ForgeChangeRequest, runId: string, runAttempt: number, testedSha: string): Promise<void> {
+    if (!Number.isSafeInteger(runAttempt) || runAttempt < 1)
+      throw new ForgeProviderError("CI recovery requires a valid workflow run attempt.");
+    const current = await this.getCiRun(change, runId, testedSha);
+    if (current.runAttempt !== runAttempt || current.status !== "completed" ||
+        !["failure", "timed_out"].includes(current.conclusion ?? ""))
+      throw new ForgeProviderError("The failed CI run attempt changed. Refresh before requesting recovery.", 409);
+    await this.http.request(`${this.path}/actions/runs/${runId}/rerun-failed-jobs`, {
+      method: "POST", role: "worker",
+    });
+  }
+
+  private async requireCurrentCiRequest(change: ForgeChangeRequest): Promise<Record<string, unknown>> {
+    const request = record((await this.http.request(this.pullPath(change.number))).body);
+    if (integer(request.number) !== change.number || record(record(request.base).repo).full_name !== this.http.repository.projectPath)
+      throw new ForgeProviderError("GitHub did not confirm the CI request repository.", 409);
+    if (change.state !== "open" || change.merged || request.state !== "open" || request.merged !== false ||
+        ciSha(record(request.head).sha) !== change.headSha || ciSha(record(request.base).sha) !== change.targetHeadSha ||
+        record(request.head).ref !== change.headBranch || record(request.base).ref !== change.baseBranch ||
+        change.checks?.reason === "superseded_merge_identity" || change.checks?.reason === "pending_merge_identity")
+      throw new ForgeProviderError("The request source, target, or merge identity changed before CI recovery.", 409);
+    return request;
+  }
+
+  private async requireCurrentCiCheckout(change: ForgeChangeRequest, request: Record<string, unknown>, testedSha: string): Promise<void> {
+    if (testedSha === change.headSha) {
+      const comparison = record((await this.http.request(`${this.path}/compare/${change.targetHeadSha}...${testedSha}`)).body);
+      if (ciSha(record(comparison.base_commit).sha) === change.targetHeadSha &&
+          ciSha(record(comparison.merge_base_commit).sha) === change.targetHeadSha) return;
+    } else {
+      if (request.mergeable !== true)
+        throw new ForgeProviderError("GitHub has not confirmed a current merge identity for CI recovery.", 409);
+      const merge = record((await this.http.request(`${this.path}/git/ref/pull/${change.number}/merge`)).body);
+      if (merge.ref !== `refs/pull/${change.number}/merge` || record(merge.object).type !== "commit" ||
+          ciSha(record(merge.object).sha) !== testedSha)
+        throw new ForgeProviderError("The tested CI merge identity changed before recovery.", 409);
+      const commit = record((await this.http.request(`${this.path}/git/commits/${testedSha}`)).body);
+      const parents = list(commit.parents).map(value => ciSha(record(value).sha));
+      if (ciSha(commit.sha) === testedSha && parents.length === 2 &&
+          parents[0] === change.targetHeadSha && parents[1] === change.headSha) return;
+    }
+    throw new ForgeProviderError("The CI checkout no longer proves the current source and target identity.", 409);
   }
 
   private async mergeIdentityFailureReason(headSha: string) {
