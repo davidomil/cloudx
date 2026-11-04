@@ -23,7 +23,7 @@ const installation = {
   id: 42,
   app_id: 123,
   suspended_at: null,
-  permissions: { contents: "write", issues: "write", pull_requests: "write", checks: "read", workflows: "write", actions: "read" },
+  permissions: { contents: "write", issues: "write", pull_requests: "write", checks: "read", workflows: "write", actions: "write" },
 };
 
 describe("GitHub application registration", () => {
@@ -51,7 +51,7 @@ describe("GitHub application registration", () => {
         pull_requests: "write",
         checks: "read",
         workflows: "write",
-        actions: "read",
+        actions: "write",
       },
     });
     expect(reviewer.manifest.default_permissions).toEqual({
@@ -219,11 +219,12 @@ describe("GitHub application registration", () => {
     ).resolves.toEqual({ installationId: "42" });
   });
 
-  it("requires Actions read permission before installing a worker that must collect failure logs", async () => {
-    const { actions, ...permissions } = installation.permissions;
-    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ ...installation, permissions }));
+  it.each([undefined, "read"])("requires Actions write permission instead of %s before installing a worker that can rerun failed jobs", async actions => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ ...installation,
+      permissions: { ...installation.permissions, actions },
+    }));
     await expect(new ForgeRegistrationClient(fetcher).githubInstallation(repository, app, "42", "worker"))
-      .rejects.toThrow("Grant the worker GitHub App actions: read permission");
+      .rejects.toThrow("Grant the worker GitHub App actions: write permission, approve the updated permissions for its installation, then continue installation.");
     expect(fetcher).toHaveBeenCalledOnce();
   });
 

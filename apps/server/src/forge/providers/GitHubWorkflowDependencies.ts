@@ -41,7 +41,7 @@ function jobNames(id: string, job: Record<string, unknown>): string[] {
     if (!merged) rows.push(included);
   }
   if (!rows.length || rows.length > 64) return ambiguous();
-  return rows.map(row => {
+  const names = rows.map(row => {
     const expanded = name.replace(/\$\{\{\s*matrix\.([A-Za-z_][A-Za-z0-9_-]*)\s*\}\}/g, (_expression, key: string) => {
       if (row[key] === undefined) return ambiguous();
       return String(row[key]);
@@ -49,6 +49,15 @@ function jobNames(id: string, job: Record<string, unknown>): string[] {
     if (expanded.includes("${{")) return ambiguous();
     return expanded;
   });
+  if (new Set(names).size !== names.length) return ambiguous();
+  return names;
+}
+
+function stepDisplayName(step: Record<string, unknown>): string | undefined {
+  const source = step.name ?? step.uses ?? step.run;
+  if (typeof source !== "string") return;
+  const firstLine = source.replace(/^[ \t\r\n]+/, "").split(/[\r\n]/, 1)[0];
+  return firstLine ? `${step.name === undefined ? "Run " : ""}${firstLine}` : "run";
 }
 
 /** Resolve Actions job names only from literal, bounded workflow definitions. */
@@ -64,15 +73,11 @@ export class GitHubWorkflowDependencies {
   }
 
   failedDependencies(gate: Record<string, unknown>, runJobs: Record<string, unknown>[]): Record<string, unknown>[] {
-    const name = string(gate.name);
-    const definitions = Object.entries(this.jobs).filter(([id, value]) => jobNames(id, record(value)).includes(name));
-    if (definitions.length !== 1) return ambiguous();
-    const [gateId, definition] = definitions[0];
-    const needs = record(definition).needs;
-    const ids = typeof needs === "string" ? [needs] : needs;
-    if (!Array.isArray(ids) || !ids.length || ids.length > 200 || !ids.every(id => typeof id === "string") || new Set(ids).size !== ids.length) return ambiguous();
+    const [gateId, definition] = this.definition(gate);
+    this.validateGraph(gateId, new Set(), new Set());
+    const ids = this.needs(definition);
+    if (!ids.length) return ambiguous();
     const dependencies = ids.flatMap(id => {
-      if (id === gateId || !Object.hasOwn(this.jobs, id)) return ambiguous();
       return jobNames(id, record(this.jobs[id])).map(name => {
         const owners = Object.entries(this.jobs).filter(([key, value]) => jobNames(key, record(value)).includes(name));
         const matches = runJobs.filter(job => job.name === name);
@@ -81,11 +86,56 @@ export class GitHubWorkflowDependencies {
         if (job.status !== "completed") throw new ForgeProviderError("An aggregate dependency is still running.");
         if (["action_required", "startup_failure", "cancelled"].includes(string(job.conclusion)))
           throw new ForgeProviderError("An aggregate dependency needs policy or infrastructure intervention.");
+        if (!["success", "failure", "timed_out"].includes(string(job.conclusion))) return ambiguous();
         return job;
       });
     });
-    const failures = dependencies.filter(job => ["failure", "timed_out"].includes(string(job.conclusion)));
-    if (!failures.length) return ambiguous();
-    return failures;
+    return dependencies.filter(job => ["failure", "timed_out"].includes(string(job.conclusion)));
+  }
+
+  pinnedArtifactStep(job: Record<string, unknown>, failedStep: { name: string; number: number }, runJobs: Record<string, unknown>[]): boolean {
+    const [id, definition] = this.definition(job);
+    this.validateGraph(id, new Set(), new Set());
+    if (definition.needs !== undefined && this.failedDependencies(job, runJobs).length) return false;
+    if (!Array.isArray(definition.steps) || !Array.isArray(job.steps)) return false;
+    const executed = job.steps.map(record);
+    const numbers = executed.map(step => step.number);
+    if (numbers.some(number => !Number.isSafeInteger(number) || Number(number) < 1) || new Set(numbers).size !== numbers.length)
+      return false;
+    const reported = executed.filter(step => step.name === failedStep.name);
+    if (reported.length !== 1 || reported[0].number !== failedStep.number || reported[0].status !== "completed" ||
+        !["failure", "timed_out"].includes(String(reported[0].conclusion))) return false;
+    const steps = definition.steps.map(record);
+    const names = steps.map(stepDisplayName);
+    if (names.some(name => name === undefined || name.includes("${{") &&
+      failedStep.name.startsWith(name.slice(0, name.indexOf("${{"))))) return false;
+    const matches = steps.filter((_step, index) => names[index] === failedStep.name);
+    return matches.length === 1 && matches[0].run === undefined &&
+      typeof matches[0].uses === "string" && /^actions\/(?:download|upload)-artifact@[a-fA-F0-9]{40}$/.test(matches[0].uses);
+  }
+
+  private definition(job: Record<string, unknown>): [string, Record<string, unknown>] {
+    const name = string(job.name);
+    const definitions = Object.entries(this.jobs).filter(([id, value]) => jobNames(id, record(value)).includes(name));
+    if (definitions.length !== 1) return ambiguous();
+    return [definitions[0][0], record(definitions[0][1])];
+  }
+
+  private needs(job: Record<string, unknown>): string[] {
+    if (job.needs === undefined) return [];
+    const ids = typeof job.needs === "string" ? [job.needs] : job.needs;
+    if (!Array.isArray(ids) || !ids.length || ids.length > 200 ||
+        !ids.every(id => typeof id === "string" && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(id)) || new Set(ids).size !== ids.length) return ambiguous();
+    return ids;
+  }
+
+  private validateGraph(id: string, active: Set<string>, completed: Set<string>): void {
+    if (active.has(id)) throw new ForgeProviderError("Aggregate dependencies form a cycle.");
+    if (completed.has(id)) return;
+    if (!Object.hasOwn(this.jobs, id)) return ambiguous();
+    active.add(id);
+    for (const dependency of this.needs(record(this.jobs[id]))) this.validateGraph(dependency, active, completed);
+    active.delete(id);
+    completed.add(id);
   }
 }

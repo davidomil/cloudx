@@ -1,4 +1,4 @@
-import { CLAUDE_LAUNCH_MODES, CODEX_REASONING_EFFORTS, FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_MODEL_CAPACITY_RETRIES, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
+import { CLAUDE_LAUNCH_MODES, CODEX_REASONING_EFFORTS, FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_RECOVERY_ATTEMPTS, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_MODEL_CAPACITY_RETRIES, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeBatchIssueResult,
@@ -421,6 +421,17 @@ function parseCiDiagnostic(value: unknown, worker: ForgeWorker): ForgeCiDiagnost
       };
       if (requiredGate.jobId === job.jobId) throw new Error("CI producers must differ from their required gate.");
     }
+    let failedStep: ForgeCiDiagnostic["jobs"][number]["failedStep"];
+    if (job.failedStep !== undefined) {
+      const step = object(job.failedStep);
+      if (!Number.isSafeInteger(step.number) || Number(step.number) < 1)
+        throw new Error("CI failed steps require a positive step number.");
+      failedStep = { name: nonblankText(step.name, "CI failed step name", 4096), number: Number(step.number) };
+    }
+    if (job.retryableFailure !== undefined && (job.retryableFailure !== "artifact_transport" ||
+      classification !== "infrastructure" || !job.testedSha || !failedStep ||
+      typeof job.log !== "string" || !job.log.trim() || !["failure", "failed", "timed_out"].includes(String(job.conclusion))))
+      throw new Error("Retryable CI failures require infrastructure, tested identity, failed step and original failure logs.");
     return {
       runId: nonblankText(job.runId, "CI run identity", 256), runAttempt: Number(job.runAttempt),
       jobId: nonblankText(job.jobId, "CI job identity", 256), name: nonblankText(job.name, "CI job name", 4096),
@@ -428,6 +439,8 @@ function parseCiDiagnostic(value: unknown, worker: ForgeWorker): ForgeCiDiagnost
       ...(job.testedSha === undefined ? {} : { testedSha: commitSha(job.testedSha, "CI job tested commit") }), classification,
       ...(job.log === undefined ? {} : { log: text(job.log, "CI job log", 32_000) }),
       ...(requiredGate ? { requiredGate } : {}),
+      ...(failedStep ? { failedStep } : {}),
+      ...(job.retryableFailure === undefined ? {} : { retryableFailure: "artifact_transport" as const }),
     };
   });
   const jobIdentities = jobs.map(job => JSON.stringify([job.runId, job.runAttempt, job.jobId]));
@@ -443,6 +456,42 @@ function parseCiDiagnostic(value: unknown, worker: ForgeWorker): ForgeCiDiagnost
     ...(testedSha === undefined ? {} : { testedSha }), failureKey: nonblankText(input.failureKey, "CI failure identity", 4096),
     state, ...(input.reason === undefined ? {} : { reason: nonblankText(input.reason, "CI diagnostic reason", 4096) }), jobs,
   };
+}
+
+function parseCiRecovery(value: unknown, worker: ForgeWorker): NonNullable<ForgeWorker["ciRecovery"]> {
+  const input = object(value);
+  if (worker.kind !== "issue" || !worker.changeNumber)
+    throw new Error("CI recovery requires an owning issue worker and published request.");
+  if (!Array.isArray(input.actions) || !input.actions.length || input.actions.length > MAX_FORGE_CI_RECOVERY_ATTEMPTS)
+    throw new Error("CI recovery actions must fit the bounded recovery budget.");
+  const rawActions = input.actions;
+  const actions: NonNullable<ForgeWorker["ciRecovery"]>["actions"] = rawActions.map((raw, index) => {
+    const action = object(raw);
+    const runId = nonblankText(action.runId, "CI recovery run identity", 256);
+    const runAttempt = action.runAttempt;
+    if (!Number.isSafeInteger(runAttempt) || Number(runAttempt) < 1)
+      throw new Error("CI recovery requires a positive run attempt.");
+    const phase = action.phase;
+    if (phase !== "requesting" && phase !== "waiting" && phase !== "observed" ||
+      phase !== "observed" && index !== rawActions.length - 1)
+      throw new Error("CI recovery phase must preserve one final pending action.");
+    const observedAttempt = action.observedAttempt;
+    if (phase === "observed" && observedAttempt === undefined || observedAttempt !== undefined &&
+      (!Number.isSafeInteger(observedAttempt) || Number(observedAttempt) <= Number(runAttempt)))
+      throw new Error("Observed CI recovery requires a newer completed run attempt.");
+    const diagnostic = parseCiDiagnostic(action.diagnostic, worker);
+    if (diagnostic.state !== "blocked" || !diagnostic.testedSha || !diagnostic.jobs.length || diagnostic.jobs.some(job =>
+      job.runId !== runId || job.runAttempt !== runAttempt || job.retryableFailure !== "artifact_transport" ||
+      job.testedSha?.toLowerCase() !== diagnostic.testedSha!.toLowerCase()))
+      throw new Error("CI recovery must retain the matching trusted artifact transport diagnostic.");
+    return { runId, runAttempt: Number(runAttempt), phase, requestedAt: isoTimestamp(action.requestedAt, "CI recovery request timestamp"), diagnostic,
+      ...(observedAttempt === undefined ? {} : { observedAttempt: Number(observedAttempt) }),
+      ...(action.reason === undefined ? {} : { reason: nonblankText(action.reason, "CI recovery reason", 4096) }),
+    };
+  });
+  if (new Set(actions.map(action => JSON.stringify([action.runId, action.runAttempt]))).size !== actions.length)
+    throw new Error("CI recovery run attempt actions must be unique.");
+  return { actions };
 }
 
 function parseCiRepair(value: unknown, worker: ForgeWorker): ForgeCiRepair {
@@ -777,7 +826,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     if (worker.status === "draft" && (!parsed.batch || [
       "repositoryPath", "worktreePath", "branch", "tabId", "attemptId", "completion", "retainedWorkspace",
       "publicationState", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
-      "mergeConflict", "ciRepair", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest", "executionSettings", "modelCapacityRecovery",
+      "mergeConflict", "ciRepair", "ciRecovery", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest", "executionSettings", "modelCapacityRecovery",
     ].some(key => worker[key] !== undefined) || parsed.batch.results !== undefined))
       throw new Error("A draft batch cannot own execution or publication state.");
     if (worker.completion !== undefined) {
@@ -910,6 +959,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       parsed.rebaseRecovery = parseRebaseRecovery(worker.rebaseRecovery, parsed);
     if (worker.ciRepair !== undefined)
       parsed.ciRepair = parseCiRepair(worker.ciRepair, parsed);
+    if (worker.ciRecovery !== undefined)
+      parsed.ciRecovery = parseCiRecovery(worker.ciRecovery, parsed);
     if (parsed.providerRetryAt && (
       parsed.kind !== "issue" || parsed.status !== "paused" || !parsed.autoReview?.enabled ||
       parsed.mergeAttempted || ["creating", "uncertain"].includes(parsed.publicationState ?? "") ||

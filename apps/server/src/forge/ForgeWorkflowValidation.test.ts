@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_FORGE_CI_REPAIR_ATTEMPTS } from "@cloudx/shared";
+import { MAX_FORGE_CI_RECOVERY_ATTEMPTS, MAX_FORGE_CI_REPAIR_ATTEMPTS } from "@cloudx/shared";
 import type { ForgeCiDiagnostic, ForgeCiRepair, ForgeIssueCompletionReport, ForgeReviewScope, ForgeWorker } from "@cloudx/shared";
 import { parseReview, parseScopedReview, parseWorkerReport, parseWorkers } from "./ForgeWorkflowValidation.js";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
@@ -174,6 +174,81 @@ describe("Persisted CI repair evidence", () => {
       expect(() => parse({ ...ready, diagnostic: { ...diagnostic, changeNumber } })).toThrow();
     expect(() => parseWorkers([{ ...owned, changeNumber: undefined, ciRepair: ready }])).toThrow();
     expect(() => parseWorkers([{ ...owned, kind: "review", ciRepair: ready }])).toThrow(/issue/i);
+  });
+});
+
+describe("Persisted CI transport recovery", () => {
+  const testedSha = "c".repeat(40);
+  const diagnostic: ForgeCiDiagnostic = {
+    repository: worker.repository, changeNumber: 12, sourceHeadSha: headSha, targetHeadSha: "b".repeat(40), testedSha,
+    failureKey: "run-1:1:job-1", state: "blocked", reason: "Artifact download failed: ECONNRESET",
+    jobs: [{ runId: "run-1", runAttempt: 1, jobId: "job-1", name: "Isolated full verifier",
+      url: "https://github.com/cloudx/example/actions/runs/1/job/1", conclusion: "failure", testedSha,
+      classification: "infrastructure", retryableFailure: "artifact_transport", failedStep: { name: "Download artifacts", number: 4 },
+      log: "Unable to download artifact(s): Failed to GetSignedArtifactURL: Unable to make request: ECONNRESET" }],
+  };
+  const action = { runId: "run-1", runAttempt: 1, phase: "requesting", requestedAt: "2026-11-04T19:20:46.000Z", diagnostic };
+  const owned = { ...worker, changeNumber: 12, headSha };
+  const parse = (ciRecovery: unknown) => parseWorkers([{ ...owned, ciRecovery }])[0].ciRecovery;
+  const parseDiagnostic = (value: unknown) => parseWorkers([{ ...owned,
+    ciRepair: { phase: "blocked", attempts: 0, attemptedHeads: [], diagnostic: value } }])[0].ciRepair?.diagnostic;
+
+  it("retains trusted transport evidence and historical recovery independently of source repair", () => {
+    for (const phase of ["requesting", "waiting", "observed"]) {
+      const recovery = { actions: [{ ...action, phase, ...(phase === "observed" ? { observedAttempt: 2 } : {}) }] };
+      expect(parse(recovery)).toEqual(recovery);
+      expect(parse(recovery)).not.toBe(recovery);
+      expect(parseWorkers([{ ...owned, headSha: "d".repeat(40), ciRecovery: recovery }])[0].ciRecovery).toEqual(recovery);
+    }
+    expect(parseDiagnostic(diagnostic)).toEqual(diagnostic);
+    for (const phase of ["requesting", "waiting"]) {
+      const propagated = { actions: [{ ...action, phase, observedAttempt: 2 }] };
+      expect(parse(propagated)).toEqual(propagated);
+    }
+    const recovery = { actions: [{ ...action, phase: "observed", observedAttempt: 2 },
+      { ...action, runAttempt: 2, phase: "waiting", diagnostic: { ...diagnostic, jobs: [{ ...diagnostic.jobs[0], runAttempt: 2 }] } }] };
+    expect(recovery.actions).toHaveLength(MAX_FORGE_CI_RECOVERY_ATTEMPTS);
+    expect(parse(recovery)).toEqual(recovery);
+  });
+
+  it.each([
+    { retryableFailure: "unknown" }, { classification: "code" }, { classification: "credentials" },
+    { log: undefined }, { log: " " }, { testedSha: undefined }, { failedStep: undefined }, { conclusion: "success" },
+    { failedStep: null }, { failedStep: {} }, { failedStep: { name: " ", number: 4 } },
+    { failedStep: { name: "x".repeat(4097), number: 4 } },
+    ...[0, -1, 1.5, "4"].map(number => ({ failedStep: { name: "Download artifacts", number } })),
+  ])("rejects unsupported transport evidence %#", patch => {
+    expect(() => parseDiagnostic({ ...diagnostic, jobs: [{ ...diagnostic.jobs[0], ...patch }] })).toThrow();
+  });
+
+  it.each([
+    null, {}, { actions: [] }, { actions: null }, { actions: Array.from({ length: 3 }, () => action) },
+    ...[0, -1, 1.5, "1"].map(runAttempt => ({ actions: [{ ...action, runAttempt }] })),
+    { actions: [{ ...action, runId: " " }] }, { actions: [{ ...action, runId: "r".repeat(257) }] },
+    { actions: [{ ...action, phase: "unknown" }] }, { actions: [{ ...action, requestedAt: "2026-11-04" }] },
+    { actions: [{ ...action, requestedAt: "2026-02-31T00:00:00.000Z" }] },
+    { actions: [{ ...action, reason: " " }] }, { actions: [{ ...action, reason: "r".repeat(4097) }] },
+    { actions: [{ ...action, phase: "observed" }] },
+    ...[0, 1, 1.5, "2"].map(observedAttempt => ({ actions: [{ ...action, phase: "observed", observedAttempt }] })),
+    { actions: [action, { ...action, runAttempt: 2 }] },
+    { actions: [{ ...action, phase: "observed", observedAttempt: 2 }, { ...action, phase: "waiting" }] },
+  ])("rejects unbounded or contradictory recovery history %#", recovery => {
+    expect(() => parse(recovery)).toThrow();
+  });
+
+  it.each([
+    { state: "pending" }, { testedSha: undefined }, { testedSha: "d".repeat(40) }, { jobs: [] },
+    { repository: { ...worker.repository, projectPath: "other/repo" } }, { changeNumber: 13 },
+    ...[{ runId: "other-run" }, { runAttempt: 2 }, { retryableFailure: undefined }, { classification: "unknown", retryableFailure: undefined }]
+      .map(patch => ({ jobs: [{ ...diagnostic.jobs[0], ...patch }] })),
+  ])("binds each recovery to its one trusted run and tested identity %#", patch => {
+    expect(() => parse({ actions: [{ ...action, diagnostic: { ...diagnostic, ...patch } }] })).toThrow();
+  });
+
+  it("requires an issue owner and published request", () => {
+    const ciRecovery = { actions: [action] };
+    expect(() => parseWorkers([{ ...owned, kind: "review", ciRecovery }])).toThrow(/issue/i);
+    expect(() => parseWorkers([{ ...owned, changeNumber: undefined, ciRecovery }])).toThrow();
   });
 });
 

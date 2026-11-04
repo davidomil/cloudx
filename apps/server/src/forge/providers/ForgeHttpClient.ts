@@ -46,8 +46,8 @@ export class ForgeHttpClient {
     const prefix = this.repository.provider === "github"
       ? `/repos/${this.repository.projectPath.split("/").map(encodeURIComponent).join("/")}/actions/jobs/`
       : `/projects/${encodeURIComponent(this.repository.projectPath)}/jobs/`;
-    if (!path.startsWith(prefix) || !/^\d+\/(?:logs|trace)$/.test(path.slice(prefix.length)) ||
-        !path.endsWith(this.repository.provider === "github" ? "/logs" : "/trace"))
+    const logPath = this.repository.provider === "github" ? /^\d+\/(?:steps\/[1-9]\d*\/)?logs$/ : /^\d+\/trace$/;
+    if (!path.startsWith(prefix) || !logPath.test(path.slice(prefix.length)))
       throw new ForgeProviderError("CI logs require a job in the configured repository.");
     return (await this.performRequest(path, {}, true)).body as CiLogEvidence;
   }

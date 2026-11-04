@@ -57,22 +57,34 @@ corrections, and the eligible merge automatically; a clarification
 request pauses the loop.
 
 With **Auto review** enabled, a terminal failure in required CI starts
-an automatic repair on the same issue checkout, even before approval.
+a diagnosis on the same issue checkout, even before approval.
 Forge waits for any running reviewer, collects bounded and sanitized
 job logs, and pins the diagnosis to the request, source and target
-commits, tested commit and run attempt. The worker reproduces the
-failure and commits a validated fix. Forge publishes to the existing
-PR/MR with the saved source-head lease, reviews the patch, and requires
-fresh passing CI before merging.
+commits, tested commit and run attempt. For an application failure, the
+worker reproduces the failure and commits a validated fix. Forge publishes
+to the existing PR/MR with the saved source-head lease, reviews the patch,
+and requires fresh passing CI before merging.
+
+A transport error in a failed GitHub artifact action pinned to a commit
+can recover through a failed-job rerun. Successful upstream jobs do not make
+the gate's own failure ambiguous. Forge keeps the original failure logs,
+step and commit identities, records the rerun before sending it, and waits
+for a newer run attempt and fresh passing checks. Each issue worker can
+request at most two transport reruns. These reruns preserve the completed
+implementation, conversation, review and CI repair budget. A restart
+or repeated **Resume** only observes a recorded request; it never sends
+that request again. If no newer attempt appears within two minutes, Forge
+pauses for inspection. A running recovery has a two-hour wait limit.
 
 The worker card shows the repair phase, attempt count and job links.
 Each issue worker has a budget of two automatic CI repair attempts;
 the same source commit cannot start another attempt. Missing logs,
-infrastructure or credential failures, and uncertain launch outcomes
+other infrastructure or credential failures, and uncertain launch outcomes
 retain the checkout and show the action needed. **Pause**, **Stop** and
-disabled **Auto review** prevent automatic repair. GitHub issue worker
-Apps need **Actions: read** permission to collect logs; approve the
-updated permission on existing installations before continuing setup.
+disabled **Auto review** prevent automatic repair and transport recovery.
+GitHub issue worker Apps need **Actions: write** permission to collect logs
+and rerun failed jobs; approve the updated permission on existing
+installations before continuing setup.
 
 After the automatic budget is exhausted, Forge still refreshes the current
 CI diagnosis. The card shows the budget separately from the failing producer

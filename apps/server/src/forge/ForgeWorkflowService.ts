@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Readable } from "node:stream";
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_MODEL_CAPACITY_RETRIES, forgeWorkerIssueNumbers, validateForgeDiagnosticSnapshotInput } from "@cloudx/shared";
+import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, isForgeTurnCompletion, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_CI_RECOVERY_ATTEMPTS, MAX_FORGE_MODEL_CAPACITY_RETRIES, forgeWorkerIssueNumbers, validateForgeDiagnosticSnapshotInput } from "@cloudx/shared";
 import type {
   ClaudeLaunchMode,
   CodexReasoningEffort,
@@ -295,6 +295,7 @@ export class ForgeWorkflowService {
   private readonly requestedActions = new Map<string, { phase: string; queuedAt: number; startedAt?: number }>();
   private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
+  private readonly ciFailureOperations = new Set<string>();
   private readonly cooperationContinuations = new Map<string, string>();
   private readonly stateListeners = new Set<(workers: ForgeWorker[]) => void>();
   private readonly nextAutoReviewCheckAt = new Map<string, number>();
@@ -611,8 +612,12 @@ export class ForgeWorkflowService {
     return this.exclusive(() => this.createWorker(repository, "review", number, autoPost, placement));
   }
   setAutoReview(id: string, enabled: boolean, placement: ForgePlacement): Promise<ForgeWorker> {
-    if (!enabled && (this.providerRecoveries.has(id) ||
-        ["diagnosing", "ready"].includes(this.workers.find(worker => worker.id === id)?.ciRepair?.phase ?? "")))
+    const current = this.workers.find(worker => worker.id === id);
+    const automaticLoop = current?.kind === "issue" && current.autoReview?.enabled &&
+      current.autoReview.phase !== "implementing" && this.reservationFor(current);
+    if (!enabled && (automaticLoop || this.providerRecoveries.has(id) || this.ciFailureOperations.has(id) ||
+        ["diagnosing", "ready"].includes(current?.ciRepair?.phase ?? "") ||
+        ["requesting", "waiting"].includes(current?.ciRecovery?.actions.at(-1)?.phase ?? "")))
       this.operations.get(id)?.abort(new Error("Automatic review disabled by user."));
     return this.exclusive(async () => {
       await this.waitForWorkerAction(id);
@@ -1981,8 +1986,11 @@ export class ForgeWorkflowService {
     const change = await this.observeProvider(worker, "getChangeRequest", () => provider.getChangeRequest(worker.changeNumber!));
     signal?.throwIfAborted();
     const ciWait = worker.autoReview?.ciWait;
+    const ciRecovery = worker.ciRecovery?.actions.at(-1);
     const awaitingCi = ["pending", "failed"].includes(change.checks?.state ?? "") ||
-      worker.ciRepair?.phase === "reviewing" && change.checks?.state !== "passed";
+      worker.ciRepair?.phase === "reviewing" && change.checks?.state !== "passed" ||
+      ciRecovery && ciRecovery.diagnostic.sourceHeadSha === change.headSha && ciRecovery.diagnostic.targetHeadSha === change.targetHeadSha &&
+        (ciRecovery.phase !== "observed" || change.checks?.state !== "passed");
     if (ciWait && (ciWait.headSha !== change.headSha || ciWait.targetHeadSha !== change.targetHeadSha || !awaitingCi))
       worker.autoReview!.ciWait = undefined;
     this.observeMergeConflict(worker, change);
@@ -2002,6 +2010,7 @@ export class ForgeWorkflowService {
     signal?.throwIfAborted();
     if (issue.number !== worker.number || issue.state !== "open")
       throw new Error("Auto review requires the original issue to remain open.");
+    if (await this.reconcileCiRecovery(worker, change)) return;
     return { issue, issues: await this.batchIssues(worker), change };
   }
   private async observeProvider<T>(worker: Pick<ForgeWorker, "number" | "changeNumber">, operation: "getChangeRequest" | "getIssue", read: () => Promise<T>): Promise<T> {
@@ -2437,6 +2446,14 @@ export class ForgeWorkflowService {
     return latest;
   }
   private async repairFailedCi(worker: ForgeWorker, context: { issue: ForgeIssueDetail; change: ForgeChangeRequest }): Promise<boolean> {
+    this.ciFailureOperations.add(worker.id);
+    try {
+      return await this.repairCurrentCi(worker, context);
+    } finally {
+      this.ciFailureOperations.delete(worker.id);
+    }
+  }
+  private async repairCurrentCi(worker: ForgeWorker, context: { issue: ForgeIssueDetail; change: ForgeChangeRequest }): Promise<boolean> {
     const { change, issue } = context;
     if (change.checks?.state !== "failed" || !worker.autoReview?.enabled) return false;
     this.requireRecoveryPublication(worker);
@@ -2488,6 +2505,13 @@ export class ForgeWorkflowService {
     }
     repair.diagnosticStatus = diagnostic.state === "obsolete" ? "stale" : "current";
     repair.diagnosticReason = diagnostic.state === "obsolete" ? diagnostic.reason : undefined;
+    if (diagnostic.state === "blocked" && diagnostic.testedSha && diagnostic.jobs.length &&
+        diagnostic.jobs.every(job => job.classification === "infrastructure" && job.retryableFailure === "artifact_transport" &&
+          job.failedStep && job.log?.trim() && job.testedSha === diagnostic.testedSha)) {
+      worker.ciRepair = saved ?? repair;
+      await this.recoverCiTransport(worker, change, diagnostic);
+      return true;
+    }
     if (automaticBlocker) {
       repair.diagnosticStatus = "stale";
       repair.diagnosticReason = "Confirming the current request after collecting CI evidence.";
@@ -2558,6 +2582,93 @@ export class ForgeWorkflowService {
     worker.error = undefined;
     await this.persist();
     await this.launch(worker, worker.autoReview.placement, { item: currentIssue, change: latest });
+    return true;
+  }
+  private async recoverCiTransport(worker: ForgeWorker, change: ForgeChangeRequest, diagnostic: ForgeCiDiagnostic): Promise<void> {
+    const provider = this.providerFor(worker);
+    const runs = new Set(diagnostic.jobs.map(job => `${job.runId}:${job.runAttempt}`));
+    const actions = worker.ciRecovery?.actions ?? [];
+    if (!provider.getCiRun || !provider.rerunFailedCi || runs.size !== 1) {
+      await this.pauseAutoReview(worker, "The artifact transport failure needs a failed-job rerun. Automatic recovery requires one verified GitHub run and provider rerun support; the checkout and diagnosis are retained.");
+      return;
+    }
+    const { runId, runAttempt } = diagnostic.jobs[0];
+    if (actions.some(action => action.runId === runId && action.runAttempt === runAttempt) || actions.length >= MAX_FORGE_CI_RECOVERY_ATTEMPTS) {
+      await this.pauseAutoReview(worker, "The bounded CI transport recovery budget is exhausted or this run attempt already has a recorded rerun. Inspect the retained action and rerun CI manually before resuming; no source repair was started.");
+      return;
+    }
+    const signal = this.operations.get(worker.id)?.signal;
+    const latest = await provider.getChangeRequest(worker.changeNumber!);
+    signal?.throwIfAborted();
+    requirePublicationRequest(worker, latest);
+    if (latest.headSha !== diagnostic.sourceHeadSha || latest.targetHeadSha !== diagnostic.targetHeadSha ||
+        latest.baseSha !== change.baseSha || latest.baseBranch !== change.baseBranch || latest.checks?.state !== "failed" ||
+        latest.checks.reason) {
+      await this.pauseAutoReview(worker, "The request or CI identity changed before transport recovery. Refresh CI evidence before resuming.");
+      return;
+    }
+    const action = { runId, runAttempt, phase: "requesting" as const, requestedAt: new Date(Date.now()).toISOString(), diagnostic: structuredClone(diagnostic) };
+    worker.ciRecovery = { actions: [...actions, action] };
+    // A saved request is never replayed: GitHub has no idempotent rerun endpoint.
+    await this.waitForCi(worker, latest, `Requesting failed-job rerun for CI run ${runId}, attempt ${runAttempt}.`);
+    signal?.throwIfAborted();
+    if (worker.status === "paused" || !worker.autoReview?.enabled) return;
+    try {
+      await this.waitForWorkerIO(worker, "Rerunning failed CI jobs", () => provider.rerunFailedCi!(latest, runId, runAttempt, diagnostic.testedSha!));
+    } catch (error) {
+      signal?.throwIfAborted();
+      const recorded = worker.ciRecovery.actions.at(-1)!;
+      recorded.reason = `The failed-job rerun was not confirmed: ${message(error)}`.slice(0, 4096);
+      await this.pauseAutoReview(worker, `${recorded.reason} Inspect the run, rerun manually if needed, then Resume. Forge will only observe this request and will not submit it again.`);
+      return;
+    }
+    signal?.throwIfAborted();
+    worker.ciRecovery.actions.at(-1)!.phase = "waiting";
+    await this.waitForCi(worker, latest, `Failed-job rerun requested for CI run ${runId}. Waiting for a new run attempt and fresh checks.`);
+  }
+  private async reconcileCiRecovery(worker: ForgeWorker, change: ForgeChangeRequest): Promise<boolean> {
+    const action = worker.ciRecovery?.actions.at(-1);
+    if (!action || action.phase === "observed") {
+      if (action?.diagnostic.sourceHeadSha === change.headSha && action.diagnostic.targetHeadSha === change.targetHeadSha &&
+          change.checks?.state !== "passed" && change.checks?.state !== "failed") {
+        await this.waitForCi(worker, change, "Waiting for fresh passing checks after CI transport recovery.");
+        return true;
+      }
+      return false;
+    }
+    if (change.headSha !== action.diagnostic.sourceHeadSha || change.targetHeadSha !== action.diagnostic.targetHeadSha) {
+      await this.pauseAutoReview(worker, "The source or target changed during CI transport recovery. Inspect the retained run identity before resuming.");
+      return true;
+    }
+    const provider = this.providerFor(worker);
+    if (!provider.getCiRun) {
+      await this.pauseAutoReview(worker, "The provider cannot confirm the retained CI rerun. Inspect the recorded action before resuming.");
+      return true;
+    }
+    const run = await this.waitForWorkerIO(worker, "Observing CI rerun attempt", () => provider.getCiRun!(change, action.runId, action.diagnostic.testedSha!));
+    this.operations.get(worker.id)?.signal.throwIfAborted();
+    if (run.runAttempt > action.runAttempt) {
+      action.observedAttempt = run.runAttempt;
+      if (run.status === "completed" && (run.conclusion === "success" && change.checks?.state === "passed" ||
+          ["failure", "timed_out"].includes(run.conclusion ?? "") && change.checks?.state === "failed")) {
+        action.phase = "observed";
+        worker.error = undefined;
+        await this.persist();
+        return false;
+      }
+      if (run.status === "completed" && ["cancelled", "action_required", "startup_failure"].includes(run.conclusion ?? "")) {
+        await this.pauseAutoReview(worker, `The CI rerun ended with ${run.conclusion}. Inspect the run before resuming; no further rerun or source repair was started.`);
+        return true;
+      }
+    } else if (Date.now() - Date.parse(action.requestedAt) >= 120_000) {
+      await this.pauseAutoReview(worker, "The CI rerun has no confirmed new attempt after two minutes. Its outcome is uncertain. Inspect the run, rerun manually if needed, then Resume. Forge will not submit a duplicate rerun.");
+      return true;
+    }
+    if (Date.now() - Date.parse(action.requestedAt) >= CI_WAIT_WINDOW) {
+      await this.pauseAutoReview(worker, "CI transport recovery has not produced matching completed results and fresh checks within two hours. Inspect the retained run, then Resume when CI is ready.");
+      return true;
+    }
+    await this.waitForCi(worker, change, `Waiting for CI run ${action.runId} to publish a completed new attempt and fresh checks.`);
     return true;
   }
   private async startRebaseRecovery(worker: ForgeWorker, placement: ForgePlacement, localConflict = false, modelCapacityRecovery?: "automatic" | "manual" | "continuation"): Promise<void> {

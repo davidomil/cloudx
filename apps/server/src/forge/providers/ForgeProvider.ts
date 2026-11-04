@@ -20,6 +20,12 @@ export interface ForgeListIdentity {
   workerAuthors: string[];
 }
 
+export interface ForgeCiRunState {
+  runAttempt: number;
+  status: string;
+  conclusion?: string;
+}
+
 export interface ForgeProvider {
   listIssues(query?: ForgeListQuery): Promise<ForgePage<ForgeIssue>>;
   listChangeRequests(
@@ -29,6 +35,8 @@ export interface ForgeProvider {
   getChangeRequestStatus(number: number): Promise<ForgeChangeRequestStatus>;
   getChangeRequest(number: number): Promise<ForgeChangeRequest>;
   getCiFailure(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic>;
+  getCiRun?(change: ForgeChangeRequest, runId: string, testedSha: string): Promise<ForgeCiRunState>;
+  rerunFailedCi?(change: ForgeChangeRequest, runId: string, runAttempt: number, testedSha: string): Promise<void>;
   findChangeRequestByBranch(
     headBranch: string,
     baseBranch: string,
