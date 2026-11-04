@@ -295,6 +295,7 @@ export class ForgeWorkflowService {
   private readonly requestedActions = new Map<string, { phase: string; queuedAt: number; startedAt?: number }>();
   private readonly completionChecks = new AbortController();
   private readonly operations = new Map<string, AbortController>();
+  private readonly ciFailureOperations = new Set<string>();
   private readonly cooperationContinuations = new Map<string, string>();
   private readonly stateListeners = new Set<(workers: ForgeWorker[]) => void>();
   private readonly nextAutoReviewCheckAt = new Map<string, number>();
@@ -611,9 +612,12 @@ export class ForgeWorkflowService {
     return this.exclusive(() => this.createWorker(repository, "review", number, autoPost, placement));
   }
   setAutoReview(id: string, enabled: boolean, placement: ForgePlacement): Promise<ForgeWorker> {
-    if (!enabled && (this.providerRecoveries.has(id) ||
-        ["diagnosing", "ready"].includes(this.workers.find(worker => worker.id === id)?.ciRepair?.phase ?? "") ||
-        ["requesting", "waiting"].includes(this.workers.find(worker => worker.id === id)?.ciRecovery?.actions.at(-1)?.phase ?? "")))
+    const current = this.workers.find(worker => worker.id === id);
+    const automaticLoop = current?.kind === "issue" && current.autoReview?.enabled &&
+      current.autoReview.phase !== "implementing" && this.reservationFor(current);
+    if (!enabled && (automaticLoop || this.providerRecoveries.has(id) || this.ciFailureOperations.has(id) ||
+        ["diagnosing", "ready"].includes(current?.ciRepair?.phase ?? "") ||
+        ["requesting", "waiting"].includes(current?.ciRecovery?.actions.at(-1)?.phase ?? "")))
       this.operations.get(id)?.abort(new Error("Automatic review disabled by user."));
     return this.exclusive(async () => {
       await this.waitForWorkerAction(id);
@@ -2442,6 +2446,14 @@ export class ForgeWorkflowService {
     return latest;
   }
   private async repairFailedCi(worker: ForgeWorker, context: { issue: ForgeIssueDetail; change: ForgeChangeRequest }): Promise<boolean> {
+    this.ciFailureOperations.add(worker.id);
+    try {
+      return await this.repairCurrentCi(worker, context);
+    } finally {
+      this.ciFailureOperations.delete(worker.id);
+    }
+  }
+  private async repairCurrentCi(worker: ForgeWorker, context: { issue: ForgeIssueDetail; change: ForgeChangeRequest }): Promise<boolean> {
     const { change, issue } = context;
     if (change.checks?.state !== "failed" || !worker.autoReview?.enabled) return false;
     this.requireRecoveryPublication(worker);

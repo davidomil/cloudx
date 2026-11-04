@@ -53,6 +53,13 @@ function jobNames(id: string, job: Record<string, unknown>): string[] {
   return names;
 }
 
+function stepDisplayName(step: Record<string, unknown>): string | undefined {
+  const source = step.name ?? step.uses ?? step.run;
+  if (typeof source !== "string") return;
+  const firstLine = source.replace(/^[ \t\r\n]+/, "").split(/[\r\n]/, 1)[0];
+  return firstLine ? `${step.name === undefined ? "Run " : ""}${firstLine}` : "run";
+}
+
 /** Resolve Actions job names only from literal, bounded workflow definitions. */
 export class GitHubWorkflowDependencies {
   private readonly jobs: Record<string, unknown>;
@@ -86,13 +93,23 @@ export class GitHubWorkflowDependencies {
     return dependencies.filter(job => ["failure", "timed_out"].includes(string(job.conclusion)));
   }
 
-  pinnedArtifactStep(job: Record<string, unknown>, stepName: string, runJobs: Record<string, unknown>[]): boolean {
+  pinnedArtifactStep(job: Record<string, unknown>, failedStep: { name: string; number: number }, runJobs: Record<string, unknown>[]): boolean {
     const [id, definition] = this.definition(job);
     this.validateGraph(id, new Set(), new Set());
     if (definition.needs !== undefined && this.failedDependencies(job, runJobs).length) return false;
-    if (!Array.isArray(definition.steps)) return false;
-    const matches = definition.steps.map(record).filter(step =>
-      (step.name ?? (typeof step.uses === "string" ? `Run ${step.uses}` : undefined)) === stepName);
+    if (!Array.isArray(definition.steps) || !Array.isArray(job.steps)) return false;
+    const executed = job.steps.map(record);
+    const numbers = executed.map(step => step.number);
+    if (numbers.some(number => !Number.isSafeInteger(number) || Number(number) < 1) || new Set(numbers).size !== numbers.length)
+      return false;
+    const reported = executed.filter(step => step.name === failedStep.name);
+    if (reported.length !== 1 || reported[0].number !== failedStep.number || reported[0].status !== "completed" ||
+        !["failure", "timed_out"].includes(String(reported[0].conclusion))) return false;
+    const steps = definition.steps.map(record);
+    const names = steps.map(stepDisplayName);
+    if (names.some(name => name === undefined || name.includes("${{") &&
+      failedStep.name.startsWith(name.slice(0, name.indexOf("${{"))))) return false;
+    const matches = steps.filter((_step, index) => names[index] === failedStep.name);
     return matches.length === 1 && matches[0].run === undefined &&
       typeof matches[0].uses === "string" && /^actions\/(?:download|upload)-artifact@[a-fA-F0-9]{40}$/.test(matches[0].uses);
   }

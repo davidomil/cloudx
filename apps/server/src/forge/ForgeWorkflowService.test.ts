@@ -5452,6 +5452,62 @@ describe("Forge issue auto review", () => {
     else expect(f.currentIssue().status).toBe(action === "pause" ? "paused" : "stopped");
   });
 
+  it.each([0, 1, 2].flatMap(attempts => ["initial context", "diagnosis", "identity refresh", "Resume context"].map(window => ({ attempts, window }))))(
+    "disables transport recovery during $window with $attempts saved source repairs", async ({ attempts, window }) => {
+      const f = await approvedIssue();
+      const oldRepair: NonNullable<ForgeWorker["ciRepair"]> = { phase: "blocked", attempts,
+        attemptedHeads: attempts === 1 ? [f.change.headSha] : ["b".repeat(40), "c".repeat(40)].slice(0, attempts) };
+      await f.deps.store.write(f.stored().map(worker => worker.id === f.issue.id ? {
+        ...worker, ciRepair: oldRepair, ...(window === "Resume context" ? { status: "paused" as const } : {}),
+      } : worker));
+      const service = new ForgeWorkflowService(f.deps);
+      await service.dashboard();
+      const diagnostic = transportFailure(f);
+      const { rerunFailedCi } = ciRecoveryProvider(f);
+      const reached = deferred<void>();
+      const release = deferred<void>();
+      let collected = false;
+      let held = false;
+      f.provider.getCiFailure.mockImplementationOnce(async () => {
+        if (window === "diagnosis") { reached.resolve(); await release.promise; }
+        collected = true;
+        return diagnostic;
+      });
+      const readChange = f.provider.getChangeRequest.getMockImplementation()!;
+      f.provider.getChangeRequest.mockImplementation(async () => {
+        if (!held && (["initial context", "Resume context"].includes(window) || window === "identity refresh" && collected)) {
+          held = true; reached.resolve(); await release.promise;
+        }
+        return readChange();
+      });
+      const polling = window === "Resume context" ? service.resume(f.issue.id, placement) : service.poll();
+      await reached.promise;
+      const disabling = service.setAutoReview(f.issue.id, false, placement);
+      release.resolve();
+      await Promise.all([polling, disabling]);
+      f.advanceTime(5_000); await service.poll();
+      expect(f.currentIssue()).toMatchObject({ autoReview: { enabled: false }, ciRepair: { attempts, attemptedHeads: oldRepair.attemptedHeads } });
+      expect(rerunFailedCi).not.toHaveBeenCalled();
+      expect(f.currentIssue().ciRecovery).toBeUndefined();
+      expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+      expect(f.provider.merge).not.toHaveBeenCalled();
+    },
+  );
+
+  it("disables automatic review without interrupting the running implementation turn", async () => {
+    const f = await automaticIssue();
+    const implementation = structuredClone(f.currentIssue());
+    await f.service.setAutoReview(f.issue.id, false, placement);
+    await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "running", attemptId: implementation.attemptId,
+      tabId: implementation.tabId, autoReview: { enabled: false, phase: "implementing" } });
+    expect(f.runtime.pause).not.toHaveBeenCalled();
+    expect(f.runtime.close).not.toHaveBeenCalled();
+    expect(f.runtime.launch.mock.calls[0]?.[1]?.aborted).toBe(false);
+    expect(f.runtime.launch).toHaveBeenCalledOnce();
+    expect(f.provider.getCiFailure).not.toHaveBeenCalled();
+  });
+
   it.each(["pause", "stop", "disable"] as const)("honors %s while the transport recovery checkpoint is saving", async action => {
     const f = await approvedIssue();
     transportFailure(f);
@@ -6556,8 +6612,89 @@ describe("Forge issue auto review", () => {
     f.provider.getCiFailure.mockImplementation(change => provider.getCiFailure(change));
     f.change.checks = { state: "failed", url: `${f.change.url}/checks` };
     f.reports.read.mockResolvedValue(undefined);
-    return { repository, sourceHead, targetHead, testedMerge, token, fetcher, run, checks };
+    return { repository, sourceHead, targetHead, testedMerge, token, fetcher, run, checks, job, gate, optional };
   }
+
+  function realArtifactFailure(f: Awaited<ReturnType<typeof approvedIssue>>, failure: "missing_dependency" | "duplicate_dependency" | "required_check_error" | "required_check_api_error" | "step_collision") {
+    const log = "Error: Failed to ListArtifacts: Unable to make request: ECONNRESET\n";
+    const evidence = realCiDiagnostics(f, "github", log, "Isolated full verifier", true);
+    const { rerunFailedCi } = ciRecoveryProvider(f);
+    const originalFetch = evidence.fetcher.getMockImplementation()!;
+    const collision = failure === "step_collision";
+    const steps = [{ name: "Set up job", number: 1, status: "completed", conclusion: "success" },
+      { name: "Download artifacts", number: 2, status: "completed", conclusion: collision ? "success" : "failure" },
+      ...(collision ? [{ name: "Download artifacts", number: 3, status: "completed", conclusion: "failure" }] : [])];
+    const failed = { ...evidence.job, steps };
+    const prerequisite = { ...evidence.optional, id: 12, name: "Verifier producer", conclusion: "success" };
+    const workflow = Buffer.from([
+      "jobs:", "  aggregate:", "    name: CI aggregate", "    needs: verifier",
+      "  verifier:", "    name: Isolated full verifier", "    needs: producer", "    steps:",
+      "      - name: Download artifacts", `        uses: actions/download-artifact@${"a".repeat(40)}`,
+      ...(collision ? ["      - name: \"${{ 'Download artifacts' }}\"", "        run: |", `          echo '${log.trim()}'`, "          exit 1"] : []),
+      "  producer:", "    name: Verifier producer", "",
+    ].join("\n"));
+    let jobReads = 0;
+    let requiredReads = 0;
+    evidence.fetcher.mockImplementation(async input => {
+      const pathname = decodeURIComponent(new URL(String(input)).pathname);
+      if (pathname === "/repos/a/b/actions/runs/42/attempts/1/jobs") {
+        const final = ++jobReads === 2;
+        const jobs = [evidence.gate, failed, prerequisite];
+        if (final && failure === "missing_dependency") jobs.pop();
+        if (final && failure === "duplicate_dependency") jobs.push({ ...prerequisite, id: 13 });
+        return Response.json({ jobs });
+      }
+      if (pathname === "/repos/a/b/contents/.github/workflows/ci.yml") return Response.json({
+        type: "file", path: ".github/workflows/ci.yml", encoding: "base64", size: workflow.length,
+        content: workflow.toString("base64"), sha: createHash("sha1").update(`blob ${workflow.length}\0`).update(workflow).digest("hex"),
+      });
+      if (pathname.endsWith(`/jobs/9/steps/${collision ? 3 : 2}/logs`)) return new Response(log);
+      if (pathname === "/graphql" && ++requiredReads === 2) {
+        if (failure === "required_check_error") return Response.json({ errors: [{ message: "Required checks unavailable" }] });
+        if (failure === "required_check_api_error") return Response.json({ message: "Service unavailable" }, { status: 503 });
+      }
+      return originalFetch(input);
+    });
+    return { ...evidence, log, rerunFailedCi };
+  }
+
+  it.each([
+    { failure: "missing_dependency", reason: /unambiguous aggregate job dependencies/i },
+    { failure: "duplicate_dependency", reason: /unambiguous aggregate job dependencies/i },
+    { failure: "required_check_error", reason: /could not verify required CI evidence/i },
+    { failure: "required_check_api_error", reason: /503|unavailable/i },
+  ] as const)("rejects transport recovery when final collector evidence has $failure", async ({ failure, reason }) => {
+    const f = await approvedIssue();
+    const evidence = realArtifactFailure(f, failure);
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", error: expect.stringMatching(reason),
+      ciRepair: { attempts: 0, attemptedHeads: [], diagnostic: { state: "blocked", reason: expect.stringMatching(reason),
+        sourceHeadSha: evidence.sourceHead, targetHeadSha: evidence.targetHead, testedSha: evidence.testedMerge,
+        jobs: [{ jobId: "9", runId: "42", runAttempt: 1, testedSha: evidence.testedMerge, classification: "infrastructure",
+          failedStep: { name: "Download artifacts", number: 2 }, log: expect.stringContaining(evidence.log.trim()) }] } } });
+    expect(f.currentIssue().ciRepair!.diagnostic!.jobs[0].retryableFailure).toBeUndefined();
+    expect(f.currentIssue().ciRecovery).toBeUndefined();
+    expect(evidence.rerunFailedCi).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.runtime.cleanup).not.toHaveBeenCalled();
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("rejects a failing expression-named script that collides with a successful pinned artifact action", async () => {
+    const f = await approvedIssue();
+    const evidence = realArtifactFailure(f, "step_collision");
+    await f.poll(); await f.poll();
+    expect(f.currentIssue()).toMatchObject({ status: "paused", ciRepair: { attempts: 0, diagnostic: {
+      state: "blocked", sourceHeadSha: evidence.sourceHead, targetHeadSha: evidence.targetHead, testedSha: evidence.testedMerge,
+      jobs: [{ jobId: "9", runId: "42", runAttempt: 1, testedSha: evidence.testedMerge,
+        failedStep: { name: "Download artifacts", number: 3 }, log: expect.stringContaining(evidence.log.trim()) }],
+    } } });
+    expect(f.currentIssue().ciRepair!.diagnostic!.jobs[0].retryableFailure).toBeUndefined();
+    expect(f.currentIssue().ciRecovery).toBeUndefined();
+    expect(evidence.rerunFailedCi).not.toHaveBeenCalled();
+    expect(f.runtime.launch).toHaveBeenCalledTimes(2);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
 
   it.each(["github", "gitlab"] as const)("collects real %s adapter diagnostics through the repair workflow and redacts credentials", async providerKind => {
     const f = await approvedIssue(1, providerKind);

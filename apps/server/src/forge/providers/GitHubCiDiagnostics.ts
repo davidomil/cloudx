@@ -27,6 +27,7 @@ export class GitHubCiDiagnostics {
 
   async collect(change: ForgeChangeRequest): Promise<ForgeCiDiagnostic> {
     const diagnostic = ciDiagnostic(this.http.repository, change);
+    const retryableJobs = new Set<CiJob>();
     try {
       if (!change.targetHeadSha) throw new ForgeProviderError("CI repair requires a current target head.");
       if (change.checks?.reason === "superseded_merge_identity") {
@@ -62,7 +63,7 @@ export class GitHubCiDiagnostics {
         const active = new Set<number>();
         const completed = new Set<number>();
         const resolvedGates = new Set<number>();
-        const artifactSteps = new Map<number, string>();
+        const artifactSteps = new Map<number, NonNullable<CiJob["failedStep"]>>();
         let workflow: GitHubWorkflowDependencies | undefined;
         let workflowSha: string | undefined;
         const loadWorkflow = async (testedSha?: string): Promise<boolean> => {
@@ -125,14 +126,14 @@ export class GitHubCiDiagnostics {
             }
             if (collected.artifactTransportFailure && failedStep && evidence.classification !== "code") {
               if (!await loadWorkflow(testedSha)) return false;
-              if (workflow!.pinnedArtifactStep(producer, failedStep.name, jobs)) {
+              if (workflow!.pinnedArtifactStep(producer, failedStep, jobs)) {
                 const step = await this.http.ciLogEvidence(`${this.path}/actions/jobs/${jobId}/steps/${failedStep.number}/logs`);
                 if (step.artifactTransportFailure && !["code", "credentials", "policy"].includes(step.classification)) {
                   evidence.classification = "infrastructure";
-                  evidence.retryableFailure = "artifact_transport";
+                  retryableJobs.add(evidence);
                   evidence.testedSha ??= workflowSha;
                   completed.add(jobId);
-                  artifactSteps.set(jobId, failedStep.name);
+                  artifactSteps.set(jobId, failedStep);
                   return true;
                 }
               }
@@ -184,9 +185,9 @@ export class GitHubCiDiagnostics {
         // Re-resolve the pinned dependency graph too: a successful sibling becoming
         // a failed dependency must invalidate this evidence, even if selected IDs stayed fixed.
         if (workflow) {
-          for (const [id, stepName] of artifactSteps) {
+          for (const [id, failedStep] of artifactSteps) {
             const selected = currentJobs.find(job => ciId(job.id) === id)!;
-            if (!workflow.pinnedArtifactStep(selected, stepName, currentJobs)) {
+            if (!workflow.pinnedArtifactStep(selected, failedStep, currentJobs)) {
               diagnostic.state = "obsolete"; diagnostic.reason = "Artifact action dependencies changed while reading failure evidence.";
               return finishCiDiagnostic(diagnostic);
             }
@@ -208,7 +209,10 @@ export class GitHubCiDiagnostics {
       const latest = await this.requiredFailures(change, diagnostic);
       if (!latest || JSON.stringify(latest) !== JSON.stringify(failures)) {
         diagnostic.state = "obsolete"; diagnostic.reason = "Required CI changed while reading failure evidence.";
-      } else classifyDiagnostic(diagnostic);
+      } else {
+        classifyDiagnostic(diagnostic);
+        for (const job of retryableJobs) job.retryableFailure = "artifact_transport";
+      }
     } catch (error) {
       diagnostic.state = "blocked"; diagnostic.reason = ciEvidenceFailure(error);
     }

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { GitHubWorkflowDependencies } from "./GitHubWorkflowDependencies.js";
 
 const terminal = (name: string, conclusion = "success") => ({ name, status: "completed", conclusion });
+const artifactAction = "actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0";
+const artifactStep = { name: "Download artifacts", number: 5, status: "completed", conclusion: "failure" };
 
 describe("Pinned workflow dependencies", () => {
   it.each(["Installed previous-version upgrade", "Codex native recovery (0.166.0)"])("resolves the real CI aggregate's failed %s producer, including every literal matrix sibling", async failedName => {
@@ -79,7 +81,71 @@ describe("Pinned workflow dependencies", () => {
     { uses: "custom/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0", trusted: false },
   ])("binds retry trust to the exact literal artifact action: $uses", ({ uses, trusted }) => {
     const workflow = new GitHubWorkflowDependencies(`jobs: {gate: {steps: [{uses: '${uses}'}]}}`);
-    expect(workflow.pinnedArtifactStep(terminal("gate"), `Run ${uses}`, [])).toBe(trusted);
+    const step = { ...artifactStep, name: `Run ${uses}` };
+    expect(workflow.pinnedArtifactStep({ ...terminal("gate"), steps: [step] }, step, [])).toBe(trusted);
+  });
+
+  it("binds the failed runtime number without assuming a YAML step ordinal", () => {
+    const workflow = new GitHubWorkflowDependencies(`jobs: {gate: {steps: [{name: Download artifacts, uses: '${artifactAction}'}]}}`);
+    const job = { ...terminal("gate", "failure"), steps: [
+      { ...terminal("Set up job"), number: 1 }, { ...terminal("Pre setup"), number: 2 }, artifactStep,
+    ] };
+    expect(workflow.pinnedArtifactStep(job, artifactStep, [])).toBe(true);
+    expect(workflow.pinnedArtifactStep(job, { ...artifactStep, number: 2 }, [])).toBe(false);
+  });
+
+  it("rejects a successful action and failed expression-named script with the same runtime name", () => {
+    const workflow = new GitHubWorkflowDependencies(`jobs:
+  gate:
+    steps:
+      - name: Download artifacts
+        uses: ${artifactAction}
+      - name: \${{ 'Download artifacts' }}
+        run: exit 1
+`);
+    const failed = { ...artifactStep, number: 3 };
+    const job = { ...terminal("gate", "failure"), steps: [
+      { ...artifactStep, number: 2, conclusion: "success" }, failed,
+    ] };
+    expect(workflow.pinnedArtifactStep(job, failed, [])).toBe(false);
+  });
+
+  it.each([
+    { name: "literal duplicate", step: { name: artifactStep.name, run: "exit 1" } },
+    { name: "expression name", step: { name: "${{ 'Download artifacts' }}", run: "exit 1" } },
+    { name: "expression suffix", step: { name: "Download ${{ inputs.kind }}", run: "exit 1" } },
+    { name: "multiline name", step: { name: " \nDownload artifacts\nother text", run: "exit 1" } },
+  ])("rejects unresolved workflow display-name collisions: $name", ({ step }) => {
+    const workflow = new GitHubWorkflowDependencies(`jobs: ${JSON.stringify({ gate: { steps: [
+      { name: artifactStep.name, uses: artifactAction }, step,
+    ] } })}`);
+    expect(workflow.pinnedArtifactStep({ ...terminal("gate"), steps: [artifactStep] }, artifactStep, [])).toBe(false);
+  });
+
+  it.each([
+    { run: artifactAction }, { run: ` \n${artifactAction}\necho done` },
+    { run: "${{ inputs.command }}" }, { uses: "${{ inputs.action }}" },
+  ])("rejects colliding generated script or action display names: %j", step => {
+    const workflow = new GitHubWorkflowDependencies(`jobs: ${JSON.stringify({ gate: { steps: [{ uses: artifactAction }, step] } })}`);
+    const failed = { ...artifactStep, name: `Run ${artifactAction}` };
+    expect(workflow.pinnedArtifactStep({ ...terminal("gate"), steps: [failed] }, failed, [])).toBe(false);
+  });
+
+  it("permits expression-based display names whose literal prefix cannot collide", () => {
+    const workflow = new GitHubWorkflowDependencies(`jobs: ${JSON.stringify({ gate: { steps: [
+      { uses: artifactAction }, { run: 'node aggregate.mjs "${{ github.sha }}"' }, { name: "Verify ${{ inputs.lane }}", run: "exit 1" },
+    ] } })}`);
+    const failed = { ...artifactStep, name: `Run ${artifactAction}` };
+    expect(workflow.pinnedArtifactStep({ ...terminal("gate"), steps: [failed] }, failed, [])).toBe(true);
+  });
+
+  it.each([
+    undefined, [], [{ ...artifactStep, conclusion: "success" }], [{ ...artifactStep, status: "in_progress" }],
+    [{ ...artifactStep, number: 2 }], [artifactStep, { ...artifactStep, number: 6, conclusion: "success" }],
+    [artifactStep, { ...artifactStep, name: "Other step" }], [artifactStep, { ...artifactStep, name: "Other step", number: 0 }],
+  ])("requires one unique failed runtime name and number: %j", steps => {
+    const workflow = new GitHubWorkflowDependencies(`jobs: {gate: {steps: [{name: Download artifacts, uses: '${artifactAction}'}]}}`);
+    expect(workflow.pinnedArtifactStep({ ...terminal("gate"), steps }, artifactStep, [])).toBe(false);
   });
 
   it("rejects policy, cancelled and running siblings even beside a code failure", () => {

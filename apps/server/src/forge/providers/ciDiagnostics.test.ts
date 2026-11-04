@@ -926,6 +926,68 @@ describe("GitHub independently failed aggregate jobs", () => {
     expect(diagnostic.jobs[0].retryableFailure).toBeUndefined();
   });
 
+  it("does not trust a failed shell step whose expression name collides with a successful artifact action", async () => {
+    const stepName = "Download artifacts";
+    const failedStep = { ...artifactStep, name: stepName, number: 3 };
+    const verifier = { ...independentGateJobs.find(job => job.id === 512)!, steps: [
+      { ...artifactStep, name: stepName, number: 2, conclusion: "success" }, failedStep,
+    ] };
+    const fixture = independentGateFixture({
+      checks: [{ ...check, databaseId: 912, name: verifier.name }],
+      workflow: `jobs:
+  verifier:
+    name: Isolated full verifier
+    needs: producer
+    steps:
+      - name: Download artifacts
+        uses: ${artifactAction}
+      - name: \${{ 'Download artifacts' }}
+        run: |
+          echo "Error: Failed to ListArtifacts: Unable to make request: ECONNRESET"
+          exit 1
+  producer:
+    name: Producer
+`,
+      jobs: [verifier, { ...hubJob, id: 514, name: "Producer", conclusion: "success" }],
+      logs: { "512": checkout + artifactError }, stepLogs: { "512/3": artifactError },
+    });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "blocked", testedSha: tested, jobs: [{ jobId: "512", classification: "unknown",
+      failedStep: { name: stepName, number: 3 }, log: expect.stringContaining("ECONNRESET") }] });
+    expect(diagnostic.jobs[0].retryableFailure).toBeUndefined();
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/512/steps/3/logs"))).toBe(false);
+  });
+
+  it.each(["missing dependency", "duplicate dependency", "jobs API", "run API", "tested identity API", "required checks", "required checks API"])("withholds retry authority when final verification fails on %s", async failure => {
+    let jobsRead = 0;
+    let runsRead = 0;
+    let checksRead = 0;
+    let requestsRead = 0;
+    const original = independentGateFixture();
+    const fixture = independentGateFixture({ intercept: (url, init) => {
+      if (url.pathname.endsWith("/attempts/2/jobs") && ++jobsRead === 2) {
+        if (failure === "missing dependency") return Response.json({ jobs: independentGateJobs.filter(job => job.name !== "Isolated verifier (coverage-1)") });
+        if (failure === "duplicate dependency") return Response.json({ jobs: [...independentGateJobs, { ...independentGateJobs[13], id: 999 }] });
+        if (failure === "jobs API") return Response.json({ message: "Final jobs evidence unavailable" }, { status: 503 });
+      }
+      if (url.pathname.endsWith("/actions/runs/100") && ++runsRead === 2 && failure === "run API")
+        return Response.json({ message: "Final run evidence unavailable" }, { status: 503 });
+      if (url.pathname.endsWith("/pulls/7") && ++requestsRead === 3 && failure === "tested identity API")
+        return Response.json({ message: "Final tested identity unavailable" }, { status: 503 });
+      if (url.pathname === "/graphql" && ++checksRead === 2) {
+        if (failure === "required checks") return Response.json({ errors: [{ message: "Final required checks unavailable" }] });
+        if (failure === "required checks API") return Response.json({ message: "Final required checks unavailable" }, { status: 503 });
+      }
+      return original.fetcher(url, init);
+    } });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "blocked", reason: expect.any(String), testedSha: tested, sourceHeadSha: source, targetHeadSha: target,
+      jobs: [{ jobId: "512", runId: "100", runAttempt: 2, classification: "infrastructure", testedSha: tested,
+        failedStep: { name: artifactStep.name, number: 5 }, log: expect.stringContaining(artifactError.trim()) }] });
+    expect(diagnostic.jobs.every(job => job.retryableFailure === undefined)).toBe(true);
+    expect(diagnostic.reason).toContain(failure.endsWith("dependency") ? "unambiguous" : failure === "required checks" ? "could not verify required CI evidence" : "unavailable");
+  });
+
   it.each(["step", "sibling"])("invalidates changed %s evidence before returning retry eligibility", async movement => {
     let jobsRead = 0;
     const original = independentGateFixture();
@@ -935,6 +997,8 @@ describe("GitHub independently failed aggregate jobs", () => {
           movement === "sibling" && job.name === "Merged isolated coverage" ? { ...job, conclusion: "failure" } : job) });
       return original.fetcher(url, init);
     } });
-    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "obsolete" });
+    const diagnostic = await fixture.provider.getCiFailure(change);
+    expect(diagnostic).toMatchObject({ state: "obsolete" });
+    expect(diagnostic.jobs.every(job => job.retryableFailure === undefined)).toBe(true);
   });
 });
