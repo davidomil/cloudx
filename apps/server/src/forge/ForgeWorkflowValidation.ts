@@ -1,4 +1,4 @@
-import { FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
+import { CLAUDE_LAUNCH_MODES, CODEX_REASONING_EFFORTS, FORGE_PUBLICATION_CONFIRMATION_WINDOW_MS, isForgeTurnCompletion, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_MODEL_CAPACITY_RETRIES, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH, MAX_FORGE_REVIEW_HISTORY, MAX_FORGE_REVIEW_REPORT_BODY_LENGTH } from "@cloudx/shared";
 import type {
   ForgeAutoReview,
   ForgeBatchIssueResult,
@@ -777,7 +777,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     if (worker.status === "draft" && (!parsed.batch || [
       "repositoryPath", "worktreePath", "branch", "tabId", "attemptId", "completion", "retainedWorkspace",
       "publicationState", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
-      "mergeConflict", "ciRepair", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest",
+      "mergeConflict", "ciRepair", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest", "executionSettings", "modelCapacityRecovery",
     ].some(key => worker[key] !== undefined) || parsed.batch.results !== undefined))
       throw new Error("A draft batch cannot own execution or publication state.");
     if (worker.completion !== undefined) {
@@ -830,6 +830,38 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     }
     if (worker.providerRetryAt !== undefined)
       parsed.providerRetryAt = isoTimestamp(worker.providerRetryAt, "provider retry deadline");
+    if (worker.executionSettings !== undefined) {
+      const settings = object(worker.executionSettings);
+      if (!CODEX_REASONING_EFFORTS.includes(settings.reasoningEffort as never) ||
+          settings.claudeLaunchMode !== undefined && !CLAUDE_LAUNCH_MODES.includes(settings.claudeLaunchMode as never))
+        throw new Error("Invalid saved worker model settings.");
+      parsed.executionSettings = {
+        model: nonblankText(settings.model, "worker model", 256),
+        reasoningEffort: settings.reasoningEffort as NonNullable<ForgeWorker["executionSettings"]>["reasoningEffort"],
+        ...(settings.accountId === undefined ? {} : { accountId: nonblankText(settings.accountId, "worker account", 256) }),
+        ...(settings.claudeLaunchMode === undefined ? {} : { claudeLaunchMode: settings.claudeLaunchMode as NonNullable<ForgeWorker["executionSettings"]>["claudeLaunchMode"] }),
+      };
+    }
+    if (worker.modelCapacityRecovery !== undefined) {
+      const recovery = object(worker.modelCapacityRecovery);
+      const retries = recovery.retries;
+      if (!Number.isSafeInteger(retries) || Number(retries) < 0 || Number(retries) > MAX_FORGE_MODEL_CAPACITY_RETRIES || !parsed.executionSettings)
+        throw new Error("Invalid saved model-capacity recovery count or settings.");
+      const failedAttemptId = nonblankText(recovery.failedAttemptId, "capacity attempt", 36);
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(failedAttemptId)) throw new Error("Invalid capacity attempt identity.");
+      const threadId = nonblankText(recovery.threadId, "capacity conversation", 256);
+      const turnId = nonblankText(recovery.turnId, "capacity turn", 256);
+      const executionId = recovery.executionId === undefined ? undefined : nonblankText(recovery.executionId, "capacity execution", 256);
+      const retryAt = recovery.retryAt === undefined ? undefined : isoTimestamp(recovery.retryAt, "capacity retry deadline");
+      const turn = parsed.completion?.turn;
+      if (retryAt && (!["paused", "starting"].includes(parsed.status) || Number(retries) >= MAX_FORGE_MODEL_CAPACITY_RETRIES ||
+          !executionId || parsed.attemptId !== failedAttemptId || !turn || turn.status !== "failed" || turn.threadId !== threadId || turn.turnId !== turnId || turn.executionId !== executionId ||
+          !["serverOverloaded", "server_overloaded"].includes(turn.nativeError?.code ?? "") || parsed.completion?.reportError ||
+          parsed.pendingPublication || parsed.mergeAttempted || !parsed.worktreePath || !parsed.placement))
+        throw new Error("Automatic capacity recovery requires its paused, owned, terminal native failure.");
+      parsed.modelCapacityRecovery = { retries: Number(retries), failedAttemptId, threadId, turnId,
+        ...(executionId ? { executionId } : {}), ...(retryAt ? { retryAt } : {}) };
+    }
     if (worker.kind !== "review" && (worker.draft !== undefined || worker.reviewHistory !== undefined || worker.reviewBaseline !== undefined))
       throw new Error("Only review workers can have review drafts or history.");
     if (worker.draft !== undefined) parsed.draft = parseHistoricalReviewDraft(worker);

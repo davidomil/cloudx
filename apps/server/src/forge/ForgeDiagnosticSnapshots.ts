@@ -8,6 +8,7 @@ import { assertDirectoryIdentity, readDirectoryIdentity, type DirectoryIdentity 
 import { openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
 import { assertForgeRemovalContents, captureForgeRemovalContents, isForgeRemovalContents, type ForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 import { ForgeDiagnosticSnapshotRecovery, isSnapshotRecoveryReceipt, type SnapshotRecoveryReceipt } from "./ForgeDiagnosticSnapshotRecovery.js";
+import { captureSnapshotIndex, isOnlyIndexStatRefresh, isSnapshotIndexBaseline, type SnapshotIndexBaseline } from "./ForgeDiagnosticSnapshotIndex.js";
 
 export interface OwnedDiagnosticSnapshot extends ForgeDiagnosticSnapshotResult {
   workerId: string;
@@ -17,6 +18,7 @@ export interface OwnedDiagnosticSnapshot extends ForgeDiagnosticSnapshotResult {
   origin: { checkout: DirectoryIdentity; gitDirectory: DirectoryIdentity; commitSha: string; url: string };
   state: "creating" | "ready" | "removing" | "removed";
   contents?: ForgeRemovalContents[];
+  indexBaseline?: SnapshotIndexBaseline;
   removalContents?: ForgeRemovalContents[];
   recovery?: SnapshotRecoveryReceipt;
   hold?: string;
@@ -109,6 +111,11 @@ export class ForgeDiagnosticSnapshots {
     await assertIdentity(checkout);
     await assertIdentity(snapshot.identity);
     const finalContents = await captureForgeRemovalContents(snapshot.identity, signal);
+    if (input.kind === "repository") {
+      snapshot.indexBaseline = await captureSnapshotIndex(snapshot.identity, input.commitSha, signal);
+      const afterBaseline = await captureForgeRemovalContents(snapshot.identity, signal);
+      if (!sameContents(afterBaseline, finalContents)) throw changedContents(snapshot, finalContents, afterBaseline);
+    }
     if (input.kind === "source-only" && JSON.stringify(finalContents) !== JSON.stringify(snapshot.contents))
       throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} changed after committed-source verification; recover its preserved contents before Resume.`);
     snapshot.contents = finalContents;
@@ -186,14 +193,15 @@ export class ForgeDiagnosticSnapshots {
           assertSourceOnly(snapshot.contents!, snapshot.path);
           assertSourceOnly(current, snapshot.path);
         }
-        const authorized = await this.authorizeGeneratedLinks(checkout, identity, snapshot.contents!, current, signal);
+        const linked = await this.authorizeGeneratedLinks(checkout, identity, snapshot.contents!, current, signal);
+        const authorized = await this.authorizeIndexRefresh(snapshot, identity, linked, current, signal);
         if (snapshot.state === "ready" && !sameContents(current, authorized))
-          throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} has modified, missing or additional source; its contents were preserved. Recover the changed copy before Resume.`);
+          throw changedContents(snapshot, authorized, current);
         snapshot.removalContents = snapshot.state === "ready" ? current : authorized;
         await save();
       }
       if (snapshot.state === "ready" && !sameContents(current, snapshot.removalContents))
-        throw new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} has modified, missing or additional source; its contents were preserved. Recover the changed copy before Resume.`);
+        throw changedContents(snapshot, snapshot.removalContents, current);
       await assertForgeRemovalContents(identity, snapshot.removalContents, signal);
       if (snapshot.retentionPolicy === "recover" || snapshot.recovery) {
         if (snapshot.state !== "removing") await this.requireRecovery().preserve(snapshot, identity, save, signal);
@@ -254,6 +262,16 @@ export class ForgeDiagnosticSnapshots {
     return this.recovery;
   }
 
+  private async authorizeIndexRefresh(snapshot: OwnedDiagnosticSnapshot, identity: DirectoryIdentity, original: ForgeRemovalContents[],
+    current: ForgeRemovalContents[], signal?: AbortSignal): Promise<ForgeRemovalContents[]> {
+    const baseline = snapshot.indexBaseline;
+    const before = original.find(entry => entry.path === ".git/index"), after = current.find(entry => entry.path === ".git/index");
+    if (snapshot.kind !== "repository" || !baseline || !before || !after || before.fingerprint === after.fingerprint) return original;
+    const index = await captureSnapshotIndex(identity, snapshot.origin.commitSha, signal);
+    if (!index || !isOnlyIndexStatRefresh(baseline, index)) return original;
+    return original.map(entry => entry.path === ".git/index" ? after : entry);
+  }
+
   private async authorizeGeneratedLinks(checkout: DirectoryIdentity, identity: DirectoryIdentity, original: ForgeRemovalContents[],
     current: ForgeRemovalContents[], signal?: AbortSignal): Promise<ForgeRemovalContents[]> {
     const expected = new Set(original.map(entry => entry.path));
@@ -292,6 +310,7 @@ export function isOwnedDiagnosticSnapshot(value: unknown, workerId: string, chec
     typeof snapshot.origin.url === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(snapshot.origin.commitSha) &&
     (snapshot.hold === undefined || typeof snapshot.hold === "string") &&
     (snapshot.recovery === undefined || isSnapshotRecoveryReceipt(snapshot.recovery)) &&
+    (snapshot.indexBaseline === undefined || snapshot.kind === "repository" && isSnapshotIndexBaseline(snapshot.indexBaseline)) &&
     (snapshot.removalContents === undefined || isForgeRemovalContents(snapshot.removalContents)) &&
     (snapshot.contents === undefined ? snapshot.state === "creating" || snapshot.state === "removed" ||
       snapshot.recovery?.state === "verified" && snapshot.removalContents !== undefined : isForgeRemovalContents(snapshot.contents)));
@@ -317,6 +336,14 @@ function overlaps(left: string, right: string): boolean { return left === right 
 function sameContents(current: ForgeRemovalContents[], authorized: ForgeRemovalContents[]): boolean {
   const expected = new Map(authorized.map(entry => [entry.path, entry.fingerprint]));
   return current.length === expected.size && current.every(entry => expected.get(entry.path) === entry.fingerprint);
+}
+
+function changedContents(snapshot: OwnedDiagnosticSnapshot, original: ForgeRemovalContents[], current: ForgeRemovalContents[]): Error {
+  const before = new Map(original.map(entry => [entry.path, entry.fingerprint]));
+  const after = new Map(current.map(entry => [entry.path, entry.fingerprint]));
+  const changes = [...new Set([...before.keys(), ...after.keys()])].filter(file => before.get(file) !== after.get(file));
+  const inventory = changes.slice(0, 20).map(file => `${JSON.stringify(file.length > 256 ? `${file.slice(0, 253)}...` : file)} (${!before.has(file) ? "added" : !after.has(file) ? "missing" : "modified"})`).join(", ");
+  return new Error(`Diagnostic snapshot ${JSON.stringify(snapshot.path)} has modified, missing or additional source: ${inventory}${changes.length > 20 ? `; ${changes.length - 20} more paths` : ""}; its contents were preserved. Recover the changed copy before Resume.`);
 }
 
 async function committedArchiveContents(file: string, signal?: AbortSignal): Promise<Map<string, SourceContent>> {

@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Check, ExternalLink, GitPullRequest, MessageSquare, Pause, Play, RefreshCw, Settings, Square, Monitor, Terminal, Trash2 } from "lucide-react";
-import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
+import { forgeWorkerIssueNumbers, MAX_FORGE_BATCH_ISSUES, MAX_FORGE_CI_REPAIR_ATTEMPTS, MAX_FORGE_MODEL_CAPACITY_RETRIES, forgeWorkerContinuationBlocker, hasUnconfirmedPublication, MAX_FORGE_CONTINUATION_MESSAGE_LENGTH, MAX_FORGE_REVIEW_DRAFT_BODY_LENGTH } from "@cloudx/shared";
 import type { AgentUsageSummary, DirectoryOwnershipAvailability, DirectoryOwnershipPreview, ForgeChangeRequest, ForgeComment, ForgeDashboard, ForgeIssue, ForgeIssueDetail, ForgeListScope, ForgePage, ForgePlacement, ForgeRepository, ForgeReviewComment, ForgeReviewDraft, ForgeWorker, ForgeWorkerHistory, WorkspaceTab } from "@cloudx/shared";
 
 import { AgentSwitchMenu, useAgentSwitchMenu } from "./AgentSwitchMenu.js";
@@ -609,7 +609,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
   const reviews = workers.filter(candidate => worker.kind === "issue" && candidate.kind === "review" && candidate.number === worker.changeNumber &&
     candidate.repository.provider === worker.repository.provider && candidate.repository.apiUrl === worker.repository.apiUrl && candidate.repository.projectPath === worker.repository.projectPath);
   const reviewRunning = reviews.some(review => ["starting", "running"].includes(review.status));
-  const canPause = ["starting", "running", "awaiting_publication", "awaiting_merge"].includes(worker.status) || (worker.status === "awaiting_review" && automaticReview);
+  const canPause = !!worker.modelCapacityRecovery?.retryAt || ["starting", "running", "awaiting_publication", "awaiting_merge"].includes(worker.status) || (worker.status === "awaiting_review" && automaticReview);
   const canResume = !reviewRunning && !worker.completion?.continuationRequired && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
   const pendingPublication = worker.pendingPublication;
   const reportedHandoff = worker.completion?.report?.kind === "issue" && worker.completion.report.handoff?.status === "ready"
@@ -630,7 +630,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     !(worker.rebaseRecovery?.headSha === worker.headSha && worker.rebaseRecovery?.targetHeadSha === conflict.targetHeadSha) &&
     reviews.every(review => review.status === "completed");
   const canStop = ["starting", "running", "awaiting_publication", "awaiting_merge", "paused", "awaiting_review", "failed"].includes(worker.status);
-  const progress = worker.providerRetryAt ? undefined : autoReviewProgress(worker);
+  const progress = worker.providerRetryAt || worker.modelCapacityRecovery?.retryAt ? undefined : autoReviewProgress(worker);
   const draft = archivedDraft ?? worker.draft;
   const card = <article className="forge-worker" aria-label={worker.batch ? `Batch worker ${worker.title}` : `${worker.kind} worker #${worker.number}`}>
     <div className="forge-worker-heading"><strong>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</strong>{!archivedDraft ? <span className={`forge-status forge-status-${worker.status}`}>{worker.status.replaceAll("_", " ")}</span> : null}</div>
@@ -649,6 +649,7 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
       <details><summary>Retained paths ({retainedFiles.retainedPaths.length})</summary><ul>{retainedFiles.retainedPaths.map(path => <li key={path}><code>{path}</code></li>)}</ul></details>
     </section> : null}
     {!archivedDraft && worker.providerRetryAt ? <p role="status">Worker will retry automatically at <time dateTime={worker.providerRetryAt}>{new Date(worker.providerRetryAt).toLocaleString()}</time>.</p> : null}
+    {!archivedDraft && worker.modelCapacityRecovery?.retryAt ? <p role="status">Waiting for model capacity. Automatic retry {worker.modelCapacityRecovery.retries + 1} of {MAX_FORGE_MODEL_CAPACITY_RETRIES} at <time dateTime={worker.modelCapacityRecovery.retryAt}>{new Date(worker.modelCapacityRecovery.retryAt).toLocaleString()}</time>.</p> : null}
     {!archivedDraft && worker.status === "awaiting_publication" ? <p role="status">{worker.error ?? `The commit was pushed. Waiting for ${worker.repository.provider === "github" ? "GitHub to confirm the pull" : "GitLab to confirm the merge"} request update; work continues automatically.`}</p> : null}
     {!archivedDraft && conflict ? <p role="status" className="forge-notice">Merge conflicts block this request. Rebase {conflict.headSha.slice(0, 8)} onto {worker.baseBranch} ({conflict.targetHeadSha.slice(0, 8)}) and resolve conflicts.</p> : null}
     {!archivedDraft ? <MergeQueueStatus worker={worker} workers={workers} /> : null}

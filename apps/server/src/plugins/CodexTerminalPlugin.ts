@@ -246,7 +246,7 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
         fileURLToPath(new URL("../../helpers/codex-worker-bridge.mjs", import.meta.url)),
         JSON.stringify({
           preparationMs: performance.now() - preparationStarted,
-          ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
+          ...(input.agentTurn ? { binding: { ...input.agentTurn, ...(selection ? { executionId: selection.executionId } : {}), ...(resume?.mode === "session" ? { expectedThreadId: resume.sessionId } : {}) } } : {}),
           ...(selection ? { selection } : {}),
           ...(selection && cooperationEnv.CLOUDX_COOPERATION_CONTEXT ? { cooperation: {
             contextPath: cooperationEnv.CLOUDX_COOPERATION_CONTEXT, tabId: input.tab.id, executionId: selection.executionId,

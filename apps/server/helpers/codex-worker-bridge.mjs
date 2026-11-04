@@ -76,6 +76,7 @@ export class CodexWorkerTurn {
         throw new Error(`Native worker turn/start failed: ${message.error?.message ?? "missing turn identity"}`);
       this.turn = {
         workerId: this.binding.workerId, attemptId: this.binding.attemptId,
+        ...(this.binding.executionId ? { executionId: this.binding.executionId } : {}),
         threadId: this.request.threadId, turnId, status: "running"
       };
       this.save(this.turn);
@@ -102,7 +103,10 @@ export class CodexWorkerTurn {
     const error = params.turn.error?.message;
     // Native turn/completed contains only the final agent message summary.
     for (const item of params.turn.items ?? []) this.preserveFinal(item);
-    this.turn = { ...this.turn, status, ...(typeof error === "string" ? { error } : {}) };
+    const code = params.turn.error?.codexErrorInfo ?? params.turn.error?.codex_error_info;
+    const nativeError = typeof code === "string" && code.trim() && code.length <= 256
+      ? { code } : undefined;
+    this.turn = { ...this.turn, status, ...(typeof error === "string" ? { error } : {}), ...(nativeError ? { nativeError } : {}) };
     this.save(this.turn);
   }
 

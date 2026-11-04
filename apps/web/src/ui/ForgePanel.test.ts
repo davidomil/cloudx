@@ -77,6 +77,34 @@ const rebaseRecovery: NonNullable<ForgeWorker["rebaseRecovery"]> = {
 const tab: WorkspaceTab = { id: "forge-tab", pluginId: "forge", title: "Forge", cwd: "/repo", status: "idle", indicator: { color: "green", label: "Ready", updatedAt: "2026-09-07" }, createdAt: "2026-09-07", updatedAt: "2026-09-07" };
 const workerTab: WorkspaceTab = { ...tab, id: "codex-worker", pluginId: "codex-terminal", ownerPluginId: "forge", pluginMetadata: { "forge-workers": { workerId: worker.id } } };
 
+describe("Forge model capacity controls", () => {
+  const recovery = { retries: 2, retryAt: "2026-11-04T02:00:30.000Z", failedAttemptId: "attempt", threadId: "conversation", turnId: "turn", executionId: "execution" };
+
+  it.each(["Pause", "Stop"])("shows the next capacity retry and keeps %s available", async action => {
+    const testFixture = fixture({ workers: [{ ...worker, status: "paused", modelCapacityRecovery: recovery }] });
+    const panel = await renderPanel(testFixture);
+    const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+    expect(card.querySelector('[role="status"]')?.textContent).toContain("Waiting for model capacity. Automatic retry 3 of 5");
+    expect(card.querySelector("time")?.dateTime).toBe(recovery.retryAt);
+    expect(button(card, action).disabled).toBe(false);
+    expect(button(card, "Resume").disabled).toBe(false);
+    await click(card, action);
+    expect(testFixture.calls).toContainEqual({ hook: `forge.worker.${action.toLowerCase()}`, input: { id: worker.id }, tabId: tab.id });
+  });
+
+  it("leaves deliberate Resume available after automatic capacity recovery is exhausted", async () => {
+    const testFixture = fixture({ workers: [{ ...worker, status: "paused", error: "Model capacity recovery exhausted after 5 automatic retries. Resume when capacity is available.",
+      modelCapacityRecovery: { ...recovery, retries: 5, retryAt: undefined } }] });
+    const panel = await renderPanel(testFixture);
+    const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+    expect(card.textContent).toContain("exhausted after 5 automatic retries");
+    expect(card.querySelector("time")).toBeNull();
+    expect(button(card, "Resume").disabled).toBe(false);
+    await click(card, "Resume");
+    expect(testFixture.calls).toContainEqual({ hook: "forge.worker.resume", input: { id: worker.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id });
+  });
+});
+
 type HookHandler = (hook: string, input: Record<string, unknown>) => unknown | Promise<unknown>;
 function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler) {
   const dashboard: ForgeDashboard = { configured: true, repository, workers: [], ...overrides };

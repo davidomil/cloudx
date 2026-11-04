@@ -5592,7 +5592,7 @@ describe("buildServer", () => {
 
       expect(html.statusCode).toBe(200);
       expect(html.headers["x-frame-options"]).toBeUndefined();
-      expect(html.headers["content-security-policy"]).toBeUndefined();
+      expect(html.headers["content-security-policy"]).toBe("sandbox allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-scripts");
       expect(html.headers["clear-site-data"]).toBeUndefined();
       expect(html.headers["set-cookie"]).toBeUndefined();
       expect(html.headers["x-local-hop-by-hop"]).toBeUndefined();
@@ -5666,6 +5666,7 @@ describe("buildServer", () => {
         `<base href="/api/local-web/${tabId}/proxy/redirected/">`,
       );
       expect(externalRedirect.statusCode).toBe(502);
+      expect(externalRedirect.headers["content-security-policy"]).toBe(html.headers["content-security-policy"]);
       expect(externalRedirect.body).toContain(
         "redirected outside its configured origin",
       );

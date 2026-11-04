@@ -25,6 +25,7 @@ const HTML_HTML_OPEN_TAG_PATTERN = /<html\b[^>]*>/i;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_PROXY_REDIRECTS = 5;
 const LOCAL_WEB_PROXY_FETCH_TIMEOUT_MS = 15_000;
+const LOCAL_WEB_PROXY_SANDBOX = "sandbox allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-scripts";
 export const LOCAL_WEB_PROXY_MAX_BODY_BYTES = 25 * 1024 * 1024;
 const LOCAL_WEB_WS_PENDING_MAX_MESSAGES = 16;
 const LOCAL_WEB_WS_PENDING_MAX_BYTES = 1024 * 1024;
@@ -60,6 +61,7 @@ export class LocalWebProxy {
   constructor(private readonly sessions: SessionStore) {}
 
   async handle(tabId: string, proxiedPath: string | undefined, requestUrl: string | undefined, reply: FastifyReply, request: LocalWebProxyRequest = {}): Promise<void> {
+    reply.header("content-security-policy", LOCAL_WEB_PROXY_SANDBOX);
     const targetBaseUrl = this.readTargetUrl(tabId);
     let targetUrl = resolveTargetUrl(targetBaseUrl, proxiedPath ?? "", requestUrl ?? "");
     let response: Response;

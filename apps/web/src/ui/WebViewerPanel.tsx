@@ -93,12 +93,19 @@ export function WebViewerPanel({ tab }: { tab: WorkspaceTab }) {
           <X size={15} />
         </ControlButton>
         {url ? (
-          <ControlLink className="web-viewer-popout" iconOnly href={frameSrc} target="_blank" rel="noreferrer" title="Open proxied view in a new browser tab">
+          <ControlLink className="web-viewer-popout" iconOnly href={url} target="_blank" rel="noopener noreferrer" title="Open original site in a new browser tab">
             <ExternalLink size={15} />
           </ControlLink>
         ) : null}
       </form>
-      {error ? <div className="inline-error">{error}</div> : null}
+      <div className="web-viewer-notices">
+        {error ? <div className="inline-error">{error}</div> : null}
+        {url ? (
+          <aside className="web-viewer-restriction" aria-label="Restricted preview">
+            <strong>Restricted preview.</strong> Browser storage (localStorage and sessionStorage) is unavailable here. Apps that need storage may stop loading. <a href={url} target="_blank" rel="noopener noreferrer">Open original site in a new tab</a> to use storage. The site must be reachable from this browser device; localhost refers to this device in the new tab.
+          </aside>
+        ) : null}
+      </div>
       <div className="web-viewer-content">
         {url ? (
           <iframe

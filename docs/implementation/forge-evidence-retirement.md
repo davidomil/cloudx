@@ -77,6 +77,17 @@ source inventory and archive checksums before removal; matching HEAD is
 insufficient. Git metadata that depends on external object storage
 remains protected.
 
+Inspect a repository copy with
+`git --no-optional-locks -C <source> status --porcelain=v1 -z --untracked-files=all --no-renames`.
+Forge-owned status probes also disable optional locks. Ordinary `git status`
+can rewrite the index stat cache even when the working tree is clean.
+New repository receipts retain a checksum-verified index baseline. Only changes
+to entry stat-cache fields can pass automatic retirement; entry modes, object
+IDs, paths, conflict stages, flags and extensions must remain exact. Forge
+preserves and verifies the complete current repository before removing it.
+Index changes without that baseline remain protected. Recovery holds list up
+to 20 changed paths with added, missing or modified categories.
+
 Durable ownership receipts record archive progress before source
 removal. Interrupted archive creation resumes from unchanged source, and
 published archives are verified and reused. Interrupted removal checks

@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { extract } from "tar";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
+import { captureForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 import { ForgeDiagnosticSnapshotRecovery } from "./ForgeDiagnosticSnapshotRecovery.js";
 import { ForgeDiagnosticSnapshots, isOwnedDiagnosticSnapshot, type OwnedDiagnosticSnapshot } from "./ForgeDiagnosticSnapshots.js";
 
@@ -155,6 +156,135 @@ describe("Owned Forge diagnostic snapshots", () => {
     await extract({ file: snapshot.recovery!.archivePath, cwd: restored });
     expect(await state.git([`--git-dir=${path.join(restored, ".git")}`, "cat-file", "-p", unpublished])).toContain("Unpublished diagnostic history");
     await state.recovery.verify(snapshot);
+  });
+
+  it("archives two repository copies from separate attempts after clean status refreshes only their indexes", async () => {
+    const state = await fixture();
+    const copies: OwnedDiagnosticSnapshot[] = [];
+    for (const attempt of ["first-attempt", "second-attempt"]) {
+      const snapshot = await state.snapshots.create(state.checkoutIdentity, state.gitDirectory, url, workerId, attempt,
+        { kind: "repository", commitSha: state.commitSha }, state.git, state.save);
+      expect(await state.git(["-C", snapshot.identity.path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"])).toBe("");
+      const current = await captureForgeRemovalContents(snapshot.identity);
+      expect(current.filter(entry => snapshot.contents!.find(original => original.path === entry.path)?.fingerprint !== entry.fingerprint)
+        .map(entry => entry.path)).toEqual([".git/index"]);
+      copies.push(snapshot);
+    }
+    await state.snapshots.retire(state.checkoutIdentity, copies, [], async () => {}, state.git);
+    for (const snapshot of copies) {
+      expect(snapshot.state).toBe("removed");
+      await state.recovery.verify(snapshot);
+      const restored = path.join(state.root, snapshot.attemptId);
+      await fs.mkdir(restored);
+      await extract({ file: snapshot.recovery!.archivePath, cwd: restored });
+      expect(await state.git(["--no-optional-locks", "-C", restored, "status", "--porcelain=v1"])).toBe("");
+      expect((await state.git(["-C", restored, "rev-parse", "HEAD"])).trim()).toBe(state.commitSha);
+    }
+  });
+
+  it("inspects a repository copy without changing its index when optional locks are disabled", async () => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    expect(await state.git(["--no-optional-locks", "-C", snapshot.identity.path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"])).toBe("");
+    expect(await captureForgeRemovalContents(snapshot.identity)).toEqual(snapshot.contents);
+    await state.retire(snapshot);
+    expect(snapshot.state).toBe("removed");
+    await state.recovery.verify(snapshot);
+  });
+
+  it("verifies a real version-4 index with compressed paths after a clean refresh", async () => {
+    const state = await fixture();
+    await state.git(["update-index", "--index-version=4"]);
+    const snapshot = await state.create("repository");
+    const index = path.join(snapshot.identity.path, ".git/index");
+    expect((await fs.readFile(index)).readUInt32BE(4)).toBe(4);
+    expect(await state.git(["-C", snapshot.identity.path, "status", "--porcelain=v1"])).toBe("");
+    await state.retire(snapshot);
+    expect(snapshot.state).toBe("removed");
+    await state.recovery.verify(snapshot);
+  });
+
+  it.each(["staged content", "assume-unchanged", "skip-worktree", "permissions", "replaced index", "missing baseline", "invalid checksum"])(
+    "protects a repository copy with %s instead of treating it as a stat refresh", async change => {
+      const state = await fixture();
+      const snapshot = await state.create("repository");
+      const args = ["-C", snapshot.identity.path];
+      const index = path.join(snapshot.identity.path, ".git/index");
+      if (change === "staged content") {
+        const blob = (await state.git(["rev-parse", `${state.commitSha}:nested/child.txt`])).trim();
+        await state.git([...args, "update-index", "--cacheinfo", "100644", blob, "source.txt"]);
+      }
+      if (change === "assume-unchanged" || change === "skip-worktree") {
+        await state.git([...args, "update-index", `--${change}`, "source.txt"]);
+        expect(await state.git(["--no-optional-locks", ...args, "status", "--porcelain=v1"])).toBe("");
+      }
+      if (change === "permissions") {
+        await state.git([...args, "status", "--porcelain=v1"]);
+        await fs.chmod(index, 0o600);
+      }
+      if (change === "replaced index") {
+        const bytes = await fs.readFile(index);
+        await fs.rename(index, path.join(state.root, "original-index"));
+        await fs.writeFile(index, bytes);
+      }
+      if (change === "missing baseline") {
+        delete snapshot.indexBaseline;
+        await state.git([...args, "status", "--porcelain=v1"]);
+      }
+      if (change === "invalid checksum") {
+        const bytes = await fs.readFile(index);
+        bytes[12] ^= 1;
+        await fs.writeFile(index, bytes);
+      }
+      const bytes = await fs.readFile(index);
+      await expect(state.retire(snapshot)).rejects.toThrow(".git/index");
+      expect(snapshot.hold).toContain(change === "invalid checksum" ? "invalid index format" : '".git/index" (modified)');
+      expect(snapshot.state).toBe("ready");
+      expect(snapshot.recovery).toBeUndefined();
+      expect(await fs.readFile(index)).toEqual(bytes);
+    });
+
+  it("resumes preservation after restart with the exact refreshed index and keeps verified archives readable", async () => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    await state.git(["-C", snapshot.identity.path, "status", "--porcelain=v1"]);
+    const refreshedIndex = await fs.readFile(path.join(snapshot.identity.path, ".git/index"));
+    const rename = fs.rename.bind(fs);
+    const interrupted = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      if (String(destination).endsWith("/snapshot.tar")) throw new Error("Interrupted refreshed-index archive publication");
+      return rename(source, destination);
+    });
+    await expect(state.retire(snapshot)).rejects.toThrow("Interrupted refreshed-index archive publication");
+    interrupted.mockRestore();
+    expect(snapshot.recovery?.state).toBe("archiving");
+    expect(snapshot.removalContents).toBeDefined();
+    const resumed = JSON.parse(JSON.stringify(snapshot)) as OwnedDiagnosticSnapshot;
+    const restarted = new ForgeDiagnosticSnapshots(state.recovery);
+    await restarted.retire(state.checkoutIdentity, [resumed], [], async () => {}, state.git);
+    expect(resumed.state).toBe("removed");
+    expect(resumed.hold).toBeUndefined();
+    await state.recovery.verify(resumed);
+    const restored = path.join(state.root, "refreshed-index-archive");
+    await fs.mkdir(restored);
+    await extract({ file: resumed.recovery!.archivePath, cwd: restored });
+    expect(await fs.readFile(path.join(restored, ".git/index"))).toEqual(refreshedIndex);
+    const chunks: Buffer[] = [];
+    for await (const chunk of await state.recovery.fileStream(resumed)) chunks.push(Buffer.from(chunk));
+    expect(Buffer.concat(chunks)).toEqual(await fs.readFile(resumed.recovery!.archivePath));
+  });
+
+  it("lists bounded changed-path diagnostics with added, missing and modified categories", async () => {
+    const state = await fixture();
+    const snapshot = await state.create("repository");
+    await fs.unlink(path.join(snapshot.identity.path, "nested/child.txt"));
+    await fs.writeFile(path.join(snapshot.identity.path, "source.txt"), "Changed source\n");
+    await Promise.all(Array.from({ length: 25 }, (_, index) => fs.writeFile(path.join(snapshot.identity.path, `new-${String(index).padStart(2, "0")}.txt`), "New source\n")));
+    await expect(state.retire(snapshot)).rejects.toThrow('"nested/child.txt" (missing)');
+    expect(snapshot.hold).toContain('"source.txt" (modified)');
+    expect(snapshot.hold).toContain('"new-00.txt" (added)');
+    expect(snapshot.hold).toContain("7 more paths");
+    expect(snapshot.hold).not.toContain('"new-24.txt"');
+    expect(snapshot.removalContents).toBeUndefined();
   });
 
   it.each(["directory", "symbolic link"])("preserves a replacement %s when source ownership changes while saving the creation receipt", async replacement => {
