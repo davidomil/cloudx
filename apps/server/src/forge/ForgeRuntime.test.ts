@@ -1223,6 +1223,145 @@ describe("ForgeRuntime remote checkouts", () => {
   });
 });
 
+describe("ForgeRuntime publication recovery verification", () => {
+  async function published(retainedPaths: string[] = []) {
+    const workspace = await prepare();
+    for (const file of retainedPaths) await fs.writeFile(path.join(workspace.worktreePath, file), "Retained publication evidence\n");
+    await runtime.preparePublication(workspace, "attempt", {
+      headSha, status: "ready", retainedPaths, details: "Keep the completed publication evidence.",
+    });
+    await runtime.publishBranch(workspace, undefined, headSha);
+    return workspace;
+  }
+
+  it("verifies the exact published handoff after restart without changing local or remote work", async () => {
+    const workspace = await published(["notes.txt"]);
+    const manifestPath = path.join(root, "data/forge-workers/workspaces", `${workspace.id}.json`);
+    const manifest = await fs.readFile(manifestPath);
+    const index = await fs.readFile(path.join(workspace.worktreePath, ".git/index"));
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+
+    await runtime.verifyPublicationBranch(workspace, headSha, expectedRepository);
+
+    expect(await fs.readFile(manifestPath)).toEqual(manifest);
+    expect(await fs.readFile(path.join(workspace.worktreePath, ".git/index"))).toEqual(index);
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Retained publication evidence\n");
+    expect(await git(origin, "rev-parse", `refs/heads/${workspace.branch}`)).toBe(headSha);
+    expect(vi.mocked(deps.git).mock.calls.filter(([, args]) => args[0] === "ls-remote")).toHaveLength(1);
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => ["push", "fetch", "reset", "checkout"].includes(args[0]!))).toBe(false);
+    expect(deps.workspaceCommands.createTab).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "changed", "malformed", "unreadable"])("blocks recovery when the published branch is %s", async state => {
+    const workspace = await published();
+    const deps = dependencies();
+    if (state === "missing") await git(origin, "update-ref", "-d", `refs/heads/${workspace.branch}`);
+    if (state === "changed") {
+      await git(repositoryPath, "commit", "--allow-empty", "-m", "TEST: concurrent remote commit");
+      await git(repositoryPath, "push", "origin", `HEAD:refs/heads/${workspace.branch}`);
+    }
+    const run = deps.git!;
+    deps.git = vi.fn(async (cwd, args, signal, environment) => {
+      if (args[0] === "ls-remote" && state === "malformed") return `${headSha}\trefs/heads/foreign\n`;
+      if (args[0] === "ls-remote" && state === "unreadable") throw new Error("Remote inspection failed");
+      return run(cwd, args, signal, environment);
+    });
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.verifyPublicationBranch(workspace, headSha, expectedRepository)).rejects.toThrow(state === "changed"
+      ? "published branch changed" : state === "unreadable" ? "Remote inspection failed" : "branch is missing");
+
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => args[0] === "push")).toBe(false);
+    expect(await git(workspace.worktreePath, "rev-parse", "HEAD")).toBe(headSha);
+  });
+
+  it.each(["workspace", "branch", "origin", "provider"])("rejects a changed %s identity before inspecting the remote", async identity => {
+    const workspace = await published();
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+    if (identity === "workspace") workspace.worktreePath = repositoryPath;
+    if (identity === "branch") await git(workspace.worktreePath, "switch", "-c", "other-branch");
+    if (identity === "origin") await git(workspace.worktreePath, "remote", "set-url", "origin", "https://github.com/cloudx/other.git");
+    if (identity === "provider") vi.mocked(deps.gitAccess).mockResolvedValue({
+      cloneUrl: "https://github.com/cloudx/other.git", authorization: "Basic fixture-secret",
+    });
+
+    await expect(runtime.verifyPublicationBranch(workspace, headSha, expectedRepository)).rejects.toThrow(identity === "workspace"
+      ? "ownership does not match" : identity === "branch" ? "changed branch" : /origin|repository/iu);
+
+    expect(vi.mocked(deps.git).mock.calls.some(([, args]) => args[0] === "ls-remote")).toBe(false);
+  });
+
+  it.each([
+    { field: "provider", repository: { ...expectedRepository, provider: "gitlab" as const } },
+    { field: "API origin", repository: { ...expectedRepository, apiUrl: "https://api.other.example" } },
+    { field: "project", repository: { ...expectedRepository, projectPath: "cloudx/other" } },
+  ])("rejects a caller repository with another $field before obtaining access", async ({ repository }) => {
+    const workspace = await published();
+    const deps = dependencies();
+    deps.git = vi.fn(deps.git!);
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.verifyPublicationBranch(workspace, headSha, repository)).rejects.toThrow("repository does not match the owned workspace");
+
+    expect(deps.gitAccess).not.toHaveBeenCalled();
+    expect(deps.git).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing handoff", "different handoff", "unconfirmed push", "different push"])("requires the saved exact handoff and confirmed push after restart: %s", async evidence => {
+    const workspace = await published();
+    const manifestPath = path.join(root, "data/forge-workers/workspaces", `${workspace.id}.json`);
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    if (evidence === "missing handoff") {
+      delete manifest.publicationAttemptId;
+      delete manifest.publicationHandoffs;
+    }
+    if (evidence === "different handoff") manifest.publicationHandoffs.attempt.headSha = "b".repeat(40);
+    if (evidence === "unconfirmed push") manifest.branchPublication.confirmed = false;
+    if (evidence === "different push") manifest.branchPublication.headSha = "b".repeat(40);
+    await fs.writeFile(manifestPath, JSON.stringify(manifest));
+    runtime = new ForgeRuntime(dependencies());
+
+    await expect(runtime.verifyPublicationBranch(workspace, headSha, expectedRepository)).rejects.toThrow("exact saved handoff and confirmed published commit");
+  });
+
+  it("rejects retained evidence changed during remote inspection", async () => {
+    const workspace = await published(["notes.txt"]);
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, environment) => {
+      const result = await run(cwd, args, signal, environment);
+      if (args[0] === "ls-remote") await fs.writeFile(path.join(workspace.worktreePath, "notes.txt"), "Changed evidence\n");
+      return result;
+    };
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.verifyPublicationBranch(workspace, headSha, expectedRepository)).rejects.toThrow("changed after the publication handoff");
+    expect(await fs.readFile(path.join(workspace.worktreePath, "notes.txt"), "utf8")).toBe("Changed evidence\n");
+  });
+
+  it("honors cancellation during remote inspection without recording a recovery", async () => {
+    const workspace = await published();
+    const manifestPath = path.join(root, "data/forge-workers/workspaces", `${workspace.id}.json`);
+    const manifest = await fs.readFile(manifestPath);
+    const controller = new AbortController();
+    const deps = dependencies();
+    const run = deps.git!;
+    deps.git = async (cwd, args, signal, environment) => {
+      const result = await run(cwd, args, signal, environment);
+      if (args[0] === "ls-remote") controller.abort(new Error("Recovery cancelled"));
+      return result;
+    };
+    runtime = new ForgeRuntime(deps);
+
+    await expect(runtime.verifyPublicationBranch(workspace, headSha, expectedRepository, controller.signal)).rejects.toThrow("Recovery cancelled");
+    expect(await fs.readFile(manifestPath)).toEqual(manifest);
+  });
+});
+
 describe("ForgeRuntime publication handoff", () => {
   const ready = (headSha: string, retainedPaths: string[]) => ({
     headSha, status: "ready" as const, retainedPaths, details: "These working files are intentionally excluded from publication.",

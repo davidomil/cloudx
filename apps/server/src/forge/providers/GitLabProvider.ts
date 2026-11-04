@@ -15,6 +15,7 @@ import type {
   ForgeReviewSubmission,
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
+import { ForgeRequestFailures } from "./ForgeRequestFailures.js";
 import {
   ForgeDiscussionReplyNotStartedError,
   ForgeHeadChangedError,
@@ -271,9 +272,13 @@ export class GitLabProvider implements ForgeProvider {
   async createChangeRequest(
     input: ForgeCreateChangeRequest,
   ): Promise<ForgeChangeRequestSummary> {
-    validateCreateRequest(input);
-    rejectQuickActions(input.body);
-    const response = await this.http.request(`${this.path}/merge_requests`, {
+    const path = `${this.path}/merge_requests`;
+    const failures = new ForgeRequestFailures(this.http.repository, "worker", path, "POST", "request");
+    try {
+      validateCreateRequest(input);
+      rejectQuickActions(input.body);
+    } catch (error) { throw failures.beforeDispatch(error); }
+    const response = await this.http.request(path, {
       method: "POST",
       role: "worker",
       body: {
@@ -284,7 +289,9 @@ export class GitLabProvider implements ForgeProvider {
         remove_source_branch: true,
       },
     });
-    return gitlabRequestSummary(response.body);
+    failures.received(response);
+    try { return gitlabRequestSummary(response.body); }
+    catch { throw failures.unreadableResponse(true); }
   }
 
   async updateChangeRequest(number: number, input: { title: string; body: string }): Promise<void> {
@@ -313,17 +320,20 @@ export class GitLabProvider implements ForgeProvider {
       source_branch: headBranch,
       target_branch: baseBranch,
     });
+    const project = record((await this.http.request(this.path)).body);
+    const projectId = issueNumber(integer(project.id));
+    if (string(project.path_with_namespace).toLowerCase() !== this.http.repository.projectPath.toLowerCase())
+      throw new ForgeProviderError("The merge request lookup returned a different project. Reconcile it before continuing.", 409);
     const requests = (
-      await this.http.all(`${this.path}/merge_requests?${params}`)
+      await this.http.all(`${this.path}/merge_requests?${params}`, { requireCompletePages: true })
     )
-      .map(record)
-      .filter(
-        (request) =>
-          string(request.source_branch) === headBranch &&
-          string(request.target_branch) === baseBranch &&
-          integer(request.source_project_id) ===
-            integer(request.target_project_id),
-      );
+      .map(record);
+    for (const request of requests) {
+      if (string(request.source_branch) !== headBranch || string(request.target_branch) !== baseBranch ||
+          issueNumber(integer(request.source_project_id)) !== projectId ||
+          issueNumber(integer(request.target_project_id)) !== projectId)
+        throw new ForgeProviderError("The merge request lookup returned a different repository or branch. Reconcile it before continuing.", 409);
+    }
     if (requests.length > 1)
       throw new ForgeProviderError(
         "Multiple merge requests use this worker branch. Reconcile them before continuing.",

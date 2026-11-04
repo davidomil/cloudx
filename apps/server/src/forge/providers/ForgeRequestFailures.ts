@@ -48,12 +48,19 @@ export class ForgeRequestFailures {
     };
   }
 
-  prepare(message = "The forge request could not be prepared; check its configuration."): ForgeProviderError {
-    this.report("prepare", { failure: "invalid_request", retryable: false });
-    return new ForgeProviderError(message);
+  prepare(message = "The forge request could not be prepared; check its configuration.", statusCode = 400): ForgeProviderError {
+    const diagnostic = this.report("prepare", { failure: "invalid_request", retryable: false });
+    return new ForgeProviderError(message, statusCode, diagnostic);
   }
 
-  received(response: Response): void {
+  beforeDispatch(error: unknown): ForgeProviderError {
+    if (error instanceof ForgeProviderUnavailableError)
+      return this.unavailable("prepare", { failure: error.failure, retryable: error.retryable, retryAfterMs: error.retryAfterMs });
+    return this.prepare(error instanceof ForgeProviderError ? error.message : undefined,
+      error instanceof ForgeProviderError ? error.statusCode : 400);
+  }
+
+  received(response: Pick<Response, "status" | "headers">): void {
     const prefix = this.context.provider === "github" ? "x-ratelimit" : "ratelimit";
     const requestId = response.headers.get(this.context.provider === "github" ? "x-github-request-id" : "x-request-id");
     const requestIdPattern = this.context.provider === "github"
@@ -82,11 +89,15 @@ export class ForgeRequestFailures {
   transport(error: unknown, signal: AbortSignal, changesRemoteState: boolean, responseReceived = false): ForgeProviderError {
     const phase = responseReceived ? "response" : "fetch";
     if (error instanceof ForgeProviderError && !changesRemoteState) {
-      this.report(phase, { failure: "unreadable_response", retryable: false });
-      return error;
+      const diagnostic = this.report(phase, { failure: "unreadable_response", retryable: false });
+      return new ForgeProviderError(error.message, error.statusCode, diagnostic);
     }
     const details = transportFailure(error, signal, responseReceived);
     return this.unavailable(phase, { ...details, retryable: details.retryable && !changesRemoteState }, changesRemoteState);
+  }
+
+  unreadableResponse(changesRemoteState: boolean): ForgeProviderError {
+    return this.unavailable("response", { failure: "unreadable_response", retryable: false }, changesRemoteState);
   }
 
   http(details: FailureDetails, changesRemoteState: boolean): ForgeProviderError {
@@ -94,24 +105,28 @@ export class ForgeRequestFailures {
     if (details.failure === "redirect" || (changesRemoteState && details.httpStatus! >= 500))
       return this.unavailable("response", failure, changesRemoteState);
     if (failure.retryable) return this.unavailable("response", failure);
-    this.report("response", failure);
+    const diagnostic = this.report("response", failure);
     const message = this.context.operation === "authentication"
       ? `GitHub App authentication failed (HTTP ${details.httpStatus}).`
       : `The ${this.context.provider} API rejected the operation (HTTP ${details.httpStatus}).`;
-    return new ForgeProviderError(message, details.httpStatus);
+    return new ForgeProviderError(message, details.httpStatus, diagnostic);
   }
 
   private unavailable(phase: ForgeRequestDiagnostic["phase"], details: FailureDetails, changesRemoteState = false): ForgeProviderError {
-    this.report(phase, details);
-    const unavailable = new ForgeProviderUnavailableError(details.failure, this.context.operation, details);
+    const diagnostic = this.report(phase, details);
+    const unavailable = new ForgeProviderUnavailableError(details.failure, this.context.operation, { ...details, diagnostic });
     return changesRemoteState
       ? new ForgeMutationUncertainError(unavailable)
       : unavailable;
   }
 
-  private report(phase: ForgeRequestDiagnostic["phase"], details: FailureDetails): void {
-    const diagnostic = Object.freeze({
+  private report(phase: ForgeRequestDiagnostic["phase"], details: FailureDetails): ForgeRequestDiagnostic {
+    const httpStatus = details.httpStatus ?? this.response.httpStatus;
+    const diagnostic: ForgeRequestDiagnostic = Object.freeze({
       ...this.context, ...this.response, phase, ...details,
+      occurredAt: new Date().toISOString(),
+      dispatch: phase === "prepare" ? "not_started"
+        : httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500 ? "rejected" : "unknown",
       elapsedMs: Math.max(0, Math.round(performance.now() - this.startedAt)),
       timeoutMs: forgeRequestTimeoutMs,
       causeCodes: Object.freeze([...(details.causeCodes ?? [])]),
@@ -121,6 +136,7 @@ export class ForgeRequestFailures {
     } catch {
       // Diagnostic delivery must not change the request outcome.
     }
+    return diagnostic;
   }
 }
 

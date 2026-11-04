@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ForgeRepository } from "@cloudx/shared";
 import { ForgeRequestFailures, httpFailure } from "./ForgeRequestFailures.js";
-import { ForgeProviderUnavailableError } from "./ForgeProvider.js";
+import { ForgeMutationUncertainError, ForgeProviderError, ForgeProviderUnavailableError } from "./ForgeProvider.js";
 
 const github: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "private-owner/private-repo" };
 const gitlab: ForgeRepository = { provider: "gitlab", apiUrl: "https://private.example/api/v4", projectPath: "private-group/private-subgroup/private-repo" };
@@ -135,7 +135,7 @@ describe("sanitized provider diagnostics", () => {
   ])("uses only a static template for $path", ({ repository, path, expected }) => {
     const observer = vi.fn();
     new ForgeRequestFailures(repository, "reviewer", path, "GET", "request", observer).prepare();
-    expect(observer).toHaveBeenCalledExactlyOnceWith({ provider: repository.provider, role: "reviewer", operation: "request", method: "GET", path: expected, phase: "prepare", failure: "invalid_request", retryable: false, causeCodes: [], elapsedMs: expect.any(Number), timeoutMs: 30_000 });
+    expect(observer).toHaveBeenCalledExactlyOnceWith({ provider: repository.provider, role: "reviewer", operation: "request", method: "GET", path: expected, phase: "prepare", failure: "invalid_request", retryable: false, causeCodes: [], elapsedMs: expect.any(Number), timeoutMs: 30_000, occurredAt: expect.any(String), dispatch: "not_started" });
     expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
   });
 
@@ -163,5 +163,46 @@ describe("sanitized provider diagnostics", () => {
     expect(errors.map(error => (failure.transport(error, new AbortController().signal, false) as ForgeProviderUnavailableError).retryable))
       .toEqual([true, false, false]);
     expect(JSON.stringify(observer.mock.calls)).not.toContain("private");
+  });
+
+  it("attaches the exact sanitized diagnostic even when the observer fails", () => {
+    const observer = vi.fn().mockImplementation(() => { throw new Error("private-token"); });
+    const failures = new ForgeRequestFailures(github, "worker", "/repos/private-owner/private-repo/pulls", "POST", "request", observer);
+    const cause = Object.assign(new Error("DNS resolution failed for private.example"), { code: "EAI_AGAIN" });
+    const error = failures.transport(new TypeError("private-token", { cause }), new AbortController().signal, true);
+    expect(error).toBeInstanceOf(ForgeMutationUncertainError);
+    expect(error.statusCode).toBe(409);
+    expect(error.diagnostic).toBe(observer.mock.calls[0][0]);
+    expect(error.diagnostic).toMatchObject({ failure: "connection", causeCodes: ["EAI_AGAIN"], phase: "fetch", dispatch: "unknown", retryable: false });
+    expect(new Date(error.diagnostic!.occurredAt).toISOString()).toBe(error.diagnostic!.occurredAt);
+    expect(JSON.stringify(error)).not.toContain("private");
+    expect(error.diagnostic?.httpStatus).toBeUndefined();
+  });
+
+  it("proves that an invalid request and an aborted preflight did not start dispatch", () => {
+    const failures = new ForgeRequestFailures(github, "worker", "/repos/owner/repo/pulls", "POST", "request");
+    expect(failures.prepare().diagnostic).toMatchObject({ phase: "prepare", dispatch: "not_started", failure: "invalid_request" });
+    expect(() => failures.assertReady(AbortSignal.abort())).toThrow(expect.objectContaining({ diagnostic: expect.objectContaining({ dispatch: "not_started", failure: "cancelled" }) }));
+  });
+
+  it.each([
+    { status: 422, dispatch: "rejected", uncertain: false },
+    { status: 429, dispatch: "rejected", uncertain: false },
+    { status: 503, dispatch: "unknown", uncertain: true },
+    { status: 302, dispatch: "unknown", uncertain: true },
+  ])("distinguishes HTTP $status from a locally uncertain outcome", ({ status, dispatch, uncertain }) => {
+    const failures = new ForgeRequestFailures(github, "worker", "/repos/owner/repo/pulls", "POST", "request");
+    const response = new Response(null, { status });
+    failures.received(response);
+    const error = failures.http(httpFailure(response, "github"), true);
+    expect(error instanceof ForgeMutationUncertainError).toBe(uncertain);
+    expect(error.diagnostic).toMatchObject({ phase: "response", httpStatus: status, dispatch });
+  });
+
+  it.each([false, true])("retains unreadable response evidence for a request that changes remote state: %s", changesRemoteState => {
+    const failures = new ForgeRequestFailures(github, "worker", "/repos/owner/repo/pulls", changesRemoteState ? "POST" : "GET", "request");
+    failures.received(new Response(null, { status: 201 }));
+    const error = failures.transport(new ForgeProviderError("The provider returned an invalid or incomplete response.", 502), new AbortController().signal, changesRemoteState, true);
+    expect(error.diagnostic).toMatchObject({ phase: "response", failure: "unreadable_response", httpStatus: 201, dispatch: "unknown", retryable: false });
   });
 });

@@ -34,6 +34,7 @@ async function fixture() {
     syncAndReview: vi.fn(async () => ({ id: "worker" })),
     rebaseAndResolve: vi.fn(async () => ({ id: "worker" })),
     continueWorker: vi.fn(async () => ({ id: "worker" })),
+    recoverPublication: vi.fn(async () => ({ id: "worker" })),
     omitDiscussionReply: vi.fn(async () => ({ id: "worker" })),
     dashboard: vi.fn(async () => ({ workers: [] })),
     workerHistory: vi.fn(async () => undefined as import("@cloudx/shared").ForgeWorkerHistory | undefined),
@@ -65,6 +66,30 @@ async function fixture() {
   return { plugin, config, settings, hooks, workflow, connections, logger };
 }
 describe("Forge plugin boundary", () => {
+  it.each(["ui", "http"] as const)("requires an explicit recorded publication recovery through %s", async kind => {
+    const { hooks, workflow } = await fixture();
+    const placement = { windowId: "window", paneId: "pane" };
+    const input = { id: "worker", action: "reconcile", ...placement };
+    await expect(hooks.call("forge.worker.recoverPublication", input, { caller: { kind } })).resolves.toEqual({ worker: { id: "worker" } });
+    expect(workflow.recoverPublication).toHaveBeenCalledExactlyOnceWith("worker", { action: "reconcile" }, placement);
+    await hooks.call("forge.worker.recoverPublication", { ...input, action: "create", recoveryId: "recorded-check" }, { caller: { kind } });
+    expect(workflow.recoverPublication).toHaveBeenLastCalledWith("worker", { action: "create", recoveryId: "recorded-check" }, placement);
+  });
+
+  it("rejects malformed or unrecorded publication recovery before calling the workflow", async () => {
+    const { hooks, workflow } = await fixture();
+    const input = { id: "worker", action: "reconcile", windowId: "window", paneId: "pane" };
+    for (const invalid of [
+      { ...input, id: "" }, { ...input, action: undefined }, { ...input, action: "retry" },
+      { ...input, action: "create" }, { ...input, action: "create", recoveryId: "" },
+      { ...input, action: "create", recoveryId: " " }, { ...input, action: "create", recoveryId: 1 },
+      { ...input, recoveryId: "unused" }, { ...input, windowId: undefined },
+      { ...input, paneId: undefined }, { ...input, force: true },
+    ]) await expect(hooks.call("forge.worker.recoverPublication", invalid, { caller: { kind: "ui" } })).rejects.toThrow(/invalid input/);
+    await expect(hooks.call("forge.worker.recoverPublication", input, { caller: { kind: "automation" } })).rejects.toThrow(/exposed/);
+    expect(workflow.recoverPublication).not.toHaveBeenCalled();
+  });
+
   it("saves bounded batch membership and starts the saved worker once per request", async () => {
     const { hooks, workflow } = await fixture();
     const input = { repository, name: "CI reliability", numbers: [7, 9] };

@@ -1246,3 +1246,43 @@ describe("Persisted issue batches", () => {
     expect(() => parseWorkerReport({ kind: "review", headSha, event: "approve", body: "Done", comments: [], issueResults: results })).toThrow(/Only issue/);
   });
 });
+
+
+describe("Persisted publication recovery evidence", () => {
+  const failure = {
+    repository: worker.repository, occurredAt: worker.startedAt, operation: "request", method: "POST",
+    path: "/repos/{owner}/{repo}/pulls", phase: "fetch", failure: "connection", causeCodes: ["EAI_AGAIN"],
+    dispatch: "unknown", elapsedMs: 10_065,
+  };
+  const recovery = {
+    id: reviewWorkerId, repository: worker.repository, headBranch: "cloudx/forge/owned", baseBranch: "main", headSha,
+    handoffDigest: "d".repeat(64), checkedAt: worker.startedAt, phase: "absent",
+  };
+  it("roundtrips first-cause evidence and one-use recovery decisions", () => {
+    for (const publicationState of ["uncertain", "creating", "not_started", "rejected"] as const) {
+      const saved = { ...worker, publicationState, publicationFailure: failure, publicationRecovery: recovery };
+      const parsed = parseWorkers([saved])[0];
+      expect(parsed).toEqual(saved);
+      expect(parsed.publicationFailure).not.toBe(saved.publicationFailure);
+      expect(parsed.publicationRecovery).not.toBe(saved.publicationRecovery);
+    }
+    const saved = { ...worker, publicationRecovery: { ...recovery, phase: "dispatching", dispatchedAt: worker.startedAt } };
+    expect(parseWorkers([saved])[0]).toEqual(saved);
+  });
+  it.each([
+    { operation: "private arbitrary text" }, { method: "private request" }, { phase: "unknown" }, { failure: "oops" },
+    { dispatch: "never sent because DNS" }, { causeCodes: ["credential=private"] }, { causeCodes: Array(33).fill("EAI_AGAIN") },
+    { elapsedMs: -1 }, { elapsedMs: Infinity }, { httpStatus: 4090 }, { httpStatus: 0 },
+    { occurredAt: "bad date" }, { path: "/pulls?secret=private" },
+    { repository: { ...worker.repository, projectPath: "other/repo" } },
+  ])("rejects malformed saved failure evidence %#", patch => {
+    expect(() => parseWorkers([{ ...worker, publicationFailure: { ...failure, ...patch } }])).toThrow();
+  });
+  it.each([
+    { id: "not-an-identity" }, { phase: "complete" }, { phase: "dispatching" }, { phase: "uncertain" },
+    { handoffDigest: "changed" }, { headSha: "missing" }, { checkedAt: "bad date" },
+    { dispatchedAt: "bad date" }, { repository: { ...worker.repository, apiUrl: "https://other.example" } },
+  ])("rejects malformed saved recovery decisions %#", patch => {
+    expect(() => parseWorkers([{ ...worker, publicationRecovery: { ...recovery, ...patch } }])).toThrow();
+  });
+});

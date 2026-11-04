@@ -1926,6 +1926,34 @@ export class ForgeRuntime {
     });
   }
 
+  verifyPublicationBranch(
+    workspace: ForgeWorkspace,
+    expectedHeadSha: string,
+    expectedRepository: ForgeRepository,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.serialize(workspace.id, "verifyPublicationBranch", signal, async () => {
+      signal?.throwIfAborted();
+      const owned = await this.matchOwned(workspace);
+      if (owned.expectedRepository.provider !== expectedRepository.provider ||
+          owned.expectedRepository.apiUrl !== expectedRepository.apiUrl ||
+          owned.expectedRepository.projectPath !== expectedRepository.projectPath)
+        throw new Error("Publication recovery repository does not match the owned workspace.");
+      if (!owned.prepared || !owned.branchOwned || !owned.branch || owned.cleaned || owned.role !== "worker")
+        throw new Error("The published issue workspace is no longer available.");
+      if (this.publicationHandoff(owned)?.headSha !== expectedHeadSha ||
+          !owned.branchPublication?.confirmed || owned.branchPublication.headSha !== expectedHeadSha)
+        throw new Error("Publication recovery requires the exact saved handoff and confirmed published commit.");
+      await this.assertQuiescent(owned);
+      await this.verifyPublicationHead(owned, expectedHeadSha, signal);
+      const access = await this.workerAccess(owned, signal);
+      if (await this.publishedBranchHead(owned, access, signal) !== expectedHeadSha)
+        throw new Error("The published branch changed after completion. Publication recovery is blocked; local work was preserved.");
+      await this.verifyPublicationHead(owned, expectedHeadSha, signal);
+      signal?.throwIfAborted();
+    });
+  }
+
   private async verifyHead(
     owned: OwnedWorkspace,
     expectedHeadSha: string,

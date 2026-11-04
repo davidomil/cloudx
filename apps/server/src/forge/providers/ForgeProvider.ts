@@ -98,6 +98,7 @@ export class ForgeProviderError extends Error {
   constructor(
     message: string,
     readonly statusCode = 400,
+    readonly diagnostic?: ForgeRequestDiagnostic,
   ) {
     super(message);
     this.name = "ForgeProviderError";
@@ -110,6 +111,8 @@ export type ForgeProviderFailure = "timeout" | "cancelled" | "connection" | "unr
 export const forgeRequestTimeoutMs = 30_000;
 
 export interface ForgeRequestDiagnostic {
+  readonly occurredAt: string;
+  readonly dispatch: "not_started" | "unknown" | "rejected";
   readonly provider: ForgeRepository["provider"];
   readonly role: ForgeCredentialRole;
   readonly operation: "request" | "authentication";
@@ -138,7 +141,7 @@ export class ForgeProviderUnavailableError extends ForgeProviderError {
   constructor(
     readonly failure: ForgeProviderFailure,
     operation: "request" | "authentication" = "request",
-    options: { retryable?: boolean; retryAfterMs?: number } = {},
+    options: { retryable?: boolean; retryAfterMs?: number; diagnostic?: ForgeRequestDiagnostic } = {},
   ) {
     const subject = operation === "authentication" ? "GitHub App authentication" : "The forge request";
     const detail = {
@@ -154,7 +157,7 @@ export class ForgeProviderUnavailableError extends ForgeProviderError {
       rejected: "was rejected by the API",
       unknown: "failed before receiving a response",
     }[failure];
-    super(`${subject} ${detail}.`, failure === "timeout" ? 504 : failure === "cancelled" ? 499 : 502);
+    super(`${subject} ${detail}.`, failure === "timeout" ? 504 : failure === "cancelled" ? 499 : 502, options.diagnostic);
     this.name = "ForgeProviderUnavailableError";
     this.retryable = options.retryable ?? false;
     this.retryAfterMs = options.retryAfterMs;
@@ -195,14 +198,14 @@ export class ForgeHeadChangedError extends ForgeProviderError {
 
 export class ForgeMutationUncertainError extends ForgeProviderError {
   constructor(error: ForgeProviderUnavailableError) {
-    super(`${error.message} Its remote result is unknown. Refresh provider state before submitting again.`, 409);
+    super(`${error.message} Its remote result is unknown. Refresh provider state before submitting again.`, 409, error.diagnostic);
     this.name = "ForgeMutationUncertainError";
   }
 }
 
 export class ForgeMergeRejectedError extends ForgeProviderError {
   constructor(error: ForgeProviderError) {
-    super(error.message, error.statusCode);
+    super(error.message, error.statusCode, error.diagnostic);
     this.name = "ForgeMergeRejectedError";
     this.cause = error;
   }
@@ -213,6 +216,7 @@ export class ForgeMergeNotStartedError extends ForgeProviderError {
     super(
       error instanceof Error ? error.message : "Could not verify merge readiness.",
       error instanceof ForgeProviderError ? error.statusCode : 500,
+      error instanceof ForgeProviderError ? error.diagnostic : undefined,
     );
     this.name = "ForgeMergeNotStartedError";
     this.cause = error;
@@ -224,6 +228,7 @@ export class ForgeDiscussionReplyNotStartedError extends ForgeProviderError {
     super(
       error instanceof Error ? error.message : "Could not verify the discussion before replying.",
       error instanceof ForgeProviderError ? error.statusCode : 500,
+      error instanceof ForgeProviderError ? error.diagnostic : undefined,
     );
     this.name = "ForgeDiscussionReplyNotStartedError";
     this.cause = error;

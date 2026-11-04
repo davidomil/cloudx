@@ -2313,61 +2313,102 @@ describe("merge preflight and mutation boundaries", () => {
 });
 
 describe("request creation and input boundaries", () => {
-  it.each([github, gitlab])(
-    "finds an existing request after an ambiguous create response ($provider)",
-    async (repository) => {
-      const existing =
-        repository.provider === "github"
-          ? {
-              ...hubRequest,
-              head: { ...hubRequest.head, repo: { full_name: "owner/repo" } },
-            }
-          : { ...labRequest, source_project_id: 20, target_project_id: 20 };
-      const { provider, calls } = harness(repository, () =>
-        response([existing]),
-      );
-      expect(
-        await provider.findChangeRequestByBranch("fix-race", "main"),
-      ).toMatchObject({ number: 7 });
-      expect(calls[0].url.searchParams.get("state")).toBe("all");
-      expect(
-        calls[0].url.searchParams.get(
-          repository.provider === "github" ? "head" : "source_branch",
-        ),
-      ).toBe(repository.provider === "github" ? "owner:fix-race" : "fix-race");
-      expect(calls.every((call) => call.options.method === "GET")).toBe(true);
-    },
-  );
+  it.each([github, gitlab])("proves invalid $provider create input failed before dispatch", async repository => {
+    const { provider, calls } = harness(repository, () => response({}));
+    const error = await provider.createChangeRequest({ title: "", body: "private-token", headBranch: "worker", baseBranch: "main" }).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error.diagnostic).toMatchObject({ provider: repository.provider, method: "POST", operation: "request", phase: "prepare", dispatch: "not_started", failure: "invalid_request" });
+    expect(calls).toHaveLength(0);
+    expect(JSON.stringify(error)).not.toContain("private");
+  });
 
-  it.each([github, gitlab])(
-    "refuses ambiguous branch matches and excludes another source repository ($provider)",
-    async (repository) => {
-      const existing =
-        repository.provider === "github"
-          ? {
-              ...hubRequest,
-              head: { ...hubRequest.head, repo: { full_name: "owner/repo" } },
-            }
-          : { ...labRequest, source_project_id: 20, target_project_id: 20 };
-      const duplicate = harness(repository, () =>
-        response([existing, existing]),
-      );
-      await expect(
-        duplicate.provider.findChangeRequestByBranch("fix-race", "main"),
-      ).rejects.toThrow("Multiple");
-      const foreign =
-        repository.provider === "github"
-          ? {
-              ...hubRequest,
-              head: { ...hubRequest.head, repo: { full_name: "fork/repo" } },
-            }
-          : { ...labRequest, source_project_id: 10, target_project_id: 20 };
-      const absent = harness(repository, () => response([foreign]));
-      expect(
-        await absent.provider.findChangeRequestByBranch("fix-race", "main"),
-      ).toBeUndefined();
-    },
-  );
+  it.each([github, gitlab])("preserves unknown $provider create outcome when a successful response has an invalid schema", async repository => {
+    const { provider, calls } = harness(repository, () => new Response(JSON.stringify({ token: "private-token" }), { status: 201 }));
+    const error = await provider.createChangeRequest({ title: "Ready", body: "", headBranch: "worker", baseBranch: "main" }).catch(error => error);
+    expect(error).toBeInstanceOf(ForgeProviderError);
+    expect(error.statusCode).toBe(409);
+    expect(error.diagnostic).toMatchObject({ provider: repository.provider, method: "POST", operation: "request", phase: "response", dispatch: "unknown", failure: "unreadable_response", httpStatus: 201 });
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(error)).not.toContain("private");
+  });
+
+  function lookupRequest(repository: ForgeRepository) {
+    return repository.provider === "github"
+      ? { ...hubRequest, head: { ...hubRequest.head, repo: { full_name: "owner/repo" } }, base: { ...hubRequest.base, repo: { full_name: "owner/repo" } } }
+      : { ...labRequest, source_project_id: 20, target_project_id: 20 };
+  }
+
+  function lookupHarness(repository: ForgeRepository, handler: Handler) {
+    return harness(repository, (url, options) => url.pathname === "/api/v4/projects/group%2Fsubgroup%2Frepo"
+      ? response({ id: 20, path_with_namespace: "group/subgroup/repo" }) : handler(url, options));
+  }
+
+  it.each([github, gitlab])("finds an existing request after an ambiguous create response ($provider)", async repository => {
+    const { provider, calls } = lookupHarness(repository, () => response([lookupRequest(repository)]));
+    expect(await provider.findChangeRequestByBranch("fix-race", "main")).toMatchObject({ number: 7, state: "open" });
+    const lookup = calls.find(call => call.url.pathname.endsWith(repository.provider === "github" ? "/pulls" : "/merge_requests"))!;
+    expect(lookup.url.searchParams.get("state")).toBe("all");
+    expect(lookup.url.searchParams.get(repository.provider === "github" ? "head" : "source_branch"))
+      .toBe(repository.provider === "github" ? "owner:fix-race" : "fix-race");
+    expect(lookup.url.searchParams.get(repository.provider === "github" ? "base" : "target_branch")).toBe("main");
+    expect(calls.every(call => call.options.method === "GET")).toBe(true);
+  });
+
+  it.each([github, gitlab])("reports absence only after every $provider result page", async repository => {
+    const { provider, calls } = lookupHarness(repository, url => response([], url.searchParams.get("page") === "1"
+      ? { "x-next-page": "2" } : {}));
+    expect(await provider.findChangeRequestByBranch("fix-race", "main")).toBeUndefined();
+    expect(calls.filter(call => call.url.searchParams.has("page")).map(call => call.url.searchParams.get("page"))).toEqual(["1", "2"]);
+  });
+
+  it.each([github, gitlab])("refuses ambiguous $provider branch matches across pages", async repository => {
+    const { provider } = lookupHarness(repository, url => response([lookupRequest(repository)], url.searchParams.get("page") === "1"
+      ? { "x-next-page": "2" } : {}));
+    await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toThrow("Multiple");
+  });
+
+  it.each([github, gitlab])("returns a closed $provider request for the publication guard", async repository => {
+    const { provider, calls } = lookupHarness(repository, () => response([{ ...lookupRequest(repository), state: "closed" }]));
+    expect(await provider.findChangeRequestByBranch("fix-race", "main")).toMatchObject({ number: 7, state: "closed" });
+    expect(calls.every(call => call.options.method === "GET")).toBe(true);
+  });
+
+  it.each([
+    { head: { ...hubRequest.head, repo: { full_name: "fork/repo" } } },
+    { base: { ...hubRequest.base, repo: { full_name: "other/repo" } } },
+    { head: { ...hubRequest.head, ref: "other", repo: { full_name: "owner/repo" } } },
+    { base: { ...hubRequest.base, ref: "release", repo: { full_name: "owner/repo" } } },
+  ])("blocks mismatched GitHub lookup identity %j", async change => {
+    const { provider } = lookupHarness(github, () => response([{ ...lookupRequest(github), ...change }]));
+    await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toThrow("different repository or branch");
+  });
+
+  it.each([
+    { source_project_id: 10 }, { target_project_id: 21 },
+    { source_project_id: 10, target_project_id: 10 },
+    { source_branch: "other" }, { target_branch: "release" },
+  ])("blocks mismatched GitLab lookup identity %j", async change => {
+    const { provider } = lookupHarness(gitlab, () => response([{ ...lookupRequest(gitlab), ...change }]));
+    await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toThrow("different repository or branch");
+  });
+
+  it.each([null, {}, { id: 20 }, { id: 20, path_with_namespace: "other/project" }])("blocks incomplete or mismatched configured GitLab project identity %j", async project => {
+    const { provider } = harness(gitlab, () => response(project));
+    await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toBeInstanceOf(ForgeProviderError);
+  });
+
+  it.each([github, gitlab])("blocks unreadable or incomplete $provider lookup evidence", async repository => {
+    for (const evidence of [null, {}, [null], [{}], [{ ...lookupRequest(repository), state: "unknown" }]]) {
+      const { provider } = lookupHarness(repository, () => response(evidence));
+      await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toBeInstanceOf(ForgeProviderError);
+    }
+  });
+
+  it.each([github, gitlab])("blocks a failed later $provider lookup page instead of reporting absence", async repository => {
+    const { provider } = lookupHarness(repository, url => url.searchParams.get("page") === "1"
+      ? response([], { "x-next-page": "2" }) : new Response(null, { status: 503 }));
+    await expect(provider.findChangeRequestByBranch("fix-race", "main")).rejects.toBeInstanceOf(ForgeProviderError);
+  });
   it("rejects GitLab quick actions before they can bypass explicit review or merge actions", async () => {
     const { provider, calls } = harness(gitlab, () => response({}));
     await expect(

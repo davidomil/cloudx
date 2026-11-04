@@ -65,6 +65,14 @@ const uncertainReplyWorker: ForgeWorker = {
     replyingToDiscussionId: uncertainReply.discussionId,
   },
 };
+const publicationFailure: NonNullable<ForgeWorker["publicationFailure"]> = {
+  repository, occurredAt: "2026-11-04T20:43:55.846Z", operation: "request", method: "POST", path: "/repos/cloudx/example/pulls",
+  phase: "fetch", failure: "connection", causeCodes: ["EAI_AGAIN"], dispatch: "unknown", elapsedMs: 10065,
+};
+const publicationRecoveryWorker: ForgeWorker = {
+  ...worker, status: "failed", branch: "cloudx/forge/work-1", publicationState: "uncertain", publicationFailure,
+  pendingPublication: { ...publishingWorker.pendingPublication!, previousHeadSha: undefined },
+};
 const conflictedWorker: ForgeWorker = {
   ...worker, status: "awaiting_merge", branch: change.headBranch, worktreePath: "/repo/worker",
   changeNumber: change.number, headSha: change.headSha,
@@ -129,6 +137,7 @@ function fixture(overrides: Partial<ForgeDashboard> = {}, handler?: HookHandler)
       "forge.worker.ownershipAvailability": { availability: { status: "not_needed" } },
       "forge.worker.stop": { worker: { ...worker, status: "stopped" } },
       "forge.worker.resume": { worker },
+      "forge.worker.recoverPublication": { worker },
       "forge.worker.continue": { worker },
       "forge.worker.omitDiscussionReply": { worker },
       "forge.worker.syncAndReview": { worker },
@@ -1895,6 +1904,87 @@ describe("ForgePanel", () => {
       expect(diagnostics.open).toBe(true);
     }
     expect(f.calls.some(call => (call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability"))).toBe(false);
+  });
+
+  it.each(["creating", "uncertain", "not_started", "rejected"] as const)("checks %s publication without starting another implementation turn", async publicationState => {
+    const selected = { ...publicationRecoveryWorker, publicationState, autoReview: { enabled: true, phase: "implementing" as const, placement: { windowId: "window-1", paneId: "pane-2" } } };
+    const f = fixture({ workers: [selected] });
+    const panel = await renderPanel(f);
+    const card = panel.querySelector('[aria-label="issue worker #7"]')!;
+    expect(card.textContent).toContain("Check publication after resolving the error");
+    expect(Array.from(card.querySelectorAll("button"), item => item.textContent?.trim())).not.toContain("Retry publication");
+    await click(card, "Check publication");
+    expect(f.calls.filter(call => call.hook.startsWith("forge.worker.") && call.hook !== "forge.worker.ownershipAvailability")).toEqual([
+      { hook: "forge.worker.recoverPublication", input: { id: worker.id, action: "reconcile", windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+  });
+
+  it("requires the recorded absent check and serializes explicit publication creation", async () => {
+    const recovery: NonNullable<ForgeWorker["publicationRecovery"]> = {
+      id: "checked-recovery", repository, headBranch: publicationRecoveryWorker.branch!, baseBranch: "main",
+      headSha: publicationRecoveryWorker.pendingPublication!.headSha!, handoffDigest: "c".repeat(64), checkedAt: "2026-11-04T21:00:00.000Z", phase: "absent",
+    };
+    const creation = deferred<unknown>();
+    let f: ReturnType<typeof fixture>;
+    f = fixture({ workers: [publicationRecoveryWorker] }, (hook, input) => {
+      if (hook !== "forge.worker.recoverPublication") return;
+      if (input.action === "create") return creation.promise;
+      f.dashboard.workers = [{ ...publicationRecoveryWorker, publicationRecovery: recovery }];
+      return { worker: f.dashboard.workers[0] };
+    });
+    const panel = await renderPanel(f);
+    expect(panel.textContent).not.toContain("Create request after check");
+    await click(panel, "Check publication");
+    const section = panel.querySelector('[aria-label="Publication recovery"]')!;
+    expect(section.textContent).toContain("An empty result does not prove that the previous create request never reached the provider");
+    expect(section.textContent).toContain(recovery.headSha);
+    expect(section.querySelector("time")?.dateTime).toBe(recovery.checkedAt);
+    await click(section, "Create request after check");
+    expect(button(section, "Check publication").disabled).toBe(true);
+    expect(button(section, "Create request after check").disabled).toBe(true);
+    await click(section, "Create request after check");
+    expect(f.calls.filter(call => call.hook === "forge.worker.recoverPublication")).toEqual([
+      { hook: "forge.worker.recoverPublication", input: { id: worker.id, action: "reconcile", windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+      { hook: "forge.worker.recoverPublication", input: { id: worker.id, action: "create", recoveryId: recovery.id, windowId: "window-1", paneId: "pane-2" }, tabId: tab.id },
+    ]);
+    await act(async () => { creation.reject(new Error("Provider outcome remains uncertain.")); });
+    expect(panel.textContent).toContain("Provider outcome remains uncertain.");
+    expect(panel.querySelector('[aria-label="Original publication failure"]')?.textContent).toContain("EAI_AGAIN");
+  });
+
+  it.each(["dispatching", "uncertain", "adopted"] as const)("does not reuse a recovery authorization after %s", async phase => {
+    const f = fixture({ workers: [{ ...publicationRecoveryWorker, publicationRecovery: {
+      id: "used-recovery", repository, headBranch: publicationRecoveryWorker.branch!, baseBranch: "main",
+      headSha: publicationRecoveryWorker.pendingPublication!.headSha!, handoffDigest: "c".repeat(64), checkedAt: "2026-11-04T21:00:00.000Z", phase,
+    } }] });
+    const panel = await renderPanel(f);
+    expect(panel.textContent).not.toContain("Create request after check");
+    expect(button(panel, "Check publication").disabled).toBe(false);
+  });
+
+  it.each([
+    { status: "running" as const }, { status: "awaiting_publication" as const }, { changeNumber: 12 },
+    { kind: "review" as const }, { pendingPublication: undefined }, { publicationState: "created" as const },
+  ])("does not offer publication recovery outside an inactive unpublished issue %#", async overrides => {
+    const f = fixture({ workers: [{ ...publicationRecoveryWorker, ...overrides }] });
+    const panel = await renderPanel(f);
+    expect(Array.from(panel.querySelectorAll("button"), item => item.textContent?.trim())).not.toContain("Check publication");
+    expect(panel.textContent).not.toContain("Create request after check");
+  });
+
+  it.each([
+    { failure: publicationFailure, text: "Write outcome unknown · no provider HTTP response was recorded.", absent: "Provider rejected" },
+    { failure: { ...publicationFailure, dispatch: "rejected" as const, phase: "response" as const, httpStatus: 422 }, text: "Provider rejected the request · HTTP 422.", absent: "Write outcome unknown" },
+    { failure: { ...publicationFailure, dispatch: "not_started" as const, phase: "prepare" as const }, text: "Request was not dispatched.", absent: "Provider rejected" },
+  ])("retains the original publication cause after pending publication clears %#", async ({ failure, text, absent }) => {
+    const f = fixture({ workers: [{ ...publicationRecoveryWorker, status: "awaiting_review", changeNumber: 12, headSha: "b".repeat(40), pendingPublication: undefined, publicationFailure: failure }] });
+    const panel = await renderPanel(f);
+    const diagnostics = panel.querySelector('[aria-label="Original publication failure"]')!;
+    expect(diagnostics.textContent).toContain(text);
+    expect(diagnostics.textContent).not.toContain(absent);
+    for (const value of [failure.repository.provider, failure.repository.projectPath, failure.repository.apiUrl, failure.operation,
+      failure.method, failure.path, failure.phase, failure.failure, "EAI_AGAIN", "10065 ms"]) expect(diagnostics.textContent).toContain(value);
+    expect(diagnostics.querySelector("time")?.dateTime).toBe(failure.occurredAt);
   });
 
   it("shows stopped publication confirmation as an alert with the preserved diagnostics and retry action", async () => {
