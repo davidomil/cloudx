@@ -1,5 +1,5 @@
 import type { ForgeWorker } from "@cloudx/shared";
-import { ForgeMergeNotStartedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
+import { ForgeMutationUncertainError, ForgeMergeNotStartedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 
 export interface ForgeLogger {
   info(fields: Record<string, unknown>, message?: string): void;
@@ -34,6 +34,13 @@ export type ForgeWorkerLogContext = ReturnType<typeof forgeWorkerContext>;
 
 export function forgeErrorFields(error: unknown): Record<string, unknown> {
   const failure = error instanceof ForgeMergeNotStartedError ? error.cause : error;
+  if (failure instanceof ForgeMutationUncertainError)
+    return { failure: "mutation_uncertain", statusCode: failure.statusCode, dispatch: "unknown",
+      ...(failure.diagnostic ? { providerFailure: failure.diagnostic.failure, causeCodes: failure.diagnostic.causeCodes, phase: failure.diagnostic.phase,
+        ...(failure.diagnostic.httpStatus === undefined ? {} : { httpStatus: failure.diagnostic.httpStatus }) } : {}) };
+  if (failure instanceof ForgeProviderError && failure.diagnostic?.dispatch === "not_started")
+    return { failure: "request_not_started", statusCode: failure.statusCode, dispatch: "not_started", phase: failure.diagnostic.phase,
+      providerFailure: failure.diagnostic.failure, causeCodes: failure.diagnostic.causeCodes };
   if (failure instanceof ForgeProviderUnavailableError)
     return { failure: failure.failure, statusCode: failure.statusCode, retryable: failure.retryable, retryAfterMs: failure.retryAfterMs };
   if (failure instanceof ForgeProviderError)

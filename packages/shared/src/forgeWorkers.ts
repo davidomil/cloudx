@@ -168,6 +168,32 @@ export interface ForgePublicationObservation {
   reason: "snapshot" | "mixed_heads" | "waiting" | "deferred" | "confirmed" | "exhausted" | "provider_error" | "rejected";
 }
 
+export interface ForgePublicationFailure {
+  repository: ForgeRepository;
+  occurredAt: string;
+  operation: "request" | "authentication";
+  method: string;
+  path: string;
+  phase: "prepare" | "fetch" | "response";
+  failure: "timeout" | "cancelled" | "connection" | "unreadable_response" | "tls" | "redirect" | "invalid_request" | "rate_limited" | "service_unavailable" | "rejected" | "unknown";
+  causeCodes: string[];
+  dispatch: "not_started" | "unknown" | "rejected";
+  httpStatus?: number;
+  elapsedMs: number;
+}
+
+export interface ForgePublicationRecovery {
+  id: string;
+  repository: ForgeRepository;
+  headBranch: string;
+  baseBranch: string;
+  headSha: string;
+  handoffDigest: string;
+  checkedAt: string;
+  phase: "absent" | "dispatching" | "uncertain" | "adopted";
+  dispatchedAt?: string;
+}
+
 export interface ForgeWorker {
   id: string;
   kind: "issue" | "review";
@@ -197,7 +223,9 @@ export interface ForgeWorker {
     executionId?: string;
   };
   retainedWorkspace?: ForgeRetainedWorkspace;
-  publicationState?: "creating" | "uncertain" | "created";
+  publicationState?: "creating" | "uncertain" | "created" | "not_started" | "rejected";
+  publicationFailure?: ForgePublicationFailure;
+  publicationRecovery?: ForgePublicationRecovery;
   mergeConflict?: {
     headSha: string;
     targetHeadSha: string;

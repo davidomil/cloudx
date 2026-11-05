@@ -738,7 +738,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       throw new Error("Invalid report identity.");
     if (
       worker.publicationState !== undefined &&
-      !["creating", "uncertain", "created"].includes(
+      !["creating", "uncertain", "created", "not_started", "rejected"].includes(
         String(worker.publicationState),
       )
     )
@@ -825,7 +825,7 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
     }
     if (worker.status === "draft" && (!parsed.batch || [
       "repositoryPath", "worktreePath", "branch", "tabId", "attemptId", "completion", "retainedWorkspace",
-      "publicationState", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
+      "publicationState", "publicationFailure", "publicationRecovery", "pendingPublication", "changeNumber", "changeUrl", "headSha", "mergeAttempted",
       "mergeConflict", "ciRepair", "ciRecovery", "rebaseRecovery", "issueWorkerId", "providerRetryAt", "resourceCleanupNotificationDigest", "executionSettings", "modelCapacityRecovery",
     ].some(key => worker[key] !== undefined) || parsed.batch.results !== undefined))
       throw new Error("A draft batch cannot own execution or publication state.");
@@ -955,6 +955,8 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
         parsed.headSha !== update.expectedHeadSha && parsed.headSha !== update.headSha))
         throw new Error("Base update checkpoint must match the worker's published request and base branch.");
     }
+    if (worker.publicationFailure !== undefined) parsed.publicationFailure = parsePublicationFailure(worker.publicationFailure, parsed);
+    if (worker.publicationRecovery !== undefined) parsed.publicationRecovery = parsePublicationRecovery(worker.publicationRecovery, parsed);
     if (worker.rebaseRecovery !== undefined)
       parsed.rebaseRecovery = parseRebaseRecovery(worker.rebaseRecovery, parsed);
     if (worker.ciRepair !== undefined)
@@ -983,4 +985,54 @@ export function parseWorkers(value: unknown): ForgeWorker[] {
       throw new Error("Automatic merge requires an enabled merging issue loop with a published request and an owned checkout.");
     return parsed;
   });
+}
+
+function requirePublicationRepository(value: unknown, worker: ForgeWorker): void {
+  const repository = object(value);
+  if (repository.provider !== worker.repository.provider || repository.apiUrl !== worker.repository.apiUrl || repository.projectPath !== worker.repository.projectPath)
+    throw new Error("Publication recovery evidence must belong to the worker repository.");
+}
+
+function parsePublicationFailure(value: unknown, worker: ForgeWorker): NonNullable<ForgeWorker["publicationFailure"]> {
+  const failure = object(value);
+  requirePublicationRepository(failure.repository, worker);
+  if (worker.kind !== "issue" || !["request", "authentication"].includes(String(failure.operation)) ||
+      !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "OTHER"].includes(String(failure.method)) ||
+      !["prepare", "fetch", "response"].includes(String(failure.phase)) ||
+      !["timeout", "cancelled", "connection", "unreadable_response", "tls", "redirect", "invalid_request", "rate_limited", "service_unavailable", "rejected", "unknown"].includes(String(failure.failure)) ||
+      !["not_started", "unknown", "rejected"].includes(String(failure.dispatch)) ||
+      !Array.isArray(failure.causeCodes) || failure.causeCodes.length > 32 ||
+      failure.causeCodes.some(code => typeof code !== "string" || !/^[A-Z][A-Z0-9_]{0,63}$/.test(code)) ||
+      !Number.isSafeInteger(failure.elapsedMs) || Number(failure.elapsedMs) < 0 ||
+      failure.httpStatus !== undefined && (!Number.isInteger(failure.httpStatus) || Number(failure.httpStatus) < 100 || Number(failure.httpStatus) > 599))
+    throw new Error("Invalid publication failure diagnostic.");
+  const diagnosticPath = nonblankText(failure.path, "publication operation path", 256);
+  if (!/^\/[A-Za-z0-9_{}/<>-]+$/.test(diagnosticPath)) throw new Error("Invalid publication diagnostic path.");
+  return {
+    repository: { ...worker.repository }, occurredAt: isoTimestamp(failure.occurredAt, "publication failure time"),
+    operation: failure.operation as "request" | "authentication", method: String(failure.method), path: diagnosticPath,
+    phase: failure.phase as "prepare" | "fetch" | "response", failure: failure.failure as NonNullable<ForgeWorker["publicationFailure"]>["failure"],
+    dispatch: failure.dispatch as "not_started" | "unknown" | "rejected", causeCodes: [...failure.causeCodes] as string[], elapsedMs: Number(failure.elapsedMs),
+    ...(failure.httpStatus === undefined ? {} : { httpStatus: Number(failure.httpStatus) }),
+  };
+}
+
+function parsePublicationRecovery(value: unknown, worker: ForgeWorker): NonNullable<ForgeWorker["publicationRecovery"]> {
+  const recovery = object(value);
+  requirePublicationRepository(recovery.repository, worker);
+  const id = nonblankText(recovery.id, "publication recovery ID", 36);
+  const digest = nonblankText(recovery.handoffDigest, "publication handoff digest", 64);
+  if (worker.kind !== "issue" || !/^[a-f0-9-]{36}$/.test(id) || !/^[a-f0-9]{64}$/.test(digest) ||
+      !["absent", "dispatching", "uncertain", "adopted"].includes(String(recovery.phase)))
+    throw new Error("Invalid publication recovery checkpoint.");
+  const result: NonNullable<ForgeWorker["publicationRecovery"]> = {
+    id, repository: { ...worker.repository }, headBranch: nonblankText(recovery.headBranch, "recovery head branch", 1024),
+    baseBranch: nonblankText(recovery.baseBranch, "recovery base branch", 1024), headSha: commitSha(recovery.headSha, "recovery pushed commit"),
+    handoffDigest: digest, checkedAt: isoTimestamp(recovery.checkedAt, "publication check time"),
+    phase: recovery.phase as NonNullable<ForgeWorker["publicationRecovery"]>["phase"],
+    ...(recovery.dispatchedAt === undefined ? {} : { dispatchedAt: isoTimestamp(recovery.dispatchedAt, "publication dispatch time") }),
+  };
+  if (["dispatching", "uncertain"].includes(String(recovery.phase)) && !result.dispatchedAt)
+    throw new Error("A consumed publication recovery requires its dispatch time.");
+  return result;
 }

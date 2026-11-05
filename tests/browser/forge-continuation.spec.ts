@@ -993,6 +993,186 @@ test("cancels without sending and clears the abandoned message", async ({
   ).toBeDisabled();
 });
 
+test("checks publication before explicitly creating once and retains the original transport failure", async ({
+  page,
+}, testInfo) => {
+  const repository = {
+    provider: "github" as const,
+    apiUrl: "https://api.github.com",
+    projectPath: "cloudx/example",
+  };
+  const headSha = "a".repeat(40);
+  const worker: ForgeWorker = {
+    id: "issue-worker",
+    kind: "issue",
+    number: 7,
+    title: "Repair deployment",
+    status: "failed",
+    repository,
+    repositoryPath: "/fixture/repository",
+    baseBranch: "main",
+    branch: "cloudx/forge/issue-worker",
+    templateId: "worker-template",
+    autoPost: false,
+    startedAt: "2026-11-04",
+    updatedAt: "2026-11-04",
+    publicationState: "uncertain",
+    error: "The previous create-request result is uncertain.",
+    publicationFailure: {
+      repository,
+      occurredAt: "2026-11-04T20:43:55.846Z",
+      operation: "request",
+      method: "POST",
+      path: "/repos/cloudx/example/pulls",
+      phase: "fetch",
+      failure: "connection",
+      causeCodes: ["EAI_AGAIN"],
+      dispatch: "unknown",
+      elapsedMs: 10065,
+    },
+    pendingPublication: {
+      headSha,
+      repliedDiscussionIds: [],
+      report: {
+        kind: "issue",
+        title: "Repair deployment",
+        body: "The reproduction passes.",
+        discussionReplies: [],
+        resolvedDiscussionIds: [],
+      },
+    },
+  };
+  const actions: Array<{
+    hook: string;
+    input: Record<string, unknown>;
+    tabId: string;
+  }> = [];
+  let heldCreation: Route | undefined;
+  await page.route("**/api/forge/checkout-evidence", (route) =>
+    route.fulfill({ json: { archives: [] } }),
+  );
+  await page.route("**/api/forge/git-history", (route) =>
+    route.fulfill({ json: { archives: [] } }),
+  );
+  await page.route("**/fixture-hooks/**", async (route) => {
+    const hook = new URL(route.request().url()).pathname.split("/").pop()!;
+    const body = route.request().postDataJSON();
+    switch (hook) {
+      case "forge.dashboard":
+        return route.fulfill({
+          json: { configured: true, repository, workers: [worker] },
+        });
+      case "forge.issues.list":
+        return route.fulfill({ json: { items: [] } });
+      case "forge.worker.ownershipAvailability":
+        return route.fulfill({
+          json: { availability: { status: "not_needed" } },
+        });
+      case "forge.worker.history":
+        return route.fulfill({ json: {} });
+      case "forge.worker.recoverPublication":
+        actions.push({ hook, ...body });
+        if (body.input.action === "create") {
+          heldCreation = route;
+          return;
+        }
+        worker.publicationRecovery = {
+          id: "recorded-check",
+          repository,
+          headBranch: worker.branch!,
+          baseBranch: worker.baseBranch,
+          headSha,
+          handoffDigest: "c".repeat(64),
+          checkedAt: "2026-11-04T21:00:00.000Z",
+          phase: "absent",
+        };
+        return route.fulfill({ json: { worker } });
+      default:
+        throw new Error(`Unexpected hook ${hook}`);
+    }
+  });
+  await page.goto(baseUrl);
+  await page.getByRole("button", { name: "Workers (1)", exact: true }).click();
+  const failure = page.getByRole("region", {
+    name: "Original publication failure",
+  });
+  await expect(failure).toContainText("EAI_AGAIN");
+  await expect(failure).toContainText(
+    "Write outcome unknown · no provider HTTP response was recorded.",
+  );
+  await expect(failure).not.toContainText("Provider rejected");
+  const recovery = page.getByRole("region", { name: "Publication recovery" });
+  const check = recovery.getByRole("button", {
+    name: "Check publication",
+    exact: true,
+  });
+  await expect(
+    recovery.getByRole("button", { name: "Create request after check" }),
+  ).toHaveCount(0);
+  await check.click();
+  await expect(recovery).toContainText(
+    "An empty result does not prove that the previous create request never reached the provider",
+  );
+  await expect(recovery).toContainText(headSha);
+  const create = recovery.getByRole("button", {
+    name: "Create request after check",
+    exact: true,
+  });
+  await expect(create).toBeEnabled();
+  await create.evaluate((element) =>
+    element.scrollIntoView({ block: "center" }),
+  );
+  await expect(create).toBeInViewport({ ratio: 1 });
+  const screenshot = testInfo.outputPath("publication-recovery.png");
+  await page.screenshot({ path: screenshot });
+  await testInfo.attach("publication-recovery", {
+    path: screenshot,
+    contentType: "image/png",
+  });
+  await create.click();
+  await expect.poll(() => !!heldCreation).toBe(true);
+  await expect(check).toBeDisabled();
+  await expect(create).toBeDisabled();
+  expect(actions).toEqual([
+    {
+      hook: "forge.worker.recoverPublication",
+      input: {
+        id: worker.id,
+        action: "reconcile",
+        windowId: "window-1",
+        paneId: "pane-2",
+      },
+      tabId: "forge-tab",
+    },
+    {
+      hook: "forge.worker.recoverPublication",
+      input: {
+        id: worker.id,
+        action: "create",
+        recoveryId: "recorded-check",
+        windowId: "window-1",
+        paneId: "pane-2",
+      },
+      tabId: "forge-tab",
+    },
+  ]);
+  worker.changeNumber = 12;
+  worker.headSha = headSha;
+  worker.publicationState = "created";
+  worker.publicationRecovery!.phase = "adopted";
+  worker.status = "awaiting_review";
+  delete worker.pendingPublication;
+  delete worker.error;
+  await heldCreation!.fulfill({ json: { worker } });
+  await expect(page.getByRole("tab", { name: /Issue #7/ })).toContainText(
+    "awaiting review",
+  );
+  await expect(failure).toContainText("EAI_AGAIN");
+  await expect(create).toHaveCount(0);
+  await expect(check).toHaveCount(0);
+  expect(actions).toHaveLength(2);
+});
+
 test("omits the displayed uncertain reply before explicitly retrying publication", async ({
   page,
 }, testInfo) => {

@@ -33,7 +33,7 @@ import type {
   ForgeWorker,
   ForgeWorkerHistory,
 } from "@cloudx/shared";
-import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
+import { ForgeDiscussionReplyNotStartedError, ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { MAX_FORGE_WORKFLOW_TEXT_LENGTH, parseReview, parseScopedReview, parseWorkerReport } from "./ForgeWorkflowValidation.js";
 import { ForgeBranchConflictError, ForgeHandoffError, type ForgePublicationLease } from "./ForgeRuntime.js";
 import { directoryOwnershipAvailability } from "../directoryOwnershipReconciliation.js";
@@ -164,6 +164,12 @@ interface Runtime {
       branch: string;
     },
     expectedHeadSha: string,
+  ): Promise<void>;
+  verifyPublicationBranch(
+    workspace: { id: string; repositoryPath: string; worktreePath: string; branch: string },
+    expectedHeadSha: string,
+    expectedRepository: ForgeRepository,
+    signal?: AbortSignal,
   ): Promise<void>;
   publishBranch(
     workspace: {
@@ -906,6 +912,71 @@ export class ForgeWorkflowService {
       if (issue.autoReview?.enabled && issue.autoReview.phase !== "implementing" && !issue.pendingPublication)
         return this.resumeAutoReview(issue, placement);
       return this.resumeWorker(issue.id, placement, { refreshPublicationCredentials: true });
+    });
+  }
+  recoverPublication(
+    id: string,
+    input: { action: "reconcile" | "create"; recoveryId?: string },
+    placement: ForgePlacement,
+  ): Promise<ForgeWorker> {
+    return this.workerAction(id, "Recovering request publication", async () => {
+      const worker = this.requireWorker(id);
+      if (input.action !== "reconcile" && input.action !== "create") throw new Error("Choose a publication recovery action.");
+      if (worker.kind !== "issue" || worker.changeNumber || !["paused", "stopped", "failed"].includes(worker.status) ||
+          !["creating", "uncertain", "not_started", "rejected"].includes(worker.publicationState ?? ""))
+        throw new Error("Only an interrupted initial request publication can be recovered.");
+      if (!sameRepository(worker.repository, this.deps.settings().repository))
+        throw new Error("The configured repository changed. Restore it before recovering publication.");
+      const publication = worker.pendingPublication;
+      if (!publication?.headSha || publication.handoff?.headSha !== publication.headSha || publication.baseUpdate ||
+          !worker.completion?.readyAt || worker.completion.turn?.status !== "completed" || worker.completion.report?.kind !== "issue" ||
+          worker.completion.reportError || worker.completion.continuationRequired)
+        throw new Error("Recovery requires the saved completed turn, report and exact pushed handoff.");
+      const handoffDigest = publicationRecoveryDigest(worker);
+      const recovery = worker.publicationRecovery;
+      if (input.action === "create" && (!recovery || input.recoveryId !== recovery.id || recovery.phase !== "absent" ||
+          !sameRepository(recovery.repository, worker.repository) || recovery.headBranch !== worker.branch ||
+          recovery.baseBranch !== worker.baseBranch || recovery.headSha !== publication.headSha || recovery.handoffDigest !== handoffDigest))
+        throw new Error("This publication recovery is stale or already consumed. Check publication again before authorizing a create.");
+      const workspace = workerWorkspace(worker);
+      const controller = new AbortController();
+      this.operations.set(worker.id, controller);
+      worker.placement = placement;
+      if (worker.autoReview) worker.autoReview.placement = placement;
+      this.cancelProviderRecovery(worker);
+      try {
+        await this.recoverResources(worker);
+        await this.quiesce(worker, { retainReport: true });
+        await this.deps.runtime.verifyPublicationBranch(workspace, publication.headSha, worker.repository, controller.signal);
+        controller.signal.throwIfAborted();
+        const provider = this.providerFor(worker);
+        const found = await this.findPublication(worker, provider);
+        controller.signal.throwIfAborted();
+        if (found) {
+          await this.adoptPublication(worker, found);
+          await this.issueReady(worker);
+        } else if (input.action === "reconcile") {
+          worker.publicationRecovery = {
+            id: randomUUID(), repository: { ...worker.repository }, headBranch: worker.branch!, baseBranch: worker.baseBranch,
+            headSha: publication.headSha, handoffDigest, checkedAt: new Date().toISOString(), phase: "absent",
+          };
+          worker.error = "No matching request is visible. This does not prove the previous create never reached the provider. Create request after check explicitly authorizes one new attempt with that remaining uncertainty.";
+          await this.persist();
+        } else {
+          await this.deps.runtime.verifyPublicationBranch(workspace, publication.headSha, worker.repository, controller.signal);
+          controller.signal.throwIfAborted();
+          recovery!.phase = "dispatching";
+          recovery!.dispatchedAt = new Date().toISOString();
+          worker.publicationState = "creating";
+          await this.persist();
+          await this.createPublication(worker, provider);
+          await this.confirmPublication(worker);
+        }
+      } catch (error) {
+        if (worker.publicationRecovery?.phase === "dispatching") worker.publicationRecovery.phase = "uncertain";
+        await this.fail(worker, error, { retainReport: true, retryProvider: false });
+      }
+      return structuredClone(worker);
     });
   }
   ownershipAvailability(id: string): Promise<DirectoryOwnershipAvailability> {
@@ -2863,23 +2934,7 @@ export class ForgeWorkflowService {
     if (!worker.changeNumber) {
       worker.publicationState = "creating";
       await this.persist();
-      let change;
-      try {
-        change = await provider.createChangeRequest({
-          title: report.title,
-          body: issueRequestBody(worker, report),
-          headBranch: workspace.branch,
-          baseBranch: worker.baseBranch,
-        });
-      } catch (error) {
-        worker.publicationState = "uncertain";
-        await this.persist();
-        throw error;
-      }
-      worker.changeNumber = change.number;
-      worker.changeUrl = change.url;
-      worker.publicationState = "created";
-      await this.persist();
+      await this.createPublication(worker, provider);
     }
     if (worker.batch && !publication.baseUpdate && updateExistingRequest) {
       const current = await provider.getChangeRequestStatus(worker.changeNumber!);
@@ -3154,29 +3209,74 @@ export class ForgeWorkflowService {
       await provider.resolveDiscussion(change.number, id, headSha);
     }
   }
-  private async reconcilePublication(
-    worker: ForgeWorker,
-    provider: ForgeProvider,
-  ): Promise<void> {
-    if (!worker.branch) throw new Error("Issue branch is missing.");
-    const existing = await provider.findChangeRequestByBranch(
-      worker.branch,
-      worker.baseBranch,
-    );
-    if (existing) {
-      worker.changeNumber = existing.number;
-      worker.changeUrl = existing.url;
-      worker.publicationState = "created";
+  private async createPublication(worker: ForgeWorker, provider: ForgeProvider): Promise<void> {
+    const signal = this.operations.get(worker.id)?.signal;
+    let change;
+    let invoked = false;
+    try {
+      const input = {
+        title: worker.pendingPublication!.report.title,
+        body: issueRequestBody(worker, worker.pendingPublication!.report),
+        headBranch: worker.branch!, baseBranch: worker.baseBranch,
+      };
+      signal?.throwIfAborted();
+      invoked = true;
+      change = await provider.createChangeRequest(input);
+    } catch (error) {
+      const diagnostic = error instanceof ForgeProviderError ? error.diagnostic : undefined;
+      const dispatch = !invoked || diagnostic?.operation === "authentication" ? "not_started" : diagnostic?.dispatch ?? "unknown";
+      worker.publicationState = dispatch === "not_started" ? "not_started" : dispatch === "rejected" ? "rejected" : "uncertain";
+      worker.publicationFailure ??= {
+        repository: { ...worker.repository }, occurredAt: diagnostic?.occurredAt ?? new Date().toISOString(),
+        operation: diagnostic?.operation ?? "request", method: diagnostic?.method ?? "POST",
+        path: diagnostic?.path ?? (worker.repository.provider === "github" ? "/repos/{owner}/{repo}/pulls" : "/projects/{project}/merge_requests"),
+        phase: diagnostic?.phase ?? (invoked ? "fetch" : "prepare"), failure: diagnostic?.failure ?? (!invoked && signal?.aborted ? "cancelled" : "unknown"), causeCodes: [...(diagnostic?.causeCodes ?? [])],
+        dispatch, elapsedMs: diagnostic?.elapsedMs ?? 0,
+        ...(diagnostic?.httpStatus === undefined ? {} : { httpStatus: diagnostic.httpStatus }),
+      };
       await this.persist();
+      throw error;
+    }
+    // An acknowledged create must remain adopted even if the request is then cancelled.
+    worker.changeNumber = change.number;
+    worker.changeUrl = change.url;
+    worker.publicationState = "created";
+    if (worker.publicationRecovery) worker.publicationRecovery.phase = "adopted";
+    await this.persist();
+    signal?.throwIfAborted();
+  }
+  private async findPublication(worker: ForgeWorker, provider: ForgeProvider) {
+    if (!worker.branch) throw new Error("Issue branch is missing.");
+    const existing = await provider.findChangeRequestByBranch(worker.branch, worker.baseBranch);
+    this.operations.get(worker.id)?.signal.throwIfAborted();
+    if (!existing) return;
+    const change = await provider.getChangeRequestStatus(existing.number);
+    this.operations.get(worker.id)?.signal.throwIfAborted();
+    if (change.number !== existing.number || change.headBranch !== worker.branch || change.baseBranch !== worker.baseBranch)
+      throw new Error("The change request no longer matches this worker's branches or identity.");
+    if (change.state !== "open" || change.merged)
+      throw new Error("The change request is closed without merging. Inspect it before recovering publication.");
+    if (worker.pendingPublication?.headSha && change.headSha !== worker.pendingPublication.headSha)
+      throw new Error("The matching request head differs from the saved pushed handoff. Check publication after provider propagation.");
+    return { ...change, url: existing.url };
+  }
+  private async adoptPublication(worker: ForgeWorker, change: ForgeChangeRequestStatus & { url: string }): Promise<void> {
+    worker.changeNumber = change.number;
+    worker.changeUrl = change.url;
+    worker.publicationState = "created";
+    if (worker.publicationRecovery) worker.publicationRecovery.phase = "adopted";
+    await this.persist();
+  }
+  private async reconcilePublication(worker: ForgeWorker, provider: ForgeProvider): Promise<void> {
+    const existing = await this.findPublication(worker, provider);
+    if (existing) {
+      await this.adoptPublication(worker, existing);
       return;
     }
-    if (
-      worker.publicationState === "creating" ||
-      worker.publicationState === "uncertain"
-    )
-      throw new Error(
-        "The previous create-request result is uncertain and no matching request is visible. Inspect the provider before starting another publication.",
-      );
+    if (["creating", "uncertain", "not_started", "rejected"].includes(worker.publicationState ?? ""))
+      throw new Error(worker.publicationState === "not_started" || worker.publicationState === "rejected"
+        ? "The previous create-request did not succeed. Use Check publication, then explicitly authorize Create request after check. The original failure is retained."
+        : "The previous create-request result is uncertain and no matching request is visible. Use Check publication to reconcile it, then explicitly authorize Create request after check with the remaining uncertainty. The original failure is retained.");
   }
   private async launch(
     worker: ForgeWorker,
@@ -3602,7 +3702,12 @@ export class ForgeWorkflowService {
   }
   private async recoverResources(worker: ForgeWorker): Promise<{ tabIds: string[]; executionEnded?: boolean }> {
     const recovered = await this.waitForWorkerIO(worker, "Recovering terminal ownership", () => this.deps.runtime.recover(worker.id));
-    if (recovered.workspace) Object.assign(worker, recovered.workspace);
+    if (recovered.workspace) {
+      for (const key of ["id", "repositoryPath", "worktreePath", "branch"] as const)
+        if (worker[key] !== undefined && worker[key] !== recovered.workspace[key])
+          throw new Error("The recovered workspace identity differs from the saved worker. Inspect ownership before recovering publication.");
+      Object.assign(worker, recovered.workspace);
+    }
     for (const tabId of recovered.tabIds)
       await this.waitForWorkerIO(worker, "Closing recovered terminal and saving context", () => this.deps.runtime.close(tabId));
     if (recovered.tabIds.includes(worker.tabId ?? "")) worker.tabId = undefined;
@@ -4135,4 +4240,10 @@ function feedbackDigest(context: {
       }),
     )
     .digest("hex");
+}
+
+function publicationRecoveryDigest(worker: ForgeWorker): string {
+  return createHash("sha256").update(JSON.stringify({
+    attemptId: worker.completion?.attemptId, report: worker.pendingPublication?.report, handoff: worker.pendingPublication?.handoff,
+  })).digest("hex");
 }

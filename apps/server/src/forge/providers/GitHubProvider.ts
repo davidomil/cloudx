@@ -15,6 +15,7 @@ import type {
   ForgeReviewSubmission,
 } from "@cloudx/shared";
 import { ForgeHttpClient, hasNextPage, pagination } from "./ForgeHttpClient.js";
+import { ForgeRequestFailures } from "./ForgeRequestFailures.js";
 import {
   ForgeDiscussionReplyNotStartedError,
   ForgeHeadChangedError,
@@ -319,8 +320,11 @@ export class GitHubProvider implements ForgeProvider {
   async createChangeRequest(
     input: ForgeCreateChangeRequest,
   ): Promise<ForgeChangeRequestSummary> {
-    validateCreateRequest(input);
-    const response = await this.http.request(`${this.path}/pulls`, {
+    const path = `${this.path}/pulls`;
+    const failures = new ForgeRequestFailures(this.http.repository, "worker", path, "POST", "request");
+    try { validateCreateRequest(input); }
+    catch (error) { throw failures.beforeDispatch(error); }
+    const response = await this.http.request(path, {
       method: "POST",
       role: "worker",
       body: {
@@ -331,10 +335,12 @@ export class GitHubProvider implements ForgeProvider {
         draft: false,
       },
     });
-    return {
-      ...githubIssue(response.body),
-      draft: boolean(record(response.body).draft),
-    };
+    failures.received(response);
+    try {
+      return { ...githubIssue(response.body), draft: boolean(record(response.body).draft) };
+    } catch {
+      throw failures.unreadableResponse(true);
+    }
   }
 
   async updateChangeRequest(number: number, input: { title: string; body: string }): Promise<void> {
@@ -359,19 +365,18 @@ export class GitHubProvider implements ForgeProvider {
     const params = new URLSearchParams({
       state: "all",
       head: `${this.http.repository.projectPath.split("/")[0]}:${headBranch}`,
-      base: baseBranch,
     });
-    const requests = (await this.http.all(`${this.path}/pulls?${params}`))
-      .map(record)
-      .filter((request) => {
-        const head = record(request.head);
-        return (
-          string(head.ref) === headBranch &&
-          string(record(request.base).ref) === baseBranch &&
-          string(record(head.repo).full_name).toLowerCase() ===
-            this.http.repository.projectPath.toLowerCase()
-        );
-      });
+    const requests = (await this.http.all(`${this.path}/pulls?${params}`, { requireCompletePages: true }))
+      .map(record);
+    for (const request of requests) {
+      const head = record(request.head);
+      const base = record(request.base);
+      const repository = this.http.repository.projectPath.toLowerCase();
+      if (string(head.ref) !== headBranch || string(base.ref) !== baseBranch ||
+          string(record(head.repo).full_name).toLowerCase() !== repository ||
+          string(record(base.repo).full_name).toLowerCase() !== repository)
+        throw new ForgeProviderError("The pull request lookup returned a different repository or branch. Reconcile it before continuing.", 409);
+    }
     if (requests.length > 1)
       throw new ForgeProviderError(
         "Multiple pull requests use this worker branch. Reconcile them before continuing.",

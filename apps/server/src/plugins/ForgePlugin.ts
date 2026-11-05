@@ -218,6 +218,23 @@ export class ForgePlugin implements WorkspacePlugin {
         }),
       ),
       hook(
+        "worker.recoverPublication",
+        "Check or recover issue publication",
+        "external",
+        { id, action: { type: "string", enum: ["reconcile", "create"] }, recoveryId: { ...id, pattern: "\\S" }, ...placement },
+        ["id", "action", "windowId", "paneId"],
+        async (input) => ({
+          worker: await this.service().workflow.recoverPublication(String(input.id), {
+            action: input.action as "reconcile" | "create",
+            ...(typeof input.recoveryId === "string" ? { recoveryId: input.recoveryId } : {}),
+          }, place(input)),
+        }),
+        { anyOf: [
+          { properties: { action: { const: "reconcile" } }, not: { required: ["recoveryId"] } },
+          { properties: { action: { const: "create" } }, required: ["recoveryId"] },
+        ] },
+      ),
+      hook(
         "worker.continue",
         "Continue worker with a message",
         "external",
@@ -433,6 +450,7 @@ function hook(
   properties: Record<string, JsonSchemaLike>,
   required: string[],
   execute: HookDefinition["execute"],
+  constraints: JsonSchemaLike = {},
 ): HookDefinition {
   return {
     id: `forge.${name}`,
@@ -446,6 +464,7 @@ function hook(
       properties,
       required,
       additionalProperties: false,
+      ...constraints,
     },
     outputSchema: { type: "object", additionalProperties: true },
     execute,

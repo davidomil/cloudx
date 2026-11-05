@@ -7,7 +7,7 @@ import type { ForgeCredentialRole, ForgeRepository } from "@cloudx/shared";
 import { ConfigService } from "../configService.js";
 import { ForgePlugin } from "../plugins/ForgePlugin.js";
 import type { ForgeCredential } from "./providers/ForgeCredentials.js";
-import { ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
+import { ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
 import {
   ForgeSettingsService,
   forgeConfigFields,
@@ -136,7 +136,11 @@ describe("installation tokens across Forge provider acquisitions", () => {
     await f.settings.provider(repository, "worker").listIssues();
     if (change === "disconnect") {
       f.credentials.delete("worker");
-      await expect(f.settings.provider(repository, "worker").listIssues()).rejects.toThrow("Connect the worker");
+      const dispatched = f.fetcher.mock.calls.length;
+      const request = f.settings.provider(repository, "worker").listIssues();
+      await expect(request).rejects.toThrow("Connect the worker");
+      await expect(request).rejects.toMatchObject({ diagnostic: { phase: "prepare", dispatch: "not_started", failure: "invalid_request" } });
+      expect(f.fetcher).toHaveBeenCalledTimes(dispatched);
     } else {
       f.credentials.set("worker", { kind: "token", token: "replacement-static-token" });
       await f.settings.provider(repository, "worker").listIssues();
@@ -216,7 +220,7 @@ async function fixture() {
       ): ForgeCredential => {
         const credential = credentials.get(role);
         if (!credential)
-          throw new Error(`Connect the ${role} application in Forge settings.`);
+          throw new ForgeProviderError(`Connect the ${role} application in Forge settings.`);
         return credential;
       },
     ),

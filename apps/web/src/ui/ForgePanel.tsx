@@ -436,11 +436,17 @@ function AutoReviewToggle({ enabled, disabled, onChange }: { enabled: boolean; d
 function autoReviewProgress(worker: ForgeWorker) {
   if (!worker.autoReview?.enabled) return undefined;
   if (worker.completion?.continuationRequired) return "Auto review is waiting for implementation. Continue with message to finish the work.";
-  const action = worker.pendingPublication ? "Retry publication" : "Resume";
+  const action = canRecoverPublication(worker) ? "Check publication" : worker.pendingPublication ? "Retry publication" : "Resume";
   if (["paused", "stopped"].includes(worker.status) && worker.ciRepair?.phase === "blocked") return "Auto review is waiting for CI repair. Continue CI repair to start implementation; Resume only rechecks the loop.";
   if (["paused", "stopped"].includes(worker.status)) return `Auto review is enabled. ${action} to continue the loop.`;
   if (["failed", "cleanup_failed"].includes(worker.status)) return `Auto review is waiting for attention. ${action} after resolving the error.`;
   return `Auto review · ${{ implementing: "Implementing changes", reviewing: "Reviewing changes", merging: "Waiting to merge" }[worker.autoReview.phase]}`;
+}
+
+function canRecoverPublication(worker: ForgeWorker) {
+  return worker.kind === "issue" && !worker.changeNumber && !!worker.pendingPublication?.headSha &&
+    ["creating", "uncertain", "not_started", "rejected"].includes(worker.publicationState ?? "") &&
+    ["failed", "paused", "stopped"].includes(worker.status);
 }
 
 type WorkerCardProps = {
@@ -622,7 +628,8 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     candidate.repository.provider === worker.repository.provider && candidate.repository.apiUrl === worker.repository.apiUrl && candidate.repository.projectPath === worker.repository.projectPath);
   const reviewRunning = reviews.some(review => ["starting", "running"].includes(review.status));
   const canPause = !!worker.modelCapacityRecovery?.retryAt || ["starting", "running", "awaiting_publication", "awaiting_merge"].includes(worker.status) || (worker.status === "awaiting_review" && automaticReview);
-  const canResume = !reviewRunning && !worker.completion?.continuationRequired && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
+  const recoverPublication = canRecoverPublication(worker) && !reviewRunning;
+  const canResume = !recoverPublication && !reviewRunning && !worker.completion?.continuationRequired && ["paused", "failed", "stopped", "cleanup_failed", "awaiting_review", "awaiting_merge"].includes(worker.status);
   const pendingPublication = worker.pendingPublication;
   const reportedHandoff = worker.completion?.report?.kind === "issue" && worker.completion.report.handoff?.status === "ready"
     ? worker.completion.report.handoff : undefined;
@@ -683,6 +690,21 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
         id: worker.id, discussionId: uncertainReply.discussionId, headSha: pendingPublication!.headSha, body: uncertainReply.body,
       }))}>Omit reply</ControlButton>
     </section> : null}
+    {!archivedDraft && worker.publicationFailure ? <PublicationFailure failure={worker.publicationFailure} /> : null}
+    {!archivedDraft && (recoverPublication || worker.publicationRecovery) ? <section aria-label="Publication recovery">
+      <p><strong>Publication recovery</strong>{worker.publicationRecovery ? ` · ${worker.publicationRecovery.phase}` : ""}</p>
+      <p>Check the saved repository, owned branch, target branch and pushed commit. Forge can adopt a matching request and continue publication without another implementation turn.</p>
+      {worker.publicationRecovery ? <>
+        <p>Checked: <time dateTime={worker.publicationRecovery.checkedAt}>{new Date(worker.publicationRecovery.checkedAt).toLocaleString()}</time></p>
+        <p><code>{worker.publicationRecovery.headBranch}</code> → <code>{worker.publicationRecovery.baseBranch}</code> · <code>{worker.publicationRecovery.headSha}</code></p>
+        {worker.publicationRecovery.phase === "absent" ? <p className="forge-notice">No matching request was visible at the last check. An empty result does not prove that the previous create request never reached the provider. Create request after check authorizes one new attempt after Forge checks again.</p> : null}
+        {["dispatching", "uncertain"].includes(worker.publicationRecovery.phase) ? <p role="status">A recovery create attempt was recorded. Check publication again before deciding whether another attempt is needed.</p> : null}
+      </> : null}
+      <div className="forge-actions">
+        {recoverPublication ? <ControlButton size="compact" disabled={busy || controlling} onClick={() => void runAction(() => request("forge.worker.recoverPublication", { id: worker.id, action: "reconcile", ...placement }))}><RefreshCw size={14} /> Check publication</ControlButton> : null}
+        {recoverPublication && worker.publicationRecovery?.phase === "absent" ? <ControlButton size="compact" disabled={busy || controlling} onClick={() => void runAction(() => request("forge.worker.recoverPublication", { id: worker.id, action: "create", recoveryId: worker.publicationRecovery!.id, ...placement }))}>Create request after check</ControlButton> : null}
+      </div>
+    </section> : null}
     {!archivedDraft ? <div className="forge-actions">
       {canPause ? <ControlButton size="compact" disabled={controlling} onClick={() => void interruptWorker("pause")}><Pause size={14} /> Pause</ControlButton> : null}
       {canResume ? <ControlButton size="compact" disabled={busy} onClick={() => void runAction(() => request("forge.worker.resume", { id: worker.id, ...placement }))}><Play size={14} /> {worker.pendingPublication ? "Retry publication" : "Resume"}</ControlButton> : null}
@@ -719,6 +741,19 @@ function ActiveWorkerCard({ worker, workers, archivedDraft, request, placement, 
     </summary>
     {card}
   </details>;
+}
+
+function PublicationFailure({ failure }: { failure: NonNullable<ForgeWorker["publicationFailure"]> }) {
+  const outcome = failure.dispatch === "not_started" ? "Request was not dispatched."
+    : failure.dispatch === "rejected" ? `Provider rejected the request${failure.httpStatus ? ` · HTTP ${failure.httpStatus}` : ""}.`
+    : `Write outcome unknown · ${failure.httpStatus ? `provider HTTP ${failure.httpStatus}` : "no provider HTTP response was recorded"}.`;
+  return <section aria-label="Original publication failure">
+    <p><strong>Original publication failure</strong></p>
+    <p>{outcome}</p>
+    <p>{failure.repository.provider} · {failure.repository.projectPath} · <code>{failure.repository.apiUrl}</code></p>
+    <p>{failure.operation} · <code>{failure.method} {failure.path}</code> · {failure.phase} · {failure.failure}{failure.causeCodes.length ? ` · ${failure.causeCodes.join(", ")}` : ""}</p>
+    <p><time dateTime={failure.occurredAt}>{new Date(failure.occurredAt).toLocaleString()}</time> · {failure.elapsedMs} ms</p>
+  </section>;
 }
 
 function PublicationDiagnostics({ publication, waiting }: { publication: NonNullable<ForgeWorker["pendingPublication"]>; waiting: boolean }) {

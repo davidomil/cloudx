@@ -42,6 +42,7 @@ import { ForgeDisposableResources, type ContainerIdentity, type DisposableContai
 import { ForgeSettingsService } from "./ForgeSettingsService.js";
 import { ForgeWorkflowService, type ForgeSettings, type ForgeWorkflowDependencies } from "./ForgeWorkflowService.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
+import { ForgeRequestFailures } from "./providers/ForgeRequestFailures.js";
 import { ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 // @ts-expect-error The standalone update coordinator intentionally has no built-package dependency.
 import { assertTerminalMigrationSafe } from "../../../../scripts/terminal-upgrade-recovery.mjs";
@@ -707,6 +708,42 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
     expect(await fs.readFile(diagnosticsPath)).toEqual(diagnostics);
     expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
     expect(creating).toHaveBeenCalledOnce();
+    expect(fixture.factory.processes).toHaveLength(1);
+    expect(fixture.gitPushes).toHaveLength(1);
+  }, 20_000);
+
+  it("recovers an absent request after DNS failure through the saved native turn and owned remote branch", async () => {
+    const fixture = await LifecycleFixture.create();
+    const started = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    const receipt = await fixture.completedAssistantTurn(started);
+    const diagnosticsPath = path.join(started.worktreePath!, "diagnostics.bin");
+    const diagnostics = Buffer.from([0, 255, 128, 1]);
+    await fs.writeFile(diagnosticsPath, diagnostics);
+    await declareHandoff(receipt, { headSha: receipt.headSha, status: "ready", retainedPaths: ["diagnostics.bin"], details: "Implementation validated; retain diagnostic bytes." });
+    const failures = new ForgeRequestFailures(repository, "worker", "/repos/fixture/cloudx/pulls", "POST", "request");
+    const dns = failures.transport(new TypeError("fetch failed", { cause: Object.assign(new Error("private DNS information"), { code: "EAI_AGAIN" }) }), new AbortController().signal, true);
+    const creating = vi.spyOn(fixture.provider, "createChangeRequest").mockRejectedValueOnce(dns);
+    await fixture.workflow.poll();
+    const interrupted = await fixture.worker(started.id);
+    expect(interrupted).toMatchObject({ status: "failed", publicationState: "uncertain", publicationFailure: { failure: "connection", causeCodes: ["EAI_AGAIN"], dispatch: "unknown" } });
+    expect(interrupted.publicationFailure).not.toHaveProperty("httpStatus");
+    expect(await git(fixture.origin, "rev-parse", started.branch!)).toBe(receipt.headSha);
+    const status = await git(started.worktreePath!, "status", "--porcelain=v1", "--untracked-files=all");
+
+    await fixture.restartWorkflow();
+    await fixture.workflow.resume(started.id, fixture.placement);
+    expect(creating).toHaveBeenCalledTimes(1);
+    const checked = await fixture.workflow.recoverPublication(started.id, { action: "reconcile" }, fixture.placement);
+    expect(checked.publicationRecovery).toMatchObject({ phase: "absent", headSha: receipt.headSha });
+    await fixture.restartWorkflow();
+    const ready = await fixture.workflow.recoverPublication(started.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, fixture.placement);
+    expect(ready).toMatchObject({ status: "awaiting_review", headSha: receipt.headSha, changeNumber: 7, publicationRecovery: { phase: "adopted" } });
+    expect(ready.completion).toEqual(interrupted.completion);
+    expect(ready.publicationFailure).toEqual(interrupted.publicationFailure);
+    expect(await fs.readFile(diagnosticsPath)).toEqual(diagnostics);
+    expect(await git(started.worktreePath!, "status", "--porcelain=v1", "--untracked-files=all")).toBe(status);
+    expect(await git(started.worktreePath!, "rev-parse", "HEAD")).toBe(receipt.headSha);
+    expect(creating).toHaveBeenCalledTimes(2);
     expect(fixture.factory.processes).toHaveLength(1);
     expect(fixture.gitPushes).toHaveLength(1);
   }, 20_000);

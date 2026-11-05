@@ -34,7 +34,7 @@ export class ForgeHttpClient {
   async request(
     path: string,
     options: ForgeRequestOptions = {},
-  ): Promise<{ body: unknown; headers: Headers }> {
+  ): Promise<{ body: unknown; headers: Headers; status: number }> {
     return this.performRequest(path, options);
   }
 
@@ -56,7 +56,7 @@ export class ForgeHttpClient {
     path: string,
     options: ForgeRequestOptions,
     ciLog = false,
-  ): Promise<{ body: unknown; headers: Headers }> {
+  ): Promise<{ body: unknown; headers: Headers; status: number }> {
     const role = options.role ?? this.readRole;
     const method = (options.method ?? "GET").toUpperCase();
     const failures = new ForgeRequestFailures(this.repository, role, path, method, "request", this.onFailure);
@@ -81,12 +81,16 @@ export class ForgeHttpClient {
         (signal): signal is AbortSignal => signal !== undefined,
       ),
     ]);
+    let authorization: Record<string, string>;
+    try {
+      authorization = await this.credentials.headers(role, signal, this.onFailure);
+    } catch (error) {
+      if (error instanceof ForgeProviderError && error.diagnostic) throw error;
+      failures.assertReady(signal);
+      throw failures.beforeDispatch(error);
+    }
     const headers: Record<string, string> = {
-      ...(await this.credentials.headers(
-        role,
-        signal,
-        this.onFailure,
-      )),
+      ...authorization,
       Accept: ciLog && this.repository.provider === "gitlab" ? "text/plain" : options.text ? "application/vnd.github.diff" : "application/json",
       ...(this.repository.provider === "github"
         ? { "X-GitHub-Api-Version": "2026-03-10" }
@@ -158,20 +162,21 @@ export class ForgeHttpClient {
       if (ciLog) {
         const text = await readCiLog(response, secrets, this.repository.projectPath);
         if (signal.aborted) throw signal.reason;
-        return { body: text, headers: response.headers };
+        return { body: text, headers: response.headers, status: response.status };
       }
       const text = await readBoundedBody(response);
       if (signal.aborted) throw signal.reason;
       return {
         body: options.text ? text : text ? (JSON.parse(text) as unknown) : null,
         headers: response.headers,
+        status: response.status,
       };
     } catch (error) {
       throw failures.transport(error, signal, changesRemoteState, true);
     }
   }
 
-  async all(path: string): Promise<unknown[]> {
+  async all(path: string, options: { requireCompletePages?: boolean } = {}): Promise<unknown[]> {
     const values: unknown[] = [];
     for (let page = 1; page <= 20; page++) {
       const response = await this.request(
@@ -179,13 +184,52 @@ export class ForgeHttpClient {
       );
       const items = list(response.body);
       values.push(...items);
-      if (!hasNextPage(response.headers)) return values;
+      const next = options.requireCompletePages
+        ? hasCompleteNextPage(response.headers, this.repository.apiUrl, page)
+        : hasNextPage(response.headers);
+      if (!next) return values;
     }
     throw new ForgeProviderError(
       "This request exceeds 2,000 records. Narrow the scope before continuing.",
       422,
     );
   }
+}
+
+function hasCompleteNextPage(headers: Headers, apiUrl: string, page: number): boolean {
+  const invalidPagination = (): never => {
+    throw new ForgeProviderError("The provider returned incomplete or inconsistent pagination. Reconcile the request before continuing.", 502);
+  };
+  const expectedNext = String(page + 1);
+  const nextHeader = headers.get("x-next-page");
+  if (nextHeader !== null && nextHeader !== "" && nextHeader !== expectedNext) return invalidPagination();
+  if (headers.has("x-page") && headers.get("x-page") !== String(page)) return invalidPagination();
+  if (headers.has("x-per-page") && headers.get("x-per-page") !== "100") return invalidPagination();
+  const totalPages = headers.get("x-total-pages");
+  if (totalPages !== null && (!/^\d{1,9}$/.test(totalPages) || Number(totalPages) < page && !(page === 1 && totalPages === "0")))
+    return invalidPagination();
+  const link = headers.get("link");
+  let nextLink = false;
+  if (link !== null) {
+    if (!link || link.length > 32_768) return invalidPagination();
+    const relations = new Set<string>();
+    for (const part of link.split(/,\s*(?=<)/)) {
+      const match = part.trim().match(/^<([^<>]+)>;\s*rel="(next|prev|first|last)"$/);
+      if (!match || relations.has(match[2])) return invalidPagination();
+      relations.add(match[2]);
+      let url: URL;
+      try { url = new URL(match[1]); } catch { return invalidPagination(); }
+      if (url.origin !== new URL(apiUrl).origin || url.username || url.password || url.hash) return invalidPagination();
+      if (match[2] === "next") {
+        if (url.searchParams.getAll("page").length !== 1 || url.searchParams.get("page") !== expectedNext) return invalidPagination();
+        nextLink = true;
+      }
+    }
+  }
+  if (nextHeader !== null && link !== null && Boolean(nextHeader) !== nextLink) return invalidPagination();
+  const next = Boolean(nextHeader) || nextLink;
+  if (totalPages !== null && next !== (Number(totalPages) > page)) return invalidPagination();
+  return next;
 }
 
 export function pagination(query: ForgeListQuery = {}): {

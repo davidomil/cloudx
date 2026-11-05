@@ -138,8 +138,30 @@ draft.
 Forge tracks one configured repository on the Linux host. Changing its
 settings does not retarget existing workers. **Pause** and **Stop**
 retain unfinished issue work; inspect errors before **Resume**.
-Uncertain publication or review submission requires inspection rather
-than blindly posting again.
+If a completed issue worker has pushed its commit but has no PR/MR,
+select **Check publication**. Forge checks the saved repository, owned
+head branch, target branch, pushed commit and completed handoff. It
+adopts one matching open request and continues publication and review
+without another implementation turn. Ambiguous matches, closed
+requests and changed branch identities stay blocked.
+
+If no matching request is visible, the card offers **Create request
+after check**. An empty lookup does not prove that the previous create
+request never reached the provider. This explicit action authorizes one
+new create attempt. Forge records the choice before dispatch and checks
+the provider again before posting. Concurrent actions cannot reuse a
+consumed authorization. After a restart, Forge checks the provider before dispatch and keeps consumed
+authorizations blocked. Use **Check publication** again after
+an uncertain recovery attempt.
+
+The card keeps the original sanitized publication failure beside the
+recovery state, including transport causes such as `EAI_AGAIN`, request
+phase, dispatch certainty, provider identity and time. An unknown write
+outcome with no provider HTTP response is shown separately from a
+definitive provider HTTP rejection. Publication recovery keeps the
+completed conversation, report, handoff, committed branch and validation.
+Uncertain review submission still requires inspection before posting
+again.
 
 Use the [worker guide](../implementation/forge-workers.md) for
 conflicts, permissions, restart recovery, and cleanup behavior. [Forge

@@ -11,7 +11,7 @@ import {
   ForgeWorkflowService,
   type ForgeWorkflowDependencies,
 } from "./ForgeWorkflowService.js";
-import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError } from "./providers/ForgeProvider.js";
+import { ForgeHeadChangedError, ForgeMergeNotStartedError, ForgeMergeRejectedError, ForgeProviderError, ForgeProviderUnavailableError, type ForgeProvider } from "./providers/ForgeProvider.js";
 import { parseWorkers } from "./ForgeWorkflowValidation.js";
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { ForgeDisposableResources, ForgeEvidenceCompletenessError, type ContainerIdentity, type DisposableContainerHost } from "./ForgeDisposableResources.js";
@@ -21,6 +21,7 @@ import { ForgeBranchConflictError, ForgeHandoffError } from "./ForgeRuntime.js";
 import { GitHubProvider } from "./providers/GitHubProvider.js";
 import { GitLabProvider } from "./providers/GitLabProvider.js";
 import { ForgeHttpClient } from "./providers/ForgeHttpClient.js";
+import { ForgeRequestFailures } from "./providers/ForgeRequestFailures.js";
 import { reviewScopeSummary } from "./ForgeReviewScope.js";
 import { validateReview } from "./providers/reviewValidation.js";
 import { ForgePlugin } from "../plugins/ForgePlugin.js";
@@ -56,9 +57,7 @@ function fixture(issueNumber = 1) {
   const provider = {
     listIssues: vi.fn(),
     listChangeRequests: vi.fn(),
-    findChangeRequestByBranch: vi.fn(
-      async () => undefined as typeof change | undefined,
-    ),
+    findChangeRequestByBranch: vi.fn<ForgeProvider["findChangeRequestByBranch"]>(async () => undefined),
     getIssue: vi.fn(async (_number?: number) => ({ ...issue })),
     getChangeRequestStatus: vi.fn(async () => ({ ...change })),
     getChangeRequest: vi.fn(async () => ({ ...change })),
@@ -123,6 +122,7 @@ function fixture(issueNumber = 1) {
       ...(handoff?.retainedEvidencePaths === undefined ? {} : { retainedEvidencePaths: handoff.retainedEvidencePaths }),
     })),
     verifyPublishedWorkspace: vi.fn(async () => {}),
+    verifyPublicationBranch: vi.fn(async () => {}),
     syncPublishedBranch: vi.fn(async (_workspace: unknown, _local: string, _remote: string, _signal?: AbortSignal) => {}),
     updateIssueBranch: vi.fn(async (_workspace: unknown, head: string, _baseBranch: string, _signal?: AbortSignal) => change.requiresBaseUpdate ? "c".repeat(40) : head),
     prepareIssueRebase: vi.fn(async (_workspace: unknown, head: string, _base: string, _signal?: AbortSignal) => ({ targetHeadSha: "b".repeat(40), originalHeadSha: head })),
@@ -7656,11 +7656,17 @@ describe("Forge issue auto review", () => {
     ])("persists $publication observed by $endpoint through restart and issue closure", async ({ publication, endpoint }) => {
       const f = await resolvingIssue();
       const directory = await fs.mkdtemp(path.join(os.tmpdir(), "forge-merged-publication-"));
-      onTestFinished(() => fs.rm(directory, { recursive: true, force: true }));
       const store = new ForgeWorkflowStore(new PluginDataStore(directory));
+      onTestFinished(async () => {
+        await store.releaseWriter();
+        await fs.rm(directory, { recursive: true, force: true });
+      });
       await store.write(f.stored());
+      const releaseWriter = vi.spyOn(store, "releaseWriter");
       const save = f.deps.store.write;
       f.deps.store = {
+        claimWriter: () => store.claimWriter(),
+        releaseWriter: () => store.releaseWriter(),
         read: () => store.read(),
         write: async workers => { await store.write(workers); await save(workers); },
       };
@@ -7683,12 +7689,14 @@ describe("Forge issue auto review", () => {
       await f.poll();
       expect(f.currentIssue()).toMatchObject({ status: "awaiting_publication", headSha: previousHead,
         pendingPublication: { headSha: publishedHead, previousHeadSha: previousHead } });
+      expect(releaseWriter).not.toHaveBeenCalled();
       const report = f.currentIssue().pendingPublication!.report;
       const launches = f.runtime.launch.mock.calls.length;
       const pushes = f.runtime.publishBranch.mock.calls.length;
       const reviews = f.provider.postReview.mock.calls.length;
 
       await f.service.dispose();
+      expect(releaseWriter).toHaveBeenCalledTimes(1);
       let service = new ForgeWorkflowService(f.deps);
       await service.poll();
       expect(f.currentIssue().status).toBe("awaiting_publication");
@@ -7707,6 +7715,7 @@ describe("Forge issue auto review", () => {
       expect(f.runtime.cleanup).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.oldReview.id }));
 
       await service.dispose();
+      expect(releaseWriter).toHaveBeenCalledTimes(2);
       service = new ForgeWorkflowService(f.deps);
       await service.poll();
       expect(f.currentIssue().status).toBe("paused");
@@ -7727,6 +7736,7 @@ describe("Forge issue auto review", () => {
       expect(f.provider.resolveDiscussion).not.toHaveBeenCalled();
       expect(f.provider.merge).not.toHaveBeenCalled();
       await service.dispose();
+      expect(releaseWriter).toHaveBeenCalledTimes(3);
     });
   });
 
@@ -9613,4 +9623,305 @@ describe("Independent Forge progress during checkout preparation", () => {
     expect(f.runtime.launch.mock.calls.filter(([input]) => input.id === workerId)).toHaveLength(preparation === "rebase" ? 2 : 1);
     expect((await f.service.dashboard()).workers.every(worker => !worker.activity)).toBe(true);
   });
+});
+
+
+describe("Explicit recovery of absent request creation", () => {
+  async function absentPublication(providerKind: "github" | "gitlab" = "github") {
+    const f = fixture();
+    const settings = f.deps.settings();
+    const repository = { ...settings.repository, provider: providerKind, apiUrl: providerKind === "github" ? "https://api.github.com" : "https://gitlab.example/api/v4" };
+    f.deps.settings = () => ({ ...settings, repository });
+    const worker = await f.service.startIssue(repository, 1, placement);
+    const failures = new ForgeRequestFailures(repository, "worker", providerKind === "github" ? "/repos/a/b/pulls" : "/projects/a%2Fb/merge_requests", "POST", "request");
+    const failure = failures.transport(new TypeError("fetch failed", { cause: Object.assign(new Error("private DNS detail"), { code: "EAI_AGAIN" }) }), new AbortController().signal, true);
+    f.provider.createChangeRequest.mockRejectedValueOnce(failure);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    return { ...f, worker };
+  }
+
+  function realRetargetedRequestLookup(f: Awaited<ReturnType<typeof absentPublication>>) {
+    const repository = f.worker.repository;
+    const github = repository.provider === "github";
+    const visibility = { visible: false };
+    const request = github ? {
+      number: 7, title: "Fix", body: "Ready", html_url: "https://github.com/a/b/pull/7", state: "open", labels: [],
+      user: { login: "bot" }, updated_at: "2026-11-04T20:43:55Z", draft: false,
+      head: { ref: f.worker.branch, sha: f.change.headSha, repo: { full_name: "a/b" } },
+      base: { ref: "release", sha: f.change.baseSha, repo: { full_name: "a/b" } },
+    } : {
+      iid: 7, title: "Fix", description: "Ready", web_url: "https://gitlab.example/a/b/-/merge_requests/7", state: "opened", labels: [],
+      author: { username: "bot" }, updated_at: "2026-11-04T20:43:55Z", draft: false,
+      source_branch: f.worker.branch, target_branch: "release", source_project_id: 1, target_project_id: 1,
+    };
+    const fetcher = vi.fn<typeof fetch>(async input => {
+      const url = new URL(String(input));
+      if (!github && decodeURIComponent(url.pathname) === "/api/v4/projects/a/b")
+        return Response.json({ id: 1, path_with_namespace: "a/b" });
+      if (!url.pathname.endsWith(github ? "/pulls" : "/merge_requests"))
+        throw new Error(`Unexpected publication lookup: ${url.pathname}`);
+      const head = url.searchParams.get(github ? "head" : "source_branch");
+      const base = url.searchParams.get(github ? "base" : "target_branch");
+      const matchesHead = head === null || head === (github ? `a:${f.worker.branch}` : f.worker.branch);
+      const matchesBase = base === null || base === "release";
+      return Response.json(visibility.visible && matchesHead && matchesBase ? [request] : []);
+    });
+    const credentials = { headers: async () => ({}), requestDelay: () => undefined, deferRequests: () => {} } as unknown as ConstructorParameters<typeof ForgeHttpClient>[1];
+    const http = new ForgeHttpClient(repository, credentials, fetcher);
+    const provider = github ? new GitHubProvider(http) : new GitLabProvider(http);
+    f.provider.findChangeRequestByBranch.mockImplementation((head, base) => provider.findChangeRequestByBranch(head, base));
+    return visibility;
+  }
+
+  describe.each(["github", "gitlab"] as const)("%s retargeted publication recovery", providerKind => {
+    it.each(["reconcile", "create"] as const)("blocks %s when the same-head request targets release", async action => {
+      const f = await absentPublication(providerKind);
+      const visibility = realRetargetedRequestLookup(f);
+      const original = f.stored()[0];
+      const checked = action === "create" ? await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement) : undefined;
+      if (checked) expect(checked.publicationRecovery?.phase).toBe("absent");
+      visibility.visible = true;
+      const blocked = await f.service.recoverPublication(f.worker.id, {
+        action, ...(checked ? { recoveryId: checked.publicationRecovery!.id } : {}),
+      }, placement);
+      expect(blocked).toMatchObject({ status: "failed", publicationState: "uncertain", error: expect.stringContaining("different repository or branch") });
+      expect(blocked.publicationRecovery).toEqual(checked?.publicationRecovery);
+      expect(blocked.publicationRecovery?.dispatchedAt).toBeUndefined();
+      expect(blocked.changeNumber).toBeUndefined();
+      expect(blocked.pendingPublication).toEqual(original.pendingPublication);
+      expect(blocked.completion).toEqual(original.completion);
+      expect(blocked.publicationFailure).toEqual(original.publicationFailure);
+      expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+      expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+      expect(f.runtime.publishBranch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("retains the DNS cause across Resume and restart, then creates once through explicit recovery", async () => {
+    const f = await absentPublication();
+    const completed = f.stored()[0].completion;
+    await f.service.resume(f.worker.id, placement);
+    expect(f.stored()[0]).toMatchObject({ publicationFailure: { causeCodes: ["EAI_AGAIN"], dispatch: "unknown" } });
+    const restarted = new ForgeWorkflowService(f.deps);
+    const checked = await restarted.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    expect(checked.publicationRecovery).toMatchObject({ phase: "absent", headSha: f.change.headSha });
+    const recovered = await restarted.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement);
+    expect(recovered).toMatchObject({ status: "awaiting_review", changeNumber: 7, publicationRecovery: { phase: "adopted" }, publicationFailure: { causeCodes: ["EAI_AGAIN"] } });
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(2);
+    expect(f.runtime.publishBranch).toHaveBeenCalledTimes(1);
+    expect(f.runtime.verifyPublicationBranch).toHaveBeenCalledTimes(3);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+    expect(f.stored()[0].completion).toEqual(completed);
+    expect(parseWorkers(f.stored())[0]).toEqual(f.stored()[0]);
+    await expect(restarted.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement)).rejects.toThrow();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it("adopts a request that becomes visible after an absence check without repeating the POST", async () => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    f.provider.findChangeRequestByBranch.mockResolvedValue(f.change);
+    const recovered = await f.service.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement);
+    expect(recovered).toMatchObject({ status: "awaiting_review", changeNumber: 7, publicationRecovery: { phase: "adopted" } });
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+  });
+  it.each(["not_started", "rejected", "authentication"] as const)("classifies %s separately and still requires explicit recovery", async outcome => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    const failures = new ForgeRequestFailures(f.deps.settings().repository, "worker", "/repos/a/b/pulls", "POST", outcome === "authentication" ? "authentication" : "request");
+    const error = outcome === "not_started" ? failures.prepare() : outcome === "rejected"
+      ? failures.http({ failure: "rejected", retryable: false, httpStatus: 422 }, true)
+      : failures.transport(Object.assign(new Error("token response lost"), { code: "ECONNRESET" }), new AbortController().signal, true);
+    f.provider.createChangeRequest.mockRejectedValueOnce(error);
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    const dispatch = outcome === "rejected" ? "rejected" : "not_started";
+    expect(f.stored()[0]).toMatchObject({ publicationState: dispatch, publicationFailure: { dispatch } });
+    await f.service.resume(worker.id, placement);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.stored()[0].error).toContain("Check publication");
+    expect(parseWorkers(f.stored())[0].publicationFailure?.dispatch).toBe(dispatch);
+  });
+
+  it.each([
+    { state: "closed", merged: false }, { state: "merged", merged: true },
+    { baseBranch: "release" }, { headBranch: "another-worker" },
+    { headSha: "c".repeat(40) }, { number: 99 },
+  ])("blocks adoption or create when the matching request changes %#", async changed => {
+    const f = await absentPublication();
+    f.provider.findChangeRequestByBranch.mockResolvedValue({ ...f.change });
+    Object.assign(f.change, changed);
+    const blocked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    expect(blocked).toMatchObject({ status: "failed", publicationState: "uncertain" });
+    expect(blocked.changeNumber).toBeUndefined();
+    expect(blocked.publicationRecovery).toBeUndefined();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["Multiple pull requests use this worker branch.", "The provider returned unreadable or incomplete pagination."])("keeps ambiguous and incomplete provider results blocked: %s", async message => {
+    const f = await absentPublication();
+    f.provider.findChangeRequestByBranch.mockRejectedValueOnce(new Error(message));
+    const blocked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    expect(blocked.error).toBe(message);
+    expect(blocked.publicationRecovery).toBeUndefined();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks recovery when the owned remote branch no longer equals the handoff", async () => {
+    const f = await absentPublication();
+    f.runtime.verifyPublicationBranch.mockRejectedValueOnce(new Error("Remote head changed"));
+    const calls = f.provider.findChangeRequestByBranch.mock.calls.length;
+    const blocked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    expect(blocked.error).toBe("Remote head changed");
+    expect(blocked.publicationRecovery).toBeUndefined();
+    expect(f.provider.findChangeRequestByBranch).toHaveBeenCalledTimes(calls);
+  });
+
+  it.each(["repository", "head", "base", "handoff", "report", "id"])("rejects a changed %s after an absence check", async changed => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    const saved = f.stored()[0];
+    if (changed === "repository") { const settings = f.deps.settings(); f.deps.settings = () => ({ ...settings, repository: { ...saved.repository, projectPath: "other/repository" } }); }
+    if (changed === "head") saved.branch = "changed";
+    if (changed === "base") saved.baseBranch = "release";
+    if (changed === "handoff") saved.pendingPublication!.handoff!.retainedPaths = ["notes.txt"];
+    if (changed === "report") saved.pendingPublication!.report.body = "Changed report";
+    await f.deps.store.write([saved]);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.recoverPublication(f.worker.id, { action: "create", recoveryId: changed === "id" ? "stale" : checked.publicationRecovery!.id }, placement)).rejects.toThrow();
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes concurrent recovery and consumes the decision before POST", async () => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    let finish!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    f.provider.createChangeRequest.mockImplementationOnce(async () => {
+      expect(f.stored()[0]).toMatchObject({ publicationState: "creating", publicationRecovery: { id: checked.publicationRecovery!.id, phase: "dispatching", dispatchedAt: expect.any(String) } });
+      started();
+      await held;
+      return f.change;
+    });
+    const action = { action: "create" as const, recoveryId: checked.publicationRecovery!.id };
+    const first = f.service.recoverPublication(f.worker.id, action, placement);
+    await entered;
+    await expect(f.service.recoverPublication(f.worker.id, action, placement)).rejects.toThrow(/already/);
+    finish();
+    await first;
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not repeat a consumed recovery after a lost response and restart", async () => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    f.provider.createChangeRequest.mockRejectedValueOnce(new Error("Response lost again"));
+    const action = { action: "create" as const, recoveryId: checked.publicationRecovery!.id };
+    const uncertain = await f.service.recoverPublication(f.worker.id, action, placement);
+    expect(uncertain.publicationRecovery?.phase).toBe("uncertain");
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.recoverPublication(f.worker.id, action, placement)).rejects.toThrow(/consumed/);
+    await restarted.resume(f.worker.id, placement);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(2);
+    expect(f.stored()[0].publicationFailure?.causeCodes).toEqual(["EAI_AGAIN"]);
+    f.provider.findChangeRequestByBranch.mockResolvedValue(f.change);
+    const adopted = await restarted.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    expect(adopted).toMatchObject({ status: "awaiting_review", changeNumber: 7, publicationRecovery: { phase: "adopted" } });
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles a durable dispatch marker after restart before allowing another create", async () => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    const saved = f.stored()[0];
+    saved.publicationState = "creating";
+    saved.publicationRecovery!.phase = "dispatching";
+    saved.publicationRecovery!.dispatchedAt = new Date().toISOString();
+    await f.deps.store.write([saved]);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement)).rejects.toThrow(/consumed/);
+    await restarted.resume(f.worker.id, placement);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    const reconciled = await restarted.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    expect(reconciled.publicationRecovery?.phase).toBe("absent");
+    expect(reconciled.publicationRecovery?.id).not.toBe(checked.publicationRecovery!.id);
+  });
+
+  it.each([false, true])("cancels recovery without repeating publication (POST dispatched: %s)", async dispatched => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    let finish!: () => void;
+    let started!: () => void;
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const held = new Promise<void>(resolve => { finish = resolve; });
+    if (dispatched) f.provider.createChangeRequest.mockImplementationOnce(async () => { started(); await held; return f.change; });
+    else f.runtime.verifyPublicationBranch.mockImplementationOnce(async () => { started(); await held; });
+    const running = f.service.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement);
+    await entered;
+    const stopping = f.service.stop(f.worker.id);
+    finish();
+    await running;
+    await stopping;
+    expect(f.stored()[0].status).toBe("stopped");
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(dispatched ? 2 : 1);
+    if (dispatched) expect(f.stored()[0]).toMatchObject({ changeNumber: 7, publicationRecovery: { phase: "adopted" } });
+    expect(f.runtime.launch).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a remote change during provider reconciliation before consuming the recovery", async () => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    f.runtime.verifyPublicationBranch.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Remote changed during lookup"));
+    const blocked = await f.service.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement);
+    expect(blocked.error).toBe("Remote changed during lookup");
+    expect(blocked.publicationRecovery?.phase).toBe("absent");
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues exact-head automatic review without replacing the completed implementation", async () => {
+    const f = fixture();
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement, true);
+    f.provider.createChangeRequest.mockRejectedValueOnce(new Error("Response lost"));
+    f.reports.read.mockResolvedValue({ kind: "issue", title: "Fix", body: "Ready" });
+    await f.service.poll();
+    const completed = f.stored()[0].completion;
+    const checked = await f.service.recoverPublication(worker.id, { action: "reconcile" }, placement);
+    const recovered = await f.service.recoverPublication(worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement);
+    expect(recovered).toMatchObject({ status: "awaiting_review", headSha: f.change.headSha, autoReview: { enabled: true, phase: "reviewing" } });
+    await f.service.poll();
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.templateId === "worker")).toHaveLength(1);
+    expect(f.runtime.launch.mock.calls.filter(([input]) => input.templateId === "review")).toHaveLength(1);
+    expect(f.stored().find(saved => saved.id === worker.id)?.completion).toEqual(completed);
+  });
+
+  it.each(["id", "repositoryPath", "worktreePath", "branch"] as const)("rejects %s replaced during resource recovery", async key => {
+    const f = await absentPublication();
+    const checked = await f.service.recoverPublication(f.worker.id, { action: "reconcile" }, placement);
+    f.runtime.recover.mockResolvedValue({ workspace: { id: f.worker.id, repositoryPath: "/repo/work", worktreePath: "/repo/work", branch: "cloudx/forge/test", [key]: "changed" }, tabIds: [] });
+    const blocked = await f.service.recoverPublication(f.worker.id, { action: "create", recoveryId: checked.publicationRecovery!.id }, placement);
+    expect(blocked.error).toContain("workspace identity differs");
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.verifyPublicationBranch).toHaveBeenCalledTimes(1);
+    expect(f.stored()[0][key]).toBe(checked[key]);
+  });
+
+  it.each(["turn", "report", "handoff", "ready"])("requires the saved successful %s before reconciling publication", async missing => {
+    const f = await absentPublication();
+    const saved = f.stored()[0];
+    if (missing === "turn") saved.completion!.turn!.status = "interrupted";
+    if (missing === "report") saved.completion!.report = undefined;
+    if (missing === "ready") saved.completion!.readyAt = undefined;
+    if (missing === "handoff") saved.pendingPublication!.handoff = undefined;
+    await f.deps.store.write([saved]);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await expect(restarted.recoverPublication(f.worker.id, { action: "reconcile" }, placement)).rejects.toThrow(/saved completed turn/);
+    expect(f.provider.createChangeRequest).toHaveBeenCalledTimes(1);
+    expect(f.runtime.verifyPublicationBranch).not.toHaveBeenCalled();
+  });
+
 });

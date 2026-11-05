@@ -10,6 +10,8 @@ import { ForgeConnectionStore, connectionKey } from "./ForgeConnectionStore.js";
 import { ForgeRegistrationClient } from "./ForgeRegistrationClient.js";
 import { registerForgeConnectionRoutes } from "./ForgeConnectionRoutes.js";
 import { ForgeProviderError } from "../providers/ForgeProvider.js";
+import { ForgeCredentials } from "../providers/ForgeCredentials.js";
+import { ForgeHttpClient } from "../providers/ForgeHttpClient.js";
 
 const github: ForgeRepository = { provider: "github", apiUrl: "https://api.github.com", projectPath: "team/project" };
 const gitlab: ForgeRepository = { provider: "gitlab", apiUrl: "https://gitlab.com/api/v4", projectPath: "team/project" };
@@ -50,6 +52,50 @@ async function fixture(repository = github) {
   }
   return { root, store, clock, registration, connections, service, begin };
 }
+
+describe("credential preflight failures", () => {
+  async function expectCredentialNotDispatched(connections: ForgeConnectionService, repository: ForgeRepository, role: ForgeCredentialRole, message: string) {
+    const fetcher = vi.fn<typeof fetch>();
+    const observer = vi.fn();
+    const credentials = new ForgeCredentials(repository, async requestedRole => connections.credential(repository, requestedRole));
+    const http = new ForgeHttpClient(repository, credentials, fetcher, role, undefined, observer);
+    const error = await http.request("/user").catch(error => error);
+    expect(error).toMatchObject({
+      message,
+      diagnostic: { provider: repository.provider, role, phase: "prepare", dispatch: "not_started", failure: "invalid_request" },
+    });
+    expect(observer).toHaveBeenCalledExactlyOnceWith(error.diagnostic);
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(JSON.stringify(error)).not.toMatch(/private-|bot-secret|installation-/);
+    expect(error.cause).toBeUndefined();
+  }
+
+  it.each([github, gitlab].flatMap(repository => (["worker", "reviewer"] as const).map(role => ({ repository, role }))))(
+    "preserves reconnect guidance before dispatch for a disconnected $repository.provider $role",
+    async ({ repository, role }) => {
+      const f = await fixture(repository);
+      await expectCredentialNotDispatched(f.connections, repository, role, `Connect the ${role} application in Forge settings.`);
+    },
+  );
+
+  it("preserves renewal guidance before dispatch for an expired GitLab credential", async () => {
+    const f = await fixture(gitlab);
+    await f.connections.provisionGitLab(gitlab, "setup");
+    f.clock.now = Date.parse("2031-02-01");
+    await expectCredentialNotDispatched(f.connections, gitlab, "worker", "The worker GitLab bot token has expired. Renew its access in Forge settings before starting work.");
+  });
+
+  it("reports incomplete connected credentials before dispatch without exposing the saved application", async () => {
+    const f = await fixture();
+    const start = await f.begin();
+    await f.connections.completeGitHubManifest(start.state, "worker", start.cookie, [origin]);
+    await f.connections.completeGitHubInstallation(start.state, "41", start.cookie, [origin]);
+    const incomplete = f.store.read();
+    delete incomplete[connectionKey(github, "worker")].installationId;
+    vi.spyOn(f.store, "read").mockReturnValue(incomplete);
+    await expectCredentialNotDispatched(f.connections, github, "worker", "Forge application credentials are incomplete.");
+  });
+});
 
 describe("GitHub application connection lifecycle", () => {
   it("validates callback settings before persisting a registration", async () => {

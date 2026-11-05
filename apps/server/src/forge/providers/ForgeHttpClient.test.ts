@@ -61,7 +61,75 @@ describe("CI log evidence paths", () => {
   });
 });
 
+describe("complete publication lookup pages", () => {
+  it("accepts canonical GitHub links but always requests the owned route and filters", async () => {
+    const path = "/repos/owner/repo/pulls?state=all&head=owner%3Abranch&base=main";
+    const fetcher = vi.fn<typeof fetch>(async url => Response.json([], { headers: String(url).endsWith("page=1")
+      ? { link: '<https://api.github.com/repositories/123/pulls?page=2&per_page=100>; rel="next"' } : {} }));
+    expect(await client(fetcher).all(path, { requireCompletePages: true })).toEqual([]);
+    expect(fetcher.mock.calls.map(([url]) => url)).toEqual([
+      `https://api.github.com${path}&per_page=100&page=1`,
+      `https://api.github.com${path}&per_page=100&page=2`,
+    ]);
+  });
+
+  it.each<Record<string, string>>([
+    { "x-next-page": "3" },
+    { "x-next-page": "invalid" },
+    { "x-page": "2" },
+    { "x-per-page": "50" },
+    { "x-total-pages": "2" },
+    { "x-total-pages": "invalid" },
+    { link: "unreadable" },
+    { link: '<https://api.github.com/repositories/123/pulls?page=3>; rel="next"' },
+    { link: '<https://api.github.com/repositories/123/pulls?page=2&page=3>; rel="next"' },
+    { link: '<https://other.example/pulls?page=2>; rel="next"' },
+    { link: '<https://api.github.com/repositories/123/pulls?page=2>; rel="next", <https://api.github.com/repositories/123/pulls?page=2>; rel="next"' },
+    { "x-next-page": "", link: '<https://api.github.com/repositories/123/pulls?page=2>; rel="next"' },
+    { "x-next-page": "2", link: '<https://api.github.com/repositories/123/pulls?page=1>; rel="prev"' },
+    { "x-next-page": "2", "x-total-pages": "1" },
+  ])("blocks incomplete continuation evidence %j", async headers => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json([], { headers }));
+    await expect(client(fetcher).all("/repos/owner/repo/pulls", { requireCompletePages: true })).rejects.toThrow("pagination");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("bounds continued lookup without returning a partial result", async () => {
+    const fetcher = vi.fn<typeof fetch>(async url => Response.json([], { headers: { "x-next-page": String(Number(new URL(String(url)).searchParams.get("page")) + 1) } }));
+    await expect(client(fetcher).all("/repos/owner/repo/pulls", { requireCompletePages: true })).rejects.toThrow("2,000");
+    expect(fetcher).toHaveBeenCalledTimes(20);
+  });
+
+  it.each<Record<string, string>>([
+    {},
+    { "x-next-page": "", "x-page": "1", "x-per-page": "100", "x-total-pages": "0" },
+    { link: '<https://api.github.com/repositories/123/pulls?page=1>; rel="first"', "x-total-pages": "1" },
+  ])("accepts complete final-page evidence %j", async headers => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json([], { headers }));
+    expect(await client(fetcher).all("/repos/owner/repo/pulls", { requireCompletePages: true })).toEqual([]);
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+});
+
 describe("safe Forge request failures", () => {
+  it("proves missing credentials prevented request dispatch while retaining the original status", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const credentials = new ForgeCredentials(repository, async () => undefined);
+    const error = await new ForgeHttpClient(repository, credentials, fetcher).request("/repos/owner/repo/pulls", { method: "POST" }).catch(error => error);
+    expect(error).toMatchObject({ statusCode: 401, diagnostic: { phase: "prepare", dispatch: "not_started", failure: "invalid_request" } });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("excludes an unreadable credential source's raw error from preflight diagnostics", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const credentials = new ForgeCredentials(repository, async () => { throw new Error(privateFailure); });
+    const error = await new ForgeHttpClient(repository, credentials, fetcher).request("/repos/owner/repo/pulls", { method: "POST" }).catch(error => error);
+    expect(error.diagnostic).toMatchObject({ phase: "prepare", dispatch: "not_started" });
+    expect(JSON.stringify(error)).not.toContain("private");
+    expectPrivateFailure(error);
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("measures a timed-out fetch independently of the wall clock and reports the configured deadline", async () => {
     let elapsed = 100;
     vi.spyOn(performance, "now").mockImplementation(() => elapsed);
@@ -159,6 +227,7 @@ describe("safe Forge request failures", () => {
     expect(onFailure).toHaveBeenCalledExactlyOnceWith({
       provider: "github", role: "worker", operation: "request", method: "GET",
       path: "/repos/{owner}/{repo}/pulls/{number}", phase: "fetch", failure, retryable,
+      occurredAt: expect.any(String), dispatch: "unknown",
       causeCodes: code && code !== privateFailure ? [code] : [],
       elapsedMs: expect.any(Number), timeoutMs: 30_000,
     });
@@ -347,6 +416,7 @@ describe("safe Forge request failures", () => {
     const http = new ForgeHttpClient(repository, new ForgeCredentials(repository, read), fetcher);
     const error = await http.request("/repos/owner/repo/pulls", { method: "POST" }).catch(error => error);
     expect(error).toMatchObject({ name: "ForgeProviderUnavailableError", failure: "timeout" });
+    expect(error.diagnostic).toMatchObject({ phase: "prepare", dispatch: "not_started", failure: "timeout" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
