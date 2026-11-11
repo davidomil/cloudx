@@ -57,6 +57,22 @@ const boolean: StatusDefinition = {
 afterEach(() => vi.useRealTimers());
 
 describe("Hardware view decisions", () => {
+  it("names the exact retained owning tab", () => {
+    const owner: HardwareOwner = {
+      kind: "agent",
+      tabId: "owner",
+      providerId: "codex",
+      executionId: "original",
+    };
+    expect(
+      ownerLabel(owner, [
+        { id: "other", title: "Different investigation" },
+        { id: "owner", title: "Camera bring-up" },
+      ]),
+    ).toBe("Codex · Camera bring-up");
+    expect(ownerLabel(owner, [])).toBe("Codex · owner");
+  });
+
   it("compares exact execution and worker identities regardless of key insertion order", () => {
     const owner: HardwareOwner = {
       kind: "agent",

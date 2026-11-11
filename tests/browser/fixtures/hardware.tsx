@@ -1,9 +1,47 @@
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
-import type { WorkspaceTab } from "@cloudx/shared";
+import type { WorkspaceTab, WorkspaceWindow } from "@cloudx/shared";
 import { HardwarePanel } from "../../../apps/web/src/ui/hardware/HardwarePanel.js";
 import { applyCloudxTheme } from "../../../apps/web/src/ui/theme.js";
 import "../../../apps/web/src/styles.css";
+
+const at = "2026-11-11T00:00:00.000Z";
+const codex: WorkspaceTab = {
+  id: "fixture-codex",
+  pluginId: "codex-terminal",
+  title: "Camera bring-up",
+  cwd: "/fixture",
+  status: "running",
+  indicator: { color: "green", label: "Running", updatedAt: at },
+  createdAt: at,
+  updatedAt: at,
+};
+const tabs: WorkspaceTab[] = [
+  codex,
+  {
+    ...codex,
+    id: "fixture-claude",
+    title: "Claude worker",
+    ownerPluginId: "forge",
+    pluginMetadata: { "forge-workers": { workerId: "worker-1" } },
+  },
+];
+const windows: WorkspaceWindow[] = [
+  {
+    id: "camera-lab",
+    name: "Camera lab",
+    defaultCwd: "/fixture",
+    createdAt: at,
+    updatedAt: at,
+    layout: {
+      activePaneId: "camera-pane",
+      root: {
+        type: "pane",
+        pane: { id: "camera-pane", tabIds: [codex.id], activeTabId: codex.id },
+      },
+    },
+  },
+];
 
 function Fixture() {
   const [owner, setOwner] = useState("");
@@ -47,12 +85,7 @@ function Fixture() {
         </output>
       </header>
       <div style={{ flex: 1, minHeight: 0 }}>
-        <HardwarePanel
-          tabs={[
-            { id: "fixture-claude", title: "Claude worker" } as WorkspaceTab,
-          ]}
-          onOpenOwner={setOwner}
-        />
+        <HardwarePanel tabs={tabs} windows={windows} onOpenOwner={setOwner} />
       </div>
     </main>
   );

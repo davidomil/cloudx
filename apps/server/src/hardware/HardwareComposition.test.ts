@@ -113,6 +113,11 @@ describe("Hardware production composition", () => {
       expect(text).toContain("Registered items remain managed when disabled, held, ineligible, or unavailable.");
       expect(text).toContain("A missing helper or failed lookup does not prove that a target is unmanaged.");
       expect(text).toContain("Do not treat a denied reservation or an unknown outcome as permission for raw access to managed hardware.");
+      expect(text).toContain("Release explicitly when work ends, including known failures.");
+      expect(text).toContain("Closing the owning AI tab revokes its managed access and requests automatic release after cleanup.");
+      expect(text).toContain("Reopening the tab requires a new reservation; it cannot inherit the old claim.");
+      expect(text).toContain("The user can release a hold manually from Hardware.");
+      expect(text).toContain("A lost heartbeat, completed turn, idle tab, browser disconnect, or server detach does not release a reservation.");
     }
     expect(rule.text).toContain("reserve a suitable item exclusively");
     expect(rule.text).toContain("Use the exact reservation generation for managed access");

@@ -58,7 +58,10 @@ export function HardwareReadiness({
                   ? "Open this AI tab"
                   : "The owning tab is unavailable"
               }
-              onClick={() => onOpenOwner?.(execution.tabId)}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenOwner?.(execution.tabId);
+              }}
             >
               <ExternalLink size={13} />
               Open owner

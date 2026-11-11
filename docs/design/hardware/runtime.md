@@ -48,7 +48,13 @@ Use SSH Run script, Upload, or Download with explicit deadlines and output bound
 
 ## Release and recover
 
-Close access and release after the task, including known failure. Reservations permit broad task work; follow notes such as Do not reboot. Notes are agent guidance. Failed preparation, unknown transport effects, and unproven owner termination keep the resource held. The Reservations view shows the exact owner and generation. Force release requires the current hold revision, a reason, and acknowledgement when external activity remains unresolved. A replacement execution cannot inherit the old claim.
+Close access and release after the task, including known failure. Reservations permit broad task work; follow notes such as Do not reboot. Notes are agent guidance. Agents must release explicitly when done; an idle tab, completed turn, lost heartbeat, browser disconnect, or server detach does not release a reservation.
+
+Closing the owning AI tab revokes its claims, including claims from earlier executions of that tab. CloudX cancels managed work, closes access, and runs any pending release hook. Successful cleanup clears the lock even when an earlier operation had an unknown outcome; that operation's receipt and history remain available. Failed or unconfirmed cleanup leaves a recovery hold for manual release. Forge workers retain their separate attempt lifecycle.
+
+The Reservations view shows the owner tab's title and available workspace, plus the exact owner and generation in its details. **Open owner** reveals that existing tab, including a tab outside the current workspace or pane. It does not start a replacement execution. A missing tab is unavailable. Reopening a closed tab requires a new reservation and remains blocked while another owner holds the hardware.
+
+The user can release a hold manually. Force release requires the current hold revision, a reason, and acknowledgement when external activity remains unresolved. A replacement execution cannot inherit the old claim.
 
 ## Inspect retained outcomes
 

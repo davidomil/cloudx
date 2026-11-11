@@ -922,7 +922,6 @@ export class SessionStore {
       }
       if (session?.terminate) await session.terminate();
       else if (stopSession) session?.stop?.();
-      if (closingTab && session?.hasExited?.() === true) await this.notifyExecutionEnded(closingTab);
     } catch (error) {
       const message = `Could not close tab: ${error instanceof Error ? error.message : String(error)}`;
       this.updateTab(tabId, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });

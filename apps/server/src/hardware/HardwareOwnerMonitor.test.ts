@@ -2,17 +2,17 @@ import { expect, it, vi } from "vitest";
 import type { AgentOwner, HardwareReservation, WorkspaceTab, WorkspaceTabsUpdate } from "@cloudx/shared";
 import { HardwareOwnerMonitor } from "./HardwareOwnerMonitor.js";
 
-function fixture() {
-  const tab = { id: "agent-1", pluginId: "codex-terminal", status: "running" } as WorkspaceTab;
+function fixture(managed = false) {
+  const tab = { id: "agent-1", pluginId: "codex-terminal", status: "running", ...(managed ? { ownerPluginId: "forge" } : {}) } as WorkspaceTab;
   let owner: AgentOwner = { kind: "agent", tabId: tab.id, providerId: "codex", executionId: "execution-1" };
   let removed: (tab: WorkspaceTab) => void | Promise<void> = () => {};
   let changed: (update: WorkspaceTabsUpdate) => void = () => {};
   const claim = { owner, lastOwnerObservation: "active" } as HardwareReservation;
   let claims = [claim];
   let hardwareChanged = () => {};
-  const hardware = { ownerClaims: vi.fn(() => claims as HardwareReservation[]), ownerEnded: vi.fn(async () => {}), ownerUnknown: vi.fn(async () => {}),
+  const hardware = { ownerClaims: vi.fn(() => claims as HardwareReservation[]), ownerEnded: vi.fn(async () => {}), nativeTabClosed: vi.fn(async (_tabId: string) => {}), ownerUnknown: vi.fn(async () => {}),
     onChange: (listener: () => void) => { hardwareChanged = listener; return () => { hardwareChanged = () => {}; }; } };
-  const contexts = { owner: vi.fn(async () => owner), prepare: vi.fn(async () => undefined), revoke: vi.fn(async () => {}) };
+  const contexts = { owner: vi.fn(async (): Promise<AgentOwner | undefined> => owner), prepare: vi.fn(async () => undefined), revoke: vi.fn(async () => {}) };
   const sessions = { listTabs: () => [tab], onTabRemoved: (listener: typeof removed) => { removed = listener; return () => { removed = () => {}; }; },
     onTabsChange: (listener: typeof changed) => { changed = listener; return () => { changed = () => {}; }; } };
   const monitor = new HardwareOwnerMonitor({ hardware, contexts, sessions, report: error => { throw error; } });
@@ -50,12 +50,37 @@ it("releases only the exact owner supplied by confirmed termination", async () =
   await f.monitor.dispose();
 });
 
-it("treats a lost tab as unknown and shutdown detach as no ownership event", async () => {
+it("revokes the native context before requesting cleanup for an explicitly removed tab", async () => {
   const f = fixture();
+  await f.monitor.start();
+  f.hardware.nativeTabClosed.mockImplementation(async tabId => {
+    expect(f.contexts.revoke).toHaveBeenCalledExactlyOnceWith(tabId);
+  });
+  await f.remove();
+  expect(f.hardware.nativeTabClosed).toHaveBeenCalledExactlyOnceWith("agent-1");
+  expect(f.hardware.ownerEnded).not.toHaveBeenCalled();
+  expect(f.hardware.ownerUnknown).not.toHaveBeenCalled();
+  await f.monitor.dispose();
+  await f.remove();
+  expect(f.hardware.nativeTabClosed).toHaveBeenCalledTimes(1);
+});
+
+it("requests native cleanup even when there is no current observed execution", async () => {
+  const f = fixture();
+  f.contexts.owner.mockResolvedValueOnce(undefined);
+  await f.monitor.start();
+  await f.remove();
+  expect(f.hardware.nativeTabClosed).toHaveBeenCalledExactlyOnceWith("agent-1");
+  await f.monitor.dispose();
+});
+
+it("keeps Forge removal unknown until its runtime confirms exact-attempt quiescence", async () => {
+  const f = fixture(true);
   await f.monitor.start();
   await f.remove();
   expect(f.hardware.ownerUnknown).toHaveBeenCalledExactlyOnceWith(f.owner(), expect.stringContaining("without a matching confirmed"));
   expect(f.hardware.ownerEnded).not.toHaveBeenCalled();
+  expect(f.hardware.nativeTabClosed).not.toHaveBeenCalled();
   expect(f.contexts.revoke).toHaveBeenCalledWith("agent-1");
   await f.monitor.dispose();
   await f.remove();

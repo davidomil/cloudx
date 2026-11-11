@@ -4,12 +4,16 @@ import type {
   HardwareSummary,
   StatusBinding,
   StatusDefinition,
+  WorkspaceTab,
 } from "@cloudx/shared";
 
-export function ownerLabel(owner: HardwareOwner): string {
+export function ownerLabel(
+  owner: HardwareOwner,
+  tabs?: Pick<WorkspaceTab, "id" | "title">[],
+): string {
   return owner.kind === "user"
     ? "You"
-    : `${owner.providerId} · ${owner.workerId ? `worker ${owner.workerId} · attempt ${owner.attemptId}` : owner.tabId}`;
+    : `${owner.providerId === "codex" ? "Codex" : "Claude"} · ${tabs?.find((tab) => tab.id === owner.tabId)?.title ?? (owner.workerId ? `worker ${owner.workerId} · attempt ${owner.attemptId}` : owner.tabId)}`;
 }
 
 export function sameOwner(left: HardwareOwner, right: HardwareOwner): boolean {

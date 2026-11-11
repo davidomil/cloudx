@@ -483,6 +483,340 @@ describe("hardware admission and operation races", () => {
   });
 });
 
+describe("intentional native-tab lease revocation", () => {
+  it("revokes earlier native executions on the same tab while preserving other tabs, human claims, and Forge attempts", async () => {
+    const { service } = await fixture();
+    const target = async (name: string) => {
+      await mutate(service, "hardware.groups.create", { name });
+      const group = (await service.snapshot(user)).groups.find(group => group.name === name)!;
+      return addItem(service, { name, physicalResourceId: group.id, config: { endpoint: name } });
+    };
+    const owners: HardwareOwner[] = [alice, { ...alice, executionId: "earlier-execution" }, bob, user,
+      { ...alice, ownerPluginId: "forge", logicalRunId: "worker", workerId: "worker", attemptId: "attempt" }];
+    for (let index = 0; index < owners.length; index++) {
+      const item = await target(`Target ${index}`);
+      await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Scoped lifecycle" }, owners[index]);
+    }
+    await service.ownerUnknown(alice, "The original client could not be observed.");
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()).toHaveLength(3));
+    expect(service.ownerClaims().map(claim => claim.owner)).toEqual(owners.slice(2));
+    const state = await service.snapshot(user);
+    expect(state.history.filter(event => event.kind === "native_tab_closed")).toHaveLength(2);
+    expect(state.history.some(event => event.kind === "owner_ended")).toBe(false);
+    expect(state.history.some(event => event.kind === "owner_unknown")).toBe(true);
+  });
+
+  it("keeps uncertain receipts but frees an intentionally closed lease after known managed cleanup", async () => {
+    const { service, provider } = await fixture();
+    const close = vi.fn(async () => ({ state: "completed" as const, value: null }));
+    provider.connect = async (_config, context) => {
+      context.registerCleanup(close);
+      return { state: "completed", value: { close, invoke: async () => ({ state: "unknown", error: { code: "LOST_RESULT", message: "The operation result is unavailable." } }) } };
+    };
+    const item = await addItem(service);
+    const original = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Known final cleanup" }, alice)).reservation!;
+    const ref = { reservationId: original.reservationId, generation: original.generation };
+    await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice);
+    expect((await settled(service, operation.receipt, alice)).state).toBe("unknown");
+    close.mockImplementation(async () => {
+      expect(service.ownerClaims()[0].generation).toBeGreaterThan(ref.generation);
+      return { state: "completed", value: null };
+    });
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    expect(close).toHaveBeenCalledOnce();
+    expect((await settled(service, operation.receipt, alice)).state).toBe("unknown");
+    expect((await service.snapshot(user)).items[0].availability).toBe("available");
+  });
+
+  it("cannot let a delayed old invoke or stale generation disturb the next owner", async () => {
+    const { service, provider } = await fixture();
+    let entered!: () => void, complete!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const delayed = new Promise<{ state: "completed"; value: { value: number } }>(resolve => { complete = () => resolve({ state: "completed", value: { value: 42 } }); });
+    provider.connect = async (_config, context) => {
+      const close = async () => ({ state: "completed" as const, value: null });
+      context.registerCleanup(close);
+      return { state: "completed", value: { close, invoke: async () => { entered(); return delayed; } } };
+    };
+    const item = await addItem(service);
+    const original = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Old execution" }, alice)).reservation!;
+    const ref = { reservationId: original.reservationId, generation: original.generation };
+    await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice); await started;
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    const replacement = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Next owner" }, bob)).reservation!;
+    complete(); await delayed; await new Promise(resolve => setImmediate(resolve));
+    await expect(mutate(service, "hardware.release", ref, alice)).rejects.toMatchObject({ code: "STALE_RESERVATION" });
+    await service.ownerEnded(alice);
+    expect(service.ownerClaims()).toEqual([replacement]);
+    expect((await settled(service, operation.receipt, alice)).state).toBe("unknown");
+  });
+
+  it.each(["handle", "failed hook", "unknown hook", "previous failed hook"])("keeps %s cleanup held for manual release", async failure => {
+    const { service, provider, root } = await fixture();
+    const close = async () => failure === "handle" ? { state: "unknown" as const, error: { code: "CLOSE_UNKNOWN", message: "The native handle is still unconfirmed." } } : { state: "completed" as const, value: null };
+    provider.connect = async (_config, context) => { context.registerCleanup(close); return { state: "completed", value: { close, invoke: async () => ({ state: "completed", value: { value: 42 } }) } }; };
+    if (failure === "unknown hook") vi.spyOn(HardwareScriptRunner.prototype, "run").mockResolvedValue({ state: "unknown", exitCode: null, stdout: "", stderr: "", timedOut: true, cancelled: false, cleanupConfirmed: false, errorCode: "TIMEOUT" });
+    const item = await addItem(service, { hooks: { onRelease: { source: `printf attempt >> release-attempts${failure === "handle" ? "" : "; exit 7"}`, cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] } } });
+    const claim = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Manual recovery remains available" }, alice)).reservation!;
+    const ref = { reservationId: claim.reservationId, generation: claim.generation };
+    await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
+    if (failure === "previous failed hook") expect((await settled(service, (await mutate(service, "hardware.release", ref, alice)).receipt, alice)).state).toBe("failed");
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required" }));
+    const held = service.ownerClaims()[0];
+    expect(held.generation).toBeGreaterThan(ref.generation);
+    expect(held.lastOwnerObservation).not.toBe("confirmed_ended");
+    if (failure === "handle") await expect(fs.stat(path.join(root, "release-attempts"))).rejects.toMatchObject({ code: "ENOENT" });
+    if (failure.includes("failed hook")) expect(await fs.readFile(path.join(root, "release-attempts"), "utf8")).toBe("attempt");
+    const override = await mutate(service, "hardware.forceRelease", { target: { kind: "reservation", reservationId: held.reservationId, generation: held.generation }, expectedHoldRevision: held.revision, reason: "The operator inspected and accepts the unresolved cleanup.", acceptUnresolvedExternalActivity: true });
+    expect((await settled(service, override.receipt)).state).toBe("succeeded");
+    expect(service.ownerClaims()).toEqual([]);
+    if (failure.includes("failed hook")) expect(await fs.readFile(path.join(root, "release-attempts"), "utf8")).toBe("attempt");
+  });
+
+  it("runs a pending release hook once when the previous release was cancelled before dispatch", async () => {
+    const { service, root } = await fixture();
+    let entered!: () => void, finish!: (result: HardwareScriptResult) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), preparation = new Promise<HardwareScriptResult>(resolve => { finish = resolve; });
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(function (this: HardwareScriptRunner, script, context, signal) {
+      if (context.purpose === "before_reserve") { entered(); return preparation; }
+      return run.call(this, script, context, signal);
+    });
+    const script = { cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] };
+    const item = await addItem(service, { hooks: { beforeReserve: { ...script, source: "printf preparation" }, onRelease: { ...script, source: "printf release >> releases" } } });
+    const original = await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Close while release is queued" }, alice); await started;
+    await service.ownerEnded(alice);
+    await service.nativeTabClosed("alice");
+    finish({ state: "completed", exitCode: 0, stdout: "preparation", stderr: "", timedOut: false, cancelled: false, cleanupConfirmed: true });
+    await settled(service, original.receipt, alice);
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+  });
+
+  it("does not replay a known completed release hook when only the earlier operation result was uncertain", async () => {
+    const { service, provider, root } = await fixture();
+    provider.connect = async (_config, context) => {
+      const close = async () => ({ state: "completed" as const, value: null }); context.registerCleanup(close);
+      return { state: "completed", value: { close, invoke: async () => ({ state: "unknown", error: { code: "LOST_RESULT", message: "The remote result is unknown." } }) } };
+    };
+    const item = await addItem(service, { hooks: { onRelease: { source: "printf release >> releases", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] } } });
+    const original = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Keep prior evidence" }, alice)).reservation!;
+    const ref = { reservationId: original.reservationId, generation: original.generation };
+    await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
+    await settled(service, (await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice)).receipt, alice);
+    await settled(service, (await mutate(service, "hardware.access.close", ref, alice)).receipt, alice);
+    const held = service.ownerClaims()[0];
+    const previous = await mutate(service, "hardware.forceRelease", { target: { kind: "reservation", ...ref }, expectedHoldRevision: held.revision, reason: "Close handles without accepting the old result", acceptUnresolvedExternalActivity: false });
+    expect(await settled(service, previous.receipt)).toMatchObject({ state: "unknown", result: { diagnostics: { state: "completed" } } });
+    const afterFirstOverride = service.ownerClaims()[0];
+    const skippedHook = await mutate(service, "hardware.forceRelease", { target: { kind: "reservation", reservationId: afterFirstOverride.reservationId, generation: afterFirstOverride.generation }, expectedHoldRevision: afterFirstOverride.revision, reason: "Keep the earlier result held without replaying its completed hook", acceptUnresolvedExternalActivity: false });
+    const skippedReceipt = await settled(service, skippedHook.receipt);
+    expect(skippedReceipt.state).toBe("unknown");
+    expect(skippedReceipt.result?.diagnostics).toBeUndefined();
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+    expect((await settled(service, previous.receipt)).state).toBe("unknown");
+    expect((await settled(service, skippedHook.receipt)).state).toBe("unknown");
+  });
+
+  it("does not let late owner-loss observations or repeated close events cancel intentional cleanup", async () => {
+    const { service, root } = await fixture();
+    const item = await addItem(service, { hooks: { onRelease: { source: "printf release >> releases; while [ ! -f finish-release ]; do sleep 0.02; done", cwd: root, timeoutMs: 5000, maxOutputBytes: 100, credentialRefIds: [] } } });
+    await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Drain explicit closure" }, alice);
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(async () => expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release"));
+    const generation = service.ownerClaims()[0].generation;
+    await service.ownerUnknown(alice, "A delayed observer noticed the removed tab.");
+    await service.nativeTabClosed("alice");
+    expect(service.ownerClaims()[0]).toMatchObject({ state: "releasing", generation });
+    await fs.writeFile(path.join(root, "finish-release"), "done");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+  });
+
+  it("retains confirmed Bash status cleanup when its native tab closes during refresh", async () => {
+    const { service, root } = await fixture();
+    await mutate(service, "hardware.statuses.create", { label: "Online", valueType: "boolean" });
+    const definitionId = (await service.snapshot(user)).statusDefinitions[0].id;
+    const script = { cwd: root, timeoutMs: 5000, maxOutputBytes: 100, credentialRefIds: [] };
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId, source: "command", script: { ...script, source: "if [ -e block-status ]; then printf started > status-started; sleep 10; fi; exit 0" }, maxAgeMs: 60_000, intervalMs: null }],
+      hooks: { onRelease: { ...script, source: "printf release >> releases" } } });
+    const reserved = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Close during an owned Bash status check" }, alice)).reservation!;
+    const ref = { reservationId: reserved.reservationId, generation: reserved.generation };
+    await settled(service, (await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).receipt, alice);
+    const observations = (await service.snapshot(user)).items[0].observations;
+    expect(observations).toMatchObject([{ state: "known", value: true }]);
+    let cancelledStatus: HardwareScriptResult | undefined;
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(async function (this: HardwareScriptRunner, source, context, signal) {
+      const result = await run.call(this, source, context, signal);
+      if (context.purpose === "status" && result.cancelled) cancelledStatus = result;
+      return result;
+    });
+    await fs.writeFile(path.join(root, "block-status"), "wait");
+    const refresh = await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice);
+    await vi.waitFor(async () => expect(await fs.readFile(path.join(root, "status-started"), "utf8")).toBe("started"));
+    await service.nativeTabClosed("alice");
+    const receipt = await settled(service, refresh.receipt, alice);
+    expect(cancelledStatus).toMatchObject({ state: "unknown", cancelled: true, cleanupConfirmed: true });
+    expect(receipt).toMatchObject({ state: "unknown", result: { diagnostics: [{ definitionId, cancelled: true, cleanupConfirmed: true }] } });
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+    expect((await service.snapshot(user)).items[0].observations).toEqual(observations);
+    const replacement = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Use the released target" }, bob)).reservation!;
+    expect(replacement.generation).toBeGreaterThan(ref.generation);
+    await service.nativeTabClosed("alice");
+    await service.ownerEnded(alice);
+    await expect(mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).rejects.toMatchObject({ code: "STALE_RESERVATION" });
+    expect(service.ownerClaims()).toEqual([replacement]);
+    expect((await service.snapshot(user)).items[0].observations).toEqual(observations);
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+  });
+
+  it("retains unconfirmed status cleanup when its native tab closes during refresh", async () => {
+    const { service, root } = await fixture();
+    await mutate(service, "hardware.statuses.create", { label: "Online", valueType: "boolean" });
+    const definitionId = (await service.snapshot(user)).statusDefinitions[0].id;
+    const script = { source: "exit 0", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] };
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId, source: "command", script, maxAgeMs: 60_000, intervalMs: null }],
+      hooks: { onRelease: { ...script, source: "printf forbidden >> releases" } } });
+    const reserved = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Keep unconfirmed local cleanup held" }, alice)).reservation!;
+    const ref = { reservationId: reserved.reservationId, generation: reserved.generation };
+    await settled(service, (await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).receipt, alice);
+    const observations = (await service.snapshot(user)).items[0].observations;
+    let entered!: () => void, finish!: (result: HardwareScriptResult) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), status = new Promise<HardwareScriptResult>(resolve => { finish = resolve; });
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(function (this: HardwareScriptRunner, source, context, signal) {
+      if (context.purpose === "status") { entered(); return status; }
+      return run.call(this, source, context, signal);
+    });
+    const refresh = await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice); await started;
+    await service.nativeTabClosed("alice");
+    finish({ state: "unknown", exitCode: null, stdout: "", stderr: "", timedOut: false, cancelled: true, cleanupConfirmed: false, errorCode: "CLEANUP_UNCONFIRMED" });
+    const receipt = await settled(service, refresh.receipt, alice);
+    expect(receipt).toMatchObject({ state: "unknown", result: { diagnostics: [{ definitionId, cancelled: true, cleanupConfirmed: false }] } });
+    await vi.waitFor(() => expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required" }));
+    expect(service.ownerClaims()[0].generation).toBeGreaterThan(ref.generation);
+    expect((await service.snapshot(user)).items[0].observations).toEqual(observations);
+    await expect(fs.stat(path.join(root, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    { purpose: "before_reserve", cleanupConfirmed: false }, { purpose: "before_reserve", cleanupConfirmed: true },
+    { purpose: "status", cleanupConfirmed: false }, { purpose: "status", cleanupConfirmed: true }
+  ])("requires confirmed $purpose script cleanup ($cleanupConfirmed) before running On release", async ({ purpose, cleanupConfirmed }) => {
+    const { service, root } = await fixture();
+    await mutate(service, "hardware.statuses.create", { label: "Check", valueType: "boolean" });
+    const definitionId = (await service.snapshot(user)).statusDefinitions[0].id;
+    const script = { source: "printf check", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] };
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(function (this: HardwareScriptRunner, source, context, signal) {
+      return context.purpose === purpose ? Promise.resolve({ state: "unknown", exitCode: null, stdout: "", stderr: "", timedOut: true, cancelled: false, cleanupConfirmed, errorCode: "TIMEOUT" }) : run.call(this, source, context, signal);
+    });
+    const item = await addItem(service, { hooks: { ...(purpose === "before_reserve" ? { beforeReserve: script } : {}), onRelease: { ...script, source: "printf release >> releases" } },
+      statuses: purpose === "status" ? [{ revision: 1, definitionId, source: "command", script, maxAgeMs: 60_000, intervalMs: null }] : [] });
+    const reserved = await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Confirm local script cleanup" }, alice);
+    const receipt = purpose === "before_reserve" ? reserved.receipt : (await mutate(service, "hardware.statuses.refresh", { hardwareId: item.id, reservationId: reserved.reservation!.reservationId, generation: reserved.reservation!.generation }, alice)).receipt;
+    expect((await settled(service, receipt, alice)).state).toBe("unknown");
+    await service.nativeTabClosed("alice");
+    if (cleanupConfirmed) {
+      await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+      expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+    } else {
+      await vi.waitFor(() => expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required" }));
+      await expect(fs.stat(path.join(root, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    expect((await settled(service, receipt, alice)).state).toBe("unknown");
+  });
+
+  it("keeps unconfirmed status-script cleanup held across an earlier operator generation change", async () => {
+    const { service, root } = await fixture();
+    await mutate(service, "hardware.statuses.create", { label: "Check", valueType: "boolean" });
+    const definitionId = (await service.snapshot(user)).statusDefinitions[0].id;
+    const script = { source: "printf check", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] };
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(function (this: HardwareScriptRunner, source, context, signal) {
+      return context.purpose === "status" ? Promise.resolve({ state: "unknown", exitCode: null, stdout: "", stderr: "", timedOut: true, cancelled: false, cleanupConfirmed: false, errorCode: "TIMEOUT" }) : run.call(this, source, context, signal);
+    });
+    const item = await addItem(service, { hooks: { onRelease: { ...script, source: "printf release >> releases" } }, statuses: [{ revision: 1, definitionId, source: "command", script, maxAgeMs: 60_000, intervalMs: null }] });
+    const reserved = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Retain earlier local process uncertainty" }, alice)).reservation!;
+    const ref = { reservationId: reserved.reservationId, generation: reserved.generation };
+    await settled(service, (await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).receipt, alice);
+    const held = service.ownerClaims()[0];
+    const overridden = await mutate(service, "hardware.forceRelease", { target: { kind: "reservation", ...ref }, expectedHoldRevision: held.revision, reason: "Keep unresolved activity held", acceptUnresolvedExternalActivity: false });
+    expect((await settled(service, overridden.receipt)).state).toBe("unknown");
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required" }));
+    expect(service.ownerClaims()[0].generation).toBeGreaterThan(ref.generation + 1);
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+  });
+
+  it("does not treat provider operation data as local script cleanup evidence", async () => {
+    const { service, provider } = await fixture();
+    provider.descriptor.operations[0].outputSchema = { type: "object", additionalProperties: true };
+    provider.connect = async (_config, context) => {
+      const close = async () => ({ state: "completed" as const, value: null }); context.registerCleanup(close);
+      return { state: "completed", value: { close, invoke: async () => ({ state: "completed", value: { diagnostics: { state: "unknown", cleanupConfirmed: false } } }) } };
+    };
+    const item = await addItem(service);
+    const original = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Opaque provider output" }, alice)).reservation!;
+    const ref = { reservationId: original.reservationId, generation: original.generation };
+    await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
+    expect((await settled(service, (await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice)).receipt, alice)).state).toBe("succeeded");
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+  });
+
+  it("keeps a restored local script held when a crash prevented cleanup diagnostics from being saved", async () => {
+    const { service, root, registry } = await fixture();
+    let entered!: () => void, finish!: (result: HardwareScriptResult) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), preparation = new Promise<HardwareScriptResult>(resolve => { finish = resolve; });
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(function (this: HardwareScriptRunner, script, context, signal) {
+      if (context.purpose === "before_reserve") { entered(); return preparation; }
+      return run.call(this, script, context, signal);
+    });
+    const script = { cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] };
+    const item = await addItem(service, { hooks: { beforeReserve: { ...script, source: "printf preparing" }, onRelease: { ...script, source: "printf release >> releases" } } });
+    const reserved = await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Crash before local cleanup evidence" }, alice); await started;
+    const interrupted = await fs.readFile(path.join(root, "hardware/state.json"), "utf8");
+    finish({ state: "completed", exitCode: 0, stdout: "", stderr: "", timedOut: false, cancelled: false, cleanupConfirmed: true });
+    await settled(service, reserved.receipt, alice);
+    const restartRoot = path.join(root, "restart"); await fs.mkdir(path.join(restartRoot, "hardware"), { recursive: true });
+    await fs.writeFile(path.join(restartRoot, "hardware/state.json"), interrupted, { mode: 0o600 });
+    const restored = new HardwareService({ dataDir: restartRoot, registry, pathPolicy: new PathPolicy([root]), ownerState: () => "unknown" }); services.push(restored); await restored.init();
+    await restored.nativeTabClosed("alice");
+    await vi.waitFor(() => expect(restored.ownerClaims()[0]).toMatchObject({ state: "recovery_required" }));
+    expect((await restored.snapshot(user)).receipts.find(receipt => receipt.runId === reserved.receipt.runId)).toMatchObject({ state: "unknown" });
+    await expect(fs.stat(path.join(root, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not replay a native-close release hook after interrupted cleanup is restored", async () => {
+    const { service, root, registry } = await fixture();
+    const item = await addItem(service, { hooks: { onRelease: { source: "printf attempt >> release-attempts; while [ ! -f finish-release ]; do sleep 0.02; done", cwd: root, timeoutMs: 5000, maxOutputBytes: 100, credentialRefIds: [] } } });
+    await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Crash during native close" }, alice);
+    await service.nativeTabClosed("alice");
+    await vi.waitFor(async () => expect(await fs.readFile(path.join(root, "release-attempts"), "utf8")).toBe("attempt"));
+    const interrupted = await fs.readFile(path.join(root, "hardware/state.json"), "utf8");
+    await fs.writeFile(path.join(root, "finish-release"), "done");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    const restartRoot = path.join(root, "restart"); await fs.mkdir(path.join(restartRoot, "hardware"), { recursive: true });
+    await fs.writeFile(path.join(restartRoot, "hardware/state.json"), interrupted, { mode: 0o600 });
+    const restored = new HardwareService({ dataDir: restartRoot, registry, pathPolicy: new PathPolicy([root]), ownerState: () => "unknown" }); services.push(restored); await restored.init();
+    expect(restored.ownerClaims()).toMatchObject([{ state: "recovery_required", accessState: "unknown" }]);
+    expect((await restored.snapshot(user)).receipts.some(receipt => receipt.state === "unknown")).toBe(true);
+    expect(await fs.readFile(path.join(root, "release-attempts"), "utf8")).toBe("attempt");
+  });
+});
+
 describe("hardware discovery, observations, and retained evidence", () => {
   it("manages enum/text definitions and unused catalog records with exact revisions", async () => {
     const { service } = await fixture();

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { HardwareAccessContext, HardwareConnection, HardwareTypeProvider } from "@cloudx/plugin-api";
-import { hardwareId, hardwareInteger, hardwareRecord, hardwareText, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type BashScript, type CapabilityTag, type HardwareEndpointInspection, type HardwareFilter, type HardwareItem, type HardwareMutationResult, type HardwareOwner, type HardwareReservation, type HardwareReservationRecord, type HardwareRetentionSettings, type HardwareStateView, type HardwareSummary, type JsonObject, type OperationReceipt, type PhysicalResource, type ProviderOutcome, type ReservationRef, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
+import { hardwareId, hardwareInteger, hardwareRecord, hardwareText, isRecord, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type BashScript, type CapabilityTag, type HardwareEndpointInspection, type HardwareFilter, type HardwareItem, type HardwareMutationResult, type HardwareOwner, type HardwareReservation, type HardwareReservationRecord, type HardwareRetentionSettings, type HardwareStateView, type HardwareSummary, type JsonObject, type OperationReceipt, type PhysicalResource, type ProviderOutcome, type ReservationRef, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
 import type { PathPolicy } from "../pathPolicy.js";
 import { HardwareError, hardwareInput, requireHardware } from "./HardwareError.js";
 import { HardwareScriptRunner, type HardwareScriptResult } from "./HardwareScriptRunner.js";
@@ -25,6 +25,11 @@ interface Endpoint { provider?: HardwareTypeProvider<unknown>; config?: unknown;
 interface Inventory { endpoints: Map<string, Endpoint>; groupKeys: Map<string, string[]>; conflictingGroups: Set<string> }
 interface Task { ref?: ReservationRef; hardwareId: string; controller: AbortController; promise: Promise<void> }
 interface Access { generation: number; connection?: HardwareConnection; cleanup: Array<(signal: AbortSignal) => Promise<ProviderOutcome<null>>> }
+interface RevokedCleanup {
+  runId: string; hardwareId: string; priorRef?: ReservationRef; currentRef?: ReservationRef; checkRunId?: string;
+  generation: number; priorUncertainty: boolean; priorOperationIds: string[]; hook?: BashScript; priorReleaseRunId?: string;
+}
+type RevokedCleanupPolicy = { kind: "operator"; reason: string; acceptUnresolvedExternalActivity: boolean } | { kind: "native_tab_closed"; reason: string };
 
 const now = () => new Date().toISOString();
 const clone = <T>(value: T): T => structuredClone(value);
@@ -335,7 +340,7 @@ export class HardwareService {
     requireHardware(["reservation", "system_check"].includes(String(target.kind)) && typeof input.acceptUnresolvedExternalActivity === "boolean", "INVALID_INPUT", "Choose an exact reservation or check target and an explicit unresolved-activity acknowledgement.");
     fields(target, target.kind === "reservation" ? ["kind", "reservationId", "generation"] : ["kind", "runId", "generation"]);
     const reason = hardwareInput(() => hardwareText(input.reason, "Override reason", 2000));
-    let dispatch: { runId: string; hardwareId: string; priorRef?: ReservationRef; currentRef?: ReservationRef; checkRunId?: string; generation: number; priorUncertainty: boolean; priorOperationIds: string[]; hook?: BashScript } | undefined;
+    let dispatch: RevokedCleanup | undefined;
     const result = await this.change(next => {
       const admitted = this.admit(next, "hardware.forceRelease", input, owner);
       if (admitted.existing) return this.mutationResult(next, admitted.record.receipt);
@@ -358,39 +363,78 @@ export class HardwareService {
       this.addHistory(next, "override_requested", reason, owner, "reservationId" in hold ? hold : undefined, hold.hardwareId);
       return this.mutationResult(next, admitted.record.receipt);
     });
-    if (dispatch) {
-      const work = dispatch;
-      if (work.priorRef) this.cancelTasks(work.priorRef);
-      if (work.checkRunId) this.tasks.get(work.checkRunId)?.controller.abort(new Error("Checking generation revoked by the operator."));
-      this.launch(work.hardwareId, work.runId, work.currentRef, async signal => {
-        let unresolved = work.priorUncertainty;
-        let diagnostics: HardwareScriptResult | undefined;
-        unresolved ||= work.priorOperationIds.some(id => { const receipt = this.state.receipts.find(record => record.receipt.runId === id)?.receipt; return !receipt || ["running", "unknown"].includes(receipt.state) || receipt.state === "failed" && receipt.error?.code === "HOOK_FAILED"; });
-        if (work.priorRef) {
-          try { const closed = await this.closeAccess({ reservationId: work.priorRef.reservationId, generation: this.access.get(work.priorRef.reservationId)?.generation ?? work.priorRef.generation }, signal); unresolved ||= closed.state !== "completed"; }
-          catch { unresolved = true; }
-          if (work.hook) {
-            try {
-              const held = this.currentClaim(work.currentRef!, ["releasing", "recovery_required"]);
-              const hook = await this.runScript(work.hook, held, "on_release", signal);
-              diagnostics = hook; unresolved ||= hook.state !== "completed";
-            } catch { unresolved = true; }
-          }
-        } else if (work.checkRunId) {
-          const check = this.state.receipts.find(record => record.receipt.runId === work.checkRunId)?.receipt;
-          unresolved ||= !check || ["running", "unknown"].includes(check.state);
-        }
-        const accepted = !unresolved || input.acceptUnresolvedExternalActivity === true;
-        const outcome: ProviderOutcome<JsonObject> = accepted ? { state: "completed", value: { released: true, unresolvedActivityAccepted: unresolved, reason } } : { state: "unknown", error: { code: "RECOVERY_REQUIRED", message: "Cleanup remains uncertain. Inspect current activity, then explicitly acknowledge unresolved external activity to clear this hold." } };
-        await this.finish(work.runId, work.currentRef, outcome, (next, held, receipt) => {
-          if (diagnostics) receipt.result = { ...receipt.result, diagnostics: scriptDiagnostics(diagnostics) };
-          if (work.currentRef && held) { if (accepted) next.reservations = next.reservations.filter(record => record !== held); else this.recover(held, outcome.state === "unknown" ? outcome.error.message : "Cleanup is uncertain.", "cleanup"); }
-          if (work.checkRunId) { const check = next.checkHolds.find(record => record.runId === work.checkRunId && record.generation === work.generation); if (check) { if (accepted) next.checkHolds = next.checkHolds.filter(record => record !== check); else { check.state = "recovery_required"; check.revision++; check.recoveryReason = "Operator acknowledgement of unresolved checking activity is required."; } } }
-          this.addHistory(next, accepted ? "override_released" : "override_held", reason, owner, held, work.hardwareId);
-        });
-      });
-    }
+    if (dispatch) this.startRevokedCleanup(dispatch, owner, { kind: "operator", reason, acceptUnresolvedExternalActivity: input.acceptUnresolvedExternalActivity === true });
     return result;
+  }
+
+  private startRevokedCleanup(work: RevokedCleanup, owner: HardwareOwner, policy: RevokedCleanupPolicy): void {
+    if (work.priorRef) this.cancelTasks(work.priorRef);
+    if (work.checkRunId) this.tasks.get(work.checkRunId)?.controller.abort(new Error("Checking generation revoked by the operator."));
+    this.launch(work.hardwareId, work.runId, work.currentRef, async signal => {
+      let unresolved = policy.kind === "operator" && work.priorUncertainty;
+      let diagnostics: HardwareScriptResult | undefined, cleanupConfirmed = false;
+      let hook = work.hook;
+      if (policy.kind === "operator") unresolved ||= work.priorOperationIds.some(id => { const receipt = this.state.receipts.find(record => record.receipt.runId === id)?.receipt; return !receipt || ["running", "unknown"].includes(receipt.state) || receipt.state === "failed" && receipt.error?.code === "HOOK_FAILED"; });
+      else if (work.priorReleaseRunId) {
+        const previous = this.releaseHookOutcome(work.priorReleaseRunId);
+        if (previous !== "pending") hook = undefined;
+        unresolved = previous === "uncertain";
+      }
+      if (work.priorRef) {
+        try {
+          const closed = await this.closeAccess({ reservationId: work.priorRef.reservationId, generation: this.access.get(work.priorRef.reservationId)?.generation ?? work.priorRef.generation }, signal);
+          cleanupConfirmed = closed.state === "completed" && (policy.kind === "operator" || !this.hasUnconfirmedScriptCleanup(work.priorRef.reservationId, work.priorReleaseRunId));
+          unresolved ||= !cleanupConfirmed;
+        }
+        catch { unresolved = true; }
+        if (hook && (policy.kind === "operator" || cleanupConfirmed)) {
+          try {
+            const held = this.currentClaim(work.currentRef!, ["releasing", "recovery_required"]);
+            diagnostics = await this.runScript(hook, held, "on_release", signal);
+            unresolved ||= diagnostics.state !== "completed";
+          } catch { unresolved = true; }
+        }
+      } else if (work.checkRunId) {
+        const check = this.state.receipts.find(record => record.receipt.runId === work.checkRunId)?.receipt;
+        unresolved ||= !check || ["running", "unknown"].includes(check.state);
+      }
+      const accepted = !unresolved || policy.kind === "operator" && policy.acceptUnresolvedExternalActivity;
+      const value: JsonObject = policy.kind === "operator" ? { released: true, unresolvedActivityAccepted: unresolved, reason: policy.reason } : { released: true, nativeTabClosed: true, reason: policy.reason };
+      const outcome: ProviderOutcome<JsonObject> = accepted ? { state: "completed", value } : { state: "unknown", error: { code: "RECOVERY_REQUIRED", message: "Cleanup remains uncertain. Inspect current activity, then explicitly acknowledge unresolved external activity to clear this hold." } };
+      await this.finish(work.runId, work.currentRef, outcome, (next, held, receipt) => {
+        if (diagnostics) receipt.result = { ...receipt.result, diagnostics: scriptDiagnostics(diagnostics) };
+        if (work.currentRef && held) {
+          if (policy.kind === "native_tab_closed") held.accessState = cleanupConfirmed ? "closed" : "unknown";
+          if (accepted) next.reservations = next.reservations.filter(record => record !== held);
+          else this.recover(held, outcome.state === "unknown" ? outcome.error.message : "Cleanup is uncertain.", "cleanup");
+        }
+        if (work.checkRunId) { const check = next.checkHolds.find(record => record.runId === work.checkRunId && record.generation === work.generation); if (check) { if (accepted) next.checkHolds = next.checkHolds.filter(record => record !== check); else { check.state = "recovery_required"; check.revision++; check.recoveryReason = "Operator acknowledgement of unresolved checking activity is required."; } } }
+        this.addHistory(next, policy.kind === "operator" ? accepted ? "override_released" : "override_held" : accepted ? "native_tab_released" : "native_tab_held", policy.reason, owner, held, work.hardwareId);
+      });
+    });
+  }
+
+  private releaseHookOutcome(runId: string): "completed" | "pending" | "uncertain" {
+    const receipt = this.state.receipts.find(record => record.receipt.runId === runId)?.receipt;
+    const diagnostics = receipt?.result?.diagnostics;
+    if (isRecord(diagnostics)) return diagnostics.state === "completed" && diagnostics.cleanupConfirmed === true && diagnostics.exitCode === 0 ? "completed" : "uncertain";
+    if (receipt?.state === "succeeded") return "completed";
+    return receipt?.state === "failed" && receipt.error?.code === "CANCELLED" ? "pending" : "uncertain";
+  }
+
+  private hasUnconfirmedScriptCleanup(reservationId: string, releaseRunId?: string): boolean {
+    const claim = this.state.reservations.find(claim => claim.reservationId === reservationId);
+    if (!claim) return true;
+    return this.state.receipts.some(({ action, receipt }) => {
+      if (receipt.reservation?.reservationId !== reservationId) return false;
+      const diagnostics = receipt.result?.diagnostics;
+      const scripted = action === "hardware.statuses.refresh" || action === "hardware.reserve" && claim.acquiredItem.hooks.beforeReserve ||
+        ["hardware.release", "hardware.forceRelease"].includes(action) && claim.acquiredItem.hooks.onRelease && (receipt.runId === releaseRunId || isRecord(diagnostics));
+      if (!scripted) return false;
+      const results = action === "hardware.statuses.refresh" ? Array.isArray(diagnostics) ? diagnostics : [] : isRecord(diagnostics) ? [diagnostics] : [];
+      return results.some(result => isRecord(result) && result.cleanupConfirmed === false) ||
+        receipt.state === "unknown" && (!results.length || results.some(result => !isRecord(result) || result.cleanupConfirmed !== true));
+    });
   }
 
   private async refresh(input: Record<string, unknown>, owner: HardwareOwner): Promise<HardwareMutationResult> {
@@ -446,12 +490,12 @@ export class HardwareService {
       }
       const outcome: ProviderOutcome<JsonObject> = uncertain ? { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "Status checking process or effects remain uncertain." } } : measurementError ? failure("STATUS_CHECK_FAILED", "A status command returned an invalid or failed observation.") : { state: "completed", value: json({ observations }) };
       await this.finish(work.runId, work.ref, outcome, (next, claim, receipt) => {
+        receipt.result = json({ observations, diagnostics });
         if (work.ref && !claim) return;
         const hold = next.checkHolds.find(hold => hold.runId === work.runId && hold.generation === work.checkGeneration);
         if (!work.ref && !hold) return;
         const current = next.observations[work.item.id] ?? [];
         next.observations[work.item.id] = [...current.filter(old => !observations.some(observation => observation.definitionId === old.definitionId)), ...observations];
-        receipt.result = json({ observations, diagnostics });
         if (hold) { if (uncertain) { hold.state = "recovery_required"; hold.revision++; hold.recoveryReason = "The checking execution has an uncertain outcome."; } else next.checkHolds = next.checkHolds.filter(record => record !== hold); }
       });
     }); }
@@ -611,11 +655,50 @@ export class HardwareService {
     if (this.scheduler) clearInterval(this.scheduler);
   }
 
+  async nativeTabClosed(tabIdValue: string): Promise<void> {
+    if (!this.ready) return;
+    const tabId = hardwareInput(() => hardwareId(tabIdValue, "Closed tab ID"));
+    const reason = "The native tab was closed. Its lease was revoked and managed cleanup was requested.";
+    let dispatch: Array<{ work: RevokedCleanup; owner: HardwareOwner }>;
+    try {
+      dispatch = await this.change(next => {
+        const work: Array<{ work: RevokedCleanup; owner: HardwareOwner }> = [];
+        for (const claim of next.reservations) {
+          if (claim.owner.kind !== "agent" || claim.owner.tabId !== tabId || claim.owner.ownerPluginId || this.hasNativeTabClosure(next, claim)) continue;
+          this.addHistory(next, "native_tab_closed", reason, claim.owner, claim);
+          if (claim.lastOwnerObservation !== "confirmed_ended") claim.lastOwnerObservation = "unknown";
+          claim.lastOwnerObservedAt = now();
+          if (next.receipts.some(record => record.receipt.state === "running" && record.finalCleanupTarget?.kind === "reservation" && sameRef(record.finalCleanupTarget, claim))) continue;
+          const priorRef = refOf(claim), priorReleaseRunId = claim.acquiredItem.hooks.onRelease ? claim.releaseRunId : undefined;
+          const hook = claim.acquiredItem.hooks.onRelease;
+          const admitted = this.admit(next, "hardware.release", { requestId: `native-tab-closed-${randomUUID()}`, ...priorRef }, claim.owner);
+          claim.generation = next.nextGeneration++; claim.revision++; claim.state = "releasing"; claim.updatedAt = now();
+          delete claim.recoveryReason; delete claim.recoveryCause;
+          claim.activeOperationIds.push(admitted.record.receipt.runId);
+          claim.releaseRunId = admitted.record.receipt.runId;
+          admitted.record.receipt.reservation = refOf(claim);
+          work.push({ owner: claim.owner, work: { runId: admitted.record.receipt.runId, hardwareId: claim.hardwareId, priorRef, currentRef: refOf(claim), generation: claim.generation, priorUncertainty: false, priorOperationIds: [], hook, priorReleaseRunId } });
+        }
+        return work;
+      }, true);
+    } catch (error) {
+      if (!(error instanceof HardwareError) || error.code !== "CAPACITY_EXCEEDED") throw error;
+      for (const claim of this.ownerClaims()) if (claim.owner.kind === "agent" && claim.owner.tabId === tabId && !claim.owner.ownerPluginId)
+        await this.requireOperatorCleanupAtCapacity(refOf(claim), claim.owner);
+      return;
+    }
+    for (const { work, owner } of dispatch) this.startRevokedCleanup(work, owner, { kind: "native_tab_closed", reason });
+  }
+
+  private hasNativeTabClosure(state: HardwareStoredState, claim: ReservationRef): boolean {
+    return state.history.some(event => event.kind === "native_tab_closed" && event.reservationId === claim.reservationId);
+  }
+
   async ownerUnknown(candidate: HardwareOwner, reason = "The exact execution owner cannot be confirmed."): Promise<void> {
     if (!this.ready) return;
     const owner = hardwareInput(() => parseHardwareOwner(candidate));
     const refs = await this.change(next => {
-      const held = next.reservations.filter(claim => sameOwner(claim.owner, owner) && claim.lastOwnerObservation !== "confirmed_ended");
+      const held = next.reservations.filter(claim => sameOwner(claim.owner, owner) && claim.lastOwnerObservation !== "confirmed_ended" && !this.hasNativeTabClosure(next, claim));
       for (const claim of held) {
         claim.lastOwnerObservation = "unknown"; claim.lastOwnerObservedAt = now();
         this.recover(claim, reason, claim.recoveryCause ?? "owner");

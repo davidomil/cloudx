@@ -16,7 +16,7 @@ const user: HardwareOwner = { kind: "user", userId: "local" };
 const roots: string[] = [], services: HardwareService[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.allSettled(services.splice(0).map(service => service.dispose())); for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true }); });
 
-async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresolvedBytes?: number; stateBytes?: number; interruptedFinal?: boolean; missingReleaseCredential?: boolean; unknownConnection?: boolean; maximumTarget?: boolean; cleanupBarrier?: boolean; restartSiblings?: boolean } = {}) {
+async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresolvedBytes?: number; stateBytes?: number; interruptedFinal?: boolean; missingReleaseCredential?: boolean; unknownConnection?: boolean; maximumTarget?: boolean; cleanupBarrier?: boolean; restartSiblings?: boolean; nativeOwner?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hardware-capacity-")); roots.push(root);
   const at = new Date().toISOString();
   const state = emptyHardwareState();
@@ -66,6 +66,11 @@ async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresol
       state.receipts.push({ owner: user, action: "hardware.forceRelease", digest: "0".repeat(64), finalCleanupTarget: { kind: "reservation", reservationId: claim.reservationId, generation: claim.generation }, receipt: { requestId: "interrupted-final", runId: "interrupted-final-run", state: "running", startedAt: at, reservation: { reservationId: claim.reservationId, generation: claim.generation } } });
     }
   }
+  if (options.nativeOwner) for (const claim of state.reservations) {
+    claim.owner = { kind: "agent", tabId: "native-tab", providerId: "codex", executionId: `native-${claim.reservationId}` };
+    claim.state = "active"; claim.lastOwnerObservation = "active";
+    delete claim.recoveryReason; delete claim.recoveryCause;
+  }
   const text = `${JSON.stringify(state)}\n`;
   expect(Buffer.byteLength(text)).toBeLessThan(64 * 1024 * 1024);
   console.info(`Full receipt fixture: ${state.receipts.length} identities, ${Buffer.byteLength(text)} bytes.`);
@@ -77,7 +82,7 @@ async function fullReceiptIndex(options: { receiptCount?: number; escapedUnresol
     connect: async (_config, context) => { const close = async () => ({ state: "completed" as const, value: null }); context.registerCleanup(close); cleanupRegistrations++; return options.unknownConnection ? { state: "unknown", error: { code: "OPEN_UNKNOWN", message: "Connection setup has an unknown outcome." } } : { state: "completed", value: { close, invoke: async () => ({ state: "completed", value: {} }) } }; },
   };
   const registry = { values: () => [provider], get: () => provider };
-  const service = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]), ...(options.restartSiblings ? { ownerState: () => "active" as const } : {}) }); services.push(service); await service.init();
+  const service = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]), ...(options.restartSiblings || options.nativeOwner ? { ownerState: () => "active" as const } : {}) }); services.push(service); await service.init();
   return { service, root, registry, originalInput, cleanupRegistrations: () => cleanupRegistrations };
 }
 
@@ -92,6 +97,27 @@ async function settle(service: HardwareService, receipt: OperationReceipt, owner
 const execute = (service: HardwareService, action: string, input: Record<string, unknown>) => service.execute(action, input, user) as Promise<HardwareMutationResult>;
 
 describe("Hardware retained-request capacity", () => {
+  it("uses cleanup capacity for every prior native-tab claim at the retained-request quota", async () => {
+    const { service, root } = await fullReceiptIndex({ nativeOwner: true });
+    await service.nativeTabClosed("native-tab");
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]), { timeout: 10_000 });
+    const saved = JSON.parse(await fs.readFile(path.join(root, "hardware/state.json"), "utf8"));
+    expect(saved.receipts).toHaveLength(100_002);
+    expect(saved.receipts.slice(-2).map((record: { action: string; receipt: OperationReceipt }) => [record.action, record.receipt.state])).toEqual([["hardware.release", "succeeded"], ["hardware.release", "succeeded"]]);
+    expect(saved.checkHolds).toHaveLength(1);
+  }, 30_000);
+
+  it("keeps native-tab cleanup available for manual release when only final operator capacity remains", async () => {
+    const { service } = await fullReceiptIndex({ receiptCount: 1, stateBytes: HARDWARE_STATE_BYTES - 544 * 1024, nativeOwner: true });
+    await service.nativeTabClosed("native-tab");
+    const held = service.ownerClaims()[0];
+    expect(held).toMatchObject({ state: "recovery_required", lastOwnerObservation: "active" });
+    expect(held.recoveryReason).toContain("capacity");
+    const released = await execute(service, "hardware.forceRelease", { requestId: "manual-after-native-close-capacity", target: { kind: "reservation", reservationId: held.reservationId, generation: held.generation }, expectedHoldRevision: held.revision, reason: "The operator accepts final cleanup at capacity.", acceptUnresolvedExternalActivity: true });
+    expect((await settle(service, released.receipt)).state).toBe("succeeded");
+    expect(service.ownerClaims()).toEqual([]);
+  }, 30_000);
+
   it("rejects fresh work and skips scheduled checks without poisoning a valid full index", async () => {
     const { service, root, originalInput } = await fullReceiptIndex();
     const before = await fs.readFile(path.join(root, "hardware/state.json"), "utf8");

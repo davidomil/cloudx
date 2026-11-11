@@ -64,9 +64,11 @@ Release first prevents new operations, then drains or cancels managed access, cl
 
 ## Monitor tabs and workers
 
-Owner observation shows active, confirmed ended, or unknown. The view includes last observed time and a link to the exact tab or worker when it still exists. Heartbeats and browser connectivity are diagnostic signals. They do not expire a reservation.
+Owner observation shows active, confirmed ended, or unknown. The view includes last observed time, the owner tab title and available workspace, and a link that reveals the exact retained tab or worker. An ordinary tab outside every pane is placed explicitly when opened. A missing tab is unavailable; navigation does not create or relaunch an execution. Heartbeats and browser connectivity are diagnostic signals. They do not expire a reservation.
 
-Explicit owner release is the normal path. Confirmed tab termination or confirmed Forge-attempt quiescence requests the same cleanup path automatically. Idle tabs, a completed conversational turn, browser disconnects, missing PIDs, and server session detach do not prove that work ended. If lifecycle evidence or remote effects remain uncertain, keep the resource held and show why.
+Explicit owner release is the normal path. Closing an ordinary AI tab intentionally revokes all native claims for that tab, including claims from earlier executions. Revoke its helper capability and reservation generations before managed cleanup. Clear the lock after managed access closes and any pending release hook succeeds, while preserving earlier unknown receipts and history. A missing terminal does not prevent this explicit close path and is not proof of process termination. Failed or unconfirmed cleanup retains a visible hold for manual force release.
+
+Confirmed execution termination and confirmed Forge-attempt quiescence can also request cleanup. Idle tabs, a completed conversational turn, browser disconnects, missing PIDs, and server session detach do not release a claim. Passive loss of lifecycle evidence or uncertain remote effects keeps the resource held until explicit tab closure or operator recovery.
 
 Restart reconciliation preserves exact surviving claims. Do not transfer them to a new provider execution, fork, or replacement worker attempt automatically. A resumed logical task must finish release or request operator recovery and then acquire a new claim. This avoids introducing a second ownership-transfer protocol in the first version.
 
