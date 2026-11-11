@@ -490,12 +490,12 @@ export class HardwareService {
       }
       const outcome: ProviderOutcome<JsonObject> = uncertain ? { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "Status checking process or effects remain uncertain." } } : measurementError ? failure("STATUS_CHECK_FAILED", "A status command returned an invalid or failed observation.") : { state: "completed", value: json({ observations }) };
       await this.finish(work.runId, work.ref, outcome, (next, claim, receipt) => {
+        receipt.result = json({ observations, diagnostics });
         if (work.ref && !claim) return;
         const hold = next.checkHolds.find(hold => hold.runId === work.runId && hold.generation === work.checkGeneration);
         if (!work.ref && !hold) return;
         const current = next.observations[work.item.id] ?? [];
         next.observations[work.item.id] = [...current.filter(old => !observations.some(observation => observation.definitionId === old.definitionId)), ...observations];
-        receipt.result = json({ observations, diagnostics });
         if (hold) { if (uncertain) { hold.state = "recovery_required"; hold.revision++; hold.recoveryReason = "The checking execution has an uncertain outcome."; } else next.checkHolds = next.checkHolds.filter(record => record !== hold); }
       });
     }); }

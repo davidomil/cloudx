@@ -641,6 +641,74 @@ describe("intentional native-tab lease revocation", () => {
     expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
   });
 
+  it("retains confirmed Bash status cleanup when its native tab closes during refresh", async () => {
+    const { service, root } = await fixture();
+    await mutate(service, "hardware.statuses.create", { label: "Online", valueType: "boolean" });
+    const definitionId = (await service.snapshot(user)).statusDefinitions[0].id;
+    const script = { cwd: root, timeoutMs: 5000, maxOutputBytes: 100, credentialRefIds: [] };
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId, source: "command", script: { ...script, source: "if [ -e block-status ]; then printf started > status-started; sleep 10; fi; exit 0" }, maxAgeMs: 60_000, intervalMs: null }],
+      hooks: { onRelease: { ...script, source: "printf release >> releases" } } });
+    const reserved = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Close during an owned Bash status check" }, alice)).reservation!;
+    const ref = { reservationId: reserved.reservationId, generation: reserved.generation };
+    await settled(service, (await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).receipt, alice);
+    const observations = (await service.snapshot(user)).items[0].observations;
+    expect(observations).toMatchObject([{ state: "known", value: true }]);
+    let cancelledStatus: HardwareScriptResult | undefined;
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(async function (this: HardwareScriptRunner, source, context, signal) {
+      const result = await run.call(this, source, context, signal);
+      if (context.purpose === "status" && result.cancelled) cancelledStatus = result;
+      return result;
+    });
+    await fs.writeFile(path.join(root, "block-status"), "wait");
+    const refresh = await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice);
+    await vi.waitFor(async () => expect(await fs.readFile(path.join(root, "status-started"), "utf8")).toBe("started"));
+    await service.nativeTabClosed("alice");
+    const receipt = await settled(service, refresh.receipt, alice);
+    expect(cancelledStatus).toMatchObject({ state: "unknown", cancelled: true, cleanupConfirmed: true });
+    expect(receipt).toMatchObject({ state: "unknown", result: { diagnostics: [{ definitionId, cancelled: true, cleanupConfirmed: true }] } });
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+    expect((await service.snapshot(user)).items[0].observations).toEqual(observations);
+    const replacement = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Use the released target" }, bob)).reservation!;
+    expect(replacement.generation).toBeGreaterThan(ref.generation);
+    await service.nativeTabClosed("alice");
+    await service.ownerEnded(alice);
+    await expect(mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).rejects.toMatchObject({ code: "STALE_RESERVATION" });
+    expect(service.ownerClaims()).toEqual([replacement]);
+    expect((await service.snapshot(user)).items[0].observations).toEqual(observations);
+    expect(await fs.readFile(path.join(root, "releases"), "utf8")).toBe("release");
+  });
+
+  it("retains unconfirmed status cleanup when its native tab closes during refresh", async () => {
+    const { service, root } = await fixture();
+    await mutate(service, "hardware.statuses.create", { label: "Online", valueType: "boolean" });
+    const definitionId = (await service.snapshot(user)).statusDefinitions[0].id;
+    const script = { source: "exit 0", cwd: root, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] };
+    const item = await addItem(service, { statuses: [{ revision: 1, definitionId, source: "command", script, maxAgeMs: 60_000, intervalMs: null }],
+      hooks: { onRelease: { ...script, source: "printf forbidden >> releases" } } });
+    const reserved = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Keep unconfirmed local cleanup held" }, alice)).reservation!;
+    const ref = { reservationId: reserved.reservationId, generation: reserved.generation };
+    await settled(service, (await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice)).receipt, alice);
+    const observations = (await service.snapshot(user)).items[0].observations;
+    let entered!: () => void, finish!: (result: HardwareScriptResult) => void;
+    const started = new Promise<void>(resolve => { entered = resolve; }), status = new Promise<HardwareScriptResult>(resolve => { finish = resolve; });
+    const run = HardwareScriptRunner.prototype.run;
+    vi.spyOn(HardwareScriptRunner.prototype, "run").mockImplementation(function (this: HardwareScriptRunner, source, context, signal) {
+      if (context.purpose === "status") { entered(); return status; }
+      return run.call(this, source, context, signal);
+    });
+    const refresh = await mutate(service, "hardware.statuses.refresh", { ...ref, hardwareId: item.id }, alice); await started;
+    await service.nativeTabClosed("alice");
+    finish({ state: "unknown", exitCode: null, stdout: "", stderr: "", timedOut: false, cancelled: true, cleanupConfirmed: false, errorCode: "CLEANUP_UNCONFIRMED" });
+    const receipt = await settled(service, refresh.receipt, alice);
+    expect(receipt).toMatchObject({ state: "unknown", result: { diagnostics: [{ definitionId, cancelled: true, cleanupConfirmed: false }] } });
+    await vi.waitFor(() => expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required" }));
+    expect(service.ownerClaims()[0].generation).toBeGreaterThan(ref.generation);
+    expect((await service.snapshot(user)).items[0].observations).toEqual(observations);
+    await expect(fs.stat(path.join(root, "releases"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it.each([
     { purpose: "before_reserve", cleanupConfirmed: false }, { purpose: "before_reserve", cleanupConfirmed: true },
     { purpose: "status", cleanupConfirmed: false }, { purpose: "status", cleanupConfirmed: true }
