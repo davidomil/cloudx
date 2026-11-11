@@ -110,6 +110,15 @@
 .hardware-content {
   flex: 1;
 }
+.hardware-owner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  margin-top: 5px;
+  max-width: 320px;
+  overflow-wrap: anywhere;
+}
 .hardware-panel input,
 .hardware-panel select,
 .hardware-panel textarea {

@@ -57,14 +57,18 @@ it("reports the original exact execution after termination and before a provider
   expect(f.sessions.agentLineage(f.tab.id).executionId).toBe("execution-2");
 });
 
-it("reports confirmed restart, stop, and close without assigning their replacement execution", async () => {
+it("reports confirmed restart and stop but treats tab close as a separate lease-revocation event", async () => {
   const f = await fixture();
   await f.sessions.restartTab(f.tab.id);
   expect(f.ended.mock.calls[0]?.[1].executionId).toBe("execution-1");
   await f.sessions.executePluginAction(f.tab.id, "stop", {});
   expect(f.ended.mock.calls[1]?.[1].executionId).toBe("execution-2");
+  f.ended.mockClear();
+  const removed = vi.fn();
+  f.sessions.onTabRemoved(removed);
   await f.sessions.closeTab(f.tab.id);
-  expect(f.ended.mock.calls.at(-1)?.[1].executionId).toBe("execution-2");
+  expect(removed).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.tab.id }));
+  expect(f.ended).not.toHaveBeenCalled();
 });
 
 it("does not report confirmed termination when process termination fails or the server detaches", async () => {

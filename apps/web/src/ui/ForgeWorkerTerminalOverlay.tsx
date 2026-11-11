@@ -9,8 +9,9 @@ import { ControlButton } from "./Control.js";
 const TerminalPanel = lazy(() => import("./TerminalPanel.js").then(module => ({ default: module.TerminalPanel })));
 const ForgeWorkerHistoryPanel = lazy(() => import("./ForgeWorkerHistoryPanel.js").then(module => ({ default: module.ForgeWorkerHistoryPanel })));
 
-export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, uiScale, onClose, onOpenBlackboard }: {
+export function ForgeWorkerTerminalOverlay({ worker, ownerTabId, workerTabs, loadHistory, uiScale, onClose, onOpenBlackboard }: {
   worker: ForgeWorker;
+  ownerTabId?: string;
   workerTabs: WorkspaceTab[];
   loadHistory: (id: string) => Promise<ForgeWorkerHistory | undefined>;
   uiScale: number;
@@ -22,9 +23,9 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
   const dialogRef = useRef<HTMLDialogElement>(null);
   const terminalRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
-  const terminal = workerTabs.find(tab => tab.id === worker.tabId && tab.ownerPluginId === "forge" && isAgentTab(tab) && tab.pluginMetadata?.["forge-workers"]?.workerId === worker.id);
+  const terminal = workerTabs.find(tab => tab.id === (ownerTabId ?? worker.tabId) && tab.ownerPluginId === "forge" && isAgentTab(tab) && tab.pluginMetadata?.["forge-workers"]?.workerId === worker.id);
   const [saved, setSaved] = useState<{ history?: ForgeWorkerHistory; error?: string }>();
-  const needsHistory = !terminal && worker.status !== "starting";
+  const needsHistory = !terminal && !ownerTabId && worker.status !== "starting";
 
   useEffect(() => {
     setSaved(undefined);
@@ -50,16 +51,17 @@ export function ForgeWorkerTerminalOverlay({ worker, workerTabs, loadHistory, ui
     if (terminal && terminalRef.current?.contains(document.activeElement)) event.preventDefault();
   }} onClose={event => { if (!event.currentTarget.open) onClose(); }}>
     <header className="forge-worker-overlay-header" {...(terminal ? blackboardMenu.tabHandlers(terminal) : {})}>
-      <div tabIndex={terminal && (onOpenBlackboard || terminal.nativeWork) ? 0 : undefined}><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {worker.title}</h2><p>{worker.status.replaceAll("_", " ")}</p></div>
+      <div tabIndex={terminal && (onOpenBlackboard || terminal.nativeWork) ? 0 : undefined}><h2 id={titleId}>{worker.batch ? "Batch" : `${worker.kind === "issue" ? "Issue" : "Review"} #${worker.number}`} · {ownerTabId && terminal ? terminal.title : worker.title}</h2><p>{ownerTabId ? `Reserved owner tab · ${terminal?.status ?? "unavailable"}` : worker.status.replaceAll("_", " ")}</p></div>
       {terminal && onOpenBlackboard ? (() => { const board = blackboards.boards.find(board => board.members.some(member => member.tabId === terminal.id)); return board ? <ControlButton size="compact" aria-label={`Open blackboard ${board.title}`} onClick={() => { dialogRef.current?.close(); onOpenBlackboard(board.boardId, board.title); }}><Monitor size={14} />{board.title}</ControlButton> : null; })() : null}
       <ControlButton size="compact" iconOnly aria-label="Close worker terminal" title="Close worker terminal" onClick={() => dialogRef.current!.close()}><X size={18} /></ControlButton>
     </header>
-    {worker.error ? <p className="forge-notice" role="alert">{worker.error}</p> : null}
+    {ownerTabId ? terminal?.statusMessage ? <p className="forge-notice" role="alert">{terminal.statusMessage}</p> : null : worker.error ? <p className="forge-notice" role="alert">{worker.error}</p> : null}
     {needsHistory && history ? <p className="forge-worker-history-caption">Latest saved terminal · read only · <time dateTime={history.capturedAt}>{new Date(history.capturedAt).toLocaleString()}</time></p> : null}
     <div ref={terminalRef} className="forge-worker-overlay-terminal">
       {terminal ? <Suspense fallback={<p role="status" className="forge-empty">Loading worker terminal…</p>}>
         <TerminalPanel key={terminal.id} tab={terminal} active uiScale={uiScale} />
-      </Suspense> : !needsHistory ? <p role="status" className="forge-empty">Preparing the worker terminal…</p>
+      </Suspense> : ownerTabId ? <p role="status" className="forge-empty">The original Hardware owner tab is no longer available.</p>
+        : !needsHistory ? <p role="status" className="forge-empty">Preparing the worker terminal…</p>
         : !saved ? <p role="status" className="forge-empty">Loading worker history…</p>
         : saved.error ? <p role="alert" className="forge-empty">{saved.error}</p>
         : history ? <Suspense fallback={<p role="status" className="forge-empty">Loading worker history…</p>}>

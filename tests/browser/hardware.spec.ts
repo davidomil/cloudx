@@ -1236,7 +1236,7 @@ test("status editor identifies the selected alias hold and keeps reservations lo
     .locator(".hardware-panel")
     .getByRole("status")
     .filter({ hasText: "Reserved by" });
-  await expect(banner).toContainText("claude");
+  await expect(banner).toContainText("Claude");
   await expect(banner).toContainText("Worker status validation");
   await expect(banner).toContainText("Held through Atlas SSH");
   await expect(label(page, "Enable Before reserve")).toBeDisabled();
@@ -1553,6 +1553,113 @@ test("status bindings, exact manual values and real Bash reservation hooks work"
   );
 });
 
+test("owner titles and workspaces identify the exact tab while manual operator reservations stay independent", async ({
+  page,
+}, info) => {
+  const owner = {
+    kind: "agent" as const,
+    tabId: "fixture-codex",
+    providerId: "codex" as const,
+    executionId: "reserved-codex-execution",
+  };
+  await lab.mutate(
+    "hardware.reserve",
+    {
+      hardwareId: lab.ssh.id,
+      expectedItemRevision: lab.ssh.revision,
+      purpose: "Camera bring-up validation",
+    },
+    owner,
+  );
+  const reserved = (await lab.service.snapshot(operator)).reservations[0]!;
+  agentReadiness = [
+    {
+      tabId: owner.tabId,
+      providerId: owner.providerId,
+      executionId: "current-codex-execution",
+      state: "ready",
+    },
+  ];
+  await refresh(page);
+  const row = page
+    .locator(".hardware-inventory-list tbody tr")
+    .filter({ hasText: "Atlas SSH" });
+  await expect(row).toContainText("Codex · Camera bring-up");
+  await expect(row).toContainText("Camera lab");
+  await row
+    .getByRole("button", { name: "Open owner tab", exact: true })
+    .click();
+  await expect(page.locator("output")).toHaveText(
+    "Opened owner: fixture-codex",
+  );
+  await button(page, "Select Atlas SSH").click();
+  const inspector = page.getByRole("complementary", {
+    name: "Atlas SSH details",
+    exact: true,
+  });
+  await expect(inspector).toContainText("Codex · Camera bring-up");
+  await expect(inspector).toContainText("Camera lab");
+  await inspector
+    .getByRole("button", { name: "Open owner tab", exact: true })
+    .click();
+  await button(page, "Close item details").click();
+  await button(page, "Reservations").click();
+  const hold = page
+    .locator(".hardware-panel tbody tr")
+    .filter({ hasText: "Camera bring-up validation" });
+  for (const theme of ["cloudx-neon", "minimalist-dark"]) {
+    await label(page, "Fixture theme").selectOption(theme);
+    await expect(hold).toContainText("Codex · Camera bring-up");
+    await expect(hold).toContainText("Camera lab");
+    await hold
+      .getByRole("button", { name: "Open owner tab", exact: true })
+      .click();
+    await screenshot(page, info, `owner-tab-${theme}`);
+  }
+  const afterNavigation = (await lab.service.snapshot(operator))
+    .reservations[0]!;
+  expect(afterNavigation.owner).toEqual(owner);
+  expect(afterNavigation.generation).toBe(reserved.generation);
+  expect(lab.connections).toHaveLength(0);
+  await hold.getByRole("button", { name: "Details", exact: true }).click();
+  const details = page.getByRole("region", {
+    name: "Hold details",
+    exact: true,
+  });
+  await expect(details).toContainText("Reservation execution");
+  await expect(details).toContainText(owner.executionId);
+  await expect(details).toContainText("Current tab execution");
+  await expect(details).toContainText("current-codex-execution");
+  await expect(details).toContainText(owner.tabId);
+  await button(page, "Force release…").click();
+  await label(page, "Force release reason").fill(
+    "Operator inspected the original owner and settled its work.",
+  );
+  await button(page, "Confirm force release").click();
+  await expect
+    .poll(
+      async () => (await lab.service.snapshot(operator)).reservations.length,
+    )
+    .toBe(0);
+  await button(page, "Inventory").click();
+  await button(page, "Select Atlas SSH").click();
+  await label(page, "Reservation purpose").fill("Manual operator inspection");
+  await button(page, "Reserve hardware").click();
+  await expect(inspector.locator(".hardware-owner")).toHaveText("You");
+  await expect(
+    inspector.getByRole("button", { name: "Open owner tab", exact: true }),
+  ).toHaveCount(0);
+  expect((await lab.service.snapshot(operator)).reservations[0]!.owner).toEqual(
+    operator,
+  );
+  await button(page, "Release hardware").click();
+  await expect
+    .poll(
+      async () => (await lab.service.snapshot(operator)).reservations.length,
+    )
+    .toBe(0);
+});
+
 test("monitor navigates to a Forge worker and requires explicit recovery override", async ({
   page,
 }, info) => {
@@ -1610,7 +1717,10 @@ test("monitor navigates to a Forge worker and requires explicit recovery overrid
     page.getByText("No matching live reservations", { exact: true }),
   ).toBeVisible();
   await label(page, "Owned by me").uncheck();
-  await button(page, "Open owner").click();
+  await page
+    .getByRole("region", { name: "Hold details", exact: true })
+    .getByRole("button", { name: "Open owner tab", exact: true })
+    .click();
   await expect(page.locator("output")).toHaveText(
     "Opened owner: fixture-claude",
   );

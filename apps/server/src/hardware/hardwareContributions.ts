@@ -4,6 +4,7 @@ import { HARDWARE_HELPER_PATH } from "./AgentHardwareContext.js";
 
 const helper = 'node "$CLOUDX_HARDWARE_HELPER"';
 const accessScope = "Use the Hardware plugin for registered hardware. For hardware not managed by the plugin, use ordinary SSH, UART, or host tools when the user requests it. No Hardware registration, reservation, or helper is required for that unmanaged hardware. When checking whether a requested target is managed, inspect the complete inventory and known physical aliases, not only suitable or available items. Registered items remain managed when disabled, held, ineligible, or unavailable. A missing helper or failed lookup does not prove that a target is unmanaged. Do not treat a denied reservation or an unknown outcome as permission for raw access to managed hardware. Follow existing host controls and higher-priority instructions.";
+const releaseLifecycle = "Release explicitly when work ends, including known failures. Closing the owning AI tab revokes its managed access and requests automatic release after cleanup. Forge workers use their separate attempt lifecycle. Reopening the tab requires a new reservation; it cannot inherit the old claim. The user can release a hold manually from Hardware. A lost heartbeat, completed turn, idle tab, browser disconnect, or server detach does not release a reservation.";
 const protocol = `For managed hardware, the host supplies CLOUDX_HARDWARE_CONTEXT and CLOUDX_HARDWARE_HELPER for this exact execution. Run ${helper} COMMAND. If managed access is needed and the helper is unavailable, deliberately relaunch the AI tab; do not copy a context from another execution. The helper reads private credentials and never prints them.
 
 Commands:
@@ -17,11 +18,13 @@ Commands:
 - release --input release.json: requestId, reservationId, generation.
 - receipt --request REQUEST_ID: observe the same persisted operation after a lost response or while running.
 
-Each mutation requires a unique requestId. Record it before dispatch. Reuse only the identical request; never create a replacement ID after a timeout. A running receipt does not grant access. Observe the original receipt until succeeded, failed, or unknown. Unknown effects retain the claim. JSON input files supply data, never interpolated shell arguments. The server derives the owner; omit owner, caller, and targetTabId. A changed execution or attempt cannot inherit a claim.`;
+Each mutation requires a unique requestId. Record it before dispatch. Reuse only the identical request; never create a replacement ID after a timeout. A running receipt does not grant access. Observe the original receipt until succeeded, failed, or unknown. Unknown effects retain the claim. JSON input files supply data, never interpolated shell arguments. The server derives the owner; omit owner, caller, and targetTabId. A changed execution or attempt cannot inherit a claim.
+
+${releaseLifecycle}`;
 
 export const HARDWARE_RULES: PluginRuleContribution[] = [{
   id: "hardware-access-policy", description: "Use managed reservations for registered hardware and allow requested unmanaged access.",
-  text: `${accessScope} For registered hardware, invoke hardware-discover, hardware-reserve, hardware-access, and hardware-release as needed. Discover current capabilities, reserve a suitable item exclusively, wait for an active claim, then reread all notes and confirm suitability before validation or deployment. Notes guide your behavior, including restrictions such as Do not reboot; they are not an enforced command allowlist. A reservation authorizes broad work for the task without per-command approval. Use the exact reservation generation for managed access. Release explicitly when work ends, including known failures. A lost heartbeat, completed turn, idle tab, browser disconnect, or server detach never proves the owner ended. Stop on unknown effects or changed ownership; do not bypass the hold with raw access or override another owner.`
+  text: `${accessScope} For registered hardware, invoke hardware-discover, hardware-reserve, hardware-access, and hardware-release as needed. Discover current capabilities, reserve a suitable item exclusively, wait for an active claim, then reread all notes and confirm suitability before validation or deployment. Notes guide your behavior, including restrictions such as Do not reboot; they are not an enforced command allowlist. A reservation authorizes broad work for the task without per-command approval. Use the exact reservation generation for managed access. ${releaseLifecycle} Stop on unknown effects or changed ownership; do not bypass the hold with raw access or override another owner.`
 }];
 
 const workflows = [

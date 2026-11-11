@@ -8,13 +8,14 @@ interface OwnerMonitorOptions {
   hardware: {
     ownerClaims(): HardwareReservation[];
     ownerEnded(owner: HardwareOwner): Promise<void>;
+    nativeTabClosed(tabId: string): Promise<void>;
     ownerUnknown(owner: HardwareOwner, reason: string): Promise<void>;
     onChange(listener: () => void): () => void;
   };
   report(error: unknown): void;
 }
 
-/** Only confirmed termination releases a claim. Observation loss never grants another owner access. */
+/** Explicit native-tab closure revokes its leases. Observation loss alone never releases them. */
 export class HardwareOwnerMonitor {
   private readonly disposers: Array<() => void> = [];
   private pending: Promise<void> = Promise.resolve();
@@ -63,11 +64,15 @@ export class HardwareOwnerMonitor {
   private async removed(tab: WorkspaceTab): Promise<void> {
     if (this.stopped || !isAgentTab(tab)) return;
     const owner = this.observed.get(tab.id);
+    this.observed.delete(tab.id);
+    await this.options.contexts.revoke(tab.id);
+    if (!tab.ownerPluginId) {
+      await this.options.hardware.nativeTabClosed(tab.id);
+      return;
+    }
     // Forge supplies its exact-attempt quiescence event. An absent worker tab is insufficient.
     if (owner && this.options.hardware.ownerClaims().some(claim => claim.owner.kind === "agent" && ownerIdentity(claim.owner) === ownerIdentity(owner) && claim.lastOwnerObservation !== "confirmed_ended" && claim.lastOwnerObservation !== "unknown"))
       await this.options.hardware.ownerUnknown(owner, "The tab disappeared without a matching confirmed execution termination.");
-    this.observed.delete(tab.id);
-    await this.options.contexts.revoke(tab.id);
   }
 
   private async synchronize(): Promise<void> {

@@ -14,6 +14,7 @@ import type {
   HardwareStateView,
   OperationReceipt,
   WorkspaceTab,
+  WorkspaceWindow,
 } from "@cloudx/shared";
 import {
   callHardwareAction,
@@ -38,10 +39,15 @@ type View =
 export interface HardwarePanelProps {
   tab?: WorkspaceTab;
   tabs?: WorkspaceTab[];
+  windows?: WorkspaceWindow[];
   onOpenOwner?: (tabId: string) => void;
 }
 
-export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
+export function HardwarePanel({
+  tabs,
+  windows,
+  onOpenOwner,
+}: HardwarePanelProps) {
   const [state, setState] = useState<HardwareStateView>();
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<{
@@ -336,6 +342,9 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
             {view === "inventory" ? (
               <HardwareInventory
                 state={state}
+                tabs={tabs}
+                windows={windows}
+                onOpenOwner={onOpenOwner}
                 selectedId={selectedId}
                 onSelect={setSelectedId}
                 onEdit={(value) => {
@@ -393,11 +402,12 @@ export function HardwarePanel({ tabs, onOpenOwner }: HardwarePanelProps) {
             {view === "reservations" ? (
               <HardwareReservations
                 state={state}
+                tabs={tabs}
+                windows={windows}
                 initialSelectedId={inspectedHoldId}
                 busy={busy}
                 run={run}
                 onOpenOwner={onOpenOwner}
-                canOpenOwner={canOpenOwner}
               />
             ) : null}
             {view === "access" ? (

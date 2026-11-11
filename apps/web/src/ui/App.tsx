@@ -823,11 +823,32 @@ export function App() {
         const pane = findPaneContainingTab(window.layout.root, target.id);
         if (!pane) continue;
         if (window.id !== activeWindowIdRef.current) await handleSelectWindow(window.id);
+        if (!tabsRef.current.some(tab => tab.id === tabId)) throw new Error("The original Hardware owner tab is no longer available.");
+        const currentPane = findPaneContainingTab(layoutRef.current.root, target.id);
+        if (!currentPane) throw new Error("The Hardware owner's workspace placement changed. Inspect the current tab before opening it again.");
         setMaximizedPaneId(undefined);
-        await activateTab(target.id, pane.id);
+        await activateTab(target.id, currentPane.id);
+        scrollPaneIntoView(currentPane.id);
         return;
       }
-      throw new Error("The Hardware owner has no workspace pane.");
+      if (owner.ownerPluginId) throw new Error("The Hardware owner's plugin panel has no workspace pane.");
+      const window = windowsRef.current.find(window => window.id === activeWindowIdRef.current);
+      const pane = window && findPane(window.layout.root, window.layout.activePaneId);
+      if (!window || !pane) throw new Error("Select a workspace pane before opening the Hardware owner.");
+      const placed = await workspaceWrites.run(() => {
+        if (!tabsRef.current.some(tab => tab.id === tabId)) throw new Error("The original Hardware owner tab is no longer available.");
+        const currentWindow = windowsRef.current.find(candidate => candidate.id === window.id);
+        const currentLayout = activeWindowIdRef.current === window.id ? layoutRef.current : currentWindow?.layout;
+        if (!currentLayout || !findPane(currentLayout.root, pane.id)) throw new Error("The destination workspace pane is no longer available.");
+        return updateWindow(window.id, { layout: placeTabInPane(currentLayout, pane.id, owner.id) });
+      });
+      applyWorkspaceState(placed);
+      if (!tabsRef.current.some(tab => tab.id === tabId)) throw new Error("The original Hardware owner tab is no longer available.");
+      const currentPane = findPaneContainingTab(layoutRef.current.root, owner.id);
+      if (!currentPane) throw new Error("The Hardware owner's workspace placement changed. Inspect the current tab before opening it again.");
+      setMaximizedPaneId(undefined);
+      await activateTab(owner.id, currentPane.id);
+      scrollPaneIntoView(currentPane.id);
     } catch (error) { setError(error instanceof Error ? error.message : String(error)); }
   }
 
@@ -1335,7 +1356,7 @@ export function App() {
     },
     [PLUGIN_WEBVIEW_RENDERER]: (contribution, context) => <PluginWebviewPanel contribution={contribution} context={context} />,
     "cooperation.panel": (_contribution, context) => context.tab ? <Suspense fallback={<div className="empty-pane">Loading blackboard…</div>}><CooperationPanel tab={context.tab} tabs={tabs} active={context.active === true} onOpenBoard={openBlackboard} /></Suspense> : null,
-    "hardware.panel": (_contribution, context) => context.tab ? <Suspense fallback={<div className="empty-pane">Loading hardware…</div>}><HardwarePanel tab={context.tab} tabs={tabs} onOpenOwner={tabId => { void openHardwareOwner(tabId); }} /></Suspense> : null,
+    "hardware.panel": (_contribution, context) => context.tab ? <Suspense fallback={<div className="empty-pane">Loading hardware…</div>}><HardwarePanel tab={context.tab} tabs={tabs} windows={windows} onOpenOwner={tabId => { void openHardwareOwner(tabId); }} /></Suspense> : null,
     "jira.panel": (_contribution, context) => context.callHook ? (
       <Suspense fallback={<div className="empty-pane">Loading Jira...</div>}>
         <JiraPanel callHook={context.callHook} activeTriggerIds={activeAutomationTriggerIds} emitTrigger={handleEmitTrigger} />

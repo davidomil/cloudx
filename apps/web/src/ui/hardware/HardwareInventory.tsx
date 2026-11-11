@@ -22,7 +22,8 @@ import {
   StatusInput,
   type HardwareRun,
 } from "./HardwareControls.js";
-import { matchesHardware, ownerLabel, sameOwner } from "./hardwareModel.js";
+import { matchesHardware, sameOwner } from "./hardwareModel.js";
+import { HardwareOwnerView, type HardwareOwnerProps } from "./HardwareOwner.js";
 
 export function HardwareInventory({
   state,
@@ -33,6 +34,9 @@ export function HardwareInventory({
   onStatuses,
   busy,
   run,
+  tabs,
+  windows,
+  onOpenOwner,
 }: {
   state: HardwareStateView;
   selectedId?: string;
@@ -42,7 +46,7 @@ export function HardwareInventory({
   onStatuses: (id: string) => void;
   busy: boolean;
   run: HardwareRun;
-}) {
+} & HardwareOwnerProps) {
   const [storedFilter, setFilter] = useState<HardwareFilter>({});
   const statuses = storedFilter.statuses?.filter((predicate) =>
     state.statusDefinitions.some(
@@ -349,13 +353,21 @@ export function HardwareInventory({
                         className={`hardware-badge state-${summary.reservation?.state ?? summary.checkHold?.state ?? summary.availability}`}
                       >
                         {summary.reservation
-                          ? `${summary.reservation.state.replaceAll("_", " ")} · ${ownerLabel(summary.reservation.owner)}`
+                          ? summary.reservation.state.replaceAll("_", " ")
                           : summary.checkHold
                             ? "System check"
                             : summary.availability === "ineligible"
                               ? "Needs attention"
                               : "Available"}
                       </span>
+                      {summary.reservation ? (
+                        <HardwareOwnerView
+                          owner={summary.reservation.owner}
+                          tabs={tabs}
+                          windows={windows}
+                          onOpenOwner={onOpenOwner}
+                        />
+                      ) : null}
                     </td>
                   </tr>
                 ))}
@@ -396,6 +408,9 @@ export function HardwareInventory({
             }}
             busy={busy}
             run={run}
+            tabs={tabs}
+            windows={windows}
+            onOpenOwner={onOpenOwner}
           />
         ) : (
           <aside className="hardware-inspector hardware-empty">
@@ -417,6 +432,9 @@ function HardwareInspector({
   onClose,
   busy,
   run,
+  tabs,
+  windows,
+  onOpenOwner,
 }: {
   state: HardwareStateView;
   summary: HardwareSummary;
@@ -426,7 +444,7 @@ function HardwareInspector({
   onClose: () => void;
   busy: boolean;
   run: HardwareRun;
-}) {
+} & HardwareOwnerProps) {
   const [tab, setTab] = useState("overview");
   const [purpose, setPurpose] = useState("");
   const { item, reservation } = summary;
@@ -551,11 +569,19 @@ function HardwareInspector({
                       className={`hardware-badge state-${reservation?.state ?? summary.availability}`}
                     >
                       {reservation
-                        ? `${reservation.state.replaceAll("_", " ")} · ${ownerLabel(reservation.owner)}`
+                        ? reservation.state.replaceAll("_", " ")
                         : summary.checkHold
                           ? summary.checkHold.state
                           : summary.availability}
                     </span>
+                    {reservation ? (
+                      <HardwareOwnerView
+                        owner={reservation.owner}
+                        tabs={tabs}
+                        windows={windows}
+                        onOpenOwner={onOpenOwner}
+                      />
+                    ) : null}
                   </dd>
                 </dl>
                 {summary.blockers.length ? (

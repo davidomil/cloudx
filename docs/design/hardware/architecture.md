@@ -62,6 +62,7 @@ State transitions and invariants.
 | Preparing | Matching successful hook and live owner | Active reservation. |
 | Preparing | Failed, lost, or ambiguous hook | Recovery required; keys remain held. |
 | Active | Explicit release or confirmed owner end | Releasing; new access is closed. |
+| Native agent claim | Explicit closure of its owning tab | Revoke generation; cancel managed work and release after confirmed cleanup. Preserve earlier unknown receipts. |
 | Releasing | All managed access closed and release hook succeeded or absent | Remove live claim; append released history and receipt atomically. |
 | Any live phase | Unknown owner/effect or cleanup failure | Recovery required; preserve every key. |
 | Any held phase | Matching operator override | Revoke old generation first; clear only after cleanup or explicit acceptance of unresolved activity. |
@@ -133,7 +134,9 @@ Deployment reports per-execution skill readiness and a clear Relaunch required s
 
 ## Lifecycle, startup, and shutdown
 
-HardwareOwnerMonitor subscribes to SessionStore tab changes/removal and Forge attempt lifecycle. Use authoritative execution completion and drain evidence. Keep owner liveness separate from UI tab status. New executions, provider switches, forks, and new worker attempts do not inherit claims. Display the old held claim until it is released or recovered.
+HardwareOwnerMonitor subscribes to SessionStore tab changes/removal and Forge attempt lifecycle. Explicit native-tab removal is an intentional lease revocation, distinct from proof of producer termination. Revoke the tab's helper capability first, then revoke all native reservation generations for its exact tab ID and run managed cleanup. Earlier unknown effects remain in receipts and history but do not prevent release after successful cleanup. Failed native cleanup or a failed release hook remains held for manual recovery. Forge retains its exact-attempt quiescence authority.
+
+Keep owner liveness separate from UI tab status. New executions, provider switches, forks, and new worker attempts do not inherit claims. Reopening a closed tab must obtain a new reservation and cannot bypass a subsequent owner's generation.
 
 Startup order is writer lease, validated snapshot, closed access admission, complete workspace/Forge restoration, exact-owner and receipt reconciliation, persisted reconciliation, then open admission. Preserve an active claim only for the exact surviving execution. Unknown owners, interrupted checking/preparation/release, and missing receipts remain held. Never replay scripts or auto-expire on startup.
 

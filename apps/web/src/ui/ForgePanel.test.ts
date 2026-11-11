@@ -198,6 +198,30 @@ describe("ForgePanel", () => {
     expect(panel.querySelector('[data-terminal-tab="replacement-worker"]')).toBeNull();
   });
 
+  it("opens a retained original Hardware tab when the worker already has a replacement attempt", async () => {
+    const replacement = { ...worker, tabId: "replacement-worker", attemptId: "replacement-attempt" };
+    const f = fixture({ workers: [replacement] });
+    const panel = await renderPanel(f, { workerTabs: [workerTab, { ...workerTab, id: replacement.tabId }], ownerRequest: { tabId: workerTab.id, requestId: "hardware-retained-attempt" } });
+    await vi.waitFor(() => expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull());
+    expect(panel.querySelector('[data-terminal-tab="replacement-worker"]')).toBeNull();
+    expect(f.calls.some(call => call.hook === "forge.worker.history")).toBe(false);
+  });
+
+  it("keeps a Hardware owner dialog on the requested tab when Forge advances to another attempt", async () => {
+    const replacement = { ...worker, tabId: "replacement-worker", attemptId: "replacement-attempt", title: "Replacement attempt" };
+    const f = fixture({ workers: [worker] });
+    const panel = await renderPanel(f, { workerTabs: [workerTab, { ...workerTab, id: replacement.tabId }], ownerRequest: { tabId: workerTab.id, requestId: "hardware-request-race" } });
+    await vi.waitFor(() => expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull());
+    f.dashboard.workers = [replacement];
+    await click(panel, "Refresh Forge");
+    await vi.waitFor(() => expect(panel.querySelector('[role="tab"]')?.textContent).toContain("Replacement attempt"));
+    expect(panel.querySelector('[data-terminal-tab="codex-worker"]')).not.toBeNull();
+    expect(panel.querySelector('[data-terminal-tab="replacement-worker"]')).toBeNull();
+    await click(panel, "Close worker terminal");
+    await click(panel, "View worker");
+    await vi.waitFor(() => expect(panel.querySelector('[data-terminal-tab="replacement-worker"]')).not.toBeNull());
+  });
+
   it("opens blackboard assignment from managed worker tabs and from the native terminal header", async () => {
     const summary = { boardId: "design", title: "Payment design", revision: 1, status: "active", eventCursor: 1, members: [{ tabId: workerTab.id, providerId: "codex", label: "Worker", assignmentGeneration: 1, role: "responder" }], itemCount: 0, openQuestions: 0 };
     const fetchMock = vi.fn(async () => new Response(JSON.stringify([summary])));

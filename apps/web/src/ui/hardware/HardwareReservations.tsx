@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, Info, Trash2 } from "lucide-react";
+import { Info, Trash2 } from "lucide-react";
 import type {
   HardwareCheckHold,
   HardwareHoldRef,
@@ -13,7 +13,8 @@ import {
   ReceiptView,
   type HardwareRun,
 } from "./HardwareControls.js";
-import { ownerLabel, sameOwner } from "./hardwareModel.js";
+import { sameOwner } from "./hardwareModel.js";
+import { HardwareOwnerView, type HardwareOwnerProps } from "./HardwareOwner.js";
 
 type Hold = HardwareReservation | HardwareCheckHold;
 const isCheck = (hold: Hold): hold is HardwareCheckHold => "runId" in hold;
@@ -34,15 +35,14 @@ export function HardwareReservations({
   busy,
   run,
   onOpenOwner,
-  canOpenOwner,
+  tabs,
+  windows,
 }: {
   state: HardwareStateView;
   initialSelectedId?: string;
   busy: boolean;
   run: HardwareRun;
-  onOpenOwner?: (tabId: string) => void;
-  canOpenOwner?: (tabId: string) => boolean;
-}) {
+} & HardwareOwnerProps) {
   const [selectedId, setSelectedId] = useState(initialSelectedId);
   const details = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -58,6 +58,13 @@ export function HardwareReservations({
   const [accept, setAccept] = useState(false);
   const holds: Hold[] = [...state.reservations, ...state.checkHolds];
   const selected = holds.find((hold) => holdId(hold) === selectedId);
+  const ownerTabId =
+    selected && !isCheck(selected) && selected.owner.kind === "agent"
+      ? selected.owner.tabId
+      : undefined;
+  const currentExecution = state.agentReadiness?.find(
+    (execution) => execution.tabId === ownerTabId,
+  );
   const rows = holds.filter(
     (hold) =>
       (!phase || hold.state === phase) &&
@@ -141,7 +148,16 @@ export function HardwareReservations({
                     <strong>{item?.name ?? hold.hardwareId}</strong>
                   </td>
                   <td>
-                    {isCheck(hold) ? "System check" : ownerLabel(hold.owner)}
+                    {isCheck(hold) ? (
+                      "System check"
+                    ) : (
+                      <HardwareOwnerView
+                        owner={hold.owner}
+                        tabs={tabs}
+                        windows={windows}
+                        onOpenOwner={onOpenOwner}
+                      />
+                    )}
                   </td>
                   <td>{isCheck(hold) ? "Status observation" : hold.purpose}</td>
                   <td>
@@ -160,28 +176,6 @@ export function HardwareReservations({
                       : `${hold.lastOwnerObservation.replaceAll("_", " ")}${hold.lastOwnerObservedAt ? ` · ${new Date(hold.lastOwnerObservedAt).toLocaleTimeString()}` : ""}`}
                   </td>
                   <td className="hardware-inline">
-                    {!isCheck(hold) && hold.owner.kind === "agent" ? (
-                      <ControlButton
-                        size="compact"
-                        disabled={
-                          !onOpenOwner ||
-                          canOpenOwner?.(hold.owner.tabId) === false
-                        }
-                        title={
-                          onOpenOwner &&
-                          canOpenOwner?.(hold.owner.tabId) !== false
-                            ? "Open owning tab"
-                            : "Owner navigation is unavailable"
-                        }
-                        onClick={() => {
-                          if (hold.owner.kind === "agent")
-                            onOpenOwner?.(hold.owner.tabId);
-                        }}
-                      >
-                        <ExternalLink size={13} />
-                        Open owner
-                      </ControlButton>
-                    ) : null}
                     <ControlButton
                       size="compact"
                       onClick={() => setSelectedId(holdId(hold))}
@@ -230,9 +224,16 @@ export function HardwareReservations({
               <dd>{selected.state}</dd>
               <dt>Owner</dt>
               <dd>
-                {isCheck(selected)
-                  ? "System check"
-                  : ownerLabel(selected.owner)}
+                {isCheck(selected) ? (
+                  "System check"
+                ) : (
+                  <HardwareOwnerView
+                    owner={selected.owner}
+                    tabs={tabs}
+                    windows={windows}
+                    onOpenOwner={onOpenOwner}
+                  />
+                )}
               </dd>
               <dt>Reason</dt>
               <dd>
@@ -242,10 +243,21 @@ export function HardwareReservations({
                 <>
                   <dt>Outstanding operations</dt>
                   <dd>{selected.activeOperationIds.join(", ") || "None"}</dd>
-                  <dt>Execution</dt>
+                  <dt>Reservation execution</dt>
                   <dd>
                     <pre>{JSON.stringify(selected.owner, null, 2)}</pre>
                   </dd>
+                  {selected.owner.kind === "agent" ? (
+                    <>
+                      <dt>Current tab execution</dt>
+                      <dd>
+                        <code>
+                          {currentExecution?.executionId ??
+                            "No current execution evidence"}
+                        </code>
+                      </dd>
+                    </>
+                  ) : null}
                 </>
               ) : null}
             </dl>
@@ -299,7 +311,10 @@ export function HardwareReservations({
         <h3>Recent operation receipts</h3>
         {state.retention ? (
           <p className="hardware-muted" aria-label="Hardware retention">
-            Completed details: {state.retention.completedMaxAgeMs / 86_400_000} days · {state.retention.completedMaxEntries.toLocaleString()} entries · {state.retention.outputMaxBytes / 1_048_576} MiB result budget. Running and unknown receipts stay retained.
+            Completed details: {state.retention.completedMaxAgeMs / 86_400_000}{" "}
+            days · {state.retention.completedMaxEntries.toLocaleString()}{" "}
+            entries · {state.retention.outputMaxBytes / 1_048_576} MiB result
+            budget. Running and unknown receipts stay retained.
           </p>
         ) : null}
         {[...state.receipts]

@@ -76,6 +76,8 @@ Reserve requires the observed item revision. A stale revision returns REVISION_C
 
 Open, invoke, and owner status refresh require an active, nonrevoked claim at admission and dispatch. Close requires the exact current held generation and matching owner; it may run in recovery or releasing to settle handles, but it cannot clear earlier uncertainty. Normal release moves active to releasing; a repeated release in releasing observes that cleanup, while recovery returns RECOVERY_REQUIRED without launching a new hook. The service resolves hardware from the claim; invocation input cannot retarget it. A user override invalidates the generation before cleanup. A delayed completion cannot make an obsolete generation active again.
 
+Explicit closure of an ordinary AI tab is a separate server lifecycle action. It revokes the helper capability and all native claims for that tab before cleanup. Successful managed cleanup and any pending release hook clear the lock, including an earlier unknown-owner or effects hold; earlier receipts and history retain their outcomes. Unconfirmed cleanup remains held for manual force release. Browser disconnect, end of turn, and server detach do not invoke this action. A reopened tab must acquire a new claim and cannot use its previous generation.
+
 ## SSH operation payloads
 
 SSH configuration uses `auth: { kind: "agent" }` by default. `socketPath` is optional for an explicit agent override. Other modes are `{ kind: "identity_file", path }` and `{ kind: "password", credentialRefId }`. `knownHostsFile` is optional; omitting it uses normal OpenSSH host files with `StrictHostKeyChecking=accept-new`. An explicit override uses strict checking.

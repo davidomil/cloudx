@@ -58,7 +58,8 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
   const [view, setView] = useState<View>("issues");
   const [selectedWorkerId, setSelectedWorkerId] = useState<string>();
   const [terminalWorkerId, setTerminalWorkerId] = useState<string>();
-  const onViewWorker = (workerId: string) => { setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
+  const [terminalOwnerTabId, setTerminalOwnerTabId] = useState<string>();
+  const onViewWorker = (workerId: string) => { setTerminalOwnerTabId(undefined); setSelectedWorkerId(workerId); setTerminalWorkerId(workerId); };
   const [revision, setRevision] = useState(0);
   const [snapshot, setSnapshot] = useState<{ key: string; dashboard: ForgeDashboard }>();
   const [continuationMessages, setContinuationMessages] = useState<Record<string, string>>({});
@@ -92,11 +93,13 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
     if (!active || !ownerRequest || !repositoryReady || !dashboard || openedOwnerRequest.current === ownerRequest.requestId) return;
     openedOwnerRequest.current = ownerRequest.requestId;
     setView("workers");
-    const owner = dashboard.workers.find(worker => worker.tabId === ownerRequest.tabId);
+    const ownerTab = workerTabs.find(tab => tab.id === ownerRequest.tabId && tab.ownerPluginId === "forge");
+    const owner = ownerTab && dashboard.workers.find(worker => worker.id === ownerTab.pluginMetadata?.["forge-workers"]?.workerId);
     if (!owner) { setActionError("The original Hardware owner attempt is no longer present in Forge. Inspect its reservation history."); return; }
     setSelectedWorkerId(owner.id);
+    setTerminalOwnerTabId(ownerRequest.tabId);
     setTerminalWorkerId(owner.id);
-  }, [active, ownerRequest, repositoryReady, dashboard]);
+  }, [active, ownerRequest, repositoryReady, dashboard, workerTabs]);
 
   useEffect(() => {
     mounted.current = true;
@@ -191,7 +194,7 @@ export function ForgePanel({ callHook, tab, windowId, paneId, onOpenSettings, wo
       {view === "workers" ? <ForgeWorkerTabs workers={workers} selectedWorkerId={selectedWorkerId} onSelectWorker={setSelectedWorkerId} tabHandlers={worker => { const tab = workerTabs.find(tab => tab.id === worker.tabId); return tab ? blackboardMenu.tabHandlers(tab) : {}; }} workerActions={worker => { const board = blackboards.boards.find(board => board.members.some(member => member.tabId === worker.tabId)); return board && onOpenBlackboard ? <ControlButton size="compact" iconOnly aria-label={`Open blackboard ${board.title}`} title={board.title} onClick={() => onOpenBlackboard(board.boardId, board.title)}><Monitor size={14} /></ControlButton> : null; }}>
         {(worker) => <WorkerCard worker={worker} workers={workers} request={request} placement={placement} runAction={runAction} onViewWorker={onViewWorker} />}
       </ForgeWorkerTabs> : (view === "issues" || view === "changes") && dashboard.configured && repository ? <ForgeItems key={`${repository.provider}:${repository.apiUrl}:${repository.projectPath}:${view}`} kind={view} repository={repository} request={request} revision={revision} workers={workers.filter((worker) => worker.repository.provider === repository.provider && worker.repository.apiUrl === repository.apiUrl && worker.repository.projectPath === repository.projectPath)} placement={placement} runAction={runAction} busy={busy || pendingWorkers.size > 0} onViewWorker={onViewWorker} onBatchSaved={id => { setSelectedWorkerId(id); setView("workers"); }} /> : null}
-      {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onOpenBlackboard={onOpenBlackboard} onClose={() => setTerminalWorkerId(undefined)} /> : null}
+      {active && terminalWorker ? <ForgeWorkerTerminalOverlay key={terminalWorker.id} worker={terminalWorker} ownerTabId={terminalOwnerTabId} workerTabs={workerTabs} loadHistory={loadWorkerHistory} uiScale={uiScale} onOpenBlackboard={onOpenBlackboard} onClose={() => { setTerminalOwnerTabId(undefined); setTerminalWorkerId(undefined); }} /> : null}
     </> : null}
     {blackboardMenu.position ? (() => { const tab = workerTabs.find(tab => tab.id === blackboardMenu.position?.tabId); return tab ? <AgentSwitchMenu tab={tab} x={blackboardMenu.position.x} y={blackboardMenu.position.y} accountsEnabled={false} cooperationEnabled={Boolean(onOpenBlackboard)} onSwitched={() => {}} onOpenAccounts={() => {}} onOpenBoard={onOpenBlackboard} onOpenNativeWork={tab => {
       const worker = workers.find(worker => worker.tabId === tab.id);
